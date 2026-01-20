@@ -118,7 +118,7 @@ After the user approves the Key details draft, run five review iterations. Each 
   - Title: the working title
   - Description: include the full contents of `.opencode/tmp/intake-draft-<title>.md`
   - Assignee: "Build"
-  - Labels: "state:idea"
+  - Labels: "stage:idea"
 
 - If creating a new issue and a parent has been identified, create it as a sub-issue (`--parent <id>`).
 - Add dependencies with `bd dep add` as appropriate.
