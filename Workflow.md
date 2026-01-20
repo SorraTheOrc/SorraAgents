@@ -34,7 +34,7 @@ In summary the workflow is:
 
 In more detail, the steps are:
 
-### Project Definition
+### Project/Feature Definition
 
 Define the bounding intent for the work: scope, measurable success metrics, constraints, and the top risks. Capture a one-paragraph project summary at the top of the PRD and include:
 
@@ -44,8 +44,9 @@ Define the bounding intent for the work: scope, measurable success metrics, cons
 - **Status Label:** `idea`, `prf_complete`
 
 Agent Commands:
-1) Create initial tracking bead: `/intake <Project Title>`
-2) Create PRD via interview: `/prd <Bead ID>`
+
+1. Create initial tracking bead: `/intake <Project Title>`
+2. Create PRD via interview: `/prd <Bead ID>`
 
 Summary: a clear, testable project definition that guides epics and prioritization.
 
@@ -59,7 +60,8 @@ Map the end-to-end user outcomes into one or more master epics that represent de
 - **Status Label:** `milestones_defined`
 
 Agent Commands:
-1) Decompose the PRD into master epic(s): `/milestones <bead-id>`
+
+1. Decompose the PRD into master epic(s): `/milestones <bead-id>`
 
 Summary: master epics turn the project definition into parallel, owned workstreams.
 
@@ -75,22 +77,24 @@ Break each epic into discrete features: each feature should have a concise accep
 Tackle a single Milestone/Epic at a time. Do not attempt to decompose more than one epic at a timte. This allows each milestone to feed into the next, correcting any poor assumptiosn made in previous steps.
 
 Agent Commands:
-1) Decompose epics into features and tasks: `/plan <Epic ID>`
+
+1. Decompose epics into features and tasks: `/plan <Epic ID>`
 
 Summary: features make epics executable and testable in small increments.
 
 ### Feature Implementation
 
-Implement each feature one at a time. Each issue will have a set of child tasks for (at least) implementation, infra, docs, and tests. Workthrough each feature as a vertical slice that delivers end-to-end user value. 
+Implement each feature one at a time. Each issue will have a set of child tasks for (at least) implementation, infra, docs, and tests. Workthrough each feature as a vertical slice that delivers end-to-end user value.
 
 - **Complete slice:** include code, unit/integration tests, CI configuration, deployment config, runtime observability (metrics/logs), and a rollback/feature-flag plan.
 - **Demo-ready:** each slice should be deployable to a staging environment and demoable with a short script.
 - **Status Label:** `in_progress`
 
 Agent Commands:
-1) For the test issue, generate test plan: `/testplan <Issue ID>`
-2) For the docs issue, generate user documentation: `/doc <Issue ID>`
-3) Implement the feature and tests: `implement <Issue ID>`
+
+1. For the test issue, generate test plan: `/testplan <Issue ID>`
+2. For the docs issue, generate user documentation: `/doc <Issue ID>`
+3. Implement the feature and tests: `implement <Issue ID>`
 
 Summary: vertical slices reduce integration risk and make progress visible.
 
@@ -109,5 +113,6 @@ After merging the PR, clean up the repository by closing the bead, removing temp
 
 - **Status Label:** `done`
 
-Agent Commands: 
-1) `/cleanup`
+Agent Commands:
+
+1. `/cleanup`
