@@ -1,7 +1,7 @@
 ---
 description: Probe (QA AI) — quality gates, test strategy, and risk checks
 mode: subagent
-model: github-copilot/gpt-5.1-codex-max
+model: github-copilot/gpt-5.2-codex-max
 temperature: 0.1
 tools:
   write: false

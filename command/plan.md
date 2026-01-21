@@ -45,6 +45,10 @@ You are helping the team decompose a Beads epic (or other Beads issue) into **fe
 1) Fetch & summarise (agent responsibility)
 
 - Run `bd show <beadId> --json` and summarise the bead in one paragraph: title, type (epic/feature/task), headline, and any existing milestone/plan info.
+- Validate that the bead is ready for planning by inspecting its `stage:*` label:
+  - a `stage:milestones_defined` label then it is ready for planning
+  - a `stage:plan_complete` label then this is a request to review the existing plan. The following steps can be followed, but previous planning work should be considered while working through each step.
+  - any other `stage:*` label indicates that the bead is not currently ready for planning and the user should be asked how to proceed.
 - Read any PRD linked in the bead or any of its parents to extract key details for later reference.
 - Derive 3–6 keywords from the bead title/description to search the repo and beads for related work. Present any likely duplicates or parent/child relationships.
 
@@ -109,19 +113,11 @@ Keep asking questions until the breakdown into features is clear.
     - Purpose: Make the plan copy-pasteable and easy to execute.
     - Actions: Standardize bullets, tense, and structure; keep titles canonical.
 
-5) Create beads (agent)
+5) Update beads (agent)
 
 - Create child beads for each feature with a parent link to the original bead:
-  - `bd create "<Short Title>" --description "<Full feature description>" --parent <beadId> -t feature --json --labels "feature" --priority P2 --validate`
-
-- For each created/reused feature bead, create implementation tasks as children (minimum set):
-  - `bd create "Docs: <Short Title>" --description "<Docs task notes>" --parent <featureBeadId> -t task --json --labels "docs" --priority P2 --assignee Scribbler --validate`
-  - `bd create "Tests: <Short Title>" --description "<Test task notes>" --parent <featureBeadId> -t task --json --labels "test" --priority P1 --assignee Probe --validate`
-  - `bd create "Implement: <Short Title>" --description "<Implementation task notes>" --parent <featureBeadId> -t task --json --labels "task" --priority P1 --assignee Patch --validate`
-
-  Note: These child beads include default assignees following repository conventions (Docs → Scribbler, Tests → Probe, Implementation → Patch). If you need a different owner, update the bead after creation with `bd update`.
-  - Add optional tasks (only if needed): Infra/Ops, UX, Security review.
-
+  - `bd create "<Short Title>" --description "<Full feature description>" --parent <beadId> -t feature --priority P2 --labels "stage:idea" --validate` --json
+- Add optional tasks (only if needed): Infra/Ops, UX, Security review.
 - Create dependency edges between feature beads where the plan specifies dependencies:
   - `bd dep add <DependentFeatureId> <PrereqFeatureId>`
 
@@ -129,12 +125,10 @@ Keep asking questions until the breakdown into features is clear.
   - If a child bead with the same canonical name already exists, reuse it instead of creating a duplicate.
   - Use `bd list --parent <beadId> --json` for features, and `bd list --parent <featureBeadId> --json` for tasks.
 
-- Update the parent bead description to add or update a "Plan" section with:
-  - The approved feature list
-  - The created/reused feature bead ids
-  - Any Open Questions
-
-- When updating the parent bead, append or replace only a well-marked "Plan" block; if a previous generated block exists, replace it rather than appending.
+- Add a comment to the planned bead:
+  - `bd comments add bd-42 "Planning Complete. <Summary of the approved feature list, any open questions that remain>" --actor @your-agent-name --json`
+- Update labels on the planned bead:
+  - `bd update $1 --add-label stage:plan_complete --remove-label state:milestons_defined`
 
 ## Traceability & idempotence
 

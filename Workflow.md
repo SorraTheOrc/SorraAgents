@@ -41,7 +41,7 @@ Define the bounding intent for the work: scope, measurable success metrics, cons
 - **Success signals:** precise, automatable metrics and baseline measurements to evaluate the outcome.
 - **Constraints:** timeline, budget, compatibility, and regulatory limits that affect tradeoffs.
 - **Top risks:** short list of the highest-impact uncertainties and a proposed first-mitigation.
-- **Status Label:** `idea`, `prf_complete`
+- **Status Label:** `idea`, `prd_complete`
 
 Agent Commands:
 
@@ -72,7 +72,7 @@ Break each epic into discrete features: each feature should have a concise accep
 - **Acceptance:** expressable, pass/fail acceptance criteria suitable for automated tests or a short manual checklist.
 - **Prototype:** when assumptions are risky, describe a lightweight experiment (fake-API, mock UI, A/B) and success thresholds.
 - **Taskization:** create `bd` tasks for implementation, infra, docs, and tests; link to the PRD and epic.
-- **Status Label:** `planned`
+- **Status Label:** `plan_complete`
 
 Tackle a single Milestone/Epic at a time. Do not attempt to decompose more than one epic at a timte. This allows each milestone to feed into the next, correcting any poor assumptiosn made in previous steps.
 
