@@ -6,7 +6,7 @@ tags:
 agent: build
 ---
 
-You are coordinating an intake brief as part of the [development workflow](docs/dev/Workflow.md).
+You are coordinating an intake brief for a new Beads issue.
 
 ## Description
 
@@ -14,9 +14,8 @@ You are authoring a new Bead issue that describeds a feature or a bug fix to be 
 
 ## Quick inputs
 
-- You _must_ be provided with a short intake phrase as $ARGUMENTS.
-  - Example: `/intake As a product manager I need to add an onboarding tutorial so that new users complete setup faster`
-- If $ARGUMENTS is empty, you must ask one brief question to obtain a brief description of the product/epic/feature before starting the interview
+- The user story is '$ARGUMENTS'.
+- If the user story is empty, you must ask for a user story in the form 'As a <user type> I need <goal> so that <reason>'.
 
 ## Behavior
 
@@ -29,19 +28,20 @@ The command implements the procedural workflow below. Each numbered step is part
 - Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or OpenCode ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
 - If the user indicates uncertainty at any point, add clarifying questions rather than guessing.
+- The goal is not to capture an exhaustive spec, but to gather sufficient detail to create a clear Beads issue that will be used to either seed a PRD, update an existing one, or if the work is small and well-defined, be implemented directly from the Beads issue.
 
 ## Process (must follow)
 
 1. Gather context (agent responsibility)
 
 - Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for product context.
-- Derive 2–6 keywords from the user's working title and early answers to guide repository and Beads searches.
+- Derive 2–6 keywords from the user story and early answers to guide repository and Beads searches.
 - Use derived keywords to search source and docs for related artifacts and to surface possible duplicates:
   - Scan `docs/`, `README.md`, and `src/` (or equivalent top-level code folders).
   - Use ripgrep (`rg`) where available. If `rg` is unavailable, use a best-effort scan and ask the user to install `rg` for future runs.
 - Search Beads for related issues (`bd list --status open --json | rg -i "<keyword>"`) and `bd ready` when appropriate.
 - Output clearly labelled lists with single line summaries:
-  - "Likely duplicates / related docs" (file paths)
+  - "Possible duplicates / related docs" (file paths)
   - "Related issues" (ids + titles)
 - If any likely duplicates are found:
   - Highlight them to the user and ask if any represent the work to be done.
@@ -118,7 +118,7 @@ After the user approves the Key details draft, run five review iterations. Each 
   - Title: the working title
   - Description: include the full contents of `.opencode/tmp/intake-draft-<title>.md`
   - Assignee: "Build"
-  - Labels: "state:idea"
+  - Labels: "stage:idea"
 
 - If creating a new issue and a parent has been identified, create it as a sub-issue (`--parent <id>`).
 - Add dependencies with `bd dep add` as appropriate.
