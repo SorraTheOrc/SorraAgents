@@ -2,12 +2,12 @@
 
 ## Description
 
-You are implementing a Beads issue identified by a provided id. You will fully implement this issue and all dependent work required to satisfy its acceptance criteria, following project rules and best practices.  
+You are implementing a Beads issue identified by a provided id. You will fully implement this issue and all dependent work required to satisfy its acceptance criteria, following project rules and best practices.
 
 ## Quick inputs
 
-  - The beads issue id is $1.
-  - Optional additional freeform arguments will be used to guide the implementation effots. Freeform arguments are found in the entire arguments string: "$ARGUMENTS".
+- The beads issue id is $1.
+- Optional additional freeform arguments will be used to guide the implementation effots. Freeform arguments are found in the entire arguments string: "$ARGUMENTS".
 
 ## Behavior
 
@@ -32,13 +32,13 @@ Live context commands (use to gather runtime state)
 
 ## Procedure
 
-0) Safety gate: handle dirty working tree
+0. Safety gate: handle dirty working tree
 
 - Inspect `git status --porcelain=v1 -b`.
 - If uncommitted changes are limited to `.beads/`, carry them into the new working branch and commit there.
 - If other uncommitted changes exist, pause and present explicit choices: carry them into the issue branch, commit first, stash (and optionally pop later), revert/discard (explicit confirmation), or abort.
 
-1) Understand the issue
+1. Understand the issue
 
 - Claim by running `bd update $1 --status in_progress --add-label "stage:in_progress" --assignee "@AGENT" --json` (omit `--assignee` if not applicable).
 - Fetch the issue JSON if not already present: `bd show $1 --json` and `bd show $1 --thread --refs --json`.
@@ -47,7 +47,7 @@ Live context commands (use to gather runtime state)
 - Inspect linked PRDs, plans or docs referenced in the issue.
 - Confirm expected tests or validation steps.
 
-1.1) Definition gate (must pass before implementation)
+  1.1) Definition gate (must pass before implementation)
 
 - Verify:
   - Clear scope (in/out-of-scope).
@@ -55,15 +55,19 @@ Live context commands (use to gather runtime state)
   - Constraints and compatibility expectations.
   - Unknowns captured as explicit questions.
 - If the issue is not well-defined, run the intake interview to update the existing bead (see `command/intake.md`) and update the issue `description` or `acceptance` fields with the intake output.
+- If the issue is too large to implement in one pass, run the milestones interview for items that should be epics (see `command/milestones.md`) or the plan interview (see `command/plan.md`) to break it into smaller beads, create those beads, link them as blockers/dependencies, and pick the highest-priority bead to implement next.
+- If you ran the intake interview, update the current bead with the new definition and inform the user of your actions and ask if you should restart the implementation review.
+- If you ran the milestone interview convert this issue to an epic and inform the user that implementation should move to first milestone bead created.
+- if you ran the plan interview you can proceed.
 
-2) Create a working branch
+2. Create a working branch
 
 - inspect the current branch name via `git rev-parse --abbrev-ref HEAD`.
 - If the current branch was created for a bead that is an ancestor of $1, continue on that branch (that is if the name has an ancestor bead id).
 - Otherwise create a new branch named `feature/$1-<short>` or `bug/$1-<short>` (include the bead id).
 - Never commit directly to `main`.
 
-3) Implement
+3. Implement
 
 - If the bead has any open or in-progress blockers or dependencies:
   - Select te most appropriate bead to work on next (blocker > dependency; most critical first).
@@ -83,28 +87,28 @@ Live context commands (use to gather runtime state)
   - Summarize changes made in the bead description or comments.
   - Do not proceed to the next step until the user confirms it is OK to do so.
 
-4) Automated self-review
+4. Automated self-review
 
 - Perform sequential self-review passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff.
 - For each pass, produce a short note and limit edits to small, goal-aligned changes. If intent changes are discovered, create an Open Question and stop automated edits.
 - Run the entire test suite.
-    - Fix any failing tests before continuing.
+  - Fix any failing tests before continuing.
 - Commit the work and update the labels `bd update $1 --add-label "stage:in_review" --json`
 
-5) Commit, Push and create PR
+5. Commit, Push and create PR
 
 - Push the branch to `origin`.
-- Create a Pull Request against the repository's default branch. 
+- Create a Pull Request against the repository's default branch.
   - Use a title in the form of "WIP: <bead-title> (b<bead-id>)" and a body that contains a concise summary of the goal and of the work done and reviewer instructions.
   - Link the PR to the bead via `--external-ref`.
 
-6) Human PR review
+6. Human PR review
 
 - Notify the human reviewer(s) that the PR is ready for review.
 - Address any review comments or requested changes.
 - Once merged, proceed to the next step.
 
-7) Cleanup
+7. Cleanup
 
 - Only take the following actions after the PR is merged:
 - Close the bead and all its depdents and blockers by running `bd update <bead-id> --status done --add-label "stage:done" --remove-label "stage:in_review" --json`.
