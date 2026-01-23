@@ -7,10 +7,10 @@ You are helping create or update a Product Requirements Document (PRD) for an ar
 
 ## Quick inputs
 
-  - The beads issue id is $1.
-    - If no bead id is provided, ask the user to provide one.
-  - Optional additional freeform arguments will be used to guide the PRD authoring. Freeform arguments are found in the entire arguments string, after the bead id ($1): "$ARGUMENTS".
-  
+- The beads issue id is $1.
+  - If no bead id is provided, ask the user to provide one.
+- Optional additional freeform arguments will be used to guide the PRD authoring. Freeform arguments are found in the entire arguments string, after the bead id ($1): "$ARGUMENTS".
+
 ## Argument parsing
 
 - Pattern: If the raw input begins with a slash-command token (a leading token that starts with `/`, e.g., `/prd`), strip that token first.
@@ -28,13 +28,13 @@ You are helping create or update a Product Requirements Document (PRD) for an ar
 
 ## Behavior
 
-The command implements the procedural workflow below. Each numbered step is part of the canonical execution path; substeps describe concrete checks or commands that implementors or automation should run. 
+The command implements the procedural workflow below. Each numbered step is part of the canonical execution path; substeps describe concrete checks or commands that implementors or automation should run.
 
 When a step is gated by user approval, do not proceed until the user approves the output of that step. Do not provide alternative paths unless explicitly requested by the user.
 
 ## Process (must follow)
 
-0) Gather context (agent responsibility)
+0. Gather context (agent responsibility)
 
 - Mark the bead as in progress using `bd update <bead-id> --status in_progress --json`
 - Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for product context.
@@ -44,27 +44,28 @@ When a step is gated by user approval, do not proceed until the user approves th
 - If `bd` is unavailable or the issue cannot be found, fail fast and ask the user to provide a valid issue id or paste the issue content.
 - Prepend a short “Seed Context” block to the interview that includes the fetched details and treat it as authoritative initial intent while still asking clarifying questions.
 
-1) Interview
+1. Interview
 
 - In interview iterations (≤ 3 questions each) build a full understanding of the work, offering templates/examples informed by repo context where possible.
 - If anything is ambiguous, ask for clarification rather than guessing.
 - Keep asking the user questions until all core PRD information is captured and clarifications are made.
 - Once you feel you are able to do so, write a draft PRD using the template below and including noting any areas that could benefit from further expansion.
 
-3) Draft PRD
+3. Draft PRD
 
 - Store the draft PRD at `docs/prd/PRD_<bead_title>_(<bead_id>).md`
 - Present the draft to the user and ask the user to review it and provide feedback.
 - The user may:
-  - Respond with edits or clarifications, in which case you must incorporate them, and go back to the previous step of drafting the intake brief, 
+  - Respond with edits or clarifications, in which case you must incorporate them, and go back to the previous step of drafting the intake brief,
   - Ask you to continue asking questions, in which case you must continue the interview to gather more information, or
   - Approve the current draft, in which case you must proceed to the next step.
 
-4) Automated review stages (must follow; no human intervention required)
+4. Automated review stages (must follow; no human intervention required)
 
-After the user approves the draft PRD, run five review iterations. Each review MUST provide a new draft if any changes are recommended and then print a clear "finished" message as follows: 
-  - "Finished <Stage Name> review: <brief notes of improvements>"
-  - If no improvements were made: "Finished <Stage Name> review: no changes needed"
+After the user approves the draft PRD, run five review iterations. Each review MUST provide a new draft if any changes are recommended and then print a clear "finished" message as follows:
+
+- "Finished <Stage Name> review: <brief notes of improvements>"
+- If no improvements were made: "Finished <Stage Name> review: no changes needed"
 
 - General requirements for the automated reviews:
   - Run without human intervention.
@@ -74,40 +75,38 @@ After the user approves the draft PRD, run five review iterations. Each review M
   - Improvements should be conservative and clearly scoped to the stage. If an automated improvement could change intent, the reviewer should avoid making that change and instead record an Open Question in the PRD.
 
 - Review stages and expected behavior:
-
-  1) Structural review
+  1. Structural review
      - Purpose: Validate the PRD follows the required outline and check for missing or mis-ordered sections.
      - Actions: Ensure headings appear exactly as specified in the PRD outline; detect missing sections; propose and apply minimal reordering or section insertion to satisfy the outline. If structural changes may alter intent, add an Open Question instead of applying them.
-  2) Clarity & language review
+  2. Clarity & language review
      - Purpose: Improve readability, clarity, and grammar without changing meaning.
      - Actions: Apply non-destructive rewrites (shorten long sentences, fix grammar, clarify ambiguous phrasing). Do NOT change intent or add new functional requirements.
-     
-  3) Technical consistency review
+  3. Technical consistency review
      - Purpose: Check requirements and technical notes for internal consistency with gathered context.
      - Actions: Detect contradictions between Requirements, Users, and Release & Operations sections; where safe, adjust wording to remove contradictions (e.g., normalize terminology). Record unresolved inconsistencies as Open Questions.
-     
-  4) Security & compliance review
+  4. Security & compliance review
      - Purpose: Surface obvious security, privacy, and compliance concerns and ensure the PRD includes at least note-level mitigations where applicable.
      - Actions: Scan for missing security/privacy considerations in relevant sections and add short mitigation notes (labelled "Security note:" or "Privacy note:"). Do not invent security requirements beyond conservative, informational notes.
-     
-  5) Lint, style & polish
+  5. Lint, style & polish
      - Purpose: Run automated formatting and linting (including markdown lint) and apply safe autofixes.
      - Actions: Run `remark` with autofix enabled, apply whitespace/formatting fixes, ensure consistent bulleting and code block formatting. Summarize what lint fixes were applied.
-     
+
 - Failure handling:
   - If any automated review encounters an error it cannot safely recover from, the command MUST stop and surface a clear error message indicating which stage failed and why. Do not attempt destructive fixes in that case; instead record an Open Question in the PRD and abort the remaining automated stages.
 
 - Human handoff:
   - Although the reviews are automated, the output messages and changelog entries MUST be sufficient for a human reviewer to understand what changed and why.
 
-5) PRD sign-off (human step)
+5. PRD sign-off (human step)
+
 - Present the final PRD draft to the user for approval.
 - If this was an update to an existing PRD, highlight the changes made during this process.
 - The user may:
   - Request further changes, in which case you must return to the interview step to gather more information and then re-run the automated reviews.
   - Approve the final draft, in which case you must proceed to the finishing steps.
 
-6) Finalizing the PRD
+6. Finalizing the PRD
+
 - Save the final PRD markdown to the appropriate path:
 - Record a the existince of the PRD in the beads issue by adding a comment: "The PRD has been created/updated at: <path>" and linking to the file using an external reference.
 - run `bd sync` to sync bead changes.
@@ -115,7 +114,8 @@ After the user approves the draft PRD, run five review iterations. Each review M
 - Ask the user to review the PR and merge it when ready.
 - Monior the PR until it is merged, providing updates to the user as needed.
 
-7) Next steps
+7. Next steps
+
 - After the PR is merged, ask the user whether they would like to cleanup the repository and move back to main branch (recommended).
   - If the user agrees, run the cleanup command: `/cleanup`
 - Once cleanup is complete tell the user: "The next step is to decompose the PRD into master epics using the command: `/milestones <bead-id>`" and offer to run it for them.
@@ -130,8 +130,8 @@ After the user approves the draft PRD, run five review iterations. Each review M
 
 ## Finishing steps (must do)
 
-  - Remove the label: "Status: Intake Completed" ` bd update <bead-id> --remove-label "state:idea" --json`
-  - Add a Label: "Status: PRD Completed" `bd update <bead-id> --add-label "state:prd_complete" --json`
+- Remove the label: "Status: Intake Completed" ` bd update <bead-id> --remove-label "stage:idea" --json`
+- Add a Label: "Status: PRD Completed" `bd update <bead-id> --add-label "stage:prd_complete" --json`
 - Run `bs sync` to sync bead changes.
 - Run `bd show <bead-id>` (not --json) to show the entire bead.
 - End with: "This completes the PRD process for <bd-id>".
