@@ -2,12 +2,14 @@
 
 ## Description
 
-You are implementing a Worklog work item identified by a provided id. You will fully implement this work item and all dependent work required to satisfy its acceptance criteria, following project rules and best practices.
+You are implementing a Worklog work item identified by a provided id. You will fully implement this work item and all dependent work required to satisfy its acceptance criteria,
+following project rules and best practices.
 
 ## Quick inputs
 
-- The work item id is $1.
-- Optional additional freeform arguments will be used to guide the implementation effots. Freeform arguments are found in the entire arguments string: "$ARGUMENTS".
+- The supplied <work-item-id> is $1.
+  - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
+- Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
 
 ## Behavior
 
@@ -40,7 +42,7 @@ Live context commands (use to gather runtime state)
 
 1. Understand the work item
 
-- Claim by running `wl update $1 --status in_progress --add-label "stage:in_progress" --assignee "@AGENT" --json` (omit `--assignee` if not applicable).
+- Claim by running `wl update $1 --status in_progress --stage in_progress --assignee "@AGENT" --json` (omit `--assignee` if not applicable).
 - Fetch the work item JSON if not already present: `wl show $1 --json` and `wl show $1 --thread --refs --json`.
 - Restate acceptance criteria and constraints from the work item JSON.
 - Surface blockers, dependencies and missing requirements.
@@ -71,9 +73,9 @@ Live context commands (use to gather runtime state)
 
 - If the work item has any open or in-progress blockers or dependencies:
   - Select te most appropriate work item to work on next (blocker > dependency; most critical first).
-  - Claim the work item by running `wl update <work-item-id> --status in_progress --add-label "stage:in_progress" --assignee "@AGENT" --json`
+  - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "@AGENT" --json`
   - Recursively implement that work item as described in this procedure.
-  - When a work item is completed commit the work and update the labels `wl update <work-item-id> --add-label "stage:in_review" --json`
+  - When a work item is completed commit the work and update the stage: `wl update <work-item-id> --stage in_review --json`
 - Write tests and code to ensure all acceptance criteria defined in or related to the current work item are met:
   - Make minimal, focused changes that satisfy acceptance criteria.
   - Follow a test-driven development approach where applicable.
@@ -93,7 +95,7 @@ Live context commands (use to gather runtime state)
 - For each pass, produce a short note and limit edits to small, goal-aligned changes. If intent changes are discovered, create an Open Question and stop automated edits.
 - Run the entire test suite.
   - Fix any failing tests before continuing.
-- Commit the work and update the labels `wl update $1 --add-label "stage:in_review" --json`
+- Commit the work and update the stage `wl update $1 --stage in_review --json`
 
 5. Commit, Push and create PR
 
@@ -111,7 +113,7 @@ Live context commands (use to gather runtime state)
 7. Cleanup
 
 - Only take the following actions after the PR is merged:
-- Close the work item and all its depdents and blockers by running `wl update <work-item-id> --status done --add-label "stage:done" --remove-label "stage:in_review" --json`.
+- Close the work item and all its depdents and blockers by running `wl update <work-item-id> --status done --stage done --json`.
 - Cleanup using the cleanup skill
 
 ## Exit codes & errors

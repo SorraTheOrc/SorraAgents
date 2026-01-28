@@ -10,13 +10,14 @@ You are coordinating an intake brief for a new Worklog work item.
 
 ## Description
 
-You are authoring a new Worklog work item that describes a feature or a bug fix to be implemented. You will ensure that the details in the Worklog work item are sufficient to allow a developer to complete the work. You will follow an interview-driven approach to gather requirements, constraints, success criteria, and related work.
+You are authoring a new Worklog work item that describes a feature or a bug fix to be implemented. You will ensure that the details in the Worklog work item are sufficient to allow a developer to complete the work.
+You will follow an interview-driven approach to gather requirements, constraints, success criteria, and related work.
 
 ## Quick inputs
 
-- $1 may be a <work-item-id> (ids are formatted as '<prefix>-<hash>').
-  - If provided, fetch the work item details using Worklog CLI: `wl show $1 --children --json` and treat the work item description and comments, including the content of any referenced artifacts as authoritative <seed-intent>.
-  - If no work item id is provided, then $ARGUMETNS contains the authoritative <seed-intent>.
+- The supplied <work-item-id> is $1.
+  - If a valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), fetch and use it. If no work-item id is provided or the id is not valid, the command may still proceed: treat `$ARGUMENTS` as the authoritative seed intent and create a new work item as needed. If the user intended to reference an existing work item but provided an invalid id, ask the user to provide one.
+- Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
 
 ## Behavior
 

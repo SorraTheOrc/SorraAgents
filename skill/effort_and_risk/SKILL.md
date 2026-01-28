@@ -12,7 +12,8 @@ Produce a concise, auditable engineering estimate (effort + risk) for a prepared
 
 Gating (mandatory)
 -------------------
-Before doing any work the issue MUST be in the plan_complete stage. If it is not, refuse and output ONLY this single sentence (replace <issue-id> with the actual id):
+
+Before doing any work the issue MUST be in the `plan_complete` stage. If it is not, refuse and output ONLY this single sentence (replace <issue-id> with the actual id):
 
 The issue does not have a sufficiently detailed plan, as shown by it not being in the stage of `plan_complete`. Run the planning command with `/plan <issue-id>`
 
@@ -20,7 +21,7 @@ Do not output any other text when refusing.
 
 When to use
 -----------
-Use this skill only after the Producer has prepared a plan and moved the issue to stage: plan_complete. The plan should contain in-scope/out-of-scope notes, a lightweight WBS (5–12 items) and any known estimates or constraints.
+Use this skill only after the Producer has prepared a plan and set the work item's stage to `plan_complete`. The plan should contain in-scope/out-of-scope notes, a lightweight WBS (5–12 items) and any known estimates or constraints.
 
 Required inputs (what you must prepare before running the scripts)
 ----------------------------------------------------------------

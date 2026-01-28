@@ -11,15 +11,9 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 ## Quick inputs
 
-- The work item id is $1.
-  - If no work item id is provided, ask the user to provide one.
-- Optional additional freeform arguments will be used to guide the plan. Freeform arguments are found in the entire arguments string: "$ARGUMENTS".
-
-## Argument parsing
-
-- Pattern: If the raw input begins with a slash-command token (a leading token that starts with `/`, e.g., `/plan`), strip that token first.
-- The first meaningful token after any leading slash-command is available as `$1` (the first argument). `$ARGUMENTS` contains the full arguments string (everything after the leading command token, if present).
-- This command expects a single work item id as the first argument. Validate that `$1` is present and that `$2` is empty; if not, ask the user to re-run with a single work item id argument.
+- The supplied <work-item-id> is $1.
+  - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
+-- Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
 
 ## Hard requirements
 
@@ -37,7 +31,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 - Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for context.
 - Fetch and read the work item details using Worklog CLI: `wl show <work-item-id> --json` and treat the work item description and any referenced artifacts as authoritative seed intent.
 - Pay particular attention to any PRD referenced in this work item or any of its parent work items.
-- If `wl` is unavailable or the work item cannot be found, fail fast and ask the user to provide a valid work item id or paste the work item content.
+- If `wl` is unavailable or the work item cannot be found, fail fast and ask the user to provide a valid <work-item-id> or paste the work item content.
 - Prepend a short “Seed Context” block to the interview that includes the fetched work item title, type, current labels, and one-line description.
 
 ## Process (must follow)
@@ -45,10 +39,12 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 1. Fetch & summarise (agent responsibility)
 
 - Run `wl show <work-item-id> --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing milestone/plan info.
-- Validate that the work item is ready for planning by inspecting its `stage:*` label:
-  - a `stage:milestones_defined` label then it is ready for planning
-  - a `stage:plan_complete` label then this is a request to review the existing plan. The following steps can be followed, but previous planning work should be considered while working through each step.
-  - any other `stage:*` label indicates that the work item is not currently ready for planning and the user should be asked how to proceed.
+ - Validate that the work item is ready for planning by inspecting its `stage` field:
+  - Run `wl show <work-item-id> --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing milestone/plan info.
+  - Validate readiness by examining the work item's `stage` value:
+   - `milestones_defined` indicates it is ready for planning.
+   - `plan_complete` indicates this is a request to review the existing plan; follow the steps below but consider previous planning work.
+   - any other `stage` value suggests the work item is not currently ready for planning — ask the user how to proceed.
 - Read any PRD linked in the work item or any of its parents to extract key details for later reference.
 - Derive 3–6 keywords from the work item title/description to search the repo and work items for related work. Present any likely duplicates or parent/child relationships.
 
@@ -76,6 +72,7 @@ Keep asking questions until the breakdown into features is clear.
   - **Tasks to create** (at least: implementation, tests, docs; infra/ops if applicable)
 
 - Each of the features should clearly identify how the player experience will be changed by the feature and what acceptance critera are required to validate it.
+ - Each of the features should clearly identify how the user experience will be changed by the feature and what acceptance criteria are required to validate it.
 
 - Present the draft as a numbered list and ask the user to: accept, edit titles/scopes, reorder, or split/merge features.
 - If the user requests changes, iterate until the feature list is approved.
@@ -109,8 +106,8 @@ Keep asking questions until the breakdown into features is clear.
 
 5. Update work items (agent)
 
-- Create child work items for each feature with a parent link to the original work item:
-  - `wl create "<Short Title>" --description "<Full feature description>" --parent <work-item-id> -t feature --priority P2 --labels "stage:idea" --validate` --json
+ - Create child work items for each feature with a parent link to the original work item:
+  - `wl create "<Short Title>" --description "<Full feature description>" --parent <work-item-id> -t feature --priority P2 --stage idea --validate --json`
 - Add optional tasks (only if needed): Infra/Ops, UX, Security review.
 - Create dependency edges between feature work items where the plan specifies dependencies:
   - `wl dep add <DependentFeatureId> <PrereqFeatureId>`
@@ -120,9 +117,9 @@ Keep asking questions until the breakdown into features is clear.
   - Use `wl list --parent <work-item-id> --json` for features, and `wl list --parent <featureWorkItemId> --json` for tasks.
 
 - Add a comment to the planned work item:
-  - `wl comments add wl-42 "Planning Complete. <Summary of the approved feature list, any open questions that remain>" --actor @your-agent-name --json`
-- Update labels on the planned work item:
-  - `wl update $1 --add-label stage:plan_complete --remove-label state:milestons_defined`
+  - `wl comments add $1 "Planning Complete. <Summary of the approved feature list, any open questions that remain>" --actor @your-agent-name --json`
+-- Update the planned work item's stage to indicate planning is complete:
+  - `wl update $1 --stage plan_complete --json`
 
 ## Traceability & idempotence
 
@@ -140,11 +137,16 @@ Keep asking questions until the breakdown into features is clear.
 
 ## Finishing steps (must do)
 
-- On the parent work item remove the label: "Status: Milestones Defined" ` wl update <work-item-id> --remove-label "Status: Milestones Defined" --json`
-- On the parent work item add a Label: "Status: Plan Created" ` wl update <work-item-id> --add-label "Status: Plan Created" --json`
+-- On the parent work item set the work item's stage to `plan_complete`:
+  `wl update <work-item-id> --stage plan_complete --json`
 - Run `wl sync` to sync work item changes.
 - Run `wl show <work-item-id>` (not --json) to show the entire work item.
 - End with: "This completes the Plan process for <work-item-id>".
+  - On the parent work item set the machine-readable `stage` field to `plan_complete`:
+    `wl update <work-item-id> --stage plan_complete --json`
+ - Run `wl sync` to sync work item changes.
+ - Run `wl show <work-item-id>` (without `--json`) to display the entire work item.
+ - End with: "This completes the Plan process for <work-item-id>".
 
 ## Examples
 

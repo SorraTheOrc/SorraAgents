@@ -7,9 +7,9 @@ You are helping create or update a Product Requirements Document (PRD) for an ar
 
 ## Quick inputs
 
-- The work item id is $1.
-  - If no work item id is provided, ask the user to provide one.
-- Optional additional freeform arguments will be used to guide the PRD authoring. Freeform arguments are found in the entire arguments string, after the work item id ($1): "$ARGUMENTS".
+- The supplied <work-item-id> is $1.
+  - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
+- Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
 
 ## Argument parsing
 
@@ -130,8 +130,8 @@ After the user approves the draft PRD, run five review iterations. Each review M
 
 ## Finishing steps (must do)
 
-- Remove the label: "Status: Intake Completed" ` wl update <work-item-id> --remove-label "stage:idea" --json`
-- Add a Label: "Status: PRD Completed" `wl update <work-item-id> --add-label "stage:prd_complete" --json`
+-- Set the work item stage to indicate PRD completion:
+  `wl update <work-item-id> --stage prd_complete --json`
 - Run `wl sync` to sync work item changes.
 - Run `wl show <work-item-id>` (not --json) to show the entire work item.
 - End with: "This completes the PRD process for <work-item-id>".
