@@ -9,7 +9,7 @@ agent: build
 
 You are helping the team decompose a Worklog epic (or other Worklog work item) into **features** and **implementation tasks**.
 
-## Quick inputs
+## Inputs
 
 - The supplied <work-item-id> is $1.
   - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.

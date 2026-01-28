@@ -5,17 +5,12 @@ agent: build
 
 You are helping create or update a Product Requirements Document (PRD) for an arbitrary product, feature, or tool.
 
-## Quick inputs
+## Inputs
 
 - The supplied <work-item-id> is $1.
   - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
 - Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
 
-## Argument parsing
-
-- Pattern: If the raw input begins with a slash-command token (a leading token that starts with `/`, e.g., `/prd`), strip that token first.
-- The first meaningful token after any leading slash-command is available as `$1` (the first argument). `$ARGUMENTS` contains the full arguments string (everything after the leading command token, if present).
-- This command expects a single work item id as the first argument. Validate that `$1` is present and that `$2` is empty; otherwise, ask the user to re-run with a single work item id argument.
 
 ## Hard requirements
 

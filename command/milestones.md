@@ -8,7 +8,7 @@ agent: build
 
 You are helping the team define a clear, actionable milestone plan for work tracked by a Worklog work item.
 
-## Quick inputs
+## Inputs
 
 - The supplied <work-item-id> is $1.
   - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.

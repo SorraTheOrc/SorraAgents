@@ -13,7 +13,7 @@ You are coordinating an intake brief for a new Worklog work item.
 You are authoring a new Worklog work item that describes a feature or a bug fix to be implemented. You will ensure that the details in the Worklog work item are sufficient to allow a developer to complete the work.
 You will follow an interview-driven approach to gather requirements, constraints, success criteria, and related work.
 
-## Quick inputs
+## Inputs
 
 - The supplied <work-item-id> is $1.
   - If a valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), fetch and use it. If no work-item id is provided or the id is not valid, the command may still proceed: treat `$ARGUMENTS` as the authoritative seed intent and create a new work item as needed. If the user intended to reference an existing work item but provided an invalid id, ask the user to provide one.
