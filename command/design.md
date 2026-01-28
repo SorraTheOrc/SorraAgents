@@ -7,11 +7,6 @@ agent: build
 
 You are creating or improving the **design notes** for a single Worklog work item.
 
-## Argument parsing
-
-- Pattern: If the raw input begins with a slash-command token (a leading token that starts with `/`, e.g., `/design`), strip that token first.
-- The first meaningful token after any leading slash-command is available as `$1` (the first argument). `$ARGUMENTS` contains the full arguments string (everything after the leading command token, if present).
-- This command expects a single work item id as the first argument. Validate that `$1` is present and that `$2` is empty; if not, ask the user to re-run with a single work item id argument.
 
 Worklog context (must do):
 

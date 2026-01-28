@@ -5,7 +5,7 @@
 You are implementing a Worklog work item identified by a provided id. You will fully implement this work item and all dependent work required to satisfy its acceptance criteria,
 following project rules and best practices.
 
-## Quick inputs
+## Inputs
 
 - The supplied <work-item-id> is $1.
   - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
