@@ -2,51 +2,106 @@
 
 ## Introduction
 
-This document describes a issue and PRD-driven workflow for building new products and features using a mix of human collaborators (PM / Producer) and agent collaborators (PM, coding, documents, test, shipping). The workflow emphasizes:
+This document describes a issue and PRD-driven workflow for building new products and features using a mix of human collaborators (PM / Producer) and agent collaborators (planning, coding, documents, test, shipping). The workflow emphasizes:
 
-- A single source of truth in the repo (PRDs, issues, code, release notes)
-- Clear handoffs and auditability (who decided what, and why) (see wf-ba2.8)
+- A single source of truth about the intent and steps taken (the Worklog)
+- A single source of truth about the implementation (the code)
+- A clear mapping from intent to implementation (PRD -> Epics -> Features -> Code)
+- Small, vertical slices of end-to-end value delivered frequently
+- A rapid iterative workflow that leverages agentic development and human led feedback loops
+- Clear handoffs and auditability (who decided what, and why)
 - Keeping `main` always releasable via feature flags and quality gates
-
-By default, this workflow is tool-agnostic about the implementation stack (language, framework, test runner). It assumes this repository is the system of record.
 
 ## Prerequisites
 
 You need the following available to follow this workflow end-to-end:
 
-- Repo access with permission to create/edit files.
-- A shared issue tracking mechanism.
-  - In this repo, use `bd` (beads) for issue tracking.
-- An agreed PRD template.
-  - In this repo, use the OpenCode command `/prd` to create an PRD via Agent based interview (stored under `.opencode/command/prd.md`). (see wf-ba2.3)
-- A minimal quality bar for “releasable `main`” (tests/coverage gates, feature-flag policy, and review policy).
+- Repo access with permission to create/edit files, either in a shared repo or in a fork.
+- A shared issue tracking mechanism that is optimized for humans and agents alike (this document assumes Worklog is the tool of choice).
+- Access to the agentic development environment with the necessary permissions and configurations.
+
+## Project Decomposition
+
+It is important to understand that unlike traditional workflows where work is often done in large batches, this workflow emphasizes small, vertical slices of end-to-end value delivered frequently. This approach reduces integration risk, makes progress visible, and allows for rapid feedback and iteration. It assumes an agent driven rapid tune-build-test-deploy cycle, often measured in hours or days rather than weeks or months.
+
+The workflow focuses on clarity where it is needed to enable agents to deliver value autonomously, while keeping forward planning and coordination manageable for human collaborators. The breakdown below is deliberately modeled against traditional software development concepts to make it easier for human collaborators to understand and manage. However, despite how it may look at first glance, this is not a traditional waterfall approach. Instead, it is a flexible framework that allows for rapid iteration and adaptation as new information emerges during development.
+
+The goal is to create a clear mapping from high-level intent (the PRD) to low-level implementation (code) through a series of well-defined steps and artifacts. That allow for ambiguities at the higher, mostly human-led levels to be resolved through rapid iteration and feedback at the lower, mostly agent-led levels.
+
+- A **Project** is the overall initiative, defined by a PRD that captures scope, success metrics, constraints, and risks. A project consistes of one or more milestones.
+- A **Milestone** is a major deliverable within a project. Milestones map to end-to-end user experiences and have cross-functional ownership. A milestone consists of one or more epics.
+- An **Epic** is a large body of work that can be broken down into one or more new features or feature enhancements. Features represents a significant user outcome within a milestone and are often cross-functional.
+- A **Feature** is a discrete unit of user value that can be delivered independently (e.g., a new command, UI screen, or API endpoint). Features consist of one or more tasks and are sometimes cross-functional.
+- A **Task** is a specific task that needs to be completed to deliver a feature (e.g., implementation, testing, documentation). Tasks are the smallest unit of work and are typically assigned to a single individual or agent.
+
+Each of these levels must be clearly documented in the Worklog with appropriate links and references to ensure traceability from project definition to code implementation. Each level should also have clear acceptance criteria to validate completion and success.
+
+The tooling that accompanies this workflow ensures that agents keep copious notes about decisions made, code generated, and tests run. This creates an auditable trail that can be reviewed by human collaborators to ensure alignment with the original intent and, perhaps more importantly, enable agents to rebuild required context quickly when switching between tasks. That is the Worklog becomes the agents "water cooler" where they can pick up context and understand the rationale behind decisions.
 
 ## Steps
 
-The following steps describe the end-to-end workflow for delivering a new feature or product. A product is a collection of features that deliver end-user value. A feature is a discrete unit of user value that can be delivered independently (e.g., a new command, UI screen, or API endpoint). An epic is a collection of related features that deliver a larger user story.
+This section describes the detailed steps of the workflow, from project definition to feature implementation and review. In the earlier steps the emphasis is on high-level planning and clarification with the human being the holder of truth, while later steps focus on detailed implementation and validation, with agents becoming increasingly autonomous.
 
-In summary the workflow is:
+First is a high-level summary of each step, followed by a more detailed breakdown with specific actions and agent commands.
 
-- Define the project: state scope, measurable success metrics, constraints, and top risks.
-- Define Milestone(s): map end-to-end user outcomes, milestones (M0/M1), and cross-functional owners.
-- Decompose each epic into features: for each feature specify acceptance criteria, minimal implementation, and the prototype or experiment to validate assumptions.
-- Implement each milestone/epic as vertical, end-to-end slices: deliver the smallest end-to-end feature (code, tests, infra, docs, observability) per iteration.
+- Record the project idea: create a tracking work-item to capture the project title and basic info; humans simply drop their thoughts into the work-item; mark the status `idea`.
+- Expand the idea into a high-level project overview; humans refine and clarify the idea and its motivations; Agents assist with structure and authoring through an interview process; mark status `intake_complete`.
+- Frame the project with a PRD: capture scope, success signals, constraints, and top risks; Agents assist with authoring through an interview process, humans bring creativity and the domain knowledge; mark status `prd_complete`.
+- Define milestone epics: map end-to-end outcomes, owners, and epic-level acceptance criteria; Agents build the plan with guidance through an interview process, humans bring clarity and the domain knowledge; mark status `milestones_defined`.
+- Decompose each epic into sub-epics and features with acceptance criteria, a minimal plan, and prototype/experiment design where needed; Agents build the plan with validation from human collaborators; mark status `plan_complete`.
+- Implement one feature at a time: Agents write code, tests and documentation with human validation through acceptance testing; move through `in_progress` → `in_review` → `done`.
 
-In more detail, the steps are:
+During execution, work proceeds one feature at a time. During this process new features may be added, removed, or reprioritized based on feedback and learning. This flexible approach allows the team to adapt to changing requirements and ensures that the most valuable work is always being prioritized. When new features are identified they pass through the stages `idea` → `intake_complete` → `plan_complete` before being slotted into the implementation queue. That is they (usually) skip the PRD and milestone definition steps.
 
-### Project/Feature Definition
+The outputs of each of these steps are recorded in the Worklog as linked work-items, creating a clear trace from project definition to code implementation. Each step includes specific agent commands to facilitate the process, ensuring that both human and agent collaborators can work together effectively.
 
-Define the bounding intent for the work: scope, measurable success metrics, constraints, and the top risks. Capture a one-paragraph project summary at the top of the PRD and include:
+Each step also provided a clear "go-no-go" decision point, allowing human collaborators to review and validate the work before proceeding to the next stage. This ensures that the project remains aligned with its original intent and can adapt to new information as it emerges during development.
+
+Each step is described in more detail below. With respect to the useful commands those that start with a `/` are agent commands that can be issued in the agentic development environment, while those that do not are commands to be run in the shell, whether that be by human or agent collaborators.
+
+### Idea Capture
+
+Record the initial feature or project idea in a tracking work-item. This work-item serves as the central hub for all subsequent planning and execution activities. This step is typically initiated by a human collaborator who has identified a new opportunity or requirement. The more details provided at this stage, the easier it will be to refine and expand the idea in subsequent steps. On the other hand, the goal is to lower the barrier to entry, so even a brief note is sufficient to get started.
+
+- **Motivation:** capture the initial thought or requirement that sparked the idea, as quickly as possible.
+- **Acceptance Criteria:** a single work item with idea title and a brief description of the idea.
+- **Status Label:** `idea`
+- **Useful Commands:**
+  - `wl create -t "<Project Title>" -d "<Brief Description>"`
+  - optionally add a parent work-item ID to link to a larger initiative (`--parent <Parent Work-Item ID>`).
+- **Next Step:** If the idea is a project go to the `Project Definition` step; if a smaller feature go to `Feature Intake` step.
+
+### Feature Intake (for small features)
+
+For smaller features that do not require a full PRD, expand the initial idea into a more detailed feature intake work-item. This step captures the motivation, user impact, and high-level requirements for the feature. Agents assist with structuring and authoring the intake through an interview process, while humans provide the creativity and domain knowledge.
+
+- **Motivation:** describe the problem being solved and why it matters to users.
+- **Acceptance Criteria:** work-item contains a clear understanding of the feature's purpose and requirements.
+- **Status Label:** `intake_complete`
+- **Useful Commands:**
+  - `/intake <Work-Item ID>`
+- **Next Step:** proceed to the `Define Milestones` step.
+
+### Project Definition (for larger projects)
+
+Expand the initial idea into a comprehensive Project Requirements Document (PRD). This document captures the scope, success metrics, constraints, and top risks associated with the project. Agents assist with structuring and authoring the PRD through an interview process, while humans provide creativity and domain knowledge.
+
+- **Motivation:** describe the problem being solved and why it matters to users.
+- **Acceptance Criteria:** work-item contains a clear understanding of the feature's purpose and requirements.
+- **Status Label:** `intake_complete`
+- **Useful Commands:**
+  - `/intake <Work-Item ID>`
+- **Next Step:** proceed to the `Define Milestones` step.
 
 - **Success signals:** precise, automatable metrics and baseline measurements to evaluate the outcome.
 - **Constraints:** timeline, budget, compatibility, and regulatory limits that affect tradeoffs.
 - **Top risks:** short list of the highest-impact uncertainties and a proposed first-mitigation.
-- **Status Label:** `idea`, `prd_complete`
+- **Status Label:** `intake_complete`
 
 Agent Commands:
 
-1. Create initial tracking bead: `/intake <Project Title>`
-2. Create PRD via interview: `/prd <Bead ID>`
+1. Create initial tracking work-item: `/intake <Project Title>`
+2. Create PRD via interview: `/prd <work-item ID>`
 
 Summary: a clear, testable project definition that guides epics and prioritization.
 
@@ -61,7 +116,7 @@ Map the end-to-end user outcomes into one or more master epics that represent de
 
 Agent Commands:
 
-1. Decompose the PRD into master epic(s): `/milestones <bead-id>`
+1. Decompose the PRD into master epic(s): `/milestones <work-item-id>`
 
 Summary: master epics turn the project definition into parallel, owned workstreams.
 
@@ -109,7 +164,7 @@ Review each Pull Request for completeness, correctness, and adherence to the PRD
 
 ### Cleanup (Agent Step)
 
-After merging the PR, clean up the repository by closing the bead, removing temporary files, checking out and updating `main`, and deleting local and remote branches.
+After merging the PR, clean up the repository by closing the work-item, removing temporary files, checking out and updating `main`, and deleting local and remote branches.
 
 - **Status Label:** `done`
 

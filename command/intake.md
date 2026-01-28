@@ -6,16 +6,17 @@ tags:
 agent: build
 ---
 
-You are coordinating an intake brief for a new Beads issue.
+You are coordinating an intake brief for a new Worklog work item.
 
 ## Description
 
-You are authoring a new Bead issue that describeds a feature or a bug fix to be implemented. You will ensure that the details in the Bead issue are sufficient to allow a developer to complete the work. You will follow an interview-driven approach to gather requirements, constraints, success criteria, and related work.
+You are authoring a new Worklog work item that describes a feature or a bug fix to be implemented. You will ensure that the details in the Worklog work item are sufficient to allow a developer to complete the work. You will follow an interview-driven approach to gather requirements, constraints, success criteria, and related work.
 
 ## Quick inputs
 
-- The user story is '$ARGUMENTS'.
-- If the user story is empty, you must ask for a user story in the form 'As a <user type> I need <goal> so that <reason>'.
+- $1 may be a <work-item-id> (ids are formatted as '<prefix>-<hash>').
+  - If provided, fetch the work item details using Worklog CLI: `wl show $1 --children --json` and treat the work item description and comments, including the content of any referenced artifacts as authoritative <seed-intent>.
+  - If no work item id is provided, then $ARGUMETNS contains the authoritative <seed-intent>.
 
 ## Behavior
 
@@ -25,116 +26,106 @@ The command implements the procedural workflow below. Each numbered step is part
 
 - Use an interview style: concise, high-signal questions grouped to a soft-maximum of three per iteration.
 - Do not invent requirements or constraints; if unknown, ask the user.
+- Do not ask leading questions that bias the user towards a particular answer.
+- If a response is unclear or ambiguous, ask for clarification rather than guessing or asking a largely similar question.
 - Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or OpenCode ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
-- If the user indicates uncertainty at any point, add clarifying questions rather than guessing.
-- The goal is not to capture an exhaustive spec, but to gather sufficient detail to create a clear Beads issue that will be used to either seed a PRD, update an existing one, or if the work is small and well-defined, be implemented directly from the Beads issue.
+- The goal is not to capture an exhaustive spec, but to gather sufficient detail to create a clear Worklog work item that will be used to either seed a PRD, update an existing one, or if the work is small and well-defined, be implemented directly from the Worklog work item.
 
 ## Process (must follow)
 
 1. Gather context (agent responsibility)
 
-- Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for product context.
-- Derive 2–6 keywords from the user story and early answers to guide repository and Beads searches.
-- Use derived keywords to search source and docs for related artifacts and to surface possible duplicates:
-  - Scan `docs/`, `README.md`, and `src/` (or equivalent top-level code folders).
-  - Use ripgrep (`rg`) where available. If `rg` is unavailable, use a best-effort scan and ask the user to install `rg` for future runs.
-- Search Beads for related issues (`bd list --status open --json | rg -i "<keyword>"`) and `bd ready` when appropriate.
-- Output clearly labelled lists with single line summaries:
-  - "Possible duplicates / related docs" (file paths)
-  - "Related issues" (ids + titles)
+- Derive 2–6 keywords from the <seed-context> and user input to guide repository.
+- Use derived keywords to search work items (`wl list <search> --json`) and the repository for additional context.
 - If any likely duplicates are found:
   - Highlight them to the user and ask if any represent the work to be done.
-- If a likely parent issue is found:
-  - Note it for later use when creating the bead (as a sub-issue).
-- Read each of these related artifacts to extract key details for later reference.
-- If a single existing artifact clearly represents the work, prefer UPDATE over NEW and ask the user to confirm.
+  - If they are confirmed as duplicates ask the user to resolve the duplicate instead of proceeding.
+  - if any are confirmed as a parent/child work item, remember this and, when creating work items, create the appropriate parent/child relationship.
+- Output clearly labelled lists with single line summaries:
+  - "Potentially related docs" (file paths)
+  - "Potentially related work items" (titles followed by ID)
+- Read and summarize each of these related artifacts for later reference.
 
-2. Interview
+2. Work Item prep (agent responsibility)
 
-- In interview iterations (≤ 3 questions each) build a full understanding of the work, offering templates/examples informed by repo context where possible.
+- If a <work-item-id> was provided:
+  - Mark the work item as in progress and at stage idea by running `wl update $1 --stage idea --status in_progress --assignee Map --json`.
+- If no work item id was provided:
+  - Extract a working title from the <seed-intent> (one line).
+  - Create a new Worklog work item using `wl create --stage idea --status in_progress --title "<working-title>" --description "<seed-context>" --type epic --assignee Map --json`
+  - Remember the returned <work-item-id> for later steps.
+
+3. Interview
+
+- In user interview iterations with a soft limit of 3 questions per round, build a full understanding of the work, offering suggested answers and examples informed by repo context where possible.
 - If anything is ambiguous, ask for clarification rather than guessing.
 - Keep asking the user questions until all core information is captured and clarifications are made.
-- Once you feel you are able to do so, write a clear intake brief (including noting any areas that could benefit from further expansion), present it to the user and ask the user to review it and provide feedback.
+  - The goal is not a complete spec but a sufficient understanding to draft a problem definition with user stories, success criteria, and related work.
+- Do not proceed until you have gathered sufficient information to draft an intake brief.
+
+4. Draft intake brief (agent responsibility + user confirmation)
+
+- Write a clear intake brief with at `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` the following sections:
+  - Problem statement: one or two sentences summarizing the problem to be solved.
+  - Users: who will benefit from or use the feature and examples of their user stories.
+  - Success criteria: 3–5 concise, measurable bullets describing how success will be evaluated.
+  - Constraints: any known constraints (technical, business, regulatory) that must be considered.
+  - Existing state: brief summary of the current state of affairs related to the problem.
+  - Desired change: brief summary of the likely changes needed.
+  - Related work: list of related documents or work items with brief descriptions and links/ids.
+- Present the draft brief to the user and ask the user to review it and provide feedback.
 - The user may:
-  - Respond with edits or clarifications, in which case you must incorporate them, and go back to the previous step of drafting the intake brief,
-  - Ask you to continue asking questions, in which case you must continue the interview to gather more information, or
-  - Approve the current draft, in which case you must proceed to the next step.
-
-3. Decide next step (agent + user confirmation)
-
-- Recommend NEW PRD or UPDATE and confirm with the user.
-- If UPDATE: propose the PRD file path to update; if uncertain, ask the user to confirm the path.
-- If NEW: propose a PRD filename under `docs/prd` using the convention `docs/prd/<feature>_PRD.md` and ask the user to confirm.
-
-4. Draft Beads "Key details" (agent responsibility)
-
-- Produce a short, copy-pastable "Key details" draft suitable for the Beads issue description. Use this template:
-  - Problem
-  - Users
-  - Success criteria
-  - Constraints
-  - Existing state (if applicable)
-  - Desired change (if applicable)
-  - Likely duplicates / related docs
-  - Related issues (Beads ids)
-  - Recommended next step (NEW PRD at: <path> OR UPDATE PRD at: <path>)
-
-- Save the draft to a temporary Markdown file at `.opencode/tmp/intake-draft-<title>.md`.
-- Present the draft to the user and ask for any alterations or clarifications. Do not proceed until the user approves the draft or supplies edits.
+  - Respond with edits or clarifications, in which case you must incorporate them, and re-present the updated draft for approval, or
+  - Approve, in which case you must proceed to the next step.
 
 5. Five mini-review stages (agent responsibility; must follow)
 
-After the user approves the Key details draft, run five review iterations. Each review will make any necessary changes to `.opencode/tmp/intake-draft-<title>.md`.
+After the user approves the draft brief, run five review iterations. Each review will make any necessary changes to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
 
-- Each review stage the agent should apply only conservative edits. If a proposed change could alter intent, ask a clarifying question instead of changing content.
+In each review stage apply only conservative edits. If a proposed change could alter intent, ask a clarifying question before making any changes.
 
-- After each stage print a clear "finished" message as follows: "Finished <Stage Name> review: <brief notes of improvements>" or "Finished <Stage Name> review: no changes needed"
+After each stage output: "Finished <review-type> review: <brief notes of changes>" or "Finished <review-type> review: no changes needed"
 
-- The five Intake review mini-prompts (names and intents):
-  1. Completeness review
+- The five Intake review types are:
+  1. Completeness
      - Ensure Problem, Success criteria, Constraints, and Suggested next step are present and actionable. Add missing bullets or concise placeholders when obvious.
-  2. Capture fidelity review
+  2. Capture fidelity
      - Verify the user's answers are accurately and neutrally represented. Shorten or rephrase only for clarity; do not change meaning.
-  3. Related-work & traceability review
-     - Confirm related docs/issues are correctly referenced and that the recommended next step references the correct path/issue ids.
-  4. Risks & assumptions review
-     - Add missing risks, failure modes, and assumptions in short bullets. Do not invent mitigations beyond note-level comments.
-  5. Polish & handoff review
-     - Tighten language for reading speed, ensure copy-paste-ready commands, and produce the final 1–2 sentence summary used as the issue body headline.
+  3. Related-work & traceability
+  - Confirm related docs/work items are correctly referenced and that the recommended next step references the correct path/work item ids.
+  4. Risks & assumptions
+     - Add missing risks and mitigations, failure modes, and assumptions in short bullets. Do not invent mitigations beyond note-level comments.
+  5. Polish & handoff
+  - Tighten language for reading speed, ensure copy-paste-ready commands, and produce the final 1–2 sentence summary used as the work item body headline.
 
 6. Present final artifact for approval (human step)
 
-- After the five reviews, present:
-  - The 1–2 sentence headline summary for the issue
-  - The full key details document in Markdown
-- Ask the user to approve the final artifact or request further changes. Do not create the Beads issue until the user gives explicit approval.
+- After the five reviews, output the content of `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` for the user.
+- Ask the user to approve the final artifact or request further changes.
+- Only proceed to the next step when the user approves the final intake brief.
 
-7. Create or update the Beads issue (must do)
+7. Update the Worklog work item (agent responsibility; must follow)
 
-- When the user approves, create a Beads issue (or update an existing one). The issue must:
-  - Type: `epic` or `feature`
-  - Priority: Prioritise according to your review of related content and your understanding of the work.
-  - Title: the working title
-  - Description: include the full contents of `.opencode/tmp/intake-draft-<title>.md`
-  - Assignee: "Build"
-  - Labels: "stage:idea"
+Update the description of the Worklog work item with the final intake brief from `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` using `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --stage intake_complete --json`.
 
-- If creating a new issue and a parent has been identified, create it as a sub-issue (`--parent <id>`).
-- Add dependencies with `bd dep add` as appropriate.
+Review the new issue in the overall context of the project and consider:
+
+- Adding dependencies with `wl comment add <work-item-id> --comment "Blocks:<blocked-item-id>" --json` and `wl comment add <work-item-id> --comment "Blocked-by:<blocking-item-id>" --json`
+- Adjusting priority to better match the new understanding of scope and impact using `wl update <work-item-id> --priority <level> --json`
 
 8. Closing (must do)
 
-- Run `bd sync` to sync bead changes.
-- Run `bd show <bead-id>` (not --json) to show the entire bead.
-- End with: "This completes the Intake process for <bd-id>".
+- Run `wl sync` to sync work item changes.
+- Run `wl show <work-item-id>` (not --json) to show the entire work item.
+- End with: "This completes the Intake process for <work-item-id>".
 - Remove all temporary files created during the process, including `.opencode/tmp/intake-draft-<title>.md`.
-- Output the new issue id, a 1–2 sentence summary
-- Finish with "This completes the Intake process for <bd-id>"
+- Output the new work item id, a 1–2 sentence summary
+- Finish with "This completes the Intake process for <work-item-id>"
 
 ## Traceability & idempotence
 
-- When the agent updates or creates a Beads issue, it must do so idempotently: running the command again should not create duplicate links or duplicate clarifying-question entries.
+- When the agent updates or creates a Worklog work item, it must do so idempotently: running the command again should not create duplicate links or duplicate clarifying-question entries.
 
 ## Editing rules & safety
 

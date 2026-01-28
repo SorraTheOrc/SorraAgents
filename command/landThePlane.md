@@ -8,7 +8,7 @@ agent: ship
 permission:
   bash:
     "git*": allow
-    "bd*": allow
+    "wl*": allow
 ---
 
 You are guiding the end-of-session wrap-up so that work is fully synced, issues are updated, and no changes are stranded locally.
@@ -16,7 +16,7 @@ You are guiding the end-of-session wrap-up so that work is fully synced, issues 
 ## Argument parsing
 
 - Pattern: If the raw input begins with a slash-command token (a leading token that starts with `/`, e.g., `/landThePlane`), strip that token first.
-- This command expects no arguments; `$ARGUMENTS` may be empty. If the user provides unexpected arguments, ask whether they intended to pass a specific bead id or option, and suggest running the command without arguments if none are required.
+- This command expects no arguments; `$ARGUMENTS` may be empty. If the user provides unexpected arguments, ask whether they intended to pass a specific work item id or option, and suggest running the command without arguments if none are required.
 
 ## Preconditions
 
@@ -25,13 +25,13 @@ You are guiding the end-of-session wrap-up so that work is fully synced, issues 
 
 ## Mandatory workflow
 
-1. **File issues for remaining work** — create beads for any follow-ups or known gaps.
+1. **File issues for remaining work** — create work items for any follow-ups or known gaps.
 2. **Run quality gates** — execute relevant tests/linters/builds if code changed.
-3. **Update issue status** — close finished items; refresh in-progress beads.
+3. **Update issue status** — close finished items; refresh in-progress work items.
 4. **Push to remote** — required once a remote exists:
    ```bash
    git pull --rebase
-   bd sync
+   wl sync
    git push
    git status  # MUST show "up to date with origin"
    ```
