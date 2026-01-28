@@ -3,6 +3,7 @@ description: Define project milestones and create milestone work items
 tags:
   - workflow
   - milestones
+subtask: true
 agent: build
 ---
 
@@ -14,14 +15,22 @@ You are helping the team define a clear, actionable milestone plan for work trac
   - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
 - Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
 
+## Results and Outputs
+
+- A set of Epic work items created for each milestone in a parent project or feature work item ($1).
+- Idempotence: Re-running `/milestones` reuses existing milestone epics and replaces or extends the generated "Milestones" rather than creating duplicates.
+
 ## Hard requirements
 
+- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
 - Be environment-agnostic: do not assume calendar systems, CI schedules, or release cadence unless the user specifies them.
 - Use an interview style: concise, high-signal questions grouped to a soft-maximum of three per iteration.
 - Do not invent commitments (dates, owners) — propose ranges and ask the user to confirm assignments and due dates.
 - Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or any OpenCode ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
 - If the user indicates uncertainty, add clarifying questions rather than guessing.
+
+- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
 
 ## Seed context
 

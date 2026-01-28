@@ -22,3 +22,11 @@ You are authoring a new OpenCode command that implements a specific functionalit
 5. Review the command markdown with the user for feedback and make necessary revisions. Do not proceed until the user approves the draft.
 6. Once approved, finalize the command markdown and place in the `.opencode/commands` directory
 7. Document the command in the README.md file and any other relevant documentation.
+
+
+## Special placeholders supported by OpenCode:
+
+- `$ARGUMENTS` — the full argument string passed to the command.
+- `$1`, `$2`, ... — individual positional arguments.
+- `!`command`` — runs a shell command and injects its stdout into the prompt. Use sparingly and document side effects.
+- `@path/to/file` — includes the contents of a repository file in the prompt.

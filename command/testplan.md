@@ -5,6 +5,7 @@ tags:
   - testplan
   - qa
 agent: probe
+subtask: true
 ---
 
 You are helping the team design a **comprehensive automated test plan** that focuses on **end-user experience** and full feature fidelity. The plan must produce actionable test cases and create them as child work items under the designated test implementation work item.
@@ -14,6 +15,15 @@ You are helping the team design a **comprehensive automated test plan** that foc
 - The supplied <work-item-id> is $1.
   - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
 - Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
+
+## Results and Outputs
+
+- An Test Plan Epic with child items that identify an opportunity for improving test coverage.
+- Idempotence: Existing implemented tests and test-case work items are reused and enhanced rather than duplicated.
+
+## Hard requirements
+
+- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
 
 
 ## Hard requirements
@@ -25,6 +35,8 @@ You are helping the team design a **comprehensive automated test plan** that foc
 - Do not invent requirements, commitments (dates), or owners — propose options and ask the user to confirm.
 - Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or any OpenCode ignore rules.
 - If the user indicates uncertainty, add clarifying questions rather than guessing.
+
+- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
 
 ## Seed context
 
