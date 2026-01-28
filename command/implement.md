@@ -1,18 +1,17 @@
----
-description: Create an intake brief (Workflow step 1)
+  ---
+  description: Implement a Worklog work item
 tags:
   - workflow
-  - intake
+  - implement
 agent: patch
 subtask: true
 ---
 
-# implement
+# Implement
 
 ## Description
 
-You are implementing a Worklog work item identified by a provided id. You will fully implement this work item and all dependent work required to satisfy its acceptance criteria,
-following project rules and best practices.
+You are implementing a Worklog work item identified by a provided id. You will fully implement this work item and all dependent work required to satisfy its acceptance criteria, following project rules and best practices.
 
 ## Inputs
 
