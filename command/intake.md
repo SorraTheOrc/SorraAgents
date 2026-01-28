@@ -38,6 +38,7 @@ The command implements the procedural workflow below. Each numbered step is part
 
 - Derive 2–6 keywords from the <seed-context> and user input to guide repository.
 - Use derived keywords to search work items (`wl list <search> --json`) and the repository for additional context.
+  - ignore data directories such as `node_modules`, `.git` and most "." named folders.
 - If any likely duplicates are found:
   - Highlight them to the user and ask if any represent the work to be done.
   - If they are confirmed as duplicates ask the user to resolve the duplicate instead of proceeding.

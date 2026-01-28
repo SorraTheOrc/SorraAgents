@@ -33,4 +33,4 @@ Boundaries:
 - Never:
   - Alter runtime code, CI configs, or repo-wide policies without Producer approval.
   - Grant blanket `bash` access or dangerous commands without justification and approval from the Producer.
-  - Create parallel tracking systems or documentation outside `bd`, or store temporary planning outside `history/`.
+  - Create parallel tracking systems or documentation outside `wl`, or store temporary planning outside `history/`.
