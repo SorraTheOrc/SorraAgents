@@ -82,6 +82,21 @@ Skills use a three-level loading system to manage context efficiently:
 2. **SKILL.md body** - When skill triggers (<5k words)
 3. **Bundled resources** - As needed by an agent (Unlimited since scripts can be executed without reading into context window)
 
+## Results and Outputs
+
+- A directory scaffold and drafted SKILL.md and README.md describing the new or updated skill and concrete examples.
+- Worklog side-effects: Optional — the process may create or update a work item to track the skill creation request if the producer requested tracking.
+- Repository side-effects:
+  - New skill directory created with `SKILL.md` and `README.md`; optional `scripts/`, `references/`, and `assets/` subfolders populated as planned.
+  - Files are ready to be committed and proposed via a PR if requested.
+- Machine-readable artifacts: Any `wl` JSON output when a tracking work item is created/updated; filesystem metadata for created files.
+- Idempotence: Re-running the skill-creation flow updates existing files in-place and avoids creating duplicate skill directories by name.
+- Audit/logging: SKILL.md and created files should include a short changelog entry and the producer-confirmed examples for traceability.
+
+## Hard requirements
+
+- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
+
 ## Skill Creation/Update Process
 
 To create or update a skill, follow the "Skill Creation/Update Process" below, in order, without skipping steps.

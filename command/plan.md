@@ -5,6 +5,7 @@ tags:
   - plan
   - decomposition
 agent: build
+subtask: true
 ---
 
 You are helping the team decompose a Worklog epic (or other Worklog work item) into **features** and **implementation tasks**.
@@ -14,6 +15,11 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 - The supplied <work-item-id> is $1.
   - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
 -- Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
+
+## Results and Outputs
+
+- The parent work item ($1) or each of the milestone epics below it are decomposed into child work items.
+- Idempotence: The command reuses existing child work items and updates or augments previously generated task work-items instead of creating duplicates.
 
 ## Hard requirements
 
@@ -25,6 +31,12 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 - Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or any OpenCode ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
 - If the user indicates uncertainty, add clarifying questions rather than guessing.
+
+- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
+
+## Note
+
+- This Hard requirements section is populated with the mandatory progression rule above; review the rest of the hard requirements for task-specific constraints.
 
 ## Seed context
 
@@ -44,7 +56,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
   - Validate readiness by examining the work item's `stage` value:
    - `milestones_defined` indicates it is ready for planning.
    - `plan_complete` indicates this is a request to review the existing plan; follow the steps below but consider previous planning work.
-   - any other `stage` value suggests the work item is not currently ready for planning — ask the user how to proceed.
+   - any other `stage` value suggests the work item is not currently ready for planning — ask the user how to proceed indicating that if the work item is small enough it is OK to proceed.
 - Read any PRD linked in the work item or any of its parents to extract key details for later reference.
 - Derive 3–6 keywords from the work item title/description to search the repo and work items for related work. Present any likely duplicates or parent/child relationships.
 

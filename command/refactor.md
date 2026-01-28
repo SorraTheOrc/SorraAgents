@@ -18,6 +18,15 @@ Use `$ARGUMENTS` to specify the target code or module for refactoring. If no tar
 
 You will not edit any files during the assessment. Instead you will try to identify opportunities for improvements that improve code quality and maintainability but ensures that existing behavior remains identical. If unsure, do not record the proposed change.
 
+## Results and Outputs
+
+- An Epic with children that each represent a specific refactoring opportunity
+- Idempotence: When re-run, the command detects previously created refactor items and avoids creating duplicates; it may update descriptions instead.
+
+## Hard requirements
+
+- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
+
 This command will create zero or more Worklog work items at the root of the project, each describing a specific refactoring opportunity.
 
 ## Refactoring Protocol

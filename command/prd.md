@@ -1,6 +1,7 @@
 ---
 description: Create or edit a PRD through interview
 agent: build
+subtask: true
 ---
 
 You are helping create or update a Product Requirements Document (PRD) for an arbitrary product, feature, or tool.
@@ -11,6 +12,15 @@ You are helping create or update a Product Requirements Document (PRD) for an ar
   - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
 - Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
 
+## Results and Outputs
+
+- PRD written to the work item $1.
+- Idempotence: Running this command again updates the PRD in the work item description, rather than creating duplicate work items or PRDs
+
+## Hard requirements
+
+- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
+
 
 ## Hard requirements
 
@@ -20,6 +30,8 @@ You are helping create or update a Product Requirements Document (PRD) for an ar
 - Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or any OpenCode ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
 - If the user indicates uncertainty at any point, add clarifying questions rather than guessing.
+
+- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
 
 ## Behavior
 

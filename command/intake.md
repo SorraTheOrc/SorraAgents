@@ -19,6 +19,12 @@ You will follow an interview-driven approach to gather requirements, constraints
   - If a valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), fetch and use it. If no work-item id is provided or the id is not valid, the command may still proceed: treat `$ARGUMENTS` as the authoritative seed intent and create a new work item as needed. If the user intended to reference an existing work item but provided an invalid id, ask the user to provide one.
 - Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
 
+## Results and Outputs
+
+- A 1–2 sentence headline summary of the intake brief.
+- Final intake brief text and the new or updated work item $1.
+- Idempotence: Rerunning `/intake` reuses existing work items when they are considered to be the same item.
+
 ## Behavior
 
 The command implements the procedural workflow below. Each numbered step is part of the canonical execution path; substeps describe concrete checks or commands that implementors or automation should run.
@@ -32,6 +38,12 @@ The command implements the procedural workflow below. Each numbered step is part
 - Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or OpenCode ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
 - The goal is not to capture an exhaustive spec, but to gather sufficient detail to create a clear Worklog work item that will be used to either seed a PRD, update an existing one, or if the work is small and well-defined, be implemented directly from the Worklog work item.
+
+- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
+
+## Note
+
+- This Hard requirements section is populated with the mandatory progression rule above; review the rest of the hard requirements for task-specific constraints.
 
 ## Process (must follow)
 
@@ -116,13 +128,14 @@ Review the new issue in the overall context of the project and consider:
 - Adding dependencies with `wl comment add <work-item-id> --comment "Blocks:<blocked-item-id>" --json` and `wl comment add <work-item-id> --comment "Blocked-by:<blocking-item-id>" --json`
 - Adjusting priority to better match the new understanding of scope and impact using `wl update <work-item-id> --priority <level> --json`
 
-8. Closing (must do)
+8. Finishing (must do)
 
+- DO NOT close the issue
 - Run `wl sync` to sync work item changes.
 - Run `wl show <work-item-id>` (not --json) to show the entire work item.
 - End with: "This completes the Intake process for <work-item-id>".
 - Remove all temporary files created during the process, including `.opencode/tmp/intake-draft-<title>.md`.
-- Output the new work item id, a 1–2 sentence summary
+- Output the new work item id, a 1–2 sentence summary headline
 - Finish with "This completes the Intake process for <work-item-id>"
 
 ## Traceability & idempotence

@@ -5,6 +5,7 @@ tags:
   - docs
   - documentation
 agent: scribbler
+subtask: true
 ---
 
 You are creating and/or improving **documentation** for a single feature detailed in a Worklog work item.
@@ -52,6 +53,16 @@ Temp draft requirement (must do)
   - Draft content blocks (ready to paste into final docs)
   - Open Questions
 - Do not delete the temp file automatically. It is useful during implementation when docs are revised by later workflow commands.
+
+## Results and Outputs
+
+- A set of created/updated documentation files.
+- A short headline summarising what was documented.
+- Idempotence: Existing docs pages are edited in-place when possible; reruns reuse existing pages and update content instead of creating new, significantly duplicating content.
+
+## Hard requirements
+
+- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
 
 Seed context
 
