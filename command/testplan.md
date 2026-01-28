@@ -11,16 +11,9 @@ You are helping the team design a **comprehensive automated test plan** that foc
 
 ## Quick inputs
 
-- The user should run this as `/tstplan <work-item-id>`.
-  - Use $1 as the initial Worklog ID (first argument).
-  - $ARGUMENTS contains all arguments passed to the command.
-  - This ID will be either the ID of a **Docs:** task or the ID of its parent feature. You will need both IDs, so fetch the parent/child as needed.
-- No other options/arguments are supported.
-  - If $1 is empty/undefined, ask for the missing id and stop.
-  - If additional arguments are provided (e.g. `$2` exists), ask the user to re-run with exactly one argument and stop.
-- This work item ID corresponds to either the feature to be tested, or it is the test implementation work item itself, which will be a child of the feature work item.
-- You will need both the feature work item and the test implementation work item. If you cannot identify both then report this to the user and ask them to confirm they have run the `/plan` command first.
-- If $1 is empty, print: "I cannot parse the work item id from your input '$ARGUMENTS'" and ask the user for a valid work item id in your first interview question.
+- The supplied <work-item-id> is $1.
+  - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
+- Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
 
 ## Argument parsing
 
@@ -132,7 +125,8 @@ After draft approval, run five review iterations. Each review MUST provide a new
 
 ## Finishing steps (must do)
 
-- Add label to the test implementation work item: `wl update <testWorkItemId> --add-label "Status: Test Plan Created" --json` (leave existing labels intact).
+- Set the test implementation work item's stage to indicate the test plan was created:
+  `wl update <testWorkItemId> --stage test_plan_created --json` (leave other fields intact).
 - Run `wl sync` to sync work item changes.
 - Run `wl show <testWorkItemId>` (not --json) to show the entire work item.
 - End with: "This completes the Test Plan process for <testWorkItemId>".

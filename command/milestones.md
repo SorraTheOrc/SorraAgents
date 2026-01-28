@@ -10,9 +10,9 @@ You are helping the team define a clear, actionable milestone plan for work trac
 
 ## Quick inputs
 
-- The work item id is $1.
-  - If no work item id is provided, ask the user to provide one.
-- Optional additional freeform arguments will be used to guide the milestone planning. Freeform arguments are found in the entire arguments string: "$ARGUMENTS".
+- The supplied <work-item-id> is $1.
+  - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
+- Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
 
 ## Hard requirements
 
@@ -117,8 +117,8 @@ After the user approves the milestone list, run five review iterations. Each rev
 
 ## Finishing steps (must do)
 
-- On the parent work item remove the label: "Status: PRD Completed" ` wl update <work-item-id> --remove-label "stage:prd_complete" --json`
-- On the parent work item add a Label: "Status: Milestones Defined" ` wl update <work-item-id> --add-label "stage:milestones_defined" --json`
+-- On the parent work item clear the previous stage and set the new stage using the stage flag:
+  `wl update <work-item-id> --stage milestones_defined --json`
 - If child work items were created, print their ids and add a short changelog entry to the parent work item.
 - Run `wl sync` to sync work item changes.
 - Run `wl show <parentWorkItemId>` (not --json) to show the entire work item.

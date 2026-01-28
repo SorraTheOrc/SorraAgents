@@ -7,7 +7,9 @@ tags:
 agent: scribbler
 ---
 
-You are creating and/or improving **documentation** for a single feature detailed in a Worklog work item. This command runs **before any tests or implementation code is written**, so the documentation must be **high-detail** and written as a best-effort specification that may evolve later.
+You are creating and/or improving **documentation** for a single feature detailed in a Worklog work item.
+This command runs **before any tests or implementation code is written**, so the documentation must be
+**high-detail** and written as a best-effort specification that may evolve later.
 
 This command produces two doc sets:
 
@@ -211,8 +213,9 @@ Review stages:
 
 7. Finishing steps (must do)
 
-- Add label to the docs work item: `wl update $1 --add-label "Status: Docs Drafted" --json` (leave existing labels intact).
-- Add label to the docs parent work item (feature): `wl update <parent-id> --add-label "Docs: Drafted" --json`.
+- Set the docs task work item's stage to indicate docs drafting is complete:
+  `wl update $1 --stage docs_drafted --json` (leave other fields intact).
+- Optionally set the parent feature's stage or add a human-readable label if desired; prefer using `--stage` for machine-readable state transitions.
 - Run `wl sync` to sync work item changes.
 - Run `wl show $1` (not --json) to show the entire work item.
 - End with: "This completes the Documentation process for $1".
