@@ -32,5 +32,5 @@ Boundaries:
   - Requesting additional tooling or large asset libraries.
 - Never:
   - Edit code or run destructive commands.
-  - Create alternate tracking docs outside `bd` or stash temporary planning outside `history/`.
+  - Create alternate tracking docs outside `wl` or stash temporary planning outside `history/`.
   - Approve implementation trade-offs without Producer confirmation or coordination with `@patch`/`@probe`.

@@ -26,8 +26,8 @@ Output: NDJSON lines: {
   "last_commit_date": "...",
   "unpushed_commits": N,
   "upstream": "...",
-  "bead_token": "...",
-  "bead_id": "..."
+  "work_item_token": "...",
+  "work_item_id": "..."
 }
 EOF
 }
@@ -60,8 +60,8 @@ detect_default() {
   echo "$DEFAULT_FALLBACK"
 }
 
-# parse bead token like bd-123 or bd123
-parse_bead() {
+# parse work item token like wl-123 or wl123
+parse_work_item() {
   local bname="$1"
   # prefer prefix-number (letters then dash then digits)
   if [[ "$bname" =~ ([A-Za-z]+-[0-9]+) ]]; then
@@ -73,7 +73,7 @@ parse_bead() {
     echo "$token" ""
     return
   fi
-  # fallback: letters+digits (bd123)
+  # fallback: letters+digits (wl123)
   if [[ "$bname" =~ ([A-Za-z]+[0-9]+) ]]; then
     token="${BASH_REMATCH[1]}"
     if [[ "$token" =~ ([A-Za-z]+)([0-9]+)$ ]]; then
@@ -168,15 +168,15 @@ git for-each-ref --format='%(refname:short)' refs/heads/ | while IFS= read -r br
     fi
   fi
 
-  bead_token=""; bead_id=""
-  read -r bead_token bead_id < <(parse_bead "$branch")
+  work_item_token=""; work_item_id=""
+  read -r work_item_token work_item_id < <(parse_work_item "$branch")
 
   b_escaped=$(escape_json "$branch")
   u_escaped=$(escape_json "$upstream")
   lt_escaped=$(escape_json "$last_sha")
   ld_escaped=$(escape_json "$last_date")
-  bt_escaped=$(escape_json "$bead_token")
-  bid_escaped=$(escape_json "$bead_id")
+  bt_escaped=$(escape_json "$work_item_token")
+  bid_escaped=$(escape_json "$work_item_id")
 
   printf '{'
   printf '"branch":"%s",' "$b_escaped"
@@ -188,8 +188,8 @@ git for-each-ref --format='%(refname:short)' refs/heads/ | while IFS= read -r br
   printf '"last_commit_date":"%s",' "$ld_escaped"
   printf '"unpushed_commits":%s,' "$unpushed"
   printf '"upstream":"%s",' "$u_escaped"
-  printf '"bead_token":"%s",' "$bt_escaped"
-  printf '"bead_id":"%s"' "$bid_escaped"
+  printf '"work_item_token":"%s",' "$bt_escaped"
+  printf '"work_item_id":"%s"' "$bid_escaped"
   printf '}\n'
 
 done
