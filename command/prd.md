@@ -7,15 +7,15 @@ You are helping create or update a Product Requirements Document (PRD) for an ar
 
 ## Quick inputs
 
-- The beads issue id is $1.
-  - If no bead id is provided, ask the user to provide one.
-- Optional additional freeform arguments will be used to guide the PRD authoring. Freeform arguments are found in the entire arguments string, after the bead id ($1): "$ARGUMENTS".
+- The work item id is $1.
+  - If no work item id is provided, ask the user to provide one.
+- Optional additional freeform arguments will be used to guide the PRD authoring. Freeform arguments are found in the entire arguments string, after the work item id ($1): "$ARGUMENTS".
 
 ## Argument parsing
 
 - Pattern: If the raw input begins with a slash-command token (a leading token that starts with `/`, e.g., `/prd`), strip that token first.
 - The first meaningful token after any leading slash-command is available as `$1` (the first argument). `$ARGUMENTS` contains the full arguments string (everything after the leading command token, if present).
-- This command expects a single beads id as the first argument. Validate that `$1` is present and that `$2` is empty; otherwise, ask the user to re-run with a single bead id argument.
+- This command expects a single work item id as the first argument. Validate that `$1` is present and that `$2` is empty; otherwise, ask the user to re-run with a single work item id argument.
 
 ## Hard requirements
 
@@ -36,12 +36,12 @@ When a step is gated by user approval, do not proceed until the user approves th
 
 0. Gather context (agent responsibility)
 
-- Mark the bead as in progress using `bd update <bead-id> --status in_progress --json`
+- Mark the work item as in progress using `wl update <work-item-id> --status in_progress --json`
 - Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for product context.
-- Fetch and read the issue details using beads CLI: `bd show <issueId> --json`.
-- Fetch and read any documents or beads referenced in the issue external references.
-- If a PRD already exisgts at the path indicated in the bead then assume we are updating an existing PRD.
-- If `bd` is unavailable or the issue cannot be found, fail fast and ask the user to provide a valid issue id or paste the issue content.
+- Fetch and read the work item details using Worklog CLI: `wl show <work-item-id> --json`.
+- Fetch and read any documents or work items referenced in the work item external references.
+- If a PRD already exists at the path indicated in the work item then assume we are updating an existing PRD.
+- If `wl` is unavailable or the work item cannot be found, fail fast and ask the user to provide a valid work item id or paste the work item content.
 - Prepend a short “Seed Context” block to the interview that includes the fetched details and treat it as authoritative initial intent while still asking clarifying questions.
 
 1. Interview
@@ -53,7 +53,7 @@ When a step is gated by user approval, do not proceed until the user approves th
 
 3. Draft PRD
 
-- Store the draft PRD at `docs/prd/PRD_<bead_title>_(<bead_id>).md`
+- Store the draft PRD at `docs/prd/PRD_<work_item_title>_(<work_item_id>).md`
 - Present the draft to the user and ask the user to review it and provide feedback.
 - The user may:
   - Respond with edits or clarifications, in which case you must incorporate them, and go back to the previous step of drafting the intake brief,
@@ -108,8 +108,8 @@ After the user approves the draft PRD, run five review iterations. Each review M
 6. Finalizing the PRD
 
 - Save the final PRD markdown to the appropriate path:
-- Record a the existince of the PRD in the beads issue by adding a comment: "The PRD has been created/updated at: <path>" and linking to the file using an external reference.
-- run `bd sync` to sync bead changes.
+- Record a the existince of the PRD in the Worklog work item by adding a comment: "The PRD has been created/updated at: <path>" and linking to the file using an external reference.
+- run `wl sync` to sync work item changes.
 - Raise a PR in the repo with the new/updated PRD file
 - Ask the user to review the PR and merge it when ready.
 - Monior the PR until it is merged, providing updates to the user as needed.
@@ -118,8 +118,8 @@ After the user approves the draft PRD, run five review iterations. Each review M
 
 - After the PR is merged, ask the user whether they would like to cleanup the repository and move back to main branch (recommended).
   - If the user agrees, run the cleanup command: `/cleanup`
-- Once cleanup is complete tell the user: "The next step is to decompose the PRD into master epics using the command: `/milestones <bead-id>`" and offer to run it for them.
-  - If the user agrees, run the command with the same bead id used to create/update the PRD.
+- Once cleanup is complete tell the user: "The next step is to decompose the PRD into master epics using the command: `/milestones <work-item-id>`" and offer to run it for them.
+  - If the user agrees, run the command with the same work item id used to create/update the PRD.
 
 ## Editing rules (when updating an existing PRD)
 
@@ -130,11 +130,11 @@ After the user approves the draft PRD, run five review iterations. Each review M
 
 ## Finishing steps (must do)
 
-- Remove the label: "Status: Intake Completed" ` bd update <bead-id> --remove-label "stage:idea" --json`
-- Add a Label: "Status: PRD Completed" `bd update <bead-id> --add-label "stage:prd_complete" --json`
-- Run `bs sync` to sync bead changes.
-- Run `bd show <bead-id>` (not --json) to show the entire bead.
-- End with: "This completes the PRD process for <bd-id>".
+- Remove the label: "Status: Intake Completed" ` wl update <work-item-id> --remove-label "stage:idea" --json`
+- Add a Label: "Status: PRD Completed" `wl update <work-item-id> --add-label "stage:prd_complete" --json`
+- Run `wl sync` to sync work item changes.
+- Run `wl show <work-item-id>` (not --json) to show the entire work item.
+- End with: "This completes the PRD process for <work-item-id>".
 
 ## PRD outline (use headings exactly):
 

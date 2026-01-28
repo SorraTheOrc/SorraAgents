@@ -1,5 +1,5 @@
 ---
-description: Create or improve developer + user documentation for a beads issue
+description: Create or improve developer + user documentation for a Worklog work item
 tags:
   - workflow
   - docs
@@ -7,7 +7,7 @@ tags:
 agent: scribbler
 ---
 
-You are creating and/or improving **documentation** for a single feature detailed in a Beads issue. This command runs **before any tests or implementation code is written**, so the documentation must be **high-detail** and written as a best-effort specification that may evolve later.
+You are creating and/or improving **documentation** for a single feature detailed in a Worklog work item. This command runs **before any tests or implementation code is written**, so the documentation must be **high-detail** and written as a best-effort specification that may evolve later.
 
 This command produces two doc sets:
 
@@ -20,12 +20,12 @@ Where possible, update and improve existing documentation rather than creating n
 
 - Pattern: If the raw input begins with a slash-command token (a leading token that starts with `/`, e.g., `/doc`), strip that token first.
 - The first meaningful token after any leading slash-command is available as `$1` (the first argument). `$ARGUMENTS` contains the full arguments string (everything after the leading command token, if present).
-- This command expects a single beads id as the first argument. Validate that `$1` is present and that `$2` is empty; if not, ask the user to re-run with a single bead id argument.
+- This command expects a single work item id as the first argument. Validate that `$1` is present and that `$2` is empty; if not, ask the user to re-run with a single work item id argument.
 
-Beads context (must do):
+Worklog context (must do):
 
-- Mark the **Docs:** task as in-progress `bd update <docs-id> --status in_progress`
-- Fetch the issue details using beads CLI: `bd show <parent-id> --json`.
+- Mark the **Docs:** task as in-progress `wl update <docs-id> --status in_progress`
+- Fetch the work item details using Worklog CLI: `wl show <parent-id> --json`.
 - Treat `title`, `description`, `acceptance` (if present), and any linked artifacts as authoritative seed intent.
 
 Hard requirements
@@ -59,18 +59,18 @@ Temp draft requirement (must do)
 Seed context
 
 - Read `docs/` (including `docs/dev`), `README.md`, and other high-level files for product context.
-- Fetch and read the issue details using `bd show $1 --json`.
-- If the issue is a **Docs:** task, locate its parent (feature) and its PRD/design/plan and treat those as additional authoritative context.
+- Fetch and read the work item details using `wl show $1 --json`.
+- If the work item is a **Docs:** task, locate its parent (feature) and its PRD/design/plan and treat those as additional authoritative context.
 - Start the command by presenting a short “Seed Context” block:
-  - Issue title
-  - Issue type
+  - Work item title
+  - Work item type
   - One-line description
   - Acceptance criteria summary (if present)
   - Linked references discovered (PRD/design/plan/doc files)
 
 Process (must follow)
 
-1) Inventory the doc set (agent responsibility)
+1. Inventory the doc set (agent responsibility)
 
 - Identify the **target readers** and doc types required:
   - **User docs**: how to install/setup (if applicable), intended purpose within the product, how to use, examples, limitations, common errors.
@@ -82,9 +82,9 @@ Process (must follow)
   - `docs/…` (user)
   - `docs/dev/…` (developer)
 
-2) Interview (only as needed)
+2. Interview (only as needed)
 
-Ask questions only if the issue/PRD does not fully specify what must be documented. Focus on:
+Ask questions only if the work item/PRD does not fully specify what must be documented. Focus on:
 
 - Primary user journeys (happy path) and the most important edge cases.
 - Inputs/outputs, user-visible state changes, and error messages.
@@ -94,7 +94,7 @@ Ask questions only if the issue/PRD does not fully specify what must be document
 
 Keep asking until the documentation is actionable.
 
-3) Draft the documentation (agent responsibility)
+3. Draft the documentation (agent responsibility)
 
 - Write the new/updated documentation content in the temp draft file first.
 - The docs must read as if they are the best specification available right now.
@@ -158,7 +158,7 @@ Use this outline when creating a new developer-facing doc page:
 
 ## Open Questions
 
-4) User review (must do)
+4. User review (must do)
 
 - Present the proposed file list and draft content blocks to the user for review.
 - For each file, show:
@@ -168,7 +168,7 @@ Use this outline when creating a new developer-facing doc page:
 - Ask for feedback and requested changes.
 - Iterate drafting and review until the user approves all changes.
 
-5) Automated review stages (must follow; no human intervention required)
+5. Automated review stages (must follow; no human intervention required)
 
 Once the user approves the draft, run four review iterations (see below). Each review MAY make changes to the draft and MUST output exactly:
 
@@ -183,7 +183,7 @@ Review stages:
         - Ensure dev docs answer: how it works, extension points, troubleshooting, testing notes.
 
     ii) Consistency review
-        - Ensure terminology matches the issue/PRD.
+      - Ensure terminology matches the work item/PRD.
         - Ensure user and dev docs do not contradict each other.
         - Ensure any assumptions are clearly labeled.
 
@@ -195,28 +195,28 @@ Review stages:
         - Fix headings, formatting, code fences.
         - Keep formatting consistent with existing docs.
 
-5) Apply docs changes to the repo (agent responsibility)
+5. Apply docs changes to the repo (agent responsibility)
 
 - Create new docs/update existing docs.
 - Ensure all docs in the repo cross-link appropriately (from user doc to user doc and from developer doc to user doc or developer doc).
 - If there is an obvious existing index page in `docs/` and/or `docs/dev/`, add a link to the new page.
 
-6) Write back to the bead (agent responsibility)
+6. Write back to the work item (agent responsibility)
 
-- Update the docs task bead (`$1`) description by adding or updating a well-marked block titled "Documentation" with:
+- Update the docs task work item (`$1`) description by adding or updating a well-marked block titled "Documentation" with:
   - The list of updated/created files
   - What each file contains
   - Open Questions
   - A small changelog with timestamps
 
-7) Finishing steps (must do)
+7. Finishing steps (must do)
 
-- Add label to the docs bead: `bd update $1 --add-label "Status: Docs Drafted" --json` (leave existing labels intact).
-- Add label to the docs parent bead (feature): `bd update <parent-id> --add-label "Docs: Drafted" --json`.
-- Run `bd sync` to sync bead changes.
-- Run `bd show $1` (not --json) to show the entire bead.
+- Add label to the docs work item: `wl update $1 --add-label "Status: Docs Drafted" --json` (leave existing labels intact).
+- Add label to the docs parent work item (feature): `wl update <parent-id> --add-label "Docs: Drafted" --json`.
+- Run `wl sync` to sync work item changes.
+- Run `wl show $1` (not --json) to show the entire work item.
 - End with: "This completes the Documentation process for $1".
 
 Notes
 
-- Do not introduce new features in the docs that are not in the issue/PRD.
+- Do not introduce new features in the docs that are not in the work item/PRD.

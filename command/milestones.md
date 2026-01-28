@@ -1,17 +1,17 @@
 ---
-description: Define project milestones and create milestone beads
+description: Define project milestones and create milestone work items
 tags:
   - workflow
   - milestones
 agent: build
 ---
 
-You are helping the team define a clear, actionable milestone plan for work tracked by a Beads issue.
+You are helping the team define a clear, actionable milestone plan for work tracked by a Worklog work item.
 
 ## Quick inputs
 
-- The beads issue id is $1.
-  - If no bead id is provided, ask the user to provide one.
+- The work item id is $1.
+  - If no work item id is provided, ask the user to provide one.
 - Optional additional freeform arguments will be used to guide the milestone planning. Freeform arguments are found in the entire arguments string: "$ARGUMENTS".
 
 ## Hard requirements
@@ -26,17 +26,17 @@ You are helping the team define a clear, actionable milestone plan for work trac
 ## Seed context
 
 - Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for context to help estimate scope.
-- Fetch and read the bead details using beads CLI: `bd show $1 --json` and treat the bead description and any referenced artifacts as authoritative seed intent.
-- Read any documents or beads referenced in the bead description, comments or external references.
-- If `bd` is unavailable or the issue cannot be found, fail fast and ask the user to provide a valid bead id or paste the bead content.
-- Prepend a short “Seed Context” block to the interview that includes the fetched bead title, type, current labels, and one-line description.
+- Fetch and read the work item details using Worklog CLI: `wl show $1 --json` and treat the work item description and any referenced artifacts as authoritative seed intent.
+- Read any documents or work items referenced in the work item description, comments or external references.
+- If `wl` is unavailable or the work item cannot be found, fail fast and ask the user to provide a valid work item id or paste the work item content.
+- Prepend a short “Seed Context” block to the interview that includes the fetched work item title, type, current labels, and one-line description.
 
 ## Process (must follow)
 
 1. Fetch & summarise (agent responsibility)
 
-- Run `bd show $1 --json` and summarise the bead in one paragraph: title, type (epic/feature/task), headline, and any existing milestone/roadmap info.
-- Derive 3–6 keywords from the bead title/description to search the repo and beads for related work. Present any likely duplicates or parent/child relationships.
+- Run `wl show $1 --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing milestone/roadmap info.
+- Derive 3–6 keywords from the work item title/description to search the repo and work items for related work. Present any likely duplicates or parent/child relationships.
 
 2. Interview
 
@@ -86,27 +86,27 @@ After the user approves the milestone list, run five review iterations. Each rev
   - Actions: Flag milestones that are too broad/vague or duplicate scope. Suggest split/merge candidates as Open Questions (do not apply automatically unless the user already approved that restructuring).
   4. Traceability & idempotence review
   - Purpose: Ensure the plan supports safe re-runs of the command.
-  - Actions: Confirm milestone titles are canonical (stable, ≤ 7 words) and suitable for child bead creation; ensure the plan does not imply duplicate bead creation on reruns.
+  - Actions: Confirm milestone titles are canonical (stable, ≤ 7 words) and suitable for child work item creation; ensure the plan does not imply duplicate work item creation on reruns.
   5. Polish & handoff review
   - Purpose: Make the milestone plan copy-pasteable and easy to execute.
   - Actions: Tighten wording for clarity, standardize bullets.
 
-5. Create beads (agent)
+5. Create work items (agent)
 
-- Create child beads (type: epic) for each milestone with a parent link to the original bead:
-  - `bd create "<Short Title>" --description "Description>" --parent $1 -t epic --json --labels "milestone" --priority P1 --assignee Build --validate`
+- Create child work items (type: epic) for each milestone with a parent link to the original work item:
+  - `wl create "<Short Title>" --description "Description>" --parent $1 -t epic --json --labels "milestone" --priority P1 --assignee Build --validate`
 
-  Note: milestone epics are assigned to Build by default per repository conventions. If a different owner is requested, update the bead after creation with `bd update`.
+  Note: milestone epics are assigned to Build by default per repository conventions. If a different owner is requested, update the work item after creation with `wl update`.
 
 - Creating blocking relationship between each milestone as appropriate, this will be a "chain" of dependencies (e.g. M3 blocked by M2 blocked by M1).
-  - `bd dep add <Bead ID> <Previous Milestone Bead ID>`
-- Update the parent bead description to add or update a "Milestones" section with the agreed list (minimal, non-destructive). Identify the Milestone epic ID.
-- When creating child beads, ensure idempotence: if a child bead with the same canonical name, or a child bead previously created by this command exists, reuse it instead of creating a duplicate. Use `bd list --parent $1 --json` or equivalent to detect existing children.
-- When updating the parent bead, append or replace only a well-marked "Milestones" block; if a previous generated block exists, replace it rather than appending.
+  - `wl dep add <Work Item ID> <Previous Milestone Work Item ID>`
+- Update the parent work item description to add or update a "Milestones" section with the agreed list (minimal, non-destructive). Identify the Milestone epic ID.
+- When creating child work items, ensure idempotence: if a child work item with the same canonical name, or a child work item previously created by this command exists, reuse it instead of creating a duplicate. Use `wl list --parent $1 --json` or equivalent to detect existing children.
+- When updating the parent work item, append or replace only a well-marked "Milestones" block; if a previous generated block exists, replace it rather than appending.
 
 ## Traceability & idempotence
 
-- Re-running `/milestones <bd-id>` should not create duplicate child beads or duplicate generated milestone blocks in the parent bead.
+- Re-running `/milestones <work-item-id>` should not create duplicate child work items or duplicate generated milestone blocks in the parent work item.
 
 ## Editing rules & safety
 
@@ -117,16 +117,16 @@ After the user approves the milestone list, run five review iterations. Each rev
 
 ## Finishing steps (must do)
 
-- On the parent bead remove the label: "Status: PRD Completed" ` bd update <bead-id> --remove-label "stage:prd_complete" --json`
-- On the parent bead add a Label: "Status: Milestones Defined" ` bd update <bead-id> --add-label "stage:milestones_defined" --json`
-- If child beads were created, print their ids and add a short changelog entry to the parent bead.
-- Run `bs sync` to sync bead changes.
-- Run `bd show <parentBeadId>` (not --json) to show the entire bead.
-- End with: "This completes the Milestones process for <bd-id>".
+- On the parent work item remove the label: "Status: PRD Completed" ` wl update <work-item-id> --remove-label "stage:prd_complete" --json`
+- On the parent work item add a Label: "Status: Milestones Defined" ` wl update <work-item-id> --add-label "stage:milestones_defined" --json`
+- If child work items were created, print their ids and add a short changelog entry to the parent work item.
+- Run `wl sync` to sync work item changes.
+- Run `wl show <parentWorkItemId>` (not --json) to show the entire work item.
+- End with: "This completes the Milestones process for <work-item-id>".
 
 ## Examples
 
-- `/milestones bd-123`
-  - Starts an interview using bead bd-123 as seed context.
-- `/milestones bd-123 Q3 release`
+- `/milestones wl-123`
+  - Starts an interview using work item wl-123 as seed context.
+- `/milestones wl-123 Q3 release`
   - Starts the same interview but seeds the conversation with a target horizon of "Q3 release".

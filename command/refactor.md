@@ -3,6 +3,7 @@ description: Refactoring session - discovers opportunities to improves code qual
 agent: patch
 subtask: true
 ---
+
 # Refactor Mode - Code Quality Improvement
 
 Your mission is to identify opportunities to improve code quality, readability, and maintainability WITHOUT changing external behavior.
@@ -17,11 +18,12 @@ Use `$ARGUMENTS` to specify the target code or module for refactoring. If no tar
 
 You will not edit any files during the assessment. Instead you will try to identify opportunities for improvements that improve code quality and maintainability but ensures that existing behavior remains identical. If unsure, do not record the proposed change.
 
-This command will create zero or more beads at the root of the project, each describing a specific refactoring opportunity.
+This command will create zero or more Worklog work items at the root of the project, each describing a specific refactoring opportunity.
 
 ## Refactoring Protocol
 
 ### Phase 1: Assess
+
 1. **Understand current behavior**
    - Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for product context.
    - What does this code do?
@@ -39,7 +41,6 @@ This command will create zero or more beads at the root of the project, each des
    - Unnecessary comments
 
    The following are not considered refactoring opportunities (and should be ignored):
-
    - Public API signatures
    - New features
    - Large sweeping changes
@@ -48,18 +49,19 @@ This command will create zero or more beads at the root of the project, each des
    - Are there existing tests?
    - Do they cover the code to be refactored?
    - Are the tests reliable and fast?
-   
+
 ### Phase 2: Plan
+
 1. **Prioritize improvements**
    - Impact vs effort analysis
    - Risk assessment
    - Dependencies between changes
    - Priority will be set to:
-    - `1` for critical maintainability issues that hinder future work
-    - `2` for high-impact improvements that enhance clarity and reduce complexity
-    - `3` for minor improvements that have low impact
+   - `1` for critical maintainability issues that hinder future work
+   - `2` for high-impact improvements that enhance clarity and reduce complexity
+   - `3` for minor improvements that have low impact
 
-2. **Record** - Create a beads issue for each refactoring opportunity with:
+2. **Record** - Create a Worklog work item for each refactoring opportunity with:
    - A title in the form "REFACTOR: <summary>"
    - A clear description of the code smell to be addressed. Including:
      - Location (file, class, method)
