@@ -27,6 +27,28 @@ echo "Creating worktree '$WORKTREE_DIR' with branch '$BRANCH'"
 git worktree add --checkout "$WORKTREE_DIR" -b "$BRANCH" HEAD
 
 pushd "$WORKTREE_DIR" >/dev/null
+ROOT_DIR=$(git rev-parse --show-toplevel)
+
+# Ensure the new worktree has Worklog local state.
+# If the parent repo has a .worklog directory, copy it. Otherwise initialize with `wl init`.
+if [ ! -d ".worklog" ]; then
+  if [ -d "${ROOT_DIR}/.worklog" ]; then
+    echo "Copying parent .worklog into new worktree"
+    cp -a "${ROOT_DIR}/.worklog" .worklog
+  else
+    echo "No parent .worklog found; initializing Worklog in new worktree"
+    # Copy repository settings that should be used as defaults, if present
+    if [ -f "${ROOT_DIR}/opencode.json" ]; then
+      echo "Copying opencode.json defaults into new worktree"
+      cp "${ROOT_DIR}/opencode.json" ./opencode.json
+    fi
+    # Initialize local Worklog state
+    if ! wl init; then
+      echo "wl init failed in worktree; aborting" >&2
+      exit 1
+    fi
+  fi
+fi
 
 echo "agent: ${AGENT_NAME}" > agent-metadata.txt
 echo "work-item: ${WORK_ITEM_ID}" >> agent-metadata.txt
