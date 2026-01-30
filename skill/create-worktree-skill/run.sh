@@ -61,17 +61,42 @@ ROOT_DIR=$(git rev-parse --show-toplevel)
 if [ ! -d ".worklog" ]; then
   if [ -d "${REPO_ROOT}/.worklog" ]; then
     echo "Copying parent .worklog into new worktree"
-    cp -a "${REPO_ROOT}/.worklog" .worklog
-    # verify copy
-    if [ ! -f .worklog/initialized ]; then
-      echo "Warning: copied .worklog missing 'initialized' marker; will run 'wl init' as fallback"
+    # Prefer copying critical files explicitly to avoid skipping large DB files or symlinks
+    mkdir -p .worklog
+    SRC_WL_DIR="${REPO_ROOT}/.worklog"
+    FILES_TO_COPY=("worklog-data.jsonl" "worklog.db" "config.yaml" "initialized" "tui-state.json")
+    COPIED_ANY=0
+    for f in "${FILES_TO_COPY[@]}"; do
+      if [ -e "${SRC_WL_DIR}/$f" ]; then
+        echo "Copying $f"
+        cp -a "${SRC_WL_DIR}/$f" ".worklog/"
+        COPIED_ANY=1
+      fi
+    done
+    # Copy logs dir if present
+    if [ -d "${SRC_WL_DIR}/logs" ]; then
+      cp -a "${SRC_WL_DIR}/logs" .worklog/
+      COPIED_ANY=1
+    fi
+    if [ "$COPIED_ANY" -eq 0 ]; then
+      echo "Warning: no .worklog files were copied from ${SRC_WL_DIR}; will attempt wl init as fallback"
       if ! wl init; then
-        echo "wl init failed after copying .worklog; aborting" >&2
+        echo "wl init failed after attempting copy; aborting" >&2
         ls -la .worklog || true
         exit 1
       fi
     else
-      echo "Copied .worklog appears initialized"
+      echo "Copied .worklog files: verifying presence of worklog-data.jsonl or worklog.db"
+      if [ ! -f .worklog/worklog-data.jsonl ] && [ ! -f .worklog/worklog.db ]; then
+        echo "Warning: copied .worklog lacks expected data files; attempting wl init fallback"
+        if ! wl init; then
+          echo "wl init failed after copy; aborting" >&2
+          ls -la .worklog || true
+          exit 1
+        fi
+      else
+        echo "Copied .worklog appears to contain data"
+      fi
     fi
   else
     echo "No parent .worklog found; initializing Worklog in new worktree"
