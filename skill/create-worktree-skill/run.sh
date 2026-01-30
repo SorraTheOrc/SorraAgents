@@ -22,6 +22,12 @@ TIMESTAMP=$(date +"%d-%m-%y-%H-%M")
 REPO_ROOT=$(git rev-parse --show-toplevel)
 
 WORKTREE_DIR=".worklog/tmp-worktree-${AGENT_NAME}-${TIMESTAMP}"
+# Ensure WORKTREE_DIR is unique if it already exists (leftover from failed runs)
+if [ -e "$WORKTREE_DIR" ]; then
+  UNIQUE_POSTFIX=$(date +"%s%N")
+  WORKTREE_DIR="${WORKTREE_DIR}-${UNIQUE_POSTFIX}"
+  echo "Worktree path already existed; using unique path $WORKTREE_DIR"
+fi
 BRANCH_BASE="feature/${WORK_ITEM_ID}-${SHORT}"
 BRANCH="$BRANCH_BASE"
 
