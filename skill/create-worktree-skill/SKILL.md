@@ -13,10 +13,11 @@ Provide a simple, deterministic way for agents to create isolated worktrees and 
 1. Prepare inputs
    - Required inputs:
      - work_item_id (string) — the work-item id (e.g. `SA-0ML0502B21WHXDYA`)
-     - agent_name (string) — short identifier for the agent (e.g. `testA`)
+   - Optional (recommended):
+     - agent_name (string) — short identifier for the agent (e.g. `testA`). If omitted the script derives a name from environment/git/whoami; passing an explicit agent_name is recommended for clarity and auditability.
 
 2. Execute the skill
-   - Run the canonical script: `skill/create-worktree-skill/scripts/run.sh <work_item_id> <agent_name>`
+   - Run the canonical script: `skill/create-worktree-skill/scripts/run.sh <work_item_id> [agent_name]`
 
 3. Observe outputs
    - The script prints status lines and writes diagnostics to `/tmp` on failure (e.g. `/tmp/wl_init_out`, `/tmp/wl_init_err`). It exits non-zero on unrecoverable failures.
@@ -27,13 +28,17 @@ Provide a simple, deterministic way for agents to create isolated worktrees and 
 
 ## Examples
 
-- Example invocation (happy path):
+Example invocations:
 
 ```
-skill/create-worktree-skill/run.sh SA-0ML0502B21WHXDYA testA it
+# preferred: pass agent name explicitly
+skill/create-worktree-skill/scripts/run.sh SA-0ML0502B21WHXDYA testA
+
+# agent name omitted: script derives a value
+skill/create-worktree-skill/scripts/run.sh SA-0ML0502B21WHXDYA
 ```
 
-Expected result: a new unique worktree under `.worktrees/` is created, a branch `feature/SA-0ML0502B21WHXDYA-it(-<uniq>)` is created/checked-out, a sample commit is made, and `wl sync` publishes the commit so other worktrees can see it.
+Expected result: a new worktree under `.worktrees/` is created (named `<agent>-<work_item_id>`), a branch `feature/<work_item_id>` (or a unique variant if the branch is checked out elsewhere) is created/checked-out, Worklog is initialized in the worktree if necessary, and `wl sync` publishes the state so other worktrees can see the branch.
 
 ## Security note
 
