@@ -18,6 +18,9 @@ command -v git >/dev/null 2>&1 || { echo "git is required"; exit 1; }
 command -v wl >/dev/null 2>&1 || { echo "wl CLI is required"; exit 1; }
 
 TIMESTAMP=$(date +"%d-%m-%y-%H-%M")
+# record repo root before creating the worktree so we can copy .worklog from the main worktree
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
 WORKTREE_DIR=".worklog/tmp-worktree-${AGENT_NAME}-${TIMESTAMP}"
 BRANCH_BASE="feature/${WORK_ITEM_ID}-${SHORT}"
 BRANCH="$BRANCH_BASE"
@@ -82,8 +85,11 @@ wl sync
 COMMIT_HASH=$(git rev-parse HEAD)
 echo "Committed ${COMMIT_HASH} on ${BRANCH} in ${WORKTREE_DIR}"
 
-popd >/dev/null
+  # use REPO_ROOT (main worktree) when copying .worklog
+  ROOT_DIR="$REPO_ROOT"
 
-echo "Skill run complete. Worktree: $WORKTREE_DIR Branch: $BRANCH Commit: $COMMIT_HASH"
+  popd >/dev/null
+
+  echo "Skill run complete. Worktree: $WORKTREE_DIR Branch: $BRANCH Commit: $COMMIT_HASH"
 
 exit 0
