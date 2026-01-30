@@ -12,13 +12,6 @@ fi
 
 WORK_ITEM_ID="$1"
 AGENT_NAME="$2"
-# derive suffix from work item id if it contains a final '-suffix'
-if [[ "$WORK_ITEM_ID" == *-* ]]; then
-  SHORT=${WORK_ITEM_ID##*-}
-else
-  # sensible default when not present
-  SHORT=it
-fi
 
 command -v git >/dev/null 2>&1 || { echo "git is required"; exit 1; }
 command -v wl >/dev/null 2>&1 || { echo "wl CLI is required"; exit 1; }
@@ -30,28 +23,22 @@ TIMESTAMP=$(date +"%d-%m-%y-%H-%M")
 REPO_ROOT=$(git rev-parse --show-toplevel)
 
 mkdir -p "${REPO_ROOT}/.worktrees"
-# create a unique worktree dir inside the repo .worktrees using mktemp
-WORKTREE_DIR=$(mktemp -d "${REPO_ROOT}/.worktrees/tmp-worktree-${AGENT_NAME}-XXXXXXXX")
-if [ -z "$WORKTREE_DIR" ] || [ ! -d "$WORKTREE_DIR" ]; then
-  echo "Failed to create unique worktree dir with mktemp" >&2
-  exit 1
+# deterministic worktree name: <agent>-<work-item-id>; append epoch suffix if it already exists
+WORKTREE_DIR="${REPO_ROOT}/.worktrees/${AGENT_NAME}-${WORK_ITEM_ID}"
+if [ -e "$WORKTREE_DIR" ]; then
+  WORKTREE_DIR="${WORKTREE_DIR}-$(date +%s)"
 fi
 # relative path used with git worktree add
 WORKTREE_DIR_REL=${WORKTREE_DIR#${REPO_ROOT}/}
 
-BRANCH_BASE="feature/${WORK_ITEM_ID}-${SHORT}"
+# Branch name: feature/<work-item-id>
+BRANCH_BASE="feature/${WORK_ITEM_ID}"
 BRANCH="$BRANCH_BASE"
 
 echo "Creating worktree '$WORKTREE_DIR_REL' with branch '$BRANCH'"
 
-echo "Ensuring repository Worklog state is up-to-date (running wl sync in repo root)"
-pushd "$REPO_ROOT" >/dev/null
-if wl sync; then
-  echo "Repository wl sync succeeded"
-else
-  echo "Warning: repository wl sync failed or reported uninitialized; continuing but new worktree sync may fail" >&2
-fi
-popd >/dev/null
+# Do not run wl sync in repo root here. Worklog initialization and sync will be
+# performed inside the new worktree after it's created and initialized.
 
 # If the branch already exists, check it out into the new worktree; otherwise create it from HEAD
 if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
@@ -101,13 +88,15 @@ if [ ! -f ".worklog/initialized" ]; then
   fi
 fi
 
-echo "agent: ${AGENT_NAME}" > agent-metadata.txt
-echo "work-item: ${WORK_ITEM_ID}" >> agent-metadata.txt
-echo "timestamp: $(date --iso-8601=seconds)" >> agent-metadata.txt
-
-echo "Sample change from agent ${AGENT_NAME} for ${WORK_ITEM_ID}" > agent-sample.txt
-git add agent-metadata.txt agent-sample.txt
-git commit -m "chore(${WORK_ITEM_ID}): agent ${AGENT_NAME} sample commit"
+# Add a comment to the work-item indicating the worktree and branch were created
+COMMENT="Agent ${AGENT_NAME} created worktree '${WORKTREE_DIR_REL}' and branch '${BRANCH}'"
+echo "Adding worklog comment to ${WORK_ITEM_ID}: ${COMMENT}"
+if ! wl comment add "${WORK_ITEM_ID}" --comment "${COMMENT}" --author "${AGENT_NAME}" --json >/tmp/wl_comment_out 2>/tmp/wl_comment_err; then
+  echo "Warning: failed to add worklog comment for ${WORK_ITEM_ID}. See /tmp/wl_comment_err" >&2
+  sed -n '1,200p' /tmp/wl_comment_err || true
+else
+  sed -n '1,200p' /tmp/wl_comment_out || true
+fi
 
 echo "Running wl sync from worktree: $WORKTREE_DIR"
 WL_SYNC_OUT=$(mktemp)
@@ -115,58 +104,18 @@ WL_SYNC_ERR=$(mktemp)
 if wl sync >"$WL_SYNC_OUT" 2>"$WL_SYNC_ERR"; then
   echo "wl sync succeeded"
 else
-  SYNC_ERR_CONTENT=$(cat "$WL_SYNC_ERR" | tr -d '\r')
-  echo "wl sync failed: $SYNC_ERR_CONTENT"
-  if echo "$SYNC_ERR_CONTENT" | grep -qi "not initialized"; then
-    echo "Detected uninitialized Worklog in worktree; attempting 'wl init' and retry"
-    WL_INIT_ARGS=()
-    if [ -f "${REPO_ROOT}/.worklog/config.yaml" ]; then
-      PROJECT_NAME=$(sed -n 's/^projectName:[[:space:]]*\(.*\)$/\1/p' "${REPO_ROOT}/.worklog/config.yaml" | sed 's/^ *//;s/ *$//') || true
-      PREFIX=$(sed -n 's/^prefix:[[:space:]]*\(.*\)$/\1/p' "${REPO_ROOT}/.worklog/config.yaml" | sed 's/^ *//;s/ *$//') || true
-      if [ -n "$PROJECT_NAME" ]; then
-        WL_INIT_ARGS+=(--project-name "$PROJECT_NAME")
-      fi
-      if [ -n "$PREFIX" ]; then
-        WL_INIT_ARGS+=(--prefix "$PREFIX")
-      fi
-    fi
-    if wl init --json "${WL_INIT_ARGS[@]}" > /tmp/wl_init_out 2>/tmp/wl_init_err; then
-      echo "wl init succeeded; output:"; sed -n '1,200p' /tmp/wl_init_out || true
-      sleep 1
-      echo ".worklog after init:"; ls -la .worklog || true
-      echo "wl init succeeded; retrying wl sync"
-      if ! wl sync >"$WL_SYNC_OUT" 2>"$WL_SYNC_ERR"; then
-        echo "wl sync still failing after wl init:" >&2
-        cat "$WL_SYNC_ERR" >&2
-        echo "Listing .worklog for debug:" >&2
-        ls -la .worklog || true
-        echo "Printing .worklog/initialized if present:" >&2
-        [ -f .worklog/initialized ] && cat .worklog/initialized || true
-        echo "wl sync still failing after wl init and no bootstrap performed:" >&2
-        cat "$WL_SYNC_ERR" >&2 || true
-        echo "Listing .worklog for debug:" >&2
-        ls -la .worklog || true
-        exit 1
-      fi
-    else
-      echo "wl init failed; aborting" >&2
-      cat "$WL_SYNC_ERR" >&2 || true
-      exit 1
-    fi
-  else
-    echo "wl sync failed with unexpected error:" >&2
-    cat "$WL_SYNC_ERR" >&2 || true
-    exit 1
-  fi
+  echo "wl sync failed:" >&2
+  sed -n '1,200p' "$WL_SYNC_ERR" >&2 || true
+  echo "Listing .worklog for debug:" >&2
+  ls -la .worklog || true
+  [ -f .worklog/initialized ] && echo "initialized:" && cat .worklog/initialized || true
+  exit 1
 fi
-
-COMMIT_HASH=$(git rev-parse HEAD)
-echo "Committed ${COMMIT_HASH} on ${BRANCH} in ${WORKTREE_DIR}"
 
 ROOT_DIR="$REPO_ROOT"
 
 popd >/dev/null
 
-echo "Skill run complete. Worktree: $WORKTREE_DIR Branch: $BRANCH Commit: $COMMIT_HASH"
+echo "Skill run complete. Worktree: $WORKTREE_DIR Branch: $BRANCH"
 
 exit 0
