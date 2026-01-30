@@ -56,6 +56,17 @@ if [ ! -d ".worklog" ]; then
   if [ -d "${ROOT_DIR}/.worklog" ]; then
     echo "Copying parent .worklog into new worktree"
     cp -a "${ROOT_DIR}/.worklog" .worklog
+    # verify copy
+    if [ ! -f .worklog/initialized ]; then
+      echo "Warning: copied .worklog missing 'initialized' marker; will run 'wl init' as fallback"
+      if ! wl init; then
+        echo "wl init failed after copying .worklog; aborting" >&2
+        ls -la .worklog || true
+        exit 1
+      fi
+    else
+      echo "Copied .worklog appears initialized"
+    fi
   else
     echo "No parent .worklog found; initializing Worklog in new worktree"
     # Copy repository settings that should be used as defaults, if present
