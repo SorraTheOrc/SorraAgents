@@ -10,21 +10,46 @@ WORK_ITEM_ID=${1:-SA-0ML0502B21WHXDYA}
 AGENT_A=testA
 SHORT_A=it
 
-TMP_A_DIR=".worklog/tmp-worktree-${AGENT_A}-test"
-TMP_B_DIR=".worklog/tmp-worktree-testB"
+TMP_A_DIR=$(mktemp -d ".worktrees/tmp-worktree-${AGENT_A}-test-XXXXXX")
+TMP_B_DIR=$(mktemp -d ".worktrees/tmp-worktree-testB-XXXXXX")
+
+if [ -z "$TMP_A_DIR" ] || [ -z "$TMP_B_DIR" ]; then
+  echo "Failed to create unique tmp dirs" >&2
+  exit 1
+fi
 
 cleanup() {
   echo "Cleaning up..."
   set +e
-  # remove worktrees if present
-  if [ -d "$TMP_A_DIR" ]; then
-    git worktree remove "$TMP_A_DIR" || true
-    rm -rf "$TMP_A_DIR" || true
-  fi
-  if [ -d "$TMP_B_DIR" ]; then
-    git worktree remove "$TMP_B_DIR" || true
-    rm -rf "$TMP_B_DIR" || true
-  fi
+  # prune stale worktree references first to clear broken gitdir entries
+  git worktree prune >/dev/null 2>&1 || true
+  # remove worktrees if present; be resilient to tracked/untracked changes and avoid noisy errors
+  for p in "$TMP_A_DIR" "$TMP_B_DIR"; do
+    if [ -z "$p" ]; then
+      continue
+    fi
+    # If the directory exists on disk
+    if [ -d "$p" ]; then
+      # Check whether git still considers this path a registered worktree
+      if git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' | grep -Fx "$p" >/dev/null 2>&1; then
+        # Clean tracked/untracked files to allow a non-force remove
+        git -C "$p" reset --hard >/dev/null 2>&1 || true
+        git -C "$p" clean -fd >/dev/null 2>&1 || true
+        # Attempt non-forced remove; fall back to forced only if necessary
+        if ! git worktree remove "$p" >/dev/null 2>&1; then
+          git worktree remove -f "$p" >/dev/null 2>&1 || true
+        fi
+      else
+        # Not registered as a worktree; just delete the directory
+        rm -rf "$p" >/dev/null 2>&1 || true
+      fi
+    else
+      # Directory not present; ensure any stale registration is pruned
+      git worktree prune >/dev/null 2>&1 || true
+    fi
+  done
+  # final prune to clean any leftover refs
+  git worktree prune >/dev/null 2>&1 || true
 }
 
 trap cleanup EXIT
@@ -42,9 +67,21 @@ COMMIT_A=$(git rev-parse ${BRANCH})
 echo "Agent A created branch ${BRANCH} commit ${COMMIT_A}"
 
 echo "Creating Agent B worktree"
-git worktree add --checkout "$TMP_B_DIR" HEAD
+# Avoid triggering post-pull hooks that run wl sync before we init the worktree
+WORKLOG_SKIP_POST_PULL=1 git worktree add --checkout "$TMP_B_DIR" HEAD
 
 pushd "$TMP_B_DIR" >/dev/null
+echo "Agent B initializing worklog (non-interactive)"
+# Provide defaults for non-interactive init (copy repo config and opencode.json) so wl init can complete
+mkdir -p .worklog
+if [ -f "${ROOT_DIR}/opencode.json" ]; then
+  cp "${ROOT_DIR}/opencode.json" ./opencode.json || true
+fi
+if [ -f "${ROOT_DIR}/.worklog/config.yaml" ]; then
+  cp "${ROOT_DIR}/.worklog/config.yaml" .worklog/config.yaml || true
+fi
+wl init --json > /tmp/wl_init_b_out 2>/tmp/wl_init_b_err || true
+echo ".worklog after Agent B init:"; ls -la .worklog || true
 echo "Agent B running wl sync"
 wl sync
 popd >/dev/null
