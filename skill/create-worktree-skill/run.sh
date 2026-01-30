@@ -56,12 +56,12 @@ echo "Using branch: ${BRANCH}"
 pushd "$WORKTREE_DIR" >/dev/null
 ROOT_DIR=$(git rev-parse --show-toplevel)
 
-# Ensure the new worktree has Worklog local state.
-# If the parent repo has a .worklog directory, copy it. Otherwise initialize with `wl init`.
+ # Ensure the new worktree has Worklog local state.
+ # If the parent repo has a .worklog directory, copy it. Otherwise initialize with `wl init`.
 if [ ! -d ".worklog" ]; then
-  if [ -d "${ROOT_DIR}/.worklog" ]; then
+  if [ -d "${REPO_ROOT}/.worklog" ]; then
     echo "Copying parent .worklog into new worktree"
-    cp -a "${ROOT_DIR}/.worklog" .worklog
+    cp -a "${REPO_ROOT}/.worklog" .worklog
     # verify copy
     if [ ! -f .worklog/initialized ]; then
       echo "Warning: copied .worklog missing 'initialized' marker; will run 'wl init' as fallback"
@@ -76,9 +76,9 @@ if [ ! -d ".worklog" ]; then
   else
     echo "No parent .worklog found; initializing Worklog in new worktree"
     # Copy repository settings that should be used as defaults, if present
-    if [ -f "${ROOT_DIR}/opencode.json" ]; then
+    if [ -f "${REPO_ROOT}/opencode.json" ]; then
       echo "Copying opencode.json defaults into new worktree"
-      cp "${ROOT_DIR}/opencode.json" ./opencode.json
+      cp "${REPO_ROOT}/opencode.json" ./opencode.json
     fi
     # Initialize local Worklog state
     if ! wl init; then
