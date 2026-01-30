@@ -109,10 +109,17 @@ if [ ! -d ".worklog" ]; then
     fi
   fi
 
-  if ! wl init "${WL_INIT_ARGS[@]}"; then
+  if ! wl init --json "${WL_INIT_ARGS[@]}" > /tmp/wl_init_out 2>/tmp/wl_init_err; then
     echo "wl init failed in worktree; aborting" >&2
+    echo "--- wl init stdout ---"; sed -n '1,200p' /tmp/wl_init_out || true
+    echo "--- wl init stderr ---"; sed -n '1,200p' /tmp/wl_init_err || true
     ls -la .worklog || true
     exit 1
+  else
+    echo "wl init succeeded; output:"; sed -n '1,200p' /tmp/wl_init_out || true
+    # small pause to let init write files to disk
+    sleep 1
+    echo ".worklog after init:"; ls -la .worklog || true
   fi
 fi
 
@@ -145,7 +152,18 @@ else
         WL_INIT_ARGS+=(--project-name "$PROJECT_NAME")
       fi
     fi
-    if wl init "${WL_INIT_ARGS[@]}"; then
+    # Retry initialization with defaults from parent config if available
+    WL_INIT_ARGS=()
+    if [ -f "./.worklog/config.yaml" ]; then
+      PROJECT_NAME=$(sed -n 's/^projectName:[[:space:]]*\(.*\)$/\1/p' ./.worklog/config.yaml | sed 's/^ *//;s/ *$//') || true
+      if [ -n "$PROJECT_NAME" ]; then
+        WL_INIT_ARGS+=(--project-name "$PROJECT_NAME")
+      fi
+    fi
+    if wl init --json "${WL_INIT_ARGS[@]}" > /tmp/wl_init_out 2>/tmp/wl_init_err; then
+      echo "wl init succeeded; output:"; sed -n '1,200p' /tmp/wl_init_out || true
+      sleep 1
+      echo ".worklog after init:"; ls -la .worklog || true
       echo "wl init succeeded; retrying wl sync"
       if ! wl sync >"$WL_SYNC_OUT" 2>"$WL_SYNC_ERR"; then
         echo "wl sync still failing after wl init:" >&2
