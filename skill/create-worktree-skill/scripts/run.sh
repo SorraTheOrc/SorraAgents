@@ -44,6 +44,19 @@ TIMESTAMP=$(date +"%d-%m-%y-%H-%M")
 REPO_ROOT=$(git rev-parse --show-toplevel)
 
 mkdir -p "${REPO_ROOT}/.worktrees"
+# refuse to create if any worktree exists for this work-item id
+shopt -s nullglob
+existing=("${REPO_ROOT}/.worktrees/"*"-${WORK_ITEM_ID}"*)
+shopt -u nullglob
+if [ "${#existing[@]}" -gt 0 ]; then
+  echo "Refusing to create worktree: found existing worktree(s) matching '*-${WORK_ITEM_ID}*':"
+  for p in "${existing[@]}"; do
+    echo "  - $p"
+  done
+  echo "Please confirm those worktree(s) are inactive and remove them (eg. 'git worktree remove <path>' or 'rm -rf <path>') before retrying."
+  exit 2
+fi
+
 # deterministic worktree name: <agent>-<work-item-id>; append epoch suffix if it already exists
 WORKTREE_DIR="${REPO_ROOT}/.worktrees/${AGENT_NAME}-${WORK_ITEM_ID}"
 if [ -e "$WORKTREE_DIR" ]; then
