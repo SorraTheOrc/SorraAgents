@@ -56,60 +56,27 @@ echo "Using branch: ${BRANCH}"
 pushd "$WORKTREE_DIR" >/dev/null
 ROOT_DIR=$(git rev-parse --show-toplevel)
 
- # Ensure the new worktree has Worklog local state.
- # If the parent repo has a .worklog directory, copy it. Otherwise initialize with `wl init`.
+# Initialize Worklog in the new worktree using the parent repo settings (init-only strategy).
+# Do NOT copy the parent's runtime DB files; instead, copy configuration defaults and run `wl init`.
 if [ ! -d ".worklog" ]; then
-  if [ -d "${REPO_ROOT}/.worklog" ]; then
-    echo "Copying parent .worklog into new worktree"
-    # Prefer copying critical files explicitly to avoid skipping large DB files or symlinks
+  echo "Initializing Worklog in new worktree using parent repo settings (init-only)"
+  mkdir -p .worklog
+  # Copy opencode.json if present in repo root to provide provider/settings defaults
+  if [ -f "${REPO_ROOT}/opencode.json" ]; then
+    echo "Copying ${REPO_ROOT}/opencode.json into worktree"
+    cp "${REPO_ROOT}/opencode.json" ./opencode.json
+  fi
+  # Copy parent .worklog/config.yaml if present to preserve Worklog config defaults
+  if [ -f "${REPO_ROOT}/.worklog/config.yaml" ]; then
+    echo "Copying ${REPO_ROOT}/.worklog/config.yaml into new worktree .worklog/config.yaml"
     mkdir -p .worklog
-    SRC_WL_DIR="${REPO_ROOT}/.worklog"
-    FILES_TO_COPY=("worklog-data.jsonl" "worklog.db" "config.yaml" "initialized" "tui-state.json")
-    COPIED_ANY=0
-    for f in "${FILES_TO_COPY[@]}"; do
-      if [ -e "${SRC_WL_DIR}/$f" ]; then
-        echo "Copying $f"
-        cp -a "${SRC_WL_DIR}/$f" ".worklog/"
-        COPIED_ANY=1
-      fi
-    done
-    # Copy logs dir if present
-    if [ -d "${SRC_WL_DIR}/logs" ]; then
-      cp -a "${SRC_WL_DIR}/logs" .worklog/
-      COPIED_ANY=1
-    fi
-    if [ "$COPIED_ANY" -eq 0 ]; then
-      echo "Warning: no .worklog files were copied from ${SRC_WL_DIR}; will attempt wl init as fallback"
-      if ! wl init; then
-        echo "wl init failed after attempting copy; aborting" >&2
-        ls -la .worklog || true
-        exit 1
-      fi
-    else
-      echo "Copied .worklog files: verifying presence of worklog-data.jsonl or worklog.db"
-      if [ ! -f .worklog/worklog-data.jsonl ] && [ ! -f .worklog/worklog.db ]; then
-        echo "Warning: copied .worklog lacks expected data files; attempting wl init fallback"
-        if ! wl init; then
-          echo "wl init failed after copy; aborting" >&2
-          ls -la .worklog || true
-          exit 1
-        fi
-      else
-        echo "Copied .worklog appears to contain data"
-      fi
-    fi
-  else
-    echo "No parent .worklog found; initializing Worklog in new worktree"
-    # Copy repository settings that should be used as defaults, if present
-    if [ -f "${REPO_ROOT}/opencode.json" ]; then
-      echo "Copying opencode.json defaults into new worktree"
-      cp "${REPO_ROOT}/opencode.json" ./opencode.json
-    fi
-    # Initialize local Worklog state
-    if ! wl init; then
-      echo "wl init failed in worktree; aborting" >&2
-      exit 1
-    fi
+    cp "${REPO_ROOT}/.worklog/config.yaml" .worklog/config.yaml
+  fi
+  # Initialize local Worklog state
+  if ! wl init; then
+    echo "wl init failed in worktree; aborting" >&2
+    ls -la .worklog || true
+    exit 1
   fi
 fi
 
