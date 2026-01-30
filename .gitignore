@@ -14,3 +14,19 @@ Worklog Specific Ignores
 .opencode/tmp/
 
 ### End of Worklog Specific Ignores
+
+# Node / package artifacts
+node_modules
+package.json
+bun.lock
+.gitignore
+
+# worklog:gitignore:v1
+.worklog/config.yaml
+.worklog/initialized
+.worklog/worklog.db
+.worklog/worklog.db-shm
+.worklog/worklog.db-wal
+.worklog/worklog-data.jsonl
+.worklog/tmp-worktree-*
+.worktrees/
