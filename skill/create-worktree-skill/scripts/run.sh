@@ -1,18 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Agent skill: create a named worktree, create/check-out a branch, commit a sample file, and run 'wl sync'
-# Location: ./skill/create-worktree-skill/
-# Usage: ./run.sh <work-item-id> <agent-name> <short-suffix>
+# Create Worktree Skill script (moved into scripts/)
+# Usage: ./scripts/run.sh <work-item-id> <agent-name> [short-suffix]
+# short-suffix is optional; if omitted the script will try to derive a suffix from the work-item id
 
-if [ "$#" -lt 3 ]; then
-  echo "Usage: $0 <work-item-id> <agent-name> <short-suffix>"
+if [ "$#" -lt 2 ]; then
+  echo "Usage: $0 <work-item-id> <agent-name> [short-suffix]"
   exit 2
 fi
 
 WORK_ITEM_ID="$1"
 AGENT_NAME="$2"
-SHORT="$3"
+SHORT=""
+if [ "$#" -ge 3 ]; then
+  SHORT="$3"
+else
+  # derive suffix from work item id if it contains a final '-suffix'
+  if [[ "$WORK_ITEM_ID" == *-* ]]; then
+    SHORT=${WORK_ITEM_ID##*-}
+  else
+    # sensible default when not present
+    SHORT=it
+  fi
+fi
 
 command -v git >/dev/null 2>&1 || { echo "git is required"; exit 1; }
 command -v wl >/dev/null 2>&1 || { echo "wl CLI is required"; exit 1; }
@@ -21,7 +32,6 @@ command -v wl >/dev/null 2>&1 || { echo "wl CLI is required"; exit 1; }
 export WORKLOG_SKIP_POST_PULL=1
 
 TIMESTAMP=$(date +"%d-%m-%y-%H-%M")
-# record repo root before creating the worktree so we can copy .worklog from the main worktree
 REPO_ROOT=$(git rev-parse --show-toplevel)
 
 mkdir -p "${REPO_ROOT}/.worktrees"
@@ -39,7 +49,6 @@ BRANCH="$BRANCH_BASE"
 
 echo "Creating worktree '$WORKTREE_DIR_REL' with branch '$BRANCH'"
 
-# Ensure repository Worklog state is published so new worktree can sync after wl init
 echo "Ensuring repository Worklog state is up-to-date (running wl sync in repo root)"
 pushd "$REPO_ROOT" >/dev/null
 if wl sync; then
@@ -51,11 +60,8 @@ popd >/dev/null
 
 # If the branch already exists, check it out into the new worktree; otherwise create it from HEAD
 if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
-  # Branch exists. Try to add worktree for it; if it's already checked out elsewhere,
-  # create a new unique branch based on timestamp to avoid conflicts.
   echo "Branch ${BRANCH} already exists; attempting to add worktree for existing branch"
   if git worktree list --porcelain | grep -q "refs/heads/${BRANCH}"; then
-    # branch is checked out in another worktree; create a unique branch instead
     UNIQUE_SUFFIX=$(date +"%s")
     BRANCH="${BRANCH_BASE}-${UNIQUE_SUFFIX}"
     echo "Branch is checked out elsewhere; creating a unique branch ${BRANCH} from HEAD"
@@ -72,40 +78,18 @@ echo "Using branch: ${BRANCH}"
 pushd "$WORKTREE_DIR" >/dev/null
 ROOT_DIR=$(git rev-parse --show-toplevel)
 
-# Initialize Worklog in the new worktree using the parent repo settings (init-only strategy).
-# Do NOT copy the parent's runtime DB files; instead, copy configuration defaults and run `wl init`.
-# Prefer to initialize when the worktree is not initialized (no .worklog/initialized marker)
+# Initialize Worklog in the new worktree when necessary; do not copy runtime DB files
 if [ ! -f ".worklog/initialized" ]; then
   echo "Worklog not initialized in new worktree (missing .worklog/initialized) — initializing (init-only)"
-  # Do not pre-create .worklog; let `wl init` create it so initialization is consistent.
-  # Build wl init args from the parent repo config when available.
   WL_INIT_ARGS=()
   if [ -f "${REPO_ROOT}/.worklog/config.yaml" ]; then
-    # parse simple yaml entries (projectName, prefix, autoSync, autoExport)
     PROJECT_NAME=$(sed -n 's/^projectName:[[:space:]]*\(.*\)$/\1/p' "${REPO_ROOT}/.worklog/config.yaml" | sed 's/^ *//;s/ *$//') || true
     PREFIX=$(sed -n 's/^prefix:[[:space:]]*\(.*\)$/\1/p' "${REPO_ROOT}/.worklog/config.yaml" | sed 's/^ *//;s/ *$//') || true
-    AUTO_SYNC=$(sed -n 's/^autoSync:[[:space:]]*\(.*\)$/\1/p' "${REPO_ROOT}/.worklog/config.yaml" | sed 's/^ *//;s/ *$//') || true
-    AUTO_EXPORT=$(sed -n 's/^autoExport:[[:space:]]*\(.*\)$/\1/p' "${REPO_ROOT}/.worklog/config.yaml" | sed 's/^ *//;s/ *$//') || true
     if [ -n "$PROJECT_NAME" ]; then
       WL_INIT_ARGS+=(--project-name "$PROJECT_NAME")
     fi
     if [ -n "$PREFIX" ]; then
       WL_INIT_ARGS+=(--prefix "$PREFIX")
-    fi
-    if [ -n "$AUTO_SYNC" ]; then
-      # map true/false to yes/no
-      if [ "$AUTO_SYNC" = "true" ] || [ "$AUTO_SYNC" = "True" ]; then
-        WL_INIT_ARGS+=(--auto-sync yes)
-      else
-        WL_INIT_ARGS+=(--auto-sync no)
-      fi
-    fi
-    if [ -n "$AUTO_EXPORT" ]; then
-      if [ "$AUTO_EXPORT" = "true" ] || [ "$AUTO_EXPORT" = "True" ]; then
-        WL_INIT_ARGS+=(--auto-export yes)
-      else
-        WL_INIT_ARGS+=(--auto-export no)
-      fi
     fi
   fi
 
@@ -117,7 +101,6 @@ if [ ! -f ".worklog/initialized" ]; then
     exit 1
   else
     echo "wl init succeeded; output:"; sed -n '1,200p' /tmp/wl_init_out || true
-    # small pause to let init write files to disk
     sleep 1
     echo ".worklog after init:"; ls -la .worklog || true
   fi
@@ -141,7 +124,6 @@ else
   echo "wl sync failed: $SYNC_ERR_CONTENT"
   if echo "$SYNC_ERR_CONTENT" | grep -qi "not initialized"; then
     echo "Detected uninitialized Worklog in worktree; attempting 'wl init' and retry"
-    # Retry initialization using the parent repo config again (do not rely on local .worklog)
     WL_INIT_ARGS=()
     if [ -f "${REPO_ROOT}/.worklog/config.yaml" ]; then
       PROJECT_NAME=$(sed -n 's/^projectName:[[:space:]]*\(.*\)$/\1/p' "${REPO_ROOT}/.worklog/config.yaml" | sed 's/^ *//;s/ *$//') || true
@@ -165,8 +147,6 @@ else
         ls -la .worklog || true
         echo "Printing .worklog/initialized if present:" >&2
         [ -f .worklog/initialized ] && cat .worklog/initialized || true
-
-        # No test-only bootstrap available — abort and surface diagnostics
         echo "wl sync still failing after wl init and no bootstrap performed:" >&2
         cat "$WL_SYNC_ERR" >&2 || true
         echo "Listing .worklog for debug:" >&2
@@ -188,11 +168,10 @@ fi
 COMMIT_HASH=$(git rev-parse HEAD)
 echo "Committed ${COMMIT_HASH} on ${BRANCH} in ${WORKTREE_DIR}"
 
-  # use REPO_ROOT (main worktree) when copying .worklog
-  ROOT_DIR="$REPO_ROOT"
+ROOT_DIR="$REPO_ROOT"
 
-  popd >/dev/null
+popd >/dev/null
 
-  echo "Skill run complete. Worktree: $WORKTREE_DIR Branch: $BRANCH Commit: $COMMIT_HASH"
+echo "Skill run complete. Worktree: $WORKTREE_DIR Branch: $BRANCH Commit: $COMMIT_HASH"
 
 exit 0

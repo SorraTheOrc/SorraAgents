@@ -15,9 +15,9 @@ Usage
 Run the script:
 
 ```
-skill/create-worktree-skill/run.sh <work_item_id> <agent_name> <short_suffix>
+skill/create-worktree-skill/scripts/run.sh <work_item_id> <agent_name> [short_suffix]
 ```
 
 Examples and CI
 ---------------
-- See `tests/integration/agent-worktree-visibility.sh` for a working example. CI must ensure a repo-level `wl init` or restore an initialized `.worklog` state prior to running the integration test.
+- CI note: ensure a repo-level `wl init` or restore an initialized `.worklog` state prior to running integration tests that exercise this skill.
