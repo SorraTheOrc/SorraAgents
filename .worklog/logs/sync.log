@@ -8,3 +8,133 @@ No conflicts detected.
 Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=1
 Sync summary commentsAdded=0 commentsUnchanged=1
 --- sync end 2026-01-28T07:07:14.143Z ---
+--- sync start 2026-01-30T07:07:36.835Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T07:07:39.139Z ---
+--- sync start 2026-01-30T07:08:04.238Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T07:08:06.578Z ---
+--- sync start 2026-01-30T07:08:30.385Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T07:08:32.600Z ---
+--- sync start 2026-01-30T07:08:45.547Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T07:08:47.829Z ---
+--- sync start 2026-01-30T07:32:00.340Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T07:32:02.905Z ---
+--- sync start 2026-01-30T07:39:05.205Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T07:39:07.654Z ---
+--- sync start 2026-01-30T07:39:21.961Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T07:39:24.237Z ---
+--- sync start 2026-01-30T07:39:42.581Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T07:39:44.890Z ---
+--- sync start 2026-01-30T09:34:13.147Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T09:34:17.812Z ---
+--- sync start 2026-01-30T09:35:02.421Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T09:35:06.748Z ---
+--- sync start 2026-01-30T09:35:28.176Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T09:35:31.591Z ---
+--- sync start 2026-01-30T09:38:43.867Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T09:38:47.255Z ---
+--- sync start 2026-01-30T09:39:36.484Z file=/home/rogardle/.config/opencode/.worklog/worklog-data.jsonl ---
+Options json=undefined verbose=undefined dryRun=false push=true
+Starting sync for /home/rogardle/.config/opencode/.worklog/worklog-data.jsonl...
+Local state: 20 work items, 8 comments
+Remote state: 20 work items, 8 comments
+Conflict details suppressed (run with --verbose to print).
+No conflicts detected.
+Sync summary itemsAdded=0 itemsUpdated=0 itemsUnchanged=20
+Sync summary commentsAdded=0 commentsUnchanged=8
+--- sync end 2026-01-30T09:39:39.851Z ---
