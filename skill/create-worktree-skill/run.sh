@@ -97,7 +97,40 @@ git add agent-metadata.txt agent-sample.txt
 git commit -m "chore(${WORK_ITEM_ID}): agent ${AGENT_NAME} sample commit"
 
 echo "Running wl sync from worktree: $WORKTREE_DIR"
-wl sync
+WL_SYNC_OUT=$(mktemp)
+WL_SYNC_ERR=$(mktemp)
+if wl sync >"$WL_SYNC_OUT" 2>"$WL_SYNC_ERR"; then
+  echo "wl sync succeeded"
+else
+  SYNC_ERR_CONTENT=$(cat "$WL_SYNC_ERR" | tr -d '\r')
+  echo "wl sync failed: $SYNC_ERR_CONTENT"
+  if echo "$SYNC_ERR_CONTENT" | grep -qi "not initialized"; then
+    echo "Detected uninitialized Worklog in worktree; attempting 'wl init' and retry"
+    if [ -f ./opencode.json ]; then
+      echo "Using opencode.json in worktree for init defaults"
+    fi
+    if wl init; then
+      echo "wl init succeeded; retrying wl sync"
+      if ! wl sync >"$WL_SYNC_OUT" 2>"$WL_SYNC_ERR"; then
+        echo "wl sync still failing after wl init:" >&2
+        cat "$WL_SYNC_ERR" >&2
+        echo "Listing .worklog for debug:" >&2
+        ls -la .worklog || true
+        echo "Printing .worklog/initialized if present:" >&2
+        [ -f .worklog/initialized ] && cat .worklog/initialized || true
+        exit 1
+      fi
+    else
+      echo "wl init failed; aborting" >&2
+      cat "$WL_SYNC_ERR" >&2 || true
+      exit 1
+    fi
+  else
+    echo "wl sync failed with unexpected error:" >&2
+    cat "$WL_SYNC_ERR" >&2 || true
+    exit 1
+  fi
+fi
 
 COMMIT_HASH=$(git rev-parse HEAD)
 echo "Committed ${COMMIT_HASH} on ${BRANCH} in ${WORKTREE_DIR}"
