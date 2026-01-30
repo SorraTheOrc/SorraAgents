@@ -19,17 +19,30 @@ command -v wl >/dev/null 2>&1 || { echo "wl CLI is required"; exit 1; }
 
 TIMESTAMP=$(date +"%d-%m-%y-%H-%M")
 WORKTREE_DIR=".worklog/tmp-worktree-${AGENT_NAME}-${TIMESTAMP}"
-BRANCH="feature/${WORK_ITEM_ID}-${SHORT}"
+BRANCH_BASE="feature/${WORK_ITEM_ID}-${SHORT}"
+BRANCH="$BRANCH_BASE"
 
 echo "Creating worktree '$WORKTREE_DIR' with branch '$BRANCH'"
 
 # If the branch already exists, check it out into the new worktree; otherwise create it from HEAD
 if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
-  echo "Branch ${BRANCH} already exists; adding worktree for existing branch"
-  git worktree add --checkout "$WORKTREE_DIR" "$BRANCH"
+  # Branch exists. Try to add worktree for it; if it's already checked out elsewhere,
+  # create a new unique branch based on timestamp to avoid conflicts.
+  echo "Branch ${BRANCH} already exists; attempting to add worktree for existing branch"
+  if git worktree list --porcelain | grep -q "refs/heads/${BRANCH}"; then
+    # branch is checked out in another worktree; create a unique branch instead
+    UNIQUE_SUFFIX=$(date +"%s")
+    BRANCH="${BRANCH_BASE}-${UNIQUE_SUFFIX}"
+    echo "Branch is checked out elsewhere; creating a unique branch ${BRANCH} from HEAD"
+    git worktree add --checkout "$WORKTREE_DIR" -b "$BRANCH" HEAD
+  else
+    git worktree add --checkout "$WORKTREE_DIR" "$BRANCH"
+  fi
 else
   git worktree add --checkout "$WORKTREE_DIR" -b "$BRANCH" HEAD
 fi
+
+echo "Using branch: ${BRANCH}"
 
 pushd "$WORKTREE_DIR" >/dev/null
 ROOT_DIR=$(git rev-parse --show-toplevel)
