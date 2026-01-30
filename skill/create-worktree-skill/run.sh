@@ -21,7 +21,7 @@ TIMESTAMP=$(date +"%d-%m-%y-%H-%M")
 # record repo root before creating the worktree so we can copy .worklog from the main worktree
 REPO_ROOT=$(git rev-parse --show-toplevel)
 
-WORKTREE_DIR=".worklog/tmp-worktree-${AGENT_NAME}-${TIMESTAMP}"
+WORKTREE_DIR=".worktrees/tmp-worktree-${AGENT_NAME}-${TIMESTAMP}"
 # Ensure WORKTREE_DIR is unique if it already exists (leftover from failed runs)
 if [ -e "$WORKTREE_DIR" ]; then
   UNIQUE_POSTFIX=$(date +"%s%N")
