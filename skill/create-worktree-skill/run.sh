@@ -23,8 +23,13 @@ BRANCH="feature/${WORK_ITEM_ID}-${SHORT}"
 
 echo "Creating worktree '$WORKTREE_DIR' with branch '$BRANCH'"
 
-# Create the worktree and new branch based on HEAD
-git worktree add --checkout "$WORKTREE_DIR" -b "$BRANCH" HEAD
+# If the branch already exists, check it out into the new worktree; otherwise create it from HEAD
+if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+  echo "Branch ${BRANCH} already exists; adding worktree for existing branch"
+  git worktree add --checkout "$WORKTREE_DIR" "$BRANCH"
+else
+  git worktree add --checkout "$WORKTREE_DIR" -b "$BRANCH" HEAD
+fi
 
 pushd "$WORKTREE_DIR" >/dev/null
 ROOT_DIR=$(git rev-parse --show-toplevel)
