@@ -82,8 +82,34 @@ if [ ! -d ".worklog" ]; then
     mkdir -p .worklog
     cp "${REPO_ROOT}/.worklog/config.yaml" .worklog/config.yaml
   fi
-  # Initialize local Worklog state
-  if ! wl init; then
+  # Initialize local Worklog state using parent .worklog config defaults when present
+  WL_INIT_ARGS=()
+  if [ -f "${REPO_ROOT}/.worklog/config.yaml" ]; then
+    # parse simple yaml entries (projectName, autoSync, autoExport)
+    PROJECT_NAME=$(sed -n 's/^projectName:[[:space:]]*\(.*\)$/\1/p' "${REPO_ROOT}/.worklog/config.yaml" | sed 's/^ *//;s/ *$//') || true
+    AUTO_SYNC=$(sed -n 's/^autoSync:[[:space:]]*\(.*\)$/\1/p' "${REPO_ROOT}/.worklog/config.yaml" | sed 's/^ *//;s/ *$//') || true
+    AUTO_EXPORT=$(sed -n 's/^autoExport:[[:space:]]*\(.*\)$/\1/p' "${REPO_ROOT}/.worklog/config.yaml" | sed 's/^ *//;s/ *$//') || true
+    if [ -n "$PROJECT_NAME" ]; then
+      WL_INIT_ARGS+=(--project-name "$PROJECT_NAME")
+    fi
+    if [ -n "$AUTO_SYNC" ]; then
+      # map true/false to yes/no
+      if [ "$AUTO_SYNC" = "true" ] || [ "$AUTO_SYNC" = "True" ]; then
+        WL_INIT_ARGS+=(--auto-sync yes)
+      else
+        WL_INIT_ARGS+=(--auto-sync no)
+      fi
+    fi
+    if [ -n "$AUTO_EXPORT" ]; then
+      if [ "$AUTO_EXPORT" = "true" ] || [ "$AUTO_EXPORT" = "True" ]; then
+        WL_INIT_ARGS+=(--auto-export yes)
+      else
+        WL_INIT_ARGS+=(--auto-export no)
+      fi
+    fi
+  fi
+
+  if ! wl init "${WL_INIT_ARGS[@]}"; then
     echo "wl init failed in worktree; aborting" >&2
     ls -la .worklog || true
     exit 1
@@ -111,7 +137,15 @@ else
     if [ -f ./opencode.json ]; then
       echo "Using opencode.json in worktree for init defaults"
     fi
-    if wl init; then
+    # Retry initialization with defaults from parent config if available
+    WL_INIT_ARGS=()
+    if [ -f "./.worklog/config.yaml" ]; then
+      PROJECT_NAME=$(sed -n 's/^projectName:[[:space:]]*\(.*\)$/\1/p' ./.worklog/config.yaml | sed 's/^ *//;s/ *$//') || true
+      if [ -n "$PROJECT_NAME" ]; then
+        WL_INIT_ARGS+=(--project-name "$PROJECT_NAME")
+      fi
+    fi
+    if wl init "${WL_INIT_ARGS[@]}"; then
       echo "wl init succeeded; retrying wl sync"
       if ! wl sync >"$WL_SYNC_OUT" 2>"$WL_SYNC_ERR"; then
         echo "wl sync still failing after wl init:" >&2
