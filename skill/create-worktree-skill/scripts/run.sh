@@ -2,27 +2,22 @@
 set -euo pipefail
 
 # Create Worktree Skill script (moved into scripts/)
-# Usage: ./scripts/run.sh <work-item-id> <agent-name> [short-suffix]
-# short-suffix is optional; if omitted the script will try to derive a suffix from the work-item id
+# Usage: ./scripts/run.sh <work-item-id> <agent-name>
+# The script derives a short suffix from the work-item id (final '-' segment) or uses 'it' when not present.
 
-if [ "$#" -lt 2 ]; then
-  echo "Usage: $0 <work-item-id> <agent-name> [short-suffix]"
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 <work-item-id> <agent-name>"
   exit 2
 fi
 
 WORK_ITEM_ID="$1"
 AGENT_NAME="$2"
-SHORT=""
-if [ "$#" -ge 3 ]; then
-  SHORT="$3"
+# derive suffix from work item id if it contains a final '-suffix'
+if [[ "$WORK_ITEM_ID" == *-* ]]; then
+  SHORT=${WORK_ITEM_ID##*-}
 else
-  # derive suffix from work item id if it contains a final '-suffix'
-  if [[ "$WORK_ITEM_ID" == *-* ]]; then
-    SHORT=${WORK_ITEM_ID##*-}
-  else
-    # sensible default when not present
-    SHORT=it
-  fi
+  # sensible default when not present
+  SHORT=it
 fi
 
 command -v git >/dev/null 2>&1 || { echo "git is required"; exit 1; }

@@ -1,12 +1,12 @@
 ---
 name: Create Worktree Skill
 description: |
-  Create an ephemeral, isolated worktree and branch for an agent to make a small, auditable repo change and publish it with `wl sync`.
+  Create an ephemeral, isolated worktree and branch for an agent to work on an identified issue.
 ---
 
 ## Purpose
 
-Provide a simple, deterministic way for agents to create isolated worktrees and branches so they can make small, auditable repository changes without contaminating runtime files at the repository root.
+Provide a simple, deterministic way for agents to create isolated worktrees and branches to work on an identified issue without contaminating runtime files at the repository root.
 
 ## Instructions
 
@@ -14,10 +14,9 @@ Provide a simple, deterministic way for agents to create isolated worktrees and 
    - Required inputs:
      - work_item_id (string) — the work-item id (e.g. `SA-0ML0502B21WHXDYA`)
      - agent_name (string) — short identifier for the agent (e.g. `testA`)
-   - Note: `short_suffix` is optional when invoking the script; if omitted the script derives a suffix from the work-item id or uses `it` as a default.
 
 2. Execute the skill
-   - Run the canonical script: `skill/create-worktree-skill/scripts/run.sh <work_item_id> <agent_name> [short_suffix]`
+   - Run the canonical script: `skill/create-worktree-skill/scripts/run.sh <work_item_id> <agent_name>`
 
 3. Observe outputs
    - The script prints status lines and writes diagnostics to `/tmp` on failure (e.g. `/tmp/wl_init_out`, `/tmp/wl_init_err`). It exits non-zero on unrecoverable failures.
