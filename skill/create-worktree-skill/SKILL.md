@@ -13,8 +13,7 @@ Provide a simple, deterministic way for agents to create isolated worktrees and 
 1. Prepare inputs
    - Required inputs:
      - work_item_id (string) — the work-item id (e.g. `SA-0ML0502B21WHXDYA`)
-   - Optional (recommended):
-     - agent_name (string) — short identifier for the agent (e.g. `testA`). If omitted the script derives a name from environment/git/whoami; passing an explicit agent_name is recommended for clarity and auditability.
+     - agent_name (string) — your agent name.
 
 2. Execute the skill
    - Run the canonical script: `skill/create-worktree-skill/scripts/run.sh <work_item_id> [agent_name]`

@@ -5,10 +5,9 @@ set -euo pipefail
 # Usage: ./tests/integration/agent-worktree-visibility.sh
 
 ROOT_DIR=$(pwd)
-SKILL=./skill/create-worktree-skill/run.sh
+SKILL=./skill/create-worktree-skill/scripts/run.sh
 WORK_ITEM_ID=${1:-SA-0ML0502B21WHXDYA}
 AGENT_A=testA
-SHORT_A=it
 
 TMP_A_DIR=$(mktemp -d ".worktrees/tmp-worktree-${AGENT_A}-test-XXXXXX")
 TMP_B_DIR=$(mktemp -d ".worktrees/tmp-worktree-testB-XXXXXX")
@@ -55,10 +54,10 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Running skill to create worktree and branch (Agent A)"
-"$SKILL" "$WORK_ITEM_ID" "$AGENT_A" "$SHORT_A"
+"$SKILL" "$WORK_ITEM_ID" "$AGENT_A"
 
 # Determine branch name and commit hash
-BRANCH="feature/${WORK_ITEM_ID}-${SHORT_A}"
+BRANCH="feature/${WORK_ITEM_ID}"
 if ! git show-ref --verify --quiet refs/heads/${BRANCH}; then
   echo "Branch ${BRANCH} not found in repo refs" >&2
   exit 3
