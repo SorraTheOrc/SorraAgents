@@ -5,13 +5,34 @@ set -euo pipefail
 # Usage: ./scripts/run.sh <work-item-id> <agent-name>
 # The script derives a short suffix from the work-item id (final '-' segment) or uses 'it' when not present.
 
-if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 <work-item-id> <agent-name>"
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "Usage: $0 <work-item-id> [agent-name]"
   exit 2
 fi
 
 WORK_ITEM_ID="$1"
-AGENT_NAME="$2"
+# Agent name may be provided as an optional second arg; otherwise derive it from env/git/whoami
+if [ "$#" -ge 2 ]; then
+  AGENT_NAME="$2"
+else
+  AGENT_NAME="${AGENT_NAME:-}"
+  if [ -z "$AGENT_NAME" ]; then
+    # prefer git user.name, then git user.email, then whoami, then hostname
+    GIT_NAME=$(git config user.name 2>/dev/null || true)
+    if [ -z "$GIT_NAME" ]; then
+      GIT_NAME=$(git config user.email 2>/dev/null || true)
+    fi
+    if [ -z "$GIT_NAME" ]; then
+      GIT_NAME=$(whoami 2>/dev/null || true)
+    fi
+    if [ -z "$GIT_NAME" ]; then
+      GIT_NAME=$(hostname 2>/dev/null || true)
+    fi
+    AGENT_NAME="${GIT_NAME:-agent}"
+    # sanitize: lowercase, replace non-alnum with '-', trim '-' edges
+    AGENT_NAME=$(echo "$AGENT_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g' | sed 's/^-*//;s/-*$//')
+  fi
+fi
 
 command -v git >/dev/null 2>&1 || { echo "git is required"; exit 1; }
 command -v wl >/dev/null 2>&1 || { echo "wl CLI is required"; exit 1; }
@@ -79,6 +100,15 @@ if [ ! -f ".worklog/initialized" ]; then
     if [ -n "$PREFIX" ]; then
       WL_INIT_ARGS+=(--prefix "$PREFIX")
     fi
+  fi
+
+  # Provide non-interactive defaults and repo config when available
+  if [ -f "${REPO_ROOT}/opencode.json" ]; then
+    cp "${REPO_ROOT}/opencode.json" ./opencode.json || true
+  fi
+  if [ -f "${REPO_ROOT}/.worklog/config.yaml" ]; then
+    mkdir -p .worklog
+    cp "${REPO_ROOT}/.worklog/config.yaml" .worklog/config.yaml || true
   fi
 
   if ! wl init --json "${WL_INIT_ARGS[@]}" > /tmp/wl_init_out 2>/tmp/wl_init_err; then
