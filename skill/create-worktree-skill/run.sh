@@ -33,6 +33,16 @@ BRANCH="$BRANCH_BASE"
 
 echo "Creating worktree '$WORKTREE_DIR' with branch '$BRANCH'"
 
+# Ensure repository Worklog state is published so new worktree can sync after wl init
+echo "Ensuring repository Worklog state is up-to-date (running wl sync in repo root)"
+pushd "$REPO_ROOT" >/dev/null
+if wl sync; then
+  echo "Repository wl sync succeeded"
+else
+  echo "Warning: repository wl sync failed or reported uninitialized; continuing but new worktree sync may fail" >&2
+fi
+popd >/dev/null
+
 # If the branch already exists, check it out into the new worktree; otherwise create it from HEAD
 if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
   # Branch exists. Try to add worktree for it; if it's already checked out elsewhere,
