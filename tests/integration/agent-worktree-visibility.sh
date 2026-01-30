@@ -9,6 +9,7 @@ SKILL=./skill/create-worktree-skill/scripts/run.sh
 WORK_ITEM_ID=${1:-SA-0ML0502B21WHXDYA}
 AGENT_A=testA
 
+<<<<<<< HEAD
 TMP_A_DIR=$(mktemp -d ".worktrees/tmp-worktree-${AGENT_A}-test-XXXXXX")
 TMP_B_DIR=$(mktemp -d ".worktrees/tmp-worktree-testB-XXXXXX")
 
@@ -16,6 +17,10 @@ if [ -z "$TMP_A_DIR" ] || [ -z "$TMP_B_DIR" ]; then
   echo "Failed to create unique tmp dirs" >&2
   exit 1
 fi
+=======
+TMP_A_DIR=".worktrees/tmp-worktree-${AGENT_A}-test"
+TMP_B_DIR=".worktrees/tmp-worktree-testB"
+>>>>>>> bb1b266 (Use .worktrees/ for test tmp worktree paths)
 
 cleanup() {
   echo "Cleaning up..."
