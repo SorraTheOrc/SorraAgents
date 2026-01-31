@@ -1,13 +1,13 @@
 ---
 name: status
-description: "Provide concise project / work item status and run Worklog/waif helpers to augment results. Trigger on user queries such as: 'What is the current status?', 'Status of the project?', 'What is the status of <work-item-id>?', 'audit', 'audit <work-item-id>'"
+description: "Provide concise project / work item status and run Worklog helpers to augment results. Trigger on user queries such as: 'What is the current status?', 'Status of the project?', 'What is the status of <work-item-id>?', 'audit', 'audit <work-item-id>'"
 ---
 
 # Status
 
 ## Overview
 
-Provide a concise, human-friendly summary of project status or a specific work item. When no work item id is provided, run `waif` CLI tool to summarize recent work and current work in progress. When a work item id is provided, run `wl show <work-item-id> --json` and provide a detailed explanation of that work item (title, status, assignee, description, blockers, and related links).
+Provide a concise, human-friendly summary of project status or a specific work item. When no work item id is provided, run `wl` CLI tool to summarize recent work and current work in progress. When a work item id is provided, run `wl show <work-item-id> --json` and provide a detailed explanation of that work item (title, status, assignee, description, blockers, and related links).
 
 ## When To Use
 
@@ -42,4 +42,4 @@ Provide a concise, human-friendly summary of project status or a specific work i
 ## Notes
 
 - Keep the output concise and actionable for quick human consumption.
-- Handle errors gracefully: if `waif`, `wl` or any other command is not available or return invalid JSON, present a helpful error and possible remediation steps.
+- Handle errors gracefully: if `wl` or any other command is not available or return invalid JSON, present a helpful error and possible remediation steps.
