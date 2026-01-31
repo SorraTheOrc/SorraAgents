@@ -14,7 +14,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 - The supplied <work-item-id> is $1.
   - If no valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), ask the user to provide one.
--- Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
+    -- Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
 
 ## Results and Outputs
 
@@ -51,12 +51,12 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 1. Fetch & summarise (agent responsibility)
 
 - Run `wl show <work-item-id> --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing milestone/plan info.
- - Validate that the work item is ready for planning by inspecting its `stage` field:
-  - Run `wl show <work-item-id> --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing milestone/plan info.
-  - Validate readiness by examining the work item's `stage` value:
-   - `milestones_defined` indicates it is ready for planning.
-   - `plan_complete` indicates this is a request to review the existing plan; follow the steps below but consider previous planning work.
-   - any other `stage` value suggests the work item is not currently ready for planning — ask the user how to proceed indicating that if the work item is small enough it is OK to proceed.
+- Validate that the work item is ready for planning by inspecting its `stage` field:
+- Run `wl show <work-item-id> --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing milestone/plan info.
+- Validate readiness by examining the work item's `stage` value:
+- `milestones_defined` indicates it is ready for planning.
+- `plan_complete` indicates this is a request to review the existing plan; follow the steps below but consider previous planning work.
+- any other `stage` value suggests the work item is not currently ready for planning — ask the user how to proceed indicating that if the work item is small enough it is OK to proceed.
 - Read any PRD linked in the work item or any of its parents to extract key details for later reference.
 - Derive 3–6 keywords from the work item title/description to search the repo and work items for related work. Present any likely duplicates or parent/child relationships.
 
@@ -81,10 +81,10 @@ Keep asking questions until the breakdown into features is clear.
   - **Prototype / Experiment** (optional; include success thresholds)
   - **Dependencies** (other features or explicit external factors)
   - **Deliverables** (artifacts: docs, tests, demo script, telemetry)
-  - **Tasks to create** (at least: implementation, tests, docs; infra/ops if applicable)
+  - **Sub-Tasks to create** (zero or more implementation sub-tasks needed to deliver the feature)
 
 - Each of the features should clearly identify how the player experience will be changed by the feature and what acceptance critera are required to validate it.
- - Each of the features should clearly identify how the user experience will be changed by the feature and what acceptance criteria are required to validate it.
+- Each of the features should clearly identify how the user experience will be changed by the feature and what acceptance criteria are required to validate it.
 
 - Present the draft as a numbered list and ask the user to: accept, edit titles/scopes, reorder, or split/merge features.
 - If the user requests changes, iterate until the feature list is approved.
@@ -118,8 +118,8 @@ Keep asking questions until the breakdown into features is clear.
 
 5. Update work items (agent)
 
- - Create child work items for each feature with a parent link to the original work item:
-  - `wl create "<Short Title>" --description "<Full feature description>" --parent <work-item-id> -t feature --priority P2 --stage idea --validate --json`
+- Create child work items for each feature with a parent link to the original work item:
+- `wl create "<Short Title>" --description "<Full feature description>" --parent <work-item-id> -t feature --priority P2 --stage idea --validate --json`
 - Add optional tasks (only if needed): Infra/Ops, UX, Security review.
 - Create dependency edges between feature work items where the plan specifies dependencies:
   - `wl dep add <DependentFeatureId> <PrereqFeatureId>`
@@ -130,7 +130,7 @@ Keep asking questions until the breakdown into features is clear.
 
 - Add a comment to the planned work item:
   - `wl comments add $1 "Planning Complete. <Summary of the approved feature list, any open questions that remain>" --actor @your-agent-name --json`
--- Update the planned work item's stage to indicate planning is complete:
+    -- Update the planned work item's stage to indicate planning is complete:
   - `wl update $1 --stage plan_complete --json`
 
 ## Traceability & idempotence
@@ -150,15 +150,16 @@ Keep asking questions until the breakdown into features is clear.
 ## Finishing steps (must do)
 
 -- On the parent work item set the work item's stage to `plan_complete`:
-  `wl update <work-item-id> --stage plan_complete --json`
+`wl update <work-item-id> --stage plan_complete --json`
+
 - Run `wl sync` to sync work item changes.
 - Run `wl show <work-item-id>` (not --json) to show the entire work item.
 - End with: "This completes the Plan process for <work-item-id>".
   - On the parent work item set the machine-readable `stage` field to `plan_complete`:
     `wl update <work-item-id> --stage plan_complete --json`
- - Run `wl sync` to sync work item changes.
- - Run `wl show <work-item-id>` (without `--json`) to display the entire work item.
- - End with: "This completes the Plan process for <work-item-id>".
+- Run `wl sync` to sync work item changes.
+- Run `wl show <work-item-id>` (without `--json`) to display the entire work item.
+- End with: "This completes the Plan process for <work-item-id>".
 
 ## Examples
 
