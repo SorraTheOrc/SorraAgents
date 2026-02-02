@@ -65,7 +65,7 @@ Record the initial feature or project idea in a tracking work-item. This work-it
 
 - **Motivation:** capture the initial thought or requirement that sparked the idea, as quickly as possible.
 - **Acceptance Criteria:** a single work item with idea title and a brief description of the idea.
-- **Status Label:** `idea`
+- **Status Tag:** `idea`
 - **Useful Commands:**
   - `wl create -t "<Project Title>" -d "<Brief Description>"`
   - optionally add a parent work-item ID to link to a larger initiative (`--parent <Parent Work-Item ID>`).
@@ -77,7 +77,7 @@ For smaller features that do not require a full PRD, expand the initial idea int
 
 - **Motivation:** describe the problem being solved and why it matters to users.
 - **Acceptance Criteria:** work-item contains a clear understanding of the feature's purpose and requirements.
-- **Status Label:** `intake_complete`
+- **Status Tag:** `intake_complete`
 - **Useful Commands:**
   - `/intake <Work-Item ID>`
 - **Next Step:** proceed to the `Define Milestones` step.
@@ -88,7 +88,7 @@ Expand the initial idea into a comprehensive Project Requirements Document (PRD)
 
 - **Motivation:** describe the problem being solved and why it matters to users.
 - **Acceptance Criteria:** work-item contains a clear understanding of the feature's purpose and requirements.
-- **Status Label:** `intake_complete`
+- **Status Tag:** `intake_complete`
 - **Useful Commands:**
   - `/intake <Work-Item ID>`
 - **Next Step:** proceed to the `Define Milestones` step.
@@ -96,7 +96,7 @@ Expand the initial idea into a comprehensive Project Requirements Document (PRD)
 - **Success signals:** precise, automatable metrics and baseline measurements to evaluate the outcome.
 - **Constraints:** timeline, budget, compatibility, and regulatory limits that affect tradeoffs.
 - **Top risks:** short list of the highest-impact uncertainties and a proposed first-mitigation.
-- **Status Label:** `intake_complete`
+- **Status Tag:** `intake_complete`
 
 Agent Commands:
 
@@ -112,7 +112,7 @@ Map the end-to-end user outcomes into one or more master epics that represent de
 - **Outcome map:** list the user flows the epic must enable and the acceptance criteria at the epic level.
 - **Milestones:** define at least one short feedback milestone (M0) and one fuller delivery milestone (M1).
 - **Ownership:** assign an owner for PM, engineering, infra, security and UX per epic.
-- **Status Label:** `milestones_defined`
+- **Status Tag:** `milestones_defined`
 
 Agent Commands:
 
@@ -127,7 +127,7 @@ Break each epic into discrete features: each feature should have a concise accep
 - **Acceptance:** expressable, pass/fail acceptance criteria suitable for automated tests or a short manual checklist.
 - **Prototype:** when assumptions are risky, describe a lightweight experiment (fake-API, mock UI, A/B) and success thresholds.
  - **Taskization:** create `wl` tasks for implementation, infra, docs, and tests; link to the PRD and epic.
-- **Status Label:** `plan_complete`
+- **Status Tag:** `plan_complete`
 
 Tackle a single Milestone/Epic at a time. Do not attempt to decompose more than one epic at a timte. This allows each milestone to feed into the next, correcting any poor assumptiosn made in previous steps.
 
@@ -143,7 +143,7 @@ Implement each feature one at a time. Each issue will have a set of child tasks 
 
 - **Complete slice:** include code, unit/integration tests, CI configuration, deployment config, runtime observability (metrics/logs), and a rollback/feature-flag plan.
 - **Demo-ready:** each slice should be deployable to a staging environment and demoable with a short script.
-- **Status Label:** `in_progress`
+- **Status Tag:** `in_progress`
 
 Agent Commands:
 
@@ -160,13 +160,13 @@ Review each Pull Request for completeness, correctness, and adherence to the PRD
 - **Automated checks:** ensure all tests pass, coverage gates are met, and lint/build checks succeed.
 - **Human review:** verify the implementation meets the acceptance criteria and includes necessary documentation and observability.
 - **Merge:** once approved, merge the PR and deploy to staging/production as per the deployment plan.
-- **Status Label:** `in_review`
+- **Status Tag:** `in_review`
 
 ### Cleanup (Agent Step)
 
 After merging the PR, clean up the repository by closing the work-item, removing temporary files, checking out and updating `main`, and deleting local and remote branches.
 
-- **Status Label:** `done`
+- **Status Tag:** `done`
 
 Agent Commands:
 

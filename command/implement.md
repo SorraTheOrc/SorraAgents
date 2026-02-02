@@ -1,10 +1,13 @@
-  ---
-  description: Implement a Worklog work item
+---
+
+description: Implement a Worklog work item
 tags:
-  - workflow
-  - implement
-agent: patch
-subtask: true
+
+- workflow
+- implement
+  agent: patch
+  subtask: true
+
 ---
 
 # Implement
@@ -62,7 +65,7 @@ Live context commands (use to gather runtime state)
 1. Understand the work item
 
 - Claim by running `wl update $1 --status in_progress --stage in_progress --assignee "@AGENT" --json` (omit `--assignee` if not applicable).
-- Fetch the work item JSON if not already present: `wl show $1 --json` and `wl show $1 --thread --refs --json`.
+- Fetch the work item JSON if not already present: `wl show $1 --json` and `wl show $1 -F full --refs --json`.
 - Restate acceptance criteria and constraints from the work item JSON.
 - Surface blockers, dependencies and missing requirements.
 - Inspect linked PRDs, plans or docs referenced in the work item.

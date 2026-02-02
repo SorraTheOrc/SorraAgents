@@ -1,15 +1,27 @@
 {
     "$schema": "https://opencode.ai/config.json",
     "provider": {
-        "foundry-local": { 
-            "name": "Local Models (NPU)",
+        "llama-local": { 
+            "name": "Local Models (LLama)",
             "npm": "@ai-sdk/openai-compatible",
             "options": {
-                "baseUrl": "http://192.168.176.1:8002/v1"
+                "baseURL": "http://192.168.88.5:8080/v1"
+            },
+            "models": {
+                "Qwen2.5-Coder-32B-Instruct-GGUF": {
+                    "name": "Qwen 2.5 32B (local)"
+                }
+            }
+        },
+        "foundry-local": { 
+            "name": "Local Models (Foundry)",
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {
+                "baseURL": "http://192.168.176.1:8002/v1"
             },
             "models": {
                 "qwen2.5-7b-instruct-qnn-npu:2": {
-                    "name": "Qwen 2.5 (local npu)"
+                    "name": "Qwen 2.5 7b (local npu)"
                 }
             } 
         }

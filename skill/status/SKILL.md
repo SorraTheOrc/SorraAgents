@@ -27,7 +27,7 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 4. If a work item id is provided:
 
-- Run `wl show <work-item-id> --json` and `wl show <work-item-id> --thread --refs --json` to fetch work item details.
+- Run `wl show <work-item-id> --json` and `wl show <work-item-id> -F full --refs --json` to fetch work item details (with all comments).
 - Parse and present: title, status, assignee, priority, description, blockers, dependencies, summary of all comments, and relevant links.
 - Walk through all open and in-progress subtasks, children, and blockers, summarizing their status as well.
   - Never skip any related work item that is open or in-progress.

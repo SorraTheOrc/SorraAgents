@@ -43,7 +43,7 @@ Each command entry uses the following fields:
 - `post`: list of invariant names that must pass after the transition is applied.
 - `inputs`: optional schema-like object describing required arguments (names, types, required/optional, enums).
 - `prompt_ref`: optional path to a versioned prompt template (e.g., `prompts/command-name.md`); template variables must correspond to `inputs` for validation.
-- `effects`: optional additional side effects to assert/emit (e.g., labels to add/remove, events to emit, audit tags such as prompt hash, `agent_id`, chosen model, response IDs, trace/event hooks). These are descriptive; executors decide how to implement.
+- `effects`: optional additional side effects to assert/emit (e.g., tags to add/remove, events to emit, audit tags such as prompt hash, `agent_id`, chosen model, response IDs, trace/event hooks). These are descriptive; executors decide how to implement.
 - Naming convention: commands should be imperative verbs describing the action (e.g., `intake`, `plan`, `approve`), not the resulting state.
 
 ## Invariant Definition Shape
@@ -116,7 +116,7 @@ commands:
     inputs:
       summary: { type: string, required: true }
     effects:
-      add_labels: [intake]
+      add_tags: [intake]
   author_prd:
     description: Produce PRD draft and link it
     from: [intake]
@@ -139,7 +139,7 @@ commands:
     to: building
     actor: Developer
     effects:
-      add_labels: [in_progress]
+      add_tags: [in_progress]
   block:
     description: Mark item as blocked with reason
     from:
