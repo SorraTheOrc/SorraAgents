@@ -1,12 +1,10 @@
 ---
-
 description: Implement a Worklog work item
 tags:
-
-- workflow
-- implement
-  agent: patch
-  subtask: true
+  - workflow
+  - implement
+agent: patch
+subtask: true
 
 ---
 
