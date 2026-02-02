@@ -22,23 +22,62 @@ Blocking decision algorithm
 3. Select the blocker as the work item in the overlap group with the highest `sortIndex` value. If multiple items share the same `sortIndex`, select the one with the earliest `createdAt` timestamp.
 4. For each non-blocker in the group create a dependency relation that marks it as blocked by the blocker and add a comment with the canonical format (see CLI examples). Do not convert items into parent/child relationships.
 
+Dependency recording & comment format
+-------------------------------
+
+When the automation records a blocking decision it must perform two actions (in this order, when permissions allow):
+
+1) Create the WorkLog dependency edge (or record the intended action in the report if permission is not available).
+   - Example CLI / API intent: `wl dep add <blockedId> <blockerId>` (or equivalent API call).
+2) Post a human-readable comment on the blocked work item describing the reason and unblock criteria.
+
+Canonical comment template (use exact phrasing for idempotence):
+
+"Blocked by automation: <blockerId> — reason: overlapping exact file path(s): <path1>, <path2>."
+
+Example:
+
+```
+Blocked by automation: SA-0ML4EDHTD09ZZD7Y — reason: overlapping exact file path(s): src/config.yaml.
+```
+
+When the automation cannot create an edge due to permissions, post a clear actionable comment instead:
+
+```
+Detected intended dependency: SA-0ML4EE9NH05OG9TI <- SA-0ML4EE9SQ1I39EZ3
+Action skipped: automation lacks permission to create dependency edges. Please run: wl dep add <blocked> <blocker>
+```
+
 CLI behaviour & reporting
 -------------------------
 - Command: `/plan` (existing driver) — accepts a work item id or implied parent context.
-- Report: deterministic, machine-readable summary and human-readable summary. Example human output:
+- Report: deterministic machine-readable summary and concise human summary. Example human output:
 
 ```
 Detected 2 overlaps:
 - overlap: src/config.yaml
-  - blocker: SA-0AAA111 (priority: high, createdAt: 2026-01-01T00:00Z)
+  - blocker: SA-0AAA111 (sortIndex: 200, createdAt: 2026-01-01T00:00Z)
   - blocked: SA-0BBB222, SA-0CCC333
 Actions taken: added 2 dependency edges, added 2 comments.
 ```
 
-CLI idempotence rules
----------------------
- - Before creating a `wl dep` edge or posting a comment, the automation must detect existing edges/comments created by itself (match by exact comment text) and skip if present.
-- When updating the parent work item with a generated Milestones/Plan block, replace the content between explicit markers: `<!-- PLAN:START -->` and `<!-- PLAN:END -->`.
+Idempotence notes (practical guidance)
+-------------------------------------
+- Match exact canonical comment text before posting a comment to avoid duplicates; use the canonical template above.
+- When possible, inspect the WorkLog API for existing dependency references before issuing `wl dep add`. If the API surface is limited, rely on exact comment matching and the generated parent block state to detect prior runs.
+- Re-running `/plan` on an unchanged parent should be a no-op and return "no changes".
+
+Example dependency graph excerpt (human-readable):
+
+```
+SA-0ML4EDHTD09ZZD7Y (Spec & Design)
+  └─ SA-0ML4EE9NH05OG9TI (Detection Engine) [blocked by SA-0ML4EDHTD09ZZD7Y]
+  └─ SA-0ML4EE9SQ1I39EZ3 (Dependency Recording) [blocked by SA-0ML4EE9NH05OG9TI]
+```
+
+Cross-epic handling
+-------------------
+- When overlaps span different parent epics, each parent run should detect and record the overlap in its generated report. Do not automatically create cross-epic dependency edges unless an explicit configuration/option is provided to enable cross-epic blocking.
 
 Acceptance tests (definition)
 -----------------------------
