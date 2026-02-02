@@ -43,7 +43,7 @@ You are helping the team design a **comprehensive automated test plan** that foc
 - Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for context.
 - Fetch and read the feature work item details using Worklog CLI: `wl show <work-item-id> --json` and treat the work item description, acceptance criteria, and any referenced artifacts as authoritative seed intent.
 - Ensure you have identified the **test implementation work item** to use for creating test-case children (see Quick Inputs, above).
-- Prepend a short “Seed Context” block to the interview that includes the fetched work item title, type, current labels, one-line description, and whether a test implementation work item was found or selected.
+- Prepend a short “Seed Context” block to the interview that includes the fetched work item title, type, current tags, one-line description, and whether a test implementation work item was found or selected.
 
 ## Process (must follow)
 
@@ -107,7 +107,7 @@ After draft approval, run five review iterations. Each review MUST provide a new
 
 - Determine the **test implementation work item** (`<testWorkItemId>`). If not confidently resolved, stop and ask the user.
 - Create child work items (type: task) for each approved test case under `<testWorkItemId>`:
-  - `wl create "Test Case: <Short Title>" --description "<Test case details including Preconditions/Data, Steps, Expected Results, Automation Level, Tooling, Mocking vs real, Coverage tags, ## Acceptance Criteria>" --parent <testWorkItemId> -t task --json --labels "test-case,test" --priority P1 --assignee Probe --validate`
+  - `wl create "Test Case: <Short Title>" --description "<Test case details including Preconditions/Data, Steps, Expected Results, Automation Level, Tooling, Mocking vs real, Coverage tags, ## Acceptance Criteria>" --parent <testWorkItemId> -t task --json --tags "test-case,test" --priority P1 --assignee Probe --validate`
 
   Note: this command includes an explicit assignee following repository conventions: tests are assigned to Probe. If the test case represents a different type (e.g., performance or infra), override assignee after creation with `wl update`.
 
