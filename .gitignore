@@ -30,3 +30,6 @@ bun.lock
 .worklog/worklog-data.jsonl
 .worklog/tmp-worktree-*
 .worktrees/
+
+__pycache__/
+*.pyc
