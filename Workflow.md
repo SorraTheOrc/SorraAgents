@@ -126,7 +126,7 @@ Break each epic into discrete features: each feature should have a concise accep
 
 - **Acceptance:** expressable, pass/fail acceptance criteria suitable for automated tests or a short manual checklist.
 - **Prototype:** when assumptions are risky, describe a lightweight experiment (fake-API, mock UI, A/B) and success thresholds.
- - **Taskization:** create `wl` tasks for implementation, infra, docs, and tests; link to the PRD and epic.
+- **Taskization:** avoid creating separate child tasks by default; instead include implementation, tests, and docs in the feature’s acceptance criteria and deliverables. Only create child tasks when the feature is too large for a single task, or when a dependency or cross-team handoff requires it.
 - **Status Tag:** `plan_complete`
 
 Tackle a single Milestone/Epic at a time. Do not attempt to decompose more than one epic at a timte. This allows each milestone to feed into the next, correcting any poor assumptiosn made in previous steps.
