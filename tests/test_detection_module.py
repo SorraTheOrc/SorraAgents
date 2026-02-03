@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 
 # Ensure repository root is on PYTHONPATH for test discovery of `plan` package
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from plan import detection
