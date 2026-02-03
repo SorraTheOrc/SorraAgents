@@ -38,7 +38,7 @@ You are helping the team define a clear, actionable milestone plan for work trac
 - Fetch and read the work item details using Worklog CLI: `wl show $1 --json` and treat the work item description and any referenced artifacts as authoritative seed intent.
 - Read any documents or work items referenced in the work item description, comments or external references.
 - If `wl` is unavailable or the work item cannot be found, fail fast and ask the user to provide a valid work item id or paste the work item content.
-- Prepend a short “Seed Context” block to the interview that includes the fetched work item title, type, current labels, and one-line description.
+- Prepend a short “Seed Context” block to the interview that includes the fetched work item title, type, current tags, and one-line description.
 
 ## Process (must follow)
 
@@ -103,7 +103,7 @@ After the user approves the milestone list, run five review iterations. Each rev
 5. Create work items (agent)
 
 - Create child work items (type: epic) for each milestone with a parent link to the original work item:
-  - `wl create "<Short Title>" --description "Description>" --parent $1 -t epic --json --labels "milestone" --priority P1 --assignee Build --validate`
+  - `wl create "<Short Title>" --description "Description>" --parent $1 -t epic --json --tags "milestone" --priority P1 --assignee Build --validate`
 
   Note: milestone epics are assigned to Build by default per repository conventions. If a different owner is requested, update the work item after creation with `wl update`.
 

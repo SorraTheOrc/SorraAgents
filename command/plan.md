@@ -44,7 +44,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 - Fetch and read the work item details using Worklog CLI: `wl show <work-item-id> --json` and treat the work item description and any referenced artifacts as authoritative seed intent.
 - Pay particular attention to any PRD referenced in this work item or any of its parent work items.
 - If `wl` is unavailable or the work item cannot be found, fail fast and ask the user to provide a valid <work-item-id> or paste the work item content.
-- Prepend a short “Seed Context” block to the interview that includes the fetched work item title, type, current labels, and one-line description.
+- Prepend a short “Seed Context” block to the interview that includes the fetched work item title, type, current tags, and one-line description.
 
 ## Process (must follow)
 

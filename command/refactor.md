@@ -79,5 +79,5 @@ This command will create zero or more Worklog work items at the root of the proj
    - Tests that will validate behavior remains unchanged.
      - Recommendations for improving existing tests if coverage is insufficient.
    - A rationale explaining why this change improves the code.
-   - Labels: `refactor` plus any relevant module/component tags.
+   - Tags: `refactor` plus any relevant module/component tags.
    - Priority (1, 2, or 3).

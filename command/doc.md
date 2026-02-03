@@ -221,7 +221,7 @@ Review stages:
 
 - Set the docs task work item's stage to indicate docs drafting is complete:
   `wl update $1 --stage docs_drafted --json` (leave other fields intact).
-- Optionally set the parent feature's stage or add a human-readable label if desired; prefer using `--stage` for machine-readable state transitions.
+- Optionally set the parent feature's stage or add a human-readable tag if desired; prefer using `--stage` for machine-readable state transitions.
 - Run `wl sync` to sync work item changes.
 - Run `wl show $1` (not --json) to show the entire work item.
 - End with: "This completes the Documentation process for $1".
