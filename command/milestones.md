@@ -127,7 +127,8 @@ After the user approves the milestone list, run five review iterations. Each rev
 ## Finishing steps (must do)
 
 -- On the parent work item clear the previous stage and set the new stage using the stage flag:
-  `wl update <work-item-id> --stage milestones_defined --json`
+`wl update <work-item-id> --stage milestones_defined --json`
+
 - If child work items were created, print their ids and add a short changelog entry to the parent work item.
 - Run `wl sync` to sync work item changes.
 - Run `wl show <parentWorkItemId>` (not --json) to show the entire work item.
