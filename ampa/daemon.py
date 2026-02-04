@@ -14,6 +14,7 @@ import os
 import socket
 import time
 from typing import Any, Dict, Optional
+import tempfile
 
 try:
     # optional dependency for .env file parsing
@@ -35,7 +36,15 @@ def get_env_config() -> Dict[str, Any]:
     # override the environment. Loading is optional; if python-dotenv is not
     # installed we skip loading the file.
     env_path = os.path.join(os.path.dirname(__file__), ".env")
-    if load_dotenv and find_dotenv:
+    # Allow callers/tests to disable loading the package .env file by setting
+    # AMPA_LOAD_DOTENV=0. By default the package .env is loaded when python-dotenv
+    # is available and a package-local .env exists. Note: .env values override
+    # the environment per user request.
+    if (
+        os.getenv("AMPA_LOAD_DOTENV", "1").lower() in ("1", "true", "yes")
+        and load_dotenv
+        and find_dotenv
+    ):
         # prefer package-local .env when present
         pkg_env = find_dotenv(env_path, usecwd=True)
         if pkg_env:
@@ -46,21 +55,16 @@ def get_env_config() -> Dict[str, Any]:
         LOG.error("AMPA_DISCORD_WEBHOOK is not set; cannot send heartbeats")
         raise SystemExit(2)
 
-    # Default heartbeat interval is 60 minutes (long-running daemon)
-    minutes_raw = os.getenv("AMPA_HEARTBEAT_MINUTES", "60")
+    minutes_raw = os.getenv("AMPA_HEARTBEAT_MINUTES", "1")
     try:
         minutes = int(minutes_raw)
         if minutes <= 0:
             raise ValueError("must be positive")
     except Exception:
-        LOG.warning(
-            "Invalid AMPA_HEARTBEAT_MINUTES=%r, falling back to 60", minutes_raw
-        )
-        minutes = 60
+        LOG.warning("Invalid AMPA_HEARTBEAT_MINUTES=%r, falling back to 1", minutes_raw)
+        minutes = 1
 
-    work_item = os.getenv("AMPA_WORKITEM_ID")
-
-    return {"webhook": webhook, "minutes": minutes, "work_item": work_item}
+    return {"webhook": webhook, "minutes": minutes}
 
 
 def build_payload(
@@ -85,7 +89,25 @@ def build_payload(
     return payload
 
 
-def send_webhook(url: str, payload: Dict[str, Any], timeout: int = 10) -> int:
+def _read_state(path: str) -> Dict[str, str]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _write_state(path: str, data: Dict[str, str]) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except Exception:
+        LOG.exception("Failed to write state file %s", path)
+
+
+def send_webhook(
+    url: str, payload: Dict[str, Any], timeout: int = 10, message_type: str = "other"
+) -> int:
     """Send the webhook payload using requests.
 
     Returns HTTP status code on success. Raises RuntimeError if requests
@@ -97,6 +119,9 @@ def send_webhook(url: str, payload: Dict[str, Any], timeout: int = 10) -> int:
         LOG.error("requests package is required to send webhook: %s", exc)
         raise RuntimeError("requests missing") from exc
 
+    state_file = os.getenv("AMPA_STATE_FILE") or os.path.join(
+        tempfile.gettempdir(), "ampa_state.json"
+    )
     try:
         resp = requests.post(url, json=payload, timeout=timeout)
         try:
@@ -107,11 +132,43 @@ def send_webhook(url: str, payload: Dict[str, Any], timeout: int = 10) -> int:
                 resp.status_code,
                 getattr(resp, "text", ""),
             )
+            # record attempted send
+            _write_state(
+                state_file,
+                {
+                    "last_message_ts": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
+                    "last_message_type": message_type,
+                },
+            )
             return resp.status_code
         LOG.info("Webhook POST succeeded: %s", resp.status_code)
+        _write_state(
+            state_file,
+            {
+                "last_message_ts": datetime.datetime.now(
+                    datetime.timezone.utc
+                ).isoformat(),
+                "last_message_type": message_type,
+            },
+        )
         return resp.status_code
     except Exception as exc:
         LOG.error("Webhook POST exception: %s", exc)
+        # record attempted send even on exception
+        try:
+            _write_state(
+                state_file,
+                {
+                    "last_message_ts": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
+                    "last_message_type": message_type,
+                },
+            )
+        except Exception:
+            LOG.debug("Failed to record state after exception")
         raise
 
 
@@ -122,11 +179,62 @@ def run_once(config: Dict[str, Any]) -> int:
     """
     hostname = socket.gethostname()
     ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    payload = build_payload(hostname, ts, config.get("work_item"))
-    LOG.info(
-        "Sending heartbeat for host=%s work_item=%s", hostname, config.get("work_item")
+    payload = build_payload(hostname, ts, None)
+    LOG.info("Evaluating whether to send heartbeat for host=%s", hostname)
+
+    state_file = os.getenv("AMPA_STATE_FILE") or os.path.join(
+        tempfile.gettempdir(), "ampa_state.json"
     )
-    return send_webhook(config["webhook"], payload)
+    state = _read_state(state_file)
+    last_message_ts = None
+    last_message_type = None
+    last_heartbeat_ts = None
+    try:
+        if "last_message_ts" in state:
+            last_message_ts = datetime.datetime.fromisoformat(state["last_message_ts"])
+    except Exception:
+        last_message_ts = None
+    try:
+        if "last_message_type" in state:
+            last_message_type = state["last_message_type"]
+    except Exception:
+        last_message_type = None
+    try:
+        if "last_heartbeat_ts" in state:
+            last_heartbeat_ts = datetime.datetime.fromisoformat(
+                state["last_heartbeat_ts"]
+            )
+    except Exception:
+        last_heartbeat_ts = None
+
+    # Only send the heartbeat if no "other" message has been sent since the last heartbeat.
+    if (
+        last_heartbeat_ts is not None
+        and last_message_ts is not None
+        and last_message_type != "heartbeat"
+    ):
+        if last_message_ts > last_heartbeat_ts:
+            LOG.info(
+                "Skipping heartbeat: other message sent since last heartbeat (last_message=%s)",
+                state.get("last_message_ts"),
+            )
+            return 0
+
+    # Send heartbeat and update heartbeat timestamp
+    status = send_webhook(config["webhook"], payload, message_type="heartbeat")
+    try:
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _write_state(
+            state_file,
+            {
+                "last_heartbeat_ts": now_iso,
+                "last_message_ts": now_iso,
+                "last_message_type": "heartbeat",
+            },
+        )
+    except Exception:
+        LOG.exception("Failed to update state after heartbeat")
+    return status
 
 
 def main() -> None:
