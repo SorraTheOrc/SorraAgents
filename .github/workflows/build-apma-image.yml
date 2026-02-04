@@ -7,7 +7,7 @@ on:
       - master
   pull_request:
     paths:
-      - 'APMA/**'
+      - 'ampa/**'
 
 jobs:
   build-apma-image:
@@ -26,8 +26,8 @@ jobs:
       - name: Build APMA image
         uses: docker/build-push-action@v4
         with:
-          context: ./APMA
-          file: ./APMA/Dockerfile
+          context: ./ampa
+          file: ./ampa/Dockerfile
           push: false
           tags: ampa-daemon:ci-${{ github.run_id }}
 

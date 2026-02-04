@@ -56,7 +56,14 @@ def get_env_config() -> Dict[str, Any]:
         if pkg_env:
             load_dotenv(pkg_env, override=True)
 
+    # Read webhook and be tolerant of values coming from Docker `--env-file`
+    # which preserve surrounding quotes. Strip whitespace and surrounding
+    # single/double quotes so both dotenv and Docker env-file formats work.
     webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+    if webhook:
+        webhook = webhook.strip()
+        # remove surrounding quotes if present
+        webhook = webhook.strip('"\'"')
     if not webhook:
         LOG.error("AMPA_DISCORD_WEBHOOK is not set; cannot send heartbeats")
         raise SystemExit(2)
