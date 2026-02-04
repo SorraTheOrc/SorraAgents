@@ -12,7 +12,9 @@ build:
 		chmod 700 "$$XDG_RUNTIME_DIR"; \
 	fi; \
 	if command -v podman >/dev/null 2>&1; then \
-		podman build -t ampa-daemon:local .; \
+		# Use chroot isolation for rootless environments to avoid sd-bus/permission
+		# errors when running tools like useradd during image build.
+		podman build --isolation chroot -t ampa-daemon:local .; \
 	else \
 		docker build -t ampa-daemon:local .; \
 	fi
