@@ -46,14 +46,17 @@ def get_env_config() -> Dict[str, Any]:
         LOG.error("AMPA_DISCORD_WEBHOOK is not set; cannot send heartbeats")
         raise SystemExit(2)
 
-    minutes_raw = os.getenv("AMPA_HEARTBEAT_MINUTES", "1")
+    # Default heartbeat interval is 60 minutes (long-running daemon)
+    minutes_raw = os.getenv("AMPA_HEARTBEAT_MINUTES", "60")
     try:
         minutes = int(minutes_raw)
         if minutes <= 0:
             raise ValueError("must be positive")
     except Exception:
-        LOG.warning("Invalid AMPA_HEARTBEAT_MINUTES=%r, falling back to 1", minutes_raw)
-        minutes = 1
+        LOG.warning(
+            "Invalid AMPA_HEARTBEAT_MINUTES=%r, falling back to 60", minutes_raw
+        )
+        minutes = 60
 
     work_item = os.getenv("AMPA_WORKITEM_ID")
 
