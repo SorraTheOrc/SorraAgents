@@ -28,4 +28,6 @@ RUN chown -R 1000:1000 /opt/ampa
 USER 1000
 
 EXPOSE 8080
-CMD ["/opt/ampa/.venv/bin/python", "-u", "./ampa_daemon.py"]
+# Run the package module so we use the package entrypoint (ampa.daemon)
+# Using the module ensures the correct file inside the package is executed.
+CMD ["/opt/ampa/.venv/bin/python", "-u", "-m", "ampa.daemon"]
