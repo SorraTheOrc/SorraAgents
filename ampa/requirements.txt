@@ -1,2 +1,5 @@
-requests
-python-dotenv
+requests>=2.30.0
+prometheus_client>=0.16.0
+
+# dev
+pytest>=7.0.0
