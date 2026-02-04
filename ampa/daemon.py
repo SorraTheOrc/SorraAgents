@@ -15,6 +15,13 @@ import socket
 import time
 from typing import Any, Dict, Optional
 
+try:
+    # optional dependency for .env file parsing
+    from dotenv import load_dotenv, find_dotenv
+except Exception:  # pragma: no cover - optional behavior
+    load_dotenv = None
+    find_dotenv = None
+
 LOG = logging.getLogger("ampa.daemon")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -24,6 +31,16 @@ def get_env_config() -> Dict[str, Any]:
 
     Raises SystemExit (2) if AMPA_DISCORD_WEBHOOK is not set.
     """
+    # If an .env file exists in the ampa package, load it so values there
+    # override the environment. Loading is optional; if python-dotenv is not
+    # installed we skip loading the file.
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if load_dotenv and find_dotenv:
+        # prefer package-local .env when present
+        pkg_env = find_dotenv(env_path, usecwd=True)
+        if pkg_env:
+            load_dotenv(pkg_env, override=True)
+
     webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
     if not webhook:
         LOG.error("AMPA_DISCORD_WEBHOOK is not set; cannot send heartbeats")
