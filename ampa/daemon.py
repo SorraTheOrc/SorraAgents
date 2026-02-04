@@ -23,6 +23,12 @@ except Exception:  # pragma: no cover - optional behavior
     load_dotenv = None
     find_dotenv = None
 
+# import requests at module level so tests can monkeypatch ampa.daemon.requests.post
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None
+
 LOG = logging.getLogger("ampa.daemon")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -113,11 +119,9 @@ def send_webhook(
     Returns HTTP status code on success. Raises RuntimeError if requests
     is not available.
     """
-    try:
-        import requests
-    except Exception as exc:  # pragma: no cover - environment dependent
-        LOG.error("requests package is required to send webhook: %s", exc)
-        raise RuntimeError("requests missing") from exc
+    if requests is None:
+        LOG.error("requests package is required to send webhook")
+        raise RuntimeError("requests missing")
 
     state_file = os.getenv("AMPA_STATE_FILE") or os.path.join(
         tempfile.gettempdir(), "ampa_state.json"
