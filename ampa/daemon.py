@@ -1,9 +1,8 @@
-"""Core Heartbeat Sender (minimal implementation).
+"""AMPA package entry points and core heartbeat sender.
 
-Reads env vars and posts a heartbeat payload to a Discord webhook URL.
-
-This module is intentionally small and structured so its formatting and
-env-var handling can be unit-tested without performing network calls.
+This module contains the same functionality as the top-level script but is
+packaged under the `ampa` Python package so it can be imported in tests and
+installed if needed.
 """
 
 from __future__ import annotations
@@ -13,23 +12,21 @@ import json
 import logging
 import os
 import socket
-import sys
 import time
 from typing import Any, Dict, Optional
 
-LOG = logging.getLogger("ampa_daemon")
+LOG = logging.getLogger("ampa.daemon")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 def get_env_config() -> Dict[str, Any]:
     """Read and validate environment configuration.
 
-    Exits with non-zero status if AMPA_DISCORD_WEBHOOK is not set.
+    Raises SystemExit (2) if AMPA_DISCORD_WEBHOOK is not set.
     """
     webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
     if not webhook:
         LOG.error("AMPA_DISCORD_WEBHOOK is not set; cannot send heartbeats")
-        # Exit with non-zero status per acceptance criteria.
         raise SystemExit(2)
 
     minutes_raw = os.getenv("AMPA_HEARTBEAT_MINUTES", "1")
@@ -51,8 +48,7 @@ def build_payload(
 ) -> Dict[str, Any]:
     """Build a Discord webhook payload (embed format) for a heartbeat.
 
-    The exact embed structure is minimal but includes hostname, ISO timestamp
-    and the optional work item id.
+    The embed includes hostname, ISO timestamp and the optional work item id.
     """
     embed = {
         "title": "AMPA Heartbeat",
@@ -70,10 +66,10 @@ def build_payload(
 
 
 def send_webhook(url: str, payload: Dict[str, Any], timeout: int = 10) -> int:
-    """Send the webhook payload using requests if available.
+    """Send the webhook payload using requests.
 
-    Returns HTTP status code on success.
-    Raises RuntimeError if the requests package is not installed or network call fails.
+    Returns HTTP status code on success. Raises RuntimeError if requests
+    is not available.
     """
     try:
         import requests
@@ -102,7 +98,7 @@ def send_webhook(url: str, payload: Dict[str, Any], timeout: int = 10) -> int:
 def run_once(config: Dict[str, Any]) -> int:
     """Send a single heartbeat using the provided config.
 
-    Returns the HTTP status code (0 indicates that no HTTP call was made).
+    Returns the HTTP status code (or raises if requests is missing).
     """
     hostname = socket.gethostname()
     ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -110,7 +106,6 @@ def run_once(config: Dict[str, Any]) -> int:
     LOG.info(
         "Sending heartbeat for host=%s work_item=%s", hostname, config.get("work_item")
     )
-    # Attempt to send; if requests is missing, surface the error to caller.
     return send_webhook(config["webhook"], payload)
 
 
