@@ -1,0 +1,14 @@
+[project]
+name = "ampa"
+version = "0.1.0"
+description = "AMPA Core Heartbeat Sender"
+readme = "ampa/README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "requests",
+  "python-dotenv",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
