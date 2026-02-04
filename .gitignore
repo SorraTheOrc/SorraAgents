@@ -33,3 +33,7 @@ bun.lock
 
 __pycache__/
 *.pyc
+
+# Local env files
+.env
+ampa/.env

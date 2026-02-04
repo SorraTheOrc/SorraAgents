@@ -18,8 +18,8 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 ## Results and Outputs
 
-- The parent work item ($1) or each of the milestone epics below it are decomposed into child work items.
-- Idempotence: The command reuses existing child work items and updates or augments previously generated task work-items instead of creating duplicates.
+- The parent work item ($1) or each of the milestone epics below it are decomposed into child feature work items.
+- Idempotence: The command reuses existing child work items and updates or augments previously generated feature work-items instead of creating duplicates.
 
 ## Hard requirements
 
@@ -81,7 +81,6 @@ Keep asking questions until the breakdown into features is clear.
   - **Prototype / Experiment** (optional; include success thresholds)
   - **Dependencies** (other features or explicit external factors)
   - **Deliverables** (artifacts: docs, tests, demo script, telemetry)
-  - **Sub-Tasks to create** (zero or more implementation sub-tasks needed to deliver the feature)
 
 - Each of the features should clearly identify how the player experience will be changed by the feature and what acceptance critera are required to validate it.
 - Each of the features should clearly identify how the user experience will be changed by the feature and what acceptance criteria are required to validate it.
@@ -120,13 +119,12 @@ Keep asking questions until the breakdown into features is clear.
 
 - Create child work items for each feature with a parent link to the original work item:
 - `wl create "<Short Title>" --description "<Full feature description>" --parent <work-item-id> -t feature --priority P2 --stage idea --validate --json`
-- Add optional tasks (only if needed): Infra/Ops, UX, Security review.
 - Create dependency edges between feature work items where the plan specifies dependencies:
   - `wl dep add <DependentFeatureId> <PrereqFeatureId>`
 
 - When creating child work items, ensure idempotence:
-  - If a child work item with the same canonical name already exists, reuse it instead of creating a duplicate.
-  - Use `wl list --parent <work-item-id> --json` for features, and `wl list --parent <featureWorkItemId> --json` for tasks.
+- If a child work item with the same canonical name already exists, reuse it instead of creating a duplicate.
+- Use `wl list --parent <work-item-id> --json` for features.
 
 - Add a comment to the planned work item:
   - `wl comments add $1 "Planning Complete. <Summary of the approved feature list, any open questions that remain>" --actor @your-agent-name --json`

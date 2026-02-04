@@ -5,7 +5,6 @@ tags:
   - implement
 agent: patch
 subtask: true
-
 ---
 
 # Implement
@@ -111,18 +110,20 @@ Live context commands (use to gather runtime state)
 
 4. Automated self-review
 
+- Audit the work item to confirm all acceptance criteria are met: `audit $1`.
+  - If the audit reveals any unmet acceptance criteria, inform the user of the findings and return to step 3 to address them.
 - Perform sequential self-review passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff.
 - For each pass, produce a short note and limit edits to small, goal-aligned changes. If intent changes are discovered, create an Open Question and stop automated edits.
 - Run the entire test suite.
   - Fix any failing tests before continuing.
-- Commit the work and update the stage `wl update $1 --stage in_review --json`
 
 5. Commit, Push and create PR
 
+- Commit the work item to completed/in-review with `wl update $1 --status completed --stage in_review --json`
 - Push the branch to `origin`.
 - Create a Pull Request against the repository's default branch.
   - Use a title in the form of "WIP: <work item title> (<work item id>)" and a body that contains a concise summary of the goal and of the work done and reviewer instructions.
-  - Link the PR to the work item via `--external-ref`.
+  - Link the PR to the work item via a comment .
 
 6. Human PR review
 
@@ -133,7 +134,7 @@ Live context commands (use to gather runtime state)
 7. Cleanup
 
 - Only take the following actions after the PR is merged:
-- Close the work item and all its depdents and blockers by running `wl update <work-item-id> --status done --stage done --json`.
+- Close the work item and all its dependents and blockers by running `wl update <work-item-id> --status done --stage done --json`.
 - Cleanup using the cleanup skill
 
 ## Exit codes & errors

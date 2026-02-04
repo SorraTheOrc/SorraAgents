@@ -19,7 +19,6 @@ This command produces two doc sets:
 
 Where possible, update and improve existing documentation rather than creating new files. Create new docs only when needed.
 
-
 Worklog context (must do):
 
 - Mark the **Docs:** task as in-progress `wl update <docs-id> --status in_progress`
