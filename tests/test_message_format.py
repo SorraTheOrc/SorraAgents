@@ -3,7 +3,7 @@ import socket
 
 import pytest
 
-from ampa_daemon import build_payload, get_env_config
+from ampa.daemon import build_payload, get_env_config
 
 
 def test_build_payload_includes_hostname_and_timestamp():
