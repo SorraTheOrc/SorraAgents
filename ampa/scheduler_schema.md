@@ -18,11 +18,13 @@ Each scheduled command is represented by a `CommandSpec` entry.
 ## Config knobs (env)
 
 - `AMPA_SCHEDULER_STORE`: file path for the scheduler store (default: `ampa/scheduler_store.json` next to the module).
-- `AMPA_SCHEDULER_POLL_INTERVAL_SECONDS`: scheduler loop interval in seconds (default: 30).
+- `AMPA_SCHEDULER_POLL_INTERVAL_SECONDS`: scheduler loop interval in seconds (default: 5).
 - `AMPA_SCHEDULER_GLOBAL_MIN_INTERVAL_SECONDS`: global minimum interval between command starts (default: 60).
 - `AMPA_SCHEDULER_PRIORITY_WEIGHT`: priority multiplier weight (default: 0.1).
 - `AMPA_LLM_HEALTHCHECK_URL`: HTTP endpoint for LLM availability (default: `http://localhost:8000/health`).
 - `AMPA_SCHEDULER_MAX_RUN_HISTORY`: number of runs retained per command (default: 50).
+
+Scheduled shell commands run in the working directory where the scheduler daemon was started.
 
 ## Store schema
 
@@ -51,11 +53,21 @@ The store is a JSON file with the following top-level structure (see `ampa/sched
       "max_runtime_minutes": null,
       "type": "heartbeat"
     },
-    "wl-recent": {
-      "id": "wl-recent",
-      "command": "wl recent",
+    "wl-in-progress": {
+      "id": "wl-in-progress",
+      "command": "wl in-progress",
       "requires_llm": false,
       "frequency_minutes": 1,
+      "priority": 0,
+      "metadata": {},
+      "max_runtime_minutes": 1,
+      "type": "shell"
+    },
+    "wl-status": {
+      "id": "wl-status",
+      "command": "wl status",
+      "requires_llm": false,
+      "frequency_minutes": 10,
       "priority": 0,
       "metadata": {},
       "max_runtime_minutes": 1,
@@ -98,7 +110,7 @@ Commands with the highest score are selected. Negative lateness is clamped to ze
 
 ## Suggested tuning values
 
-- `AMPA_SCHEDULER_POLL_INTERVAL_SECONDS=30`: quick enough for near real-time scheduling without excessive wake-ups.
+- `AMPA_SCHEDULER_POLL_INTERVAL_SECONDS=5`: fast scheduling cadence for near real-time scheduling.
 - `AMPA_SCHEDULER_GLOBAL_MIN_INTERVAL_SECONDS=60`: ensure only one command starts per minute to avoid overload.
 - `AMPA_SCHEDULER_PRIORITY_WEIGHT=0.1`: priority range 0-10 maps to a multiplier 1.0-2.0.
 - `AMPA_SCHEDULER_MAX_RUN_HISTORY=50`: keeps recent run metrics without unbounded growth.

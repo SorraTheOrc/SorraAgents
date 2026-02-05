@@ -211,6 +211,12 @@ wl close <work-item-id-1> <work-item-id-2> --json
 
 # *Destructive command ask for confirmation before running* Dekete a work item permanently
 wl delete <work-item-id> --json
+
+# Dependencies
+wl dep --help  # Show help for dependency commands
+wl dep add <dependent-work-item-id> <prereq-work-item-id>
+wl dep list <work-item-id> --json
+wl dep remove <dependent-work-item-id> <prereq-work-item-id>
 ```
 
 ### Project Status

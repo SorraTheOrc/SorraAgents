@@ -129,7 +129,7 @@ class SchedulerConfig:
             os.path.dirname(__file__), "scheduler_store.json"
         )
         return SchedulerConfig(
-            poll_interval_seconds=_int("AMPA_SCHEDULER_POLL_INTERVAL_SECONDS", 30),
+            poll_interval_seconds=_int("AMPA_SCHEDULER_POLL_INTERVAL_SECONDS", 5),
             global_min_interval_seconds=_int(
                 "AMPA_SCHEDULER_GLOBAL_MIN_INTERVAL_SECONDS", 60
             ),
@@ -231,7 +231,7 @@ def default_llm_probe(url: str) -> bool:
         return False
 
 
-def default_executor(spec: CommandSpec) -> RunResult:
+def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> RunResult:
     if spec.command_type == "heartbeat":
         start = _utc_now()
         try:
@@ -258,6 +258,7 @@ def default_executor(spec: CommandSpec) -> RunResult:
         timeout=timeout,
         text=True,
         capture_output=True,
+        cwd=command_cwd,
     )
     end = _utc_now()
     LOG.info(
@@ -303,11 +304,16 @@ class Scheduler:
         config: SchedulerConfig,
         llm_probe: Optional[Callable[[str], bool]] = None,
         executor: Optional[Callable[[CommandSpec], RunResult]] = None,
+        command_cwd: Optional[str] = None,
     ) -> None:
         self.store = store
         self.config = config
         self.llm_probe = llm_probe or default_llm_probe
-        self.executor = executor or default_executor
+        self.command_cwd = command_cwd or os.getcwd()
+        if executor is None:
+            self.executor = lambda spec: default_executor(spec, self.command_cwd)
+        else:
+            self.executor = executor
 
     def _global_rate_limited(self, now: dt.datetime) -> bool:
         last_start = self.store.last_global_start()
@@ -486,11 +492,16 @@ class Scheduler:
             command_id,
             output,
             run.exit_code,
+            title="AMPA Scheduler",
         )
         daemon.send_webhook(webhook, payload, message_type="command")
 
     def _post_startup_message(self) -> None:
-        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+        try:
+            config = daemon.get_env_config()
+        except SystemExit:
+            return
+        webhook = config.get("webhook")
         if not webhook:
             return
         hostname = os.uname().nodename
@@ -499,16 +510,17 @@ class Scheduler:
             hostname,
             ts,
             "scheduler_start",
-            "scheduler started",
+            "Scheduler started",
             0,
+            title="Scheduler Started",
         )
         daemon.send_webhook(webhook, payload, message_type="startup")
 
 
-def load_scheduler() -> Scheduler:
+def load_scheduler(command_cwd: Optional[str] = None) -> Scheduler:
     config = SchedulerConfig.from_env()
     store = SchedulerStore(config.store_path)
-    return Scheduler(store, config)
+    return Scheduler(store, config, command_cwd=command_cwd)
 
 
 def _parse_metadata(value: Optional[str]) -> Dict[str, Any]:
@@ -609,10 +621,11 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
+    start_cwd = os.getcwd()
     parser = _build_parser()
     args = parser.parse_args()
     if not args.command:
-        scheduler = load_scheduler()
+        scheduler = load_scheduler(command_cwd=start_cwd)
         scheduler.run_forever()
         return
     handlers = {

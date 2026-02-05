@@ -1,4 +1,5 @@
 import datetime as dt
+import os
 
 from ampa.scheduler import (
     CommandSpec,
@@ -94,3 +95,36 @@ def test_global_rate_limiter_blocks_selection():
     scheduler.store.update_global_start(now - dt.timedelta(seconds=10))
     selected = scheduler.select_next(now)
     assert selected is None
+
+
+def test_scheduler_runs_commands_from_start_cwd(tmp_path):
+    now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+    store_path = tmp_path / "scheduler_store.json"
+    store = SchedulerStore(str(store_path))
+    config = SchedulerConfig(
+        poll_interval_seconds=10,
+        global_min_interval_seconds=10,
+        priority_weight=0.0,
+        store_path=str(store_path),
+        llm_healthcheck_url="http://localhost:8000/health",
+        max_run_history=5,
+    )
+    original_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        scheduler = Scheduler(
+            store,
+            config,
+            llm_probe=lambda _url: True,
+        )
+
+        spec = CommandSpec("cmd", "pwd", False, 1, 0, {})
+        scheduler.store.add_command(spec)
+        run = scheduler.start_command(spec, now)
+    finally:
+        os.chdir(original_cwd)
+
+    run = run
+    assert run is not None
+    output = getattr(run, "output", "")
+    assert output.strip() == str(tmp_path)
