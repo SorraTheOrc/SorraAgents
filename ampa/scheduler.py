@@ -233,6 +233,44 @@ def default_llm_probe(url: str) -> bool:
         return False
 
 
+def _summarize_for_discord(text: Optional[str], max_chars: int = 1000) -> str:
+    """If text is longer than max_chars, call `opencode run` to produce a short summary.
+
+    Returns the original text on any failure.
+    """
+    if not text:
+        return ""
+    try:
+        if len(text) <= max_chars:
+            return text
+        # avoid passing extremely large blobs to the CLI; cap input size
+        cap = 20000
+        input_text = text[:cap]
+        cmd = [
+            "opencode",
+            "run",
+            f"summarize this content in under {max_chars} characters: {input_text}",
+        ]
+        LOG.info("Summarizing content for Discord (len=%d) via opencode", len(text))
+        proc = subprocess.run(
+            cmd, check=False, capture_output=True, text=True, timeout=30
+        )
+        if proc.returncode != 0:
+            LOG.warning(
+                "opencode summarizer failed rc=%s stderr=%r",
+                getattr(proc, "returncode", None),
+                getattr(proc, "stderr", None),
+            )
+            return text
+        summary = (proc.stdout or "").strip()
+        if not summary:
+            return text
+        return summary
+    except Exception:
+        LOG.exception("Failed to summarize content for Discord")
+        return text
+
+
 def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> RunResult:
     if spec.command_type == "heartbeat":
         start = _utc_now()
@@ -714,6 +752,11 @@ class Scheduler:
                 if not summary_text:
                     # fallback simple summary
                     summary_text = f"{work_id} — {title} | exit={exit_code}"
+                # if Discord will reject long messages, summarize to <=1000 chars
+                try:
+                    summary_text = _summarize_for_discord(summary_text, max_chars=1000)
+                except Exception:
+                    LOG.exception("Failed to summarize triage summary_text")
                 try:
                     payload = daemon.build_payload(
                         os.uname().nodename,
@@ -1004,11 +1047,18 @@ class Scheduler:
         command_id = spec.command_id
         if spec.metadata.get("discord_label"):
             command_id = str(spec.metadata.get("discord_label"))
+        # ensure Discord-safe summary for output
+        try:
+            short_output = _summarize_for_discord(output, max_chars=1000)
+        except Exception:
+            LOG.exception("Failed to summarize output for discord post")
+            short_output = output
+
         payload = daemon.build_command_payload(
             hostname,
             ts,
             command_id,
-            output,
+            short_output,
             run.exit_code,
             title="AMPA Scheduler",
         )
