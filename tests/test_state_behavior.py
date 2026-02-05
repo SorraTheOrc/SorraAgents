@@ -48,11 +48,11 @@ def test_heartbeat_skipped_when_other_message_since_last_heartbeat(
 
     called = {"count": 0}
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(self, url, json=None, timeout=None):
         called["count"] += 1
         return DummyResp()
 
-    monkeypatch.setattr("ampa.daemon.requests.post", fake_post)
+    monkeypatch.setattr("ampa.daemon.requests.Session.post", fake_post)
 
     cfg = get_env_config()
     status = run_once(cfg)
@@ -77,10 +77,10 @@ def test_heartbeat_sent_and_updates_state(monkeypatch, tmp_path):
     monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid")
     monkeypatch.setenv("AMPA_LOAD_DOTENV", "0")
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(self, url, json=None, timeout=None):
         return DummyResp(204)
 
-    monkeypatch.setattr("ampa.daemon.requests.post", fake_post)
+    monkeypatch.setattr("ampa.daemon.requests.Session.post", fake_post)
 
     cfg = get_env_config()
     status = run_once(cfg)
@@ -100,10 +100,10 @@ def test_initial_heartbeat_when_no_state(monkeypatch, tmp_path):
     monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid")
     monkeypatch.setenv("AMPA_LOAD_DOTENV", "0")
 
-    def fake_post(url, json=None, timeout=None):
+    def fake_post(self, url, json=None, timeout=None):
         return DummyResp(204)
 
-    monkeypatch.setattr("ampa.daemon.requests.post", fake_post)
+    monkeypatch.setattr("ampa.daemon.requests.Session.post", fake_post)
 
     cfg = get_env_config()
     status = run_once(cfg)
