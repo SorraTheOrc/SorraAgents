@@ -2,17 +2,30 @@ AMPA Core Heartbeat Sender
 
 Run locally:
 
-  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon
+AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon
 
-Run in container (preferred for reproducible runs):
+Scheduler
 
-  # Build and run using the repository Makefile
-  make -C ampa build
-  make -C ampa run
+The scheduler runs periodic commands with a normalized-lateness algorithm and stores state on disk.
 
-  # Or manually from the ampa/ directory
-  cd ampa && podman build -t ampa-daemon:local .
-  podman run --rm -e AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" -p 8080:8080 ampa-daemon:local
+Run locally:
+
+  python -m ampa.scheduler
+
+Example scheduler store:
+
+  python -m ampa.scheduler
+
+Key config knobs (env):
+
+- AMPA_SCHEDULER_STORE: path to the JSON scheduler store
+- AMPA_SCHEDULER_POLL_INTERVAL_SECONDS: poll interval in seconds
+- AMPA_SCHEDULER_GLOBAL_MIN_INTERVAL_SECONDS: minimum gap between command starts
+- AMPA_SCHEDULER_PRIORITY_WEIGHT: priority multiplier weight
+- AMPA_LLM_HEALTHCHECK_URL: LLM availability probe URL
+- AMPA_SCHEDULER_MAX_RUN_HISTORY: number of run history entries to keep
+
+See `ampa/scheduler_schema.md` for the command field schema, store layout, and tuning guidance.
 
 Configuration via .env
 
@@ -35,31 +48,5 @@ Add the runtime dependencies and install them in your environment:
 
 Run as a daemon
 
-  # Run in the foreground (use system tools to daemonize if needed)
-  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon
-
-   # Run as a background container (systemd example shown below)
-   make -C ampa build
-   podman run -d --name ampa-daemon --restart=always \
-     -e AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" -p 8080:8080 ampa-daemon:local
-
-Injecting `.env` into the container
-
-  # Mount the ampa/.env into the container so the process reads the same
-  # environment variables as when run locally. This avoids passing many -e
-  # flags and keeps secrets out of VCS.
-   # From the repository root:
-   podman run --rm --env-file ampa/.env -p 8080:8080 ampa-daemon:local
-
-  # Example systemd unit (save as /etc/systemd/system/ampa.service):
-  # [Unit]
-  # Description=AMPA Heartbeat Daemon
-  # After=network.target
-  #
-  # [Service]
-   # ExecStart=/usr/bin/podman run --name ampa-daemon --rm \
-   #   -e AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" -p 8080:8080 ampa-daemon:local
-  # Restart=always
-  #
-  # [Install]
-  # WantedBy=multi-user.target
+   # Run in the foreground (use system tools to daemonize if needed)
+   AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.scheduler

@@ -1,0 +1,28 @@
+{
+  "commands": {
+    "heartbeat": {
+      "id": "heartbeat",
+      "command": "",
+      "requires_llm": false,
+      "frequency_minutes": 1,
+      "priority": 1,
+      "metadata": {},
+      "max_runtime_minutes": null,
+      "type": "heartbeat"
+    },
+    "wl-recent": {
+      "id": "wl-recent",
+      "command": "wl recent",
+      "requires_llm": false,
+      "frequency_minutes": 1,
+      "priority": 0,
+      "metadata": {
+        "discord_label": "wl recent"
+      },
+      "max_runtime_minutes": 1,
+      "type": "shell"
+    }
+  },
+  "state": {},
+  "last_global_start_ts": null
+}

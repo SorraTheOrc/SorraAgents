@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+import ampa.daemon as daemon
 from ampa.daemon import get_env_config, run_once
 
 
@@ -112,3 +113,18 @@ def test_initial_heartbeat_when_no_state(monkeypatch, tmp_path):
     st = read_state(state_file)
     assert st.get("last_message_type") == "heartbeat"
     assert "last_heartbeat_ts" in st
+
+
+def test_build_command_payload_includes_output():
+    payload = daemon.build_command_payload(
+        "host",
+        "2026-01-01T00:00:00+00:00",
+        "wl-recent",
+        "recent output",
+        0,
+    )
+    embed = payload["embeds"][0]
+    fields = {field["name"]: field["value"] for field in embed["fields"]}
+    assert fields["command_id"] == "wl-recent"
+    assert fields["exit_code"] == "0"
+    assert "recent output" in fields["output"]

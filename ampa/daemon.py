@@ -12,8 +12,7 @@ import json
 import logging
 import os
 import socket
-import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import tempfile
 import urllib.parse
 
@@ -32,6 +31,14 @@ except Exception:
 
 LOG = logging.getLogger("ampa.daemon")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+__all__ = [
+    "build_command_payload",
+    "build_payload",
+    "get_env_config",
+    "run_once",
+    "send_webhook",
+]
 
 
 def get_env_config() -> Dict[str, Any]:
@@ -87,8 +94,17 @@ def get_env_config() -> Dict[str, Any]:
     return {"webhook": webhook, "minutes": minutes}
 
 
+def _truncate_output(output: str, limit: int = 900) -> str:
+    if len(output) <= limit:
+        return output
+    return output[:limit] + "\n... (truncated)"
+
+
 def build_payload(
-    hostname: str, timestamp_iso: str, work_item_id: Optional[str] = None
+    hostname: str,
+    timestamp_iso: str,
+    work_item_id: Optional[str] = None,
+    extra_fields: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build a Discord webhook payload (embed format) for a heartbeat.
 
@@ -104,9 +120,29 @@ def build_payload(
         embed["fields"].append(
             {"name": "work_item_id", "value": work_item_id, "inline": False}
         )
+    if extra_fields:
+        embed["fields"].extend(extra_fields)
 
     payload = {"embeds": [embed]}
     return payload
+
+
+def build_command_payload(
+    hostname: str,
+    timestamp_iso: str,
+    command_id: Optional[str],
+    output: Optional[str],
+    exit_code: Optional[int],
+) -> Dict[str, Any]:
+    fields: List[Dict[str, Any]] = []
+    if command_id:
+        fields.append({"name": "command_id", "value": command_id, "inline": False})
+    if exit_code is not None:
+        fields.append({"name": "exit_code", "value": str(exit_code), "inline": True})
+    if output:
+        formatted = "```\n" + _truncate_output(output) + "\n```"
+        fields.append({"name": "output", "value": formatted, "inline": False})
+    return build_payload(hostname, timestamp_iso, extra_fields=fields)
 
 
 def _read_state(path: str) -> Dict[str, str]:
@@ -318,19 +354,13 @@ def run_once(config: Dict[str, Any]) -> int:
 
 def main() -> None:
     config = get_env_config()
-    interval = config["minutes"] * 60
-    LOG.info("Starting AMPA heartbeat sender; interval=%s seconds", interval)
+    LOG.info("Sending AMPA heartbeat once")
     try:
-        while True:
-            try:
-                run_once(config)
-            except SystemExit:
-                raise
-            except Exception:
-                LOG.exception("Error while sending heartbeat")
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        LOG.info("AMPA heartbeat sender stopped by user")
+        run_once(config)
+    except SystemExit:
+        raise
+    except Exception:
+        LOG.exception("Error while sending heartbeat")
 
 
 if __name__ == "__main__":
