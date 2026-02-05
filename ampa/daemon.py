@@ -105,26 +105,22 @@ def build_payload(
     timestamp_iso: str,
     work_item_id: Optional[str] = None,
     extra_fields: Optional[List[Dict[str, Any]]] = None,
+    title: str = "AMPA Heartbeat",
 ) -> Dict[str, Any]:
-    """Build a Discord webhook payload (embed format) for a heartbeat.
+    """Build a Discord webhook payload (plain text) for a heartbeat.
 
-    The embed includes hostname, ISO timestamp and the optional work item id.
+    The text includes hostname, ISO timestamp and the optional work item id.
     """
-    embed = {
-        "title": "AMPA Heartbeat",
-        "description": f"Host: {hostname}\nTimestamp: {timestamp_iso}",
-        "color": 5814783,
-        "fields": [],
-    }
+    lines = [title, f"Host: {hostname}", f"Timestamp: {timestamp_iso}"]
     if work_item_id:
-        embed["fields"].append(
-            {"name": "work_item_id", "value": work_item_id, "inline": False}
-        )
+        lines.append(f"work_item_id: {work_item_id}")
     if extra_fields:
-        embed["fields"].extend(extra_fields)
-
-    payload = {"embeds": [embed]}
-    return payload
+        for field in extra_fields:
+            name = field.get("name")
+            value = field.get("value")
+            if name and value is not None:
+                lines.append(f"{name}: {value}")
+    return {"content": "\n".join(lines)}
 
 
 def build_command_payload(
@@ -133,6 +129,7 @@ def build_command_payload(
     command_id: Optional[str],
     output: Optional[str],
     exit_code: Optional[int],
+    title: str = "AMPA Heartbeat",
 ) -> Dict[str, Any]:
     fields: List[Dict[str, Any]] = []
     if command_id:
@@ -142,7 +139,12 @@ def build_command_payload(
     if output:
         formatted = "```\n" + _truncate_output(output) + "\n```"
         fields.append({"name": "output", "value": formatted, "inline": False})
-    return build_payload(hostname, timestamp_iso, extra_fields=fields)
+    return build_payload(
+        hostname,
+        timestamp_iso,
+        extra_fields=fields,
+        title=title,
+    )
 
 
 def _read_state(path: str) -> Dict[str, str]:
@@ -322,15 +324,13 @@ def run_once(config: Dict[str, Any]) -> int:
     except Exception:
         last_heartbeat_ts = None
 
-    # Only send the heartbeat if no "other" message has been sent since the last heartbeat.
-    if (
-        last_heartbeat_ts is not None
-        and last_message_ts is not None
-        and last_message_type != "heartbeat"
-    ):
-        if last_message_ts > last_heartbeat_ts:
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    # Only send the heartbeat if no non-heartbeat message was sent in the last 5 minutes.
+    if last_message_ts is not None and last_message_type != "heartbeat":
+        if (now - last_message_ts) < datetime.timedelta(minutes=5):
             LOG.info(
-                "Skipping heartbeat: other message sent since last heartbeat (last_message=%s)",
+                "Skipping heartbeat: other message sent within last 5 minutes (last_message=%s)",
                 state.get("last_message_ts"),
             )
             return 0
