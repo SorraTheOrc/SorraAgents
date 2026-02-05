@@ -115,3 +115,84 @@ def test_triage_audit_runs_and_cleans_temp(tmp_path, monkeypatch):
     # ensure temp files for this work id were removed
     post = glob.glob(f"/tmp/wl-audit-comment-{work_id}-*.md")
     assert not post
+
+
+def test_triage_audit_auto_complete_with_gh(tmp_path, monkeypatch):
+    """Verify triage-audit auto-completes when gh confirms PR merged."""
+    calls = []
+    work_id = "TEST-WID-PR-1"
+
+    monkeypatch.setattr(daemon, "send_webhook", lambda *a, **k: None)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            out = json.dumps(
+                {
+                    "workItems": [
+                        {
+                            "id": work_id,
+                            "title": "PR item",
+                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        }
+                    ]
+                }
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment list {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
+            out = "Summary:\nPR merged: https://github.com/example/repo/pull/42\n\nDetails: ready to close"
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith("gh pr view"):
+            # simulate gh returning merged:true
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"merged": True}), stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment add {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        if cmd.strip().startswith(f"wl show {work_id}"):
+            # return no children
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({}), stderr=""
+            )
+        if cmd.strip().startswith(f"wl update {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={
+            "truncate_chars": 65536,
+            "audit_cooldown_hours": 0,
+            "verify_pr_with_gh": True,
+        },
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    # enable GH verification via env
+    monkeypatch.setenv("AMPA_VERIFY_PR_WITH_GH", "1")
+
+    sched.start_command(spec)
+
+    # ensure gh pr view was invoked
+    assert any(c.startswith("gh pr view") for c in calls)
+    # ensure wl update was invoked to set completed
+    assert any(c.startswith(f"wl update {work_id}") for c in calls)

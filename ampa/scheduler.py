@@ -11,6 +11,7 @@ import os
 import subprocess
 import tempfile
 import re
+import shutil
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -769,6 +770,167 @@ class Scheduler:
                         LOG.debug("Failed to remove temp comment file %s", cpath)
                 except Exception:
                     LOG.exception("Failed to write artifact and post comment")
+            # After posting the audit comment, check whether the work item can be
+            # auto-completed. Criteria (both required):
+            #  - Evidence of a merged PR (either a GitHub PR URL in the audit output
+            #    or a textual 'PR merged' token), and
+            #  - No open/in_progress child work items (or the audit explicitly
+            #    states the item is ready to close).
+            try:
+                # fetch latest work item state
+                proc_show = _call(f"wl show {work_id} --json")
+                if proc_show.returncode == 0 and proc_show.stdout:
+                    try:
+                        wi_raw = json.loads(proc_show.stdout)
+                    except Exception:
+                        wi_raw = {}
+                else:
+                    wi_raw = {}
+
+                # determine if children are open
+                def _children_open(wobj: Dict[str, Any]) -> bool:
+                    # look for common child containers
+                    for key in (
+                        "children",
+                        "workItems",
+                        "work_items",
+                        "items",
+                        "subtasks",
+                    ):
+                        val = wobj.get(key)
+                        if isinstance(val, list) and val:
+                            # if any child has a status that's not closed/completed, consider open
+                            for c in val:
+                                st = c.get("status") or c.get("state") or c.get("stage")
+                                if st and str(st).lower() not in (
+                                    "closed",
+                                    "done",
+                                    "completed",
+                                    "resolved",
+                                ):
+                                    return True
+                            # no open children
+                            return False
+                    return False
+
+                children_open = _children_open(wi_raw)
+
+                # check audit output for PR merged evidence or PR URL
+                merged_pr = False
+
+                def _extract_pr_from_text(text: str):
+                    if not text:
+                        return None, None
+                    m = re.search(
+                        r"https?://github\.com/(?P<owner_repo>[^/]+/[^/]+)/pull/(?P<number>\d+)",
+                        text,
+                        re.I,
+                    )
+                    if m:
+                        return m.group("owner_repo"), m.group("number")
+                    return None, None
+
+                def _verify_pr_with_gh(owner_repo: str, pr_num: str) -> bool:
+                    # Determine whether to verify via gh. Priority (highest -> lowest):
+                    # 1) per-command metadata if present,
+                    # 2) environment variable AMPA_VERIFY_PR_WITH_GH if set,
+                    # 3) default: enabled (True).
+                    meta_val = spec.metadata.get("verify_pr_with_gh")
+                    if meta_val is not None:
+                        try:
+                            verify_enabled = bool(meta_val)
+                        except Exception:
+                            verify_enabled = str(meta_val).lower() in (
+                                "1",
+                                "true",
+                                "yes",
+                            )
+                    else:
+                        env = os.getenv("AMPA_VERIFY_PR_WITH_GH")
+                        if env is None or env == "":
+                            verify_enabled = True
+                        else:
+                            verify_enabled = env.lower() in ("1", "true", "yes")
+                    if not verify_enabled:
+                        # verification explicitly disabled; treat PR URL presence as evidence
+                        return True
+                    # ensure gh CLI is present
+                    if shutil.which("gh") is None:
+                        LOG.warning("gh CLI not found; cannot verify PR merged status")
+                        return False
+                    cmd = f"gh pr view {pr_num} --repo {owner_repo} --json merged"
+                    proc = _call(cmd)
+                    if proc.returncode != 0 or not proc.stdout:
+                        LOG.warning(
+                            "gh pr view failed: cmd=%r rc=%s stderr=%r",
+                            cmd,
+                            getattr(proc, "returncode", None),
+                            getattr(proc, "stderr", None),
+                        )
+                        return False
+                    try:
+                        data = json.loads(proc.stdout)
+                        return bool(data.get("merged")) is True
+                    except Exception:
+                        LOG.exception("Failed to parse gh pr view output")
+                        return False
+
+                # first try to extract a PR URL
+                owner_repo, pr_num = _extract_pr_from_text(audit_out or "")
+                if owner_repo and pr_num:
+                    if _verify_pr_with_gh(owner_repo, pr_num):
+                        merged_pr = True
+                else:
+                    # fallback to textual heuristics
+                    if audit_out and re.search(
+                        r"pr\s*merged|merged\s+pr|pull request\s+merged",
+                        audit_out,
+                        re.I,
+                    ):
+                        merged_pr = True
+
+                # check audit output for explicit ready-to-close tokens
+                ready_token = False
+                if audit_out and re.search(
+                    r"ready to close|can be closed|ready for final|ready for sign-?off",
+                    audit_out,
+                    re.I,
+                ):
+                    ready_token = True
+
+                if merged_pr and (not children_open or ready_token):
+                    # proceed to mark work item completed -> in_review
+                    try:
+                        upd_cmd = f"wl update {work_id} --status completed --stage in_review --json"
+                        _call(upd_cmd)
+                        # send a completion-style discord message (embed-like payload)
+                        try:
+                            if webhook:
+                                payload = daemon.build_payload(
+                                    os.uname().nodename,
+                                    _utc_now().isoformat(),
+                                    work_item_id=work_id,
+                                    extra_fields=[
+                                        {
+                                            "name": "status",
+                                            "value": "completed - ready for producer sign-off",
+                                        },
+                                        {
+                                            "name": "summary",
+                                            "value": (audit_out or "")[:1000],
+                                        },
+                                    ],
+                                    title="AMPA Audit: Completed",
+                                )
+                                daemon.send_webhook(
+                                    webhook, payload, message_type="completion"
+                                )
+                        except Exception:
+                            LOG.exception("Failed to send completion webhook")
+                    except Exception:
+                        LOG.exception("Failed to auto-update work item %s", work_id)
+            except Exception:
+                LOG.exception("Auto-complete check failed for %s", work_id)
         except Exception:
             LOG.exception("Error during triage audit processing")
 

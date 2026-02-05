@@ -24,6 +24,9 @@ Key config knobs (env):
 - AMPA_SCHEDULER_PRIORITY_WEIGHT: priority multiplier weight
 - AMPA_LLM_HEALTHCHECK_URL: LLM availability probe URL
 - AMPA_SCHEDULER_MAX_RUN_HISTORY: number of run history entries to keep
+ - AMPA_VERIFY_PR_WITH_GH: when set to 1/true, enable verification of GitHub PR merge status
+   via the `gh` CLI before auto-completing work items. Defaults to enabled when not set;
+   per-command metadata `verify_pr_with_gh` can override this behavior.
 
 See `ampa/scheduler_schema.md` for the command field schema, store layout, and tuning guidance.
 
@@ -35,6 +38,7 @@ Example `ampa/.env` contents:
 
 AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/...."
 AMPA_HEARTBEAT_MINUTES=1
+AMPA_VERIFY_PR_WITH_GH=1
 
 Environment variables are used if `.env` is not present. The daemon prefers values from the `.env` file when available.
 
