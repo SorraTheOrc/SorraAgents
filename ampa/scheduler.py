@@ -305,6 +305,7 @@ class Scheduler:
         llm_probe: Optional[Callable[[str], bool]] = None,
         executor: Optional[Callable[[CommandSpec], RunResult]] = None,
         command_cwd: Optional[str] = None,
+        run_shell: Optional[Callable[..., subprocess.CompletedProcess]] = None,
     ) -> None:
         self.store = store
         self.config = config
@@ -314,6 +315,8 @@ class Scheduler:
             self.executor = lambda spec: default_executor(spec, self.command_cwd)
         else:
             self.executor = executor
+        # injectable shell runner (for tests); defaults to subprocess.run
+        self.run_shell = run_shell or subprocess.run
 
     def _global_rate_limited(self, now: dt.datetime) -> bool:
         last_start = self.store.last_global_start()
@@ -413,8 +416,228 @@ class Scheduler:
             output = run.output
             exit_code = run.exit_code
         self._record_run(spec, run, exit_code, output)
+        # After recording run, perform any command-specific post actions
+        try:
+            # special-case triage-audit command id
+            if (
+                spec.command_id == "wl-triage-audit"
+                or spec.command_type == "triage-audit"
+            ):
+                # run triage-audit handler which posts WL comments and Discord summary
+                self._run_triage_audit(spec, run, output)
+        except Exception:
+            LOG.exception("Triage audit post-processing failed")
+        # always post the generic discord message afterwards
         self._post_discord(spec, run, output)
         return run
+
+    def _run_triage_audit(
+        self, spec: CommandSpec, run: RunResult, output: Optional[str]
+    ) -> None:
+        """Execute triage-audit post-processing.
+
+        This method:
+        - Calls `wl in-progress --json` to get candidate work items
+        - Selects the least-recently-updated work item not audited within cooldown
+        - Executes `opencode run audit <work_item_id>` and captures output
+        - Posts a short Discord summary and a WL comment containing the full output
+        - Persists `last_audit_at` per-work-item in the scheduler store under
+          state[spec.command_id]["last_audit_at_by_item"]
+        """
+        # configuration: allow overrides via metadata
+        try:
+            cooldown_hours = int(spec.metadata.get("audit_cooldown_hours", 6))
+        except Exception:
+            cooldown_hours = 6
+        try:
+            truncate_chars = int(spec.metadata.get("truncate_chars", 65536))
+        except Exception:
+            truncate_chars = 65536
+
+        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+
+        # helper to run shell commands via injectable runner
+        def _call(cmd: str) -> subprocess.CompletedProcess:
+            LOG.debug("Running shell: %s", cmd)
+            return self.run_shell(
+                cmd,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+
+        # 1) list in-progress work items
+        try:
+            proc = _call("wl in-progress --json")
+            if proc.returncode != 0:
+                LOG.warning("wl in-progress failed: %s", proc.stderr)
+                return
+            items = []
+            try:
+                items = json.loads(proc.stdout or "[]")
+            except Exception:
+                LOG.exception("Failed to parse wl in-progress output")
+                return
+            if not isinstance(items, list) or not items:
+                LOG.debug("No in-progress items returned")
+                return
+
+            # find candidate sorted by their updated timestamp (oldest first)
+            def _item_updated_ts(it: Dict[str, Any]) -> Optional[dt.datetime]:
+                for k in (
+                    "updated_at",
+                    "last_updated_at",
+                    "updated_ts",
+                    "updated",
+                    "last_update_ts",
+                ):
+                    v = it.get(k)
+                    if v:
+                        try:
+                            return _from_iso(v)
+                        except Exception:
+                            try:
+                                return dt.datetime.fromisoformat(v)
+                            except Exception:
+                                continue
+                return None
+
+            now = _utc_now()
+            cooldown_delta = dt.timedelta(hours=cooldown_hours)
+
+            # filter out items audited within cooldown by inspecting WL comments
+            candidates: List[Tuple[Optional[dt.datetime], Dict[str, Any]]] = []
+            for it in items:
+                wid = it.get("id") or it.get("work_item_id") or it.get("work_item")
+                if not wid:
+                    continue
+
+                # inspect WL comments to find the most recent audit comment
+                last_audit: Optional[dt.datetime] = None
+                try:
+                    proc_c = _call(f"wl comment list {wid} --json")
+                    if proc_c.returncode == 0 and proc_c.stdout:
+                        try:
+                            comments = json.loads(proc_c.stdout)
+                        except Exception:
+                            comments = []
+                        for c in comments:
+                            body = (
+                                c.get("comment") or c.get("body") or c.get("text") or ""
+                            )
+                            if not body:
+                                continue
+                            if "# AMPA Audit Result" not in body:
+                                continue
+                            # try to extract a timestamp from comment metadata
+                            cand_ts = None
+                            for key in (
+                                "created_at",
+                                "created_ts",
+                                "created",
+                                "ts",
+                                "timestamp",
+                            ):
+                                v = c.get(key)
+                                if v:
+                                    try:
+                                        cand_ts = _from_iso(v)
+                                    except Exception:
+                                        try:
+                                            cand_ts = dt.datetime.fromisoformat(v)
+                                        except Exception:
+                                            cand_ts = None
+                                    if cand_ts is not None:
+                                        break
+                            if cand_ts is None:
+                                # no metadata timestamp available; skip
+                                continue
+                            if last_audit is None or cand_ts > last_audit:
+                                last_audit = cand_ts
+                except Exception:
+                    LOG.exception("Failed to list comments for %s", wid)
+
+                if last_audit is not None and (now - last_audit) < cooldown_delta:
+                    # skip - recently audited
+                    continue
+
+                updated = _item_updated_ts(it)
+                candidates.append((updated, {**it, "id": wid}))
+
+            if not candidates:
+                LOG.debug("No triage candidates after cooldown filter")
+                return
+
+            # sort by updated timestamp ascending (oldest first), None treated as oldest
+            candidates.sort(
+                key=lambda t: (
+                    t[0] is not None,
+                    t[0] or dt.datetime.fromtimestamp(0, dt.timezone.utc),
+                )
+            )
+            selected = candidates[0][1]
+            work_id = selected.get("id")
+            title = selected.get("title") or selected.get("name") or "(no title)"
+
+            # 2) run the audit command
+            # use quoted subcommand so the audit string is passed as one argument
+            audit_cmd = f'opencode run "audit {work_id}"'
+            proc_audit = _call(audit_cmd)
+            audit_out = ""
+            if proc_audit.stdout:
+                audit_out += proc_audit.stdout
+            if proc_audit.stderr:
+                audit_out += proc_audit.stderr
+
+            exit_code = proc_audit.returncode
+
+            # 3) post a short Discord summary (1-3 lines)
+            if webhook:
+                summary = f"{work_id} — {title} | exit={exit_code}"
+                try:
+                    payload = daemon.build_payload(
+                        os.uname().nodename,
+                        _utc_now().isoformat(),
+                        work_item_id=work_id,
+                        extra_fields=[{"name": "summary", "value": summary}],
+                    )
+                    daemon.send_webhook(webhook, payload, message_type="command")
+                except Exception:
+                    LOG.exception("Failed to send discord summary")
+
+            # 4) post full audit output as WL comment, truncating if necessary
+            full_output = audit_out or ""
+            # Post the audit result as a WL comment with a standard heading so
+            # future runs can discover the last audit via comment timestamps.
+            if len(full_output) <= truncate_chars:
+                comment_text = full_output or "(no output)"
+                try:
+                    comment = f"# AMPA Audit Result\n\nAudit output:\n\n{comment_text}"
+                    safe = comment.replace("'", "\\'")
+                    _call(
+                        f"wl comment add {work_id} --comment '{safe}' --author 'ampa-scheduler' --json"
+                    )
+                except Exception:
+                    LOG.exception("Failed to post wl comment")
+            else:
+                # write artifact to temp file and post comment referencing it
+                try:
+                    fd, path = tempfile.mkstemp(
+                        prefix=f"wl-audit-{work_id}-", suffix=".log"
+                    )
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(full_output)
+                    comment = f"# AMPA Audit Result\n\nAudit output too large; full output saved to: {path}"
+                    safe = comment.replace("'", "\\'")
+                    _call(
+                        f"wl comment add {work_id} --comment '{safe}' --author 'ampa-scheduler' --json"
+                    )
+                except Exception:
+                    LOG.exception("Failed to write artifact and post comment")
+        except Exception:
+            LOG.exception("Error during triage audit processing")
 
     def run_once(self) -> Optional[RunResult]:
         now = _utc_now()
