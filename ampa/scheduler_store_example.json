@@ -34,6 +34,21 @@
       "requires_llm": false,
       "type": "shell"
     }
+    ,
+    "wl-triage-audit": {
+      "command": "true",
+      "frequency_minutes": 2,
+      "id": "wl-triage-audit",
+      "max_runtime_minutes": 5,
+      "metadata": {
+        "discord_label": "wl triage audit",
+        "audit_cooldown_hours": 6,
+        "truncate_chars": 65536
+      },
+      "priority": 0,
+      "requires_llm": false,
+      "type": "triage-audit"
+    }
   },
   "last_global_start_ts": "2026-02-05T07:51:52.053932+00:00",
   "state": {

@@ -13,6 +13,7 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 - User asks general project status (e.g., "What is the current status?", "Status of the project?", "audit the project", "audit").
 - User asks about a specific work item id (e.g., "What is the status of wl-123?", "audit wl-123").
+- The `/audit <work-item-id>` command is invoked.
 
 ## Behavior
 
@@ -38,6 +39,15 @@ Provide a concise, human-friendly summary of project status or a specific work i
 - If no work item id is provided, always offer to run `audit <work-item-id>` (do not mention `wl show`) against the most important in-progress work item (show ID and title), add one or two alternative next actions relevant to the current status.
 - If a work item id is provided, suggest appropriate next steps to complete the work item (if not already completed).
 - Do not provide an alternative set of actions. There should only be 3 numbered next steps and a free-form response allowed.
+
+6. Provide a final section titled "# Summary" containing the following optional items as applicable:
+
+- If the item is blocked this will be stated and a list of work-items that are not yet completed and block this item will be provided. If the item is not blocked, skip this point.
+- If there is an open PR a note requesting review and the URL for this PR will be returned. If there is no open PR, skip this point.
+- If the item can be closed (all acceptance criteria met, all children completed, PR merged) a recommendation to close will be included. If the item cannot be closed, skip this point.
+- If none of the above apply a note stating that the item is in good standing and no action is required at this time. If any of the above apply, skip this point.
+
+DO NOT output anything after the summary section.
 
 ## Notes
 
