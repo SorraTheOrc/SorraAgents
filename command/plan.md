@@ -127,7 +127,7 @@ Keep asking questions until the breakdown into features is clear.
 - Use `wl list --parent <work-item-id> --json` for features.
 
 - Add a comment to the planned work item:
-  - `wl comments add $1 "Planning Complete. <Summary of the approved feature list, any open questions that remain>" --actor @your-agent-name --json`
+  - `wl comments add $1 "Planning Complete. <Summary of the approved feature list, any open questions that remain>" --actor <your-agent-name> --json`
     -- Update the planned work item's stage to indicate planning is complete:
   - `wl update $1 --stage plan_complete --json`
 

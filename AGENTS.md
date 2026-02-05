@@ -1,4 +1,5 @@
 <!-- WORKFLOW: start -->
+
 ## Workflow for AI Agents
 
 It is expected that a session will be started by a human operator who will supply an initial prompt which defines the overall goals and context for the work to be done. When receiving such a prompt the agent will create an initial work-item in the worklog to track the work required to meet those goals. The work-item is created with a command such as `wl create "<work-item-title>" --description "<detailed-description-of-goals-and-context>" --issue-type <type-of-work-item> --json` (see [Work-Item Management](#work-item-management) below for more information). Remember the work-item id that is returnedm this will be referred to below as the <base-item-id>.
@@ -10,7 +11,7 @@ Once approved the agent should ask if they may ask further clarifying questions 
 The agent(s) will then plan and execute the work required to meet those goals by following the steps below.
 
 0. **Claim the work-item** created by the operator:
-   - Claim it with `wl update <id> --status in-progress --assignee @your-agent-name`
+   - Claim it with `wl update <id> --status in-progress --assignee <your-agent-name>`
 1. **Ensure the work-item is clearly defined**:
    - Review the description, acceptance criteria, and any related files/paths in the work item description and comments (retrieved with `wl show <id> --children --json`)
    - Review any existing work-items in the repository that may be related to this work-item (`wl list <search-terms> --include-closed` and `wl show <id> --children --json`).
@@ -33,7 +34,7 @@ The agent(s) will then plan and execute the work required to meet those goals by
 3. **Decide what to work on next**:
    - Use `wl next --json` to get a recommendation for the next work-item to work on. The id of this item will be referred to below as <WIP-id>.
    - If the recommended work-item has no children proceed to the next step.
-   - If the recommended work-item has children claim this work-item and mark it as in progress using `wl update <WIP-id> --status in-progress --assignee @your-agent-name`
+   - If the recommended work-item has children claim this work-item and mark it as in progress using `wl update <WIP-id> --status in-progress --assignee <your-agent-name>`
    - Repeat this step to get the next recommended work-item until a leaf work-item (one with no children) is reached.
    - if there are no descendents of <base-item-id> left to work on go to the `End session` step.
    - Report back to the operator summarising the selected work-item and proceed to the next step.
@@ -52,9 +53,9 @@ The agent(s) will then plan and execute the work required to meet those goals by
      - Regularly build and run all tests and checks to ensure nothing is broken
        - If the build or any tests/checks fail, fix the issues and repeat until all tests/checks pass
      - Commit changes whenever the Producer observes that a significant amount of progress has been made (ask if you think it is due), use clear commit messages that reference the WIP id and summarise the changes made.
-   - If a particularly complex issue is identified or a significant design decisions or assumption is made record this in a comment on the work-item using `wl comment add <WIP-id> --comment "<detailed-comment>" --author @your-agent-name --json`
+   - If a particularly complex issue is identified or a significant design decisions or assumption is made record this in a comment on the work-item using `wl comment add <WIP-id> --comment "<detailed-comment>" --author <your-agent-name> --json`
    - Once the acceptance criteria of <WIP-id> has been satisfied and all tests pass, Commit final changes to the branch with a message such as `<WIP-id>: Completed work to satisfy acceptance criteria: <acceptance-criteria-summary>`
-   - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author @your-agent-name --json`
+   - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
    - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
    - Report back to the operator summarising the work completed and proceed to the next step.
 5. **Merge work into main**:
@@ -78,7 +79,7 @@ The agent(s) will then plan and execute the work required to meet those goals by
    - When the operator indicates that the session is complete, ensure all work-items created or worked on during the session are in the `in_review` or `done` stage.
    - Provide a final summary to the operator of all work completed during the session, including work-item ids, commit hashes, and any relevant links.
    - Thank the operator and end the session.
-<!-- WORKFLOW: end -->
+   <!-- WORKFLOW: end -->
 
 ## work-item Tracking with Worklog (wl)
 
@@ -210,6 +211,12 @@ wl close <work-item-id-1> <work-item-id-2> --json
 
 # *Destructive command ask for confirmation before running* Dekete a work item permanently
 wl delete <work-item-id> --json
+
+# Dependencies
+wl dep --help  # Show help for dependency commands
+wl dep add <dependent-work-item-id> <prereq-work-item-id>
+wl dep list <work-item-id> --json
+wl dep remove <dependent-work-item-id> <prereq-work-item-id>
 ```
 
 ### Project Status
@@ -219,14 +226,14 @@ wl delete <work-item-id> --json
 # Display a recommendation for the next item to work on in JSON
 wl next --json
 # Display a recommendation for the next item assigned to `agent-name` to work on
-wl next --assignee "agent-name" --json
+wl next --assignee "<agent-name>" --json
 # Display a recommendation for the next item to work on that matches a keyword (in title/description/comments)
 wl next --search "keyword" --json
 
 # Show all items with status `in-progress` in JSON
 wl in-progress --json
 # Show in-progress items assigned to `agent-name`
-wl in-progress --assignee "agent-name" --json
+wl in-progress --assignee "<agent-name>" --json
 
 # Show recently created or updated work items
 wl recent --json
@@ -246,7 +253,7 @@ wl list --priority high --json
 # List items filtered by comma-separated tags
 wl list --tags "frontend,bug" --json
 # List items filtered by assignee (short or full name)
-wl list --assignee alice --json
+wl list --assignee "<assignee-name>" --json
 # List items filtered by stage (e.g. triage, review, done)
 wl list --stage review --json
 

@@ -12,11 +12,11 @@ def test_build_payload_includes_hostname_and_timestamp():
         2020, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc
     ).isoformat()
     payload = build_payload(hostname, ts, work_item_id="SA-123")
-    assert "embeds" in payload
-    embed = payload["embeds"][0]
-    assert "Host: test-host" in embed["description"]
-    assert "Timestamp: 2020-01-02T03:04:05+00:00" in embed["description"]
-    assert any(f["name"] == "work_item_id" for f in embed["fields"])
+    assert "content" in payload
+    content = payload["content"]
+    assert "Host: test-host" in content
+    assert "Timestamp: 2020-01-02T03:04:05+00:00" in content
+    assert "work_item_id: SA-123" in content
 
 
 def test_get_env_config_missing_webhook(monkeypatch):

@@ -4,6 +4,9 @@ import os
 
 import pytest
 
+from typing import Any, cast
+
+import ampa.daemon as daemon
 from ampa.daemon import get_env_config, run_once
 
 
@@ -32,11 +35,10 @@ def test_heartbeat_skipped_when_other_message_since_last_heartbeat(
 ):
     state_file = tmp_path / "ampa_state.json"
     now = datetime.datetime.now(datetime.timezone.utc)
-    # last heartbeat was 60s ago, other message 30s ago -> skip heartbeat
+    # other message 30s ago -> skip heartbeat
     write_state(
         state_file,
         {
-            "last_heartbeat_ts": (now - datetime.timedelta(seconds=60)).isoformat(),
             "last_message_ts": (now - datetime.timedelta(seconds=30)).isoformat(),
             "last_message_type": "other",
         },
@@ -63,12 +65,11 @@ def test_heartbeat_skipped_when_other_message_since_last_heartbeat(
 def test_heartbeat_sent_and_updates_state(monkeypatch, tmp_path):
     state_file = tmp_path / "ampa_state.json"
     now = datetime.datetime.now(datetime.timezone.utc)
-    # last heartbeat was 60s ago, last message was 120s ago -> heartbeat should send
+    # last message was 6 minutes ago -> heartbeat should send
     write_state(
         state_file,
         {
-            "last_heartbeat_ts": (now - datetime.timedelta(seconds=60)).isoformat(),
-            "last_message_ts": (now - datetime.timedelta(seconds=120)).isoformat(),
+            "last_message_ts": (now - datetime.timedelta(minutes=6)).isoformat(),
             "last_message_type": "other",
         },
     )
@@ -112,3 +113,17 @@ def test_initial_heartbeat_when_no_state(monkeypatch, tmp_path):
     st = read_state(state_file)
     assert st.get("last_message_type") == "heartbeat"
     assert "last_heartbeat_ts" in st
+
+
+def test_build_command_payload_includes_output():
+    payload = cast(Any, daemon).build_command_payload(
+        "host",
+        "2026-01-01T00:00:00+00:00",
+        "wl-in-progress",
+        "in progress output",
+        0,
+    )
+    content = payload["content"]
+    assert "command_id: wl-in-progress" in content
+    assert "exit_code: 0" in content
+    assert "in progress output" in content
