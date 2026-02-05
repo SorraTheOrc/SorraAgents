@@ -228,11 +228,19 @@ def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
 def send_webhook(
     url: str, payload: Dict[str, Any], timeout: int = 10, message_type: str = "other"
 ) -> int:
-    """Send the webhook payload using requests.
+    """Send the webhook payload using requests with an exponential backoff.
 
-    Returns HTTP status code on success. Raises RuntimeError if requests
-    is not available.
+    Retries on non-2xx responses and network errors up to AMPA_MAX_RETRIES
+    (default 10). Backoff base is controlled by AMPA_BACKOFF_BASE_SECONDS
+    (default 2) and doubles each attempt. Sleep is performed via
+    time.sleep() so tests can monkeypatch it.
+
+    Returns HTTP status code on success or when a remote server returns a
+    non-2xx after exhausting retries. On final network error the underlying
+    exception is re-raised after logging and invoking dead_letter.
     """
+    import time
+
     if requests is None:
         LOG.error("requests package is required to send webhook")
         raise RuntimeError("requests missing")
@@ -243,75 +251,129 @@ def send_webhook(
 
     def _mask_url(u: str) -> str:
         try:
-            # Mask the webhook token portion so logs aren't leaking it
             parts = u.split("/")
             if len(parts) > 0:
-                # last two segments are id/token; mask token
                 parts[-1] = "<token>"
                 return "/".join(parts)
         except Exception:
             pass
         return "<redacted>"
 
+    # Configurable retry parameters
     try:
-        session = requests.Session()
-        session.trust_env = False
-        LOG.debug(
-            "Sending webhook to %s (masked=%s); trust_env=%s",
-            url,
-            _mask_url(url),
-            session.trust_env,
-        )
-        resp = session.post(url, json=payload, timeout=timeout)
+        max_retries = int(os.getenv("AMPA_MAX_RETRIES", "10"))
+        if max_retries < 1:
+            raise ValueError()
+    except Exception:
+        LOG.warning("Invalid AMPA_MAX_RETRIES, falling back to 10")
+        max_retries = 10
+
+    try:
+        backoff_base = float(os.getenv("AMPA_BACKOFF_BASE_SECONDS", "2"))
+        if backoff_base <= 0:
+            raise ValueError()
+    except Exception:
+        LOG.warning("Invalid AMPA_BACKOFF_BASE_SECONDS, falling back to 2")
+        backoff_base = 2.0
+
+    session = requests.Session()
+    session.trust_env = False
+    LOG.debug(
+        "Sending webhook to %s (masked=%s); trust_env=%s",
+        url,
+        _mask_url(url),
+        session.trust_env,
+    )
+
+    last_exc: Optional[BaseException] = None
+
+    for attempt in range(1, max_retries + 1):
         try:
-            resp.raise_for_status()
-        except Exception:
-            # Log a richer set of debug information to help diagnose
-            # environments where the webhook appears valid on the host but
-            # fails from inside the running container.
-            LOG.error(
-                "Webhook POST failed: %s %s",
-                resp.status_code,
-                getattr(resp, "text", ""),
-            )
+            resp = session.post(url, json=payload, timeout=timeout)
             try:
-                # Show the exact URL and headers used for the request (mask token)
-                req = getattr(resp, "request", None)
-                if req is not None:
-                    masked = _mask_url(getattr(req, "url", None) or "")
-                    headers = {
-                        k: v
-                        for k, v in getattr(req, "headers", {}).items()
-                        if k.lower() not in ("authorization",)
-                    }
-                    body_len = (
-                        len(getattr(req, "body", b""))
-                        if getattr(req, "body", None)
-                        else 0
-                    )
-                    LOG.info(
-                        "Request made to %s; headers=%s; body_len=%s",
-                        masked,
-                        headers,
-                        body_len,
-                    )
-                    # Attempt to resolve the webhook host from inside the process
-                    parsed = urllib.parse.urlparse(getattr(req, "url", ""))
-                    host = parsed.hostname
-                    if host:
-                        try:
-                            addrs = [
-                                a[4][0]
-                                for a in __import__("socket").getaddrinfo(
-                                    host, parsed.port or 443
-                                )
-                            ]
-                            LOG.info("Resolved %s -> %s", host, addrs)
-                        except Exception as _e:
-                            LOG.info("Failed to resolve host %s: %s", host, _e)
+                resp.raise_for_status()
             except Exception:
-                LOG.info("Failed to log request debug info")
-            # record attempted send
+                # HTTP error (non-2xx) - log and decide whether to retry
+                LOG.warning(
+                    "Webhook POST attempt %d/%d failed: %s %s",
+                    attempt,
+                    max_retries,
+                    getattr(resp, "status_code", None),
+                    getattr(resp, "text", ""),
+                )
+                # Log additional debug info once per failure
+                try:
+                    req = getattr(resp, "request", None)
+                    if req is not None:
+                        masked = _mask_url(getattr(req, "url", None) or "")
+                        headers = {
+                            k: v
+                            for k, v in getattr(req, "headers", {}).items()
+                            if k.lower() not in ("authorization",)
+                        }
+                        body_len = (
+                            len(getattr(req, "body", b""))
+                            if getattr(req, "body", None)
+                            else 0
+                        )
+                        LOG.info(
+                            "Request made to %s; headers=%s; body_len=%s",
+                            masked,
+                            headers,
+                            body_len,
+                        )
+                        parsed = urllib.parse.urlparse(getattr(req, "url", ""))
+                        host = parsed.hostname
+                        if host:
+                            try:
+                                addrs = [
+                                    a[4][0]
+                                    for a in __import__("socket").getaddrinfo(
+                                        host, parsed.port or 443
+                                    )
+                                ]
+                                LOG.info("Resolved %s -> %s", host, addrs)
+                            except Exception as _e:
+                                LOG.info("Failed to resolve host %s: %s", host, _e)
+                except Exception:
+                    LOG.info("Failed to log request debug info")
+
+                # record attempted send
+                try:
+                    _write_state(
+                        state_file,
+                        {
+                            "last_message_ts": datetime.datetime.now(
+                                datetime.timezone.utc
+                            ).isoformat(),
+                            "last_message_type": message_type,
+                        },
+                    )
+                except Exception:
+                    LOG.debug("Failed to record state after exception")
+
+                if attempt >= max_retries:
+                    LOG.error(
+                        "Webhook POST final failure after %d attempts: %s",
+                        attempt,
+                        getattr(resp, "status_code", None),
+                    )
+                    try:
+                        dead_letter(
+                            payload, reason=f"HTTP {getattr(resp, 'status_code', None)}"
+                        )
+                    except Exception:
+                        LOG.exception("dead_letter failed on final HTTP error")
+                    return getattr(resp, "status_code", 0)
+
+                # sleep before next retry
+                backoff = backoff_base * (2 ** (attempt - 1))
+                LOG.info("Backing off for %.1fs before next attempt", backoff)
+                time.sleep(backoff)
+                continue
+
+            # success
+            LOG.info("Webhook POST succeeded: %s", resp.status_code)
             _write_state(
                 state_file,
                 {
@@ -322,33 +384,45 @@ def send_webhook(
                 },
             )
             return resp.status_code
-        LOG.info("Webhook POST succeeded: %s", resp.status_code)
-        _write_state(
-            state_file,
-            {
-                "last_message_ts": datetime.datetime.now(
-                    datetime.timezone.utc
-                ).isoformat(),
-                "last_message_type": message_type,
-            },
-        )
-        return resp.status_code
-    except Exception as exc:
-        LOG.error("Webhook POST exception: %s", exc)
-        # record attempted send even on exception
-        try:
-            _write_state(
-                state_file,
-                {
-                    "last_message_ts": datetime.datetime.now(
-                        datetime.timezone.utc
-                    ).isoformat(),
-                    "last_message_type": message_type,
-                },
+
+        except Exception as exc:
+            # network or other exception - retry unless out of attempts
+            last_exc = exc
+            LOG.warning(
+                "Webhook POST attempt %d/%d exception: %s",
+                attempt,
+                max_retries,
+                exc,
             )
-        except Exception:
-            LOG.debug("Failed to record state after exception")
-        raise
+            try:
+                _write_state(
+                    state_file,
+                    {
+                        "last_message_ts": datetime.datetime.now(
+                            datetime.timezone.utc
+                        ).isoformat(),
+                        "last_message_type": message_type,
+                    },
+                )
+            except Exception:
+                LOG.debug("Failed to record state after exception")
+
+            if attempt >= max_retries:
+                LOG.error(
+                    "Webhook POST final exception after %d attempts: %s",
+                    attempt,
+                    exc,
+                )
+                try:
+                    dead_letter(payload, reason=str(exc))
+                except Exception:
+                    LOG.exception("dead_letter failed on final exception")
+                # re-raise to preserve previous behavior for callers
+                raise
+
+            backoff = backoff_base * (2 ** (attempt - 1))
+            LOG.info("Backing off for %.1fs before next attempt", backoff)
+            time.sleep(backoff)
 
 
 def run_once(config: Dict[str, Any]) -> int:
