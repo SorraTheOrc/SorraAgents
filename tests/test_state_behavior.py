@@ -119,11 +119,11 @@ def test_build_command_payload_includes_output():
     payload = cast(Any, daemon).build_command_payload(
         "host",
         "2026-01-01T00:00:00+00:00",
-        "wl-in-progress",
+        "wl-in_progress",
         "in progress output",
         0,
     )
     content = payload["content"]
-    assert "command_id: wl-in-progress" in content
+    assert "command_id: wl-in_progress" in content
     assert "exit_code: 0" in content
     assert "in progress output" in content

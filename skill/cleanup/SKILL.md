@@ -84,7 +84,7 @@ Triggers
 
 - Run `wl sync` to ensure work item data is current.
 - If `wl` available: `wl list --status in_progress --json`.
-- Cross-reference work items with branches found in the repo. For each in-progress work item, show last updated, linked branches, and recommend close if: the branch is merged and PRs/commits indicate completion or inactivity (configurable age threshold).
+- Cross-reference work items with branches found in the repo. For each in_progress work item, show last updated, linked branches, and recommend close if: the branch is merged and PRs/commits indicate completion or inactivity (configurable age threshold).
 - For each work item use the status skill to evaluate their suitability for closure.
 - Present candidate work item closures and ask for confirmation. If confirmed and not `dry-run`: `wl close <id> --reason "Completed" --json` then `wl sync`.
   - If there are no candidates, report none found.

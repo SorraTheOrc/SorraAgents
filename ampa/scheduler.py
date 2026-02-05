@@ -451,7 +451,7 @@ class Scheduler:
         """Execute triage-audit post-processing.
 
         This method:
-        - Calls `wl in-progress --json` to get candidate work items
+        - Calls `wl in_progress --json` to get candidate work items
         - Selects the least-recently-updated work item not audited within cooldown
         - Executes `opencode run audit <work_item_id>` and captures output
         - Posts a short Discord summary and a WL comment containing the full output
@@ -507,17 +507,17 @@ class Scheduler:
 
         # keep a single _call wrapper for shell execution (no retries)
 
-        # 1) list in-progress work items
+        # 1) list in_progress work items
         try:
-            proc = _call("wl in-progress --json")
+            proc = _call("wl in_progress --json")
             if proc.returncode != 0:
-                LOG.warning("wl in-progress failed: %s", proc.stderr)
+                LOG.warning("wl in_progress failed: %s", proc.stderr)
                 return
             items = []
             try:
                 raw = json.loads(proc.stdout or "null")
             except Exception:
-                LOG.exception("Failed to parse wl in-progress output")
+                LOG.exception("Failed to parse wl in_progress output")
                 return
             # normalize different wl outputs: either a list or an object with a list under
             # keys like workItems, work_items, items, or data
@@ -537,9 +537,9 @@ class Scheduler:
                             items = v
                             break
             if not isinstance(items, list) or not items:
-                LOG.debug("No in-progress items returned")
+                LOG.debug("No in_progress items returned")
                 return
-            LOG.info("Found %d in-progress work item(s)", len(items))
+            LOG.info("Found %d in_progress work item(s)", len(items))
 
             # find candidate sorted by their updated timestamp (oldest first)
             def _item_updated_ts(it: Dict[str, Any]) -> Optional[dt.datetime]:

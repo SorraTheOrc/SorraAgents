@@ -89,7 +89,7 @@ Live context commands (use to gather runtime state)
 
 3. Implement
 
-- If the work item has any open or in-progress blockers or dependencies:
+- If the work item has any open or in_progress blockers or dependencies:
   - Select te most appropriate work item to work on next (blocker > dependency; most critical first).
   - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
   - Recursively implement that work item as described in this procedure.
@@ -133,7 +133,7 @@ Live context commands (use to gather runtime state)
 7. Cleanup
 
 - Only take the following actions after the PR is merged:
-- Close the work item and all its dependents and blockers by running `wl update <work-item-id> --status done --stage done --json`.
+- Close the work item and all its dependents and blockers by running `wl update <work-item-id> --status completed --stage completed --json`.
 - Cleanup using the cleanup skill
 
 ## Exit codes & errors
