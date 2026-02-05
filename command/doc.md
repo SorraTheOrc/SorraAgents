@@ -21,7 +21,7 @@ Where possible, update and improve existing documentation rather than creating n
 
 Worklog context (must do):
 
-- Mark the **Docs:** task as in-progress `wl update <docs-id> --status in_progress`
+- Mark the **Docs:** task as in_progress `wl update <docs-id> --status in_progress`
 - Fetch the work item details using Worklog CLI: `wl show <parent-id> --json`.
 - Treat `title`, `description`, `acceptance` (if present), and any linked artifacts as authoritative seed intent.
 

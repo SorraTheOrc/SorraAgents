@@ -21,22 +21,22 @@ Provide a concise, human-friendly summary of project status or a specific work i
 2. Run git status to what branch we are on and whether there are uncommitted changes and include a note if any are found.
 3. If no work item id is provided:
 
-- Run `waif in-progress --json` to fetch in-progress work JSON format to get more information, but do not display it.
+- Run `waif in_progress --json` to fetch in_progress work JSON format to get more information, but do not display it.
 - Present a one line summary of the overall project status based on the JSON data.
-- Present a summary of actively in-progress work items (ignore items that are open or closed). Start with the one deepest in the dependency chain and work upwards. Include the last updated date and a summary of the most recent comment if applicable.
-- List the files referenced in the in-progress work items.
+- Present a summary of actively in_progress work items (ignore items that are open or closed). Start with the one deepest in the dependency chain and work upwards. Include the last updated date and a summary of the most recent comment if applicable.
+- List the files referenced in the in_progress work items.
 
 4. If a work item id is provided:
 
 - Run `wl show <work-item-id> --json` and `wl show <work-item-id> --json` to fetch work item details (with all comments).
 - Parse and present: title, status, assignee, priority, description, blockers, dependencies, summary of all comments, and relevant links.
-- Walk through all open and in-progress subtasks, children, and blockers, summarizing their status as well.
-  - Never skip any related work item that is open or in-progress.
+- Walk through all open and in_progress subtasks, children, and blockers, summarizing their status as well.
+  - Never skip any related work item that is open or in_progress.
 - Make a very clear statement about whether the work item can be closed or not. If it cannot be closed, explain why (e.g., blockers, dependencies, incomplete tasks).
 
 5. Provide numbered actionable next steps based on the status information.
 
-- If no work item id is provided, always offer to run `audit <work-item-id>` (do not mention `wl show`) against the most important in-progress work item (show ID and title), add one or two alternative next actions relevant to the current status.
+- If no work item id is provided, always offer to run `audit <work-item-id>` (do not mention `wl show`) against the most important in_progress work item (show ID and title), add one or two alternative next actions relevant to the current status.
 - If a work item id is provided, suggest appropriate next steps to complete the work item (if not already completed).
 - Do not provide an alternative set of actions. There should only be 3 numbered next steps and a free-form response allowed.
 

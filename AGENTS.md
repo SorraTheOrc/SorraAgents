@@ -11,7 +11,7 @@ Once approved the agent should ask if they may ask further clarifying questions 
 The agent(s) will then plan and execute the work required to meet those goals by following the steps below.
 
 0. **Claim the work-item** created by the operator:
-   - Claim it with `wl update <id> --status in-progress --assignee <your-agent-name>`
+   - Claim it with `wl update <id> --status in_progress --assignee <your-agent-name>`
 1. **Ensure the work-item is clearly defined**:
    - Review the description, acceptance criteria, and any related files/paths in the work item description and comments (retrieved with `wl show <id> --children --json`)
    - Review any existing work-items in the repository that may be related to this work-item (`wl list <search-terms> --include-closed` and `wl show <id> --children --json`).
@@ -34,7 +34,7 @@ The agent(s) will then plan and execute the work required to meet those goals by
 3. **Decide what to work on next**:
    - Use `wl next --json` to get a recommendation for the next work-item to work on. The id of this item will be referred to below as <WIP-id>.
    - If the recommended work-item has no children proceed to the next step.
-   - If the recommended work-item has children claim this work-item and mark it as in progress using `wl update <WIP-id> --status in-progress --assignee <your-agent-name>`
+   - If the recommended work-item has children claim this work-item and mark it as in progress using `wl update <WIP-id> --status in_progress --assignee <your-agent-name>`
    - Repeat this step to get the next recommended work-item until a leaf work-item (one with no children) is reached.
    - if there are no descendents of <base-item-id> left to work on go to the `End session` step.
    - Report back to the operator summarising the selected work-item and proceed to the next step.
@@ -154,7 +154,7 @@ Use parent/child relationships to track blocking dependencies.
 
 - Child items must be completed before the parent can be closed.
 - If a work item blocks another, make it a child of the blocked item.
-- If a work item blocks multiple items, create the parent/child relationships with the highest priority item as the parent unless one of the items is in-progress, in which case that item should be the parent.
+- If a work item blocks multiple items, create the parent/child relationships with the highest priority item as the parent unless one of the items is in_progress, in which case that item should be the parent.
   - If in doubt raise for product manager review.
 
 Other types of dependencies can be tracked in descriptions, for example `discovered-from:<work-item-id>`, `related-to:<work-item-id>`, `blocked-by:<work-item-id>`.
@@ -172,7 +172,7 @@ Worklog does not enforce these relationships but they can be used for planning a
   - If available use the `effort_and_risk` agent skill to estimate these values.
 
 1. Check ready work: `wl next`
-2. Claim your task: `wl update <id> --status in-progress`
+2. Claim your task: `wl update <id> --status in_progress`
 3. Work on it: implement, test, document
 4. Discover new work? Create a linked issue:
 
@@ -194,7 +194,7 @@ wl create --title "Found bug" --priority high --tags "discovered-from:WL-123" --
 
 # Update work items
 wl update --help  # Show help for updating work items
-wl update <work-item-id> --status in-progress --json
+wl update <work-item-id> --status in_progress --json
 wl update <work-item-id> --priority high --json
 
 # Comments
@@ -230,10 +230,10 @@ wl next --assignee "<agent-name>" --json
 # Display a recommendation for the next item to work on that matches a keyword (in title/description/comments)
 wl next --search "keyword" --json
 
-# Show all items with status `in-progress` in JSON
-wl in-progress --json
-# Show in-progress items assigned to `agent-name`
-wl in-progress --assignee "<agent-name>" --json
+# Show all items with status `in_progress` in JSON
+wl in_progress --json
+# Show in_progress items assigned to `agent-name`
+wl in_progress --assignee "<agent-name>" --json
 
 # Show recently created or updated work items
 wl recent --json
@@ -246,7 +246,7 @@ wl recent --children --json
 wl list --json
 # Limit list output
 wl list -n 5 --json
-# List items filtered by status (open, in-progress, closed, etc.)
+# List items filtered by status (open, in_progress, closed, etc.)
 wl list --status open --json
 # List items filtered by priority (critical, high, medium, low)
 wl list --priority high --json

@@ -53,9 +53,9 @@ The store is a JSON file with the following top-level structure (see `ampa/sched
       "max_runtime_minutes": null,
       "type": "heartbeat"
     },
-    "wl-in-progress": {
-      "id": "wl-in-progress",
-      "command": "wl in-progress",
+    "wl-in_progress": {
+      "id": "wl-in_progress",
+      "command": "wl in_progress",
       "requires_llm": false,
       "frequency_minutes": 1,
       "priority": 0,

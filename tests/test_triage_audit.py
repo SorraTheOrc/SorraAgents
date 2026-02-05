@@ -49,8 +49,8 @@ def test_triage_audit_runs_and_cleans_temp(tmp_path, monkeypatch):
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        # wl in-progress
-        if cmd.strip() == "wl in-progress --json":
+        # wl in_progress
+        if cmd.strip() == "wl in_progress --json":
             out = json.dumps(
                 {
                     "workItems": [
