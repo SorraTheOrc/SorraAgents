@@ -61,7 +61,7 @@ Live context commands (use to gather runtime state)
 
 1. Understand the work item
 
-- Claim by running `wl update $1 --status in_progress --stage in_progress --assignee "@AGENT" --json` (omit `--assignee` if not applicable).
+- Claim by running `wl update $1 --status in_progress --stage in_progress --assignee "<AGENT>" --json` (omit `--assignee` if not applicable).
 - Fetch the work item JSON if not already present: `wl show $1 --json` and `wl show $1 -F full --refs --json`.
 - Restate acceptance criteria and constraints from the work item JSON.
 - Surface blockers, dependencies and missing requirements.
@@ -92,7 +92,7 @@ Live context commands (use to gather runtime state)
 
 - If the work item has any open or in-progress blockers or dependencies:
   - Select te most appropriate work item to work on next (blocker > dependency; most critical first).
-  - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "@AGENT" --json`
+  - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
   - Recursively implement that work item as described in this procedure.
   - When a work item is completed commit the work and update the stage: `wl update <work-item-id> --stage in_review --json`
 - Write tests and code to ensure all acceptance criteria defined in or related to the current work item are met:
