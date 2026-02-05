@@ -1,10 +1,3 @@
-"""AMPA package exports."""
+"""AMPA package marker. Keeps the ampa directory importable as a package."""
 
-from .daemon import (
-    build_payload,
-    get_env_config,
-    run_once,
-    send_webhook,
-)  # re-export for tests
-
-__all__ = ["build_payload", "get_env_config", "run_once", "send_webhook"]
+__all__ = []

@@ -15,6 +15,7 @@ import socket
 import time
 from typing import Any, Dict, Optional
 import tempfile
+import urllib.parse
 
 try:
     # optional dependency for .env file parsing
@@ -38,7 +39,7 @@ def get_env_config() -> Dict[str, Any]:
 
     Raises SystemExit (2) if AMPA_DISCORD_WEBHOOK is not set.
     """
-    # If an .env file exists in the ampa package, load it so values there
+    # If an .env file exists in the package directory, load it so values there
     # override the environment. Loading is optional; if python-dotenv is not
     # installed we skip loading the file.
     env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -55,8 +56,21 @@ def get_env_config() -> Dict[str, Any]:
         pkg_env = find_dotenv(env_path, usecwd=True)
         if pkg_env:
             load_dotenv(pkg_env, override=True)
+        else:
+            # Fallback to a repo root .env (e.g. /opt/ampa/.env) when present.
+            root_env = os.path.join(os.getcwd(), ".env")
+            if os.path.isfile(root_env):
+                load_dotenv(root_env, override=True)
 
+    # Read webhook and be tolerant of values coming from Docker `--env-file`
+    # which preserve surrounding quotes. Strip whitespace and surrounding
+    # single/double quotes so both dotenv and Docker env-file formats work.
     webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+    if webhook:
+        webhook = webhook.strip()
+        # remove surrounding single/double quotes if present (handles values
+        # coming from dotenv or Docker env-file which may include quotes)
+        webhook = webhook.strip("'\"")
     if not webhook:
         LOG.error("AMPA_DISCORD_WEBHOOK is not set; cannot send heartbeats")
         raise SystemExit(2)
@@ -126,16 +140,77 @@ def send_webhook(
     state_file = os.getenv("AMPA_STATE_FILE") or os.path.join(
         tempfile.gettempdir(), "ampa_state.json"
     )
+
+    def _mask_url(u: str) -> str:
+        try:
+            # Mask the webhook token portion so logs aren't leaking it
+            parts = u.split("/")
+            if len(parts) > 0:
+                # last two segments are id/token; mask token
+                parts[-1] = "<token>"
+                return "/".join(parts)
+        except Exception:
+            pass
+        return "<redacted>"
+
     try:
-        resp = requests.post(url, json=payload, timeout=timeout)
+        session = requests.Session()
+        session.trust_env = False
+        LOG.debug(
+            "Sending webhook to %s (masked=%s); trust_env=%s",
+            url,
+            _mask_url(url),
+            session.trust_env,
+        )
+        resp = session.post(url, json=payload, timeout=timeout)
         try:
             resp.raise_for_status()
         except Exception:
+            # Log a richer set of debug information to help diagnose
+            # environments where the webhook appears valid on the host but
+            # fails from inside the running container.
             LOG.error(
                 "Webhook POST failed: %s %s",
                 resp.status_code,
                 getattr(resp, "text", ""),
             )
+            try:
+                # Show the exact URL and headers used for the request (mask token)
+                req = getattr(resp, "request", None)
+                if req is not None:
+                    masked = _mask_url(getattr(req, "url", None) or "")
+                    headers = {
+                        k: v
+                        for k, v in getattr(req, "headers", {}).items()
+                        if k.lower() not in ("authorization",)
+                    }
+                    body_len = (
+                        len(getattr(req, "body", b""))
+                        if getattr(req, "body", None)
+                        else 0
+                    )
+                    LOG.info(
+                        "Request made to %s; headers=%s; body_len=%s",
+                        masked,
+                        headers,
+                        body_len,
+                    )
+                    # Attempt to resolve the webhook host from inside the process
+                    parsed = urllib.parse.urlparse(getattr(req, "url", ""))
+                    host = parsed.hostname
+                    if host:
+                        try:
+                            addrs = [
+                                a[4][0]
+                                for a in __import__("socket").getaddrinfo(
+                                    host, parsed.port or 443
+                                )
+                            ]
+                            LOG.info("Resolved %s -> %s", host, addrs)
+                        except Exception as _e:
+                            LOG.info("Failed to resolve host %s: %s", host, _e)
+            except Exception:
+                LOG.info("Failed to log request debug info")
             # record attempted send
             _write_state(
                 state_file,

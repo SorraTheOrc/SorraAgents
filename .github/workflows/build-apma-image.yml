@@ -1,0 +1,39 @@
+name: Build APMA container
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    paths:
+      - 'ampa/**'
+
+jobs:
+  build-apma-image:
+    name: Build APMA image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build APMA image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./ampa
+          file: ./ampa/Dockerfile
+          push: false
+          tags: ampa-daemon:ci-${{ github.run_id }}
+
+      - name: Smoke-run image
+        run: |
+          # Run a trivial command to verify the image is runnable. We
+          # override the container command to /bin/true to ensure quick
+          # successful exit even if the daemon would normally run long.
+          docker run --rm ampa-daemon:ci-${{ github.run_id }} /bin/true
