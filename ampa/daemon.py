@@ -38,6 +38,7 @@ __all__ = [
     "get_env_config",
     "run_once",
     "send_webhook",
+    "dead_letter",
 ]
 
 
@@ -161,6 +162,67 @@ def _write_state(path: str, data: Dict[str, str]) -> None:
             json.dump(data, fh)
     except Exception:
         LOG.exception("Failed to write state file %s", path)
+
+
+def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
+    """Handle final-failure messages by forwarding to a dead-letter webhook or file.
+
+    Behavior:
+    - If AMPA_DEADLETTER_WEBHOOK is set, POST the payload (with optional reason) to that URL.
+    - Otherwise append a JSON record to AMPA_DEADLETTER_FILE (default: /var/log/ampa_deadletter.log).
+    This function is best-effort and will log but not raise on failure.
+    """
+    try:
+        dd_wh = os.getenv("AMPA_DEADLETTER_WEBHOOK")
+        record = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "reason": reason,
+            "payload": payload,
+        }
+        if dd_wh:
+            if requests is None:
+                LOG.error(
+                    "dead_letter: requests missing; cannot POST to deadletter webhook"
+                )
+            else:
+                try:
+                    sess = requests.Session()
+                    sess.trust_env = False
+                    resp = sess.post(dd_wh, json=record, timeout=10)
+                    try:
+                        resp.raise_for_status()
+                        LOG.info(
+                            "dead_letter: posted to deadletter webhook status=%s",
+                            resp.status_code,
+                        )
+                        return
+                    except Exception:
+                        LOG.error(
+                            "dead_letter: deadletter webhook POST failed: %s %s",
+                            getattr(resp, "status_code", None),
+                            getattr(resp, "text", ""),
+                        )
+                except Exception as exc:
+                    LOG.exception(
+                        "dead_letter: exception posting to deadletter webhook: %s", exc
+                    )
+        # fallback to local file
+        dl_file = os.getenv("AMPA_DEADLETTER_FILE", "/var/log/ampa_deadletter.log")
+        try:
+            # Ensure parent dir exists when writing to a path we control (may not for /var/log)
+            parent = os.path.dirname(dl_file)
+            if parent and not os.path.isdir(parent):
+                try:
+                    os.makedirs(parent, exist_ok=True)
+                except Exception:
+                    pass
+            with open(dl_file, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+            LOG.info("dead_letter: appended failure record to %s", dl_file)
+        except Exception:
+            LOG.exception("dead_letter: failed to write dead-letter file %s", dl_file)
+    except Exception:
+        LOG.exception("dead_letter: unexpected error while handling dead letter")
 
 
 def send_webhook(
