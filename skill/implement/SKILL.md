@@ -136,6 +136,29 @@ in work item comments or PR bodies. If such data must be referenced, reference
 it by work-item id or document path instead of pasting values. Mask or redact
 any sensitive values before writing them to logs or comments.
 
+## Best Practices
+
+- Follow the steps in order and do not skip steps.
+- Keep implementation focused on meeting acceptance criteria with minimal changes.
+- Use work item comments to document your process, decisions, and next steps.
+- Handle errors gracefully and provide actionable messages for remediation.
+- If the work item is not well-defined, do not proceed with implementation. Instead, run the intake interview to clarify and update the work item before implementing.
+- If the work item has blockers or dependencies, implement those first before proceeding with the main work item.
+- Never commit directly to `main`. Always create a feature or bug branch for implementation.
+- When creating branches, include the work item id in the branch name for traceability (e.g., `feature/WL-123-add-auth`).
+- When writing the PR body, include a concise summary of the goal, work done, and clear instructions for reviewers on what to focus on in the review. Also include instructions on how to experience the any new/changed user experiences.
+- After implementation, use the cleanup skill to tidy up branches and local state, but only after the PR is merged to avoid disrupting the review process.
+
+## Handling Assets
+
+- If the implementation requires the creation of assets such as graphics or audio files, create these assets in an appropriate subfolder of the `assets` directory (e.g., `assets/images/`, `assets/audio/`) and use a name that has the prefix "placeholder\_" followed by a descriptive name (e.g., `placeholder_player_explosion_spritesheet.png` or `placeholder_player_jump.wav`).
+  - always reference new assets in the work item comments and PR description. Ensure that any generated assets are included in the commit and pushed to the repository.
+  - when creating assets, ensure they are optimized for size and performance, and follow any project guidelines for asset creation and management.
+  - you can discover assets on the web as part of your implementation, but ensure that you have the right to use and distribute any assets you include in the project. Always provide proper attribution if required by the asset's license.
+  - any
+- If the implementation requires changes to documentation, update the relevant markdown files in the `docs` directory and reference these changes in the work item comments and PR description.
+  - ensure that documentation changes are clear, concise, and accurately reflect the implementation changes. Include examples or screenshots if they help clarify the documentation.
+
 ## Examples
 
 - Example 1 — Full implementation (canonical)

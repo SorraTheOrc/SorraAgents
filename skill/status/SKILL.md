@@ -29,6 +29,7 @@ Provide a concise, human-friendly summary of project status or a specific work i
 4. If a work item id is provided:
 
 - Run `wl show <work-item-id> --json` and `wl show <work-item-id> --json` to fetch work item details (with all comments).
+- Evaluate the current codebase against the acceptance criteria and the work item status to determine if the item can be closed or not. If it cannot be closed, identify blockers, dependencies, or incomplete tasks that are preventing closure.
 - Parse and present: title, status, assignee, priority, description, blockers, dependencies, summary of all comments, and relevant links.
 - Walk through all open and in_progress subtasks, children, and blockers, summarizing their status as well.
   - Never skip any related work item that is open or in_progress.
