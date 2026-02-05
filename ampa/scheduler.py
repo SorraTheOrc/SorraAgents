@@ -10,6 +10,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import re
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -409,7 +410,20 @@ class Scheduler:
         state.update({"running": True, "last_start_ts": _to_iso(now)})
         self.store.update_state(spec.command_id, state)
         self.store.update_global_start(now)
+        LOG.debug(
+            "Executor starting for command_id=%s command=%r",
+            spec.command_id,
+            spec.command,
+        )
+        start_exec = _utc_now()
         run = self.executor(spec)
+        end_exec = _utc_now()
+        LOG.debug(
+            "Executor finished for command_id=%s exit=%s duration=%.3fs",
+            spec.command_id,
+            getattr(run, "exit_code", None),
+            (end_exec - start_exec).total_seconds(),
+        )
         output: Optional[str] = None
         exit_code = run.exit_code
         if isinstance(run, CommandRunResult):
@@ -458,8 +472,9 @@ class Scheduler:
 
         # helper to run shell commands via injectable runner
         def _call(cmd: str) -> subprocess.CompletedProcess:
-            LOG.debug("Running shell: %s", cmd)
-            return self.run_shell(
+            LOG.debug("Running shell (verbose): %s", cmd)
+            start = _utc_now()
+            proc = self.run_shell(
                 cmd,
                 shell=True,
                 check=False,
@@ -467,6 +482,30 @@ class Scheduler:
                 text=True,
                 cwd=self.command_cwd,
             )
+            end = _utc_now()
+            try:
+                stdout_len = len(proc.stdout) if proc.stdout is not None else 0
+            except Exception:
+                stdout_len = 0
+            try:
+                stderr_len = len(proc.stderr) if proc.stderr is not None else 0
+            except Exception:
+                stderr_len = 0
+            LOG.info(
+                "Shell run finished: cmd=%r returncode=%s duration=%.3fs stdout_len=%d stderr_len=%d",
+                cmd,
+                getattr(proc, "returncode", None),
+                (end - start).total_seconds(),
+                stdout_len,
+                stderr_len,
+            )
+            if stdout_len > 0:
+                LOG.debug("Shell stdout (truncated 512): %s", (proc.stdout or "")[:512])
+            if stderr_len > 0:
+                LOG.debug("Shell stderr (truncated 512): %s", (proc.stderr or "")[:512])
+            return proc
+
+        # keep a single _call wrapper for shell execution (no retries)
 
         # 1) list in-progress work items
         try:
@@ -476,13 +515,31 @@ class Scheduler:
                 return
             items = []
             try:
-                items = json.loads(proc.stdout or "[]")
+                raw = json.loads(proc.stdout or "null")
             except Exception:
                 LOG.exception("Failed to parse wl in-progress output")
                 return
+            # normalize different wl outputs: either a list or an object with a list under
+            # keys like workItems, work_items, items, or data
+            if isinstance(raw, list):
+                items = raw
+            elif isinstance(raw, dict):
+                for key in ("workItems", "work_items", "items", "data"):
+                    val = raw.get(key)
+                    if isinstance(val, list):
+                        items = val
+                        break
+                # some implementations return the list directly under 'workItems' key with
+                # different casing; try a case-insensitive match
+                if not items:
+                    for k, v in raw.items():
+                        if isinstance(v, list) and k.lower().endswith("workitems"):
+                            items = v
+                            break
             if not isinstance(items, list) or not items:
                 LOG.debug("No in-progress items returned")
                 return
+            LOG.info("Found %d in-progress work item(s)", len(items))
 
             # find candidate sorted by their updated timestamp (oldest first)
             def _item_updated_ts(it: Dict[str, Any]) -> Optional[dt.datetime]:
@@ -520,9 +577,19 @@ class Scheduler:
                     proc_c = _call(f"wl comment list {wid} --json")
                     if proc_c.returncode == 0 and proc_c.stdout:
                         try:
-                            comments = json.loads(proc_c.stdout)
+                            raw_comments = json.loads(proc_c.stdout)
                         except Exception:
-                            comments = []
+                            raw_comments = []
+                        # normalize comments list
+                        comments = []
+                        if isinstance(raw_comments, list):
+                            comments = raw_comments
+                        elif isinstance(raw_comments, dict):
+                            for key in ("comments", "items", "data"):
+                                val = raw_comments.get(key)
+                                if isinstance(val, list):
+                                    comments = val
+                                    break
                         for c in comments:
                             body = (
                                 c.get("comment") or c.get("body") or c.get("text") or ""
@@ -580,10 +647,14 @@ class Scheduler:
             selected = candidates[0][1]
             work_id = selected.get("id")
             title = selected.get("title") or selected.get("name") or "(no title)"
+            # record selected candidate for easier observability
+            LOG.info("Selected triage candidate %s — %s", work_id, title)
 
             # 2) run the audit command
             # use quoted subcommand so the audit string is passed as one argument
-            audit_cmd = f'opencode run "audit {work_id}"'
+            # changed to use the leading slash form as requested
+            audit_cmd = f'opencode run "/audit {work_id}"'
+            LOG.info("Running audit command: %s", audit_cmd)
             proc_audit = _call(audit_cmd)
             audit_out = ""
             if proc_audit.stdout:
@@ -592,16 +663,62 @@ class Scheduler:
                 audit_out += proc_audit.stderr
 
             exit_code = proc_audit.returncode
+            LOG.info(
+                "Audit finished for %s exit=%s stdout_len=%d stderr_len=%d",
+                work_id,
+                exit_code,
+                len(proc_audit.stdout or ""),
+                len(proc_audit.stderr or ""),
+            )
 
             # 3) post a short Discord summary (1-3 lines)
             if webhook:
-                summary = f"{work_id} — {title} | exit={exit_code}"
+                # extract the "Summary" section from the audit output if present
+                def _extract_summary(text: str) -> str:
+                    if not text:
+                        return ""
+                    # look for a heading-style or standalone 'Summary' line
+                    m = re.search(
+                        r"^(?:#{1,6}\s*)?Summary\s*:?$",
+                        text,
+                        re.IGNORECASE | re.MULTILINE,
+                    )
+                    if m:
+                        start = m.end()
+                        rest = text[start:]
+                        lines = rest.splitlines()
+                        collected: List[str] = []
+                        for line in lines:
+                            # stop on next markdown heading
+                            if re.match(r"^\s*#{1,6}\s+", line):
+                                break
+                            # stop on next section like 'OtherSection:' (Title-case followed by colon)
+                            if re.match(r"^[A-Z][A-Za-z0-9 \-]{0,80}\s*:$", line):
+                                break
+                            collected.append(line)
+                        # strip leading/trailing blank lines
+                        while collected and collected[0].strip() == "":
+                            collected.pop(0)
+                        while collected and collected[-1].strip() == "":
+                            collected.pop()
+                        return "\n".join(collected).strip()
+                    # fallback: try inline 'Summary:' followed by content on same line or next
+                    m2 = re.search(r"Summary:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+                    if m2:
+                        # take up to a reasonable length
+                        return m2.group(1).strip().split("\n\n")[0].strip()
+                    return ""
+
+                summary_text = _extract_summary(audit_out or "")
+                if not summary_text:
+                    # fallback simple summary
+                    summary_text = f"{work_id} — {title} | exit={exit_code}"
                 try:
                     payload = daemon.build_payload(
                         os.uname().nodename,
                         _utc_now().isoformat(),
                         work_item_id=work_id,
-                        extra_fields=[{"name": "summary", "value": summary}],
+                        extra_fields=[{"name": "summary", "value": summary_text}],
                     )
                     daemon.send_webhook(webhook, payload, message_type="command")
                 except Exception:
@@ -615,10 +732,19 @@ class Scheduler:
                 comment_text = full_output or "(no output)"
                 try:
                     comment = f"# AMPA Audit Result\n\nAudit output:\n\n{comment_text}"
-                    safe = comment.replace("'", "\\'")
-                    _call(
-                        f"wl comment add {work_id} --comment '{safe}' --author 'ampa-scheduler' --json"
+                    # write comment to temp file and use command substitution to avoid shell
+                    # quoting issues with embedded quotes/newlines
+                    fd, cpath = tempfile.mkstemp(
+                        prefix=f"wl-audit-comment-{work_id}-", suffix=".md"
                     )
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fh.write(comment)
+                    cmd = f"wl comment add {work_id} --comment \"$(cat '{cpath}')\" --author 'ampa-scheduler' --json"
+                    _call(cmd)
+                    try:
+                        os.remove(cpath)
+                    except Exception:
+                        LOG.debug("Failed to remove temp comment file %s", cpath)
                 except Exception:
                     LOG.exception("Failed to post wl comment")
             else:
@@ -630,10 +756,17 @@ class Scheduler:
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         fh.write(full_output)
                     comment = f"# AMPA Audit Result\n\nAudit output too large; full output saved to: {path}"
-                    safe = comment.replace("'", "\\'")
-                    _call(
-                        f"wl comment add {work_id} --comment '{safe}' --author 'ampa-scheduler' --json"
+                    fd2, cpath = tempfile.mkstemp(
+                        prefix=f"wl-audit-comment-{work_id}-", suffix=".md"
                     )
+                    with os.fdopen(fd2, "w", encoding="utf-8") as fh:
+                        fh.write(comment)
+                    cmd = f"wl comment add {work_id} --comment \"$(cat '{cpath}')\" --author 'ampa-scheduler' --json"
+                    _call(cmd)
+                    try:
+                        os.remove(cpath)
+                    except Exception:
+                        LOG.debug("Failed to remove temp comment file %s", cpath)
                 except Exception:
                     LOG.exception("Failed to write artifact and post comment")
         except Exception:
