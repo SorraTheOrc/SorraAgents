@@ -202,10 +202,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     argv = argv or sys.argv[1:]
     parser = argparse.ArgumentParser(prog="wl ampa")
-    sub = parser.add_subparsers(dest="cmd")
+    sub = parser.add_subparsers(dest="subcmd")
 
     p_start = sub.add_parser("start")
-    p_start.add_argument("--cmd", help="Command to run (overrides config)")
+    p_start.add_argument("--cmd", dest="cmd", help="Command to run (overrides config)")
     p_start.add_argument("--name", default="default")
     p_start.add_argument("--foreground", action="store_true")
 
@@ -223,17 +223,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(str(e))
         return 2
 
-    if ns.cmd == "start":
-        cmd = resolve_command(ns.cmd if getattr(ns, "cmd", None) else None, root)
+    if ns.subcmd == "start":
+        cli_cmd = getattr(ns, "cmd", None)
+        cmd = resolve_command(cli_cmd, root)
         if cmd is None:
             print(
                 "No command resolved. Set --cmd, WL_AMPA_CMD or configure worklog.json/package.json/scripts."
             )
             return 2
         return start(root, cmd, name=ns.name, foreground=ns.foreground)
-    if ns.cmd == "stop":
+    if ns.subcmd == "stop":
         return stop(root, name=ns.name)
-    if ns.cmd == "status":
+    if ns.subcmd == "status":
         return status(root, name=ns.name)
     parser.print_help()
     return 2
