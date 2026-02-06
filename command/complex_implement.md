@@ -109,7 +109,7 @@ Live context commands (use to gather runtime state)
 
 4. Automated self-review
 
-- Audit the work item to confirm all acceptance criteria are met: `audit $1`.
+- Audit the work item to confirm all acceptance criteria are met: `/audit $1`.
   - If the audit reveals any unmet acceptance criteria, inform the user of the findings and return to step 3 to address them.
 - Perform sequential self-review passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff.
 - For each pass, produce a short note and limit edits to small, goal-aligned changes. If intent changes are discovered, create an Open Question and stop automated edits.
