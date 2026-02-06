@@ -69,7 +69,9 @@ async function resolveCommand(cliCmd, projectRoot) {
     const pyBundle = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py', 'ampa');
     if (fs.existsSync(path.join(pyBundle, '__init__.py'))) {
       const pyPath = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py');
-      return { cmd: ['python', '-m', 'ampa.daemon'], env: { PYTHONPATH: pyPath } };
+      // Run the daemon in long-running mode by default (start scheduler).
+      // Users can override via --cmd or AMPA_RUN_SCHEDULER env var if desired.
+      return { cmd: ['python', '-m', 'ampa.daemon', '--start-scheduler'], env: { PYTHONPATH: pyPath } };
     }
   } catch (e) {}
   return null;
@@ -115,6 +117,12 @@ async function start(projectRoot, cmd, name = 'default', foreground = false) {
       }
     } catch (e) {}
   }
+  // Diagnostic: record the resolved command and env to the log so failures to
+  // persist can be investigated easily.
+  try {
+    fs.appendFileSync(lpath, `Resolved command: ${JSON.stringify(cmd)}\n`);
+  } catch (e) {}
+
   if (foreground) {
     if (cmd && cmd.cmd && Array.isArray(cmd.cmd)) {
       const env = Object.assign({}, process.env, cmd.env || {});
