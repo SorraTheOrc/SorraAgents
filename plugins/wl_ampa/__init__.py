@@ -161,9 +161,16 @@ def stop(project_root: Path, name: str = "default", timeout: int = 10) -> int:
         # Try to terminate the whole process group first.
         try:
             os.killpg(pid, signal.SIGTERM)
-        except AttributeError:
-            # os.killpg not available on Windows; fall back to os.kill
-            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            try:
+                # Alternative: send to negative pid to target the group
+                os.kill(-pid, signal.SIGTERM)
+            except Exception:
+                # Fallback to killing the single pid
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
     except Exception:
         pass
     # wait
@@ -175,8 +182,14 @@ def stop(project_root: Path, name: str = "default", timeout: int = 10) -> int:
         try:
             try:
                 os.killpg(pid, signal.SIGKILL)
-            except AttributeError:
-                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    os.kill(-pid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
         except Exception:
             pass
     if not is_running(pid):
