@@ -146,7 +146,9 @@ any sensitive values before writing them to logs or comments.
 - If the work item has blockers or dependencies, implement those first before proceeding with the main work item.
 - Never commit directly to `main`. Always create a feature or bug branch for implementation.
 - When creating branches, include the work item id in the branch name for traceability (e.g., `feature/WL-123-add-auth`).
+- Only create a PR when all acceptance criteria are met and the implementation is ready for review. Do not create PRs for work in progress.
 - When writing the PR body, include a concise summary of the goal, work done, and clear instructions for reviewers on what to focus on in the review. Also include instructions on how to experience the any new/changed user experiences.
+- Do not escape content in the PR or work-item description; use markdown formatting as needed for clarity and readability.
 - After implementation, use the cleanup skill to tidy up branches and local state, but only after the PR is merged to avoid disrupting the review process.
 
 ## Handling Assets
@@ -213,6 +215,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - If additional work is discovered, create linked work items: `wl create "<title>" --deps discovered-from:<work-item-id> --json`
 - Once all acceptance criteria for the primary work item and all blockers and dependents are met:
   - Run the entire test suite.
+    - Report the reults
     - Fix any failing tests before continuing.
   - Update or create relevant documentation.
   - Summarize changes made in the work item description or comments.
@@ -231,7 +234,8 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 - Ensure all work has been committed
 - Push the branch to `origin`.
-- Create a Pull Request against the repository's default branch.
+- Create a Pull Request (PR) against the repository's default branch.
   - Use a title in the form of "<work item title> (<work item id>)" and a body that contains a concise summary of the goal and of the work done and reviewer instructions.
-- Add a comment to the work item as follows `wl comment <work-item-id> --body "PR created: <URL>\nBlocked on review and merge." --author "<AGENT>" --json`.
+  - Do not escape the PR body; use markdown formatting as needed.
+- Link the PR to the work-item in a work-item comment to the work item as follows `wl comment <work-item-id> --body "PR created: <URL>\nBlocked on review and merge." --author "<AGENT>" --json`.
 - Mark the work item to completed/in-review with `wl update <work-item-id> --status blocked --stage in_review --json`
