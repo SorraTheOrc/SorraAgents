@@ -37,6 +37,11 @@ from .webhook import (
     _read_state,
     _write_state,
 )
+from .metrics import (
+    ampa_heartbeat_failure_total,
+    ampa_heartbeat_sent_total,
+    ampa_last_heartbeat_timestamp_seconds,
+)
 
 
 def get_env_config() -> Dict[str, Any]:
@@ -158,6 +163,17 @@ def run_once(config: Dict[str, Any]) -> int:
         )
     except Exception:
         LOG.exception("Failed to update state after heartbeat")
+    # Update Prometheus metrics
+    try:
+        if int(status) >= 200 and int(status) < 300:
+            ampa_heartbeat_sent_total.inc()
+            ampa_last_heartbeat_timestamp_seconds.set(
+                int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+            )
+        else:
+            ampa_heartbeat_failure_total.inc()
+    except Exception:
+        LOG.debug("Failed to update Prometheus metrics")
     return status
 
 
