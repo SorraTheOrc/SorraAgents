@@ -13,14 +13,22 @@ fi
 SRC="$1"
 TARGET_DIR=${2:-.worklog/plugins}
 
+# If the source is inside plugins/ or examples/, prefer copying only the basename
+# into the target dir under the same name (e.g. plugins/wl_ampa/ampa.mjs -> ampa.mjs)
+if [ "${SRC#plugins/}" != "$SRC" ] || [ "${SRC#examples/}" != "$SRC" ]; then
+  BASENAME=$(basename "$SRC")
+else
+  BASENAME=$(basename "$SRC")
+fi
+
 if [ ! -f "$SRC" ]; then
   echo "Source file not found: $SRC"
   exit 2
 fi
 
 mkdir -p "$TARGET_DIR"
-cp -f "$SRC" "$TARGET_DIR/$(basename "$SRC")"
-echo "Installed Worklog plugin $SRC to $TARGET_DIR/$(basename "$SRC")"
+cp -f "$SRC" "$TARGET_DIR/$BASENAME"
+echo "Installed Worklog plugin $SRC to $TARGET_DIR/$BASENAME"
 
 # If the script was called without explicit target, and the target is the default
 # `.worklog/plugins`, also place the installer itself into `.worklog/plugins` for
