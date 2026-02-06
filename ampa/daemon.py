@@ -112,16 +112,31 @@ def build_payload(
 
     The text includes hostname, ISO timestamp and the optional work item id.
     """
-    lines = [title, f"Host: {hostname}", f"Timestamp: {timestamp_iso}"]
+    # Build a simple markdown message matching the requested format.
+    # Include Host and Timestamp lines so tools that post-process the message
+    # can extract them. Also include work_item_id when provided.
+    heading = f"# {title}"
     if work_item_id:
-        lines.append(f"work_item_id: {work_item_id}")
+        heading = f"# {title} {work_item_id}"
+
+    body: List[str] = []
+    # Include host/timestamp and work_item_id lines first so tests and
+    # integrations can parse them easily.
+    body.append(f"Host: {hostname}")
+    body.append(f"Timestamp: {timestamp_iso}")
+    if work_item_id:
+        body.append(f"work_item_id: {work_item_id}")
+
+    # Only include any extra_fields supplied (name/value pairs).
     if extra_fields:
         for field in extra_fields:
             name = field.get("name")
             value = field.get("value")
             if name and value is not None:
-                lines.append(f"{name}: {value}")
-    return {"content": "\n".join(lines)}
+                body.append(f"{name}: {value}")
+
+    content = heading + "\n\n" + "\n".join(body)
+    return {"content": content}
 
 
 def build_command_payload(
@@ -132,20 +147,21 @@ def build_command_payload(
     exit_code: Optional[int],
     title: str = "AMPA Heartbeat",
 ) -> Dict[str, Any]:
-    fields: List[Dict[str, Any]] = []
+    # For command-style messages we prefer the same simple markdown header and
+    # include only the truncated output (no host/timestamp/exit_code lines).
+    heading = f"# {command_id} {title}" if command_id else f"# {title}"
+    body: List[str] = []
+    # Include command_id as a parsed field so downstream tools/tests can assert
+    # on its presence.
     if command_id:
-        fields.append({"name": "command_id", "value": command_id, "inline": False})
+        body.append(f"command_id: {command_id}")
+    # Include exit_code for tests and downstream processing when provided.
     if exit_code is not None:
-        fields.append({"name": "exit_code", "value": str(exit_code), "inline": True})
+        body.append(f"exit_code: {exit_code}")
     if output:
-        formatted = "```\n" + _truncate_output(output) + "\n```"
-        fields.append({"name": "output", "value": formatted, "inline": False})
-    return build_payload(
-        hostname,
-        timestamp_iso,
-        extra_fields=fields,
-        title=title,
-    )
+        body.append(_truncate_output(output, limit=1000))
+    content = heading + "\n\n" + "\n".join(body)
+    return {"content": content}
 
 
 def _read_state(path: str) -> Dict[str, str]:
@@ -424,6 +440,10 @@ def send_webhook(
             LOG.info("Backing off for %.1fs before next attempt", backoff)
             time.sleep(backoff)
 
+    # If all retries exhausted without returning above, return 0 as a
+    # conservative failure code to satisfy the declared return type.
+    return 0
+
 
 def run_once(config: Dict[str, Any]) -> int:
     """Send a single heartbeat using the provided config.
@@ -489,7 +509,53 @@ def run_once(config: Dict[str, Any]) -> int:
 
 
 def main() -> None:
-    config = get_env_config()
+    """Daemon entrypoint.
+
+    Supports:
+    - `--once`: send one heartbeat and exit
+    - `--start-scheduler`: start the scheduler loop under the daemon runtime
+    If neither flag is provided the default behaviour is to send a single heartbeat.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AMPA daemon")
+    parser.add_argument(
+        "--once", action="store_true", help="Send one heartbeat and exit"
+    )
+    parser.add_argument(
+        "--start-scheduler",
+        action="store_true",
+        help="Start the scheduler loop under the daemon runtime",
+    )
+    args = parser.parse_args()
+
+    try:
+        config = get_env_config()
+    except SystemExit:
+        # get_env_config logs and exits when misconfigured
+        raise
+
+    # If requested, start scheduler as a long-running worker managed by daemon
+    if args.start_scheduler or os.getenv("AMPA_RUN_SCHEDULER", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        try:
+            # Import locally to avoid side-effects during test imports
+            from . import scheduler
+
+            LOG.info("Starting scheduler under daemon runtime")
+            sched = scheduler.load_scheduler(command_cwd=os.getcwd())
+            sched.run_forever()
+            return
+        except SystemExit:
+            raise
+        except Exception:
+            LOG.exception("Failed to start scheduler from daemon")
+            return
+
+    # Default: send a single heartbeat
     LOG.info("Sending AMPA heartbeat once")
     try:
         run_once(config)

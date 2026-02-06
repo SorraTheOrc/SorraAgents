@@ -52,5 +52,14 @@ Add the runtime dependencies and install them in your environment:
 
 Run as a daemon
 
-   # Run in the foreground (use system tools to daemonize if needed)
-   AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.scheduler
+   # Run daemon in the foreground and start scheduler loop
+   AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon --start-scheduler
+
+   # Alternatively, run a single heartbeat once
+   AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon --once
+
+Scheduler admin CLI
+
+  Use the scheduler CLI for admin tasks (listing, adding, updating commands):
+
+    python -m ampa.scheduler list
