@@ -717,5 +717,9 @@ main() {
   log_info "Installation complete."
 }
 
+# Note: the installer no longer copies itself into the target plugin dir.
+# Keeping installer in the repo (plugins/install-worklog-plugin.sh) is preferred
+# to avoid writing executable files into .worklog/ which is usually gitignored.
+
 # Run main function with all arguments
 main "$@"
