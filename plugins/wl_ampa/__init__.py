@@ -127,8 +127,15 @@ def start(
     # Detached
     f = open(lpath, "ab")
     # On Windows, close_fds semantics differ; keep simple cross-platform approach
+    # Start a new session so the daemon is the leader of its process group.
+    # This makes it easier to signal the whole group when stopping.
     proc = subprocess.Popen(
-        cmd, cwd=str(project_root), stdout=f, stderr=subprocess.STDOUT, close_fds=True
+        cmd,
+        cwd=str(project_root),
+        stdout=f,
+        stderr=subprocess.STDOUT,
+        close_fds=True,
+        start_new_session=True,
     )
     ppath.write_text(str(proc.pid))
     print(f"Started {name} pid={proc.pid} log={lpath}")
@@ -151,7 +158,12 @@ def stop(project_root: Path, name: str = "default", timeout: int = 5) -> int:
         print("Not running (stale pid file cleared)")
         return 0
     try:
-        os.kill(pid, signal.SIGTERM)
+        # Try to terminate the whole process group first.
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except AttributeError:
+            # os.killpg not available on Windows; fall back to os.kill
+            os.kill(pid, signal.SIGTERM)
     except Exception:
         pass
     # wait
@@ -161,7 +173,10 @@ def stop(project_root: Path, name: str = "default", timeout: int = 5) -> int:
         time.sleep(0.1)
     if is_running(pid):
         try:
-            os.kill(pid, signal.SIGKILL)
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except AttributeError:
+                os.kill(pid, signal.SIGKILL)
         except Exception:
             pass
     if not is_running(pid):
