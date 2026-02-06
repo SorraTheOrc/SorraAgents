@@ -142,7 +142,7 @@ def start(
     return 0
 
 
-def stop(project_root: Path, name: str = "default", timeout: int = 5) -> int:
+def stop(project_root: Path, name: str = "default", timeout: int = 10) -> int:
     ppath = pid_path(project_root, name)
     if not ppath.exists():
         print("Not running (no pid file)")
