@@ -717,6 +717,18 @@ main() {
   log_info "Installation complete."
 }
 
+# If the repository contains a Python `ampa` package at the repo root, also
+# copy it into the project's plugin dir as `.worklog/plugins/ampa_py/ampa` so
+# the JS plugin can automatically run `python -m ampa.daemon`.
+if [ -d "ampa" ]; then
+  PY_TARGET_DIR="$TARGET_DIR/ampa_py"
+  mkdir -p "$PY_TARGET_DIR"
+  # Replace any existing bundle
+  rm -rf "$PY_TARGET_DIR/ampa"
+  cp -R "ampa" "$PY_TARGET_DIR/ampa"
+  echo "Installed Python ampa package to $PY_TARGET_DIR/ampa"
+fi
+
 # Note: the installer no longer copies itself into the target plugin dir.
 # Keeping installer in the repo (plugins/install-worklog-plugin.sh) is preferred
 # to avoid writing executable files into .worklog/ which is usually gitignored.
