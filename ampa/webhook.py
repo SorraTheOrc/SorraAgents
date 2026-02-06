@@ -1,8 +1,9 @@
-"""AMPA package entry points and core heartbeat sender.
+"""Shared webhook and payload utilities for AMPA.
 
-This module contains the same functionality as the top-level script but is
-packaged under the `ampa` Python package so it can be imported in tests and
-installed if needed.
+This module contains low-level helpers for building Discord payloads, sending
+webhook POSTs with retries/backoff, and dead-letter handling. It is intended to
+be the single source of truth for notification behaviour so scheduler and
+daemon can import from here.
 """
 
 from __future__ import annotations
@@ -11,105 +12,16 @@ import datetime
 import json
 import logging
 import os
-import socket
-from typing import Any, Dict, Optional, List
 import tempfile
 import urllib.parse
+from typing import Any, Dict, List, Optional
 
 try:
-    # optional dependency for .env file parsing
-    from dotenv import load_dotenv, find_dotenv
-except Exception:  # pragma: no cover - optional behavior
-    load_dotenv = None
-    find_dotenv = None
-
-# import requests at module level so tests can monkeypatch ampa.webhook.requests.post
-try:
-    # Keep a requests import here for backwards compatibility in tests that
-    # reference ampa.daemon.requests. Prefer callers to import from ampa.webhook.
     import requests  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover - optional dependency in tests
     requests = None
 
-LOG = logging.getLogger("ampa.daemon")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-__all__ = ["get_env_config", "run_once"]
-
-# Backwards-compat shims: re-export commonly imported helpers from ampa.webhook
-try:
-    from .webhook import (
-        build_command_payload,
-        build_payload,
-        send_webhook,
-        dead_letter,
-    )
-except Exception:
-    # If import fails (e.g., tests that monkeypatch), fall back to local names
-    def build_command_payload(*a, **k):  # type: ignore
-        raise RuntimeError("webhook helpers unavailable")
-
-    def build_payload(*a, **k):  # type: ignore
-        raise RuntimeError("webhook helpers unavailable")
-
-    def send_webhook(*a, **k):  # type: ignore
-        raise RuntimeError("webhook helpers unavailable")
-
-    def dead_letter(*a, **k):  # type: ignore
-        raise RuntimeError("webhook helpers unavailable")
-
-
-def get_env_config() -> Dict[str, Any]:
-    """Read and validate environment configuration.
-
-    Raises SystemExit (2) if AMPA_DISCORD_WEBHOOK is not set.
-    """
-    # If an .env file exists in the package directory, load it so values there
-    # override the environment. Loading is optional; if python-dotenv is not
-    # installed we skip loading the file.
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
-    # Allow callers/tests to disable loading the package .env file by setting
-    # AMPA_LOAD_DOTENV=0. By default the package .env is loaded when python-dotenv
-    # is available and a package-local .env exists. Note: .env values override
-    # the environment per user request.
-    if (
-        os.getenv("AMPA_LOAD_DOTENV", "1").lower() in ("1", "true", "yes")
-        and load_dotenv
-        and find_dotenv
-    ):
-        # prefer package-local .env when present
-        pkg_env = find_dotenv(env_path, usecwd=True)
-        if pkg_env:
-            load_dotenv(pkg_env, override=True)
-        else:
-            # Fallback to a repo root .env (e.g. /opt/ampa/.env) when present.
-            root_env = os.path.join(os.getcwd(), ".env")
-            if os.path.isfile(root_env):
-                load_dotenv(root_env, override=True)
-
-    # Read webhook and be tolerant of values coming from Docker `--env-file`
-    # which preserve surrounding quotes. Strip whitespace and surrounding
-    # single/double quotes so both dotenv and Docker env-file formats work.
-    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-    if webhook:
-        webhook = webhook.strip()
-        # remove surrounding single/double quotes if present (handles values
-        # coming from dotenv or Docker env-file which may include quotes)
-        webhook = webhook.strip("'\"")
-    if not webhook:
-        LOG.error("AMPA_DISCORD_WEBHOOK is not set; cannot send heartbeats")
-        raise SystemExit(2)
-
-    minutes_raw = os.getenv("AMPA_HEARTBEAT_MINUTES", "1")
-    try:
-        minutes = int(minutes_raw)
-        if minutes <= 0:
-            raise ValueError("must be positive")
-    except Exception:
-        LOG.warning("Invalid AMPA_HEARTBEAT_MINUTES=%r, falling back to 1", minutes_raw)
-        minutes = 1
-
-    return {"webhook": webhook, "minutes": minutes}
+LOG = logging.getLogger("ampa.webhook")
 
 
 def _truncate_output(output: str, limit: int = 900) -> str:
@@ -125,33 +37,20 @@ def build_payload(
     extra_fields: Optional[List[Dict[str, Any]]] = None,
     title: str = "AMPA Heartbeat",
 ) -> Dict[str, Any]:
-    """Build a Discord webhook payload (plain text) for a heartbeat.
-
-    The text includes hostname, ISO timestamp and the optional work item id.
-    """
-    # Build a simple markdown message matching the requested format.
-    # Include Host and Timestamp lines so tools that post-process the message
-    # can extract them. Also include work_item_id when provided.
     heading = f"# {title}"
     if work_item_id:
         heading = f"# {title} {work_item_id}"
-
     body: List[str] = []
-    # Include host/timestamp and work_item_id lines first so tests and
-    # integrations can parse them easily.
     body.append(f"Host: {hostname}")
     body.append(f"Timestamp: {timestamp_iso}")
     if work_item_id:
         body.append(f"work_item_id: {work_item_id}")
-
-    # Only include any extra_fields supplied (name/value pairs).
     if extra_fields:
         for field in extra_fields:
             name = field.get("name")
             value = field.get("value")
             if name and value is not None:
                 body.append(f"{name}: {value}")
-
     content = heading + "\n\n" + "\n".join(body)
     return {"content": content}
 
@@ -164,15 +63,10 @@ def build_command_payload(
     exit_code: Optional[int],
     title: str = "AMPA Heartbeat",
 ) -> Dict[str, Any]:
-    # For command-style messages we prefer the same simple markdown header and
-    # include only the truncated output (no host/timestamp/exit_code lines).
     heading = f"# {command_id} {title}" if command_id else f"# {title}"
     body: List[str] = []
-    # Include command_id as a parsed field so downstream tools/tests can assert
-    # on its presence.
     if command_id:
         body.append(f"command_id: {command_id}")
-    # Include exit_code for tests and downstream processing when provided.
     if exit_code is not None:
         body.append(f"exit_code: {exit_code}")
     if output:
@@ -198,13 +92,6 @@ def _write_state(path: str, data: Dict[str, str]) -> None:
 
 
 def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
-    """Handle final-failure messages by forwarding to a dead-letter webhook or file.
-
-    Behavior:
-    - If AMPA_DEADLETTER_WEBHOOK is set, POST the payload (with optional reason) to that URL.
-    - Otherwise append a JSON record to AMPA_DEADLETTER_FILE (default: /var/log/ampa_deadletter.log).
-    This function is best-effort and will log but not raise on failure.
-    """
     try:
         dd_wh = os.getenv("AMPA_DEADLETTER_WEBHOOK")
         record = {
@@ -239,10 +126,8 @@ def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
                     LOG.exception(
                         "dead_letter: exception posting to deadletter webhook: %s", exc
                     )
-        # fallback to local file
         dl_file = os.getenv("AMPA_DEADLETTER_FILE", "/var/log/ampa_deadletter.log")
         try:
-            # Ensure parent dir exists when writing to a path we control (may not for /var/log)
             parent = os.path.dirname(dl_file)
             if parent and not os.path.isdir(parent):
                 try:
@@ -261,17 +146,6 @@ def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
 def send_webhook(
     url: str, payload: Dict[str, Any], timeout: int = 10, message_type: str = "other"
 ) -> int:
-    """Send the webhook payload using requests with an exponential backoff.
-
-    Retries on non-2xx responses and network errors up to AMPA_MAX_RETRIES
-    (default 10). Backoff base is controlled by AMPA_BACKOFF_BASE_SECONDS
-    (default 2) and doubles each attempt. Sleep is performed via
-    time.sleep() so tests can monkeypatch it.
-
-    Returns HTTP status code on success or when a remote server returns a
-    non-2xx after exhausting retries. On final network error the underlying
-    exception is re-raised after logging and invoking dead_letter.
-    """
     import time
 
     if requests is None:
@@ -292,7 +166,6 @@ def send_webhook(
             pass
         return "<redacted>"
 
-    # Configurable retry parameters
     try:
         max_retries = int(os.getenv("AMPA_MAX_RETRIES", "10"))
         if max_retries < 1:
@@ -326,7 +199,6 @@ def send_webhook(
             try:
                 resp.raise_for_status()
             except Exception:
-                # HTTP error (non-2xx) - log and decide whether to retry
                 LOG.warning(
                     "Webhook POST attempt %d/%d failed: %s %s",
                     attempt,
@@ -334,7 +206,6 @@ def send_webhook(
                     getattr(resp, "status_code", None),
                     getattr(resp, "text", ""),
                 )
-                # Log additional debug info once per failure
                 try:
                     req = getattr(resp, "request", None)
                     if req is not None:
@@ -371,7 +242,6 @@ def send_webhook(
                 except Exception:
                     LOG.info("Failed to log request debug info")
 
-                # record attempted send
                 try:
                     _write_state(
                         state_file,
@@ -399,13 +269,11 @@ def send_webhook(
                         LOG.exception("dead_letter failed on final HTTP error")
                     return getattr(resp, "status_code", 0)
 
-                # sleep before next retry
                 backoff = backoff_base * (2 ** (attempt - 1))
                 LOG.info("Backing off for %.1fs before next attempt", backoff)
                 time.sleep(backoff)
                 continue
 
-            # success
             LOG.info("Webhook POST succeeded: %s", resp.status_code)
             _write_state(
                 state_file,
@@ -419,7 +287,6 @@ def send_webhook(
             return resp.status_code
 
         except Exception as exc:
-            # network or other exception - retry unless out of attempts
             last_exc = exc
             LOG.warning(
                 "Webhook POST attempt %d/%d exception: %s",
@@ -450,137 +317,10 @@ def send_webhook(
                     dead_letter(payload, reason=str(exc))
                 except Exception:
                     LOG.exception("dead_letter failed on final exception")
-                # re-raise to preserve previous behavior for callers
                 raise
 
             backoff = backoff_base * (2 ** (attempt - 1))
             LOG.info("Backing off for %.1fs before next attempt", backoff)
             time.sleep(backoff)
 
-    # If all retries exhausted without returning above, return 0 as a
-    # conservative failure code to satisfy the declared return type.
     return 0
-
-
-def run_once(config: Dict[str, Any]) -> int:
-    """Send a single heartbeat using the provided config.
-
-    Returns the HTTP status code (or raises if requests is missing).
-    """
-    hostname = socket.gethostname()
-    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    payload = build_payload(hostname, ts, None)
-    LOG.info("Evaluating whether to send heartbeat for host=%s", hostname)
-
-    state_file = os.getenv("AMPA_STATE_FILE") or os.path.join(
-        tempfile.gettempdir(), "ampa_state.json"
-    )
-    state = _read_state(state_file)
-    last_message_ts = None
-    last_message_type = None
-    last_heartbeat_ts = None
-    try:
-        if "last_message_ts" in state:
-            last_message_ts = datetime.datetime.fromisoformat(state["last_message_ts"])
-    except Exception:
-        last_message_ts = None
-    try:
-        if "last_message_type" in state:
-            last_message_type = state["last_message_type"]
-    except Exception:
-        last_message_type = None
-    try:
-        if "last_heartbeat_ts" in state:
-            last_heartbeat_ts = datetime.datetime.fromisoformat(
-                state["last_heartbeat_ts"]
-            )
-    except Exception:
-        last_heartbeat_ts = None
-
-    now = datetime.datetime.now(datetime.timezone.utc)
-
-    # Only send the heartbeat if no non-heartbeat message was sent in the last 5 minutes.
-    if last_message_ts is not None and last_message_type != "heartbeat":
-        if (now - last_message_ts) < datetime.timedelta(minutes=5):
-            LOG.info(
-                "Skipping heartbeat: other message sent within last 5 minutes (last_message=%s)",
-                state.get("last_message_ts"),
-            )
-            return 0
-
-    # Send heartbeat and update heartbeat timestamp
-    status = send_webhook(config["webhook"], payload, message_type="heartbeat")
-    try:
-        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        _write_state(
-            state_file,
-            {
-                "last_heartbeat_ts": now_iso,
-                "last_message_ts": now_iso,
-                "last_message_type": "heartbeat",
-            },
-        )
-    except Exception:
-        LOG.exception("Failed to update state after heartbeat")
-    return status
-
-
-def main() -> None:
-    """Daemon entrypoint.
-
-    Supports:
-    - `--once`: send one heartbeat and exit
-    - `--start-scheduler`: start the scheduler loop under the daemon runtime
-    If neither flag is provided the default behaviour is to send a single heartbeat.
-    """
-    import argparse
-
-    parser = argparse.ArgumentParser(description="AMPA daemon")
-    parser.add_argument(
-        "--once", action="store_true", help="Send one heartbeat and exit"
-    )
-    parser.add_argument(
-        "--start-scheduler",
-        action="store_true",
-        help="Start the scheduler loop under the daemon runtime",
-    )
-    args = parser.parse_args()
-
-    try:
-        config = get_env_config()
-    except SystemExit:
-        # get_env_config logs and exits when misconfigured
-        raise
-
-    # If requested, start scheduler as a long-running worker managed by daemon
-    if args.start_scheduler or os.getenv("AMPA_RUN_SCHEDULER", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    ):
-        try:
-            # Import locally to avoid side-effects during test imports
-            from . import scheduler
-
-            LOG.info("Starting scheduler under daemon runtime")
-            sched = scheduler.load_scheduler(command_cwd=os.getcwd())
-            sched.run_forever()
-            return
-        except SystemExit:
-            raise
-        except Exception:
-            LOG.exception("Failed to start scheduler from daemon")
-            return
-
-    # Default: send a single heartbeat
-    LOG.info("Sending AMPA heartbeat once")
-    try:
-        run_once(config)
-    except SystemExit:
-        raise
-    except Exception:
-        LOG.exception("Error while sending heartbeat")
-
-
-if __name__ == "__main__":
-    main()
