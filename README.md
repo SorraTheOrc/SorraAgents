@@ -18,6 +18,15 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 2. Pick a folder to work in (e.g., `skill/` or `agent/`).
 3. Follow the appropriate guide (see files inside each folder) to implement, test, and package your work.
 
+Daemon / scheduler note
+
+- Some packages in this repository provide a long-running "daemon" that can
+  either perform a one-off action or run a scheduler loop. By default those
+  daemons often send a single heartbeat and exit; to run the scheduler loop
+  you must explicitly enable it (for example: use `--start-scheduler` or set
+  an environment flag like `AMPA_RUN_SCHEDULER=1`). Check the package README
+  (for example `ampa/README.md`) for the exact flag and environment variables.
+
 ## Contributing
 - Open an issue describing the change you'd like to make.
 - Follow the relevant guide under `command/` for design and review steps.
