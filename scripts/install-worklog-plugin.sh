@@ -1,4 +1,3 @@
-
 #!/usr/bin/env sh
 # Install a Worklog plugin into a project or user plugin directory.
 # Usage: ./scripts/install-worklog-plugin.sh <source-file> [target-dir]
