@@ -37,6 +37,12 @@ from .webhook import (
     _read_state,
     _write_state,
 )
+from .metrics import (
+    ampa_heartbeat_failure_total,
+    ampa_heartbeat_sent_total,
+    ampa_last_heartbeat_timestamp_seconds,
+)
+from .metrics import start_metrics_server
 
 
 def get_env_config() -> Dict[str, Any]:
@@ -158,6 +164,17 @@ def run_once(config: Dict[str, Any]) -> int:
         )
     except Exception:
         LOG.exception("Failed to update state after heartbeat")
+    # Update Prometheus metrics
+    try:
+        if int(status) >= 200 and int(status) < 300:
+            ampa_heartbeat_sent_total.inc()
+            ampa_last_heartbeat_timestamp_seconds.set(
+                int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+            )
+        else:
+            ampa_heartbeat_failure_total.inc()
+    except Exception:
+        LOG.debug("Failed to update Prometheus metrics")
     return status
 
 
@@ -187,6 +204,20 @@ def main() -> None:
     except SystemExit:
         # get_env_config logs and exits when misconfigured
         raise
+
+    # Start observability server if requested. Honor AMPA_METRICS_PORT when set
+    # to an integer > 0. If AMPA_METRICS_PORT is unset the default is 8000.
+    try:
+        _port_raw = os.getenv("AMPA_METRICS_PORT", "8000")
+        _port = int(_port_raw)
+    except Exception:
+        _port = 8000
+    try:
+        if _port > 0:
+            thr, bound = start_metrics_server(port=_port)
+            LOG.info("Started metrics server on 127.0.0.1:%s", bound)
+    except Exception:
+        LOG.exception("Failed to start metrics server")
 
     # If requested, start scheduler as a long-running worker managed by daemon
     if args.start_scheduler or os.getenv("AMPA_RUN_SCHEDULER", "").lower() in (
