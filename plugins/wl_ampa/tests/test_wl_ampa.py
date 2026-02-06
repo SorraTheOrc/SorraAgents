@@ -30,6 +30,8 @@ time.sleep(10)
 
 def test_start_status_stop(tmp_path):
     proj = write_tmp_project(tmp_path)
+    # run from project dir so root detection resolves worklog.json
+    os.chdir(proj)
     # start detached
     rc = ampa.main(["start", "--name", "t1"])
     assert rc == 0
