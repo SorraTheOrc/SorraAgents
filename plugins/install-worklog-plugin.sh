@@ -5,12 +5,15 @@
 
 set -e
 
+DEFAULT_SRC="plugins/wl_ampa/ampa.mjs"
+
+# If no source provided, use the canonical plugin in plugins/wl_ampa/ampa.mjs
 if [ "$#" -lt 1 ]; then
-  echo "Usage: $0 <source-file> [target-dir]"
-  exit 2
+  SRC="$DEFAULT_SRC"
+else
+  SRC="$1"
 fi
 
-SRC="$1"
 TARGET_DIR=${2:-.worklog/plugins}
 
 # Determine basename for installation
@@ -18,6 +21,7 @@ BASENAME=$(basename "$SRC")
 
 if [ ! -f "$SRC" ]; then
   echo "Source file not found: $SRC"
+  echo "If you intended to install the canonical plugin, run without arguments to use $DEFAULT_SRC"
   exit 2
 fi
 
