@@ -71,7 +71,8 @@ async function resolveCommand(cliCmd, projectRoot) {
       const pyPath = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py');
       // Run the daemon in long-running mode by default (start scheduler).
       // Users can override via --cmd or AMPA_RUN_SCHEDULER env var if desired.
-      return { cmd: ['python', '-m', 'ampa.daemon', '--start-scheduler'], env: { PYTHONPATH: pyPath } };
+      // use -u to force unbuffered stdout/stderr so logs show up promptly
+      return { cmd: ['python', '-u', '-m', 'ampa.daemon', '--start-scheduler'], env: { PYTHONPATH: pyPath, AMPA_RUN_SCHEDULER: '1' } };
     }
   } catch (e) {}
   return null;
