@@ -39,6 +39,38 @@ if [ -d "ampa" ]; then
   rm -rf "$PY_TARGET_DIR/ampa"
   cp -R "ampa" "$PY_TARGET_DIR/ampa"
   echo "Installed Python ampa package to $PY_TARGET_DIR/ampa"
+
+  # If the copied package declares Python requirements, create a venv and
+  # install them under .worklog/plugins/ampa_py/venv so the bundled daemon
+  # has its dependencies available when executed via python -m ampa.daemon.
+  REQ_FILE="$PY_TARGET_DIR/ampa/requirements.txt"
+  if [ -f "$REQ_FILE" ]; then
+    echo "Found requirements.txt; attempting to create venv and install dependencies"
+    # Prefer python3, fall back to python
+    PY_BIN="$(command -v python3 || command -v python || true)"
+    if [ -z "$PY_BIN" ]; then
+      echo "Warning: no python executable found in PATH; cannot create venv. Skipping dependency install."
+    else
+      VENV_DIR="$PY_TARGET_DIR/venv"
+      if [ ! -d "$VENV_DIR" ]; then
+        echo "Creating virtualenv at $VENV_DIR"
+        "$PY_BIN" -m venv "$VENV_DIR" || {
+          echo "Warning: failed to create venv with $PY_BIN -m venv. Skipping dependency install."
+          VENV_DIR=
+        }
+      fi
+      if [ -n "$VENV_DIR" ] && [ -x "$VENV_DIR/bin/python" ]; then
+        echo "Upgrading pip and installing requirements into venv"
+        "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
+        if "$VENV_DIR/bin/python" -m pip install -r "$REQ_FILE" >/dev/null 2>&1; then
+          echo "Installed Python dependencies into $VENV_DIR"
+        else
+          echo "Warning: pip install failed. You may need to run:"
+          echo "  $VENV_DIR/bin/python -m pip install -r $REQ_FILE"
+        fi
+      fi
+    fi
+  fi
 fi
 
 # Note: the installer no longer copies itself into the target plugin dir.
