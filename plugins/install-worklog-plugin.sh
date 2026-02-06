@@ -445,7 +445,7 @@ copy_python_package() {
    local store_backup=""
    
    # Record pre-removal state
-   log_decision "PRE_REMOVE_ls=$(ls -la "$py_target_dir" 2>/dev/null || true)"
+   log_decision "PRE_REMOVE_ls=$(ls -la \"$py_target_dir\" 2>/dev/null || true)"
    
    # Backup existing .env if present
    if [ -f "$py_target_dir/ampa/.env" ]; then
@@ -466,7 +466,7 @@ copy_python_package() {
    cp -R "ampa" "$py_target_dir/ampa"
    
     # Record post-copy state
-    log_decision "POST_COPY_ls=$(ls -la "$py_target_dir/ampa" 2>/dev/null || true)"
+    log_decision "POST_COPY_ls=$(ls -la \"$py_target_dir/ampa\" 2>/dev/null || true)"
 
     # Ensure scheduler_store.json exists for fresh installs
     if [ ! -f "$py_target_dir/ampa/scheduler_store.json" ]; then
