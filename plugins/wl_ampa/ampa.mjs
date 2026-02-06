@@ -63,6 +63,15 @@ async function resolveCommand(cliCmd, projectRoot) {
       if (fs.existsSync(c) && fs.accessSync(c, fs.constants.X_OK) === undefined) return [c];
     } catch (e) {}
   }
+  // Fallback: if a bundled Python package 'ampa' was installed into
+  // .worklog/plugins/ampa_py/ampa, prefer running it with Python -m ampa.daemon
+  try {
+    const pyBundle = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py', 'ampa');
+    if (fs.existsSync(path.join(pyBundle, '__init__.py'))) {
+      const pyPath = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py');
+      return { cmd: ['python', '-m', 'ampa.daemon'], env: { PYTHONPATH: pyPath } };
+    }
+  } catch (e) {}
   return null;
 }
 
@@ -107,6 +116,14 @@ async function start(projectRoot, cmd, name = 'default', foreground = false) {
     } catch (e) {}
   }
   if (foreground) {
+    if (cmd && cmd.cmd && Array.isArray(cmd.cmd)) {
+      const env = Object.assign({}, process.env, cmd.env || {});
+      const proc = spawn(cmd.cmd[0], cmd.cmd.slice(1), { cwd: projectRoot, stdio: 'inherit', env });
+      return await new Promise((resolve) => {
+        proc.on('exit', (code) => resolve(code || 0));
+        proc.on('error', () => resolve(1));
+      });
+    }
     const proc = spawn(cmd[0], cmd.slice(1), { cwd: projectRoot, stdio: 'inherit' });
     return await new Promise((resolve) => {
       proc.on('exit', (code) => resolve(code || 0));
@@ -114,8 +131,14 @@ async function start(projectRoot, cmd, name = 'default', foreground = false) {
     });
   }
   const out = fs.openSync(lpath, 'a');
-  const proc = spawn(cmd[0], cmd.slice(1), { cwd: projectRoot, detached: true, stdio: ['ignore', out, out] });
+  let proc;
   try {
+    if (cmd && cmd.cmd && Array.isArray(cmd.cmd)) {
+      const env = Object.assign({}, process.env, cmd.env || {});
+      proc = spawn(cmd.cmd[0], cmd.cmd.slice(1), { cwd: projectRoot, detached: true, stdio: ['ignore', out, out], env });
+    } else {
+      proc = spawn(cmd[0], cmd.slice(1), { cwd: projectRoot, detached: true, stdio: ['ignore', out, out] });
+    }
     writePid(ppath, proc.pid);
     proc.unref();
     console.log(`Started ${name} pid=${proc.pid} log=${lpath}`);
