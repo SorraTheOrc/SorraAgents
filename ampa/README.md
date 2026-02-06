@@ -52,11 +52,32 @@ Add the runtime dependencies and install them in your environment:
 
 Run as a daemon
 
-   # Run daemon in the foreground and start scheduler loop
-   AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon --start-scheduler
+The daemon defaults to sending a single heartbeat and exiting. To run the
+scheduler loop under the daemon runtime you must explicitly enable it either
+with the `--start-scheduler` flag or the `AMPA_RUN_SCHEDULER` environment
+variable.
 
-   # Alternatively, run a single heartbeat once
-   AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon --once
+Examples:
+
+  # Run daemon in the foreground and start the scheduler loop (recommended for testing)
+  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon --start-scheduler
+
+  # Enable scheduler via environment variable instead of the CLI flag
+  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" AMPA_RUN_SCHEDULER=1 python -m ampa.daemon
+
+  # Send a single heartbeat and exit
+  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon --once
+
+Notes:
+
+- The scheduler uses the current working directory as the `command_cwd` for
+  commands it runs, so start the daemon from the directory you want commands
+  to execute in.
+- Ensure `AMPA_DISCORD_WEBHOOK` is set (or `ampa/.env` is present) before
+  starting the daemon; missing webhook will cause the daemon to exit.
+- Install runtime dependencies when running locally:
+
+  pip install -r ampa/requirements.txt
 
 Scheduler admin CLI
 
