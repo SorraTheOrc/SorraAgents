@@ -21,9 +21,21 @@ def write_tmp_project(tmp_path: Path) -> Path:
     script.write_text("""
 import time
 import sys
+import signal
+
+stop = False
+
+def handler(signum, frame):
+    global stop
+    stop = True
+
+signal.signal(signal.SIGTERM, handler)
+
 print('daemon starting')
 sys.stdout.flush()
-time.sleep(10)
+while not stop:
+    time.sleep(0.1)
+print('daemon exiting')
 """)
     return p
 
