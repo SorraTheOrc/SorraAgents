@@ -241,7 +241,21 @@ export default function register(ctx) {
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
       const cmd = await resolveCommand(opts.cmd, cwd);
-      if (!cmd) { console.error('No command resolved. Set --cmd, WL_AMPA_CMD or configure worklog.json/package.json/scripts.'); process.exitCode = 2; return; }
+      if (!cmd) {
+        console.error('No command resolved. Set --cmd, WL_AMPA_CMD or configure worklog.json/package.json/scripts.');
+        process.exitCode = 2;
+        return;
+      }
+      // Diagnostic: print resolved command and env to stdout so it's visible to the user
+      try {
+        if (cmd && cmd.cmd && Array.isArray(cmd.cmd)) {
+          console.log('Resolved command:', cmd.cmd.join(' '), 'env:', JSON.stringify(cmd.env || {}));
+        } else if (Array.isArray(cmd)) {
+          console.log('Resolved command:', cmd.join(' '));
+        } else {
+          console.log('Resolved command (unknown form):', JSON.stringify(cmd));
+        }
+      } catch (e) {}
       const code = await start(cwd, cmd, opts.name, opts.foreground);
       process.exitCode = code;
     });
