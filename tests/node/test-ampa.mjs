@@ -23,7 +23,8 @@ test('ampa start/status/stop lifecycle', async (t) => {
   // install the example plugin into tmp/.worklog/plugins
   const targetDir = path.join(tmp, '.worklog', 'plugins');
   fs.mkdirSync(targetDir, { recursive: true });
-  fs.copyFileSync(path.join(process.cwd(), 'examples', 'ampa.mjs'), path.join(targetDir, 'ampa.mjs'));
+  // install the canonical plugin from plugins/wl_ampa
+  fs.copyFileSync(path.join(process.cwd(), 'plugins', 'wl_ampa', 'ampa.mjs'), path.join(targetDir, 'ampa.mjs'));
 
   // run `node` to invoke the plugin directly via the ESM file (simulate wl loader)
   // Start
