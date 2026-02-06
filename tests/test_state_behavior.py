@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import ampa.daemon as daemon
 from ampa.daemon import get_env_config, run_once
+from ampa import webhook
 
 
 class DummyResp:
@@ -54,7 +55,7 @@ def test_heartbeat_skipped_when_other_message_since_last_heartbeat(
         called["count"] += 1
         return DummyResp()
 
-    monkeypatch.setattr("ampa.daemon.requests.Session.post", fake_post)
+    monkeypatch.setattr("ampa.webhook.requests.Session.post", fake_post)
 
     cfg = get_env_config()
     status = run_once(cfg)
@@ -81,7 +82,7 @@ def test_heartbeat_sent_and_updates_state(monkeypatch, tmp_path):
     def fake_post(self, url, json=None, timeout=None):
         return DummyResp(204)
 
-    monkeypatch.setattr("ampa.daemon.requests.Session.post", fake_post)
+    monkeypatch.setattr("ampa.webhook.requests.Session.post", fake_post)
 
     cfg = get_env_config()
     status = run_once(cfg)
@@ -104,7 +105,7 @@ def test_initial_heartbeat_when_no_state(monkeypatch, tmp_path):
     def fake_post(self, url, json=None, timeout=None):
         return DummyResp(204)
 
-    monkeypatch.setattr("ampa.daemon.requests.Session.post", fake_post)
+    monkeypatch.setattr("ampa.webhook.requests.Session.post", fake_post)
 
     cfg = get_env_config()
     status = run_once(cfg)
@@ -116,7 +117,7 @@ def test_initial_heartbeat_when_no_state(monkeypatch, tmp_path):
 
 
 def test_build_command_payload_includes_output():
-    payload = cast(Any, daemon).build_command_payload(
+    payload = cast(Any, webhook).build_command_payload(
         "host",
         "2026-01-01T00:00:00+00:00",
         "wl-in_progress",

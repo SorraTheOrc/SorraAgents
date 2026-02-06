@@ -15,6 +15,14 @@ Provide a concise, human-friendly summary of project status or a specific work i
 - User asks about a specific work item id (e.g., "What is the status of wl-123?", "audit wl-123").
 - The `/audit <work-item-id>` command is invoked.
 
+## Best Practices
+
+- Output should be formatted as markdown for readability.
+- When summarizing work items, focus on actionable information: current status, blockers, dependencies.
+- When a work item id is provided, ensure to include all relevant details and related work items (blockers, dependencies, subtasks) in the summary.
+- Always conclude with a clear summary of the status.
+- Do not recommend next steps or actions; this command is for status reporting only.
+
 ## Behavior
 
 1. Detect whether the user provided a work item id in the request.
@@ -35,13 +43,7 @@ Provide a concise, human-friendly summary of project status or a specific work i
   - Never skip any related work item that is open or in_progress.
 - Make a very clear statement about whether the work item can be closed or not. If it cannot be closed, explain why (e.g., blockers, dependencies, incomplete tasks).
 
-5. Provide numbered actionable next steps based on the status information.
-
-- If no work item id is provided, always offer to run `audit <work-item-id>` (do not mention `wl show`) against the most important in_progress work item (show ID and title), add one or two alternative next actions relevant to the current status.
-- If a work item id is provided, suggest appropriate next steps to complete the work item (if not already completed).
-- Do not provide an alternative set of actions. There should only be 3 numbered next steps and a free-form response allowed.
-
-6. Provide a final section titled "# Summary" containing the following optional items as applicable:
+5. Provide a final section titled "# Summary" containing the following optional items as applicable:
 
 - If the item is blocked this will be stated and a list of work-items that are not yet completed and block this item will be provided. If the item is not blocked, skip this point.
 - If there is an open PR a note requesting review and the URL for this PR will be returned. If there is no open PR, skip this point.

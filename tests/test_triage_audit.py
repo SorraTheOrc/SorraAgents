@@ -11,6 +11,7 @@ from ampa.scheduler import (
     SchedulerStore,
 )
 import ampa.daemon as daemon
+from ampa import webhook
 
 
 class DummyStore(SchedulerStore):
@@ -45,7 +46,7 @@ def test_triage_audit_runs_and_cleans_temp(tmp_path, monkeypatch):
     work_id = "TEST-WID-123"
 
     # dummy send_webhook so scheduler doesn't try real network
-    monkeypatch.setattr(daemon, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -122,7 +123,7 @@ def test_triage_audit_auto_complete_with_gh(tmp_path, monkeypatch):
     calls = []
     work_id = "TEST-WID-PR-1"
 
-    monkeypatch.setattr(daemon, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
