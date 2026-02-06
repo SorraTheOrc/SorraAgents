@@ -9,7 +9,7 @@ import pytest
 # Ensure repo root is on sys.path so `import ampa` works when pytest is invoked
 sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 
-from ampa import daemon
+from ampa import webhook
 
 
 class _FakeResp:
@@ -42,7 +42,7 @@ def test_retry_then_success(monkeypatch):
             return _FakeResp(200, "ok")
 
     fake_requests = types.SimpleNamespace(Session=lambda: FakeSession())
-    monkeypatch.setattr(daemon, "requests", fake_requests)
+    monkeypatch.setattr(webhook, "requests", fake_requests)
 
     slept = []
     monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
@@ -50,7 +50,7 @@ def test_retry_then_success(monkeypatch):
     monkeypatch.setenv("AMPA_MAX_RETRIES", "5")
     monkeypatch.setenv("AMPA_BACKOFF_BASE_SECONDS", "2")
 
-    status = daemon.send_webhook("http://example.com/webhook/token", {"a": 1})
+    status = webhook.send_webhook("http://example.com/webhook/token", {"a": 1})
     assert status == 200
     # two backoffs should have occurred: 2s then 4s
     assert len(slept) == 2
@@ -65,7 +65,7 @@ def test_http_final_failure_calls_dead_letter_and_returns_status(monkeypatch, tm
             return _FakeResp(500, "server error")
 
     fake_requests = types.SimpleNamespace(Session=lambda: FakeSession())
-    monkeypatch.setattr(daemon, "requests", fake_requests)
+    monkeypatch.setattr(webhook, "requests", fake_requests)
 
     slept = []
     monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
@@ -76,12 +76,12 @@ def test_http_final_failure_calls_dead_letter_and_returns_status(monkeypatch, tm
     def fake_dead_letter(payload, reason=None):
         called.append(reason)
 
-    monkeypatch.setattr(daemon, "dead_letter", fake_dead_letter)
+    monkeypatch.setattr(webhook, "dead_letter", fake_dead_letter)
 
     monkeypatch.setenv("AMPA_MAX_RETRIES", "3")
     monkeypatch.setenv("AMPA_BACKOFF_BASE_SECONDS", "1")
 
-    status = daemon.send_webhook("http://example.com/webhook/token", {"a": 1})
+    status = webhook.send_webhook("http://example.com/webhook/token", {"a": 1})
     # final HTTP status should be returned
     assert status == 500
     # dead_letter should have been called once with a reason containing the status

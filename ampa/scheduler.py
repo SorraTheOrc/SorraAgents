@@ -22,12 +22,14 @@ except Exception:  # pragma: no cover - optional dependency in tests
 
 try:
     from . import daemon
+    from . import webhook as webhook_module
 except ImportError:  # pragma: no cover - allow running as script
     import importlib
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     daemon = importlib.import_module("ampa.daemon")
+    webhook_module = importlib.import_module("ampa.webhook")
 
 LOG = logging.getLogger("ampa.scheduler")
 
@@ -758,13 +760,17 @@ class Scheduler:
                 except Exception:
                     LOG.exception("Failed to summarize triage summary_text")
                 try:
-                    payload = daemon.build_payload(
-                        os.uname().nodename,
-                        _utc_now().isoformat(),
-                        work_item_id=work_id,
-                        extra_fields=[{"name": "summary", "value": summary_text}],
+                    # Build a simple markdown-style message for Discord:
+                    #
+                    # # <command-run> <work-item-title>
+                    #
+                    # <output>
+                    command_run = f"/audit {work_id}"
+                    content = f"# {command_run} {title}\n\n{summary_text}"
+                    payload = {"content": content}
+                    webhook_module.send_webhook(
+                        webhook, payload, message_type="command"
                     )
-                    daemon.send_webhook(webhook, payload, message_type="command")
                 except Exception:
                     LOG.exception("Failed to send discord summary")
 
@@ -949,23 +955,13 @@ class Scheduler:
                         # send a completion-style discord message (embed-like payload)
                         try:
                             if webhook:
-                                payload = daemon.build_payload(
-                                    os.uname().nodename,
-                                    _utc_now().isoformat(),
-                                    work_item_id=work_id,
-                                    extra_fields=[
-                                        {
-                                            "name": "status",
-                                            "value": "completed - ready for producer sign-off",
-                                        },
-                                        {
-                                            "name": "summary",
-                                            "value": (audit_out or "")[:1000],
-                                        },
-                                    ],
-                                    title="AMPA Audit: Completed",
-                                )
-                                daemon.send_webhook(
+                                # Send a concise completion message using the
+                                # simplified markdown header format described
+                                # above.
+                                command_run = f"/audit {work_id}"
+                                content = f"# {command_run} {title}\n\n{(audit_out or '')[:1000]}"
+                                payload = {"content": content}
+                                webhook_module.send_webhook(
                                     webhook, payload, message_type="completion"
                                 )
                         except Exception:
@@ -1054,7 +1050,7 @@ class Scheduler:
             LOG.exception("Failed to summarize output for discord post")
             short_output = output
 
-        payload = daemon.build_command_payload(
+        payload = webhook_module.build_command_payload(
             hostname,
             ts,
             command_id,
@@ -1062,7 +1058,7 @@ class Scheduler:
             run.exit_code,
             title="AMPA Scheduler",
         )
-        daemon.send_webhook(webhook, payload, message_type="command")
+        webhook_module.send_webhook(webhook, payload, message_type="command")
 
     def _post_startup_message(self) -> None:
         try:
@@ -1074,7 +1070,7 @@ class Scheduler:
             return
         hostname = os.uname().nodename
         ts = _utc_now().isoformat()
-        payload = daemon.build_command_payload(
+        payload = webhook_module.build_command_payload(
             hostname,
             ts,
             "scheduler_start",
@@ -1082,7 +1078,7 @@ class Scheduler:
             0,
             title="Scheduler Started",
         )
-        daemon.send_webhook(webhook, payload, message_type="startup")
+        webhook_module.send_webhook(webhook, payload, message_type="startup")
 
 
 def load_scheduler(command_cwd: Optional[str] = None) -> Scheduler:

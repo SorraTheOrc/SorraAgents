@@ -23,23 +23,20 @@ except Exception:  # pragma: no cover - optional behavior
     load_dotenv = None
     find_dotenv = None
 
-# import requests at module level so tests can monkeypatch ampa.daemon.requests.post
-try:
-    import requests  # type: ignore
-except Exception:
-    requests = None
-
 LOG = logging.getLogger("ampa.daemon")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-__all__ = [
-    "build_command_payload",
-    "build_payload",
-    "get_env_config",
-    "run_once",
-    "send_webhook",
-    "dead_letter",
-]
+__all__ = ["get_env_config", "run_once"]
+
+# Use webhook helpers from ampa.webhook as the single source of truth.
+from .webhook import (
+    build_command_payload,
+    build_payload,
+    send_webhook,
+    dead_letter,
+    _read_state,
+    _write_state,
+)
 
 
 def get_env_config() -> Dict[str, Any]:
@@ -99,330 +96,6 @@ def _truncate_output(output: str, limit: int = 900) -> str:
     if len(output) <= limit:
         return output
     return output[:limit] + "\n... (truncated)"
-
-
-def build_payload(
-    hostname: str,
-    timestamp_iso: str,
-    work_item_id: Optional[str] = None,
-    extra_fields: Optional[List[Dict[str, Any]]] = None,
-    title: str = "AMPA Heartbeat",
-) -> Dict[str, Any]:
-    """Build a Discord webhook payload (plain text) for a heartbeat.
-
-    The text includes hostname, ISO timestamp and the optional work item id.
-    """
-    lines = [title, f"Host: {hostname}", f"Timestamp: {timestamp_iso}"]
-    if work_item_id:
-        lines.append(f"work_item_id: {work_item_id}")
-    if extra_fields:
-        for field in extra_fields:
-            name = field.get("name")
-            value = field.get("value")
-            if name and value is not None:
-                lines.append(f"{name}: {value}")
-    return {"content": "\n".join(lines)}
-
-
-def build_command_payload(
-    hostname: str,
-    timestamp_iso: str,
-    command_id: Optional[str],
-    output: Optional[str],
-    exit_code: Optional[int],
-    title: str = "AMPA Heartbeat",
-) -> Dict[str, Any]:
-    fields: List[Dict[str, Any]] = []
-    if command_id:
-        fields.append({"name": "command_id", "value": command_id, "inline": False})
-    if exit_code is not None:
-        fields.append({"name": "exit_code", "value": str(exit_code), "inline": True})
-    if output:
-        formatted = "```\n" + _truncate_output(output) + "\n```"
-        fields.append({"name": "output", "value": formatted, "inline": False})
-    return build_payload(
-        hostname,
-        timestamp_iso,
-        extra_fields=fields,
-        title=title,
-    )
-
-
-def _read_state(path: str) -> Dict[str, str]:
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return {}
-
-
-def _write_state(path: str, data: Dict[str, str]) -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh)
-    except Exception:
-        LOG.exception("Failed to write state file %s", path)
-
-
-def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
-    """Handle final-failure messages by forwarding to a dead-letter webhook or file.
-
-    Behavior:
-    - If AMPA_DEADLETTER_WEBHOOK is set, POST the payload (with optional reason) to that URL.
-    - Otherwise append a JSON record to AMPA_DEADLETTER_FILE (default: /var/log/ampa_deadletter.log).
-    This function is best-effort and will log but not raise on failure.
-    """
-    try:
-        dd_wh = os.getenv("AMPA_DEADLETTER_WEBHOOK")
-        record = {
-            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "reason": reason,
-            "payload": payload,
-        }
-        if dd_wh:
-            if requests is None:
-                LOG.error(
-                    "dead_letter: requests missing; cannot POST to deadletter webhook"
-                )
-            else:
-                try:
-                    sess = requests.Session()
-                    sess.trust_env = False
-                    resp = sess.post(dd_wh, json=record, timeout=10)
-                    try:
-                        resp.raise_for_status()
-                        LOG.info(
-                            "dead_letter: posted to deadletter webhook status=%s",
-                            resp.status_code,
-                        )
-                        return
-                    except Exception:
-                        LOG.error(
-                            "dead_letter: deadletter webhook POST failed: %s %s",
-                            getattr(resp, "status_code", None),
-                            getattr(resp, "text", ""),
-                        )
-                except Exception as exc:
-                    LOG.exception(
-                        "dead_letter: exception posting to deadletter webhook: %s", exc
-                    )
-        # fallback to local file
-        dl_file = os.getenv("AMPA_DEADLETTER_FILE", "/var/log/ampa_deadletter.log")
-        try:
-            # Ensure parent dir exists when writing to a path we control (may not for /var/log)
-            parent = os.path.dirname(dl_file)
-            if parent and not os.path.isdir(parent):
-                try:
-                    os.makedirs(parent, exist_ok=True)
-                except Exception:
-                    pass
-            with open(dl_file, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record) + "\n")
-            LOG.info("dead_letter: appended failure record to %s", dl_file)
-        except Exception:
-            LOG.exception("dead_letter: failed to write dead-letter file %s", dl_file)
-    except Exception:
-        LOG.exception("dead_letter: unexpected error while handling dead letter")
-
-
-def send_webhook(
-    url: str, payload: Dict[str, Any], timeout: int = 10, message_type: str = "other"
-) -> int:
-    """Send the webhook payload using requests with an exponential backoff.
-
-    Retries on non-2xx responses and network errors up to AMPA_MAX_RETRIES
-    (default 10). Backoff base is controlled by AMPA_BACKOFF_BASE_SECONDS
-    (default 2) and doubles each attempt. Sleep is performed via
-    time.sleep() so tests can monkeypatch it.
-
-    Returns HTTP status code on success or when a remote server returns a
-    non-2xx after exhausting retries. On final network error the underlying
-    exception is re-raised after logging and invoking dead_letter.
-    """
-    import time
-
-    if requests is None:
-        LOG.error("requests package is required to send webhook")
-        raise RuntimeError("requests missing")
-
-    state_file = os.getenv("AMPA_STATE_FILE") or os.path.join(
-        tempfile.gettempdir(), "ampa_state.json"
-    )
-
-    def _mask_url(u: str) -> str:
-        try:
-            parts = u.split("/")
-            if len(parts) > 0:
-                parts[-1] = "<token>"
-                return "/".join(parts)
-        except Exception:
-            pass
-        return "<redacted>"
-
-    # Configurable retry parameters
-    try:
-        max_retries = int(os.getenv("AMPA_MAX_RETRIES", "10"))
-        if max_retries < 1:
-            raise ValueError()
-    except Exception:
-        LOG.warning("Invalid AMPA_MAX_RETRIES, falling back to 10")
-        max_retries = 10
-
-    try:
-        backoff_base = float(os.getenv("AMPA_BACKOFF_BASE_SECONDS", "2"))
-        if backoff_base <= 0:
-            raise ValueError()
-    except Exception:
-        LOG.warning("Invalid AMPA_BACKOFF_BASE_SECONDS, falling back to 2")
-        backoff_base = 2.0
-
-    session = requests.Session()
-    session.trust_env = False
-    LOG.debug(
-        "Sending webhook to %s (masked=%s); trust_env=%s",
-        url,
-        _mask_url(url),
-        session.trust_env,
-    )
-
-    last_exc: Optional[BaseException] = None
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = session.post(url, json=payload, timeout=timeout)
-            try:
-                resp.raise_for_status()
-            except Exception:
-                # HTTP error (non-2xx) - log and decide whether to retry
-                LOG.warning(
-                    "Webhook POST attempt %d/%d failed: %s %s",
-                    attempt,
-                    max_retries,
-                    getattr(resp, "status_code", None),
-                    getattr(resp, "text", ""),
-                )
-                # Log additional debug info once per failure
-                try:
-                    req = getattr(resp, "request", None)
-                    if req is not None:
-                        masked = _mask_url(getattr(req, "url", None) or "")
-                        headers = {
-                            k: v
-                            for k, v in getattr(req, "headers", {}).items()
-                            if k.lower() not in ("authorization",)
-                        }
-                        body_len = (
-                            len(getattr(req, "body", b""))
-                            if getattr(req, "body", None)
-                            else 0
-                        )
-                        LOG.info(
-                            "Request made to %s; headers=%s; body_len=%s",
-                            masked,
-                            headers,
-                            body_len,
-                        )
-                        parsed = urllib.parse.urlparse(getattr(req, "url", ""))
-                        host = parsed.hostname
-                        if host:
-                            try:
-                                addrs = [
-                                    a[4][0]
-                                    for a in __import__("socket").getaddrinfo(
-                                        host, parsed.port or 443
-                                    )
-                                ]
-                                LOG.info("Resolved %s -> %s", host, addrs)
-                            except Exception as _e:
-                                LOG.info("Failed to resolve host %s: %s", host, _e)
-                except Exception:
-                    LOG.info("Failed to log request debug info")
-
-                # record attempted send
-                try:
-                    _write_state(
-                        state_file,
-                        {
-                            "last_message_ts": datetime.datetime.now(
-                                datetime.timezone.utc
-                            ).isoformat(),
-                            "last_message_type": message_type,
-                        },
-                    )
-                except Exception:
-                    LOG.debug("Failed to record state after exception")
-
-                if attempt >= max_retries:
-                    LOG.error(
-                        "Webhook POST final failure after %d attempts: %s",
-                        attempt,
-                        getattr(resp, "status_code", None),
-                    )
-                    try:
-                        dead_letter(
-                            payload, reason=f"HTTP {getattr(resp, 'status_code', None)}"
-                        )
-                    except Exception:
-                        LOG.exception("dead_letter failed on final HTTP error")
-                    return getattr(resp, "status_code", 0)
-
-                # sleep before next retry
-                backoff = backoff_base * (2 ** (attempt - 1))
-                LOG.info("Backing off for %.1fs before next attempt", backoff)
-                time.sleep(backoff)
-                continue
-
-            # success
-            LOG.info("Webhook POST succeeded: %s", resp.status_code)
-            _write_state(
-                state_file,
-                {
-                    "last_message_ts": datetime.datetime.now(
-                        datetime.timezone.utc
-                    ).isoformat(),
-                    "last_message_type": message_type,
-                },
-            )
-            return resp.status_code
-
-        except Exception as exc:
-            # network or other exception - retry unless out of attempts
-            last_exc = exc
-            LOG.warning(
-                "Webhook POST attempt %d/%d exception: %s",
-                attempt,
-                max_retries,
-                exc,
-            )
-            try:
-                _write_state(
-                    state_file,
-                    {
-                        "last_message_ts": datetime.datetime.now(
-                            datetime.timezone.utc
-                        ).isoformat(),
-                        "last_message_type": message_type,
-                    },
-                )
-            except Exception:
-                LOG.debug("Failed to record state after exception")
-
-            if attempt >= max_retries:
-                LOG.error(
-                    "Webhook POST final exception after %d attempts: %s",
-                    attempt,
-                    exc,
-                )
-                try:
-                    dead_letter(payload, reason=str(exc))
-                except Exception:
-                    LOG.exception("dead_letter failed on final exception")
-                # re-raise to preserve previous behavior for callers
-                raise
-
-            backoff = backoff_base * (2 ** (attempt - 1))
-            LOG.info("Backing off for %.1fs before next attempt", backoff)
-            time.sleep(backoff)
 
 
 def run_once(config: Dict[str, Any]) -> int:
@@ -489,7 +162,53 @@ def run_once(config: Dict[str, Any]) -> int:
 
 
 def main() -> None:
-    config = get_env_config()
+    """Daemon entrypoint.
+
+    Supports:
+    - `--once`: send one heartbeat and exit
+    - `--start-scheduler`: start the scheduler loop under the daemon runtime
+    If neither flag is provided the default behaviour is to send a single heartbeat.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AMPA daemon")
+    parser.add_argument(
+        "--once", action="store_true", help="Send one heartbeat and exit"
+    )
+    parser.add_argument(
+        "--start-scheduler",
+        action="store_true",
+        help="Start the scheduler loop under the daemon runtime",
+    )
+    args = parser.parse_args()
+
+    try:
+        config = get_env_config()
+    except SystemExit:
+        # get_env_config logs and exits when misconfigured
+        raise
+
+    # If requested, start scheduler as a long-running worker managed by daemon
+    if args.start_scheduler or os.getenv("AMPA_RUN_SCHEDULER", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        try:
+            # Import locally to avoid side-effects during test imports
+            from . import scheduler
+
+            LOG.info("Starting scheduler under daemon runtime")
+            sched = scheduler.load_scheduler(command_cwd=os.getcwd())
+            sched.run_forever()
+            return
+        except SystemExit:
+            raise
+        except Exception:
+            LOG.exception("Failed to start scheduler from daemon")
+            return
+
+    # Default: send a single heartbeat
     LOG.info("Sending AMPA heartbeat once")
     try:
         run_once(config)
