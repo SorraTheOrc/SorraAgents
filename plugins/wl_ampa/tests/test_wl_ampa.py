@@ -9,7 +9,7 @@ from pathlib import Path
 
 # Ensure repo root is on sys.path for test imports
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-from plugins.wl_ampa import __init__ as ampa
+import plugins.wl_ampa as ampa
 
 
 def write_tmp_project(tmp_path: Path) -> Path:
