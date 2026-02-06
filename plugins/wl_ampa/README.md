@@ -74,7 +74,6 @@ Security
 - Plugins run with the same permissions as the `wl` process. Review plugin code before installing into your environment. Avoid installing third-party plugins you do not trust.
 
 Notes and limitations
-- This plugin is designed for local development convenience. For production process supervision use system tools (systemd, supervisord, pm2, etc.).
 - Windows support is partial; signal semantics differ and may require wrapper scripts on Windows systems.
 
 Contributing
