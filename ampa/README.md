@@ -79,6 +79,48 @@ Notes:
 
   pip install -r ampa/requirements.txt
 
+Observability
+-------------
+
+AMPA exposes a lightweight observability surface intended for scraping by
+Prometheus-compatible systems. The package provides a combined `/metrics` and
+`/health` HTTP endpoint. By default these endpoints are served on port `8000`.
+
+Environment variables:
+
+- `AMPA_DISCORD_WEBHOOK` (required by the daemon): when unset or empty the
+  `/health` endpoint returns `503 Service Unavailable` to indicate fatal
+  misconfiguration.
+- `AMPA_METRICS_PORT` (optional): port to serve `/metrics` and `/health` on
+  (defaults to `8000`).
+
+Metrics exported:
+
+- `ampa_heartbeat_sent_total` (counter) — number of successful heartbeat sends
+- `ampa_heartbeat_failure_total` (counter) — number of failed heartbeat sends
+- `ampa_last_heartbeat_timestamp_seconds` (gauge) — epoch seconds of last
+  successful heartbeat
+
+Quick manual test
+
+1. Install dev dependencies: `pip install -r ampa/requirements.txt`
+2. Run the metrics server in Python REPL or a tiny script:
+
+```python
+from ampa.metrics import start_metrics_server
+start_metrics_server(port=8000)
+```
+
+3. Verify health: `curl -sSf http://127.0.0.1:8000/health` (returns HTTP 200 when
+   `AMPA_DISCORD_WEBHOOK` is set).
+4. Verify metrics: `curl http://127.0.0.1:8000/metrics | grep ampa_heartbeat`
+
+Integration test example (pytest)
+
+The repository includes integration tests that start the server on an ephemeral
+port. Run them with `pytest -q` and confirm the new `tests/test_metrics_and_health.py`
+passes.
+
 Scheduler admin CLI
 
   Use the scheduler CLI for admin tasks (listing, adding, updating commands):
