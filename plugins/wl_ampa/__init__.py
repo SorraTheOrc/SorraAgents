@@ -18,6 +18,7 @@ import sys
 import time
 from pathlib import Path
 from typing import List, Optional
+import shlex
 
 
 def find_project_root(start: Path) -> Path:
@@ -38,11 +39,11 @@ def find_project_root(start: Path) -> Path:
 def resolve_command(cli_cmd: Optional[str], project_root: Path) -> Optional[List[str]]:
     # 1. CLI
     if cli_cmd:
-        return [cli_cmd]
+        return shlex.split(cli_cmd)
     # 2. env
     env_cmd = os.getenv("WL_AMPA_CMD")
     if env_cmd:
-        return [env_cmd]
+        return shlex.split(env_cmd)
     # 3. project config: worklog.json then package.json then scripts
     wl = project_root / "worklog.json"
     if wl.exists():
@@ -51,8 +52,9 @@ def resolve_command(cli_cmd: Optional[str], project_root: Path) -> Optional[List
             if isinstance(data, dict) and "ampa" in data:
                 val = data["ampa"]
                 if isinstance(val, str):
-                    return [val]
+                    return shlex.split(val)
                 if isinstance(val, list):
+                    # assume list of args
                     return val
         except Exception:
             pass
@@ -62,7 +64,7 @@ def resolve_command(cli_cmd: Optional[str], project_root: Path) -> Optional[List
             pj = json.loads(pkg.read_text())
             scripts = pj.get("scripts", {})
             if "ampa" in scripts:
-                return [scripts["ampa"]]
+                return shlex.split(scripts["ampa"])
         except Exception:
             pass
     # 4. fallback executables
