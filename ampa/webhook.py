@@ -93,6 +93,18 @@ def _write_state(path: str, data: Dict[str, str]) -> None:
 
 def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
     try:
+        # Log at ERROR level immediately when dead_letter is invoked so that
+        # final-failure attempts are visible in logs and include reason and
+        # the original payload (truncated to avoid extremely large entries).
+        try:
+            payload_str = json.dumps(payload)
+        except Exception:
+            payload_str = str(payload)
+        LOG.error(
+            "dead_letter invoked: reason=%s payload=%s",
+            reason,
+            _truncate_output(payload_str, limit=1000),
+        )
         dd_wh = os.getenv("AMPA_DEADLETTER_WEBHOOK")
         record = {
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
