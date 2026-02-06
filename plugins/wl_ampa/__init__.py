@@ -173,6 +173,13 @@ def stop(project_root: Path, name: str = "default", timeout: int = 10) -> int:
                     pass
     except Exception:
         pass
+    # Additional fallback: use system 'kill' command which supports negative
+    # PGID semantics on many Unixes. This helps when os.killpg is unavailable or
+    # ineffective in the current environment.
+    try:
+        subprocess.run(["kill", "-TERM", f"-{pid}"], check=False)
+    except Exception:
+        pass
     # wait
     for _ in range(timeout * 10):
         if not is_running(pid):
@@ -190,6 +197,11 @@ def stop(project_root: Path, name: str = "default", timeout: int = 10) -> int:
                         os.kill(pid, signal.SIGKILL)
                     except Exception:
                         pass
+        except Exception:
+            pass
+        # Fallback to system kill
+        try:
+            subprocess.run(["kill", "-KILL", f"-{pid}"], check=False)
         except Exception:
             pass
     if not is_running(pid):
