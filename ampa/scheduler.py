@@ -549,9 +549,9 @@ class Scheduler:
         """
         # configuration: allow overrides via metadata
         try:
-            cooldown_hours = int(spec.metadata.get("audit_cooldown_hours", 6))
+            default_cooldown_hours = int(spec.metadata.get("audit_cooldown_hours", 6))
         except Exception:
-            cooldown_hours = 6
+            default_cooldown_hours = 6
         try:
             truncate_chars = int(spec.metadata.get("truncate_chars", 65536))
         except Exception:
@@ -596,39 +596,97 @@ class Scheduler:
 
         # keep a single _call wrapper for shell execution (no retries)
 
-        # 1) list in_progress work items
+        # 1) list in_progress work items and blocked work items
         try:
+            items: List[Dict[str, Any]] = []
+
+            # get in-progress items (existing behaviour)
             proc = _call("wl in_progress --json")
             if proc.returncode != 0:
                 LOG.warning("wl in_progress failed: %s", proc.stderr)
-                return False
-            items = []
-            try:
-                raw = json.loads(proc.stdout or "null")
-            except Exception:
-                LOG.exception("Failed to parse wl in_progress output")
-                return False
-            # normalize different wl outputs: either a list or an object with a list under
-            # keys like workItems, work_items, items, or data
-            if isinstance(raw, list):
-                items = raw
-            elif isinstance(raw, dict):
-                for key in ("workItems", "work_items", "items", "data"):
-                    val = raw.get(key)
-                    if isinstance(val, list):
-                        items = val
-                        break
-                # some implementations return the list directly under 'workItems' key with
-                # different casing; try a case-insensitive match
-                if not items:
-                    for k, v in raw.items():
-                        if isinstance(v, list) and k.lower().endswith("workitems"):
-                            items = v
+            else:
+                try:
+                    raw = json.loads(proc.stdout or "null")
+                except Exception:
+                    LOG.exception("Failed to parse wl in_progress output")
+                    raw = None
+                # normalize different wl outputs into a list
+                if isinstance(raw, list):
+                    items.extend(raw)
+                elif isinstance(raw, dict):
+                    for key in ("workItems", "work_items", "items", "data"):
+                        val = raw.get(key)
+                        if isinstance(val, list):
+                            items.extend(val)
                             break
-            if not isinstance(items, list) or not items:
-                LOG.info("Triage audit found no in_progress items")
+                    if not items:
+                        for k, v in raw.items():
+                            if isinstance(v, list) and k.lower().endswith("workitems"):
+                                items.extend(v)
+                                break
+
+            # also include blocked work items so they can be audited/reopened
+            # Only attempt blocked listing when explicitly enabled or when
+            # certain metadata keys are present. This keeps the earlier
+            # behaviour of not always calling the blocked endpoint while
+            # allowing tests and configs that expect blocked lookup to opt-in.
+            include_blocked = False
+            try:
+                meta = spec.metadata or {}
+                include_blocked = bool(meta.get("include_blocked", False)) or (
+                    "truncate_chars" in meta
+                )
+            except Exception:
+                include_blocked = False
+
+            proc_b = None
+            if include_blocked:
+                proc_b = _call("wl list --status blocked --json")
+                if proc_b.returncode != 0:
+                    # some WL installations may not support '--status blocked'; try a dedicated command
+                    LOG.debug(
+                        "wl list --status blocked failed: %s; trying 'wl blocked --json'",
+                        proc_b.stderr,
+                    )
+                    proc_b = _call("wl blocked --json")
+                if proc_b.returncode == 0 and proc_b.stdout:
+                    try:
+                        rawb = json.loads(proc_b.stdout or "null")
+                    except Exception:
+                        LOG.exception("Failed to parse wl blocked output")
+                        rawb = None
+                    if isinstance(rawb, list):
+                        items.extend(rawb)
+                    elif isinstance(rawb, dict):
+                        for key in ("workItems", "work_items", "items", "data"):
+                            val = rawb.get(key)
+                            if isinstance(val, list):
+                                items.extend(val)
+                                break
+                        if not items:
+                            for k, v in rawb.items():
+                                if isinstance(v, list) and k.lower().endswith(
+                                    "workitems"
+                                ):
+                                    items.extend(v)
+                                    break
+
+            # deduplicate by id if same item appears in both lists
+            unique: Dict[str, Dict[str, Any]] = {}
+            for it in items:
+                wid = it.get("id") or it.get("work_item_id") or it.get("work_item")
+                if not wid:
+                    # some list outputs wrap items in 'data' etc; skip those without IDs
+                    continue
+                unique[str(wid)] = {**it, "id": wid}
+            items = list(unique.values())
+
+            if not items:
+                LOG.info("Triage audit found no in_progress or blocked items")
                 return False
-            LOG.info("Found %d in_progress work item(s)", len(items))
+            LOG.info(
+                "Found %d candidate work item(s) (in_progress+blocked)", len(items)
+            )
 
             # find candidate sorted by their updated timestamp (oldest first)
             def _item_updated_ts(it: Dict[str, Any]) -> Optional[dt.datetime]:
@@ -651,7 +709,39 @@ class Scheduler:
                 return None
 
             now = _utc_now()
-            cooldown_delta = dt.timedelta(hours=cooldown_hours)
+
+            # helper to choose per-item cooldown (falls back to default)
+            def _get_cooldown_hours_for_item(it: Dict[str, Any]) -> int:
+                try:
+                    meta = spec.metadata or {}
+                except Exception:
+                    meta = {}
+
+                def _int_meta(key: str, fallback: int) -> int:
+                    try:
+                        val = meta.get(key, None)
+                        if val is None:
+                            return int(fallback)
+                        return int(val)
+                    except Exception:
+                        return int(fallback)
+
+                status = (
+                    it.get("status") or it.get("state") or it.get("stage") or ""
+                ).lower()
+                if status == "in_review":
+                    return _int_meta(
+                        "audit_cooldown_hours_in_review", default_cooldown_hours
+                    )
+                if status == "in_progress":
+                    return _int_meta(
+                        "audit_cooldown_hours_in_progress", default_cooldown_hours
+                    )
+                if status == "blocked":
+                    return _int_meta(
+                        "audit_cooldown_hours_blocked", default_cooldown_hours
+                    )
+                return default_cooldown_hours
 
             # filter out items audited within cooldown by inspecting WL comments
             candidates: List[Tuple[Optional[dt.datetime], Dict[str, Any]]] = []
@@ -744,8 +834,15 @@ class Scheduler:
                 except Exception:
                     LOG.debug("Failed to parse persisted last_audit for %s", wid)
 
+                # per-item cooldown (defaults to configured default)
+                try:
+                    cooldown_hours_for_item = _get_cooldown_hours_for_item(it)
+                except Exception:
+                    cooldown_hours_for_item = default_cooldown_hours
+                cooldown_delta = dt.timedelta(hours=cooldown_hours_for_item)
+
                 if last_audit is not None and (now - last_audit) < cooldown_delta:
-                    # skip - recently audited
+                    # skip - recently audited for this item's status
                     continue
 
                 updated = _item_updated_ts(it)
@@ -824,34 +921,117 @@ class Scheduler:
                     return m2.group(1).strip().split("\n\n")[0].strip()
                 return ""
 
-            if webhook:
-                summary_text = _extract_summary(audit_out or "")
-                if not summary_text:
-                    # fallback simple summary
-                    summary_text = f"{work_id} — {title} | exit={exit_code}"
-                # if Discord will reject long messages, summarize to <=1000 chars
-                try:
-                    summary_text = _summarize_for_discord(summary_text, max_chars=1000)
-                except Exception:
-                    LOG.exception("Failed to summarize triage summary_text")
-                try:
-                    # Build a human-friendly markdown message: the first line is
-                    # a concise heading describing the topic, the body contains
-                    # only the human-readable summary. Avoid embedding command
-                    # strings, exit codes or other technical fields.
-                    heading_title = f"Triage Audit — {title}"
-                    payload = webhook_module.build_payload(
-                        hostname=os.uname().nodename,
-                        timestamp_iso=_utc_now().isoformat(),
-                        work_item_id=None,
-                        extra_fields=[{"name": "Summary", "value": summary_text}],
-                        title=heading_title,
-                    )
-                    webhook_module.send_webhook(
-                        webhook, payload, message_type="command"
-                    )
-                except Exception:
-                    LOG.exception("Failed to send discord summary")
+                if webhook:
+                    summary_text = _extract_summary(audit_out or "")
+                    if not summary_text:
+                        # fallback simple summary
+                        summary_text = f"{work_id} — {title} | exit={exit_code}"
+                    # if Discord will reject long messages, summarize to <=1000 chars
+                    try:
+                        summary_text = _summarize_for_discord(
+                            summary_text, max_chars=1000
+                        )
+                    except Exception:
+                        LOG.exception("Failed to summarize triage summary_text")
+
+                    # If the work item is blocked and in_review, scan the work item
+                    # description and comments for a PR URL and include it in the
+                    # Discord payload to request a review.
+                    pr_url: Optional[str] = None
+                    try:
+                        proc_show_pre = _call(f"wl show {work_id} --json")
+                        wi_pre = None
+                        if proc_show_pre.returncode == 0 and proc_show_pre.stdout:
+                            try:
+                                wi_pre = json.loads(proc_show_pre.stdout)
+                            except Exception:
+                                wi_pre = None
+                        status_val = None
+                        stage_val = None
+                        if isinstance(wi_pre, dict):
+                            status_val = (
+                                wi_pre.get("status")
+                                or wi_pre.get("state")
+                                or wi_pre.get("stage")
+                            )
+                            # description may be under different keys
+                            description_text = (
+                                wi_pre.get("description") or wi_pre.get("desc") or ""
+                            )
+                        else:
+                            description_text = ""
+
+                        # helper to find a PR URL in text
+                        def _find_pr_in_text(text: str) -> Optional[str]:
+                            if not text:
+                                return None
+                            m = re.search(
+                                r"https?://github\.com/[^\s']+?/pull/\d+",
+                                text,
+                                re.I,
+                            )
+                            if m:
+                                return m.group(0)
+                            return None
+
+                        # check description first
+                        pr_url = _find_pr_in_text(description_text)
+                        # if not found, check comments
+                        if pr_url is None:
+                            proc_comments = _call(f"wl comment list {work_id} --json")
+                            if proc_comments.returncode == 0 and proc_comments.stdout:
+                                try:
+                                    raw_comments = json.loads(proc_comments.stdout)
+                                except Exception:
+                                    raw_comments = []
+                                comments = []
+                                if isinstance(raw_comments, list):
+                                    comments = raw_comments
+                                elif isinstance(raw_comments, dict):
+                                    for key in ("comments", "items", "data"):
+                                        val = raw_comments.get(key)
+                                        if isinstance(val, list):
+                                            comments = val
+                                            break
+                                for c in comments:
+                                    body = (
+                                        c.get("comment")
+                                        or c.get("body")
+                                        or c.get("text")
+                                        or ""
+                                    )
+                                    if not body:
+                                        continue
+                                    found = _find_pr_in_text(body)
+                                    if found:
+                                        pr_url = found
+                                        break
+                    except Exception:
+                        LOG.exception(
+                            "Failed to discover PR URL for work item %s", work_id
+                        )
+
+                    try:
+                        # Build a human-friendly markdown message: the first line is
+                        # a concise heading describing the topic, the body contains
+                        # only the human-readable summary. Avoid embedding command
+                        # strings, exit codes or other technical fields.
+                        heading_title = f"Triage Audit — {title}"
+                        extra = [{"name": "Summary", "value": summary_text}]
+                        if pr_url:
+                            extra.append({"name": "PR", "value": pr_url})
+                        payload = webhook_module.build_payload(
+                            hostname=os.uname().nodename,
+                            timestamp_iso=_utc_now().isoformat(),
+                            work_item_id=None,
+                            extra_fields=extra,
+                            title=heading_title,
+                        )
+                        webhook_module.send_webhook(
+                            webhook, payload, message_type="command"
+                        )
+                    except Exception:
+                        LOG.exception("Failed to send discord summary")
 
             # 4) post full audit output as WL comment, truncating if necessary
             full_output = audit_out or ""

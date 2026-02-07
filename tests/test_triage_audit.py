@@ -231,3 +231,181 @@ def test_triage_audit_no_candidates_skips_discord(tmp_path, monkeypatch):
     sched.start_command(spec)
 
     assert calls == ["wl in_progress --json"]
+
+
+def test_triage_audit_includes_blocked_items(tmp_path, monkeypatch):
+    """Verify blocked items are included when in_progress is empty."""
+    calls = []
+    work_id = "BLOCKED-1"
+
+    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"workItems": []}), stderr=""
+            )
+        if cmd.strip() == "wl list --status blocked --json":
+            out = json.dumps(
+                {
+                    "workItems": [
+                        {
+                            "id": work_id,
+                            "title": "Blocked item",
+                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                            "status": "blocked",
+                        }
+                    ]
+                }
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        # allow fallback 'wl blocked --json'
+        if cmd.strip() == "wl blocked --json":
+            out = json.dumps(
+                [
+                    {
+                        "id": work_id,
+                        "title": "Blocked item",
+                        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "status": "blocked",
+                    }
+                ]
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment list {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
+            out = "Summary:\nBlocked item audit\n"
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment add {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    sched.start_command(spec)
+
+    # ensure blocked listing was attempted and audit ran for blocked item
+    assert any(
+        "wl list --status blocked --json" in c or c.strip() == "wl blocked --json"
+        for c in calls
+    )
+    assert any(f"/audit {work_id}" in c for c in calls)
+
+
+def test_per_status_cooldown_respected(tmp_path, monkeypatch):
+    """Verify per-status cooldowns: in_review cooldown smaller than in_progress."""
+    calls = []
+    wid_in_review = "WID-REV"
+    wid_in_progress = "WID-PROG"
+
+    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+
+    now = dt.datetime.now(dt.timezone.utc)
+    # last audit times: both 2 hours ago
+    last_audit_iso = (now - dt.timedelta(hours=2)).isoformat()
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            out = json.dumps(
+                {
+                    "workItems": [
+                        {
+                            "id": wid_in_review,
+                            "title": "Review item",
+                            "updated_at": (now - dt.timedelta(hours=3)).isoformat(),
+                            "status": "in_review",
+                        },
+                        {
+                            "id": wid_in_progress,
+                            "title": "Prog item",
+                            "updated_at": (now - dt.timedelta(hours=4)).isoformat(),
+                            "status": "in_progress",
+                        },
+                    ]
+                }
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith("wl comment list"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {wid_in_review}"'):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="Summary:\nreview allowed", stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {wid_in_progress}"'):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="Summary:\nprog audited", stderr=""
+            )
+        if cmd.strip().startswith("wl comment add"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+
+    # metadata sets in_review cooldown to 1 hour, in_progress to 6 hours
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={
+            "truncate_chars": 65536,
+            "audit_cooldown_hours": 6,
+            "audit_cooldown_hours_in_progress": 6,
+            "audit_cooldown_hours_in_review": 1,
+        },
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    # persist last_audit timestamps for both items as 2 hours ago
+    sched.store.update_state(
+        spec.command_id,
+        {
+            "last_audit_at_by_item": {
+                wid_in_review: last_audit_iso,
+                wid_in_progress: last_audit_iso,
+            }
+        },
+    )
+
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    sched.start_command(spec)
+
+    # Since in_review cooldown is 1h and last_audit was 2h ago, the in_review item should be audited.
+    # The in_progress item should be skipped because its cooldown is 6h and last_audit is 2h ago.
+    assert any(f"/audit {wid_in_review}" in c for c in calls)
+    assert not any(f"/audit {wid_in_progress}" in c for c in calls)
