@@ -38,3 +38,8 @@ __pycache__/
 .env
 ampa/.env
 ampa/scheduler_store.json
+
+# Do not track the source copy of the ampa node plugin directory; it is
+# generated/copied during development and should not be kept in the repository
+# index. This prevents accidental commits of built artifacts.
+plugins/wl_ampa/

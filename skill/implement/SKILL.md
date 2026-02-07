@@ -6,105 +6,7 @@ description: Implement a Worklog work item by writing code, tests and documentat
 ## Purpose
 
 Provide a deterministic, step-by-step implementation workflow for completing a
-Worklog work item.
-
-Use this skill when asked to implement a specific wl work-item id
-(formatted `<prefix>-<hash>`). The skill assumes the work-item id will be
-supplied as an input and that the agent has access to `wl`, `git`, and the
-repository.
-
-## Instructions
-
-- Input: a valid work-item id (e.g. `WL-123`). If missing or invalid, prompt
-  for the id. Treat the work-item id as the primary required input (equivalent
-  to `<work-item-id>` in the canonical command implementation).
-
-Follow the numbered steps exactly. Use the listed live commands where
-applicable and record outputs in the work-item comments as you proceed.
-
-0. Safety gate: handle dirty working tree
-
-- Inspect the working tree with `git status --porcelain=v1 -b`.
-- If uncommitted changes are limited to `.worklog/`, carry them into the new
-  branch and commit there.
-- If other uncommitted changes exist, present explicit choices: carry into the
-  work-item branch, commit first, stash (and optionally pop later), revert/
-  discard (explicit confirmation), or abort.
-
-1. Understand the work item
-
-- Claim the work item: run
-  `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
-  (omit `--assignee` if not applicable).
-- Fetch the work item JSON: `wl show <id> --json`.
-- Restate acceptance criteria and constraints extracted from the work item
-  JSON in the worklog comment and in your local plan.
-- Surface blockers, dependencies and missing requirements; inspect linked PRDs
-  and docs.
-- Confirm expected tests or validation steps.
-
-  1.1) Definition gate (must pass before implementation)
-
-- Verify clear scope, concrete testable acceptance criteria, constraints, and
-  unknowns captured as explicit questions.
-- If the work item is not well-defined, run the intake interview (see
-  `.opencode/command/intake.md`) and update the work item description or
-  acceptance criteria. If too large, run milestones or plan interviews to
-  break it into smaller work items.
-
-2. Create a working branch
-
-- Inspect the current branch: `git rev-parse --abbrev-ref HEAD`.
-- If the current branch is already for an ancestor work item, continue on it.
-- Otherwise create a new branch named `feature/<id>-<short>` or
-  `bug/<id>-<short>` (include the work item id). Never commit directly to
-  `main`.
-
-3. Implement
-
-- If blockers or dependencies exist, select and claim the next appropriate
-  work-item and recursively implement it according to this skill.
-- Write tests and code to meet acceptance criteria. Keep changes minimal and
-  focused. Use TDD where appropriate.
-- Create linked work items for additional discovered work: `wl create
-"<title>" --deps discovered-from:<id> --json`.
-- When satisfied, run the full test suite and fix failing tests before
-  continuing. Update documentation and summarise changes in the work item
-  comments.
-- Pause and request operator confirmation before proceeding to automated PR
-  creation if interactive approval is required by your environment.
-
-4. Automated self-review
-
-- Run `audit <id>` to confirm acceptance criteria (if audit tooling exists).
-- Perform sequential self-review passes: completeness, dependencies & safety,
-  scope & regression, tests & acceptance, polish & handoff.
-- For each pass produce a short note and limit edits to small, goal-aligned
-  changes. If intent changes are discovered, create an Open Question and stop
-  automated edits.
-- Re-run the full test suite and fix failing tests.
-
-5. Commit, Push and create PR
-
-- Update work item status to completed/in-review: `wl update <id> --status
-completed --stage in_review --json`.
-- Push the branch to origin and create a Pull Request against the repository's
-  default branch.
-- Use the PR title `WIP: <work item title> (<work item id>)` and include a
-  concise body summarising goal, work done, and reviewer instructions.
-- Link the PR to the work item via a comment and `wl` as appropriate.
-
-6. Human PR review
-
-- Notify reviewers that the PR is ready.
-- Address review comments and requested changes.
-- After merge, proceed to cleanup.
-
-7. Cleanup (post-merge)
-
-- After the PR is merged, close the work item and its dependents: `wl update
-<work-item-id> --status completed --stage completed --json`.
-- Run the cleanup skill to prune branches and finalize local state.
+Worklog work item thorugh the creation of code, tests, and documentation.
 
 ## Inputs
 
@@ -146,7 +48,9 @@ any sensitive values before writing them to logs or comments.
 - If the work item has blockers or dependencies, implement those first before proceeding with the main work item.
 - Never commit directly to `main`. Always create a feature or bug branch for implementation.
 - When creating branches, include the work item id in the branch name for traceability (e.g., `feature/WL-123-add-auth`).
-- Only create a PR when all acceptance criteria are met and the implementation is ready for review. Do not create PRs for work in progress.
+- When creating a commit message, review the diff and write a concise message summarizing the changes made and the reason for the change, referencing the work item id.
+- When committing add a comment to the work item with the commit message and hash.
+- Only create a PR when all acceptance criteria have been met, all tests have passed and the implementation is ready for review. Do not create PRs for work in progress.
 - When writing the PR body, include a concise summary of the goal, work done, and clear instructions for reviewers on what to focus on in the review. Also include instructions on how to experience the any new/changed user experiences.
 - Do not escape content in the PR or work-item description; use markdown formatting as needed for clarity and readability.
 - After implementation, use the cleanup skill to tidy up branches and local state, but only after the PR is merged to avoid disrupting the review process.
