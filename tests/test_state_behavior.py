@@ -125,6 +125,9 @@ def test_build_command_payload_includes_output():
         0,
     )
     content = payload["content"]
-    assert "command_id: wl-in_progress" in content
-    assert "exit_code: 0" in content
+    # command_id and exit_code are technical fields and should not appear
+    # in the human-facing Discord payload. Only the output summary should be
+    # present.
+    assert "command_id:" not in content
+    assert "exit_code:" not in content
     assert "in progress output" in content
