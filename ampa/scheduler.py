@@ -68,6 +68,7 @@ def _seconds_between(now: dt.datetime, then: Optional[dt.datetime]) -> Optional[
 class CommandSpec:
     command_id: str
     command: str
+    title: Optional[str]
     requires_llm: bool
     frequency_minutes: int
     priority: int
@@ -78,6 +79,7 @@ class CommandSpec:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.command_id,
+            "title": self.title,
             "command": self.command,
             "requires_llm": self.requires_llm,
             "frequency_minutes": self.frequency_minutes,
@@ -91,7 +93,8 @@ class CommandSpec:
     def from_dict(data: Dict[str, Any]) -> "CommandSpec":
         return CommandSpec(
             command_id=str(data["id"]),
-            command=str(data["command"]),
+            command=str(data.get("command", "")),
+            title=data.get("title"),
             requires_llm=bool(data.get("requires_llm", False)),
             frequency_minutes=int(data.get("frequency_minutes", 1)),
             priority=int(data.get("priority", 0)),
@@ -667,6 +670,9 @@ class Scheduler:
                 # inspect WL comments to find the most recent audit comment
                 last_audit: Optional[dt.datetime] = None
                 try:
+                    # prepare hostname and timestamp for human-facing payloads
+                    hostname = os.uname().nodename
+                    ts = _utc_now().isoformat()
                     proc_c = _call(f"wl comment list {wid} --json")
                     if proc_c.returncode == 0 and proc_c.stdout:
                         try:
@@ -783,43 +789,41 @@ class Scheduler:
             )
 
             # 3) post a short Discord summary (1-3 lines)
-            if webhook:
-                # extract the "Summary" section from the audit output if present
-                def _extract_summary(text: str) -> str:
-                    if not text:
-                        return ""
-                    # look for a heading-style or standalone 'Summary' line
-                    m = re.search(
-                        r"^(?:#{1,6}\s*)?Summary\s*:?$",
-                        text,
-                        re.IGNORECASE | re.MULTILINE,
-                    )
-                    if m:
-                        start = m.end()
-                        rest = text[start:]
-                        lines = rest.splitlines()
-                        collected: List[str] = []
-                        for line in lines:
-                            # stop on next markdown heading
-                            if re.match(r"^\s*#{1,6}\s+", line):
-                                break
-                            # stop on next section like 'OtherSection:' (Title-case followed by colon)
-                            if re.match(r"^[A-Z][A-Za-z0-9 \-]{0,80}\s*:$", line):
-                                break
-                            collected.append(line)
-                        # strip leading/trailing blank lines
-                        while collected and collected[0].strip() == "":
-                            collected.pop(0)
-                        while collected and collected[-1].strip() == "":
-                            collected.pop()
-                        return "\n".join(collected).strip()
-                    # fallback: try inline 'Summary:' followed by content on same line or next
-                    m2 = re.search(r"Summary:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
-                    if m2:
-                        # take up to a reasonable length
-                        return m2.group(1).strip().split("\n\n")[0].strip()
+            # helper to extract a human-facing 'Summary' section from audit output
+            def _extract_summary(text: str) -> str:
+                if not text:
                     return ""
+                # look for a heading-style or standalone 'Summary' line
+                m = re.search(
+                    r"^(?:#{1,6}\s*)?Summary\s*:?$", text, re.IGNORECASE | re.MULTILINE
+                )
+                if m:
+                    start = m.end()
+                    rest = text[start:]
+                    lines = rest.splitlines()
+                    collected: List[str] = []
+                    for line in lines:
+                        # stop on next markdown heading
+                        if re.match(r"^\s*#{1,6}\s+", line):
+                            break
+                        # stop on next section like 'OtherSection:' (Title-case followed by colon)
+                        if re.match(r"^[A-Z][A-Za-z0-9 \-]{0,80}\s*:$", line):
+                            break
+                        collected.append(line)
+                    # strip leading/trailing blank lines
+                    while collected and collected[0].strip() == "":
+                        collected.pop(0)
+                    while collected and collected[-1].strip() == "":
+                        collected.pop()
+                    return "\n".join(collected).strip()
+                # fallback: try inline 'Summary:' followed by content on same line or next
+                m2 = re.search(r"Summary:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+                if m2:
+                    # take up to a reasonable length
+                    return m2.group(1).strip().split("\n\n")[0].strip()
+                return ""
 
+            if webhook:
                 summary_text = _extract_summary(audit_out or "")
                 if not summary_text:
                     # fallback simple summary
@@ -836,8 +840,8 @@ class Scheduler:
                     # strings, exit codes or other technical fields.
                     heading_title = f"Triage Audit — {title}"
                     payload = webhook_module.build_payload(
-                        hostname=hostname,
-                        timestamp_iso=ts,
+                        hostname=os.uname().nodename,
+                        timestamp_iso=_utc_now().isoformat(),
                         work_item_id=None,
                         extra_fields=[{"name": "Summary", "value": summary_text}],
                         title=heading_title,
@@ -1060,8 +1064,8 @@ class Scheduler:
                                 except Exception:
                                     short = (audit_out or "")[:1000]
                                 payload = webhook_module.build_payload(
-                                    hostname=hostname,
-                                    timestamp_iso=ts,
+                                    hostname=os.uname().nodename,
+                                    timestamp_iso=_utc_now().isoformat(),
                                     work_item_id=None,
                                     extra_fields=[{"name": "Result", "value": short}],
                                     title=heading_title,
@@ -1163,7 +1167,7 @@ class Scheduler:
             command_id,
             short_output,
             run.exit_code,
-            title="AMPA Scheduler",
+            title=(spec.title or spec.metadata.get("discord_label") or spec.command_id),
         )
         webhook_module.send_webhook(webhook, payload, message_type="command")
 
@@ -1223,6 +1227,7 @@ def _cli_add(args: argparse.Namespace) -> int:
     spec = CommandSpec(
         command_id=args.command_id,
         command=args.command,
+        title=getattr(args, "title", None),
         requires_llm=args.requires_llm,
         frequency_minutes=args.frequency_minutes,
         priority=args.priority,
@@ -1239,6 +1244,7 @@ def _cli_update(args: argparse.Namespace) -> int:
     spec = CommandSpec(
         command_id=args.command_id,
         command=args.command,
+        title=getattr(args, "title", None),
         requires_llm=args.requires_llm,
         frequency_minutes=args.frequency_minutes,
         priority=args.priority,
@@ -1271,6 +1277,7 @@ def _build_parser() -> argparse.ArgumentParser:
     add.add_argument("--metadata")
     add.add_argument("--max-runtime-minutes", type=int, dest="max_runtime_minutes")
     add.add_argument("--type", dest="command_type", default="shell")
+    add.add_argument("--title")
 
     update = sub.add_parser("update", help="Update a scheduled command")
     update.add_argument("command_id")
@@ -1281,6 +1288,7 @@ def _build_parser() -> argparse.ArgumentParser:
     update.add_argument("--metadata")
     update.add_argument("--max-runtime-minutes", type=int, dest="max_runtime_minutes")
     update.add_argument("--type", dest="command_type", default="shell")
+    update.add_argument("--title")
 
     remove = sub.add_parser("remove", help="Remove a scheduled command")
     remove.add_argument("command_id")
