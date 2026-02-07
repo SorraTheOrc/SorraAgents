@@ -29,18 +29,18 @@ test('ampa start/status/stop lifecycle', async (t) => {
   // run `node` to invoke the plugin directly via the ESM file (simulate wl loader)
   // Start
   await new Promise((resolve) => setTimeout(resolve, 50));
-  const startProc = spawn('node', ['--input-type=module', path.join(targetDir, 'ampa.mjs'), 'start', '--name', 't1'], { cwd: tmp, stdio: 'inherit' });
+  const startProc = spawn('node', [path.join(targetDir, 'ampa.mjs'), 'start', '--name', 't1'], { cwd: tmp, stdio: 'inherit' });
   await new Promise((r) => startProc.on('close', r));
 
   // status
-  const statusProc = spawn('node', ['--input-type=module', path.join(targetDir, 'ampa.mjs'), 'status', '--name', 't1'], { cwd: tmp, stdio: 'pipe' });
+  const statusProc = spawn('node', [path.join(targetDir, 'ampa.mjs'), 'status', '--name', 't1'], { cwd: tmp, stdio: 'pipe' });
   let out = '';
   for await (const chunk of statusProc.stdout) out += chunk.toString();
   await new Promise((r) => statusProc.on('close', r));
   assert.ok(/running pid=\d+/.test(out), `status output unexpected: ${out}`);
 
   // stop
-  const stopProc = spawn('node', ['--input-type=module', path.join(targetDir, 'ampa.mjs'), 'stop', '--name', 't1'], { cwd: tmp, stdio: 'inherit' });
+  const stopProc = spawn('node', [path.join(targetDir, 'ampa.mjs'), 'stop', '--name', 't1'], { cwd: tmp, stdio: 'inherit' });
   await new Promise((r) => stopProc.on('close', r));
 
   // cleanup
