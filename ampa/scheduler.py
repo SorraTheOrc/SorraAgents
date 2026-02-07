@@ -508,23 +508,26 @@ class Scheduler:
             exit_code = run.exit_code
         self._record_run(spec, run, exit_code, output)
         # After recording run, perform any command-specific post actions
-        try:
-            # special-case triage-audit command id
-            if (
-                spec.command_id == "wl-triage-audit"
-                or spec.command_type == "triage-audit"
-            ):
+        if spec.command_id == "wl-triage-audit" or spec.command_type == "triage-audit":
+            triage_audited = False
+            try:
                 # run triage-audit handler which posts WL comments and Discord summary
-                self._run_triage_audit(spec, run, output)
-        except Exception:
-            LOG.exception("Triage audit post-processing failed")
+                # returns True if an item was audited
+                triage_audited = self._run_triage_audit(spec, run, output)
+            except Exception:
+                LOG.exception("Triage audit post-processing failed")
+                triage_audited = False
+            # post the generic discord message only if an audit occurred
+            if triage_audited:
+                self._post_discord(spec, run, output)
+            return run
         # always post the generic discord message afterwards
         self._post_discord(spec, run, output)
         return run
 
     def _run_triage_audit(
         self, spec: CommandSpec, run: RunResult, output: Optional[str]
-    ) -> None:
+    ) -> bool:
         """Execute triage-audit post-processing.
 
         This method:
@@ -589,13 +592,13 @@ class Scheduler:
             proc = _call("wl in_progress --json")
             if proc.returncode != 0:
                 LOG.warning("wl in_progress failed: %s", proc.stderr)
-                return
+                return False
             items = []
             try:
                 raw = json.loads(proc.stdout or "null")
             except Exception:
                 LOG.exception("Failed to parse wl in_progress output")
-                return
+                return False
             # normalize different wl outputs: either a list or an object with a list under
             # keys like workItems, work_items, items, or data
             if isinstance(raw, list):
@@ -614,8 +617,8 @@ class Scheduler:
                             items = v
                             break
             if not isinstance(items, list) or not items:
-                LOG.debug("No in_progress items returned")
-                return
+                LOG.info("Triage audit found no in_progress items")
+                return False
             LOG.info("Found %d in_progress work item(s)", len(items))
 
             # find candidate sorted by their updated timestamp (oldest first)
@@ -711,8 +714,8 @@ class Scheduler:
                 candidates.append((updated, {**it, "id": wid}))
 
             if not candidates:
-                LOG.debug("No triage candidates after cooldown filter")
-                return
+                LOG.info("Triage audit found no eligible items after cooldown filter")
+                return False
 
             # sort by updated timestamp ascending (oldest first), None treated as oldest
             candidates.sort(
@@ -1008,6 +1011,8 @@ class Scheduler:
                 LOG.exception("Auto-complete check failed for %s", work_id)
         except Exception:
             LOG.exception("Error during triage audit processing")
+            return False
+        return True
 
     def run_once(self) -> Optional[RunResult]:
         now = _utc_now()

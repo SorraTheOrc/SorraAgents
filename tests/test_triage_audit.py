@@ -197,3 +197,37 @@ def test_triage_audit_auto_complete_with_gh(tmp_path, monkeypatch):
     assert any(c.startswith("gh pr view") for c in calls)
     # ensure wl update was invoked to set completed
     assert any(c.startswith(f"wl update {work_id}") for c in calls)
+
+
+def test_triage_audit_no_candidates_skips_discord(tmp_path, monkeypatch):
+    """Verify triage-audit logs and avoids discord when no candidates."""
+    calls = []
+
+    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"workItems": []}), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    sched.start_command(spec)
+
+    assert calls == ["wl in_progress --json"]
