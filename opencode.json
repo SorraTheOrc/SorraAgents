@@ -37,7 +37,6 @@
     },
 
     "model": "github-copilot/gpt-5-mini",
-    //"model": "foundry-local/qwen2.5-7b-instruct-qnn-npu:2"
     "small_model": "github-copilot/gpt-5-mini",
     "default_agent": "build",
     
