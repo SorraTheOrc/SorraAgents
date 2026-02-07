@@ -465,8 +465,20 @@ copy_python_package() {
    rm -rf "$py_target_dir/ampa"
    cp -R "ampa" "$py_target_dir/ampa"
    
-   # Record post-copy state
-   log_decision "POST_COPY_ls=$(ls -la "$py_target_dir/ampa" 2>/dev/null || true)"
+    # Record post-copy state
+    log_decision "POST_COPY_ls=$(ls -la "$py_target_dir/ampa" 2>/dev/null || true)"
+
+    # Ensure scheduler_store.json exists for fresh installs
+    if [ ! -f "$py_target_dir/ampa/scheduler_store.json" ]; then
+      if [ -f "$py_target_dir/ampa/scheduler_store_example.json" ]; then
+        cp -p "$py_target_dir/ampa/scheduler_store_example.json" "$py_target_dir/ampa/scheduler_store.json" 2>/dev/null || \
+          cp "$py_target_dir/ampa/scheduler_store_example.json" "$py_target_dir/ampa/scheduler_store.json" 2>/dev/null || true
+        log_info "Initialized scheduler_store.json from scheduler_store_example.json"
+      else
+        printf '{"commands": {}, "state": {}, "last_global_start_ts": null}\n' > "$py_target_dir/ampa/scheduler_store.json"
+        log_info "Initialized empty scheduler_store.json"
+      fi
+    fi
 
    # Restore .env if we backed it up
    if [ -n "$env_backup" ]; then
