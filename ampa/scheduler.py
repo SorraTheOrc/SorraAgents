@@ -1181,11 +1181,34 @@ class Scheduler:
             return
         hostname = os.uname().nodename
         ts = _utc_now().isoformat()
+        # Capture the human-facing output of `wl status` for the startup message
+        try:
+            proc = self.run_shell(
+                "wl status",
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            status_out = ""
+            if getattr(proc, "stdout", None):
+                status_out += proc.stdout
+            if getattr(proc, "stderr", None):
+                # prefer stderr only if stdout is empty to keep message concise
+                if not status_out:
+                    status_out += proc.stderr
+            if not status_out:
+                status_out = "(wl status produced no output)"
+        except Exception:
+            LOG.exception("Failed to run 'wl status' for startup message")
+            status_out = "(wl status unavailable)"
+
         payload = webhook_module.build_command_payload(
             hostname,
             ts,
             "scheduler_start",
-            "Scheduler started",
+            status_out,
             0,
             title="Scheduler Started",
         )
