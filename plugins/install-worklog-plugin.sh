@@ -268,9 +268,12 @@ find_env_sample() {
 # Back up existing .env file before removal
 backup_env_file() {
   local target_env="$1"
-  local backup_path="$target_env.preinstall.$$"
+  local backup_dir="${2:-.}"  # Use specified directory, or current directory by default
+  local backup_filename=$(basename "$target_env")
+  local backup_path="$backup_dir/$backup_filename.preinstall.$$"
   
   if [ -f "$target_env" ]; then
+    mkdir -p "$backup_dir" 2>/dev/null || true
     if cp -a "$target_env" "$backup_path" 2>/dev/null || cp "$target_env" "$backup_path" 2>/dev/null; then
       echo "$backup_path"
       log_decision "BACKUP_ENV=$backup_path"
@@ -449,11 +452,13 @@ copy_python_package() {
      env_backup=$(backup_env_file "$py_target_dir/ampa/.env")
    fi
 
-   # Backup existing scheduler_store.json if present
-   if [ -f "$py_target_dir/ampa/scheduler_store.json" ]; then
-     store_backup=$(backup_env_file "$py_target_dir/ampa/scheduler_store.json")
-     log_decision "BACKUP_SCHEDULER_STORE=$store_backup"
-   fi
+    # Backup existing scheduler_store.json if present
+    # Store backup OUTSIDE the ampa directory so it survives the rm -rf
+    if [ -f "$py_target_dir/ampa/scheduler_store.json" ]; then
+      store_backup=$(backup_env_file "$py_target_dir/ampa/scheduler_store.json" "$py_target_dir")
+      log_decision "BACKUP_SCHEDULER_STORE=$store_backup"
+    fi
+
 
    # Remove old bundle and copy new one
    mkdir -p "$py_target_dir"
