@@ -268,9 +268,12 @@ find_env_sample() {
 # Back up existing .env file before removal
 backup_env_file() {
   local target_env="$1"
-  local backup_path="$target_env.preinstall.$$"
+  local backup_dir="${2:-.}"  # Use specified directory, or current directory by default
+  local backup_filename=$(basename "$target_env")
+  local backup_path="$backup_dir/$backup_filename.preinstall.$$"
   
   if [ -f "$target_env" ]; then
+    mkdir -p "$backup_dir" 2>/dev/null || true
     if cp -a "$target_env" "$backup_path" 2>/dev/null || cp "$target_env" "$backup_path" 2>/dev/null; then
       echo "$backup_path"
       log_decision "BACKUP_ENV=$backup_path"
@@ -437,31 +440,58 @@ install_worklog_plugin() {
 
 # Copy Python package into plugin directory
 copy_python_package() {
-  local py_target_dir="$TARGET_DIR/ampa_py"
-  local env_backup=""
-  
-  # Record pre-removal state
-  log_decision "PRE_REMOVE_ls=$(ls -la "$py_target_dir" 2>/dev/null || true)"
-  
-  # Backup existing .env if present
-  if [ -f "$py_target_dir/ampa/.env" ]; then
-    env_backup=$(backup_env_file "$py_target_dir/ampa/.env")
-  fi
+   local py_target_dir="$TARGET_DIR/ampa_py"
+   local env_backup=""
+   local store_backup=""
+   
+   # Record pre-removal state
+   log_decision "PRE_REMOVE_ls=$(ls -la "$py_target_dir" 2>/dev/null || true)"
+   
+   # Backup existing .env if present
+   if [ -f "$py_target_dir/ampa/.env" ]; then
+     env_backup=$(backup_env_file "$py_target_dir/ampa/.env")
+   fi
 
-  # Remove old bundle and copy new one
-  mkdir -p "$py_target_dir"
-  rm -rf "$py_target_dir/ampa"
-  cp -R "ampa" "$py_target_dir/ampa"
-  
-  # Record post-copy state
-  log_decision "POST_COPY_ls=$(ls -la "$py_target_dir/ampa" 2>/dev/null || true)"
+    # Backup existing scheduler_store.json if present
+    # Store backup OUTSIDE the ampa directory so it survives the rm -rf
+    if [ -f "$py_target_dir/ampa/scheduler_store.json" ]; then
+      store_backup=$(backup_env_file "$py_target_dir/ampa/scheduler_store.json" "$py_target_dir")
+      log_decision "BACKUP_SCHEDULER_STORE=$store_backup"
+    fi
 
-  # Restore .env if we backed it up
-  if [ -n "$env_backup" ]; then
-    restore_env_file "$env_backup" "$py_target_dir/ampa/.env"
-  fi
 
-  log_info "Installed Python ampa package to $py_target_dir/ampa"
+   # Remove old bundle and copy new one
+   mkdir -p "$py_target_dir"
+   rm -rf "$py_target_dir/ampa"
+   cp -R "ampa" "$py_target_dir/ampa"
+   
+    # Record post-copy state
+    log_decision "POST_COPY_ls=$(ls -la "$py_target_dir/ampa" 2>/dev/null || true)"
+
+    # Ensure scheduler_store.json exists for fresh installs
+    if [ ! -f "$py_target_dir/ampa/scheduler_store.json" ]; then
+      if [ -f "$py_target_dir/ampa/scheduler_store_example.json" ]; then
+        cp -p "$py_target_dir/ampa/scheduler_store_example.json" "$py_target_dir/ampa/scheduler_store.json" 2>/dev/null || \
+          cp "$py_target_dir/ampa/scheduler_store_example.json" "$py_target_dir/ampa/scheduler_store.json" 2>/dev/null || true
+        log_info "Initialized scheduler_store.json from scheduler_store_example.json"
+      else
+        printf '{"commands": {}, "state": {}, "last_global_start_ts": null}\n' > "$py_target_dir/ampa/scheduler_store.json"
+        log_info "Initialized empty scheduler_store.json"
+      fi
+    fi
+
+   # Restore .env if we backed it up
+   if [ -n "$env_backup" ]; then
+     restore_env_file "$env_backup" "$py_target_dir/ampa/.env"
+   fi
+
+   # Restore scheduler_store.json if we backed it up
+   if [ -n "$store_backup" ]; then
+     restore_env_file "$store_backup" "$py_target_dir/ampa/scheduler_store.json"
+     log_info "Preserved existing scheduler_store.json during upgrade"
+   fi
+
+   log_info "Installed Python ampa package to $py_target_dir/ampa"
 }
 
 # Set up Python package (venv and dependencies)
@@ -674,10 +704,15 @@ main() {
     fi
   fi
 
-  # Restart daemon if requested
-  if [ "$do_restart" -eq 1 ]; then
-    start_daemon
-  fi
+   # Restart daemon if requested, or start daemon for fresh installations
+   if [ "$do_restart" -eq 1 ]; then
+     start_daemon
+   elif [ "$existing_install" -eq 0 ] && [ -d "ampa" ]; then
+     # Fresh installation with AMPA plugin: start the daemon
+     log_info "Starting daemon for fresh installation..."
+     start_daemon
+   fi
+
 
   log_info "Installation complete."
 }

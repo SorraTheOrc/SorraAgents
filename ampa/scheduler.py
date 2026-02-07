@@ -175,10 +175,46 @@ class SchedulerStore:
                     raise ValueError("store root must be object")
                 return data
         except FileNotFoundError:
-            return {"commands": {}, "state": {}, "last_global_start_ts": None}
+            # Try to initialize from example file if available
+            self._initialize_from_example()
+            # Try loading again after initialization
+            try:
+                with open(self.path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                    if not isinstance(data, dict):
+                        raise ValueError("store root must be object")
+                    return data
+            except Exception:
+                # Fall back to empty store if initialization or re-load fails
+                return {"commands": {}, "state": {}, "last_global_start_ts": None}
         except Exception:
             LOG.exception("Failed to read scheduler store; starting empty")
             return {"commands": {}, "state": {}, "last_global_start_ts": None}
+
+    def _initialize_from_example(self) -> None:
+        """Initialize scheduler_store.json from scheduler_store_example.json if available."""
+        try:
+            # Look for example file in same directory as this module
+            example_path = os.path.join(
+                os.path.dirname(__file__), "scheduler_store_example.json"
+            )
+            if not os.path.exists(example_path):
+                LOG.debug("No example file found at %s", example_path)
+                return
+
+            # Ensure target directory exists
+            dir_name = os.path.dirname(self.path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
+
+            # Copy example to target location
+            shutil.copy(example_path, self.path)
+            LOG.info(
+                "Initialized scheduler_store.json from example at %s", example_path
+            )
+        except Exception:
+            LOG.debug("Failed to initialize scheduler_store from example")
+            # Not fatal - we'll use an empty store
 
     def save(self) -> None:
         dir_name = os.path.dirname(self.path)
