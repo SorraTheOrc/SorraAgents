@@ -830,14 +830,18 @@ class Scheduler:
                 except Exception:
                     LOG.exception("Failed to summarize triage summary_text")
                 try:
-                    # Build a simple markdown-style message for Discord:
-                    #
-                    # # <command-run> <work-item-title>
-                    #
-                    # <output>
-                    command_run = f"/audit {work_id}"
-                    content = f"# {command_run} {title}\n\n{summary_text}"
-                    payload = {"content": content}
+                    # Build a human-friendly markdown message: the first line is
+                    # a concise heading describing the topic, the body contains
+                    # only the human-readable summary. Avoid embedding command
+                    # strings, exit codes or other technical fields.
+                    heading_title = f"Triage Audit — {title}"
+                    payload = webhook_module.build_payload(
+                        hostname=hostname,
+                        timestamp_iso=ts,
+                        work_item_id=None,
+                        extra_fields=[{"name": "Summary", "value": summary_text}],
+                        title=heading_title,
+                    )
                     webhook_module.send_webhook(
                         webhook, payload, message_type="command"
                     )
@@ -1043,9 +1047,25 @@ class Scheduler:
                                 # Send a concise completion message using the
                                 # simplified markdown header format described
                                 # above.
-                                command_run = f"/audit {work_id}"
-                                content = f"# {command_run} {title}\n\n{(audit_out or '')[:1000]}"
-                                payload = {"content": content}
+                                # Send a concise, human-readable completion message
+                                heading_title = f"Audit Completed — {title}"
+                                # extract a short human-facing summary if possible
+                                try:
+                                    short = _extract_summary(audit_out or "") or (
+                                        audit_out or ""
+                                    )
+                                    short = _summarize_for_discord(
+                                        short, max_chars=1000
+                                    )
+                                except Exception:
+                                    short = (audit_out or "")[:1000]
+                                payload = webhook_module.build_payload(
+                                    hostname=hostname,
+                                    timestamp_iso=ts,
+                                    work_item_id=None,
+                                    extra_fields=[{"name": "Result", "value": short}],
+                                    title=heading_title,
+                                )
                                 webhook_module.send_webhook(
                                     webhook, payload, message_type="completion"
                                 )
