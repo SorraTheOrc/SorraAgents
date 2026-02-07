@@ -48,7 +48,12 @@ def _from_iso(value: Optional[str]) -> Optional[dt.datetime]:
     if not value:
         return None
     try:
-        return dt.datetime.fromisoformat(value)
+        # Accept common ISO forms including trailing 'Z' (UTC) by normalizing
+        # to an offset-aware representation that datetime.fromisoformat can parse.
+        v = value
+        if isinstance(v, str) and v.endswith("Z"):
+            v = v[:-1] + "+00:00"
+        return dt.datetime.fromisoformat(v)
     except Exception:
         return None
 
@@ -646,6 +651,14 @@ class Scheduler:
 
             # filter out items audited within cooldown by inspecting WL comments
             candidates: List[Tuple[Optional[dt.datetime], Dict[str, Any]]] = []
+            # load persisted per-item audit timestamps (if any) to enforce cooldown
+            persisted_state = self.store.get_state(spec.command_id)
+            persisted_by_item = (
+                persisted_state.get("last_audit_at_by_item", {})
+                if isinstance(persisted_state, dict)
+                else {}
+            )
+
             for it in items:
                 wid = it.get("id") or it.get("work_item_id") or it.get("work_item")
                 if not wid:
@@ -680,14 +693,23 @@ class Scheduler:
                                 continue
                             # try to extract a timestamp from comment metadata
                             cand_ts = None
+                            # try several common timestamp keys returned by WL
                             for key in (
+                                "createdAt",
                                 "created_at",
                                 "created_ts",
                                 "created",
                                 "ts",
                                 "timestamp",
                             ):
+                                # support both exact key and case-insensitive fallback
                                 v = c.get(key)
+                                if v is None:
+                                    # try a case-insensitive match
+                                    for k2, v2 in c.items():
+                                        if k2.lower() == key.lower():
+                                            v = v2
+                                            break
                                 if v:
                                     try:
                                         cand_ts = _from_iso(v)
@@ -705,6 +727,15 @@ class Scheduler:
                                 last_audit = cand_ts
                 except Exception:
                     LOG.exception("Failed to list comments for %s", wid)
+
+                # also consider persisted last-audit timestamp for this item
+                try:
+                    pst = persisted_by_item.get(wid)
+                    pdt = _from_iso(pst) if pst else None
+                    if pdt is not None and (last_audit is None or pdt > last_audit):
+                        last_audit = pdt
+                except Exception:
+                    LOG.debug("Failed to parse persisted last_audit for %s", wid)
 
                 if last_audit is not None and (now - last_audit) < cooldown_delta:
                     # skip - recently audited
@@ -858,13 +889,28 @@ class Scheduler:
                         LOG.debug("Failed to remove temp comment file %s", cpath)
                 except Exception:
                     LOG.exception("Failed to write artifact and post comment")
-            # After posting the audit comment, check whether the work item can be
+            # After posting the audit comment, persist last-audit timestamp and
+            # check whether the work item can be
             # auto-completed. Criteria (both required):
             #  - Evidence of a merged PR (either a GitHub PR URL in the audit output
             #    or a textual 'PR merged' token), and
             #  - No open/in_progress child work items (or the audit explicitly
             #    states the item is ready to close).
             try:
+                # persist last audit timestamp so future runs can consult it even
+                # if Worklog comments are delayed or missing.
+                try:
+                    state = self.store.get_state(spec.command_id)
+                    if not isinstance(state, dict):
+                        state = dict(state or {})
+                    state.setdefault("last_audit_at_by_item", {})
+                    state["last_audit_at_by_item"][work_id] = _to_iso(now)
+                    self.store.update_state(spec.command_id, state)
+                except Exception:
+                    LOG.exception(
+                        "Failed to persist last_audit_at_by_item for %s", work_id
+                    )
+
                 # fetch latest work item state
                 proc_show = _call(f"wl show {work_id} --json")
                 if proc_show.returncode == 0 and proc_show.stdout:
