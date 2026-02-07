@@ -437,31 +437,44 @@ install_worklog_plugin() {
 
 # Copy Python package into plugin directory
 copy_python_package() {
-  local py_target_dir="$TARGET_DIR/ampa_py"
-  local env_backup=""
-  
-  # Record pre-removal state
-  log_decision "PRE_REMOVE_ls=$(ls -la "$py_target_dir" 2>/dev/null || true)"
-  
-  # Backup existing .env if present
-  if [ -f "$py_target_dir/ampa/.env" ]; then
-    env_backup=$(backup_env_file "$py_target_dir/ampa/.env")
-  fi
+   local py_target_dir="$TARGET_DIR/ampa_py"
+   local env_backup=""
+   local store_backup=""
+   
+   # Record pre-removal state
+   log_decision "PRE_REMOVE_ls=$(ls -la "$py_target_dir" 2>/dev/null || true)"
+   
+   # Backup existing .env if present
+   if [ -f "$py_target_dir/ampa/.env" ]; then
+     env_backup=$(backup_env_file "$py_target_dir/ampa/.env")
+   fi
 
-  # Remove old bundle and copy new one
-  mkdir -p "$py_target_dir"
-  rm -rf "$py_target_dir/ampa"
-  cp -R "ampa" "$py_target_dir/ampa"
-  
-  # Record post-copy state
-  log_decision "POST_COPY_ls=$(ls -la "$py_target_dir/ampa" 2>/dev/null || true)"
+   # Backup existing scheduler_store.json if present
+   if [ -f "$py_target_dir/ampa/scheduler_store.json" ]; then
+     store_backup=$(backup_env_file "$py_target_dir/ampa/scheduler_store.json")
+     log_decision "BACKUP_SCHEDULER_STORE=$store_backup"
+   fi
 
-  # Restore .env if we backed it up
-  if [ -n "$env_backup" ]; then
-    restore_env_file "$env_backup" "$py_target_dir/ampa/.env"
-  fi
+   # Remove old bundle and copy new one
+   mkdir -p "$py_target_dir"
+   rm -rf "$py_target_dir/ampa"
+   cp -R "ampa" "$py_target_dir/ampa"
+   
+   # Record post-copy state
+   log_decision "POST_COPY_ls=$(ls -la "$py_target_dir/ampa" 2>/dev/null || true)"
 
-  log_info "Installed Python ampa package to $py_target_dir/ampa"
+   # Restore .env if we backed it up
+   if [ -n "$env_backup" ]; then
+     restore_env_file "$env_backup" "$py_target_dir/ampa/.env"
+   fi
+
+   # Restore scheduler_store.json if we backed it up
+   if [ -n "$store_backup" ]; then
+     restore_env_file "$store_backup" "$py_target_dir/ampa/scheduler_store.json"
+     log_info "Preserved existing scheduler_store.json during upgrade"
+   fi
+
+   log_info "Installed Python ampa package to $py_target_dir/ampa"
 }
 
 # Set up Python package (venv and dependencies)
