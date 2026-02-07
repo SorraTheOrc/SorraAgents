@@ -72,13 +72,9 @@ def build_command_payload(
     # treated as the human-facing summary and will be truncated if needed.
     heading = f"# {title}" if title else "# AMPA Notification"
     body: List[str] = []
-    # preserve some technical context for compatibility and debugging when
-    # available: command_id and exit_code. Place them after the heading but
-    # keep the output as the main human-facing content.
-    if command_id:
-        body.append(f"command_id: {command_id}")
-    if exit_code is not None:
-        body.append(f"exit_code: {exit_code}")
+    # Keep the payload focused on human-facing content. `output` is treated
+    # as the summary text and will be truncated if necessary. Do not include
+    # raw technical fields like command_id or exit_code in the Discord body.
     if output:
         body.append(_truncate_output(output, limit=1000))
     if body:
