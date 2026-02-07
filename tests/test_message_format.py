@@ -14,9 +14,13 @@ def test_build_payload_includes_hostname_and_timestamp():
     payload = build_payload(hostname, ts, work_item_id="SA-123")
     assert "content" in payload
     content = payload["content"]
-    assert "Host: test-host" in content
-    assert "Timestamp: 2020-01-02T03:04:05+00:00" in content
-    assert "work_item_id: SA-123" in content
+    # New behavior: payload is markdown-first and only contains human-facing
+    # fields passed via extra_fields. Do not expose technical Host/Timestamp
+    # or internal ids in the default payload.
+    assert content.startswith("# AMPA Heartbeat")
+    assert "Host:" not in content
+    assert "Timestamp:" not in content
+    assert "work_item_id:" not in content
 
 
 def test_get_env_config_missing_webhook(monkeypatch):
