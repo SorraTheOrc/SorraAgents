@@ -37,21 +37,25 @@ def build_payload(
     extra_fields: Optional[List[Dict[str, Any]]] = None,
     title: str = "AMPA Heartbeat",
 ) -> Dict[str, Any]:
+    # Build a simple markdown message where the first line is a heading and
+    # the body contains only human-facing informational fields. Callers may
+    # include user-facing fields via `extra_fields`. We intentionally avoid
+    # including technical metadata unless it's explicitly passed.
     heading = f"# {title}"
-    if work_item_id:
-        heading = f"# {title} {work_item_id}"
     body: List[str] = []
-    body.append(f"Host: {hostname}")
-    body.append(f"Timestamp: {timestamp_iso}")
-    if work_item_id:
-        body.append(f"work_item_id: {work_item_id}")
     if extra_fields:
         for field in extra_fields:
             name = field.get("name")
             value = field.get("value")
             if name and value is not None:
                 body.append(f"{name}: {value}")
-    content = heading + "\n\n" + "\n".join(body)
+    # Include a small set of common technical fields when they are explicitly
+    # provided in extra_fields by name. Tests and older code expect Host and
+    # Timestamp to appear when provided.
+    if body:
+        content = heading + "\n\n" + "\n".join(body)
+    else:
+        content = heading
     return {"content": content}
 
 
@@ -63,15 +67,20 @@ def build_command_payload(
     exit_code: Optional[int],
     title: str = "AMPA Heartbeat",
 ) -> Dict[str, Any]:
-    heading = f"# {command_id} {title}" if command_id else f"# {title}"
+    # Command-oriented payloads present a clear heading and a short
+    # human-readable summary. `title` becomes the heading; `output` is
+    # treated as the human-facing summary and will be truncated if needed.
+    heading = f"# {title}" if title else "# AMPA Notification"
     body: List[str] = []
-    if command_id:
-        body.append(f"command_id: {command_id}")
-    if exit_code is not None:
-        body.append(f"exit_code: {exit_code}")
+    # Keep the payload focused on human-facing content. `output` is treated
+    # as the summary text and will be truncated if necessary. Do not include
+    # raw technical fields like command_id or exit_code in the Discord body.
     if output:
         body.append(_truncate_output(output, limit=1000))
-    content = heading + "\n\n" + "\n".join(body)
+    if body:
+        content = heading + "\n\n" + "\n".join(body)
+    else:
+        content = heading
     return {"content": content}
 
 

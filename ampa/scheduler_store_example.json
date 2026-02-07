@@ -4,6 +4,7 @@
       "command": "",
       "frequency_minutes": 1,
       "id": "heartbeat",
+      "title": "Scheduler Heartbeat",
       "max_runtime_minutes": null,
       "metadata": {},
       "priority": 1,
@@ -14,6 +15,7 @@
       "command": "wl in_progress",
       "frequency_minutes": 1,
       "id": "wl-in_progress",
+      "title": "In Progress",
       "max_runtime_minutes": 1,
       "metadata": {
         "discord_label": "wl in_progress"
@@ -26,6 +28,7 @@
       "command": "wl stats",
       "frequency_minutes": 10,
       "id": "wl-stats",
+      "title": "Stats",
       "max_runtime_minutes": 1,
       "metadata": {
         "discord_label": "wl stats"
@@ -39,6 +42,7 @@
       "command": "true",
       "frequency_minutes": 2,
       "id": "wl-triage-audit",
+      "title": "Triage Audit",
       "max_runtime_minutes": 5,
       "metadata": {
         "discord_label": "wl triage audit",
