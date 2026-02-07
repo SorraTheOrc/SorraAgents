@@ -692,10 +692,15 @@ main() {
     fi
   fi
 
-  # Restart daemon if requested
-  if [ "$do_restart" -eq 1 ]; then
-    start_daemon
-  fi
+   # Restart daemon if requested, or start daemon for fresh installations
+   if [ "$do_restart" -eq 1 ]; then
+     start_daemon
+   elif [ "$existing_install" -eq 0 ] && [ -d "ampa" ]; then
+     # Fresh installation with AMPA plugin: start the daemon
+     log_info "Starting daemon for fresh installation..."
+     start_daemon
+   fi
+
 
   log_info "Installation complete."
 }
