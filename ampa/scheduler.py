@@ -66,21 +66,22 @@ def _seconds_between(now: dt.datetime, then: Optional[dt.datetime]) -> Optional[
 
 @dataclasses.dataclass(frozen=True)
 class CommandSpec:
+    # Keep positional ordering compatible with existing tests and callers.
     command_id: str
     command: str
-    title: Optional[str]
     requires_llm: bool
     frequency_minutes: int
     priority: int
     metadata: Dict[str, Any]
+    title: Optional[str] = None
     max_runtime_minutes: Optional[int] = None
     command_type: str = "shell"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.command_id,
-            "title": self.title,
             "command": self.command,
+            "title": self.title,
             "requires_llm": self.requires_llm,
             "frequency_minutes": self.frequency_minutes,
             "priority": self.priority,
@@ -94,11 +95,11 @@ class CommandSpec:
         return CommandSpec(
             command_id=str(data["id"]),
             command=str(data.get("command", "")),
-            title=data.get("title"),
             requires_llm=bool(data.get("requires_llm", False)),
             frequency_minutes=int(data.get("frequency_minutes", 1)),
             priority=int(data.get("priority", 0)),
             metadata=dict(data.get("metadata", {})),
+            title=data.get("title"),
             max_runtime_minutes=data.get("max_runtime_minutes"),
             command_type=str(data.get("type", "shell")),
         )

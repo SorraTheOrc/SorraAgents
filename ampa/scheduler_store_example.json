@@ -15,7 +15,7 @@
       "command": "wl in_progress",
       "frequency_minutes": 1,
       "id": "wl-in_progress",
-      "title": "WL — In Progress",
+      "title": "In Progress",
       "max_runtime_minutes": 1,
       "metadata": {
         "discord_label": "wl in_progress"
@@ -28,7 +28,7 @@
       "command": "wl stats",
       "frequency_minutes": 10,
       "id": "wl-stats",
-      "title": "WL — Stats",
+      "title": "Stats",
       "max_runtime_minutes": 1,
       "metadata": {
         "discord_label": "wl stats"
@@ -42,7 +42,7 @@
       "command": "true",
       "frequency_minutes": 2,
       "id": "wl-triage-audit",
-      "title": "WL — Triage Audit",
+      "title": "Triage Audit",
       "max_runtime_minutes": 5,
       "metadata": {
         "discord_label": "wl triage audit",
