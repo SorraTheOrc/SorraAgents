@@ -1,0 +1,65 @@
+Audit Report: SA-0MLDF0YTH01PNA59
+Date: 2026-02-08T20:30:00Z
+Author: OpenCode
+
+Scope
+- Repository root: /home/rogardle/.config/opencode
+- Identifier: SA-0MLDF0YTH01PNA59
+
+Checks performed (quick, environment-limited)
+1) Inventory of common manifests: looked for package.json, pyproject.toml, requirements.txt, go.mod, Dockerfile, Terraform files.
+   - Found: package.json, pyproject.toml, ampa/requirements.txt
+2) Tool availability check: checked for common scanners and runtimes.
+   - npm: available
+   - python3: available (3.10.12)
+   - go: available
+   - semgrep: NOT found
+   - pip-audit: NOT found
+3) Content search for common secret keywords (naive regex): scanned for patterns like API_KEY, SECRET, token, BEGIN PRIVATE KEY, aws keys.
+   - Numerous matches found but most are:
+     * references inside worklog data and logs (including masked webhook URLs that use '<token>' placeholder),
+     * occurrences inside vendored/venv packages (third-party code), or
+     * generic words such as 'token' in JSON/worklog metadata.
+   - No clear plaintext private key blocks or raw AWS key-like strings were identified by this quick regex scan.
+4) Dependency manifest quick review:
+   - package.json: minimal; dependency @opencode-ai/plugin (no lockfile present)
+   - pyproject.toml / requirements.txt: standard libraries (requests, python-dotenv, prometheus_client). No pinned vulnerable versions were obvious from the manifest alone.
+
+Findings (summary, prioritized)
+- No high/critical vulnerabilities or secrets were *unequivocally* identified by the lightweight checks performed here.
+- Medium / informational items:
+  1) Logs contain many calls to Discord webhooks (filename: .worklog/ampa/default/default.log). The webhook host is present in logs; the path component is masked with '<token>' in repository copies, but real runs may have contained a full token. If a real webhook token was ever written to logs or repository history, it must be rotated.
+  2) Worklog data files contain many fields and traces (e.g., .worklog/worklog-data.jsonl). These files include metadata and may, depending on agent configuration, store sensitive references. Recommend restricting access and reviewing for secrets.
+  3) No automated vulnerability scanning tools were available in the environment (semgrep / pip-audit missing). Without these tools we cannot reliably detect code-level insecure patterns or dependency vulnerabilities.
+
+Evidence (representative paths / excerpts)
+- package.json (/home/rogardle/.config/opencode/package.json)
+- pyproject.toml (/home/rogardle/.config/opencode/pyproject.toml)
+- ampa/requirements.txt (/home/rogardle/.config/opencode/ampa/requirements.txt)
+- worklog data and logs:
+  - .worklog/worklog-data.jsonl
+  - .worklog/ampa/default/default.log  (contains webhook calls where tokens are masked in repo)
+
+Limitations / notes about this audit
+- This is a quick, repo-local audit performed without dedicated scanners (semgrep, gitleaks, pip-audit) which are not installed in the environment. Results are therefore not a substitute for a full automated scan.
+- The grep-based secret search is noisy (matches token-like words in logs and third-party vendored code). A proper secrets scanner (gitleaks/trufflehog/semgrep rules) is required for high-confidence findings.
+- No git history scanning was performed (this run only inspected the working tree). Sensitive data committed and then removed from history will not be detected by this check.
+
+Recommended next steps (actionable)
+1) Run a dedicated secret scan across history and working tree: gitleaks or truffleHog (high priority if you suspect tokens were committed). If any secrets found, rotate them immediately and create incident tickets.
+2) Install and run semgrep with standard rulepacks (r2c/community-rules) to detect common code issues and insecure patterns.
+3) Run dependency vulnerability scans:
+   - Python: install pip-audit and run `pip-audit -r ampa/requirements.txt` or `pip-audit` in a virtualenv
+   - JavaScript: if the project uses Node deps, run `npm install` then `npm audit --json` (note: prefer running in CI with lockfile present)
+4) Review .worklog data and logs for any plaintext tokens (rotate any webhook tokens found in real logs or history). Consider adding log redaction and limiting retention/access.
+5) Add CI checks to the repository to run the above scanners (semgrep, secrets scanner, pip-audit/npm audit) as part of pre-merge pipelines.
+
+Work items created
+- No high/critical findings were conclusively identified by these lightweight checks, so no child remediation work items were created automatically. If you want, I can create the following child items now:
+  a) Run full secrets scan (gitleaks) and rotate discovered secrets (priority: critical if secrets found)
+  b) Run semgrep scan and file issues for high findings (priority: high)
+  c) Add CI scanners (semgrep + secret-scan + pip-audit/npm-audit) (priority: medium)
+
+Report generated and saved at: reports/audit-SA-0MLDF0YTH01PNA59.txt
+
+End of report.
