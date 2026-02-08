@@ -119,7 +119,7 @@ Keep asking questions until the breakdown into features is clear.
 5. Update work items (agent)
 
 - Create child work items for each feature with a parent link to the original work item:
-- `wl create "<Short Title>" --description "<Full feature description>" --parent <work-item-id> -t feature --priority P2 --stage idea --validate --json`
+- `wl create --title "<Short Title>" --description "<Full feature description>" --parent <work-item-id> --priority P2 --stage idea --validate --json`
 - Create dependency edges between feature work items where the plan specifies dependencies:
   - `wl dep add <DependentFeatureId> <PrereqFeatureId>`
 
