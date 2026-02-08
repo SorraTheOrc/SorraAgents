@@ -25,13 +25,13 @@
       "type": "shell"
     },
     "wl-stats": {
-      "command": "wl stats",
+      "command": "wl status",
       "frequency_minutes": 10,
       "id": "wl-stats",
       "title": "Stats",
       "max_runtime_minutes": 1,
       "metadata": {
-        "discord_label": "wl stats"
+        "discord_label": "wl status"
       },
       "priority": 0,
       "requires_llm": false,
