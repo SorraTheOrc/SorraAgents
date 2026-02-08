@@ -72,6 +72,10 @@ def _normalize_candidates(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def normalize_candidates(payload: Any) -> List[Dict[str, Any]]:
+    return _normalize_candidates(payload)
+
+
 def select_candidate(
     *,
     run_shell: Optional[Callable[..., subprocess.CompletedProcess]] = None,
@@ -89,3 +93,18 @@ def select_candidate(
         return None
 
     return candidates[0]
+
+
+def fetch_candidates(
+    *,
+    run_shell: Optional[Callable[..., subprocess.CompletedProcess]] = None,
+    command_cwd: Optional[str] = None,
+    timeout_seconds: int = 10,
+) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    client = WLNextClient(
+        run_shell=run_shell,
+        command_cwd=command_cwd,
+        timeout_seconds=timeout_seconds,
+    )
+    payload = client.fetch_payload()
+    return _normalize_candidates(payload), payload

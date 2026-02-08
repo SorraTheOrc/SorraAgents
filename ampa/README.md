@@ -127,6 +127,17 @@ Scheduler admin CLI
 
     python -m ampa.scheduler list
 
+Dry-run report
+
+Generate a read-only report listing in-progress items, candidates from `wl next`,
+and the top candidate with rationale.
+
+  python -m ampa.scheduler dry-run
+
+Send the report to Discord (requires `AMPA_DISCORD_WEBHOOK`):
+
+  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.scheduler dry-run --discord
+
 Candidate selection
 
 The candidate selection service calls `wl next --json` and returns the top

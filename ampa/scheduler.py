@@ -23,6 +23,7 @@ except Exception:  # pragma: no cover - optional dependency in tests
 try:
     from . import daemon
     from . import webhook as webhook_module
+    from . import selection
 except ImportError:  # pragma: no cover - allow running as script
     import importlib
     import sys
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover - allow running as script
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     daemon = importlib.import_module("ampa.daemon")
     webhook_module = importlib.import_module("ampa.webhook")
+    selection = importlib.import_module("ampa.selection")
 
 LOG = logging.getLogger("ampa.scheduler")
 
@@ -318,6 +320,89 @@ def _summarize_for_discord(text: Optional[str], max_chars: int = 1000) -> str:
         return text
 
 
+def _trim_text(value: Optional[str]) -> str:
+    return value.strip() if value else ""
+
+
+def _format_in_progress_items(text: str) -> List[str]:
+    lines = [line.rstrip() for line in (text or "").splitlines()]
+    items: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "- SA-" not in stripped:
+            continue
+        cleaned = stripped.lstrip("├└│ ")
+        items.append(cleaned)
+    if not items:
+        for line in lines:
+            stripped = line.strip()
+            if stripped:
+                items.append(stripped)
+    return items
+
+
+def _format_candidate_line(candidate: Dict[str, Any]) -> str:
+    work_id = str(candidate.get("id") or "?")
+    title = candidate.get("title") or candidate.get("name") or "(no title)"
+    status = candidate.get("status") or candidate.get("stage") or ""
+    priority = candidate.get("priority")
+    parts = [f"{title} - {work_id}"]
+    meta: List[str] = []
+    if status:
+        meta.append(f"status: {status}")
+    if priority is not None:
+        meta.append(f"priority: {priority}")
+    if meta:
+        parts.append("(" + ", ".join(meta) + ")")
+    return " ".join(parts)
+
+
+def _build_dry_run_report(
+    *,
+    in_progress_output: str,
+    candidates: List[Dict[str, Any]],
+    top_candidate: Optional[Dict[str, Any]],
+) -> str:
+    sections: List[str] = []
+    sections.append("AMPA Dry Run Report")
+
+    in_progress_items = _format_in_progress_items(in_progress_output)
+    sections.append("In-progress items:")
+    if in_progress_items:
+        sections.extend([f"- {item}" for item in in_progress_items])
+    else:
+        sections.append("- (none)")
+
+    sections.append("Candidates:")
+    if candidates:
+        for cand in candidates:
+            sections.append(f"- {_format_candidate_line(cand)}")
+    else:
+        sections.append("- (none)")
+
+    sections.append("Top candidate:")
+    if top_candidate:
+        sections.append(f"- {_format_candidate_line(top_candidate)}")
+        sections.append("Rationale: selected by wl next (highest priority ready item).")
+    else:
+        sections.append("- (none)")
+        sections.append("Rationale: no candidates returned by wl next.")
+
+    return "\n".join(sections)
+
+
+def _build_dry_run_discord_message(report: str) -> str:
+    summary = _summarize_for_discord(report, max_chars=1000)
+    if summary and summary.strip():
+        return summary
+    LOG.warning("Dry-run discord summary was empty; falling back to raw report content")
+    if report and report.strip():
+        return report.strip()
+    return "(no report details)"
+
+
 def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> RunResult:
     if spec.command_type == "heartbeat":
         start = _utc_now()
@@ -515,6 +600,39 @@ class Scheduler:
         if isinstance(run, CommandRunResult):
             output = run.output
             exit_code = run.exit_code
+        if spec.command_type == "dry-run":
+            dry_report = None
+            try:
+                dry_report = self._run_dry_run_report(spec)
+            except Exception:
+                LOG.exception("Dry-run report generation failed")
+            if dry_report:
+                output = dry_report
+                try:
+                    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+                    if webhook:
+                        message = _build_dry_run_discord_message(dry_report)
+                        payload = webhook_module.build_command_payload(
+                            os.uname().nodename,
+                            run.end_ts.isoformat(),
+                            spec.command_id,
+                            message,
+                            run.exit_code,
+                            title=(
+                                spec.title
+                                or spec.metadata.get("discord_label")
+                                or "Dry Run Report"
+                            ),
+                        )
+                        webhook_module.send_webhook(
+                            webhook, payload, message_type="command"
+                        )
+                except Exception:
+                    LOG.exception("Dry-run discord notification failed")
+            if output:
+                print(output)
+            self._record_run(spec, run, exit_code, output)
+            return run
         self._record_run(spec, run, exit_code, output)
         # After recording run, perform any command-specific post actions
         if spec.command_id == "wl-triage-audit" or spec.command_type == "triage-audit":
@@ -1498,6 +1616,37 @@ class Scheduler:
         )
         webhook_module.send_webhook(webhook, payload, message_type="command")
 
+    def _run_dry_run_report(self, spec: Optional[CommandSpec] = None) -> Optional[str]:
+        def _call(cmd: str) -> subprocess.CompletedProcess:
+            LOG.debug("Running shell (dry-run): %s", cmd)
+            return self.run_shell(
+                cmd,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+
+        in_progress_text = ""
+        proc = _call("wl in_progress")
+        if proc.stdout:
+            in_progress_text += proc.stdout
+        if proc.stderr and not in_progress_text:
+            in_progress_text += proc.stderr
+
+        candidates, _payload = selection.fetch_candidates(
+            run_shell=self.run_shell, command_cwd=self.command_cwd
+        )
+        top_candidate = candidates[0] if candidates else None
+
+        report = _build_dry_run_report(
+            in_progress_output=_trim_text(in_progress_text),
+            candidates=candidates,
+            top_candidate=top_candidate,
+        )
+        return report
+
     def _post_startup_message(self) -> None:
         try:
             config = daemon.get_env_config()
@@ -1612,6 +1761,48 @@ def _cli_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_dry_run(args: argparse.Namespace) -> int:
+    scheduler = load_scheduler(command_cwd=os.getcwd())
+    spec = CommandSpec(
+        command_id="dry-run",
+        command="",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={},
+        title="Dry Run Report",
+        command_type="dry-run",
+    )
+    if args.discord and not os.getenv("AMPA_DISCORD_WEBHOOK"):
+        LOG.warning("AMPA_DISCORD_WEBHOOK not set; discord flag will be ignored")
+    report = scheduler._run_dry_run_report(spec)
+    if report:
+        print(report)
+        if args.discord:
+            try:
+                webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+                if webhook:
+                    message = _build_dry_run_discord_message(report)
+                    payload = webhook_module.build_command_payload(
+                        os.uname().nodename,
+                        _utc_now().isoformat(),
+                        spec.command_id,
+                        message,
+                        0,
+                        title="Dry Run Report",
+                    )
+                    webhook_module.send_webhook(
+                        webhook, payload, message_type="command"
+                    )
+                else:
+                    LOG.warning(
+                        "AMPA_DISCORD_WEBHOOK not set; skipping discord notification"
+                    )
+            except Exception:
+                LOG.exception("Failed to send dry-run discord notification")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AMPA scheduler")
     sub = parser.add_subparsers(dest="command")
@@ -1643,6 +1834,9 @@ def _build_parser() -> argparse.ArgumentParser:
     remove = sub.add_parser("remove", help="Remove a scheduled command")
     remove.add_argument("command_id")
 
+    dry_run = sub.add_parser("dry-run", help="Generate a dry-run report")
+    dry_run.add_argument("--discord", action="store_true")
+
     return parser
 
 
@@ -1662,6 +1856,7 @@ def main() -> None:
         "add": _cli_add,
         "update": _cli_update,
         "remove": _cli_remove,
+        "dry-run": _cli_dry_run,
     }
     handler = handlers.get(args.command)
     if handler is None:
