@@ -75,3 +75,86 @@ class WLAdapter:
             if c.get("body") == text:
                 return True
         return False
+
+    def delete_comment(self, work_id: str, comment_id: str) -> bool:
+        """Delete a comment and verify it is removed.
+
+        Args:
+            work_id: work item id (e.g. "SA-0XXX...")
+            comment_id: comment identifier portion (e.g. "C1") or full form
+                including work item prefix (e.g. "SA-0XXX-C1").
+
+        Returns:
+            True if deletion was successful and subsequent show no longer
+            lists the comment, False otherwise.
+        """
+        # Accept either a full comment ref (SA-...-C1) or just the tail (C1).
+        if comment_id.startswith(work_id):
+            ref = comment_id
+        elif "-" in comment_id and comment_id.split("-", 1)[0].startswith("SA-"):
+            # already looks like a full ref
+            ref = comment_id
+        else:
+            ref = f"{work_id}-{comment_id}"
+
+        out = self._run(["comment", "delete", ref])
+        # If the delete invocation failed at the CLI layer, report failure.
+        if out is None:
+            return False
+
+        # Verify by fetching the work item and ensuring the comment is absent.
+        w = self.show(work_id)
+        if not w:
+            # Unable to fetch work item state to verify; treat as failure so
+            # callers don't assume deletion when data is ambiguous.
+            return False
+
+        # normalize different possible wl show outputs into a comments list
+        comments = []
+        try:
+            if isinstance(w, dict):
+                # top-level comments
+                if isinstance(w.get("comments"), list):
+                    comments = w.get("comments")
+                else:
+                    # common wrappers: workItem, work_item, data, items
+                    for key in ("workItem", "work_item", "data", "items"):
+                        val = w.get(key)
+                        if isinstance(val, dict):
+                            # inner dict may contain comments or items
+                            cand = (
+                                val.get("comments")
+                                or val.get("items")
+                                or val.get("data")
+                            )
+                            if isinstance(cand, list):
+                                comments = cand
+                                break
+                        if isinstance(val, list):
+                            # val itself may be a list of comments/items
+                            comments = val
+                            break
+        except Exception:
+            comments = []
+
+        def _matches(c: dict) -> bool:
+            # comment id may appear under several keys depending on WL variant
+            cid = c.get("id") or c.get("commentId") or c.get("comment_id")
+            if cid and (
+                str(cid) == comment_id
+                or str(cid) == ref
+                or str(cid).endswith(str(comment_id))
+            ):
+                return True
+            # some WL variants include the full ref in a separate field
+            for key in ("ref", "reference"):
+                v = c.get(key)
+                if v and (str(v) == ref or str(v).endswith(str(comment_id))):
+                    return True
+            return False
+
+        for c in comments:
+            if _matches(c):
+                # still present
+                return False
+        return True
