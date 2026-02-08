@@ -184,6 +184,9 @@ class SchedulerStore:
                 data = json.load(fh)
                 if not isinstance(data, dict):
                     raise ValueError("store root must be object")
+                data.setdefault("commands", {})
+                data.setdefault("state", {})
+                data.setdefault("last_global_start_ts", None)
                 return data
         except FileNotFoundError:
             # Try to initialize from example file if available
@@ -197,10 +200,18 @@ class SchedulerStore:
                     return data
             except Exception:
                 # Fall back to empty store if initialization or re-load fails
-                return {"commands": {}, "state": {}, "last_global_start_ts": None}
+                return {
+                    "commands": {},
+                    "state": {},
+                    "last_global_start_ts": None,
+                }
         except Exception:
             LOG.exception("Failed to read scheduler store; starting empty")
-            return {"commands": {}, "state": {}, "last_global_start_ts": None}
+            return {
+                "commands": {},
+                "state": {},
+                "last_global_start_ts": None,
+            }
 
     def _initialize_from_example(self) -> None:
         """Initialize scheduler_store.json from scheduler_store_example.json if available."""
@@ -660,8 +671,6 @@ class Scheduler:
         - Selects the least-recently-updated work item not audited within cooldown
         - Executes `opencode run audit <work_item_id>` and captures output
         - Posts a short Discord summary and a WL comment containing the full output
-        - Persists `last_audit_at` per-work-item in the scheduler store under
-          state[spec.command_id]["last_audit_at_by_item"]
         """
         # configuration: allow overrides via metadata
         try:
@@ -681,26 +690,6 @@ class Scheduler:
             return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
         audit_only = _bool_meta(spec.metadata.get("audit_only"))
-
-        def _build_child_templates(parent_id: str, parent_title: str) -> str:
-            safe_title = parent_title or "(no title)"
-            return (
-                "Proposed child work items (templates):\n\n"
-                f"## Intake — {safe_title}\n"
-                "Summary: Define problem, scope, and success criteria.\n\n"
-                "## Acceptance Criteria\n"
-                f"- Define problem statement and success criteria for `{parent_id}`.\n"
-                "- Identify dependencies, risks, and stakeholders.\n\n"
-                "## Deliverables\n"
-                "- Intake brief with scope, constraints, and next steps.\n\n"
-                f"## Plan — {safe_title}\n"
-                "Summary: Decompose into features and tasks.\n\n"
-                "## Acceptance Criteria\n"
-                f"- Decompose `{parent_id}` into features and tasks with owners.\n"
-                "- Identify sequencing and dependencies.\n\n"
-                "## Deliverables\n"
-                "- Plan with child work items and acceptance criteria."
-            )
 
         webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
 
@@ -1010,6 +999,99 @@ class Scheduler:
             # record selected candidate for easier observability
             LOG.info("Selected triage candidate %s — %s", work_id, title)
 
+            delegation_note: Optional[str] = None
+
+            def _delegate_when_idle() -> None:
+                nonlocal delegation_note
+                if audit_only:
+                    delegation_note = "Delegation: skipped (audit_only)"
+                    return
+                proc_idle = _call("wl in_progress --json")
+                if proc_idle.returncode != 0:
+                    LOG.warning(
+                        "Delegation check failed: wl in_progress rc=%s",
+                        proc_idle.returncode,
+                    )
+                    delegation_note = "Delegation: skipped (in_progress check failed)"
+                    return
+                try:
+                    raw_idle = json.loads(proc_idle.stdout or "null")
+                except Exception:
+                    LOG.exception(
+                        "Failed to parse wl in_progress output for delegation"
+                    )
+                    delegation_note = "Delegation: skipped (invalid in_progress JSON)"
+                    return
+                idle_items: List[Dict[str, Any]] = []
+                if isinstance(raw_idle, list):
+                    idle_items = [item for item in raw_idle if isinstance(item, dict)]
+                elif isinstance(raw_idle, dict):
+                    for key in ("workItems", "work_items", "items", "data"):
+                        val = raw_idle.get(key)
+                        if isinstance(val, list):
+                            idle_items = [
+                                item for item in val if isinstance(item, dict)
+                            ]
+                            break
+                if idle_items:
+                    LOG.info("Delegation skipped: in-progress items exist")
+                    delegation_note = "Delegation: skipped (in_progress items)"
+                    return
+
+                candidates, _payload = selection.fetch_candidates(
+                    run_shell=self.run_shell, command_cwd=self.command_cwd
+                )
+                if not candidates:
+                    LOG.info("Delegation skipped: no wl next candidates")
+                    delegation_note = "Delegation: skipped (no wl next candidates)"
+                    return
+
+                candidate = candidates[0]
+                delegate_id = _extract_work_item_id(candidate)
+                if not delegate_id:
+                    LOG.warning("Delegation skipped: candidate missing id")
+                    delegation_note = "Delegation: skipped (candidate missing id)"
+                    return
+                delegate_title = _extract_work_item_title(candidate)
+                delegate_stage = _extract_work_item_stage(candidate)
+                if delegate_stage == "idea":
+                    command = f'opencode run "/intake {delegate_id}"'
+                    action = "intake"
+                elif delegate_stage == "intake_complete":
+                    command = f'opencode run "/plan {delegate_id}"'
+                    action = "plan"
+                elif delegate_stage == "plan_complete":
+                    command = f'opencode run "work on {delegate_id} using the implement skill"'
+                    action = "implement"
+                else:
+                    LOG.info(
+                        "Delegation skipped: unsupported stage %s for %s",
+                        delegate_stage,
+                        delegate_id,
+                    )
+                    delegation_note = (
+                        f"Delegation: skipped (unsupported stage {delegate_stage})"
+                    )
+                    return
+
+                LOG.info("Delegation dispatch: %s", command)
+                proc_delegate = _call(command)
+                if proc_delegate.returncode != 0:
+                    LOG.warning(
+                        "Delegation dispatch failed rc=%s stderr=%s",
+                        proc_delegate.returncode,
+                        (proc_delegate.stderr or "").strip(),
+                    )
+                    delegation_note = f"Delegation: failed ({action} {delegate_id})"
+                    return
+                LOG.info(
+                    "Delegation dispatched %s for %s — %s",
+                    action,
+                    delegate_id,
+                    delegate_title,
+                )
+                delegation_note = f"Delegation: dispatched {action} {delegate_id}"
+
             # 2) run the audit command
             # use quoted subcommand so the audit string is passed as one argument
             # changed to use the leading slash form as requested
@@ -1030,6 +1112,8 @@ class Scheduler:
                 len(proc_audit.stdout or ""),
                 len(proc_audit.stderr or ""),
             )
+
+            _delegate_when_idle()
 
             # 3) post a short Discord summary (1-3 lines)
             # helper to extract a human-facing 'Summary' section from audit output
@@ -1071,6 +1155,8 @@ class Scheduler:
                 if not summary_text:
                     # fallback simple summary
                     summary_text = f"{work_id} — {title} | exit={exit_code}"
+                if delegation_note:
+                    summary_text = f"{summary_text}\n{delegation_note}"
                 # if Discord will reject long messages, summarize to <=1000 chars
                 try:
                     summary_text = _summarize_for_discord(summary_text, max_chars=1000)
@@ -1188,15 +1274,6 @@ class Scheduler:
                         "",
                         comment_text,
                     ]
-                    if audit_only:
-                        comment_parts.extend(
-                            [
-                                "",
-                                "Audit-only mode: no stage changes were applied.",
-                                "",
-                                _build_child_templates(work_id, str(title or "")),
-                            ]
-                        )
                     comment = "\n".join(comment_parts)
                     # write comment to temp file and use command substitution to avoid shell
                     # quoting issues with embedded quotes/newlines
@@ -1302,10 +1379,6 @@ class Scheduler:
                         "",
                         f"Audit output too large; full output saved to: {path}",
                     ]
-                    if audit_only:
-                        comment_parts.extend(
-                            ["", _build_child_templates(work_id, str(title or ""))]
-                        )
                     comment = "\n".join(comment_parts)
                     fd2, cpath = tempfile.mkstemp(
                         prefix=f"wl-audit-comment-{work_id}-", suffix=".md"
@@ -1756,6 +1829,22 @@ def _parse_metadata(value: Optional[str]) -> Dict[str, Any]:
     except Exception:
         pass
     raise ValueError("metadata must be a JSON object")
+
+
+def _extract_work_item_id(candidate: Dict[str, Any]) -> Optional[str]:
+    for key in ("id", "work_item_id", "workItemId", "workItemID"):
+        val = candidate.get(key)
+        if val:
+            return str(val)
+    return None
+
+
+def _extract_work_item_title(candidate: Dict[str, Any]) -> str:
+    return str(candidate.get("title") or candidate.get("name") or "(no title)")
+
+
+def _extract_work_item_stage(candidate: Dict[str, Any]) -> str:
+    return str(candidate.get("stage") or candidate.get("status") or "").strip().lower()
 
 
 def _store_from_env() -> SchedulerStore:

@@ -127,6 +127,17 @@ Scheduler admin CLI
 
     python -m ampa.scheduler list
 
+Live delegation
+
+  Delegation runs as part of triage-audit and only when `audit_only` is false.
+  It also requires no in-progress work items. When idle, it selects the top
+  `wl next` candidate and dispatches the appropriate workflow:
+
+  - stage `idea`: runs `/intake <id>`
+  - stage `intake_complete`: runs `/plan <id>`
+  - stage `plan_complete`: runs `work on <id> using the implement skill`
+
+
 Dry-run report
 
 Generate a read-only report listing in-progress items, candidates from `wl next`,

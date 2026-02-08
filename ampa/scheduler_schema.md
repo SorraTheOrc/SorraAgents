@@ -26,6 +26,12 @@ Each scheduled command is represented by a `CommandSpec` entry.
 
 Scheduled shell commands run in the working directory where the scheduler daemon was started.
 
+## Delegation gating
+
+Delegation is gated by `audit_only` metadata in the triage-audit command. When `audit_only`
+is true, delegation is skipped. Otherwise it no-ops if any `wl in_progress` items exist.
+When idle, it selects the top `wl next` candidate and dispatches the appropriate workflow command.
+
 ## Store schema
 
 The store is a JSON file with the following top-level structure (see `ampa/scheduler_store.json` for the default):
@@ -94,6 +100,7 @@ The store is a JSON file with the following top-level structure (see `ampa/sched
   "last_global_start_ts": "2026-02-04T00:00:00+00:00"
 }
 ```
+
 
 ## Scheduling algorithm
 

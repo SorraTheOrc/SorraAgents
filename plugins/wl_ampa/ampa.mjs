@@ -299,4 +299,6 @@ export default function register(ctx) {
       const code = await status(cwd, opts.name);
       process.exitCode = code;
     });
+
+
 }
