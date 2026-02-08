@@ -23,6 +23,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 ## Hard requirements
 
+- Do not create a work item for the planning process itself; the output of this command is the generated feature work items and updates to the parent work item.
 - Provide guidance on how each feature can be delivered as a minimal, end-to-end slice (code, tests, docs, infra, observability).
 - Where possible identify existing implementations details that are related to the feature.
 - Where possible identify existing features or tasks that can be reused instead of creating duplicates.

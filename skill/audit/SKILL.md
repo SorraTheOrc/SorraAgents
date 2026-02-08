@@ -1,9 +1,9 @@
 ---
-name: status
-description: "Provide concise project / work item status and run Worklog helpers to augment results. Trigger on user queries such as: 'What is the current status?', 'Status of the project?', 'What is the status of <work-item-id>?', 'audit', 'audit <work-item-id>'"
+name: audit
+description: "Provide concise project / work item status and run Worklog helpers to augment results. Trigger on user queries such as: 'What is the current status?', 'Status of the project?', 'What is the status of <work-item-id>?', 'status', 'status <work-item-id>', 'audit', 'audit <work-item-id>'"
 ---
 
-# Status
+# Audit
 
 ## Overview
 
@@ -11,9 +11,8 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 ## When To Use
 
-- User asks general project status (e.g., "What is the current status?", "Status of the project?", "audit the project", "audit").
-- User asks about a specific work item id (e.g., "What is the status of wl-123?", "audit wl-123").
-- The `/audit <work-item-id>` command is invoked.
+- User asks general project status (e.g., "What is the current status?", "Status of the project?", "status", "audit the project", "audit").
+- User asks about a specific work item id (e.g., "What is the status of wl-123?", "status wl-123", "audit wl-123").
 
 ## Best Practices
 
