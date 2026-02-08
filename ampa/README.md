@@ -126,3 +126,8 @@ Scheduler admin CLI
   Use the scheduler CLI for admin tasks (listing, adding, updating commands):
 
     python -m ampa.scheduler list
+
+Candidate selection
+
+The candidate selection service calls `wl next --json` and returns the top
+candidate from that response.
