@@ -51,7 +51,8 @@
         "audit_cooldown_hours_in_review": 1,
         "audit_cooldown_hours_blocked": 6,
         "truncate_chars": 65536,
-        "include_blocked": true
+        "include_blocked": true,
+        "audit_only": true
       },
       "priority": 0,
       "requires_llm": false,

@@ -644,9 +644,7 @@ class Scheduler:
             except Exception:
                 LOG.exception("Triage audit post-processing failed")
                 triage_audited = False
-            # post the generic discord message only if an audit occurred
-            if triage_audited:
-                self._post_discord(spec, run, output)
+            # triage-audit posts its own discord summary; avoid generic post
             return run
         # always post the generic discord message afterwards
         self._post_discord(spec, run, output)
@@ -674,6 +672,35 @@ class Scheduler:
             truncate_chars = int(spec.metadata.get("truncate_chars", 65536))
         except Exception:
             truncate_chars = 65536
+
+        def _bool_meta(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return False
+            return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+        audit_only = _bool_meta(spec.metadata.get("audit_only"))
+
+        def _build_child_templates(parent_id: str, parent_title: str) -> str:
+            safe_title = parent_title or "(no title)"
+            return (
+                "Proposed child work items (templates):\n\n"
+                f"## Intake — {safe_title}\n"
+                "Summary: Define problem, scope, and success criteria.\n\n"
+                "## Acceptance Criteria\n"
+                f"- Define problem statement and success criteria for `{parent_id}`.\n"
+                "- Identify dependencies, risks, and stakeholders.\n\n"
+                "## Deliverables\n"
+                "- Intake brief with scope, constraints, and next steps.\n\n"
+                f"## Plan — {safe_title}\n"
+                "Summary: Decompose into features and tasks.\n\n"
+                "## Acceptance Criteria\n"
+                f"- Decompose `{parent_id}` into features and tasks with owners.\n"
+                "- Identify sequencing and dependencies.\n\n"
+                "## Deliverables\n"
+                "- Plan with child work items and acceptance criteria."
+            )
 
         webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
 
@@ -879,9 +906,6 @@ class Scheduler:
                 # inspect WL comments to find the most recent audit comment
                 last_audit: Optional[dt.datetime] = None
                 try:
-                    # prepare hostname and timestamp for human-facing payloads
-                    hostname = os.uname().nodename
-                    ts = _utc_now().isoformat()
                     proc_c = _call(f"wl comment list {wid} --json")
                     if proc_c.returncode == 0 and proc_c.stdout:
                         try:
@@ -978,7 +1002,10 @@ class Scheduler:
                 )
             )
             selected = candidates[0][1]
-            work_id = selected.get("id")
+            work_id = str(selected.get("id") or "")
+            if not work_id:
+                LOG.warning("Triage audit candidate missing id")
+                return False
             title = selected.get("title") or selected.get("name") or "(no title)"
             # record selected candidate for easier observability
             LOG.info("Selected triage candidate %s — %s", work_id, title)
@@ -1039,117 +1066,113 @@ class Scheduler:
                     return m2.group(1).strip().split("\n\n")[0].strip()
                 return ""
 
-                if webhook:
-                    summary_text = _extract_summary(audit_out or "")
-                    if not summary_text:
-                        # fallback simple summary
-                        summary_text = f"{work_id} — {title} | exit={exit_code}"
-                    # if Discord will reject long messages, summarize to <=1000 chars
-                    try:
-                        summary_text = _summarize_for_discord(
-                            summary_text, max_chars=1000
+            if webhook:
+                summary_text = _extract_summary(audit_out or "")
+                if not summary_text:
+                    # fallback simple summary
+                    summary_text = f"{work_id} — {title} | exit={exit_code}"
+                # if Discord will reject long messages, summarize to <=1000 chars
+                try:
+                    summary_text = _summarize_for_discord(summary_text, max_chars=1000)
+                except Exception:
+                    LOG.exception("Failed to summarize triage summary_text")
+
+                # If the work item is blocked and in_review, scan the work item
+                # description and comments for a PR URL and include it in the
+                # Discord payload to request a review.
+                pr_url: Optional[str] = None
+                try:
+                    proc_show_pre = _call(f"wl show {work_id} --json")
+                    wi_pre = None
+                    if proc_show_pre.returncode == 0 and proc_show_pre.stdout:
+                        try:
+                            wi_pre = json.loads(proc_show_pre.stdout)
+                        except Exception:
+                            wi_pre = None
+                    status_val = None
+                    stage_val = None
+                    if isinstance(wi_pre, dict):
+                        status_val = (
+                            wi_pre.get("status")
+                            or wi_pre.get("state")
+                            or wi_pre.get("stage")
                         )
-                    except Exception:
-                        LOG.exception("Failed to summarize triage summary_text")
+                        # description may be under different keys
+                        description_text = (
+                            wi_pre.get("description") or wi_pre.get("desc") or ""
+                        )
+                    else:
+                        description_text = ""
 
-                    # If the work item is blocked and in_review, scan the work item
-                    # description and comments for a PR URL and include it in the
-                    # Discord payload to request a review.
-                    pr_url: Optional[str] = None
-                    try:
-                        proc_show_pre = _call(f"wl show {work_id} --json")
-                        wi_pre = None
-                        if proc_show_pre.returncode == 0 and proc_show_pre.stdout:
-                            try:
-                                wi_pre = json.loads(proc_show_pre.stdout)
-                            except Exception:
-                                wi_pre = None
-                        status_val = None
-                        stage_val = None
-                        if isinstance(wi_pre, dict):
-                            status_val = (
-                                wi_pre.get("status")
-                                or wi_pre.get("state")
-                                or wi_pre.get("stage")
-                            )
-                            # description may be under different keys
-                            description_text = (
-                                wi_pre.get("description") or wi_pre.get("desc") or ""
-                            )
-                        else:
-                            description_text = ""
-
-                        # helper to find a PR URL in text
-                        def _find_pr_in_text(text: str) -> Optional[str]:
-                            if not text:
-                                return None
-                            m = re.search(
-                                r"https?://github\.com/[^\s']+?/pull/\d+",
-                                text,
-                                re.I,
-                            )
-                            if m:
-                                return m.group(0)
+                    # helper to find a PR URL in text
+                    def _find_pr_in_text(text: str) -> Optional[str]:
+                        if not text:
                             return None
+                        m = re.search(
+                            r"https?://github\.com/[^\s']+?/pull/\d+",
+                            text,
+                            re.I,
+                        )
+                        if m:
+                            return m.group(0)
+                        return None
 
-                        # check description first
-                        pr_url = _find_pr_in_text(description_text)
-                        # if not found, check comments
-                        if pr_url is None:
-                            proc_comments = _call(f"wl comment list {work_id} --json")
-                            if proc_comments.returncode == 0 and proc_comments.stdout:
-                                try:
-                                    raw_comments = json.loads(proc_comments.stdout)
-                                except Exception:
-                                    raw_comments = []
-                                comments = []
-                                if isinstance(raw_comments, list):
-                                    comments = raw_comments
-                                elif isinstance(raw_comments, dict):
-                                    for key in ("comments", "items", "data"):
-                                        val = raw_comments.get(key)
-                                        if isinstance(val, list):
-                                            comments = val
-                                            break
-                                for c in comments:
-                                    body = (
-                                        c.get("comment")
-                                        or c.get("body")
-                                        or c.get("text")
-                                        or ""
-                                    )
-                                    if not body:
-                                        continue
-                                    found = _find_pr_in_text(body)
-                                    if found:
-                                        pr_url = found
+                    # check description first
+                    pr_url = _find_pr_in_text(description_text)
+                    # if not found, check comments
+                    if pr_url is None:
+                        proc_comments = _call(f"wl comment list {work_id} --json")
+                        if proc_comments.returncode == 0 and proc_comments.stdout:
+                            try:
+                                raw_comments = json.loads(proc_comments.stdout)
+                            except Exception:
+                                raw_comments = []
+                            comments = []
+                            if isinstance(raw_comments, list):
+                                comments = raw_comments
+                            elif isinstance(raw_comments, dict):
+                                for key in ("comments", "items", "data"):
+                                    val = raw_comments.get(key)
+                                    if isinstance(val, list):
+                                        comments = val
                                         break
-                    except Exception:
-                        LOG.exception(
-                            "Failed to discover PR URL for work item %s", work_id
-                        )
+                            for c in comments:
+                                body = (
+                                    c.get("comment")
+                                    or c.get("body")
+                                    or c.get("text")
+                                    or ""
+                                )
+                                if not body:
+                                    continue
+                                found = _find_pr_in_text(body)
+                                if found:
+                                    pr_url = found
+                                    break
+                except Exception:
+                    LOG.exception("Failed to discover PR URL for work item %s", work_id)
 
-                    try:
-                        # Build a human-friendly markdown message: the first line is
-                        # a concise heading describing the topic, the body contains
-                        # only the human-readable summary. Avoid embedding command
-                        # strings, exit codes or other technical fields.
-                        heading_title = f"Triage Audit — {title}"
-                        extra = [{"name": "Summary", "value": summary_text}]
-                        if pr_url:
-                            extra.append({"name": "PR", "value": pr_url})
-                        payload = webhook_module.build_payload(
-                            hostname=os.uname().nodename,
-                            timestamp_iso=_utc_now().isoformat(),
-                            work_item_id=None,
-                            extra_fields=extra,
-                            title=heading_title,
-                        )
-                        webhook_module.send_webhook(
-                            webhook, payload, message_type="command"
-                        )
-                    except Exception:
-                        LOG.exception("Failed to send discord summary")
+                try:
+                    # Build a human-friendly markdown message: the first line is
+                    # a concise heading describing the topic, the body contains
+                    # only the human-readable summary. Avoid embedding command
+                    # strings, exit codes or other technical fields.
+                    heading_title = f"Triage Audit — {title}"
+                    extra = [{"name": "Summary", "value": summary_text}]
+                    if pr_url:
+                        extra.append({"name": "PR", "value": pr_url})
+                    payload = webhook_module.build_payload(
+                        hostname=os.uname().nodename,
+                        timestamp_iso=_utc_now().isoformat(),
+                        work_item_id=None,
+                        extra_fields=extra,
+                        title=heading_title,
+                    )
+                    webhook_module.send_webhook(
+                        webhook, payload, message_type="command"
+                    )
+                except Exception:
+                    LOG.exception("Failed to send discord summary")
 
             # 4) post full audit output as WL comment, truncating if necessary
             full_output = audit_out or ""
@@ -1158,7 +1181,23 @@ class Scheduler:
             if len(full_output) <= truncate_chars:
                 comment_text = full_output or "(no output)"
                 try:
-                    comment = f"# AMPA Audit Result\n\nAudit output:\n\n{comment_text}"
+                    comment_parts = [
+                        "# AMPA Audit Result",
+                        "",
+                        "Audit output:",
+                        "",
+                        comment_text,
+                    ]
+                    if audit_only:
+                        comment_parts.extend(
+                            [
+                                "",
+                                "Audit-only mode: no stage changes were applied.",
+                                "",
+                                _build_child_templates(work_id, str(title or "")),
+                            ]
+                        )
+                    comment = "\n".join(comment_parts)
                     # write comment to temp file and use command substitution to avoid shell
                     # quoting issues with embedded quotes/newlines
                     fd, cpath = tempfile.mkstemp(
@@ -1258,7 +1297,16 @@ class Scheduler:
                     )
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         fh.write(full_output)
-                    comment = f"# AMPA Audit Result\n\nAudit output too large; full output saved to: {path}"
+                    comment_parts = [
+                        "# AMPA Audit Result",
+                        "",
+                        f"Audit output too large; full output saved to: {path}",
+                    ]
+                    if audit_only:
+                        comment_parts.extend(
+                            ["", _build_child_templates(work_id, str(title or ""))]
+                        )
+                    comment = "\n".join(comment_parts)
                     fd2, cpath = tempfile.mkstemp(
                         prefix=f"wl-audit-comment-{work_id}-", suffix=".md"
                     )
@@ -1349,21 +1397,22 @@ class Scheduler:
             #    or a textual 'PR merged' token), and
             #  - No open/in_progress child work items (or the audit explicitly
             #    states the item is ready to close).
+            # persist last audit timestamp so future runs can consult it even
+            # if Worklog comments are delayed or missing.
             try:
-                # persist last audit timestamp so future runs can consult it even
-                # if Worklog comments are delayed or missing.
-                try:
-                    state = self.store.get_state(spec.command_id)
-                    if not isinstance(state, dict):
-                        state = dict(state or {})
-                    state.setdefault("last_audit_at_by_item", {})
-                    state["last_audit_at_by_item"][work_id] = _to_iso(now)
-                    self.store.update_state(spec.command_id, state)
-                except Exception:
-                    LOG.exception(
-                        "Failed to persist last_audit_at_by_item for %s", work_id
-                    )
+                state = self.store.get_state(spec.command_id)
+                if not isinstance(state, dict):
+                    state = dict(state or {})
+                state.setdefault("last_audit_at_by_item", {})
+                state["last_audit_at_by_item"][work_id] = _to_iso(now)
+                self.store.update_state(spec.command_id, state)
+            except Exception:
+                LOG.exception("Failed to persist last_audit_at_by_item for %s", work_id)
 
+            if audit_only:
+                return True
+
+            try:
                 # fetch latest work item state
                 proc_show = _call(f"wl show {work_id} --json")
                 if proc_show.returncode == 0 and proc_show.stdout:
