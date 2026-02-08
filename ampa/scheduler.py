@@ -1056,6 +1056,82 @@ class Scheduler:
                         LOG.debug("Failed to remove temp comment file %s", cpath)
                 except Exception:
                     LOG.exception("Failed to post wl comment")
+                # When running verbose/debug, verify the posted WL comment to
+                # catch cases where only the heading was posted (no body).
+                # Posting a heading-only audit comment is an ERROR-worthy
+                # diagnostic because it produces ambiguous triage outputs.
+                if LOG.isEnabledFor(logging.DEBUG):
+                    try:
+                        proc_verify = _call(f"wl comment list {work_id} --json")
+                        if proc_verify.returncode == 0 and proc_verify.stdout:
+                            try:
+                                raw_comments = json.loads(proc_verify.stdout)
+                            except Exception:
+                                raw_comments = []
+                            comments = []
+                            if isinstance(raw_comments, list):
+                                comments = raw_comments
+                            elif isinstance(raw_comments, dict):
+                                for key in ("comments", "items", "data"):
+                                    val = raw_comments.get(key)
+                                    if isinstance(val, list):
+                                        comments = val
+                                        break
+                            # pick the most-recent comment (best-effort)
+                            latest = None
+                            latest_ts = None
+                            for c in comments:
+                                # normalize timestamp
+                                ts = None
+                                for k in (
+                                    "createdAt",
+                                    "created_at",
+                                    "created",
+                                    "ts",
+                                    "timestamp",
+                                ):
+                                    v = c.get(k)
+                                    if v:
+                                        try:
+                                            ts = _from_iso(v)
+                                        except Exception:
+                                            try:
+                                                ts = dt.datetime.fromisoformat(v)
+                                            except Exception:
+                                                ts = None
+                                        if ts is not None:
+                                            break
+                                if latest is None or (
+                                    ts is not None
+                                    and (latest_ts is None or ts > latest_ts)
+                                ):
+                                    latest = c
+                                    latest_ts = ts
+                            if latest:
+                                body = (
+                                    latest.get("comment")
+                                    or latest.get("body")
+                                    or latest.get("text")
+                                    or ""
+                                )
+                                # strip the standard heading and the 'Audit output:' label
+                                stripped = re.sub(
+                                    r"(?i)^\s*#\s*AMPA Audit Result\s*", "", body
+                                )
+                                stripped = re.sub(
+                                    r"(?i)^\s*Audit output:\s*", "", stripped
+                                ).strip()
+                                if not stripped or stripped == "(no output)":
+                                    LOG.error(
+                                        "Posted AMPA audit comment for %s appears heading-only or empty; audit_out_len=%d posted_body_len=%d",
+                                        work_id,
+                                        len(full_output or ""),
+                                        len(body or ""),
+                                    )
+                    except Exception:
+                        LOG.exception(
+                            "Failed to verify posted WL comment for %s", work_id
+                        )
             else:
                 # write artifact to temp file and post comment referencing it
                 try:
@@ -1078,6 +1154,76 @@ class Scheduler:
                         LOG.debug("Failed to remove temp comment file %s", cpath)
                 except Exception:
                     LOG.exception("Failed to write artifact and post comment")
+                # also verify posted comment when verbose for the large-artifact path
+                if LOG.isEnabledFor(logging.DEBUG):
+                    try:
+                        proc_verify = _call(f"wl comment list {work_id} --json")
+                        if proc_verify.returncode == 0 and proc_verify.stdout:
+                            try:
+                                raw_comments = json.loads(proc_verify.stdout)
+                            except Exception:
+                                raw_comments = []
+                            comments = []
+                            if isinstance(raw_comments, list):
+                                comments = raw_comments
+                            elif isinstance(raw_comments, dict):
+                                for key in ("comments", "items", "data"):
+                                    val = raw_comments.get(key)
+                                    if isinstance(val, list):
+                                        comments = val
+                                        break
+                            latest = None
+                            latest_ts = None
+                            for c in comments:
+                                ts = None
+                                for k in (
+                                    "createdAt",
+                                    "created_at",
+                                    "created",
+                                    "ts",
+                                    "timestamp",
+                                ):
+                                    v = c.get(k)
+                                    if v:
+                                        try:
+                                            ts = _from_iso(v)
+                                        except Exception:
+                                            try:
+                                                ts = dt.datetime.fromisoformat(v)
+                                            except Exception:
+                                                ts = None
+                                        if ts is not None:
+                                            break
+                                if latest is None or (
+                                    ts is not None
+                                    and (latest_ts is None or ts > latest_ts)
+                                ):
+                                    latest = c
+                                    latest_ts = ts
+                            if latest:
+                                body = (
+                                    latest.get("comment")
+                                    or latest.get("body")
+                                    or latest.get("text")
+                                    or ""
+                                )
+                                stripped = re.sub(
+                                    r"(?i)^\s*#\s*AMPA Audit Result\s*", "", body
+                                )
+                                stripped = re.sub(
+                                    r"(?i)^\s*Audit output:\s*", "", stripped
+                                ).strip()
+                                if not stripped or stripped == "(no output)":
+                                    LOG.error(
+                                        "Posted AMPA audit comment (artifact path) for %s appears heading-only or empty; audit_out_len=%d posted_body_len=%d",
+                                        work_id,
+                                        len(full_output or ""),
+                                        len(body or ""),
+                                    )
+                    except Exception:
+                        LOG.exception(
+                            "Failed to verify posted WL comment for %s", work_id
+                        )
             # After posting the audit comment, persist last-audit timestamp and
             # check whether the work item can be
             # auto-completed. Criteria (both required):
