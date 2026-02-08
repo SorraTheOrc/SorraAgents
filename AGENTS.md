@@ -166,7 +166,7 @@ Worklog does not enforce these relationships but they can be used for planning a
 ### Workflow management
 
 - Use the `--stage` flag to track workflow stages according to your particular process,
-  - e.g. `idea`, `prd_complete`, `milestones_defined`, `plan_complete`, `in_progress``done`.
+  - e.g. `idea`, `intake_complete`, `plan_complete`, `in_progress`, `done`.
 - Use the `--assignee` flag to assign work items to agents.
 - Use the `--tags` flag to add arbitrary tags for filtering and organization. Though avoid over-tagging.
 - Use comments to document progress, decisions, and context.

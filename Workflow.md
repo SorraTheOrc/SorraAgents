@@ -28,10 +28,9 @@ The workflow focuses on clarity where it is needed to enable agents to deliver v
 
 The goal is to create a clear mapping from high-level intent (the PRD) to low-level implementation (code) through a series of well-defined steps and artifacts. That allow for ambiguities at the higher, mostly human-led levels to be resolved through rapid iteration and feedback at the lower, mostly agent-led levels.
 
-- A **Project** is the overall initiative, defined by a PRD that captures scope, success metrics, constraints, and risks. A project consistes of one or more milestones.
-- A **Milestone** is a major deliverable within a project. Milestones map to end-to-end user experiences and have cross-functional ownership. A milestone consists of one or more epics.
-- An **Epic** is a large body of work that can be broken down into one or more new features or feature enhancements. Features represents a significant user outcome within a milestone and are often cross-functional.
-- A **Feature** is a discrete unit of user value that can be delivered independently (e.g., a new command, UI screen, or API endpoint). Features consist of one or more tasks and are sometimes cross-functional.
+- A **Project** is the overall initiative, defined by a PRD that captures scope, success metrics, constraints, and risks. A project consistes of one or more epics.
+- An **Epic** is a large body of work that can be broken down into one or more new features or feature enhancements. Epics represent a significant user outcome within an project and are often cross-functional.
+- A **Feature** is a discrete unit of work that can be delivered independently (e.g., a new command, UI screen, or API endpoint). Features consist of one or more tasks and are sometimes cross-functional.
 - A **Task** is a specific task that needs to be completed to deliver a feature (e.g., implementation, testing, documentation). Tasks are the smallest unit of work and are typically assigned to a single individual or agent.
 
 Each of these levels must be clearly documented in the Worklog with appropriate links and references to ensure traceability from project definition to code implementation. Each level should also have clear acceptance criteria to validate completion and success.
@@ -46,12 +45,10 @@ First is a high-level summary of each step, followed by a more detailed breakdow
 
 - Record the project idea: create a tracking work-item to capture the project title and basic info; humans simply drop their thoughts into the work-item; mark the status `idea`.
 - Expand the idea into a high-level project overview; humans refine and clarify the idea and its motivations; Agents assist with structure and authoring through an interview process; mark status `intake_complete`.
-- Frame the project with a PRD: capture scope, success signals, constraints, and top risks; Agents assist with authoring through an interview process, humans bring creativity and the domain knowledge; mark status `prd_complete`.
-- Define milestone epics: map end-to-end outcomes, owners, and epic-level acceptance criteria; Agents build the plan with guidance through an interview process, humans bring clarity and the domain knowledge; mark status `milestones_defined`.
-- Decompose each epic into sub-epics and features with acceptance criteria, a minimal plan, and prototype/experiment design where needed; Agents build the plan with validation from human collaborators; mark status `plan_complete`.
+- Decompose each issue into sub-epics and features with acceptance criteria, a minimal plan, and prototype/experiment design where needed; Agents build the plan with validation from human collaborators; mark status `plan_complete`.
 - Implement one feature at a time: Agents write code, tests and documentation with human validation through acceptance testing; move through `in_progress` → `in_review` → `done`.
 
-During execution, work proceeds one feature at a time. During this process new features may be added, removed, or reprioritized based on feedback and learning. This flexible approach allows the team to adapt to changing requirements and ensures that the most valuable work is always being prioritized. When new features are identified they pass through the stages `idea` → `intake_complete` → `plan_complete` before being slotted into the implementation queue. That is they (usually) skip the PRD and milestone definition steps.
+During execution, work proceeds one feature at a time. During this process new features may be added, removed, or reprioritized based on feedback and learning. This flexible approach allows the team to adapt to changing requirements and ensures that the most valuable work is always being prioritized. When new features are identified they pass through the stages `idea` → `intake_complete` → `plan_complete` before being slotted into the implementation queue.
 
 The outputs of each of these steps are recorded in the Worklog as linked work-items, creating a clear trace from project definition to code implementation. Each step includes specific agent commands to facilitate the process, ensuring that both human and agent collaborators can work together effectively.
 
@@ -69,67 +66,29 @@ Record the initial feature or project idea in a tracking work-item. This work-it
 - **Useful Commands:**
   - `wl create -t "<Project Title>" -d "<Brief Description>"`
   - optionally add a parent work-item ID to link to a larger initiative (`--parent <Parent Work-Item ID>`).
-- **Next Step:** If the idea is a project go to the `Project Definition` step; if a smaller feature go to `Feature Intake` step.
+- **Next Step:** to `Intake` step.
 
-### Feature Intake (for small features)
+### Intake
 
-For smaller features that do not require a full PRD, expand the initial idea into a more detailed feature intake work-item. This step captures the motivation, user impact, and high-level requirements for the feature. Agents assist with structuring and authoring the intake through an interview process, while humans provide the creativity and domain knowledge.
-
-- **Motivation:** describe the problem being solved and why it matters to users.
-- **Acceptance Criteria:** work-item contains a clear understanding of the feature's purpose and requirements.
-- **Status Tag:** `intake_complete`
-- **Useful Commands:**
-  - `/intake <Work-Item ID>`
-- **Next Step:** proceed to the `Define Milestones` step.
-
-### Project Definition (for larger projects)
-
-Expand the initial idea into a comprehensive Project Requirements Document (PRD). This document captures the scope, success metrics, constraints, and top risks associated with the project. Agents assist with structuring and authoring the PRD through an interview process, while humans provide creativity and domain knowledge.
+Expand the initial idea into a more detailed feature intake work-item. This step captures the motivation, user impact, and high-level requirements for the feature. Agents assist with structuring and authoring the intake through an interview process, while humans provide the creativity and domain knowledge.
 
 - **Motivation:** describe the problem being solved and why it matters to users.
 - **Acceptance Criteria:** work-item contains a clear understanding of the feature's purpose and requirements.
 - **Status Tag:** `intake_complete`
 - **Useful Commands:**
   - `/intake <Work-Item ID>`
-- **Next Step:** proceed to the `Define Milestones` step.
-
-- **Success signals:** precise, automatable metrics and baseline measurements to evaluate the outcome.
-- **Constraints:** timeline, budget, compatibility, and regulatory limits that affect tradeoffs.
-- **Top risks:** short list of the highest-impact uncertainties and a proposed first-mitigation.
-- **Status Tag:** `intake_complete`
-
-Agent Commands:
-
-1. Create initial tracking work-item: `/intake <Project Title>`
-2. Create PRD via interview: `/prd <work-item ID>`
+- **Next Step:** proceed to the `Plan` step.
 
 Summary: a clear, testable project definition that guides epics and prioritization.
 
-### Define Milestones
+### Plan
 
-Map the end-to-end user outcomes into one or more master epics that represent deliverable milestones (for example `milestone:M0`, `milestone:M1`). For each master epic record cross-functional owners and high-level milestones.
-
-- **Outcome map:** list the user flows the epic must enable and the acceptance criteria at the epic level.
-- **Milestones:** define at least one short feedback milestone (M0) and one fuller delivery milestone (M1).
-- **Ownership:** assign an owner for PM, engineering, infra, security and UX per epic.
-- **Status Tag:** `milestones_defined`
-
-Agent Commands:
-
-1. Decompose the PRD into master epic(s): `/milestones <work-item-id>`
-
-Summary: master epics turn the project definition into parallel, owned workstreams.
-
-### Feature Decomposition
-
-Break each epic into discrete features: each feature should have a concise acceptance criteria statement, a minimal implementation plan, and—where applicable—a prototype or experiment to validate assumptions.
+For smaller features, the plan may be a simple implementation outline. For larger features or epics, the plan involves decomposing the work into sub-epics and features with clear acceptance criteria, a minimal implementation plan, and prototype/experiment design where needed. Agents assist with building the plan based on the intake information, while humans provide validation and clarification to ensure alignment with the original intent.
 
 - **Acceptance:** expressable, pass/fail acceptance criteria suitable for automated tests or a short manual checklist.
 - **Prototype:** when assumptions are risky, describe a lightweight experiment (fake-API, mock UI, A/B) and success thresholds.
 - **Taskization:** avoid creating separate child tasks by default; instead include implementation, tests, and docs in the feature’s acceptance criteria and deliverables. Only create child tasks when the feature is too large for a single task, or when a dependency or cross-team handoff requires it.
 - **Status Tag:** `plan_complete`
-
-Tackle a single Milestone/Epic at a time. Do not attempt to decompose more than one epic at a timte. This allows each milestone to feed into the next, correcting any poor assumptiosn made in previous steps.
 
 Agent Commands:
 
@@ -137,7 +96,7 @@ Agent Commands:
 
 Summary: features make epics executable and testable in small increments.
 
-### Feature Implementation
+### Implementation
 
 Implement each feature one at a time. Each issue will have a set of child tasks for (at least) implementation, infra, docs, and tests. Workthrough each feature as a vertical slice that delivers end-to-end user value.
 
@@ -147,9 +106,7 @@ Implement each feature one at a time. Each issue will have a set of child tasks 
 
 Agent Commands:
 
-1. For the test issue, generate test plan: `/testplan <Issue ID>`
-2. For the docs issue, generate user documentation: `/doc <Issue ID>`
-3. Implement the feature and tests: `implement <Issue ID>`
+1. Implement the feature and tests: `implement <Issue ID>`
 
 Summary: vertical slices reduce integration risk and make progress visible.
 
@@ -170,4 +127,4 @@ After merging the PR, clean up the repository by closing the work-item, removing
 
 Agent Commands:
 
-1. `/cleanup`
+1. `cleanup`

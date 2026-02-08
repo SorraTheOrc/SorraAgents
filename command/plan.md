@@ -18,7 +18,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 ## Results and Outputs
 
-- The parent work item ($1) or each of the milestone epics below it are decomposed into child feature work items.
+- The parent work item ($1) or each of the epics below it are decomposed into child feature work items.
 - Idempotence: The command reuses existing child work items and updates or augments previously generated feature work-items instead of creating duplicates.
 
 ## Hard requirements
@@ -50,12 +50,13 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 1. Fetch & summarise (agent responsibility)
 
-- Run `wl show <work-item-id> --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing milestone/plan info.
+- Run `wl show <work-item-id> --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing child tasks and plan info.
 - Validate that the work item is ready for planning by inspecting its `stage` field:
-- Run `wl show <work-item-id> --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing milestone/plan info.
+- Run `wl show <work-item-id> --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing child tasks and plan info.
 - Validate readiness by examining the work item's `stage` value:
-- `milestones_defined` indicates it is ready for planning.
-- `plan_complete` indicates this is a request to review the existing plan; follow the steps below but consider previous planning work.
+  - `intake_complete` indicates it is ready for planning.
+  - `plan_complete` or later stages indicate planning has already been completed; ask the user if they want to re-run the planning process and update the existing plan or skip to the next steps. If they choose to update the existing plan, proceed with the
+    steps below but consider previous planning and implementation work.
 - any other `stage` value suggests the work item is not currently ready for planning — ask the user how to proceed indicating that if the work item is small enough it is OK to proceed.
 - Read any PRD linked in the work item or any of its parents to extract key details for later reference.
 - Derive 3–6 keywords from the work item title/description to search the repo and work items for related work. Present any likely duplicates or parent/child relationships.

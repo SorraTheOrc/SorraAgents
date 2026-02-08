@@ -92,10 +92,9 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Constraints and compatibility expectations.
   - Unknowns captured as explicit questions.
 - If the work item is not well-defined, run the intake interview to update the existing work item (see `command/intake.md`) and update the work item `description` or `acceptance` fields with the intake output.
-- If the work item is too large to implement in one pass, run the milestones interview for items that should be epics (see `command/milestones.md`) or the plan interview (see `command/plan.md`) to break it into smaller work items, create those work items, link them as blockers/dependencies, and pick the highest-priority work item to implement next.
+- If the work item is too large to implement in one pass, run plan interview (see `command/plan.md`) to break it into smaller work items, create those work items, link them as blockers/dependencies, and pick the highest-priority work item to implement next.
 - If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
-- If you ran the milestone interview convert this work item to an epic and inform the user that implementation should move to first milestone work item created.
-- if you ran the plan interview you can proceed.
+- If you ran the plan interview, convert this work item to an epic and inform the user that implementation should move to the first child work item created.
 
 2. Create a working branch
 

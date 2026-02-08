@@ -13,7 +13,7 @@ Design a small, deterministic, agent-friendly language for describing stateful w
 
 - **Work item**: an entity with `id`, `status`, `stage`, optional metadata.
 - **Status**: coarse lifecycle (`open`, `in_progress`, `blocked`, `closed`).
-- **Stage**: finer-grained phase (`idea`, `intake_completed`, `prd_completed`, `milestones_defined`, `plan_completed`, `in_progress`, `in_review`, `done`).
+- **Stage**: finer-grained phase (`idea`, `intake_complete`, `plan_complete`, `in_progress`, `in_review`, `done`).
 - **State tuple**: the pair `(status, stage)`; transitions are defined on tuples, not on either dimension alone.
 - **Command**: a named action that can run only from specified state tuples and yields a new tuple if it succeeds.
 - **Invariant**: a boolean rule that must hold before and/or after a command (e.g., required fields, approvals, links).
@@ -78,19 +78,17 @@ metadata:
 status: [open, in_progress, blocked, closed]
 stage:
   - idea
-  - intake_completed
-  - prd_completed
-  - milestones_defined
-  - plan_completed
+  - intake_complete
+  - prd_complete
+  - plan_complete
   - in_progress
   - in_review
   - done
 states:
   idea: { status: open, stage: idea }
-  intake: { status: open, stage: intake_completed }
-  prd: { status: open, stage: prd_completed }
-  milestones: { status: open, stage: milestones_defined }
-  plan: { status: open, stage: plan_completed }
+  intake: { status: open, stage: intake_complete }
+  prd: { status: open, stage: prd_complete }
+  plan: { status: open, stage: plan_complete }
   building: { status: in_progress, stage: in_progress }
   review: { status: in_progress, stage: in_review }
   shipped: { status: closed, stage: done }
@@ -123,14 +121,9 @@ commands:
     to: prd
     actor: PM
     pre: [requires_prd_link]
-  define_milestones:
-    description: Break PRD into milestones/epics
-    from: [prd]
-    to: milestones
-    actor: PM
-  plan_features:
-    description: Decompose milestones into planned features
-    from: [milestones]
+  plan:
+    description: Plan implementation in stages.
+    from: [intake_complete]
     to: plan
     actor: Architect
   start_build:
