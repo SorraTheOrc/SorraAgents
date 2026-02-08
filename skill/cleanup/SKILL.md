@@ -26,13 +26,11 @@ Triggers
 
 - `dry-run` (default): list actions without performing deletes or closes
 - `confirm_all`: allow single confirmation to apply a group of safe actions
-- `delete-remote` (opt-in): permit remote branch deletion when explicitly confirmed
 
 ## Preconditions & safety
 
-- Never delete a remote branch or close a work item without explicit confirmation.
 - Never rewrite history or force-push without explicit permission.
-- Default protected branches: `main`, `master`, `develop` (do not delete or target for deletion).
+- Default protected branches: `main`, `develop` (do not delete or target for deletion).
 - Detect default branch dynamically when possible (check `git remote show origin` or fallback to `main`).
 - Use conservative merge checks (`git merge-base --is-ancestor`) to determine whether a branch's HEAD is contained in the default branch.
 
@@ -60,34 +58,29 @@ Triggers
 - If `gh` available: `gh pr list --state open --base <default> --json number,title,headRefName,url,author`.
 - Present any open PRs and their head branches; skip deleting branches that have open PRs unless user explicitly authorizes.
 
-4. Identify merged local branches
+4. Delete local merged branches
 
 - List local branches merged into `origin/<default>` using conservative check per branch:
   - For each branch `b` (excluding protected names and current):
     - `git merge-base --is-ancestor b origin/<default>` (exit code 0 => merged)
-- Present candidate list with metadata: last commit date, upstream (if any), work item id (if parseable), and open PR presence.
-- Ask user to confirm deletion. If confirmed and not `dry-run`: `git branch -d <branch>` (safe delete). If `-d` fails, report and offer `-D` only with explicit permission.
+- Present branch deletion list with metadata: last commit date, upstream (if any), work item id (if parseable), and open PR presence.
+- If not `dry-run` delete branches: `git branch -d <branch>` (safe delete). If `-d` fails, report and offer `-D` only with explicit permission.
 
-5. Offer remote deletion (opt-in)
+5. Delete remote merged branches
 
 - For each deleted or candidate local branch with a remote `origin/<branch>`:
   - Verify no open PR references it and that it is merged (use `git merge-base --is-ancestor origin/<branch> origin/<default>`).
-  - Present remote deletion candidates; ask per-branch or grouped confirmation based on `confirm_all`.
-  - If confirmed and not `dry-run` and `delete-remote` enabled: `git push origin --delete <branch>`.
+  - Present branch deletion list with metadata: last commit date, upstream (if any), work item id (if parseable), and open PR presence.
+  - If not `dry-run` delete branches: `git push origin --delete <branch>`.
 
 6. Summarize remaining branches
 
 - Produce a table of remaining local and remote branches with: name, upstream, last commit, merged? (yes/no), work item id (if any), and open PR links (if available).
 - For each remaining branch, offer actions: keep / delete / create PR / assign work item / rebase / merge.
 
-7. Work items (wl) review
+7. Temporary File Rremoval
 
-- Run `wl sync` to ensure work item data is current.
-- If `wl` available: `wl list --status in_progress --json`.
-- Cross-reference work items with branches found in the repo. For each in_progress work item, show last updated, linked branches, and recommend close if: the branch is merged and PRs/commits indicate completion or inactivity (configurable age threshold).
-- For each work item use the status skill to evaluate their suitability for closure.
-- Present candidate work item closures and ask for confirmation. If confirmed and not `dry-run`: `wl close <id> --reason "Completed" --json` then `wl sync`.
-  - If there are no candidates, report none found.
+- If any temporary files were created (e.g., branch lists, reports), remove them to avoid clutter.
 
 8. Final report
 
@@ -114,20 +107,11 @@ Commands (examples)
 
 Safety prompts (always asked)
 
-- Confirm local branch deletions with full list and dry-run preview.
-- Confirm remote deletions per-branch or as a single group (if `confirm_all`).
-- Confirm work item closures and show work item details (description, last comments, linked branches).
 - If default branch cannot be fast-forwarded, ask how to proceed (pause or abort).
-
-Suggested bundled resources (optional)
-
-- `scripts/list-merged-branches.sh` — helper to produce a conservative list of merged branches using `git merge-base` (recommended to include in the skill if operations will be repeated).
-- `references/branch-naming.md` — guide describing repo-specific branch naming and work item conventions.
 
 Outputs
 
 - Human-readable summary printed to terminal.
-- Optional `history/cleanup-report-<timestamp>.md` written on confirmation.
 
 Example short dialogue
 

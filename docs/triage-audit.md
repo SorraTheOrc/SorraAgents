@@ -24,17 +24,19 @@ References:
    - Send a Discord message capped to ~1000 chars.
 
 4. **Post full audit output to Worklog**
-   - Create a Worklog comment with a standard heading: `# AMPA Audit Result`.
-   - If output is short enough, embed it directly in the comment.
-   - If output is too large, write it to a temp file and post a comment that references the file path.
-   - Temp files used for comments are removed after posting.
+    - Create a Worklog comment with a standard heading: `# AMPA Audit Result`.
+    - If output is short enough, embed it directly in the comment.
+    - If output is too large, write it to a temp file and post a comment that references the file path.
+    - Temp files used for comments are removed after posting.
+    - If `audit_only` is enabled, delegation is skipped.
 
 5. **Auto-complete check (optional)**
    The scheduler will attempt to move the work item to `completed` and `in_review` when:
    - The audit output indicates a merged PR (PR URL or "PR merged" token), and
    - There are no open child work items, or the audit explicitly says it is ready to close.
 
-   If a GitHub PR URL is found, the scheduler can verify merge status with `gh pr view`.
+    If a GitHub PR URL is found, the scheduler can verify merge status with `gh pr view`.
+    - Skipped when `audit_only` is enabled.
 
 ## Cooldown logic
 
@@ -61,6 +63,7 @@ Per-command metadata (from the scheduler command spec):
 - `audit_cooldown_hours` (default: 6): Minimum hours between audits for the same work item.
 - `truncate_chars` (default: 65536): Max chars to inline in Worklog comments before writing to a temp file.
 - `verify_pr_with_gh` (default: true): Overrides `AMPA_VERIFY_PR_WITH_GH` when present.
+- `audit_only` (default: false): When true, do not update work item stage/status and skip delegation.
 
 ## Notes
 

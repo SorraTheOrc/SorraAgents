@@ -3,6 +3,7 @@ import os
 import glob
 import datetime as dt
 import subprocess
+import re
 
 from ampa.scheduler import (
     Scheduler,
@@ -18,7 +19,12 @@ class DummyStore(SchedulerStore):
     def __init__(self) -> None:
         # in-memory store
         self.path = ":memory:"
-        self.data = {"commands": {}, "state": {}, "last_global_start_ts": None}
+        self.data = {
+            "commands": {},
+            "state": {},
+            "last_global_start_ts": None,
+            "config": {},
+        }
 
     def save(self) -> None:
         return None
@@ -409,3 +415,410 @@ def test_per_status_cooldown_respected(tmp_path, monkeypatch):
     # The in_progress item should be skipped because its cooldown is 6h and last_audit is 2h ago.
     assert any(f"/audit {wid_in_review}" in c for c in calls)
     assert not any(f"/audit {wid_in_progress}" in c for c in calls)
+
+
+def test_triage_audit_audit_only_no_update(tmp_path, monkeypatch):
+    """Verify audit-only mode avoids wl update."""
+    calls = []
+    work_id = "AUDIT-ONLY-1"
+
+    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            out = json.dumps(
+                {
+                    "workItems": [
+                        {
+                            "id": work_id,
+                            "title": "Audit only item",
+                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        }
+                    ]
+                }
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment list {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
+            out = "Summary:\nAudit only output\n"
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment add {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        if cmd.strip().startswith(f"wl update {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    sched.start_command(spec)
+
+    # ensure comment add was attempted and no update was made
+    assert any(c.startswith(f"wl comment add {work_id}") for c in calls)
+    assert not any(c.startswith(f"wl update {work_id}") for c in calls)
+
+
+def test_triage_audit_audit_only_no_templates(tmp_path, monkeypatch):
+    """Verify audit-only mode does not add template headings in comment payload."""
+    calls = []
+    work_id = "AUDIT-ONLY-2"
+    comment_payload = {"text": ""}
+
+    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            out = json.dumps(
+                {
+                    "workItems": [
+                        {
+                            "id": work_id,
+                            "title": "Audit only title",
+                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        }
+                    ]
+                }
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment list {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
+            out = "Summary:\nAudit only output\n"
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment add {work_id}"):
+            m = re.search(r"\$\(cat '([^']+)'\)", cmd)
+            assert m
+            with open(m.group(1), "r", encoding="utf-8") as fh:
+                comment_payload["text"] = fh.read()
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    sched.start_command(spec)
+
+    assert "Proposed child work items" not in comment_payload["text"]
+    assert "## Intake" not in comment_payload["text"]
+    assert "## Plan" not in comment_payload["text"]
+
+
+def test_triage_audit_discord_summary_includes_body(tmp_path, monkeypatch):
+    """Verify Discord summary includes a body line, not just heading."""
+    calls = []
+    work_id = "DISCORD-SUMMARY-1"
+    captured = {}
+
+    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
+        captured["payload"] = payload
+        return 200
+
+    monkeypatch.setattr(webhook, "send_webhook", fake_send_webhook)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            out = json.dumps(
+                {
+                    "workItems": [
+                        {
+                            "id": work_id,
+                            "title": "Discord summary item",
+                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        }
+                    ]
+                }
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment list {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
+            out = "Summary:\nA short summary for Discord.\n"
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment add {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        if cmd.strip().startswith(f"wl show {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({}), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    sched.start_command(spec)
+
+    content = captured.get("payload", {}).get("content", "")
+    assert "# Triage Audit — Discord summary item" in content
+    assert "Summary: A short summary for Discord." in content
+    assert "Delegation:" in content
+
+
+def test_triage_audit_delegation_disabled(tmp_path, monkeypatch):
+    """Verify delegation does not run when audit_only is true."""
+    calls = []
+    work_id = "DELEGATE-1"
+
+    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            out = json.dumps(
+                {
+                    "workItems": [
+                        {
+                            "id": work_id,
+                            "title": "Audit item",
+                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        }
+                    ]
+                }
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment list {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
+            out = "Summary:\nAudit output\n"
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment add {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={
+            "truncate_chars": 65536,
+            "audit_cooldown_hours": 0,
+            "audit_only": True,
+        },
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    sched.start_command(spec)
+
+    assert not any("wl next --json" in c for c in calls)
+    assert not any("work on" in c for c in calls)
+
+
+def test_triage_audit_delegation_skips_when_in_progress(tmp_path, monkeypatch):
+    """Verify delegation no-ops when in-progress items exist."""
+    calls = []
+    work_id = "DELEGATE-2"
+
+    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            out = json.dumps(
+                {
+                    "workItems": [
+                        {
+                            "id": work_id,
+                            "title": "Audit item",
+                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        }
+                    ]
+                }
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment list {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
+            out = "Summary:\nAudit output\n"
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment add {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={
+            "truncate_chars": 65536,
+            "audit_cooldown_hours": 0,
+            "audit_only": False,
+        },
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    sched.start_command(spec)
+
+    assert not any("wl next --json" in c for c in calls)
+    assert not any("work on" in c for c in calls)
+
+
+def test_triage_audit_delegation_dispatches_intake_when_idle(tmp_path, monkeypatch):
+    """Verify delegation dispatches intake when idle and enabled."""
+    calls = []
+    work_id = "DELEGATE-3"
+    in_progress_calls = {"count": 0}
+
+    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            in_progress_calls["count"] += 1
+            if in_progress_calls["count"] == 1:
+                out = json.dumps(
+                    {
+                        "workItems": [
+                            {
+                                "id": work_id,
+                                "title": "Audit item",
+                                "updated_at": dt.datetime.now(
+                                    dt.timezone.utc
+                                ).isoformat(),
+                            }
+                        ]
+                    }
+                )
+            else:
+                out = json.dumps({"workItems": []})
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip() == "wl next --json":
+            payload = {
+                "workItem": {"id": "SA-TEST-1", "title": "Test idea", "stage": "idea"}
+            }
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+            )
+        if cmd.strip().startswith("opencode run"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="ok", stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment list {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
+            out = "Summary:\nAudit output\n"
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment add {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={
+            "truncate_chars": 65536,
+            "audit_cooldown_hours": 0,
+            "audit_only": False,
+        },
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    sched.start_command(spec)
+
+    assert any("wl next --json" in c for c in calls)
+    assert any("/intake SA-TEST-1" in c for c in calls)

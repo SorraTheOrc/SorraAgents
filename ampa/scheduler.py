@@ -23,6 +23,7 @@ except Exception:  # pragma: no cover - optional dependency in tests
 try:
     from . import daemon
     from . import webhook as webhook_module
+    from . import selection
 except ImportError:  # pragma: no cover - allow running as script
     import importlib
     import sys
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover - allow running as script
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     daemon = importlib.import_module("ampa.daemon")
     webhook_module = importlib.import_module("ampa.webhook")
+    selection = importlib.import_module("ampa.selection")
 
 LOG = logging.getLogger("ampa.scheduler")
 
@@ -182,6 +184,9 @@ class SchedulerStore:
                 data = json.load(fh)
                 if not isinstance(data, dict):
                     raise ValueError("store root must be object")
+                data.setdefault("commands", {})
+                data.setdefault("state", {})
+                data.setdefault("last_global_start_ts", None)
                 return data
         except FileNotFoundError:
             # Try to initialize from example file if available
@@ -195,10 +200,18 @@ class SchedulerStore:
                     return data
             except Exception:
                 # Fall back to empty store if initialization or re-load fails
-                return {"commands": {}, "state": {}, "last_global_start_ts": None}
+                return {
+                    "commands": {},
+                    "state": {},
+                    "last_global_start_ts": None,
+                }
         except Exception:
             LOG.exception("Failed to read scheduler store; starting empty")
-            return {"commands": {}, "state": {}, "last_global_start_ts": None}
+            return {
+                "commands": {},
+                "state": {},
+                "last_global_start_ts": None,
+            }
 
     def _initialize_from_example(self) -> None:
         """Initialize scheduler_store.json from scheduler_store_example.json if available."""
@@ -316,6 +329,89 @@ def _summarize_for_discord(text: Optional[str], max_chars: int = 1000) -> str:
     except Exception:
         LOG.exception("Failed to summarize content for Discord")
         return text
+
+
+def _trim_text(value: Optional[str]) -> str:
+    return value.strip() if value else ""
+
+
+def _format_in_progress_items(text: str) -> List[str]:
+    lines = [line.rstrip() for line in (text or "").splitlines()]
+    items: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "- SA-" not in stripped:
+            continue
+        cleaned = stripped.lstrip("├└│ ")
+        items.append(cleaned)
+    if not items:
+        for line in lines:
+            stripped = line.strip()
+            if stripped:
+                items.append(stripped)
+    return items
+
+
+def _format_candidate_line(candidate: Dict[str, Any]) -> str:
+    work_id = str(candidate.get("id") or "?")
+    title = candidate.get("title") or candidate.get("name") or "(no title)"
+    status = candidate.get("status") or candidate.get("stage") or ""
+    priority = candidate.get("priority")
+    parts = [f"{title} - {work_id}"]
+    meta: List[str] = []
+    if status:
+        meta.append(f"status: {status}")
+    if priority is not None:
+        meta.append(f"priority: {priority}")
+    if meta:
+        parts.append("(" + ", ".join(meta) + ")")
+    return " ".join(parts)
+
+
+def _build_dry_run_report(
+    *,
+    in_progress_output: str,
+    candidates: List[Dict[str, Any]],
+    top_candidate: Optional[Dict[str, Any]],
+) -> str:
+    sections: List[str] = []
+    sections.append("AMPA Dry Run Report")
+
+    in_progress_items = _format_in_progress_items(in_progress_output)
+    sections.append("In-progress items:")
+    if in_progress_items:
+        sections.extend([f"- {item}" for item in in_progress_items])
+    else:
+        sections.append("- (none)")
+
+    sections.append("Candidates:")
+    if candidates:
+        for cand in candidates:
+            sections.append(f"- {_format_candidate_line(cand)}")
+    else:
+        sections.append("- (none)")
+
+    sections.append("Top candidate:")
+    if top_candidate:
+        sections.append(f"- {_format_candidate_line(top_candidate)}")
+        sections.append("Rationale: selected by wl next (highest priority ready item).")
+    else:
+        sections.append("- (none)")
+        sections.append("Rationale: no candidates returned by wl next.")
+
+    return "\n".join(sections)
+
+
+def _build_dry_run_discord_message(report: str) -> str:
+    summary = _summarize_for_discord(report, max_chars=1000)
+    if summary and summary.strip():
+        return summary
+    LOG.warning("Dry-run discord summary was empty; falling back to raw report content")
+    if report and report.strip():
+        return report.strip()
+    return "(no report details)"
 
 
 def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> RunResult:
@@ -515,6 +611,39 @@ class Scheduler:
         if isinstance(run, CommandRunResult):
             output = run.output
             exit_code = run.exit_code
+        if spec.command_type == "dry-run":
+            dry_report = None
+            try:
+                dry_report = self._run_dry_run_report(spec)
+            except Exception:
+                LOG.exception("Dry-run report generation failed")
+            if dry_report:
+                output = dry_report
+                try:
+                    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+                    if webhook:
+                        message = _build_dry_run_discord_message(dry_report)
+                        payload = webhook_module.build_command_payload(
+                            os.uname().nodename,
+                            run.end_ts.isoformat(),
+                            spec.command_id,
+                            message,
+                            run.exit_code,
+                            title=(
+                                spec.title
+                                or spec.metadata.get("discord_label")
+                                or "Dry Run Report"
+                            ),
+                        )
+                        webhook_module.send_webhook(
+                            webhook, payload, message_type="command"
+                        )
+                except Exception:
+                    LOG.exception("Dry-run discord notification failed")
+            if output:
+                print(output)
+            self._record_run(spec, run, exit_code, output)
+            return run
         self._record_run(spec, run, exit_code, output)
         # After recording run, perform any command-specific post actions
         if spec.command_id == "wl-triage-audit" or spec.command_type == "triage-audit":
@@ -526,9 +655,7 @@ class Scheduler:
             except Exception:
                 LOG.exception("Triage audit post-processing failed")
                 triage_audited = False
-            # post the generic discord message only if an audit occurred
-            if triage_audited:
-                self._post_discord(spec, run, output)
+            # triage-audit posts its own discord summary; avoid generic post
             return run
         # always post the generic discord message afterwards
         self._post_discord(spec, run, output)
@@ -544,8 +671,6 @@ class Scheduler:
         - Selects the least-recently-updated work item not audited within cooldown
         - Executes `opencode run audit <work_item_id>` and captures output
         - Posts a short Discord summary and a WL comment containing the full output
-        - Persists `last_audit_at` per-work-item in the scheduler store under
-          state[spec.command_id]["last_audit_at_by_item"]
         """
         # configuration: allow overrides via metadata
         try:
@@ -556,6 +681,15 @@ class Scheduler:
             truncate_chars = int(spec.metadata.get("truncate_chars", 65536))
         except Exception:
             truncate_chars = 65536
+
+        def _bool_meta(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return False
+            return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+        audit_only = _bool_meta(spec.metadata.get("audit_only"))
 
         webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
 
@@ -761,9 +895,6 @@ class Scheduler:
                 # inspect WL comments to find the most recent audit comment
                 last_audit: Optional[dt.datetime] = None
                 try:
-                    # prepare hostname and timestamp for human-facing payloads
-                    hostname = os.uname().nodename
-                    ts = _utc_now().isoformat()
                     proc_c = _call(f"wl comment list {wid} --json")
                     if proc_c.returncode == 0 and proc_c.stdout:
                         try:
@@ -860,10 +991,106 @@ class Scheduler:
                 )
             )
             selected = candidates[0][1]
-            work_id = selected.get("id")
+            work_id = str(selected.get("id") or "")
+            if not work_id:
+                LOG.warning("Triage audit candidate missing id")
+                return False
             title = selected.get("title") or selected.get("name") or "(no title)"
             # record selected candidate for easier observability
             LOG.info("Selected triage candidate %s — %s", work_id, title)
+
+            delegation_note: Optional[str] = None
+
+            def _delegate_when_idle() -> None:
+                nonlocal delegation_note
+                if audit_only:
+                    delegation_note = "Delegation: skipped (audit_only)"
+                    return
+                proc_idle = _call("wl in_progress --json")
+                if proc_idle.returncode != 0:
+                    LOG.warning(
+                        "Delegation check failed: wl in_progress rc=%s",
+                        proc_idle.returncode,
+                    )
+                    delegation_note = "Delegation: skipped (in_progress check failed)"
+                    return
+                try:
+                    raw_idle = json.loads(proc_idle.stdout or "null")
+                except Exception:
+                    LOG.exception(
+                        "Failed to parse wl in_progress output for delegation"
+                    )
+                    delegation_note = "Delegation: skipped (invalid in_progress JSON)"
+                    return
+                idle_items: List[Dict[str, Any]] = []
+                if isinstance(raw_idle, list):
+                    idle_items = [item for item in raw_idle if isinstance(item, dict)]
+                elif isinstance(raw_idle, dict):
+                    for key in ("workItems", "work_items", "items", "data"):
+                        val = raw_idle.get(key)
+                        if isinstance(val, list):
+                            idle_items = [
+                                item for item in val if isinstance(item, dict)
+                            ]
+                            break
+                if idle_items:
+                    LOG.info("Delegation skipped: in-progress items exist")
+                    delegation_note = "Delegation: skipped (in_progress items)"
+                    return
+
+                candidates, _payload = selection.fetch_candidates(
+                    run_shell=self.run_shell, command_cwd=self.command_cwd
+                )
+                if not candidates:
+                    LOG.info("Delegation skipped: no wl next candidates")
+                    delegation_note = "Delegation: skipped (no wl next candidates)"
+                    return
+
+                candidate = candidates[0]
+                delegate_id = _extract_work_item_id(candidate)
+                if not delegate_id:
+                    LOG.warning("Delegation skipped: candidate missing id")
+                    delegation_note = "Delegation: skipped (candidate missing id)"
+                    return
+                delegate_title = _extract_work_item_title(candidate)
+                delegate_stage = _extract_work_item_stage(candidate)
+                if delegate_stage == "idea":
+                    command = f'opencode run "/intake {delegate_id}"'
+                    action = "intake"
+                elif delegate_stage == "intake_complete":
+                    command = f'opencode run "/plan {delegate_id}"'
+                    action = "plan"
+                elif delegate_stage == "plan_complete":
+                    command = f'opencode run "work on {delegate_id} using the implement skill"'
+                    action = "implement"
+                else:
+                    LOG.info(
+                        "Delegation skipped: unsupported stage %s for %s",
+                        delegate_stage,
+                        delegate_id,
+                    )
+                    delegation_note = (
+                        f"Delegation: skipped (unsupported stage {delegate_stage})"
+                    )
+                    return
+
+                LOG.info("Delegation dispatch: %s", command)
+                proc_delegate = _call(command)
+                if proc_delegate.returncode != 0:
+                    LOG.warning(
+                        "Delegation dispatch failed rc=%s stderr=%s",
+                        proc_delegate.returncode,
+                        (proc_delegate.stderr or "").strip(),
+                    )
+                    delegation_note = f"Delegation: failed ({action} {delegate_id})"
+                    return
+                LOG.info(
+                    "Delegation dispatched %s for %s — %s",
+                    action,
+                    delegate_id,
+                    delegate_title,
+                )
+                delegation_note = f"Delegation: dispatched {action} {delegate_id}"
 
             # 2) run the audit command
             # use quoted subcommand so the audit string is passed as one argument
@@ -885,6 +1112,8 @@ class Scheduler:
                 len(proc_audit.stdout or ""),
                 len(proc_audit.stderr or ""),
             )
+
+            _delegate_when_idle()
 
             # 3) post a short Discord summary (1-3 lines)
             # helper to extract a human-facing 'Summary' section from audit output
@@ -921,117 +1150,115 @@ class Scheduler:
                     return m2.group(1).strip().split("\n\n")[0].strip()
                 return ""
 
-                if webhook:
-                    summary_text = _extract_summary(audit_out or "")
-                    if not summary_text:
-                        # fallback simple summary
-                        summary_text = f"{work_id} — {title} | exit={exit_code}"
-                    # if Discord will reject long messages, summarize to <=1000 chars
-                    try:
-                        summary_text = _summarize_for_discord(
-                            summary_text, max_chars=1000
+            if webhook:
+                summary_text = _extract_summary(audit_out or "")
+                if not summary_text:
+                    # fallback simple summary
+                    summary_text = f"{work_id} — {title} | exit={exit_code}"
+                if delegation_note:
+                    summary_text = f"{summary_text}\n{delegation_note}"
+                # if Discord will reject long messages, summarize to <=1000 chars
+                try:
+                    summary_text = _summarize_for_discord(summary_text, max_chars=1000)
+                except Exception:
+                    LOG.exception("Failed to summarize triage summary_text")
+
+                # If the work item is blocked and in_review, scan the work item
+                # description and comments for a PR URL and include it in the
+                # Discord payload to request a review.
+                pr_url: Optional[str] = None
+                try:
+                    proc_show_pre = _call(f"wl show {work_id} --json")
+                    wi_pre = None
+                    if proc_show_pre.returncode == 0 and proc_show_pre.stdout:
+                        try:
+                            wi_pre = json.loads(proc_show_pre.stdout)
+                        except Exception:
+                            wi_pre = None
+                    status_val = None
+                    stage_val = None
+                    if isinstance(wi_pre, dict):
+                        status_val = (
+                            wi_pre.get("status")
+                            or wi_pre.get("state")
+                            or wi_pre.get("stage")
                         )
-                    except Exception:
-                        LOG.exception("Failed to summarize triage summary_text")
+                        # description may be under different keys
+                        description_text = (
+                            wi_pre.get("description") or wi_pre.get("desc") or ""
+                        )
+                    else:
+                        description_text = ""
 
-                    # If the work item is blocked and in_review, scan the work item
-                    # description and comments for a PR URL and include it in the
-                    # Discord payload to request a review.
-                    pr_url: Optional[str] = None
-                    try:
-                        proc_show_pre = _call(f"wl show {work_id} --json")
-                        wi_pre = None
-                        if proc_show_pre.returncode == 0 and proc_show_pre.stdout:
-                            try:
-                                wi_pre = json.loads(proc_show_pre.stdout)
-                            except Exception:
-                                wi_pre = None
-                        status_val = None
-                        stage_val = None
-                        if isinstance(wi_pre, dict):
-                            status_val = (
-                                wi_pre.get("status")
-                                or wi_pre.get("state")
-                                or wi_pre.get("stage")
-                            )
-                            # description may be under different keys
-                            description_text = (
-                                wi_pre.get("description") or wi_pre.get("desc") or ""
-                            )
-                        else:
-                            description_text = ""
-
-                        # helper to find a PR URL in text
-                        def _find_pr_in_text(text: str) -> Optional[str]:
-                            if not text:
-                                return None
-                            m = re.search(
-                                r"https?://github\.com/[^\s']+?/pull/\d+",
-                                text,
-                                re.I,
-                            )
-                            if m:
-                                return m.group(0)
+                    # helper to find a PR URL in text
+                    def _find_pr_in_text(text: str) -> Optional[str]:
+                        if not text:
                             return None
+                        m = re.search(
+                            r"https?://github\.com/[^\s']+?/pull/\d+",
+                            text,
+                            re.I,
+                        )
+                        if m:
+                            return m.group(0)
+                        return None
 
-                        # check description first
-                        pr_url = _find_pr_in_text(description_text)
-                        # if not found, check comments
-                        if pr_url is None:
-                            proc_comments = _call(f"wl comment list {work_id} --json")
-                            if proc_comments.returncode == 0 and proc_comments.stdout:
-                                try:
-                                    raw_comments = json.loads(proc_comments.stdout)
-                                except Exception:
-                                    raw_comments = []
-                                comments = []
-                                if isinstance(raw_comments, list):
-                                    comments = raw_comments
-                                elif isinstance(raw_comments, dict):
-                                    for key in ("comments", "items", "data"):
-                                        val = raw_comments.get(key)
-                                        if isinstance(val, list):
-                                            comments = val
-                                            break
-                                for c in comments:
-                                    body = (
-                                        c.get("comment")
-                                        or c.get("body")
-                                        or c.get("text")
-                                        or ""
-                                    )
-                                    if not body:
-                                        continue
-                                    found = _find_pr_in_text(body)
-                                    if found:
-                                        pr_url = found
+                    # check description first
+                    pr_url = _find_pr_in_text(description_text)
+                    # if not found, check comments
+                    if pr_url is None:
+                        proc_comments = _call(f"wl comment list {work_id} --json")
+                        if proc_comments.returncode == 0 and proc_comments.stdout:
+                            try:
+                                raw_comments = json.loads(proc_comments.stdout)
+                            except Exception:
+                                raw_comments = []
+                            comments = []
+                            if isinstance(raw_comments, list):
+                                comments = raw_comments
+                            elif isinstance(raw_comments, dict):
+                                for key in ("comments", "items", "data"):
+                                    val = raw_comments.get(key)
+                                    if isinstance(val, list):
+                                        comments = val
                                         break
-                    except Exception:
-                        LOG.exception(
-                            "Failed to discover PR URL for work item %s", work_id
-                        )
+                            for c in comments:
+                                body = (
+                                    c.get("comment")
+                                    or c.get("body")
+                                    or c.get("text")
+                                    or ""
+                                )
+                                if not body:
+                                    continue
+                                found = _find_pr_in_text(body)
+                                if found:
+                                    pr_url = found
+                                    break
+                except Exception:
+                    LOG.exception("Failed to discover PR URL for work item %s", work_id)
 
-                    try:
-                        # Build a human-friendly markdown message: the first line is
-                        # a concise heading describing the topic, the body contains
-                        # only the human-readable summary. Avoid embedding command
-                        # strings, exit codes or other technical fields.
-                        heading_title = f"Triage Audit — {title}"
-                        extra = [{"name": "Summary", "value": summary_text}]
-                        if pr_url:
-                            extra.append({"name": "PR", "value": pr_url})
-                        payload = webhook_module.build_payload(
-                            hostname=os.uname().nodename,
-                            timestamp_iso=_utc_now().isoformat(),
-                            work_item_id=None,
-                            extra_fields=extra,
-                            title=heading_title,
-                        )
-                        webhook_module.send_webhook(
-                            webhook, payload, message_type="command"
-                        )
-                    except Exception:
-                        LOG.exception("Failed to send discord summary")
+                try:
+                    # Build a human-friendly markdown message: the first line is
+                    # a concise heading describing the topic, the body contains
+                    # only the human-readable summary. Avoid embedding command
+                    # strings, exit codes or other technical fields.
+                    heading_title = f"Triage Audit — {title}"
+                    extra = [{"name": "Summary", "value": summary_text}]
+                    if pr_url:
+                        extra.append({"name": "PR", "value": pr_url})
+                    payload = webhook_module.build_payload(
+                        hostname=os.uname().nodename,
+                        timestamp_iso=_utc_now().isoformat(),
+                        work_item_id=None,
+                        extra_fields=extra,
+                        title=heading_title,
+                    )
+                    webhook_module.send_webhook(
+                        webhook, payload, message_type="command"
+                    )
+                except Exception:
+                    LOG.exception("Failed to send discord summary")
 
             # 4) post full audit output as WL comment, truncating if necessary
             full_output = audit_out or ""
@@ -1040,7 +1267,14 @@ class Scheduler:
             if len(full_output) <= truncate_chars:
                 comment_text = full_output or "(no output)"
                 try:
-                    comment = f"# AMPA Audit Result\n\nAudit output:\n\n{comment_text}"
+                    comment_parts = [
+                        "# AMPA Audit Result",
+                        "",
+                        "Audit output:",
+                        "",
+                        comment_text,
+                    ]
+                    comment = "\n".join(comment_parts)
                     # write comment to temp file and use command substitution to avoid shell
                     # quoting issues with embedded quotes/newlines
                     fd, cpath = tempfile.mkstemp(
@@ -1140,7 +1374,12 @@ class Scheduler:
                     )
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         fh.write(full_output)
-                    comment = f"# AMPA Audit Result\n\nAudit output too large; full output saved to: {path}"
+                    comment_parts = [
+                        "# AMPA Audit Result",
+                        "",
+                        f"Audit output too large; full output saved to: {path}",
+                    ]
+                    comment = "\n".join(comment_parts)
                     fd2, cpath = tempfile.mkstemp(
                         prefix=f"wl-audit-comment-{work_id}-", suffix=".md"
                     )
@@ -1231,21 +1470,22 @@ class Scheduler:
             #    or a textual 'PR merged' token), and
             #  - No open/in_progress child work items (or the audit explicitly
             #    states the item is ready to close).
+            # persist last audit timestamp so future runs can consult it even
+            # if Worklog comments are delayed or missing.
             try:
-                # persist last audit timestamp so future runs can consult it even
-                # if Worklog comments are delayed or missing.
-                try:
-                    state = self.store.get_state(spec.command_id)
-                    if not isinstance(state, dict):
-                        state = dict(state or {})
-                    state.setdefault("last_audit_at_by_item", {})
-                    state["last_audit_at_by_item"][work_id] = _to_iso(now)
-                    self.store.update_state(spec.command_id, state)
-                except Exception:
-                    LOG.exception(
-                        "Failed to persist last_audit_at_by_item for %s", work_id
-                    )
+                state = self.store.get_state(spec.command_id)
+                if not isinstance(state, dict):
+                    state = dict(state or {})
+                state.setdefault("last_audit_at_by_item", {})
+                state["last_audit_at_by_item"][work_id] = _to_iso(now)
+                self.store.update_state(spec.command_id, state)
+            except Exception:
+                LOG.exception("Failed to persist last_audit_at_by_item for %s", work_id)
 
+            if audit_only:
+                return True
+
+            try:
                 # fetch latest work item state
                 proc_show = _call(f"wl show {work_id} --json")
                 if proc_show.returncode == 0 and proc_show.stdout:
@@ -1498,6 +1738,37 @@ class Scheduler:
         )
         webhook_module.send_webhook(webhook, payload, message_type="command")
 
+    def _run_dry_run_report(self, spec: Optional[CommandSpec] = None) -> Optional[str]:
+        def _call(cmd: str) -> subprocess.CompletedProcess:
+            LOG.debug("Running shell (dry-run): %s", cmd)
+            return self.run_shell(
+                cmd,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+
+        in_progress_text = ""
+        proc = _call("wl in_progress")
+        if proc.stdout:
+            in_progress_text += proc.stdout
+        if proc.stderr and not in_progress_text:
+            in_progress_text += proc.stderr
+
+        candidates, _payload = selection.fetch_candidates(
+            run_shell=self.run_shell, command_cwd=self.command_cwd
+        )
+        top_candidate = candidates[0] if candidates else None
+
+        report = _build_dry_run_report(
+            in_progress_output=_trim_text(in_progress_text),
+            candidates=candidates,
+            top_candidate=top_candidate,
+        )
+        return report
+
     def _post_startup_message(self) -> None:
         try:
             config = daemon.get_env_config()
@@ -1560,6 +1831,22 @@ def _parse_metadata(value: Optional[str]) -> Dict[str, Any]:
     raise ValueError("metadata must be a JSON object")
 
 
+def _extract_work_item_id(candidate: Dict[str, Any]) -> Optional[str]:
+    for key in ("id", "work_item_id", "workItemId", "workItemID"):
+        val = candidate.get(key)
+        if val:
+            return str(val)
+    return None
+
+
+def _extract_work_item_title(candidate: Dict[str, Any]) -> str:
+    return str(candidate.get("title") or candidate.get("name") or "(no title)")
+
+
+def _extract_work_item_stage(candidate: Dict[str, Any]) -> str:
+    return str(candidate.get("stage") or candidate.get("status") or "").strip().lower()
+
+
 def _store_from_env() -> SchedulerStore:
     config = SchedulerConfig.from_env()
     return SchedulerStore(config.store_path)
@@ -1612,6 +1899,48 @@ def _cli_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_dry_run(args: argparse.Namespace) -> int:
+    scheduler = load_scheduler(command_cwd=os.getcwd())
+    spec = CommandSpec(
+        command_id="dry-run",
+        command="",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={},
+        title="Dry Run Report",
+        command_type="dry-run",
+    )
+    if args.discord and not os.getenv("AMPA_DISCORD_WEBHOOK"):
+        LOG.warning("AMPA_DISCORD_WEBHOOK not set; discord flag will be ignored")
+    report = scheduler._run_dry_run_report(spec)
+    if report:
+        print(report)
+        if args.discord:
+            try:
+                webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+                if webhook:
+                    message = _build_dry_run_discord_message(report)
+                    payload = webhook_module.build_command_payload(
+                        os.uname().nodename,
+                        _utc_now().isoformat(),
+                        spec.command_id,
+                        message,
+                        0,
+                        title="Dry Run Report",
+                    )
+                    webhook_module.send_webhook(
+                        webhook, payload, message_type="command"
+                    )
+                else:
+                    LOG.warning(
+                        "AMPA_DISCORD_WEBHOOK not set; skipping discord notification"
+                    )
+            except Exception:
+                LOG.exception("Failed to send dry-run discord notification")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AMPA scheduler")
     sub = parser.add_subparsers(dest="command")
@@ -1643,6 +1972,9 @@ def _build_parser() -> argparse.ArgumentParser:
     remove = sub.add_parser("remove", help="Remove a scheduled command")
     remove.add_argument("command_id")
 
+    dry_run = sub.add_parser("dry-run", help="Generate a dry-run report")
+    dry_run.add_argument("--discord", action="store_true")
+
     return parser
 
 
@@ -1662,6 +1994,7 @@ def main() -> None:
         "add": _cli_add,
         "update": _cli_update,
         "remove": _cli_remove,
+        "dry-run": _cli_dry_run,
     }
     handler = handlers.get(args.command)
     if handler is None:

@@ -126,3 +126,30 @@ Scheduler admin CLI
   Use the scheduler CLI for admin tasks (listing, adding, updating commands):
 
     python -m ampa.scheduler list
+
+Live delegation
+
+  Delegation runs as part of triage-audit and only when `audit_only` is false.
+  It also requires no in-progress work items. When idle, it selects the top
+  `wl next` candidate and dispatches the appropriate workflow:
+
+  - stage `idea`: runs `/intake <id>`
+  - stage `intake_complete`: runs `/plan <id>`
+  - stage `plan_complete`: runs `work on <id> using the implement skill`
+
+
+Dry-run report
+
+Generate a read-only report listing in-progress items, candidates from `wl next`,
+and the top candidate with rationale.
+
+  python -m ampa.scheduler dry-run
+
+Send the report to Discord (requires `AMPA_DISCORD_WEBHOOK`):
+
+  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.scheduler dry-run --discord
+
+Candidate selection
+
+The candidate selection service calls `wl next --json` and returns the top
+candidate from that response.

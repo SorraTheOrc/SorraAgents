@@ -1,0 +1,98 @@
+import json
+import subprocess
+
+from ampa.scheduler import Scheduler, SchedulerConfig, SchedulerStore, CommandSpec
+from ampa import webhook
+
+
+class DummyStore(SchedulerStore):
+    def __init__(self) -> None:
+        self.path = ":memory:"
+        self.data = {"commands": {}, "state": {}, "last_global_start_ts": None}
+
+    def save(self) -> None:
+        return None
+
+
+def _make_scheduler(run_shell_callable, tmp_path):
+    store = DummyStore()
+    config = SchedulerConfig(
+        poll_interval_seconds=1,
+        global_min_interval_seconds=1,
+        priority_weight=0.1,
+        store_path=str(tmp_path / "store.json"),
+        llm_healthcheck_url="http://localhost/health",
+        max_run_history=5,
+    )
+    return Scheduler(
+        store, config, run_shell=run_shell_callable, command_cwd=str(tmp_path)
+    )
+
+
+def test_dry_run_report_and_discord_message(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress":
+            out = "Found 1 in_progress work item(s):\n\n- Example item - SA-123"
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip() == "wl next --json":
+            payload = {
+                "items": [
+                    {"id": "SA-999", "title": "Next work", "status": "open"},
+                    {"id": "SA-555", "title": "Later work"},
+                ]
+            }
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    captured = {}
+
+    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["message_type"] = message_type
+        return 204
+
+    monkeypatch.setattr(webhook, "send_webhook", fake_send_webhook)
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    sched = _make_scheduler(fake_run_shell, tmp_path)
+    spec = CommandSpec(
+        command_id="dry-run",
+        command="",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={},
+        title="Dry Run Report",
+        command_type="dry-run",
+    )
+
+    report = sched._run_dry_run_report(spec)
+    assert report is not None
+    assert "AMPA Dry Run Report" in report
+    assert "Example item - SA-123" in report
+    assert "Next work - SA-999" in report
+
+    message = sched._run_dry_run_report(spec)
+    assert message is not None
+    payload = webhook.build_command_payload(
+        "host",
+        "2026-01-01T00:00:00+00:00",
+        "dry-run",
+        message,
+        0,
+        title="Dry Run Report",
+    )
+    webhook.send_webhook(
+        "http://example.invalid/webhook", payload, message_type="command"
+    )
+
+    assert "url" in captured
+    assert captured["message_type"] == "command"

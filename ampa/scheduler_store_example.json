@@ -44,14 +44,15 @@
       "id": "wl-triage-audit",
       "title": "Triage Audit",
       "max_runtime_minutes": 5,
-        "metadata": {
+      "metadata": {
         "discord_label": "wl triage audit",
         "audit_cooldown_hours": 6,
         "audit_cooldown_hours_in_progress": 6,
         "audit_cooldown_hours_in_review": 1,
         "audit_cooldown_hours_blocked": 6,
         "truncate_chars": 65536,
-        "include_blocked": true
+        "include_blocked": true,
+        "audit_only": false
       },
       "priority": 0,
       "requires_llm": false,
