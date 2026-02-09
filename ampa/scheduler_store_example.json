@@ -58,6 +58,21 @@
       "requires_llm": false,
       "type": "triage-audit"
     }
+    ,
+    "delegation": {
+      "command": "",
+      "frequency_minutes": 2,
+      "id": "delegation",
+      "title": "Delegation Report",
+      "max_runtime_minutes": 5,
+      "metadata": {
+        "discord_label": "delegation report",
+        "audit_only": false
+      },
+      "priority": 0,
+      "requires_llm": false,
+      "type": "delegation"
+    }
   },
   "last_global_start_ts": "2026-02-05T07:51:52.053932+00:00",
   "state": {

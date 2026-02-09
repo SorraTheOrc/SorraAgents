@@ -28,9 +28,10 @@ Scheduled shell commands run in the working directory where the scheduler daemon
 
 ## Delegation gating
 
-Delegation is gated by `audit_only` metadata in the triage-audit command. When `audit_only`
-is true, delegation is skipped. Otherwise it no-ops if any `wl in_progress` items exist.
-When idle, it selects the top `wl next` candidate and dispatches the appropriate workflow command.
+Delegation is gated by `audit_only` metadata in the triage-audit and delegation commands. When
+`audit_only` is true, delegation is skipped. Otherwise it no-ops if any `wl in_progress` items
+exist. When idle, it selects the top `wl next` candidate and dispatches the appropriate workflow
+command.
 
 ## Store schema
 
@@ -100,6 +101,11 @@ The store is a JSON file with the following top-level structure (see `ampa/sched
   "last_global_start_ts": "2026-02-04T00:00:00+00:00"
 }
 ```
+
+## Admin CLI
+
+- `python -m ampa.scheduler run-once <command-id>`: execute a stored command immediately and
+  return its exit code.
 
 
 ## Scheduling algorithm

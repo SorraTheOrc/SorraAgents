@@ -26,7 +26,7 @@ except Exception:  # pragma: no cover - optional behavior
 LOG = logging.getLogger("ampa.daemon")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-__all__ = ["get_env_config", "run_once"]
+__all__ = ["get_env_config", "run_once", "load_env"]
 
 # Use webhook helpers from ampa.webhook as the single source of truth.
 from .webhook import (
@@ -45,11 +45,8 @@ from .metrics import (
 from .metrics import start_metrics_server
 
 
-def get_env_config() -> Dict[str, Any]:
-    """Read and validate environment configuration.
-
-    Raises SystemExit (2) if AMPA_DISCORD_WEBHOOK is not set.
-    """
+def load_env() -> None:
+    """Load environment overrides from .env when available."""
     # If an .env file exists in the package directory, load it so values there
     # override the environment. Loading is optional; if python-dotenv is not
     # installed we skip loading the file.
@@ -72,6 +69,14 @@ def get_env_config() -> Dict[str, Any]:
             root_env = os.path.join(os.getcwd(), ".env")
             if os.path.isfile(root_env):
                 load_dotenv(root_env, override=True)
+
+
+def get_env_config() -> Dict[str, Any]:
+    """Read and validate environment configuration.
+
+    Raises SystemExit (2) if AMPA_DISCORD_WEBHOOK is not set.
+    """
+    load_env()
 
     # Read webhook and be tolerant of values coming from Docker `--env-file`
     # which preserve surrounding quotes. Strip whitespace and surrounding
