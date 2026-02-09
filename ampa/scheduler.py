@@ -400,9 +400,6 @@ def _build_dry_run_report(
         for item in in_progress_items:
             # match the visual style requested (em dash bullets)
             lines.append(f"── {item}")
-        # include the original report header for compatibility with callers/tests
-        # that expect a longer-form report (e.g. webhook payload builders)
-        lines.insert(0, "AMPA Delegation")
         return "\n".join(lines)
 
     # no in-progress items -> produce full report
