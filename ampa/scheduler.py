@@ -865,6 +865,41 @@ class Scheduler:
             else:
                 print("There is no candidate to delegate.")
                 delegation_note = "Delegation: skipped (in_progress check failed)"
+            # Send a follow-up Discord notification when a delegation action
+            # was actually dispatched so the Discord report reflects the
+            # resulting state instead of the pre-delegation dry-run.
+            try:
+                webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+                if webhook and delegation_note and isinstance(delegation_note, str):
+                    # If something was dispatched, re-run the report to capture
+                    # the post-dispatch state and post that as an update.
+                    if delegation_note.startswith("Delegation: dispatched"):
+                        try:
+                            post_report = self._run_delegation_report(spec)
+                            if post_report:
+                                post_message = _build_delegation_discord_message(
+                                    post_report
+                                )
+                                payload = webhook_module.build_command_payload(
+                                    os.uname().nodename,
+                                    run.end_ts.isoformat(),
+                                    spec.command_id,
+                                    post_message,
+                                    run.exit_code,
+                                    title=(
+                                        spec.title
+                                        or spec.metadata.get("discord_label")
+                                        or "Delegation Report"
+                                    ),
+                                )
+                                webhook_module.send_webhook(
+                                    webhook, payload, message_type="command"
+                                )
+                        except Exception:
+                            LOG.exception("Failed to send post-delegation webhook")
+            except Exception:
+                LOG.exception("Delegation webhook follow-up failed")
+
             LOG.info("Delegation summary: %s", delegation_note)
             self._record_run(spec, run, exit_code, output)
             return run
@@ -1938,37 +1973,100 @@ class Scheduler:
                 )
             return "Delegation: skipped (no wl next candidates)"
 
-        candidate = candidates[0]
-        delegate_id = _extract_work_item_id(candidate)
-        if not delegate_id:
-            LOG.warning("Delegation skipped: candidate missing id")
-            return "Delegation: skipped (candidate missing id)"
-        delegate_title = _extract_work_item_title(candidate)
-        delegate_stage = _extract_work_item_stage(candidate)
-        if delegate_stage == "idea":
-            command = f'opencode run "/intake {delegate_id}"'
-            action = "intake"
-        elif delegate_stage == "intake_complete":
-            command = f'opencode run "/plan {delegate_id}"'
-            action = "plan"
-        elif delegate_stage == "plan_complete":
-            command = f'opencode run "work on {delegate_id} using the implement skill"'
-            action = "implement"
-        else:
-            LOG.info(
-                "Delegation skipped: unsupported stage %s for %s",
-                delegate_stage,
-                delegate_id,
-            )
-            return f"Delegation: skipped (unsupported stage {delegate_stage})"
+        # Try candidates in order until we find one with a supported stage.
+        command = None
+        action = ""
+        delegate_id = None
+        delegate_title = None
+        delegate_stage = None
+
+        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+
+        for candidate in candidates:
+            cid = _extract_work_item_id(candidate)
+            if not cid:
+                LOG.warning("Delegation skipping candidate with missing id")
+                continue
+            ctitle = _extract_work_item_title(candidate)
+            cstage = _extract_work_item_stage(candidate)
+
+            if cstage == "idea":
+                command = f'opencode run "/intake {cid}"'
+                action = "intake"
+            elif cstage == "intake_complete":
+                command = f'opencode run "/plan {cid}"'
+                action = "plan"
+            elif cstage == "plan_complete":
+                command = f'opencode run "work on {cid} using the implement skill"'
+                action = "implement"
+            else:
+                # Unsupported candidate stage -> log as an error and notify Discord,
+                # then continue to the next candidate instead of aborting delegation.
+                LOG.error(
+                    'Delegation encountered unsupported stage "%s" for %s (%s); trying next candidate',
+                    cstage,
+                    cid,
+                    ctitle,
+                )
+                if webhook:
+                    try:
+                        message = (
+                            f"Delegation error: unsupported stage '{cstage}' for {cid} - {ctitle}. "
+                            "Skipping to next candidate."
+                        )
+                        payload = webhook_module.build_command_payload(
+                            os.uname().nodename,
+                            _utc_now().isoformat(),
+                            "delegation_unsupported_stage",
+                            message,
+                            1,
+                            title=("Delegation: unsupported stage"),
+                        )
+                        webhook_module.send_webhook(
+                            webhook, payload, message_type="command"
+                        )
+                    except Exception:
+                        LOG.exception(
+                            "Failed to send delegation unsupported-stage webhook for %s",
+                            cid,
+                        )
+                # try next candidate
+                continue
+
+            # found actionable candidate
+            delegate_id = cid
+            delegate_title = ctitle
+            delegate_stage = cstage
+            break
+
+        if not command or not delegate_id:
+            LOG.info("Delegation skipped: no actionable candidates found")
+            return "Delegation: skipped (no wl next actionable candidates)"
 
         LOG.info("Delegation dispatch: %s", command)
         proc_delegate = _call(command)
+        # Log opencode command response to the console for operator observability.
+        try:
+            out = (proc_delegate.stdout or "").strip()
+            err = (proc_delegate.stderr or "").strip()
+        except Exception:
+            out = ""
+            err = ""
+
+        # Truncate long outputs to keep logs concise
+        def _preview(s: str, limit: int = 4000) -> str:
+            return s if len(s) <= limit else s[:limit] + "..."
+
+        if out:
+            LOG.info("Delegation command stdout: %s", _preview(out))
+        if err:
+            LOG.info("Delegation command stderr: %s", _preview(err))
+
         if proc_delegate.returncode != 0:
             LOG.warning(
                 "Delegation dispatch failed rc=%s stderr=%s",
                 proc_delegate.returncode,
-                (proc_delegate.stderr or "").strip(),
+                err,
             )
             return f"Delegation: failed ({action} {delegate_id})"
         LOG.info(
@@ -2087,7 +2185,14 @@ def _extract_work_item_title(candidate: Dict[str, Any]) -> str:
 
 
 def _extract_work_item_stage(candidate: Dict[str, Any]) -> str:
-    return str(candidate.get("stage") or candidate.get("status") or "").strip().lower()
+    # Prefer an explicit 'stage' or 'state' field when determining workflow stage.
+    # Do NOT fall back to the work item's 'status' (which is often a lifecycle
+    # flag like 'open'/'closed') because that is a different concept and causes
+    # misleading messages. Return a clear sentinel when no stage is present.
+    val = candidate.get("stage") or candidate.get("state")
+    if not val:
+        return "undefined"
+    return str(val).strip().lower()
 
 
 def _store_from_env() -> SchedulerStore:
