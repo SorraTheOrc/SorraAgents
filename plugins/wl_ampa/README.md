@@ -1,6 +1,6 @@
 # Worklog AMPA Plugin
 
-This plugin adds a `wl ampa` command with `start`, `stop`, and `status` subcommands.
+This plugin adds a `wl ampa` command with `start`, `stop`, `status`, and `run` subcommands.
 It manages daemon PID/log files under `.worklog/ampa/<name>.pid` and `.worklog/ampa/<name>.log`.
 
 ## Install
@@ -21,6 +21,7 @@ execution.
 wl ampa start [--cmd <cmd>] [--name <name>] [--foreground]
 wl ampa stop [--name <name>]
 wl ampa status [--name <name>]
+wl ampa run <command-id>
 ```
 
 If no command is supplied, the plugin resolves it in this order:

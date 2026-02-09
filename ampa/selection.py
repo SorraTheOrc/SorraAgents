@@ -38,15 +38,20 @@ class WLNextClient:
             LOG.exception("Failed running wl next")
             return None
         if getattr(proc, "returncode", 1) != 0:
-            LOG.warning("wl next failed rc=%s", getattr(proc, "returncode", None))
+            LOG.warning(
+                "wl next failed rc=%s stderr=%r",
+                getattr(proc, "returncode", None),
+                (getattr(proc, "stderr", None) or "")[:512],
+            )
             return None
         stdout = getattr(proc, "stdout", None) or ""
         if not stdout.strip():
+            LOG.warning("wl next returned empty output")
             return None
         try:
             payload = json.loads(stdout)
         except Exception:
-            LOG.warning("wl next returned invalid JSON")
+            LOG.warning("wl next returned invalid JSON payload=%r", stdout[:1024])
             return None
         return payload if isinstance(payload, dict) else {"items": payload}
 

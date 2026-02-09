@@ -127,6 +127,10 @@ Scheduler admin CLI
 
     python -m ampa.scheduler list
 
+  Run a command immediately by id:
+
+    python -m ampa.scheduler run-once <command-id>
+
 Live delegation
 
   Delegation runs as part of triage-audit and only when `audit_only` is false.
@@ -138,16 +142,18 @@ Live delegation
   - stage `plan_complete`: runs `work on <id> using the implement skill`
 
 
-Dry-run report
+Delegation report
 
-Generate a read-only report listing in-progress items, candidates from `wl next`,
-and the top candidate with rationale.
+Generate a report listing in-progress items, candidates from `wl next`,
+and the top candidate with rationale. This command also runs idle delegation
+when the system has no in-progress items. Set `audit_only` metadata to true
+to skip dispatch.
 
-  python -m ampa.scheduler dry-run
+  python -m ampa.scheduler delegation
 
 Send the report to Discord (requires `AMPA_DISCORD_WEBHOOK`):
 
-  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.scheduler dry-run --discord
+  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.scheduler delegation --discord
 
 Candidate selection
 

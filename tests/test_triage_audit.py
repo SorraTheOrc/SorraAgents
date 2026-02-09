@@ -4,7 +4,9 @@ import glob
 import datetime as dt
 import subprocess
 import re
+from types import SimpleNamespace
 
+from ampa import scheduler
 from ampa.scheduler import (
     Scheduler,
     CommandSpec,
@@ -822,3 +824,50 @@ def test_triage_audit_delegation_dispatches_intake_when_idle(tmp_path, monkeypat
 
     assert any("wl next --json" in c for c in calls)
     assert any("/intake SA-TEST-1" in c for c in calls)
+
+
+def test_triage_audit_no_candidates_logs(tmp_path, monkeypatch, caplog):
+    calls = []
+
+    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"workItems": []}), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    with caplog.at_level("INFO"):
+        sched.start_command(spec)
+
+    assert calls == ["wl in_progress --json"]
+    assert any("no candidates" in message.lower() for message in caplog.messages)
+
+
+def test_scheduler_run_once_unknown_command(tmp_path, monkeypatch, capsys):
+    sched = make_scheduler(lambda *a, **k: subprocess.CompletedProcess("", 0), tmp_path)
+    monkeypatch.setattr(scheduler, "load_scheduler", lambda command_cwd=None: sched)
+    monkeypatch.setattr(scheduler.daemon, "load_env", lambda: None)
+    args = SimpleNamespace(command_id="missing")
+
+    exit_code = scheduler._cli_run_once(args)
+    out = capsys.readouterr().out
+
+    assert exit_code == 2
+    assert "Unknown command id" in out

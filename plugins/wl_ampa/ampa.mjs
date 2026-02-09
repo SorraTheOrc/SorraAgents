@@ -1,5 +1,5 @@
 // Node ESM implementation of the wl 'ampa' plugin, namespaced under plugins/wl_ampa
-// Registers `wl ampa start|stop|status` and manages pid/log files under
+// Registers `wl ampa start|stop|status|run` and manages pid/log files under
 // `.worklog/ampa/<name>.(pid|log)`.
 
 import { spawn } from 'child_process';
@@ -33,6 +33,38 @@ function shellSplit(s) {
     out.push(m[1] || m[2] || m[3] || '');
   }
   return out;
+}
+
+function readDotEnvFile(envPath) {
+  if (!envPath || !fs.existsSync(envPath)) return {};
+  let content = '';
+  try {
+    content = fs.readFileSync(envPath, 'utf8');
+  } catch (e) {
+    return {};
+  }
+  const env = {};
+  const lines = content.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const normalized = trimmed.startsWith('export ') ? trimmed.slice(7).trim() : trimmed;
+    const idx = normalized.indexOf('=');
+    if (idx === -1) continue;
+    const key = normalized.slice(0, idx).trim();
+    let val = normalized.slice(idx + 1).trim();
+    if (!key) continue;
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    env[key] = val;
+  }
+  return env;
+}
+
+function readDotEnv(projectRoot, extraPaths = []) {
+  const envPaths = [path.join(projectRoot, '.env'), ...extraPaths];
+  return envPaths.reduce((acc, envPath) => Object.assign(acc, readDotEnvFile(envPath)), {});
 }
 
 async function resolveCommand(cliCmd, projectRoot) {
@@ -82,6 +114,30 @@ async function resolveCommand(cliCmd, projectRoot) {
     }
   } catch (e) {}
   return null;
+}
+
+async function resolveRunOnceCommand(projectRoot, commandId) {
+  if (!commandId) return null;
+  // Prefer bundled python package if available.
+  try {
+    const pyBundle = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py', 'ampa');
+    if (fs.existsSync(path.join(pyBundle, '__init__.py'))) {
+      const pyPath = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py');
+      const venvPython = path.join(pyPath, 'venv', 'bin', 'python');
+      const pythonBin = fs.existsSync(venvPython) ? venvPython : 'python3';
+      return {
+        cmd: [pythonBin, '-u', '-m', 'ampa.scheduler', 'run-once', commandId],
+        env: { PYTHONPATH: pyPath },
+        envPaths: [path.join(pyPath, 'ampa', '.env')],
+      };
+    }
+  } catch (e) {}
+  // Fallback to repo/local package
+  return {
+    cmd: ['python3', '-m', 'ampa.scheduler', 'run-once', commandId],
+    env: {},
+    envPaths: [path.join(projectRoot, 'ampa', '.env')],
+  };
 }
 
 function ensureDirs(projectRoot, name) {
@@ -243,9 +299,23 @@ async function status(projectRoot, name = 'default') {
   }
 }
 
+async function runOnce(projectRoot, cmdSpec) {
+  const envPaths = cmdSpec && Array.isArray(cmdSpec.envPaths) ? cmdSpec.envPaths : [];
+  const dotenvEnv = readDotEnv(projectRoot, envPaths);
+  if (cmdSpec && cmdSpec.cmd && Array.isArray(cmdSpec.cmd)) {
+    const env = Object.assign({}, process.env, dotenvEnv, cmdSpec.env || {});
+    const proc = spawn(cmdSpec.cmd[0], cmdSpec.cmd.slice(1), { cwd: projectRoot, stdio: 'inherit', env });
+    return await new Promise((resolve) => {
+      proc.on('exit', (code) => resolve(code || 0));
+      proc.on('error', () => resolve(1));
+    });
+  }
+  return 1;
+}
+
 export default function register(ctx) {
   const { program } = ctx;
-  const ampa = program.command('ampa').description('Manage project dev daemons: start | stop | status');
+  const ampa = program.command('ampa').description('Manage project dev daemons: start | stop | status | run');
 
   ampa
     .command('start')
@@ -297,6 +367,23 @@ export default function register(ctx) {
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
       const code = await status(cwd, opts.name);
+      process.exitCode = code;
+    });
+
+  ampa
+    .command('run')
+    .description('Run a scheduler command immediately by id')
+    .arguments('<command-id>')
+    .action(async (commandId) => {
+      let cwd = process.cwd();
+      try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
+      const cmdSpec = await resolveRunOnceCommand(cwd, commandId);
+      if (!cmdSpec) {
+        console.error('No run-once command resolved.');
+        process.exitCode = 2;
+        return;
+      }
+      const code = await runOnce(cwd, cmdSpec);
       process.exitCode = code;
     });
 
