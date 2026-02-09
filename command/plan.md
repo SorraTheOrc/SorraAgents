@@ -120,7 +120,7 @@ Keep asking questions until the breakdown into features is clear.
 5. Update work items (agent)
 
 - Create child work items for each feature with a parent link to the original work item:
-- `wl create --title "<Short Title>" --description "<Full feature description>" --parent <work-item-id> --priority P2 --stage idea --validate --json`
+- `wl create --title "<Short Title>" --description "<Full feature description>" --parent <work-item-id> --priority P2 --stage idea --json`
 - Create dependency edges between feature work items where the plan specifies dependencies:
   - `wl dep add <DependentFeatureId> <PrereqFeatureId>`
 
@@ -143,7 +143,7 @@ Keep asking questions until the breakdown into features is clear.
 - Preserve author intent; where the agent is uncertain, create an Open Question entry rather than making assumptions.
 - Keep changes minimal and conservative.
 - Respect `.gitignore` and other ignore rules when scanning files for context.
-- **Worklog validation**: when creating `feature` or `task` work items with `--validate`, ensure the description includes a `## Acceptance Criteria` section (the validator rejects missing sections).
+- **Worklog validation**: when creating `feature` or `task` work items ensure the description includes a `## Acceptance Criteria` section.
 - **JSON parsing**: `wl ... --json` output may be either an object or an array; when extracting ids with `jq`, handle both shapes (e.g., `if type=="array" then .[0].id elif type=="object" then .id end`).
 - If any automated step fails or is ambiguous, surface an explicit Open Question and pause for human guidance.
 
