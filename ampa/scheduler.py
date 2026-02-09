@@ -390,15 +390,26 @@ def _build_dry_run_report(
     candidates: List[Dict[str, Any]],
     top_candidate: Optional[Dict[str, Any]],
 ) -> str:
+    # If there are in-progress items, produce a concise, operator-friendly
+    # message listing those items and skip the verbose candidate/top-candidate
+    # sections. This keeps the operator-facing output short when agents are
+    # actively working.
+    in_progress_items = _format_in_progress_items(in_progress_output)
+    if in_progress_items:
+        lines: List[str] = ["Agents are currently busy with:"]
+        for item in in_progress_items:
+            # match the visual style requested (em dash bullets)
+            lines.append(f"── {item}")
+        # include the original report header for compatibility with callers/tests
+        # that expect a longer-form report (e.g. webhook payload builders)
+        lines.insert(0, "AMPA Delegation")
+        return "\n".join(lines)
+
+    # no in-progress items -> produce full report
     sections: List[str] = []
     sections.append("AMPA Delegation")
-
-    in_progress_items = _format_in_progress_items(in_progress_output)
     sections.append("In-progress items:")
-    if in_progress_items:
-        sections.extend([f"- {item}" for item in in_progress_items])
-    else:
-        sections.append("- (none)")
+    sections.append("- (none)")
 
     sections.append("Candidates:")
     if candidates:
@@ -415,7 +426,7 @@ def _build_dry_run_report(
         sections.append("- (none)")
         sections.append("Rationale: no candidates returned by wl next.")
 
-    if not in_progress_items and not candidates and not top_candidate:
+    if not candidates and not top_candidate:
         sections.append(
             "Summary: delegation is idle (no in-progress items or candidates)."
         )

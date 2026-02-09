@@ -1,4 +1,5 @@
 import json
+import json
 import subprocess
 
 from ampa.scheduler import Scheduler, SchedulerConfig, SchedulerStore, CommandSpec
@@ -64,31 +65,33 @@ def test_dry_run_report_and_discord_message(tmp_path, monkeypatch):
 
     sched = _make_scheduler(fake_run_shell, tmp_path)
     spec = CommandSpec(
-        command_id="dry-run",
+        command_id="delegation",
         command="",
         requires_llm=False,
         frequency_minutes=1,
         priority=0,
         metadata={},
-        title="Dry Run Report",
-        command_type="dry-run",
+        title="Delegation Report",
+        command_type="delegation",
     )
 
-    report = sched._run_dry_run_report(spec)
+    report = sched._run_delegation_report(spec)
     assert report is not None
-    assert "AMPA Dry Run Report" in report
+    assert "AMPA Delegation" in report
     assert "Example item - SA-123" in report
-    assert "Next work - SA-999" in report
+    # when in-progress items exist, report should be concise
+    assert "Agents are currently busy with:" in report
+    assert "Next work - SA-999" not in report
 
-    message = sched._run_dry_run_report(spec)
+    message = sched._run_delegation_report(spec)
     assert message is not None
     payload = webhook.build_command_payload(
         "host",
         "2026-01-01T00:00:00+00:00",
-        "dry-run",
+        "delegation",
         message,
         0,
-        title="Dry Run Report",
+        title="Delegation Report",
     )
     webhook.send_webhook(
         "http://example.invalid/webhook", payload, message_type="command"
