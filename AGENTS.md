@@ -91,7 +91,7 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - Whenever you are provided with, or discover, a new work item create it in wl immediately
 - Whenever you are provided with or discover important context (specifications, designs, user-stories) ensure the information is added to the description of the relevant work item(s) OR create a new work item if none exist
 - Whenever you create a planning document (PRD, spec, design doc) add references to the document in the description of any work item that is directly related to the document
-- Work items cannot be closed until all child items are closed, all blocking dependencies resolved and a Producer has reviewed and approved the work
+- A child work-item may be closed independently; however, a parent work-item can only be closed once all of its child work-items are closed, all blocking dependencies are resolved, and a Producer has reviewed and approved the work
 - Never commit changes without associating them with a work item
 - Never commit changes without ensuring all tests and quality checks pass
 - Always record the commit message and hash of any commits made in a comment on the relevant work item(s)
@@ -259,10 +259,8 @@ wl list --assignee "<assignee-name>" --json
 # List items filtered by stage (e.g. triage, review, done)
 wl list --stage review --json
 
-# Show details for a specific work item
-wl show <work-item-id> --comments --json
-# Show details including child/subtask items
-wl show <work-item-id> --children --json
+# Show full details for a specific work item
+wl show <work-item-id> --format full --json
 ```
 
 #### Team
