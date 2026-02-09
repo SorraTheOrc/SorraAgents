@@ -267,6 +267,12 @@ class SchedulerStore:
         self.data["commands"][spec.command_id] = spec.to_dict()
         self.save()
 
+    def get_command(self, command_id: str) -> Optional[CommandSpec]:
+        payload = self.data.get("commands", {}).get(command_id)
+        if not payload:
+            return None
+        return CommandSpec.from_dict(payload)
+
     def get_state(self, command_id: str) -> Dict[str, Any]:
         return dict(self.data.get("state", {}).get(command_id, {}))
 
@@ -335,6 +341,14 @@ def _trim_text(value: Optional[str]) -> str:
     return value.strip() if value else ""
 
 
+def _bool_meta(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def _format_in_progress_items(text: str) -> List[str]:
     lines = [line.rstrip() for line in (text or "").splitlines()]
     items: List[str] = []
@@ -377,7 +391,7 @@ def _build_dry_run_report(
     top_candidate: Optional[Dict[str, Any]],
 ) -> str:
     sections: List[str] = []
-    sections.append("AMPA Dry Run Report")
+    sections.append("AMPA Delegation")
 
     in_progress_items = _format_in_progress_items(in_progress_output)
     sections.append("In-progress items:")
@@ -401,6 +415,11 @@ def _build_dry_run_report(
         sections.append("- (none)")
         sections.append("Rationale: no candidates returned by wl next.")
 
+    if not in_progress_items and not candidates and not top_candidate:
+        sections.append(
+            "Summary: delegation is idle (no in-progress items or candidates)."
+        )
+
     return "\n".join(sections)
 
 
@@ -412,6 +431,90 @@ def _build_dry_run_discord_message(report: str) -> str:
     if report and report.strip():
         return report.strip()
     return "(no report details)"
+
+
+def _build_delegation_report(
+    *,
+    in_progress_output: str,
+    candidates: List[Dict[str, Any]],
+    top_candidate: Optional[Dict[str, Any]],
+) -> str:
+    return _build_dry_run_report(
+        in_progress_output=in_progress_output,
+        candidates=candidates,
+        top_candidate=top_candidate,
+    )
+
+
+def _build_delegation_discord_message(report: str) -> str:
+    return _build_dry_run_discord_message(report)
+
+
+def _normalize_work_item_payload(payload: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("workItem", "work_item", "item", "data"):
+        val = payload.get(key)
+        if isinstance(val, dict):
+            return val
+    return payload
+
+
+def _excerpt_text(value: Optional[str], limit: int = 300) -> str:
+    if not value:
+        return ""
+    text = " ".join(value.split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def _format_assignee(value: Any) -> str:
+    if not value:
+        return "(none)"
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("id") or value.get("email") or value)
+    if isinstance(value, list):
+        names = [
+            _format_assignee(item)
+            for item in value
+            if item and _format_assignee(item) != "(none)"
+        ]
+        return ", ".join(names) if names else "(none)"
+    return str(value)
+
+
+def _build_work_item_markdown(item: Dict[str, Any]) -> str:
+    work_id = str(
+        item.get("id")
+        or item.get("work_item_id")
+        or item.get("workItemId")
+        or "(unknown id)"
+    )
+    title = str(item.get("title") or item.get("name") or "(no title)")
+    status = str(item.get("status") or item.get("stage") or item.get("state") or "")
+    if not status:
+        status = "(unknown)"
+    priority = item.get("priority")
+    priority_text = str(priority) if priority is not None else "(none)"
+    assignee_text = _format_assignee(item.get("assignee") or item.get("owner"))
+    description = item.get("description") or item.get("desc") or ""
+    excerpt = _excerpt_text(str(description)) or "(none)"
+    lines = [
+        f"# {title} - {work_id}",
+        f"- ID: {work_id}",
+        f"- Status/Stage: {status}",
+        f"- Priority: {priority_text}",
+        f"- Assignee: {assignee_text}",
+        "",
+        "Description:",
+        excerpt,
+        "",
+        "```json",
+        json.dumps(item, indent=2, sort_keys=True),
+        "```",
+    ]
+    return "\n".join(lines)
 
 
 def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> RunResult:
@@ -584,6 +687,90 @@ class Scheduler:
         state["run_history"] = history[-self.config.max_run_history :]
         self.store.update_state(spec.command_id, state)
 
+    def _inspect_idle_delegation(self) -> Dict[str, Any]:
+        def _call(cmd: str) -> subprocess.CompletedProcess:
+            LOG.debug("Running shell (delegation): %s", cmd)
+            return self.run_shell(
+                cmd,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+
+        def _parse_in_progress(payload: Any) -> List[Dict[str, Any]]:
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+            if isinstance(payload, dict):
+                for key in ("workItems", "work_items", "items", "data"):
+                    val = payload.get(key)
+                    if isinstance(val, list):
+                        return [item for item in val if isinstance(item, dict)]
+            return []
+
+        def _load_in_progress() -> Optional[List[Dict[str, Any]]]:
+            proc = _call("wl in_progress --json")
+            if proc.returncode != 0:
+                LOG.warning(
+                    "Delegation check failed: wl in_progress rc=%s stderr=%r",
+                    proc.returncode,
+                    (proc.stderr or "")[:512],
+                )
+                return None
+            try:
+                raw = json.loads(proc.stdout or "null")
+            except Exception:
+                LOG.exception(
+                    "Failed to parse wl in_progress output for delegation payload=%r",
+                    (proc.stdout or "")[:1024],
+                )
+                return None
+            return _parse_in_progress(raw)
+
+        idle_items = _load_in_progress()
+        if idle_items is None:
+            idle_items = _load_in_progress()
+            if idle_items is None:
+                return {"status": "error", "reason": "in_progress_failed"}
+        if idle_items:
+            return {"status": "in_progress", "items": idle_items}
+
+        candidates, payload = selection.fetch_candidates(
+            run_shell=self.run_shell, command_cwd=self.command_cwd
+        )
+        if not candidates:
+            return {"status": "idle_no_candidate", "payload": payload}
+        return {"status": "idle_with_candidate", "candidate": candidates[0]}
+
+    def _fetch_work_item_markdown(self, work_id: str) -> Optional[str]:
+        cmd = f"wl show {work_id} --json"
+        proc = self.run_shell(
+            cmd,
+            shell=True,
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=self.command_cwd,
+        )
+        if proc.returncode != 0:
+            LOG.warning(
+                "wl show failed for %s rc=%s stderr=%r",
+                work_id,
+                proc.returncode,
+                (proc.stderr or "")[:512],
+            )
+            return None
+        try:
+            payload = json.loads(proc.stdout or "null")
+        except Exception:
+            LOG.exception("Failed to parse wl show output for %s", work_id)
+            return None
+        item = _normalize_work_item_payload(payload)
+        if not item:
+            return None
+        return _build_work_item_markdown(item)
+
     def start_command(
         self, spec: CommandSpec, now: Optional[dt.datetime] = None
     ) -> RunResult:
@@ -611,18 +798,18 @@ class Scheduler:
         if isinstance(run, CommandRunResult):
             output = run.output
             exit_code = run.exit_code
-        if spec.command_type == "dry-run":
-            dry_report = None
+        if spec.command_type == "delegation":
+            report = None
             try:
-                dry_report = self._run_dry_run_report(spec)
+                report = self._run_delegation_report(spec)
             except Exception:
-                LOG.exception("Dry-run report generation failed")
-            if dry_report:
-                output = dry_report
+                LOG.exception("Delegation report generation failed")
+            if report:
+                output = report
                 try:
                     webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
                     if webhook:
-                        message = _build_dry_run_discord_message(dry_report)
+                        message = _build_delegation_discord_message(report)
                         payload = webhook_module.build_command_payload(
                             os.uname().nodename,
                             run.end_ts.isoformat(),
@@ -632,16 +819,45 @@ class Scheduler:
                             title=(
                                 spec.title
                                 or spec.metadata.get("discord_label")
-                                or "Dry Run Report"
+                                or "Delegation Report"
                             ),
                         )
                         webhook_module.send_webhook(
                             webhook, payload, message_type="command"
                         )
                 except Exception:
-                    LOG.exception("Dry-run discord notification failed")
-            if output:
-                print(output)
+                    LOG.exception("Delegation discord notification failed")
+            audit_only = _bool_meta(spec.metadata.get("audit_only"))
+            inspect = self._inspect_idle_delegation()
+            status = inspect.get("status")
+            if status == "in_progress":
+                print(
+                    "There is work in progress and thus no new work will be delegated."
+                )
+                delegation_note = "Delegation: skipped (in_progress items)"
+            elif status == "idle_no_candidate":
+                print("There is no candidate to delegate.")
+                delegation_note = "Delegation: skipped (no wl next candidates)"
+            elif status == "idle_with_candidate":
+                candidate = inspect.get("candidate") or {}
+                delegate_id = _extract_work_item_id(candidate)
+                delegate_title = _extract_work_item_title(candidate)
+                markdown = (
+                    self._fetch_work_item_markdown(delegate_id) if delegate_id else None
+                )
+                if markdown:
+                    # Print the operator-facing lead line exactly, then the
+                    # readable markdown summary (including fenced JSON) on the
+                    # following lines without extra blank lines.
+                    print("Starting work on")
+                    print(markdown)
+                else:
+                    print(f"Starting work on: {delegate_title} - {delegate_id or '?'}")
+                delegation_note = self._run_idle_delegation(audit_only=audit_only)
+            else:
+                print("There is no candidate to delegate.")
+                delegation_note = "Delegation: skipped (in_progress check failed)"
+            LOG.info("Delegation summary: %s", delegation_note)
             self._record_run(spec, run, exit_code, output)
             return run
         self._record_run(spec, run, exit_code, output)
@@ -681,13 +897,6 @@ class Scheduler:
             truncate_chars = int(spec.metadata.get("truncate_chars", 65536))
         except Exception:
             truncate_chars = 65536
-
-        def _bool_meta(value: Any) -> bool:
-            if isinstance(value, bool):
-                return value
-            if value is None:
-                return False
-            return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
         audit_only = _bool_meta(spec.metadata.get("audit_only"))
 
@@ -816,7 +1025,7 @@ class Scheduler:
             items = list(unique.values())
 
             if not items:
-                LOG.info("Triage audit found no in_progress or blocked items")
+                LOG.info("Triage audit found no candidates")
                 return False
             LOG.info(
                 "Found %d candidate work item(s) (in_progress+blocked)", len(items)
@@ -980,7 +1189,7 @@ class Scheduler:
                 candidates.append((updated, {**it, "id": wid}))
 
             if not candidates:
-                LOG.info("Triage audit found no eligible items after cooldown filter")
+                LOG.info("Triage audit found no candidates after cooldown filter")
                 return False
 
             # sort by updated timestamp ascending (oldest first), None treated as oldest
@@ -1003,94 +1212,7 @@ class Scheduler:
 
             def _delegate_when_idle() -> None:
                 nonlocal delegation_note
-                if audit_only:
-                    delegation_note = "Delegation: skipped (audit_only)"
-                    return
-                proc_idle = _call("wl in_progress --json")
-                if proc_idle.returncode != 0:
-                    LOG.warning(
-                        "Delegation check failed: wl in_progress rc=%s",
-                        proc_idle.returncode,
-                    )
-                    delegation_note = "Delegation: skipped (in_progress check failed)"
-                    return
-                try:
-                    raw_idle = json.loads(proc_idle.stdout or "null")
-                except Exception:
-                    LOG.exception(
-                        "Failed to parse wl in_progress output for delegation"
-                    )
-                    delegation_note = "Delegation: skipped (invalid in_progress JSON)"
-                    return
-                idle_items: List[Dict[str, Any]] = []
-                if isinstance(raw_idle, list):
-                    idle_items = [item for item in raw_idle if isinstance(item, dict)]
-                elif isinstance(raw_idle, dict):
-                    for key in ("workItems", "work_items", "items", "data"):
-                        val = raw_idle.get(key)
-                        if isinstance(val, list):
-                            idle_items = [
-                                item for item in val if isinstance(item, dict)
-                            ]
-                            break
-                if idle_items:
-                    LOG.info("Delegation skipped: in-progress items exist")
-                    delegation_note = "Delegation: skipped (in_progress items)"
-                    return
-
-                candidates, _payload = selection.fetch_candidates(
-                    run_shell=self.run_shell, command_cwd=self.command_cwd
-                )
-                if not candidates:
-                    LOG.info("Delegation skipped: no wl next candidates")
-                    delegation_note = "Delegation: skipped (no wl next candidates)"
-                    return
-
-                candidate = candidates[0]
-                delegate_id = _extract_work_item_id(candidate)
-                if not delegate_id:
-                    LOG.warning("Delegation skipped: candidate missing id")
-                    delegation_note = "Delegation: skipped (candidate missing id)"
-                    return
-                delegate_title = _extract_work_item_title(candidate)
-                delegate_stage = _extract_work_item_stage(candidate)
-                if delegate_stage == "idea":
-                    command = f'opencode run "/intake {delegate_id}"'
-                    action = "intake"
-                elif delegate_stage == "intake_complete":
-                    command = f'opencode run "/plan {delegate_id}"'
-                    action = "plan"
-                elif delegate_stage == "plan_complete":
-                    command = f'opencode run "work on {delegate_id} using the implement skill"'
-                    action = "implement"
-                else:
-                    LOG.info(
-                        "Delegation skipped: unsupported stage %s for %s",
-                        delegate_stage,
-                        delegate_id,
-                    )
-                    delegation_note = (
-                        f"Delegation: skipped (unsupported stage {delegate_stage})"
-                    )
-                    return
-
-                LOG.info("Delegation dispatch: %s", command)
-                proc_delegate = _call(command)
-                if proc_delegate.returncode != 0:
-                    LOG.warning(
-                        "Delegation dispatch failed rc=%s stderr=%s",
-                        proc_delegate.returncode,
-                        (proc_delegate.stderr or "").strip(),
-                    )
-                    delegation_note = f"Delegation: failed ({action} {delegate_id})"
-                    return
-                LOG.info(
-                    "Delegation dispatched %s for %s — %s",
-                    action,
-                    delegate_id,
-                    delegate_title,
-                )
-                delegation_note = f"Delegation: dispatched {action} {delegate_id}"
+                delegation_note = self._run_idle_delegation(audit_only=audit_only)
 
             # 2) run the audit command
             # use quoted subcommand so the audit string is passed as one argument
@@ -1738,9 +1860,122 @@ class Scheduler:
         )
         webhook_module.send_webhook(webhook, payload, message_type="command")
 
-    def _run_dry_run_report(self, spec: Optional[CommandSpec] = None) -> Optional[str]:
+    def _run_idle_delegation(self, *, audit_only: bool) -> str:
+        if audit_only:
+            return "Delegation: skipped (audit_only)"
+
         def _call(cmd: str) -> subprocess.CompletedProcess:
-            LOG.debug("Running shell (dry-run): %s", cmd)
+            LOG.debug("Running shell (delegation): %s", cmd)
+            return self.run_shell(
+                cmd,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+
+        def _parse_in_progress(payload: Any) -> List[Dict[str, Any]]:
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+            if isinstance(payload, dict):
+                for key in ("workItems", "work_items", "items", "data"):
+                    val = payload.get(key)
+                    if isinstance(val, list):
+                        return [item for item in val if isinstance(item, dict)]
+            return []
+
+        def _load_in_progress() -> Optional[List[Dict[str, Any]]]:
+            proc = _call("wl in_progress --json")
+            if proc.returncode != 0:
+                LOG.warning(
+                    "Delegation check failed: wl in_progress rc=%s stderr=%r",
+                    proc.returncode,
+                    (proc.stderr or "")[:512],
+                )
+                return None
+            try:
+                raw = json.loads(proc.stdout or "null")
+            except Exception:
+                LOG.exception(
+                    "Failed to parse wl in_progress output for delegation payload=%r",
+                    (proc.stdout or "")[:1024],
+                )
+                return None
+            return _parse_in_progress(raw)
+
+        idle_items = _load_in_progress()
+        if idle_items is None:
+            idle_items = _load_in_progress()
+            if idle_items is None:
+                return "Delegation: skipped (in_progress check failed)"
+        if idle_items:
+            LOG.info("Delegation skipped: in-progress items exist")
+            return "Delegation: skipped (in_progress items)"
+
+        candidates, payload = selection.fetch_candidates(
+            run_shell=self.run_shell, command_cwd=self.command_cwd
+        )
+        if not candidates:
+            if payload is None:
+                LOG.warning("Delegation skipped: wl next returned no payload")
+            else:
+                try:
+                    payload_preview = json.dumps(payload)[:1024]
+                except Exception:
+                    payload_preview = str(payload)[:1024]
+                LOG.warning(
+                    "Delegation skipped: no wl next candidates payload=%r",
+                    payload_preview,
+                )
+            return "Delegation: skipped (no wl next candidates)"
+
+        candidate = candidates[0]
+        delegate_id = _extract_work_item_id(candidate)
+        if not delegate_id:
+            LOG.warning("Delegation skipped: candidate missing id")
+            return "Delegation: skipped (candidate missing id)"
+        delegate_title = _extract_work_item_title(candidate)
+        delegate_stage = _extract_work_item_stage(candidate)
+        if delegate_stage == "idea":
+            command = f'opencode run "/intake {delegate_id}"'
+            action = "intake"
+        elif delegate_stage == "intake_complete":
+            command = f'opencode run "/plan {delegate_id}"'
+            action = "plan"
+        elif delegate_stage == "plan_complete":
+            command = f'opencode run "work on {delegate_id} using the implement skill"'
+            action = "implement"
+        else:
+            LOG.info(
+                "Delegation skipped: unsupported stage %s for %s",
+                delegate_stage,
+                delegate_id,
+            )
+            return f"Delegation: skipped (unsupported stage {delegate_stage})"
+
+        LOG.info("Delegation dispatch: %s", command)
+        proc_delegate = _call(command)
+        if proc_delegate.returncode != 0:
+            LOG.warning(
+                "Delegation dispatch failed rc=%s stderr=%s",
+                proc_delegate.returncode,
+                (proc_delegate.stderr or "").strip(),
+            )
+            return f"Delegation: failed ({action} {delegate_id})"
+        LOG.info(
+            "Delegation dispatched %s for %s — %s",
+            action,
+            delegate_id,
+            delegate_title,
+        )
+        return f"Delegation: dispatched {action} {delegate_id}"
+
+    def _run_delegation_report(
+        self, spec: Optional[CommandSpec] = None
+    ) -> Optional[str]:
+        def _call(cmd: str) -> subprocess.CompletedProcess:
+            LOG.debug("Running shell (delegation): %s", cmd)
             return self.run_shell(
                 cmd,
                 shell=True,
@@ -1762,7 +1997,7 @@ class Scheduler:
         )
         top_candidate = candidates[0] if candidates else None
 
-        report = _build_dry_run_report(
+        report = _build_delegation_report(
             in_progress_output=_trim_text(in_progress_text),
             candidates=candidates,
             top_candidate=top_candidate,
@@ -1902,32 +2137,32 @@ def _cli_remove(args: argparse.Namespace) -> int:
 def _cli_dry_run(args: argparse.Namespace) -> int:
     scheduler = load_scheduler(command_cwd=os.getcwd())
     spec = CommandSpec(
-        command_id="dry-run",
+        command_id="delegation",
         command="",
         requires_llm=False,
         frequency_minutes=1,
         priority=0,
         metadata={},
-        title="Dry Run Report",
-        command_type="dry-run",
+        title="Delegation Report",
+        command_type="delegation",
     )
     if args.discord and not os.getenv("AMPA_DISCORD_WEBHOOK"):
         LOG.warning("AMPA_DISCORD_WEBHOOK not set; discord flag will be ignored")
-    report = scheduler._run_dry_run_report(spec)
+    report = scheduler._run_delegation_report(spec)
     if report:
         print(report)
         if args.discord:
             try:
                 webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
                 if webhook:
-                    message = _build_dry_run_discord_message(report)
+                    message = _build_delegation_discord_message(report)
                     payload = webhook_module.build_command_payload(
                         os.uname().nodename,
                         _utc_now().isoformat(),
                         spec.command_id,
                         message,
                         0,
-                        title="Dry Run Report",
+                        title="Delegation Report",
                     )
                     webhook_module.send_webhook(
                         webhook, payload, message_type="command"
@@ -1937,8 +2172,26 @@ def _cli_dry_run(args: argparse.Namespace) -> int:
                         "AMPA_DISCORD_WEBHOOK not set; skipping discord notification"
                     )
             except Exception:
-                LOG.exception("Failed to send dry-run discord notification")
+                LOG.exception("Failed to send delegation discord notification")
     return 0
+
+
+def _cli_run_once(args: argparse.Namespace) -> int:
+    daemon.load_env()
+    scheduler = load_scheduler(command_cwd=os.getcwd())
+    spec = scheduler.store.get_command(args.command_id)
+    if spec is None:
+        print(f"Unknown command id: {args.command_id}")
+        return 2
+    try:
+        run = scheduler.start_command(spec)
+    except Exception:
+        LOG.exception("Run-once failed for %s", args.command_id)
+        print(f"Run-once failed for {args.command_id}")
+        return 1
+    exit_code = getattr(run, "exit_code", 1)
+    print(f"Run-once complete for {args.command_id} exit={exit_code}")
+    return int(exit_code)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1972,8 +2225,11 @@ def _build_parser() -> argparse.ArgumentParser:
     remove = sub.add_parser("remove", help="Remove a scheduled command")
     remove.add_argument("command_id")
 
-    dry_run = sub.add_parser("dry-run", help="Generate a dry-run report")
+    dry_run = sub.add_parser("delegation", help="Generate a delegation report")
     dry_run.add_argument("--discord", action="store_true")
+
+    run_once = sub.add_parser("run-once", help="Run a command immediately by id")
+    run_once.add_argument("command_id")
 
     return parser
 
@@ -1994,7 +2250,8 @@ def main() -> None:
         "add": _cli_add,
         "update": _cli_update,
         "remove": _cli_remove,
-        "dry-run": _cli_dry_run,
+        "delegation": _cli_dry_run,
+        "run-once": _cli_run_once,
     }
     handler = handlers.get(args.command)
     if handler is None:
