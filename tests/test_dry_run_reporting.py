@@ -77,10 +77,11 @@ def test_dry_run_report_and_discord_message(tmp_path, monkeypatch):
 
     report = sched._run_delegation_report(spec)
     assert report is not None
-    assert "AMPA Delegation" in report
     assert "Example item - SA-123" in report
-    # when in-progress items exist, report should be concise
+    # when in-progress items exist, report should be concise and not include the
+    # old 'AMPA Delegation' header
     assert "Agents are currently busy with:" in report
+    assert "AMPA Delegation" not in report
     assert "Next work - SA-999" not in report
 
     message = sched._run_delegation_report(spec)
