@@ -31,6 +31,7 @@ The command implements the procedural workflow below. Each numbered step is part
 
 ## Hard requirements:
 
+- Do not create a tracking work item for the intake process itself; the output of this command is the completion of a description for the work item of interest.
 - Use an interview style: concise, high-signal questions grouped to a soft-maximum of three per iteration.
 - Do not invent requirements or constraints; if unknown, ask the user.
 - Do not ask leading questions that bias the user towards a particular answer.
