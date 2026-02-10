@@ -1,0 +1,117 @@
+import json
+import subprocess
+
+from ampa.scheduler import (
+    CommandRunResult,
+    CommandSpec,
+    Scheduler,
+    SchedulerConfig,
+    SchedulerStore,
+)
+
+
+class DummyStore(SchedulerStore):
+    def __init__(self) -> None:
+        self.path = ":memory:"
+        self.data = {"commands": {}, "state": {}, "last_global_start_ts": None}
+
+    def save(self) -> None:
+        return None
+
+
+def _make_scheduler(run_shell_callable, tmp_path):
+    store = DummyStore()
+    config = SchedulerConfig(
+        poll_interval_seconds=1,
+        global_min_interval_seconds=1,
+        priority_weight=0.1,
+        store_path=str(tmp_path / "store.json"),
+        llm_healthcheck_url="http://localhost/health",
+        max_run_history=5,
+    )
+
+    def _executor(_spec):
+        now = CommandRunResult.__dataclass_fields__  # cheap no-op to satisfy type
+        # Return a minimal successful run result
+        from datetime import datetime, timezone
+
+        now_dt = datetime.now(timezone.utc)
+        return CommandRunResult(start_ts=now_dt, end_ts=now_dt, exit_code=0, output="")
+
+    return Scheduler(
+        store,
+        config,
+        run_shell=run_shell_callable,
+        command_cwd=str(tmp_path),
+        executor=_executor,
+    )
+
+
+def _delegation_spec():
+    return CommandSpec(
+        command_id="delegation",
+        command="",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={},
+        title="Delegation Report",
+        command_type="delegation",
+    )
+
+
+def test_idle_delegation_posts_single_detailed_webhook(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_send_webhook(webhook, payload, message_type=None):
+        calls.append((webhook, payload, message_type))
+
+    # patch the webhook sender used by scheduler
+    import ampa.scheduler as schedmod
+
+    monkeypatch.setattr(schedmod.webhook_module, "send_webhook", fake_send_webhook)
+    # ensure scheduler believes a webhook is configured
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "https://example.invalid/webhook")
+
+    def fake_run_shell(cmd, **kwargs):
+        s = cmd.strip()
+        if s == "wl in_progress --json":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"workItems": []}), stderr=""
+            )
+        if s == "wl in_progress":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+        if s.startswith("wl next") and "--json" in s:
+            # First candidate unsupported stage, second explicitly do-not-delegate
+            payload = {
+                "items": [
+                    {"id": "SA-unsupported", "title": "Unsupported", "stage": "closed"},
+                    {
+                        "id": "SA-skip",
+                        "title": "Skip me",
+                        "stage": "idea",
+                        "tags": ["do-not-delegate"],
+                    },
+                ]
+            }
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = _make_scheduler(fake_run_shell, tmp_path)
+    spec = _delegation_spec()
+
+    result_run = sched.start_command(spec)
+
+    # Ensure _run_idle_delegation returned a structured result recorded in logs via _record_run
+    # We can't directly access the returned dict from start_command here, but we assert webhook behavior
+    assert len(calls) == 1, "Expected one detailed idle webhook to be sent"
+    webhook, payload, mtype = calls[0]
+    assert mtype == "command"
+    # payload content should include the idle heading and considered candidates
+    content = payload.get("content") or ""
+    assert "Delegation: idle" in content or "Agents are idle" in content
+    assert "SA-unsupported" in content and "SA-skip" in content

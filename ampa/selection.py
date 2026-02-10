@@ -78,6 +78,25 @@ class WLNextClient:
         stdout = getattr(proc, "stdout", None) or ""
         if not stdout.strip():
             LOG.warning("wl next returned empty output")
+            # Fallback: if we requested multiple candidates with -n, some
+            # WL versions may only support the simpler form. Try again with
+            # `wl next --json` as a compatibility fallback.
+            if cmd.endswith("-n %d --json" % count):
+                proc2 = _run("wl next --json")
+                if (
+                    proc2
+                    and getattr(proc2, "returncode", 1) == 0
+                    and getattr(proc2, "stdout", "").strip()
+                ):
+                    try:
+                        payload = json.loads(proc2.stdout)
+                    except Exception:
+                        LOG.warning(
+                            "wl next fallback returned invalid JSON payload=%r",
+                            (proc2.stdout or "")[:1024],
+                        )
+                        return None
+                    return payload if isinstance(payload, dict) else {"items": payload}
             return None
         try:
             payload = json.loads(stdout)
@@ -124,7 +143,25 @@ def _normalize_candidates(payload: Any) -> List[Dict[str, Any]]:
                     inner = v
                     break
             out.append(inner or item)
-        return out
+        # dedupe by id preserving order
+        seen = set()
+        unique: List[Dict[str, Any]] = []
+        for it in out:
+            wid = (
+                it.get("id")
+                or it.get("work_item_id")
+                or it.get("workItemId")
+                or it.get("workItem")
+            )
+            key = str(wid) if wid is not None else None
+            if key is None:
+                unique.append(it)
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(it)
+        return unique
     if not isinstance(payload, dict):
         return []
     # Some WL implementations return a top-level 'results' list where each
@@ -142,7 +179,25 @@ def _normalize_candidates(payload: Any) -> List[Dict[str, Any]]:
                     inner = v
                     break
             out.append(inner or entry)
-        return out
+        # dedupe by id preserving order
+        seen = set()
+        unique: List[Dict[str, Any]] = []
+        for it in out:
+            wid = (
+                it.get("id")
+                or it.get("work_item_id")
+                or it.get("workItemId")
+                or it.get("workItem")
+            )
+            key = str(wid) if wid is not None else None
+            if key is None:
+                unique.append(it)
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(it)
+        return unique
 
     for key in ("candidates", "workItems", "work_items", "items", "data"):
         val = payload.get(key)

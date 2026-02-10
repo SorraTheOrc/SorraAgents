@@ -11,6 +11,8 @@ import os
 import subprocess
 import tempfile
 import re
+import uuid
+import getpass
 import shutil
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -187,6 +189,8 @@ class SchedulerStore:
                 data.setdefault("commands", {})
                 data.setdefault("state", {})
                 data.setdefault("last_global_start_ts", None)
+                # append-only dispatch records for delegation actions
+                data.setdefault("dispatches", [])
                 return data
         except FileNotFoundError:
             # Try to initialize from example file if available
@@ -211,6 +215,7 @@ class SchedulerStore:
                 "commands": {},
                 "state": {},
                 "last_global_start_ts": None,
+                "dispatches": [],
             }
 
     def _initialize_from_example(self) -> None:
@@ -244,6 +249,38 @@ class SchedulerStore:
             os.makedirs(dir_name, exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as fh:
             json.dump(self.data, fh, indent=2, sort_keys=True)
+
+    def append_dispatch(self, record: Dict[str, Any], retain_last: int = 100) -> str:
+        """Append an append-only dispatch record and persist the store.
+
+        Returns the generated dispatch id.
+        """
+        try:
+            dispatch_id = record.get("id") or uuid.uuid4().hex
+            record = dict(record)
+            record["id"] = str(dispatch_id)
+            record.setdefault("ts", _utc_now().isoformat())
+            record.setdefault("session", uuid.uuid4().hex)
+            # Best-effort runner identity
+            try:
+                record.setdefault("runner", getpass.getuser())
+            except Exception:
+                record.setdefault("runner", os.getenv("USER") or "(unknown)")
+            self.data.setdefault("dispatches", []).append(record)
+            # retention: keep only the most recent `retain_last` entries
+            try:
+                if isinstance(self.data.get("dispatches"), list):
+                    self.data["dispatches"] = self.data["dispatches"][
+                        -int(retain_last) :
+                    ]
+            except Exception:
+                pass
+            self.save()
+            return str(dispatch_id)
+        except Exception:
+            LOG.exception("Failed to append dispatch record")
+            # Fallback: return a best-effort id
+            return str(uuid.uuid4().hex)
 
     def list_commands(self) -> List[CommandSpec]:
         return [
@@ -807,45 +844,99 @@ class Scheduler:
             output = run.output
             exit_code = run.exit_code
         if spec.command_type == "delegation":
-            report = None
-            try:
-                report = self._run_delegation_report(spec)
-            except Exception:
-                LOG.exception("Delegation report generation failed")
-            if report:
-                output = report
-                try:
-                    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                    if webhook:
-                        message = _build_delegation_discord_message(report)
-                        payload = webhook_module.build_command_payload(
-                            os.uname().nodename,
-                            run.end_ts.isoformat(),
-                            spec.command_id,
-                            message,
-                            run.exit_code,
-                            title=(
-                                spec.title
-                                or spec.metadata.get("discord_label")
-                                or "Delegation Report"
-                            ),
-                        )
-                        webhook_module.send_webhook(
-                            webhook, payload, message_type="command"
-                        )
-                except Exception:
-                    LOG.exception("Delegation discord notification failed")
+            # Inspect current state first. If there is a candidate that will be
+            # dispatched we want to avoid sending the pre-dispatch report to
+            # Discord (otherwise operators see two nearly-identical messages).
             audit_only = _bool_meta(spec.metadata.get("audit_only"))
             inspect = self._inspect_idle_delegation()
+            status = inspect.get("status")
+
+            # Only generate and send a pre-dispatch report when we are not
+            # about to dispatch a candidate. If we will dispatch (status
+            # == 'idle_with_candidate' and audit_only is false) skip the
+            # pre-report; a post-dispatch report will be sent after the
+            # delegation completes.
+            report = None
+            sent_pre_report = False
+            if audit_only or status != "idle_with_candidate":
+                try:
+                    report = self._run_delegation_report(spec)
+                except Exception:
+                    LOG.exception("Delegation report generation failed")
+                if report:
+                    output = report
+                    try:
+                        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+                        if webhook:
+                            message = _build_delegation_discord_message(report)
+                            payload = webhook_module.build_command_payload(
+                                os.uname().nodename,
+                                run.end_ts.isoformat(),
+                                spec.command_id,
+                                message,
+                                run.exit_code,
+                                title=(
+                                    spec.title
+                                    or spec.metadata.get("discord_label")
+                                    or "Delegation Report"
+                                ),
+                            )
+                            webhook_module.send_webhook(
+                                webhook, payload, message_type="command"
+                            )
+                            sent_pre_report = True
+                    except Exception:
+                        LOG.exception("Delegation discord notification failed")
+            # if we skipped creating a pre-report, 'report' stays None and
+            # 'output' remains as previously (possibly None). Proceed to
+            # handling the inspected status below.
+
+            # ensure status variable is available below
+            # status may already be set above; if not, extract it
             status = inspect.get("status")
             if status == "in_progress":
                 print(
                     "There is work in progress and thus no new work will be delegated."
                 )
-                delegation_note = "Delegation: skipped (in_progress items)"
+                result = {
+                    "note": "Delegation: skipped (in_progress items)",
+                    "dispatched": False,
+                    "rejected": [],
+                    "idle_webhook_sent": False,
+                }
             elif status == "idle_no_candidate":
-                print("There is no candidate to delegate.")
-                delegation_note = "Delegation: skipped (no wl next candidates)"
+                # More descriptive idle message for operators
+                idle_msg = "Agents are idle: no actionable items found"
+                print(idle_msg)
+                result = {
+                    "note": "Delegation: skipped (no actionable candidates)",
+                    "dispatched": False,
+                    "rejected": [],
+                    "idle_webhook_sent": False,
+                }
+                # If we did not already send a detailed pre-report, send a
+                # short webhook message so Discord reflects the idle state.
+                if not sent_pre_report:
+                    try:
+                        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+                        if webhook:
+                            payload = webhook_module.build_command_payload(
+                                os.uname().nodename,
+                                run.end_ts.isoformat(),
+                                spec.command_id,
+                                idle_msg,
+                                0,
+                                title=(
+                                    spec.title
+                                    or spec.metadata.get("discord_label")
+                                    or "Delegation Report"
+                                ),
+                            )
+                            webhook_module.send_webhook(
+                                webhook, payload, message_type="command"
+                            )
+                    except Exception:
+                        LOG.exception("Failed to send idle-state webhook")
             elif status == "idle_with_candidate":
                 candidate = inspect.get("candidate") or {}
                 delegate_id = _extract_work_item_id(candidate)
@@ -861,19 +952,72 @@ class Scheduler:
                     print(markdown)
                 else:
                     print(f"Starting work on: {delegate_title} - {delegate_id or '?'}")
-                delegation_note = self._run_idle_delegation(audit_only=audit_only)
+                result = self._run_idle_delegation(audit_only=audit_only, spec=spec)
+                # If delegation did not dispatch anything, ensure operators see
+                # an idle-state message unless a detailed idle webhook was
+                # already sent by the delegation routine.
+                try:
+                    note = (
+                        result.get("note") if isinstance(result, dict) else str(result)
+                    )
+                    dispatched = bool(
+                        result.get("dispatched") if isinstance(result, dict) else False
+                    )
+                    idle_webhook_sent = bool(
+                        result.get("idle_webhook_sent")
+                        if isinstance(result, dict)
+                        else False
+                    )
+                    if not dispatched:
+                        idle_msg = "Agents are idle: no actionable items found"
+                        print(idle_msg)
+                        # If we didn't already send a detailed pre-report or the
+                        # delegation routine didn't post its detailed idle webhook,
+                        # send a short idle notification so Discord reflects the
+                        # current idle state.
+                        if not sent_pre_report and not idle_webhook_sent:
+                            webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+                            if webhook:
+                                try:
+                                    payload = webhook_module.build_command_payload(
+                                        os.uname().nodename,
+                                        run.end_ts.isoformat(),
+                                        spec.command_id,
+                                        idle_msg,
+                                        0,
+                                        title=(
+                                            spec.title
+                                            or spec.metadata.get("discord_label")
+                                            or "Delegation Report"
+                                        ),
+                                    )
+                                    webhook_module.send_webhook(
+                                        webhook, payload, message_type="command"
+                                    )
+                                except Exception:
+                                    LOG.exception("Failed to send idle-state webhook")
+                except Exception:
+                    LOG.exception("Failed to handle no-actionable-candidates path")
             else:
                 print("There is no candidate to delegate.")
-                delegation_note = "Delegation: skipped (in_progress check failed)"
+                result = {
+                    "note": "Delegation: skipped (in_progress check failed)",
+                    "dispatched": False,
+                    "rejected": [],
+                    "idle_webhook_sent": False,
+                }
             # Send a follow-up Discord notification when a delegation action
             # was actually dispatched so the Discord report reflects the
             # resulting state instead of the pre-delegation dry-run.
             try:
                 webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                if webhook and delegation_note and isinstance(delegation_note, str):
+                if webhook:
                     # If something was dispatched, re-run the report to capture
                     # the post-dispatch state and post that as an update.
-                    if delegation_note.startswith("Delegation: dispatched"):
+                    dispatched_flag = False
+                    if isinstance(result, dict):
+                        dispatched_flag = bool(result.get("dispatched"))
+                    if dispatched_flag:
                         try:
                             post_report = self._run_delegation_report(spec)
                             if post_report:
@@ -900,7 +1044,16 @@ class Scheduler:
             except Exception:
                 LOG.exception("Delegation webhook follow-up failed")
 
-            LOG.info("Delegation summary: %s", delegation_note)
+            # Use the structured result.note when available
+            summary_note = None
+            if isinstance(result, dict):
+                summary_note = result.get("note")
+            else:
+                try:
+                    summary_note = str(result)
+                except Exception:
+                    summary_note = None
+            LOG.info("Delegation summary: %s", summary_note)
             self._record_run(spec, run, exit_code, output)
             return run
         self._record_run(spec, run, exit_code, output)
@@ -1251,11 +1404,13 @@ class Scheduler:
             # record selected candidate for easier observability
             LOG.info("Selected triage candidate %s — %s", work_id, title)
 
-            delegation_note: Optional[str] = None
+            delegation_result: Optional[Dict[str, Any]] = None
 
             def _delegate_when_idle() -> None:
-                nonlocal delegation_note
-                delegation_note = self._run_idle_delegation(audit_only=audit_only)
+                nonlocal delegation_result
+                delegation_result = self._run_idle_delegation(
+                    audit_only=audit_only, spec=spec
+                )
 
             # 2) run the audit command
             # use quoted subcommand so the audit string is passed as one argument
@@ -1320,8 +1475,17 @@ class Scheduler:
                 if not summary_text:
                     # fallback simple summary
                     summary_text = f"{work_id} — {title} | exit={exit_code}"
-                if delegation_note:
-                    summary_text = f"{summary_text}\n{delegation_note}"
+                if delegation_result:
+                    try:
+                        dn = (
+                            delegation_result.get("note")
+                            if isinstance(delegation_result, dict)
+                            else str(delegation_result)
+                        )
+                    except Exception:
+                        dn = None
+                    if dn:
+                        summary_text = f"{summary_text}\n{dn}"
                 # if Discord will reject long messages, summarize to <=1000 chars
                 try:
                     summary_text = _summarize_for_discord(summary_text, max_chars=1000)
@@ -1903,9 +2067,25 @@ class Scheduler:
         )
         webhook_module.send_webhook(webhook, payload, message_type="command")
 
-    def _run_idle_delegation(self, *, audit_only: bool) -> str:
+    def _run_idle_delegation(
+        self, *, audit_only: bool, spec: Optional[CommandSpec] = None
+    ) -> Dict[str, Any]:
+        """Attempt to dispatch work when agents are idle.
+
+        Returns a dict with at least the following keys:
+        - note: human-readable summary
+        - dispatched: bool (True if a delegation was dispatched)
+        - rejected: list of rejected candidate summaries (may be empty)
+        - idle_webhook_sent: bool (True if a detailed idle webhook was posted)
+        - delegate_info: optional dict with dispatch details when dispatched
+        """
         if audit_only:
-            return "Delegation: skipped (audit_only)"
+            return {
+                "note": "Delegation: skipped (audit_only)",
+                "dispatched": False,
+                "rejected": [],
+                "idle_webhook_sent": False,
+            }
 
         def _call(cmd: str) -> subprocess.CompletedProcess:
             LOG.debug("Running shell (delegation): %s", cmd)
@@ -1951,10 +2131,20 @@ class Scheduler:
         if idle_items is None:
             idle_items = _load_in_progress()
             if idle_items is None:
-                return "Delegation: skipped (in_progress check failed)"
+                return {
+                    "note": "Delegation: skipped (in_progress check failed)",
+                    "dispatched": False,
+                    "rejected": [],
+                    "idle_webhook_sent": False,
+                }
         if idle_items:
             LOG.info("Delegation skipped: in-progress items exist")
-            return "Delegation: skipped (in_progress items)"
+            return {
+                "note": "Delegation: skipped (in_progress items)",
+                "dispatched": False,
+                "rejected": [],
+                "idle_webhook_sent": False,
+            }
 
         candidates, payload = selection.fetch_candidates(
             run_shell=self.run_shell, command_cwd=self.command_cwd
@@ -1971,7 +2161,12 @@ class Scheduler:
                     "Delegation skipped: no wl next candidates payload=%r",
                     payload_preview,
                 )
-            return "Delegation: skipped (no wl next candidates)"
+            return {
+                "note": "Delegation: skipped (no wl next candidates)",
+                "dispatched": False,
+                "rejected": [],
+                "idle_webhook_sent": False,
+            }
 
         # Try candidates in order until we find one with a supported stage.
         command = None
@@ -1982,13 +2177,34 @@ class Scheduler:
 
         webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
 
+        # Track rejected candidates for reporting
+        rejected: List[Dict[str, str]] = []
+
         for candidate in candidates:
             cid = _extract_work_item_id(candidate)
             if not cid:
                 LOG.warning("Delegation skipping candidate with missing id")
+                rejected.append(
+                    {"id": "?", "title": "(unknown)", "reason": "missing id"}
+                )
                 continue
             ctitle = _extract_work_item_title(candidate)
             cstage = _extract_work_item_stage(candidate)
+
+            # Honor per-item "do-not-delegate" signal
+            try:
+                if _is_do_not_delegate(candidate):
+                    LOG.info(
+                        "Delegation skipping candidate %s (%s): marked do-not-delegate",
+                        cid,
+                        ctitle,
+                    )
+                    rejected.append(
+                        {"id": cid, "title": ctitle, "reason": "do-not-delegate"}
+                    )
+                    continue
+            except Exception:
+                LOG.exception("Failed to evaluate do-not-delegate for %s", cid)
 
             if cstage == "idea":
                 command = f'opencode run "/intake {cid}"'
@@ -2000,37 +2216,23 @@ class Scheduler:
                 command = f'opencode run "work on {cid} using the implement skill"'
                 action = "implement"
             else:
-                # Unsupported candidate stage -> log as an error and notify Discord,
-                # then continue to the next candidate instead of aborting delegation.
+                # Unsupported candidate stage -> log as an error and continue to
+                # the next candidate. We do not send per-candidate webhooks here
+                # to avoid noisy Discord messages; a single detailed idle message
+                # is emitted below if no candidate is actionable.
                 LOG.error(
                     'Delegation encountered unsupported stage "%s" for %s (%s); trying next candidate',
                     cstage,
                     cid,
                     ctitle,
                 )
-                if webhook:
-                    try:
-                        message = (
-                            f"Delegation error: unsupported stage '{cstage}' for {cid} - {ctitle}. "
-                            "Skipping to next candidate."
-                        )
-                        payload = webhook_module.build_command_payload(
-                            os.uname().nodename,
-                            _utc_now().isoformat(),
-                            "delegation_unsupported_stage",
-                            message,
-                            1,
-                            title=("Delegation: unsupported stage"),
-                        )
-                        webhook_module.send_webhook(
-                            webhook, payload, message_type="command"
-                        )
-                    except Exception:
-                        LOG.exception(
-                            "Failed to send delegation unsupported-stage webhook for %s",
-                            cid,
-                        )
-                # try next candidate
+                rejected.append(
+                    {
+                        "id": cid,
+                        "title": ctitle,
+                        "reason": f"unsupported stage '{cstage}'",
+                    }
+                )
                 continue
 
             # found actionable candidate
@@ -2041,9 +2243,96 @@ class Scheduler:
 
         if not command or not delegate_id:
             LOG.info("Delegation skipped: no actionable candidates found")
-            return "Delegation: skipped (no wl next actionable candidates)"
+            idle_webhook_sent = False
+            # Post a detailed Discord message listing rejected candidates so
+            # operators can see why items were skipped (do-not-delegate, wrong
+            # stage, missing id, etc.). Keep the message concise.
+            try:
+                if webhook and rejected:
+                    lines = [
+                        "Agents are idle: no actionable items found",
+                        "Considered candidates:",
+                    ]
+                    for r in rejected:
+                        lines.append(
+                            f"- {r.get('id')} — {r.get('title')}: {r.get('reason')}"
+                        )
+                    message = "\n".join(lines)
+                    payload = webhook_module.build_command_payload(
+                        os.uname().nodename,
+                        _utc_now().isoformat(),
+                        "delegation_idle_detailed",
+                        message,
+                        0,
+                        title=("Delegation: idle — candidates considered"),
+                    )
+                    webhook_module.send_webhook(
+                        webhook, payload, message_type="command"
+                    )
+                    idle_webhook_sent = True
+            except Exception:
+                LOG.exception("Failed to send detailed idle-state webhook")
+            return {
+                "note": "Delegation: skipped (no wl next actionable candidates)",
+                "dispatched": False,
+                "rejected": rejected,
+                "idle_webhook_sent": idle_webhook_sent,
+            }
 
+        # Before spawning opencode, record a dispatch record and notify
         LOG.info("Delegation dispatch: %s", command)
+        dispatch_record = {
+            "work_item_id": delegate_id,
+            "action": action,
+            "command": command,
+            "delegate_title": delegate_title,
+            "delegate_stage": delegate_stage,
+            "ts": _utc_now().isoformat(),
+        }
+        try:
+            # Persist dispatch record atomically in the scheduler store and
+            # include the generated id in Discord messages so operators can
+            # reference the record even if the opencode child process dies.
+            store_id = None
+            try:
+                store_id = self.store.append_dispatch(dispatch_record)
+                dispatch_record["id"] = store_id
+            except Exception:
+                LOG.exception("Failed to persist delegation dispatch record")
+        except Exception:
+            LOG.exception("Unexpected error while preparing dispatch record")
+
+        # Send a quick notification to Discord/AMPA before spawning opencode
+        try:
+            webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+            if webhook:
+                # Human-friendly pre-dispatch message: include action, title and id
+                # Keep the message concise for Discord; do not include internal
+                # dispatch record or runner metadata.
+                pre_msg_lines = [
+                    f"Delegating '{action}' task for '{delegate_title}' ({delegate_id})",
+                ]
+                pre_msg = "\n".join(pre_msg_lines)
+                payload = webhook_module.build_command_payload(
+                    os.uname().nodename,
+                    _utc_now().isoformat(),
+                    dispatch_record.get("id", "delegation_dispatch"),
+                    pre_msg,
+                    0,
+                    title=(
+                        (spec.title if spec is not None else None)
+                        or (
+                            spec.metadata.get("discord_label")
+                            if spec is not None
+                            else None
+                        )
+                        or "Delegation Dispatch"
+                    ),
+                )
+                webhook_module.send_webhook(webhook, payload, message_type="dispatch")
+        except Exception:
+            LOG.exception("Failed to send pre-dispatch webhook")
+
         proc_delegate = _call(command)
         # Log opencode command response to the console for operator observability.
         try:
@@ -2068,14 +2357,32 @@ class Scheduler:
                 proc_delegate.returncode,
                 err,
             )
-            return f"Delegation: failed ({action} {delegate_id})"
+            return {
+                "note": f"Delegation: failed ({action} {delegate_id})",
+                "dispatched": False,
+                "rejected": rejected,
+                "idle_webhook_sent": False,
+                "error": err,
+            }
         LOG.info(
             "Delegation dispatched %s for %s — %s",
             action,
             delegate_id,
             delegate_title,
         )
-        return f"Delegation: dispatched {action} {delegate_id}"
+        return {
+            "note": f"Delegation: dispatched {action} {delegate_id}",
+            "dispatched": True,
+            "delegate_info": {
+                "action": action,
+                "id": delegate_id,
+                "title": delegate_title,
+                "stdout": out,
+                "stderr": err,
+            },
+            "rejected": rejected,
+            "idle_webhook_sent": False,
+        }
 
     def _run_delegation_report(
         self, spec: Optional[CommandSpec] = None
@@ -2193,6 +2500,56 @@ def _extract_work_item_stage(candidate: Dict[str, Any]) -> str:
     if not val:
         return "undefined"
     return str(val).strip().lower()
+
+
+def _is_do_not_delegate(candidate: Dict[str, Any]) -> bool:
+    """Return True when a candidate declares it should not be delegated.
+
+    Check common places where this signal may appear:
+    - a `tags` list containing `do-not-delegate` (case-insensitive)
+    - a metadata key `do_not_delegate` or `no_delegation` truthy value
+    """
+    try:
+        tags = candidate.get("tags") or candidate.get("tag") or []
+        if isinstance(tags, str):
+            tags_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
+        elif isinstance(tags, list):
+            tags_list = [str(t).strip().lower() for t in tags if t]
+        else:
+            tags_list = []
+        if "do-not-delegate" in tags_list or "do_not_delegate" in tags_list:
+            return True
+    except Exception:
+        pass
+
+    try:
+        meta = candidate.get("metadata") or candidate.get("meta") or {}
+        if isinstance(meta, dict):
+            if str(meta.get("do_not_delegate", "")).strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+            ):
+                return True
+            if str(meta.get("no_delegation", "")).strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "y",
+            ):
+                return True
+    except Exception:
+        pass
+
+    # explicit field support
+    try:
+        if candidate.get("do_not_delegate") in (True, "true", "1", 1):
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def _store_from_env() -> SchedulerStore:
