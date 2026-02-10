@@ -1018,13 +1018,27 @@ class Scheduler:
         start_exec = _utc_now()
         try:
             run = self.executor(spec)
-        except Exception:
-            # Ensure 'running' state is cleared even when the executor fails
-            # unexpectedly. Without this, a failed run can leave the command
-            # marked as running and block future executions.
+        except BaseException as exc:
+            # Catch BaseException to ensure that signals (KeyboardInterrupt,
+            # SystemExit) and other non-Exception subclasses do not leave a
+            # command marked as `running`. We still surface a sensible
+            # RunResult so the normal post-run recording and cleanup always
+            # execute.
             LOG.exception("Executor raised an exception for %s", spec.command_id)
             end_exec = _utc_now()
-            run = RunResult(start_ts=start_exec, end_ts=end_exec, exit_code=1)
+            # Map common BaseExceptions to conventional exit codes where
+            # appropriate (SystemExit may carry an explicit code; SIGINT is
+            # typically 130). Default to 1 for other failures.
+            if isinstance(exc, SystemExit):
+                try:
+                    exit_code = int(getattr(exc, "code", 1) or 1)
+                except Exception:
+                    exit_code = 1
+            elif isinstance(exc, KeyboardInterrupt):
+                exit_code = 130
+            else:
+                exit_code = 1
+            run = RunResult(start_ts=start_exec, end_ts=end_exec, exit_code=exit_code)
             # continue execution so post-run hooks and state recording run as
             # normal and clear the running flag.
         else:
