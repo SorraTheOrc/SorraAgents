@@ -647,7 +647,123 @@ class Scheduler:
         else:
             self.executor = executor
         # injectable shell runner (for tests); defaults to subprocess.run
-        self.run_shell = run_shell or subprocess.run
+        _orig_runner = run_shell or subprocess.run
+        # default timeout for spawned commands (seconds); can be overridden
+        # per-call by passing `timeout` to the runner. Emergency default = 300s
+        try:
+            _default_timeout = int(os.getenv("AMPA_CMD_TIMEOUT_SECONDS", "300"))
+        except Exception:
+            _default_timeout = 300
+
+        def _run_shell_with_timeout(*p_args, **p_kwargs) -> subprocess.CompletedProcess:
+            # If caller provided an explicit timeout, respect it; otherwise use
+            # configured default to avoid long-hanging child processes.
+            if "timeout" not in p_kwargs:
+                p_kwargs["timeout"] = _default_timeout
+            try:
+                return _orig_runner(*p_args, **p_kwargs)
+            except subprocess.TimeoutExpired as e:
+                # Convert TimeoutExpired into a CompletedProcess-like result so
+                # callers can handle it consistently (they typically expect a
+                # CompletedProcess and check returncode/stdout/stderr).
+                out = getattr(e, "output", None)
+                err = getattr(e, "stderr", None)
+                LOG.warning(
+                    "Command timed out after %s seconds: %s",
+                    p_kwargs.get("timeout"),
+                    p_args[0] if p_args else "(command)",
+                )
+                return subprocess.CompletedProcess(
+                    args=p_args[0] if p_args else "",
+                    returncode=124,
+                    stdout=out,
+                    stderr=err,
+                )
+
+        self.run_shell = _run_shell_with_timeout
+        LOG.info("Command runner timeout configured: %ss", _default_timeout)
+        LOG.info(
+            "Scheduler initialized: store=%s poll_interval=%s global_min_interval=%s",
+            getattr(self.store, "path", "(unknown)"),
+            self.config.poll_interval_seconds,
+            self.config.global_min_interval_seconds,
+        )
+        # Log discovered commands for operator visibility
+        try:
+            commands = self.store.list_commands()
+            if commands:
+                for cmd in commands:
+                    try:
+                        LOG.info(
+                            "Discovered scheduled command: id=%s type=%s title=%s requires_llm=%s freq=%dm priority=%s",
+                            cmd.command_id,
+                            getattr(cmd, "command_type", "(unknown)"),
+                            getattr(cmd, "title", None),
+                            getattr(cmd, "requires_llm", False),
+                            getattr(cmd, "frequency_minutes", 0),
+                            getattr(cmd, "priority", 0),
+                        )
+                    except Exception:
+                        LOG.debug(
+                            "Failed to log command details for %s",
+                            getattr(cmd, "command_id", "(unknown)"),
+                        )
+            else:
+                LOG.info(
+                    "No scheduled commands discovered in store=%s",
+                    getattr(self.store, "path", "(unknown)"),
+                )
+        except Exception:
+            LOG.exception("Failed to enumerate scheduled commands for logging")
+        # Clear any stale 'running' flags left from previous crashes or
+        # interrupted runs so commands don't remain permanently blocked.
+        try:
+            self._clear_stale_running_states()
+        except Exception:
+            LOG.exception("Failed to clear stale running states")
+
+    def _clear_stale_running_states(self) -> None:
+        """Clear `running` flags for commands whose last_start_ts is older
+        than AMPA_STALE_RUNNING_THRESHOLD_SECONDS (default 3600s).
+
+        This prevents commands from remaining marked as running due to a
+        previous crash or unhandled exception which would otherwise block
+        future scheduling.
+        """
+        try:
+            thresh_raw = os.getenv("AMPA_STALE_RUNNING_THRESHOLD_SECONDS", "3600")
+            try:
+                threshold = int(thresh_raw)
+            except Exception:
+                threshold = 3600
+            now = _utc_now()
+            for cmd in self.store.list_commands():
+                try:
+                    st = self.store.get_state(cmd.command_id) or {}
+                    if st.get("running") is not True:
+                        continue
+                    last_start_iso = st.get("last_start_ts")
+                    last_start = _from_iso(last_start_iso) if last_start_iso else None
+                    age = (
+                        None
+                        if last_start is None
+                        else int((now - last_start).total_seconds())
+                    )
+                    if age is None or age > threshold:
+                        st["running"] = False
+                        self.store.update_state(cmd.command_id, st)
+                        LOG.info(
+                            "Cleared stale running flag for %s (age_s=%s)",
+                            cmd.command_id,
+                            age,
+                        )
+                except Exception:
+                    LOG.exception(
+                        "Failed to evaluate/clear running state for %s",
+                        getattr(cmd, "command_id", "?"),
+                    )
+        except Exception:
+            LOG.exception("Unexpected error while clearing stale running states")
 
     def _global_rate_limited(self, now: dt.datetime) -> bool:
         last_start = self.store.last_global_start()
@@ -733,6 +849,17 @@ class Scheduler:
         self.store.update_state(spec.command_id, state)
 
     def _inspect_idle_delegation(self) -> Dict[str, Any]:
+        # timeout (seconds) for delegation-invoked shell commands. Respect a
+        # dedicated environment override `AMPA_DELEGATION_OPENCODE_TIMEOUT`; if
+        # not set fall back to the general `AMPA_CMD_TIMEOUT_SECONDS` default.
+        try:
+            _delegate_timeout = int(
+                os.getenv("AMPA_DELEGATION_OPENCODE_TIMEOUT")
+                or os.getenv("AMPA_CMD_TIMEOUT_SECONDS", "300")
+            )
+        except Exception:
+            _delegate_timeout = 300
+
         def _call(cmd: str) -> subprocess.CompletedProcess:
             LOG.debug("Running shell (delegation): %s", cmd)
             return self.run_shell(
@@ -742,6 +869,7 @@ class Scheduler:
                 capture_output=True,
                 text=True,
                 cwd=self.command_cwd,
+                timeout=_delegate_timeout,
             )
 
         def _parse_in_progress(payload: Any) -> List[Dict[str, Any]]:
@@ -780,6 +908,11 @@ class Scheduler:
                 return {"status": "error", "reason": "in_progress_failed"}
         if idle_items:
             return {"status": "in_progress", "items": idle_items}
+
+        # read webhook early so idle/no-candidate branches can post a short
+        # notification when appropriate. Defining it once avoids warnings
+        # from static analysis and keeps behavior consistent across branches.
+        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
 
         candidates, payload = selection.fetch_candidates(
             run_shell=self.run_shell, command_cwd=self.command_cwd
@@ -830,8 +963,19 @@ class Scheduler:
             spec.command,
         )
         start_exec = _utc_now()
-        run = self.executor(spec)
-        end_exec = _utc_now()
+        try:
+            run = self.executor(spec)
+        except Exception:
+            # Ensure 'running' state is cleared even when the executor fails
+            # unexpectedly. Without this, a failed run can leave the command
+            # marked as running and block future executions.
+            LOG.exception("Executor raised an exception for %s", spec.command_id)
+            end_exec = _utc_now()
+            run = RunResult(start_ts=start_exec, end_ts=end_exec, exit_code=1)
+            # continue execution so post-run hooks and state recording run as
+            # normal and clear the running flag.
+        else:
+            end_exec = _utc_now()
         LOG.debug(
             "Executor finished for command_id=%s exit=%s duration=%.3fs",
             spec.command_id,
@@ -844,6 +988,11 @@ class Scheduler:
             output = run.output
             exit_code = run.exit_code
         if spec.command_type == "delegation":
+            LOG.info(
+                "Handling delegation command: %s (audit_only=%s)",
+                spec.command_id,
+                _bool_meta(spec.metadata.get("audit_only")),
+            )
             # Inspect current state first. If there is a candidate that will be
             # dispatched we want to avoid sending the pre-dispatch report to
             # Discord (otherwise operators see two nearly-identical messages).
@@ -860,10 +1009,17 @@ class Scheduler:
             sent_pre_report = False
             if audit_only or status != "idle_with_candidate":
                 try:
+                    LOG.info(
+                        "Generating pre-dispatch delegation report for %s",
+                        spec.command_id,
+                    )
                     report = self._run_delegation_report(spec)
                 except Exception:
                     LOG.exception("Delegation report generation failed")
                 if report:
+                    LOG.info(
+                        "Pre-dispatch delegation report generated (len=%d)", len(report)
+                    )
                     output = report
                     try:
                         webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
@@ -885,6 +1041,9 @@ class Scheduler:
                                 webhook, payload, message_type="command"
                             )
                             sent_pre_report = True
+                            LOG.info(
+                                "Sent pre-dispatch webhook for %s", spec.command_id
+                            )
                     except Exception:
                         LOG.exception("Delegation discord notification failed")
             # if we skipped creating a pre-report, 'report' stays None and
@@ -898,6 +1057,7 @@ class Scheduler:
                 print(
                     "There is work in progress and thus no new work will be delegated."
                 )
+                LOG.info("Delegation skipped because work is in-progress")
                 result = {
                     "note": "Delegation: skipped (in_progress items)",
                     "dispatched": False,
@@ -908,6 +1068,7 @@ class Scheduler:
                 # More descriptive idle message for operators
                 idle_msg = "Agents are idle: no actionable items found"
                 print(idle_msg)
+                LOG.info("Delegation: idle_no_candidate - %s", idle_msg)
                 result = {
                     "note": "Delegation: skipped (no actionable candidates)",
                     "dispatched": False,
@@ -1099,6 +1260,15 @@ class Scheduler:
         webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
 
         # helper to run shell commands via injectable runner
+        # timeout for audit-invoked opencode commands (seconds)
+        try:
+            _audit_timeout = int(
+                os.getenv("AMPA_AUDIT_OPENCODE_TIMEOUT")
+                or os.getenv("AMPA_CMD_TIMEOUT_SECONDS", "300")
+            )
+        except Exception:
+            _audit_timeout = 300
+
         def _call(cmd: str) -> subprocess.CompletedProcess:
             LOG.debug("Running shell (verbose): %s", cmd)
             start = _utc_now()
@@ -1109,6 +1279,7 @@ class Scheduler:
                 capture_output=True,
                 text=True,
                 cwd=self.command_cwd,
+                timeout=_audit_timeout,
             )
             end = _utc_now()
             try:
@@ -1222,6 +1393,27 @@ class Scheduler:
 
             if not items:
                 LOG.info("Triage audit found no candidates")
+                # Notify Discord briefly so operators see the triage run result
+                try:
+                    if webhook:
+                        msg = "Triage found no candidates to audit"
+                        payload = webhook_module.build_command_payload(
+                            os.uname().nodename,
+                            run.end_ts.isoformat(),
+                            spec.command_id,
+                            msg,
+                            0,
+                            title=(
+                                spec.title
+                                or spec.metadata.get("discord_label")
+                                or "Triage Audit"
+                            ),
+                        )
+                        webhook_module.send_webhook(
+                            webhook, payload, message_type="command"
+                        )
+                except Exception:
+                    LOG.exception("Failed to send triage-no-candidates webhook")
                 return False
             LOG.info(
                 "Found %d candidate work item(s) (in_progress+blocked)", len(items)
@@ -1386,6 +1578,26 @@ class Scheduler:
 
             if not candidates:
                 LOG.info("Triage audit found no candidates after cooldown filter")
+                try:
+                    if webhook:
+                        msg = "Triage found no candidates to audit"
+                        payload = webhook_module.build_command_payload(
+                            os.uname().nodename,
+                            run.end_ts.isoformat(),
+                            spec.command_id,
+                            msg,
+                            0,
+                            title=(
+                                spec.title
+                                or spec.metadata.get("discord_label")
+                                or "Triage Audit"
+                            ),
+                        )
+                        webhook_module.send_webhook(
+                            webhook, payload, message_type="command"
+                        )
+                except Exception:
+                    LOG.exception("Failed to send triage-no-candidates webhook")
                 return False
 
             # sort by updated timestamp ascending (oldest first), None treated as oldest
@@ -1404,13 +1616,9 @@ class Scheduler:
             # record selected candidate for easier observability
             LOG.info("Selected triage candidate %s — %s", work_id, title)
 
+            # triage should not directly dispatch work. Remove delegation call
+            # to avoid triage automatically starting delegation actions.
             delegation_result: Optional[Dict[str, Any]] = None
-
-            def _delegate_when_idle() -> None:
-                nonlocal delegation_result
-                delegation_result = self._run_idle_delegation(
-                    audit_only=audit_only, spec=spec
-                )
 
             # 2) run the audit command
             # use quoted subcommand so the audit string is passed as one argument
@@ -1433,7 +1641,9 @@ class Scheduler:
                 len(proc_audit.stderr or ""),
             )
 
-            _delegate_when_idle()
+            # Delegation from triage disabled: previously this would call
+            # `_delegate_when_idle()` which started delegation while triage ran.
+            # That coupling was surprising; do not perform delegation here.
 
             # 3) post a short Discord summary (1-3 lines)
             # helper to extract a human-facing 'Summary' section from audit output
@@ -1990,12 +2200,64 @@ class Scheduler:
     def run_forever(self) -> None:
         LOG.info("Starting scheduler loop")
         self._post_startup_message()
+        # periodic health reporting accumulator (seconds)
+        _health_accum = 0
+        _health_interval = max(1, self.config.global_min_interval_seconds)
         while True:
             try:
                 self.run_once()
             except Exception:
                 LOG.exception("Scheduler iteration failed")
-            time.sleep(self.config.poll_interval_seconds)
+            # sleep then accumulate for periodic health reporting
+            try:
+                time.sleep(self.config.poll_interval_seconds)
+            except Exception:
+                # sleep can be interrupted (signals); continue loop
+                pass
+            _health_accum += self.config.poll_interval_seconds
+            if _health_accum >= _health_interval:
+                try:
+                    self._log_health()
+                except Exception:
+                    LOG.exception("Failed to emit periodic health report")
+                _health_accum = 0
+
+    def _log_health(self) -> None:
+        """Emit a periodic health report about scheduled commands.
+
+        Reports last run timestamp, exit code and running state for each
+        discovered command so operators can quickly see recent activity.
+        """
+        try:
+            cmds = self.store.list_commands()
+        except Exception:
+            LOG.exception("Failed to read commands for health report")
+            return
+        lines: List[str] = []
+        now = _utc_now()
+        for cmd in cmds:
+            try:
+                state = self.store.get_state(cmd.command_id) or {}
+                last_run_iso = state.get("last_run_ts")
+                last_run_dt = _from_iso(last_run_iso) if last_run_iso else None
+                age = (
+                    int((now - last_run_dt).total_seconds())
+                    if last_run_dt is not None
+                    else None
+                )
+                running = bool(state.get("running"))
+                last_exit = state.get("last_exit_code")
+                lines.append(
+                    f"{cmd.command_id} title={cmd.title!r} last_run={last_run_iso or 'never'} age_s={age if age is not None else 'NA'} exit={last_exit} running={running}"
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to build health line for %s",
+                    getattr(cmd, "command_id", "?"),
+                )
+        LOG.info(
+            "Scheduler health report: %d commands\n%s", len(lines), "\n".join(lines)
+        )
 
     def simulate(
         self,
@@ -2087,7 +2349,23 @@ class Scheduler:
                 "idle_webhook_sent": False,
             }
 
+        # Ensure `webhook` is bound for all branches below to avoid static
+        # analysis errors and NameError at runtime when branches reference
+        # the variable before a later assignment. Other codepaths may
+        # re-read the env as needed, but having a single early definition
+        # avoids unbound-variable issues.
+        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+
         def _call(cmd: str) -> subprocess.CompletedProcess:
+            # Use the same delegation timeout as above; compute lazily in case
+            # this method is called independently.
+            try:
+                _delegate_timeout = int(
+                    os.getenv("AMPA_DELEGATION_OPENCODE_TIMEOUT")
+                    or os.getenv("AMPA_CMD_TIMEOUT_SECONDS", "300")
+                )
+            except Exception:
+                _delegate_timeout = 300
             LOG.debug("Running shell (delegation): %s", cmd)
             return self.run_shell(
                 cmd,
@@ -2096,6 +2374,7 @@ class Scheduler:
                 capture_output=True,
                 text=True,
                 cwd=self.command_cwd,
+                timeout=_delegate_timeout,
             )
 
         def _parse_in_progress(payload: Any) -> List[Dict[str, Any]]:
@@ -2161,11 +2440,39 @@ class Scheduler:
                     "Delegation skipped: no wl next candidates payload=%r",
                     payload_preview,
                 )
+            # Send a short idle notification to Discord so operators see that
+            # the delegation run completed but there was nothing to act on.
+            idle_webhook_sent = False
+            try:
+                if webhook:
+                    msg = "Agents are idle: nothing to delegate"
+                    payload = webhook_module.build_command_payload(
+                        os.uname().nodename,
+                        _utc_now().isoformat(),
+                        "delegation_idle",
+                        msg,
+                        0,
+                        title=(
+                            (spec.title if spec is not None else None)
+                            or (
+                                spec.metadata.get("discord_label")
+                                if spec is not None
+                                else None
+                            )
+                            or "Delegation: idle"
+                        ),
+                    )
+                    webhook_module.send_webhook(
+                        webhook, payload, message_type="command"
+                    )
+                    idle_webhook_sent = True
+            except Exception:
+                LOG.exception("Failed to send no-candidate idle-state webhook")
             return {
                 "note": "Delegation: skipped (no wl next candidates)",
                 "dispatched": False,
                 "rejected": [],
-                "idle_webhook_sent": False,
+                "idle_webhook_sent": idle_webhook_sent,
             }
 
         # Try candidates in order until we find one with a supported stage.
@@ -2174,8 +2481,6 @@ class Scheduler:
         delegate_id = None
         delegate_title = None
         delegate_stage = None
-
-        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
 
         # Track rejected candidates for reporting
         rejected: List[Dict[str, str]] = []
@@ -2207,7 +2512,9 @@ class Scheduler:
                 LOG.exception("Failed to evaluate do-not-delegate for %s", cid)
 
             if cstage == "idea":
-                command = f'opencode run "/intake {cid}"'
+                # Use opencode with an explicit instruction to avoid follow-up
+                # questions from the agent when performing intake.
+                command = f'opencode run "/intake {cid} do not ask questions"'
                 action = "intake"
             elif cstage == "intake_complete":
                 command = f'opencode run "/plan {cid}"'
@@ -2304,7 +2611,6 @@ class Scheduler:
 
         # Send a quick notification to Discord/AMPA before spawning opencode
         try:
-            webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
             if webhook:
                 # Human-friendly pre-dispatch message: include action, title and id
                 # Keep the message concise for Discord; do not include internal
