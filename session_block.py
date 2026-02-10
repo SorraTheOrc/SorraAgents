@@ -21,6 +21,11 @@ import time
 from datetime import datetime
 from typing import Dict, Any, Optional
 
+try:
+    from ampa import webhook as webhook_module
+except Exception:  # pragma: no cover - optional dependency
+    webhook_module = None
+
 LOG = logging.getLogger("session_block")
 
 
@@ -98,6 +103,57 @@ def set_session_state(session_id: str, state: str) -> str:
     return state_path
 
 
+def _waiting_actions_text() -> str:
+    return os.getenv(
+        "AMPA_WAITING_FOR_INPUT_ACTIONS",
+        "Provide a response for the session prompt and resume the run.",
+    )
+
+
+def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[int]:
+    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+    if not webhook:
+        return None
+    if webhook_module is None:
+        LOG.warning("ampa.webhook is unavailable; cannot send notification")
+        return None
+    try:
+        hostname = os.uname().nodename
+    except Exception:
+        hostname = "(unknown host)"
+    ts = datetime.utcnow().isoformat() + "Z"
+    actions = _waiting_actions_text()
+    summary = metadata.get("summary") or "(no summary)"
+    work_item = metadata.get("work_item") or "(none)"
+    session_id = metadata.get("session") or "(unknown)"
+    prompt_file = metadata.get("prompt_file") or "(unknown)"
+    tool_dir = metadata.get("tool_output_dir") or _tool_output_dir()
+    output = (
+        "Session is waiting for input\n"
+        f"Session: {session_id}\n"
+        f"Work item: {work_item}\n"
+        f"Summary: {summary}\n"
+        f"Actions: {actions}\n"
+        f"Prompt file: {prompt_file}\n"
+        f"Tool output dir: {tool_dir}"
+    )
+    payload = webhook_module.build_command_payload(
+        hostname,
+        ts,
+        "waiting_for_input",
+        output,
+        0,
+        title="Session Waiting For Input",
+    )
+    try:
+        return webhook_module.send_webhook(
+            webhook, payload, message_type="waiting_for_input"
+        )
+    except Exception:
+        LOG.exception("Failed to send waiting_for_input notification")
+        return None
+
+
 def detect_and_surface_blocking_prompt(
     session_id: str,
     work_item_id: Optional[str],
@@ -115,7 +171,7 @@ def detect_and_surface_blocking_prompt(
     """
     ts = datetime.utcnow().isoformat() + "Z"
     summary = _excerpt_text(prompt_text, limit=500)
-    metadata = {
+    metadata: Dict[str, Any] = {
         "session": session_id,
         "work_item": work_item_id,
         "summary": summary,
@@ -142,8 +198,12 @@ def detect_and_surface_blocking_prompt(
     except Exception:
         LOG.exception("Failed to write pending prompt to %s", path)
 
+    metadata["prompt_file"] = path
+    metadata["tool_output_dir"] = out_dir
+
     # set session state and emit event
     set_session_state(session_id, "waiting_for_input")
     emit_internal_event("waiting_for_input", metadata)
+    _send_waiting_for_input_notification(metadata)
 
     return metadata
