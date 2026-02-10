@@ -88,10 +88,11 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 ## CRITICAL RULES
 
 - Use Worklog (wl), described below, for ALL task tracking, do NOT use markdown TODOs, task lists, or other tracking methods
-- Whenever you are provided with, or discover, a new work item create it in wl immediately
-- Whenever you are provided with or discover important context (specifications, designs, user-stories) ensure the information is added to the description of the relevant work item(s) OR create a new work item if none exist
-- Whenever you create a planning document (PRD, spec, design doc) add references to the document in the description of any work item that is directly related to the document
+- _NEVER_ write directly to `.worklog/worklog-data.jsonl` unless you are given permission to do so by a Producer, and you have confirmed the correct format and structure of the data to be added. Use `wl` commands to interact with the worklog data. All manipulation of work items must be done through `wl` commands to ensure data integrity and consistency.
 - A child work-item may be closed independently; however, a parent work-item can only be closed once all of its child work-items are closed, all blocking dependencies are resolved, and a Producer has reviewed and approved the work
+- Always ensure that work-items are kept up to date and accurately reflect the current state of the work. This includes updating descriptions, acceptance criteria, stages, and comments as needed throughout the lifecycle of the work.
+- Always ensure that any work-item created is associated with a clear goal and context, preferably in the form of a user story, along with measurable and testable acceptance criteria. If the requirements are not clear, seek clarification and update the work-item accordingly before proceeding with implementation.
+- When writing content for work-item descriptions, comments, or commit messages, do not escape special character EXCEPT backticks. Use markdown formatting as needed for clarity and readability, but do not add unnecessary escaping that could reduce readability or cause confusion.
 - Never commit changes without associating them with a work item
 - Never commit changes without ensuring all tests and quality checks pass
 - Always record the commit message and hash of any commits made in a comment on the relevant work item(s)
