@@ -582,16 +582,51 @@ def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> Ru
     if spec.max_runtime_minutes is not None:
         timeout = max(1, int(spec.max_runtime_minutes * 60))
     LOG.info("Starting command %s", spec.command_id)
-    result = subprocess.run(  # nosec - shell execution is explicit configuration
-        spec.command,
-        shell=True,
-        check=False,
-        timeout=timeout,
-        text=True,
-        capture_output=True,
-        cwd=command_cwd,
-    )
-    end = _utc_now()
+    try:
+        result = subprocess.run(  # nosec - shell execution is explicit configuration
+            spec.command,
+            shell=True,
+            check=False,
+            timeout=timeout,
+            text=True,
+            capture_output=True,
+            cwd=command_cwd,
+        )
+        end = _utc_now()
+    except subprocess.TimeoutExpired as e:
+        # Normalize timeouts to exit code 124 and notify operators via
+        # Discord when configured. Return a CompletedProcess-like object so
+        # the rest of the function can treat the result uniformly.
+        end = _utc_now()
+        out = getattr(e, "output", None) or ""
+        err = getattr(e, "stderr", None) or ""
+        LOG.warning(
+            "Command %s timed out after %s seconds",
+            spec.command_id,
+            timeout,
+        )
+        try:
+            webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+            if webhook and webhook_module is not None:
+                msg = f"Command {spec.command_id} timed out after {timeout}s: {spec.command}"
+                payload = webhook_module.build_command_payload(
+                    os.uname().nodename,
+                    _utc_now().isoformat(),
+                    spec.command_id,
+                    msg,
+                    124,
+                    title=(spec.title or spec.command)[:128],
+                )
+                webhook_module.send_webhook(webhook, payload, message_type="error")
+        except Exception:
+            LOG.exception("Failed to send timeout webhook")
+        result = subprocess.CompletedProcess(
+            args=spec.command,
+            returncode=124,
+            stdout=out,
+            stderr=err,
+        )
+
     LOG.info(
         "Finished command %s exit=%s duration=%.2fs",
         spec.command_id,
@@ -599,9 +634,9 @@ def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> Ru
         (end - start).total_seconds(),
     )
     output = ""
-    if result.stdout:
+    if getattr(result, "stdout", None):
         output += result.stdout
-    if result.stderr:
+    if getattr(result, "stderr", None):
         output += result.stderr
     return CommandRunResult(
         start_ts=start,
@@ -649,11 +684,11 @@ class Scheduler:
         # injectable shell runner (for tests); defaults to subprocess.run
         _orig_runner = run_shell or subprocess.run
         # default timeout for spawned commands (seconds); can be overridden
-        # per-call by passing `timeout` to the runner. Emergency default = 300s
+        # per-call by passing `timeout` to the runner. Default = 3600s (1 hour)
         try:
-            _default_timeout = int(os.getenv("AMPA_CMD_TIMEOUT_SECONDS", "300"))
+            _default_timeout = int(os.getenv("AMPA_CMD_TIMEOUT_SECONDS", "3600"))
         except Exception:
-            _default_timeout = 300
+            _default_timeout = 3600
 
         def _run_shell_with_timeout(*p_args, **p_kwargs) -> subprocess.CompletedProcess:
             # If caller provided an explicit timeout, respect it; otherwise use
@@ -673,6 +708,24 @@ class Scheduler:
                     p_kwargs.get("timeout"),
                     p_args[0] if p_args else "(command)",
                 )
+                # send a Discord error notification when configured
+                try:
+                    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+                    if webhook and webhook_module is not None:
+                        msg = f"Command timed out after {p_kwargs.get('timeout')}s: {p_args[0] if p_args else '(command)'}"
+                        payload = webhook_module.build_command_payload(
+                            os.uname().nodename,
+                            _utc_now().isoformat(),
+                            "command_timeout",
+                            msg,
+                            124,
+                            title=(p_args[0] if p_args else "Timed-out command")[:128],
+                        )
+                        webhook_module.send_webhook(
+                            webhook, payload, message_type="error"
+                        )
+                except Exception:
+                    LOG.exception("Failed to send timeout webhook")
                 return subprocess.CompletedProcess(
                     args=p_args[0] if p_args else "",
                     returncode=124,
