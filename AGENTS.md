@@ -2,13 +2,7 @@
 
 ## Workflow for AI Agents
 
-It is expected that a session will be started by a human operator who will supply an initial prompt which defines the overall goals and context for the work to be done. When receiving such a prompt the agent will create an initial work-item in the worklog to track the work required to meet those goals. The work-item is created with a command such as `wl create "<work-item-title>" --description "<detailed-description-of-goals-and-context>" --issue-type <type-of-work-item> --json` (see [Work-Item Management](#work-item-management) below for more information). Remember the work-item id that is returnedm this will be referred to below as the <base-item-id>.
-
-Once the item has been created the agent should display the outputs of `wl show <base-item-id> --format full` and confirm with the operator that the work-item accurately reflects the goals and context provided. If the operator requests changes to the work-item the agent should update the work-item description and acceptance criteria accordingly `wl update <id> --description "<updated-description>"`. DO NOT remove existing content unless it is incorrect, ONLY add to it with appropriate clarifications.
-
-Once approved the agent should ask if they may ask further clarifying questions if required during the planning and implementation of <base-item-id>, the agent should make it clear that if the operator says no the agent will attempt to complete the task without further guidance, but being able to ask questions increases the chances of success. The agent will wait for confirmation from the operator before proceeding and remember the response.
-
-The agent(s) will then plan and execute the work required to meet those goals by following the steps below.
+Follow thhe steps below whn completing tasks. If you not provided with a work-item id you must stop and ask the user to either create one for you or give you permission to create one for the request.
 
 0. **Claim the work-item** created by the operator:
    - Claim it with `wl update <id> --status in_progress --assignee <your-agent-name>`
