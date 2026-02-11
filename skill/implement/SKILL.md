@@ -138,7 +138,13 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 - Ensure all work has been committed
 - Push the branch to `origin`.
 - Create a Pull Request (PR) against the repository's default branch.
-  - Use a title in the form of "<work item title> (<work item id>)" and a body that contains a concise summary of the goal and of the work done and reviewer instructions.
+  - Use a title in the form of a summary of the goal and a body that contains
+    - a summary of the goal
+    - a summary of the work done
+    - instructions on how to test manually (where relevant)
+    - instructions on what to focus on in the review (e.g., "focus on the new authentication flow and any potential edge cases").
+    - reference the work item id(s) and link to any relevant documentation or PRDs.
+    - Ensure that the desciption covers all commits and work items involved in the implementation
   - Do not escape the PR body; use markdown formatting as needed.
 - Link the PR to the work-item in a work-item comment to the work item as follows `wl comment <work-item-id> --body "PR created: <URL>\nBlocked on review and merge." --author "<AGENT>" --json`.
 - Mark the work item to completed/in-review with `wl update <work-item-id> --status blocked --stage in_review --json`
