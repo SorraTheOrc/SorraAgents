@@ -23,14 +23,24 @@ def test_start_and_resume(tmp_path, monkeypatch):
     assert meta["session"] == session_id
     assert meta["state"] == "waiting_for_input"
 
-    # ensure pending prompt file exists
+    # ensure pending prompt file exists and contains full payload
     prompt_file = meta["prompt_file"]
     assert os.path.exists(prompt_file)
+    with open(prompt_file, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    assert payload["prompt_text"] == prompt
+    assert payload["choices"] == []
+    assert payload["context"] == []
+    assert payload["session_id"] == session_id
+    assert payload["stamp"]
 
     # resume
     res = conversation_manager.resume_session(session_id, "yes")
     assert res["status"] == "resumed"
     assert res["session"] == session_id
+    assert res["prompt_text"] == prompt
+    assert res["choices"] == []
+    assert res["context"] == []
     assert os.path.exists(os.path.join(tool_dir, "events.jsonl"))
 
 
@@ -72,10 +82,15 @@ def test_resume_invalid_state(tmp_path, monkeypatch):
     # create a pending prompt file but set session state to something else
     meta = {
         "session": session_id,
+        "session_id": session_id,
         "work_item": None,
         "summary": "x",
+        "prompt_text": "full prompt",
+        "choices": ["a", "b"],
+        "context": [{"role": "user", "content": "hi"}],
         "state": "waiting_for_input",
         "created_at": datetime.utcnow().isoformat() + "Z",
+        "stamp": "1",
     }
     prompt_file = os.path.join(str(tmp_path), f"pending_prompt_{session_id}_1.json")
     with open(prompt_file, "w", encoding="utf-8") as fh:
@@ -94,10 +109,15 @@ def test_resume_timeout(tmp_path, monkeypatch):
     created_at = (datetime.utcnow() - timedelta(days=2)).isoformat() + "Z"
     meta = {
         "session": session_id,
+        "session_id": session_id,
         "work_item": None,
         "summary": "x",
+        "prompt_text": "full prompt",
+        "choices": ["a", "b"],
+        "context": [{"role": "user", "content": "hi"}],
         "state": "waiting_for_input",
         "created_at": created_at,
+        "stamp": "1",
     }
     prompt_file = os.path.join(str(tmp_path), f"pending_prompt_{session_id}_1.json")
     with open(prompt_file, "w", encoding="utf-8") as fh:
@@ -114,8 +134,13 @@ def test_responder_payload_resume(tmp_path, monkeypatch):
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", tool_dir)
 
     session_id = "s-responder"
+    prompt = "Approve deploy?"
+    choices = ["yes", "no"]
+    context = [{"role": "user", "content": "ship it"}]
     conversation_manager.start_conversation(
-        session_id, "Approve deploy?", {"work_item": "WL-2"}
+        session_id,
+        prompt,
+        {"work_item": "WL-2", "choices": choices, "context": context},
     )
 
     payload = {"session_id": session_id, "response": "yes"}
@@ -123,3 +148,6 @@ def test_responder_payload_resume(tmp_path, monkeypatch):
 
     assert result["status"] == "resumed"
     assert result["session"] == session_id
+    assert result["prompt_text"] == prompt
+    assert result["choices"] == choices
+    assert result["context"] == context

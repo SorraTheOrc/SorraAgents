@@ -127,6 +127,7 @@ def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[i
     work_item = metadata.get("work_item") or "(none)"
     session_id = metadata.get("session") or "(unknown)"
     prompt_file = metadata.get("prompt_file") or "(unknown)"
+    pending_prompt_file = metadata.get("pending_prompt_file") or prompt_file
     tool_dir = metadata.get("tool_output_dir") or _tool_output_dir()
     output = (
         "Session is waiting for input\n"
@@ -134,7 +135,7 @@ def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[i
         f"Work item: {work_item}\n"
         f"Summary: {summary}\n"
         f"Actions: {actions}\n"
-        f"Prompt file: {prompt_file}\n"
+        f"Pending prompt file: {pending_prompt_file}\n"
         f"Tool output dir: {tool_dir}"
     )
     payload = webhook_module.build_command_payload(
@@ -158,6 +159,9 @@ def detect_and_surface_blocking_prompt(
     session_id: str,
     work_item_id: Optional[str],
     prompt_text: str,
+    *,
+    choices: Optional[Any] = None,
+    context: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Record that a prompt is blocking and surface minimal metadata.
 
@@ -171,13 +175,6 @@ def detect_and_surface_blocking_prompt(
     """
     ts = datetime.utcnow().isoformat() + "Z"
     summary = _excerpt_text(prompt_text, limit=500)
-    metadata: Dict[str, Any] = {
-        "session": session_id,
-        "work_item": work_item_id,
-        "summary": summary,
-        "state": "waiting_for_input",
-        "created_at": ts,
-    }
 
     out_dir = _tool_output_dir()
     _ensure_dir(out_dir)
@@ -185,6 +182,18 @@ def detect_and_surface_blocking_prompt(
     # filename uses timestamp to avoid races
     stamp = str(int(time.time() * 1000))
     filename = f"pending_prompt_{session_id}_{stamp}.json"
+    metadata: Dict[str, Any] = {
+        "session": session_id,
+        "session_id": session_id,
+        "work_item": work_item_id,
+        "summary": summary,
+        "prompt_text": prompt_text,
+        "choices": choices if choices is not None else [],
+        "context": context if context is not None else [],
+        "state": "waiting_for_input",
+        "created_at": ts,
+        "stamp": stamp,
+    }
     path = os.path.join(out_dir, filename)
     try:
         with open(path, "w", encoding="utf-8") as fh:
@@ -199,6 +208,7 @@ def detect_and_surface_blocking_prompt(
         LOG.exception("Failed to write pending prompt to %s", path)
 
     metadata["prompt_file"] = path
+    metadata["pending_prompt_file"] = path
     metadata["tool_output_dir"] = out_dir
 
     # set session state and emit event

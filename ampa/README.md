@@ -178,6 +178,34 @@ res = resume_session("s-123", "yes")
 print(res)
 ```
 
+Pending prompt payload
+----------------------
+
+Pending prompts are persisted as JSON files named `pending_prompt_<session_id>_<stamp>.json`
+under `AMPA_TOOL_OUTPUT_DIR` (defaults to a temp directory). These files include
+the full prompt text, choices, and conversation context so responders can review
+blocked sessions end-to-end.
+
+Example payload:
+
+```json
+{
+  "session": "s-123",
+  "session_id": "s-123",
+  "work_item": "WL-1",
+  "summary": "Please confirm the change",
+  "prompt_text": "Please confirm the change",
+  "choices": ["yes", "no"],
+  "context": [{"role": "user", "content": "ship it"}],
+  "state": "waiting_for_input",
+  "created_at": "2026-02-11T12:00:00Z",
+  "stamp": "1739275200000"
+}
+```
+
+Notifications and session metadata include `pending_prompt_file` (full path) so
+operators can open the JSON directly.
+
 SDK adapter notes
 -----------------
 
