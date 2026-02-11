@@ -13,9 +13,21 @@ from ampa import responder
 def test_start_and_resume(tmp_path, monkeypatch):
     tool_dir = str(tmp_path)
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", tool_dir)
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid")
+    monkeypatch.setenv("AMPA_RESPONDER_URL", "http://localhost:8081/respond")
 
     session_id = "s-123"
     prompt = "Please confirm this change"
+
+    captured = {}
+
+    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["message_type"] = message_type
+        return 204
+
+    monkeypatch.setattr(session_block.webhook_module, "send_webhook", fake_send_webhook)
 
     meta = conversation_manager.start_conversation(
         session_id, prompt, {"work_item": "WL-1"}
@@ -33,6 +45,13 @@ def test_start_and_resume(tmp_path, monkeypatch):
     assert payload["context"] == []
     assert payload["session_id"] == session_id
     assert payload["stamp"]
+    assert captured["message_type"] == "waiting_for_input"
+    content = captured["payload"]["content"]
+    assert "Session: s-123" in content
+    assert "Work item: WL-1" in content
+    assert "Reason: Please confirm this change" in content
+    assert "Pending prompt file:" in content
+    assert "Responder endpoint: http://localhost:8081/respond" in content
 
     # resume
     res = conversation_manager.resume_session(session_id, "yes")
