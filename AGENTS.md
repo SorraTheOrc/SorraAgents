@@ -2,7 +2,7 @@
 
 ## Workflow for AI Agents
 
-Follow thhe steps below whn completing tasks. If you not provided with a work-item id you must stop and ask the user to either create one for you or give you permission to create one for the request.
+Follow thhe steps below whn completing tasks. If you are already working on a specific work item and are not provided with a different one then continue to use that work item. However, if you do not have a current work-item id and one is not provided you must stop and ask the user to either create one for you or give you permission to create one for the request.
 
 0. **Claim the work-item** created by the operator:
    - Claim it with `wl update <id> --status in_progress --assignee <your-agent-name>`
