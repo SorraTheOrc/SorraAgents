@@ -24,7 +24,7 @@ def test_post_startup_message_uses_wl_status(tmp_path, monkeypatch):
     )
 
     # fake run_shell that returns wl status output on stdout
-    def fake_run_shell(cmd, shell, check, capture_output, text, cwd):
+    def fake_run_shell(cmd, shell, check, capture_output, text, cwd, timeout=None):
         return SimpleNamespace(
             returncode=0, stdout="WL status: all good\n1 in_progress\n", stderr=""
         )

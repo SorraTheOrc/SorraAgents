@@ -1460,27 +1460,6 @@ class Scheduler:
 
             if not items:
                 LOG.info("Triage audit found no candidates")
-                # Notify Discord briefly so operators see the triage run result
-                try:
-                    if webhook:
-                        msg = "Triage found no candidates to audit"
-                        payload = webhook_module.build_command_payload(
-                            os.uname().nodename,
-                            run.end_ts.isoformat(),
-                            spec.command_id,
-                            msg,
-                            0,
-                            title=(
-                                spec.title
-                                or spec.metadata.get("discord_label")
-                                or "Triage Audit"
-                            ),
-                        )
-                        webhook_module.send_webhook(
-                            webhook, payload, message_type="command"
-                        )
-                except Exception:
-                    LOG.exception("Failed to send triage-no-candidates webhook")
                 return False
             LOG.info(
                 "Found %d candidate work item(s) (in_progress+blocked)", len(items)
@@ -1645,26 +1624,6 @@ class Scheduler:
 
             if not candidates:
                 LOG.info("Triage audit found no candidates after cooldown filter")
-                try:
-                    if webhook:
-                        msg = "Triage found no candidates to audit"
-                        payload = webhook_module.build_command_payload(
-                            os.uname().nodename,
-                            run.end_ts.isoformat(),
-                            spec.command_id,
-                            msg,
-                            0,
-                            title=(
-                                spec.title
-                                or spec.metadata.get("discord_label")
-                                or "Triage Audit"
-                            ),
-                        )
-                        webhook_module.send_webhook(
-                            webhook, payload, message_type="command"
-                        )
-                except Exception:
-                    LOG.exception("Failed to send triage-no-candidates webhook")
                 return False
 
             # sort by updated timestamp ascending (oldest first), None treated as oldest
@@ -1708,9 +1667,16 @@ class Scheduler:
                 len(proc_audit.stderr or ""),
             )
 
-            # Delegation from triage disabled: previously this would call
-            # `_delegate_when_idle()` which started delegation while triage ran.
-            # That coupling was surprising; do not perform delegation here.
+            # Delegation from triage: when enabled, run the idle delegation
+            # logic after audit completes so we can include its note in the
+            # Discord summary and optionally dispatch intake/plan work.
+            try:
+                delegation_result = self._run_idle_delegation(
+                    audit_only=audit_only, spec=spec
+                )
+            except Exception:
+                LOG.exception("Delegation run failed during triage audit")
+                delegation_result = None
 
             # 3) post a short Discord summary (1-3 lines)
             # helper to extract a human-facing 'Summary' section from audit output
