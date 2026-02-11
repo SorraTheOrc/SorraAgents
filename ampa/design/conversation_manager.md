@@ -18,6 +18,26 @@ File interactions
 - `session_block.py` writes pending prompt files named `pending_prompt_<session_id>_<stamp>.json` and `session_<session_id>.json`. The manager MUST read these files (tool-output dir configured via `AMPA_TOOL_OUTPUT_DIR`) to locate prompt context and verify `state == "waiting_for_input"`.
 - On resume success the manager appends an event to `events.jsonl` and may update `session_<session_id>.json` to reflect the resumed state.
 
+Pending prompt payload (JSON)
+- Stored under `AMPA_TOOL_OUTPUT_DIR` as `pending_prompt_<session_id>_<stamp>.json`.
+- Includes full prompt text, available choices, and conversation context.
+
+Example:
+```
+{
+  "session": "s-123",
+  "session_id": "s-123",
+  "work_item": "WL-1",
+  "summary": "Please confirm the change",
+  "prompt_text": "Please confirm the change",
+  "choices": ["yes", "no"],
+  "context": [{"role": "user", "content": "ship it"}],
+  "state": "waiting_for_input",
+  "created_at": "2026-02-11T12:00:00Z",
+  "stamp": "1739275200000"
+}
+```
+
 OpenCode SDK usage notes
 - Dependency: `opencode-ai` (PyPI package name). Install/pin via `pip install --pre opencode-ai` (pin exact version in the implementation's requirements or `pyproject.toml`/`requirements.txt`).
 - Import examples:

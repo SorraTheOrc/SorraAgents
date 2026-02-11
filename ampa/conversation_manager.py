@@ -63,6 +63,8 @@ def start_conversation(
     metadata: Optional[Dict[str, Any]] = None,
     *,
     sdk_client: Optional[Any] = None,
+    choices: Optional[Any] = None,
+    context: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Record a pending prompt and set session state to `waiting_for_input`.
 
@@ -81,8 +83,14 @@ def start_conversation(
             LOG.exception("OpenCode SDK start failed for session=%s", session_id)
             raise SDKError("OpenCode SDK start_conversation failed") from exc
 
+    choices = metadata.get("choices") if choices is None else choices
+    context = metadata.get("context") if context is None else context
     return session_block.detect_and_surface_blocking_prompt(
-        session_id, metadata.get("work_item"), prompt
+        session_id,
+        metadata.get("work_item"),
+        prompt,
+        choices=choices,
+        context=context,
     )
 
 
@@ -134,6 +142,14 @@ def resume_session(
         LOG.exception("Failed reading pending prompt file=%s", prompt_file)
         raise NotFoundError(f"failed to read pending prompt file={prompt_file}")
 
+    prompt_text = prompt_meta.get("prompt_text") or prompt_meta.get("summary") or ""
+    choices = prompt_meta.get("choices")
+    if choices is None:
+        choices = []
+    context = prompt_meta.get("context")
+    if context is None:
+        context = []
+
     # verify session state file
     session_path = os.path.join(tool_output_dir, f"session_{session_id}.json")
     if not os.path.exists(session_path):
@@ -170,12 +186,17 @@ def resume_session(
             LOG.warning("Pending prompt timed out for session=%s", session_id)
             raise TimedOutError(f"pending prompt for session={session_id} timed out")
 
+    resume_metadata = dict(metadata)
+    resume_metadata.setdefault("prompt_text", prompt_text)
+    resume_metadata.setdefault("choices", choices)
+    resume_metadata.setdefault("context", context)
+
     if sdk_client is not None:
         sdk_resume = getattr(sdk_client, "resume_session", None)
         if not callable(sdk_resume):
             raise SDKError("sdk_client missing resume_session")
         try:
-            sdk_resume(session_id, response, metadata)
+            sdk_resume(session_id, response, resume_metadata)
         except Exception as exc:
             LOG.exception("OpenCode SDK resume failed for session=%s", session_id)
             raise SDKError("OpenCode SDK resume_session failed") from exc
@@ -200,6 +221,9 @@ def resume_session(
         "status": "resumed",
         "session": session_id,
         "prompt_file": prompt_file,
+        "prompt_text": prompt_text,
+        "choices": choices,
+        "context": context,
         "event_path": event_path,
         "response": response,
     }
