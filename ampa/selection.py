@@ -52,6 +52,16 @@ class WLNextClient:
                 return None
 
         proc = _run(cmd)
+        # Log proc output for debugging test failures where a fake runner may
+        # return an unexpected CompletedProcess shape or empty stdout.
+        if proc is not None:
+            LOG.debug(
+                "wl next initial result rc=%s stdout=%r stderr=%r cmd=%r",
+                getattr(proc, "returncode", None),
+                (getattr(proc, "stdout", None) or "")[:2048],
+                (getattr(proc, "stderr", None) or "")[:2048],
+                cmd,
+            )
 
         # Compatibility fallback: some WL installations do not accept '-n'. If
         # the initial invocation failed, try the simpler form `wl next --json`.
@@ -65,6 +75,14 @@ class WLNextClient:
             # try without -n
             cmd2 = "wl next --json"
             proc2 = _run(cmd2)
+            if proc2 is not None:
+                LOG.debug(
+                    "wl next fallback result rc=%s stdout=%r stderr=%r cmd=%r",
+                    getattr(proc2, "returncode", None),
+                    (getattr(proc2, "stdout", None) or "")[:2048],
+                    (getattr(proc2, "stderr", None) or "")[:2048],
+                    cmd2,
+                )
             if proc2 is None or getattr(proc2, "returncode", 1) != 0:
                 if proc2 is not None:
                     LOG.warning(
@@ -88,6 +106,10 @@ class WLNextClient:
                     and getattr(proc2, "returncode", 1) == 0
                     and getattr(proc2, "stdout", "").strip()
                 ):
+                    LOG.debug(
+                        "wl next fallback (no -n) stdout=%r",
+                        (getattr(proc2, "stdout", None) or "")[:2048],
+                    )
                     try:
                         payload = json.loads(proc2.stdout)
                     except Exception:
@@ -107,6 +129,14 @@ class WLNextClient:
             # different JSON shapes).
             if cmd.endswith("-n %d --json" % count):
                 proc2 = _run("wl next --json")
+                if proc2 is not None:
+                    LOG.debug(
+                        "wl next retry fallback result rc=%s stdout=%r stderr=%r cmd=%r",
+                        getattr(proc2, "returncode", None),
+                        (getattr(proc2, "stdout", None) or "")[:2048],
+                        (getattr(proc2, "stderr", None) or "")[:2048],
+                        "wl next --json",
+                    )
                 if (
                     proc2
                     and getattr(proc2, "returncode", 1) == 0
