@@ -9,9 +9,8 @@ writes the same tool-output files used by `session_block.py` and emits events
 via the same helper so other processes can react.
 
 OpenCode SDK integration is optional. Callers can pass an SDK client (for
-example, the JS/TS OpenCode SDK running in a companion service) and this
-module will invoke its `start_conversation` / `resume_session` hooks before
-updating local state.
+example, a Python OpenCode SDK adapter) and this module will invoke its
+`start_conversation` / `resume_session` hooks before updating local state.
 
 Errors are raised for common failure modes so callers can act programmatically.
 """

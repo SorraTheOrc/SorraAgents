@@ -19,7 +19,7 @@ File interactions
 - On resume success the manager appends an event to `events.jsonl` and may update `session_<session_id>.json` to reflect the resumed state.
 
 OpenCode SDK usage notes
-- Dependency: `opencode-ai` (PyPI package name). Install/pin via `pip install "opencode-ai>=0.0.0"` (pin exact version in the implementation's requirements or `pyproject.toml`/`requirements.txt`).
+- Dependency: `opencode-ai` (PyPI package name). Install/pin via `pip install --pre opencode-ai` (pin exact version in the implementation's requirements or `pyproject.toml`/`requirements.txt`).
 - Import examples:
   - sync client: `from opencode_ai import Opencode`
   - async client: `from opencode_ai import AsyncOpencode`

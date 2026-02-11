@@ -181,10 +181,11 @@ print(res)
 SDK adapter notes
 -----------------
 
-The OpenCode SDK is JavaScript/TypeScript. This module supports a lightweight
-adapter hook: pass a `sdk_client` object that provides `start_conversation` and
-`resume_session` callables. The manager invokes these hooks before updating the
-local `pending_prompt_*` and session state files.
+Use the OpenCode Python SDK (`opencode-ai`) for direct integrations. This
+module supports a lightweight adapter hook: pass a `sdk_client` object that
+provides `start_conversation` and `resume_session` callables. The manager
+invokes these hooks before updating the local `pending_prompt_*` and session
+state files.
 
 Example error handling:
 
