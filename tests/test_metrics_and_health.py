@@ -10,6 +10,7 @@ from ampa.metrics import (
     ampa_last_heartbeat_timestamp_seconds,
 )
 from ampa import conversation_manager
+import session_block
 
 
 def test_health_and_metrics_ok(tmp_path, monkeypatch):
@@ -80,3 +81,73 @@ def test_session_state_endpoint_returns_state(tmp_path, monkeypatch):
     body = json.loads(resp.read().decode())
     assert body["session"] == session_id
     assert body["state"] == "waiting_for_input"
+
+
+def test_admin_fallback_controls_responder(tmp_path, monkeypatch):
+    monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("AMPA_ADMIN_TOKEN", "secret-token")
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "https://example.com/webhook")
+
+    monkeypatch.setattr(
+        session_block.webhook_module,
+        "send_webhook",
+        lambda *args, **kwargs: 204,
+    )
+
+    session_id = "s-fallback"
+    conversation_manager.start_conversation(session_id, "Approve?")
+
+    server, port = start_metrics_server(port=0)
+    base = f"http://127.0.0.1:{port}"
+
+    cfg_payload = json.dumps(
+        {"default": "hold", "projects": {"proj-1": "auto-accept"}}
+    ).encode("utf-8")
+    cfg_req = urllib.request.Request(
+        f"{base}/admin/fallback",
+        data=cfg_payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer secret-token",
+        },
+        method="POST",
+    )
+    cfg_resp = urllib.request.urlopen(cfg_req)
+    assert cfg_resp.status == 200
+
+    resp_req = urllib.request.Request(
+        f"{base}/respond",
+        data=json.dumps({"session_id": session_id, "project_id": "proj-1"}).encode(
+            "utf-8"
+        ),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    resp = urllib.request.urlopen(resp_req)
+    assert resp.status == 200
+    body = json.loads(resp.read().decode())
+    assert body["status"] == "resumed"
+    assert body["session"] == session_id
+    assert body["response"] == "accept"
+
+
+def test_admin_fallback_requires_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("AMPA_ADMIN_TOKEN", "secret-token")
+
+    server, port = start_metrics_server(port=0)
+    base = f"http://127.0.0.1:{port}"
+
+    req = urllib.request.Request(
+        f"{base}/admin/fallback",
+        data=json.dumps({"default": "hold"}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req)
+        raised = False
+    except urllib.error.HTTPError as exc:
+        raised = True
+        assert exc.code == 401
+    assert raised

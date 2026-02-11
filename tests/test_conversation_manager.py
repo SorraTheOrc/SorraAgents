@@ -50,8 +50,10 @@ def test_start_and_resume(tmp_path, monkeypatch):
     assert "Session: s-123" in content
     assert "Work item: WL-1" in content
     assert "Reason: Please confirm this change" in content
+    assert "Call to action:" in content
     assert "Pending prompt file:" in content
     assert "Responder endpoint: http://localhost:8081/respond" in content
+    assert "Persisted prompt path:" in content
 
     # resume
     res = conversation_manager.resume_session(session_id, "yes")
@@ -170,3 +172,23 @@ def test_responder_payload_resume(tmp_path, monkeypatch):
     assert result["prompt_text"] == prompt
     assert result["choices"] == choices
     assert result["context"] == context
+
+
+def test_responder_payload_action_accept(tmp_path, monkeypatch):
+    tool_dir = str(tmp_path)
+    monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", tool_dir)
+
+    session_id = "s-responder-action"
+    prompt = "Approve deploy?"
+    conversation_manager.start_conversation(
+        session_id,
+        prompt,
+        {"work_item": "WL-3"},
+    )
+
+    payload = {"session_id": session_id, "action": "accept"}
+    result = responder.resume_from_payload(payload)
+
+    assert result["status"] == "resumed"
+    assert result["session"] == session_id
+    assert result["response"] == "accept"

@@ -19,6 +19,7 @@ def resume_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     - session_id or session
     - response or input
     - metadata (optional dict)
+    - action (optional: accept|decline|respond)
     - timeout_seconds (optional int)
     - sdk_client (optional OpenCode SDK adapter)
     """
@@ -26,8 +27,20 @@ def resume_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     response = payload.get("response") or payload.get("input")
     if not session_id:
         raise ValueError("payload missing session_id")
+
+    action = payload.get("action")
     if response is None:
-        raise ValueError("payload missing response")
+        if action is None:
+            raise ValueError("payload missing response")
+        action_text = str(action).strip().lower()
+        if action_text in ("accept", "auto-accept", "auto_accept"):
+            response = "accept"
+        elif action_text in ("decline", "auto-decline", "auto_decline"):
+            response = "decline"
+        elif action_text in ("respond", "response"):
+            raise ValueError("payload missing response")
+        else:
+            raise ValueError("payload action must be accept, decline, or respond")
 
     metadata = payload.get("metadata")
     if metadata is None:

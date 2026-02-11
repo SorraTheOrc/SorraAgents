@@ -19,6 +19,7 @@ from prometheus_client.exposition import CONTENT_TYPE_LATEST
 from wsgiref.simple_server import make_server, WSGIServer, WSGIRequestHandler
 
 from . import responder
+from . import fallback
 from .conversation_manager import (
     InvalidStateError,
     NotFoundError,
@@ -130,7 +131,17 @@ def _wsgi_app(environ, start_response):
             return _json_response(
                 start_response, "400 Bad Request", {"error": "invalid JSON"}
             )
+        if isinstance(payload, dict) and "project_id" in payload:
+            mode = fallback.resolve_mode(payload.get("project_id"))
+            if mode == "auto-accept" and "action" not in payload:
+                payload["action"] = "accept"
+            elif mode == "auto-decline" and "action" not in payload:
+                payload["action"] = "decline"
         try:
+            if not isinstance(payload, dict):
+                return _json_response(
+                    start_response, "400 Bad Request", {"error": "invalid JSON"}
+                )
             result = responder.resume_from_payload(payload)
             return _json_response(start_response, "200 OK", result)
         except NotFoundError as exc:
@@ -151,6 +162,38 @@ def _wsgi_app(environ, start_response):
             return _json_response(
                 start_response, "500 Internal Server Error", {"error": str(exc)}
             )
+
+    if path == "/admin/fallback":
+        token = os.getenv("AMPA_ADMIN_TOKEN")
+        if token:
+            auth = environ.get("HTTP_AUTHORIZATION", "")
+            if not auth.startswith("Bearer "):
+                return _json_response(
+                    start_response, "401 Unauthorized", {"error": "Unauthorized"}
+                )
+            provided = auth[len("Bearer ") :].strip()
+            if provided != token:
+                return _json_response(
+                    start_response, "403 Forbidden", {"error": "Forbidden"}
+                )
+        if method == "GET":
+            config = fallback.load_config()
+            return _json_response(start_response, "200 OK", config)
+        if method != "POST":
+            return _json_response(
+                start_response, "405 Method Not Allowed", {"error": "POST required"}
+            )
+        payload = _read_json_body(environ)
+        if payload is None:
+            return _json_response(
+                start_response, "400 Bad Request", {"error": "invalid JSON"}
+            )
+        if not isinstance(payload, dict):
+            return _json_response(
+                start_response, "400 Bad Request", {"error": "invalid JSON"}
+            )
+        config = fallback.save_config(payload)
+        return _json_response(start_response, "200 OK", config)
 
     if path.startswith("/session"):
         session_id = None
@@ -207,7 +250,7 @@ def start_metrics_server(
     thr.start()
 
     # Wait for server to be created and bound
-    for _ in range(50):
+    for _ in range(200):
         p = thr.get_port()
         if p:
             return thr, p

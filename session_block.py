@@ -106,7 +106,7 @@ def set_session_state(session_id: str, state: str) -> str:
 def _waiting_actions_text() -> str:
     return os.getenv(
         "AMPA_WAITING_FOR_INPUT_ACTIONS",
-        "Respond via the responder endpoint, or auto-accept/auto-decline.",
+        "Auto-accept, auto-decline, or respond via the responder endpoint.",
     )
 
 
@@ -134,13 +134,16 @@ def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[i
     pending_prompt_file = metadata.get("pending_prompt_file") or prompt_file
     tool_dir = metadata.get("tool_output_dir") or _tool_output_dir()
     responder_url = _responder_endpoint_url()
+    call_to_action = f"Respond now: {responder_url}"
     output = (
         "Session is waiting for input\n"
         f"Session: {session_id}\n"
         f"Work item: {work_item}\n"
         f"Reason: {summary}\n"
         f"Actions: {actions}\n"
+        f"Call to action: {call_to_action}\n"
         f"Responder endpoint: {responder_url}\n"
+        f"Persisted prompt path: {pending_prompt_file}\n"
         f"Pending prompt file: {pending_prompt_file}\n"
         f"Tool output dir: {tool_dir}"
     )
