@@ -159,3 +159,54 @@ Candidate selection
 
 The candidate selection service calls `wl next --json` and returns the top
 candidate from that response.
+
+Conversation manager
+--------------------
+
+Use `ampa.conversation_manager` to start a conversation (record a pending prompt) or resume a session awaiting input.
+
+Example:
+
+```python
+from ampa.conversation_manager import start_conversation, resume_session
+
+# start: records a pending prompt and sets session state to `waiting_for_input`
+meta = start_conversation("s-123", "Please confirm the change", {"work_item": "WL-1"})
+
+# later, resume with a human response
+res = resume_session("s-123", "yes")
+print(res)
+```
+
+SDK adapter notes
+-----------------
+
+The OpenCode SDK is JavaScript/TypeScript. This module supports a lightweight
+adapter hook: pass a `sdk_client` object that provides `start_conversation` and
+`resume_session` callables. The manager invokes these hooks before updating the
+local `pending_prompt_*` and session state files.
+
+Example error handling:
+
+```python
+from ampa.conversation_manager import resume_session, NotFoundError, TimedOutError
+
+try:
+    resume_session("s-123", "yes")
+except NotFoundError:
+    print("No pending prompt found")
+except TimedOutError:
+    print("Pending prompt timed out")
+```
+
+References
+----------
+
+- Work item: SA-0MLHQU5IZ0PJIPVL
+- Tests: `tests/test_conversation_manager.py`
+
+Configuration
+-------------
+
+- `AMPA_TOOL_OUTPUT_DIR` — directory where pending prompt and session files are written (defaults to temp dir)
+- `AMPA_RESUME_TIMEOUT_SECONDS` — resume timeout in seconds (default 86400 — 24h)
