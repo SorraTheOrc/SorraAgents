@@ -92,7 +92,7 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - Always record the commit message and hash of any commits made in a comment on the relevant work item(s)
 - Whenever a comment is made add a comment to impacted the work item(s) describing the changes, the files affected, and including the commit hash.
 - If push fails, resolve and retry until it succeeds
-- When using backticks in arguments to shell commands, escape them properly to avoid errors
+- When using backticks in arguments to shell commands, ALWAYS escape them properly to avoid errors
 - Do not escape content in the commit comments, PR body, or work-item description or comment body; use markdown formatting as needed for clarity and readability.
 - Never close an work item without ensuring all acceptance criteria are met, all child items are closed, all blockers resolved, and a Producer has reviewed and approved the work and any associated PRs have been merged.
 
