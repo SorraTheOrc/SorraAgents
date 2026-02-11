@@ -7,7 +7,9 @@ same port. Tests may start the server via `start_metrics_server`.
 
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 import threading
 import time
 from typing import Optional, Tuple
@@ -15,6 +17,14 @@ from typing import Optional, Tuple
 from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 from wsgiref.simple_server import make_server, WSGIServer, WSGIRequestHandler
+
+from . import responder
+from .conversation_manager import (
+    InvalidStateError,
+    NotFoundError,
+    SDKError,
+    TimedOutError,
+)
 
 # Registry-local metrics so they do not clash with external collectors during
 # tests or when the package is imported multiple times.
@@ -37,8 +47,65 @@ ampa_last_heartbeat_timestamp_seconds = Gauge(
 )
 
 
+def _tool_output_dir() -> str:
+    path = os.getenv("AMPA_TOOL_OUTPUT_DIR")
+    if path:
+        return path
+    return os.path.join(tempfile.gettempdir(), "opencode_tool_output")
+
+
+def _read_session_state(session_id: str) -> Optional[dict]:
+    tool_dir = _tool_output_dir()
+    session_path = os.path.join(tool_dir, f"session_{session_id}.json")
+    if not os.path.exists(session_path):
+        return None
+    try:
+        with open(session_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    data.setdefault("session", session_id)
+    data.setdefault("session_id", session_id)
+    return data
+
+
+def _json_response(start_response, status: str, payload: dict) -> "list[bytes]":
+    body = json.dumps(payload).encode("utf-8")
+    start_response(
+        status,
+        [
+            ("Content-Type", "application/json"),
+            ("Content-Length", str(len(body))),
+        ],
+    )
+    return [body]
+
+
+def _read_json_body(environ) -> Optional[dict]:
+    try:
+        length = int(environ.get("CONTENT_LENGTH") or 0)
+    except Exception:
+        length = 0
+    if length <= 0:
+        return None
+    try:
+        raw = environ.get("wsgi.input").read(length)
+    except Exception:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
 def _wsgi_app(environ, start_response):
     path = environ.get("PATH_INFO", "")
+    method = environ.get("REQUEST_METHOD", "GET").upper()
     if path == "/metrics":
         data = generate_latest(registry)
         start_response("200 OK", [("Content-Type", CONTENT_TYPE_LATEST)])
@@ -52,6 +119,53 @@ def _wsgi_app(environ, start_response):
             return [b"OK"]
         start_response("503 Service Unavailable", [("Content-Type", "text/plain")])
         return [b"misconfigured"]
+
+    if path == "/respond":
+        if method != "POST":
+            return _json_response(
+                start_response, "405 Method Not Allowed", {"error": "POST required"}
+            )
+        payload = _read_json_body(environ)
+        if payload is None:
+            return _json_response(
+                start_response, "400 Bad Request", {"error": "invalid JSON"}
+            )
+        try:
+            result = responder.resume_from_payload(payload)
+            return _json_response(start_response, "200 OK", result)
+        except NotFoundError as exc:
+            return _json_response(start_response, "404 Not Found", {"error": str(exc)})
+        except InvalidStateError as exc:
+            return _json_response(start_response, "409 Conflict", {"error": str(exc)})
+        except TimedOutError as exc:
+            return _json_response(start_response, "410 Gone", {"error": str(exc)})
+        except SDKError as exc:
+            return _json_response(
+                start_response, "502 Bad Gateway", {"error": str(exc)}
+            )
+        except ValueError as exc:
+            return _json_response(
+                start_response, "400 Bad Request", {"error": str(exc)}
+            )
+        except Exception as exc:
+            return _json_response(
+                start_response, "500 Internal Server Error", {"error": str(exc)}
+            )
+
+    if path.startswith("/session"):
+        session_id = None
+        if path.startswith("/session/"):
+            session_id = path.split("/", 2)[2]
+        if not session_id:
+            return _json_response(
+                start_response, "400 Bad Request", {"error": "session_id required"}
+            )
+        state = _read_session_state(session_id)
+        if not state:
+            return _json_response(
+                start_response, "404 Not Found", {"error": "session not found"}
+            )
+        return _json_response(start_response, "200 OK", state)
 
     start_response("404 Not Found", [("Content-Type", "text/plain")])
     return [b"not found"]
