@@ -26,6 +26,7 @@ try:
     from . import daemon
     from . import webhook as webhook_module
     from . import selection
+    from . import fallback
 except ImportError:  # pragma: no cover - allow running as script
     import importlib
     import sys
@@ -34,6 +35,7 @@ except ImportError:  # pragma: no cover - allow running as script
     daemon = importlib.import_module("ampa.daemon")
     webhook_module = importlib.import_module("ampa.webhook")
     selection = importlib.import_module("ampa.selection")
+    fallback = importlib.import_module("ampa.fallback")
 
 LOG = logging.getLogger("ampa.scheduler")
 
@@ -2669,6 +2671,28 @@ class Scheduler:
                 "idle_webhook_sent": idle_webhook_sent,
             }
 
+        project_id = spec.metadata.get("project_id") if spec else None
+        env_mode = os.getenv("AMPA_FALLBACK_MODE")
+        if not project_id and not env_mode:
+            mode = "auto-accept"
+        else:
+            mode = fallback.resolve_mode(project_id)
+        if mode == "hold":
+            LOG.info(
+                "Delegation dispatch skipped due to fallback hold mode (project=%s)",
+                project_id,
+            )
+            return {
+                "note": "Delegation: skipped (fallback hold)",
+                "dispatched": False,
+                "rejected": rejected,
+                "idle_webhook_sent": False,
+            }
+        if mode == "auto-decline":
+            action = "decline"
+        elif mode == "auto-accept":
+            action = "accept"
+
         # Before spawning opencode, record a dispatch record and notify
         LOG.info("Delegation dispatch: %s", command)
         LOG.debug("Prepared delegation command=%s delegate_id=%s", command, delegate_id)
@@ -2679,6 +2703,7 @@ class Scheduler:
             "delegate_title": delegate_title,
             "delegate_stage": delegate_stage,
             "ts": _utc_now().isoformat(),
+            "fallback_mode": mode,
         }
         try:
             # Persist dispatch record atomically in the scheduler store and
