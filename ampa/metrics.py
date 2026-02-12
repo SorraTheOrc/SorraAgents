@@ -132,7 +132,12 @@ def _wsgi_app(environ, start_response):
                 start_response, "400 Bad Request", {"error": "invalid JSON"}
             )
         if isinstance(payload, dict) and "project_id" in payload:
-            mode = fallback.resolve_mode(payload.get("project_id"))
+            project_id = payload.get("project_id")
+            if project_id:
+                is_public = False
+            else:
+                is_public = "project_id" not in payload
+            mode = fallback.resolve_mode(project_id, is_public=is_public)
             if mode == "auto-accept" and "action" not in payload:
                 payload["action"] = "accept"
             elif mode == "auto-decline" and "action" not in payload:

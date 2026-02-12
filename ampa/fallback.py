@@ -52,26 +52,34 @@ def load_config(path: Optional[str] = None) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except Exception:
-        return {"default": "hold", "projects": {}}
+        return {"default": "hold", "projects": {}, "public_default": "hold"}
     if not isinstance(data, dict):
-        return {"default": "hold", "projects": {}}
+        return {"default": "hold", "projects": {}, "public_default": "hold"}
     projects = data.get("projects")
     if not isinstance(projects, dict):
         projects = {}
     default_mode = normalize_mode(data.get("default"))
+    public_default = normalize_mode(data.get("public_default"))
     normalized_projects: Dict[str, str] = {}
     for key, value in projects.items():
         if not key:
             continue
         normalized_projects[str(key)] = normalize_mode(value)
-    return {"default": default_mode, "projects": normalized_projects}
+    return {
+        "default": default_mode,
+        "projects": normalized_projects,
+        "public_default": public_default,
+    }
 
 
 def save_config(config: Dict[str, Any], path: Optional[str] = None) -> Dict[str, Any]:
     path = path or config_path()
+    default_mode = normalize_mode(config.get("default"))
+    public_default = normalize_mode(config.get("public_default"))
     normalized = {
-        "default": normalize_mode(config.get("default")),
+        "default": default_mode,
         "projects": {},
+        "public_default": public_default,
     }
     projects = config.get("projects")
     if isinstance(projects, dict):
@@ -95,15 +103,24 @@ def resolve_mode(
     *,
     tool_output_dir: Optional[str] = None,
     env_override: bool = True,
+    is_public: Optional[bool] = None,
+    require_config: bool = False,
 ) -> str:
     if env_override:
         env_mode = os.getenv("AMPA_FALLBACK_MODE")
         if env_mode:
             return normalize_mode(env_mode)
-    cfg = load_config(config_path(tool_output_dir))
+    cfg_path = config_path(tool_output_dir)
+    if require_config and not os.path.exists(cfg_path):
+        return "auto-accept"
+    cfg = load_config(cfg_path)
     projects = cfg.get("projects") or {}
     if project_id:
         project_key = str(project_id)
         if project_key in projects:
             return normalize_mode(projects.get(project_key))
+    if is_public is None:
+        is_public = project_id is None
+    if is_public:
+        return normalize_mode(cfg.get("public_default"))
     return normalize_mode(cfg.get("default"))

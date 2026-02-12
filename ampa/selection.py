@@ -52,6 +52,10 @@ class WLNextClient:
                 return None
 
         proc = _run(cmd)
+        used_count = True
+        if proc is not None and getattr(proc, "returncode", 1) == 0:
+            if not (getattr(proc, "stdout", None) or "").strip():
+                proc = None
         # Log proc output for debugging test failures where a fake runner may
         # return an unexpected CompletedProcess shape or empty stdout.
         if proc is not None:
@@ -92,6 +96,7 @@ class WLNextClient:
                     )
                 return None
             proc = proc2
+            used_count = False
 
         stdout = getattr(proc, "stdout", None) or ""
         if not stdout.strip():
@@ -99,7 +104,7 @@ class WLNextClient:
             # Fallback: if we requested multiple candidates with -n, some
             # WL versions may only support the simpler form. Try again with
             # `wl next --json` as a compatibility fallback.
-            if cmd.endswith("-n %d --json" % count):
+            if used_count:
                 proc2 = _run("wl next --json")
                 if (
                     proc2
@@ -127,7 +132,7 @@ class WLNextClient:
             # If parsing failed for the -n invocation, try the no- -n form once
             # more as a last resort (handles implementations that emit slightly
             # different JSON shapes).
-            if cmd.endswith("-n %d --json" % count):
+            if used_count:
                 proc2 = _run("wl next --json")
                 if proc2 is not None:
                     LOG.debug(

@@ -580,10 +580,34 @@ def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> Ru
             output="heartbeat",
         )
     start = _utc_now()
+    # Determine an execution timeout in seconds.
+    # Priority (highest -> lowest):
+    # 1. CommandSpec.max_runtime_minutes (per-command override)
+    # 2. Delegation-specific env AMPA_DELEGATION_OPENCODE_TIMEOUT (used for opencode spawn)
+    # 3. Global AMPA_CMD_TIMEOUT_SECONDS default
     timeout = None
+    try:
+        default_cmd_timeout = int(os.getenv("AMPA_CMD_TIMEOUT_SECONDS", "3600"))
+    except Exception:
+        default_cmd_timeout = 3600
     if spec.max_runtime_minutes is not None:
         timeout = max(1, int(spec.max_runtime_minutes * 60))
-    LOG.info("Starting command %s", spec.command_id)
+    else:
+        # Enforce a default timeout for delegation flows and for commands that
+        # spawn `opencode run` to avoid leaving the scheduler marked running
+        # indefinitely when a child process hangs. Non-opencode commands keep
+        # the previous behaviour unless explicitly configured.
+        try:
+            delegate_env = os.getenv("AMPA_DELEGATION_OPENCODE_TIMEOUT")
+            delegate_timeout = (
+                int(delegate_env) if delegate_env else default_cmd_timeout
+            )
+        except Exception:
+            delegate_timeout = default_cmd_timeout
+        if spec.command_type == "delegation" or "opencode run" in (spec.command or ""):
+            timeout = max(1, int(delegate_timeout))
+
+    LOG.info("Starting command %s (timeout=%s)", spec.command_id, timeout)
     try:
         result = subprocess.run(  # nosec - shell execution is explicit configuration
             spec.command,
@@ -2672,11 +2696,7 @@ class Scheduler:
             }
 
         project_id = spec.metadata.get("project_id") if spec else None
-        env_mode = os.getenv("AMPA_FALLBACK_MODE")
-        if not project_id and not env_mode:
-            mode = "auto-accept"
-        else:
-            mode = fallback.resolve_mode(project_id)
+        mode = fallback.resolve_mode(project_id, require_config=True)
         if mode == "hold":
             LOG.info(
                 "Delegation dispatch skipped due to fallback hold mode (project=%s)",

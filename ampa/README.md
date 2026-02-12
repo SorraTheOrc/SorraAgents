@@ -239,3 +239,47 @@ Configuration
 
 - `AMPA_TOOL_OUTPUT_DIR` — directory where pending prompt and session files are written (defaults to temp dir)
 - `AMPA_RESUME_TIMEOUT_SECONDS` — resume timeout in seconds (default 86400 — 24h)
+- `AMPA_FALLBACK_CONFIG_FILE` — path to JSON config for fallback behaviour (defaults to `$AMPA_TOOL_OUTPUT_DIR/ampa_fallback_config.json`)
+- `AMPA_FALLBACK_MODE` — overrides all config values with a single fallback mode (`hold`, `auto-accept`, `auto-decline`)
+
+Fallback config schema
+----------------------
+
+The fallback config file controls how AMPA responds when sessions need input. It
+supports per-project overrides and a safe default for public projects (sessions
+without a project id). If no config file exists and no env override is set, the
+delegation scheduler keeps legacy behavior (auto-accept) until a config is saved.
+
+Example:
+
+```json
+{
+  "default": "auto-accept",
+  "public_default": "hold",
+  "projects": {
+    "internal-proj": "auto-accept",
+    "sandbox": "auto-decline"
+  }
+}
+```
+
+- `default`: fallback mode for non-public projects without an explicit override.
+- `public_default`: fallback mode when `project_id` is missing (safe default for public).
+- `projects`: map of `project_id` to fallback mode overrides.
+
+Valid modes: `hold`, `auto-accept`, `auto-decline`.
+
+Mode behavior (current)
+-----------------------
+
+- `hold`: always hold for human input.
+- `auto-accept`: automatically respond with `accept` when a response is required.
+- `auto-decline`: automatically respond with `decline` when a response is required.
+
+Mode behavior (planned direction)
+---------------------------------
+
+- `accept-recommendation`: automatically accept the agent's recommended option when it provides one.
+- `discuss-options`: hold a short conversation with the agent to decide, which may still resolve to hold for human input.
+
+Longer term we expect per-decision overrides (for example: always approve running tests, require discussion for opening PRs), but the current config applies a single mode to all decisions for a project.

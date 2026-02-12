@@ -101,7 +101,11 @@ def test_admin_fallback_controls_responder(tmp_path, monkeypatch):
     base = f"http://127.0.0.1:{port}"
 
     cfg_payload = json.dumps(
-        {"default": "hold", "projects": {"proj-1": "auto-accept"}}
+        {
+            "default": "hold",
+            "public_default": "hold",
+            "projects": {"proj-1": "auto-accept"},
+        }
     ).encode("utf-8")
     cfg_req = urllib.request.Request(
         f"{base}/admin/fallback",
@@ -129,6 +133,48 @@ def test_admin_fallback_controls_responder(tmp_path, monkeypatch):
     assert body["status"] == "resumed"
     assert body["session"] == session_id
     assert body["response"] == "accept"
+
+
+def test_responder_public_default_applies_when_project_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("AMPA_ADMIN_TOKEN", "secret-token")
+
+    server, port = start_metrics_server(port=0)
+    base = f"http://127.0.0.1:{port}"
+
+    cfg_payload = json.dumps(
+        {"default": "auto-accept", "public_default": "hold", "projects": {}}
+    ).encode("utf-8")
+    cfg_req = urllib.request.Request(
+        f"{base}/admin/fallback",
+        data=cfg_payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer secret-token",
+        },
+        method="POST",
+    )
+    cfg_resp = urllib.request.urlopen(cfg_req)
+    assert cfg_resp.status == 200
+
+    session_id = "s-public"
+    conversation_manager.start_conversation(session_id, "Approve?")
+
+    resp_req = urllib.request.Request(
+        f"{base}/respond",
+        data=json.dumps({"session_id": session_id}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(resp_req)
+        raised = False
+    except urllib.error.HTTPError as exc:
+        raised = True
+        assert exc.code == 400
+        body = json.loads(exc.read().decode())
+        assert "payload missing response" in body["error"]
+    assert raised
 
 
 def test_admin_fallback_requires_token(tmp_path, monkeypatch):
