@@ -268,3 +268,10 @@ Example:
 - `projects`: map of `project_id` to fallback mode overrides.
 
 Valid modes: `hold`, `auto-accept`, `auto-decline`.
+
+Mode behavior
+-------------
+
+- `hold`: do not auto-resume; keep the session waiting until a human responds.
+- `auto-accept`: automatically respond with `accept` when a response is required.
+- `auto-decline`: automatically respond with `decline` when a response is required.
