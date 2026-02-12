@@ -269,9 +269,17 @@ Example:
 
 Valid modes: `hold`, `auto-accept`, `auto-decline`.
 
-Mode behavior
--------------
+Mode behavior (current)
+-----------------------
 
-- `hold`: do not auto-resume; keep the session waiting until a human responds.
+- `hold`: always hold for human input.
 - `auto-accept`: automatically respond with `accept` when a response is required.
 - `auto-decline`: automatically respond with `decline` when a response is required.
+
+Mode behavior (planned direction)
+---------------------------------
+
+- `accept-recommendation`: automatically accept the agent's recommended option when it provides one.
+- `discuss-options`: hold a short conversation with the agent to decide, which may still resolve to hold for human input.
+
+Longer term we expect per-decision overrides (for example: always approve running tests, require discussion for opening PRs), but the current config applies a single mode to all decisions for a project.
