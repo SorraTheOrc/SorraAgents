@@ -2672,11 +2672,7 @@ class Scheduler:
             }
 
         project_id = spec.metadata.get("project_id") if spec else None
-        env_mode = os.getenv("AMPA_FALLBACK_MODE")
-        if not project_id and not env_mode:
-            mode = "auto-accept"
-        else:
-            mode = fallback.resolve_mode(project_id)
+        mode = fallback.resolve_mode(project_id, require_config=True)
         if mode == "hold":
             LOG.info(
                 "Delegation dispatch skipped due to fallback hold mode (project=%s)",
