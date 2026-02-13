@@ -124,12 +124,14 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
 
 Update the description of the Worklog work item with the final intake brief from `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` using `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --stage intake_complete --json`.
 
-Review the new issue in the overall context of the project and consider:
+8. Call the `find_related` skill to collect related work and add a report to the work item description.
+
+9. Review the new issue in the overall context of the project and consider:
 
 - Adding dependencies with `wl comment add <work-item-id> --comment "Blocks:<blocked-item-id>" --json` and `wl comment add <work-item-id> --comment "Blocked-by:<blocking-item-id>" --json`
 - Adjusting priority to better match the new understanding of scope and impact using `wl update <work-item-id> --priority <level> --json`
 
-8. Finishing (must do)
+10. Finishing (must do)
 
 - DO NOT close the issue
 - Run `wl sync` to sync work item changes.
