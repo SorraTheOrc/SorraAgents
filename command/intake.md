@@ -61,6 +61,7 @@ The command implements the procedural workflow below. Each numbered step is part
   - "Potentially related docs" (file paths)
   - "Potentially related work items" (titles followed by ID)
 - Read and summarize each of these related artifacts for later reference.
+  - Where appropriate, call the `find_related` skill to collect related work and produce an automated report. Prefer `find_related --dry-run --with-report` during interviews so the agent can present findings to the user before inserting them into the work item.
 
 2. Work Item prep (agent responsibility)
 
