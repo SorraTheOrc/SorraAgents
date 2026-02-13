@@ -4,7 +4,6 @@ import argparse
 from typing import Any
 
 from skill.cleanup.scripts import lib
-from skill.cleanup.scripts.summarize_open_prs import main as _summarize_open_prs
 
 
 PROTECTED_BRANCHES = {"main", "master", "develop"}

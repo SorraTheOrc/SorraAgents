@@ -65,6 +65,10 @@ def ensure_tool_available(tool: str) -> bool:
     return shutil.which(tool) is not None
 
 
+def tool_available_warning(tool: str) -> dict:
+    return {"warning": f"{tool} not available"}
+
+
 def confirm_action(prompt: str, assume_yes: bool, dry_run: bool) -> bool:
     if dry_run or assume_yes:
         return True

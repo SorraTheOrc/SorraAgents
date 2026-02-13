@@ -21,7 +21,11 @@ def main(argv: list[str] | None = None) -> int:
     default_branch = lib.parse_default_branch(runner, args.default)
 
     if not lib.ensure_tool_available("gh"):
-        report = {"warning": "gh not available; cannot list PRs"}
+        report = {
+            "operation": "summarize_open_prs",
+            "warning": "gh not available; cannot list PRs",
+            "prs": [],
+        }
         lib.write_report(report, args.report, print_output=not args.quiet)
         return 0
 

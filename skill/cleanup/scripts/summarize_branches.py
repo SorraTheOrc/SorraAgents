@@ -46,10 +46,16 @@ def merged_into_default(
 
 
 def parse_work_item(branch: str) -> tuple[str, str]:
+    """Parse a work item token from branch name.
+
+    Returns (token, work_item_id). The token is the matched token (e.g. WL-123).
+    The work_item_id is the same token if the numeric suffix is digits, else empty.
+    """
     m = re.search(r"([A-Za-z]+-\d+)", branch)
     if m:
         token = m.group(1)
-        return token, token
+        wid = token if token.rsplit("-", 1)[-1].isdigit() else ""
+        return token, wid
     return "", ""
 
 

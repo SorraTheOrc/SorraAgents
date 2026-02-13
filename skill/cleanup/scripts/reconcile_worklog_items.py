@@ -37,7 +37,16 @@ def main(argv: list[str] | None = None) -> int:
     runner = lib.CommandRunner()
 
     if not lib.ensure_tool_available("wl"):
-        lib.exit_with_error("wl is required")
+        # Emit a structured warning in the report and continue with empty list
+        report = {
+            "operation": "reconcile_worklog_items",
+            "warning": "wl not available; cannot reconcile work items",
+            "dry_run": args.dry_run,
+            "actions": [],
+            "summary": {},
+        }
+        lib.write_report(report, args.report, print_output=not args.quiet)
+        return 0
 
     proc = runner.run(["wl", "list", "--status", args.status, "--json"])
     payload = lib.parse_json_payload(proc.stdout)

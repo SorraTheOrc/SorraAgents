@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import timedelta
 from typing import Any
+import os
 
 from skill.cleanup.scripts import lib
 
@@ -44,6 +45,11 @@ def main(argv: list[str] | None = None) -> int:
         "--include-unmerged",
         action="store_true",
         help="Include branches not merged into default in report",
+    )
+    parser.add_argument(
+        "--allow-remote-delete",
+        action="store_true",
+        help="Explicit gate to allow remote deletions",
     )
     args = parser.parse_args(argv)
 
@@ -97,14 +103,21 @@ def main(argv: list[str] | None = None) -> int:
         ):
             actions.append({"branch": branch, "action": "skip", "result": "declined"})
             continue
+        # Require both explicit CLI flag and environment gate for remote deletions
+        env_allowed = os.environ.get(
+            "CLEANUP_ALLOW_REMOTE_DELETE", "false"
+        ).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if not args.allow_remote_delete or not env_allowed:
+            actions.append(
+                {"branch": branch, "action": "skip", "result": "no_permission"}
+            )
+            continue
         proc = lib.run_command(
-            [
-                "git",
-                "push",
-                "origin",
-                "--delete",
-                branch,
-            ],
+            ["git", "push", "origin", "--delete", branch],
             dry_run=args.dry_run,
             destructive=True,
             runner=runner,
