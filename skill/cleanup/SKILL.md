@@ -22,6 +22,16 @@ Triggers
 - `wl` (Worklog CLI) — optional but recommended for work item metadata
 - `gh` (GitHub CLI) — optional for PR summaries
 
+Scripts (implementation)
+
+- The skill ships a set of deterministic scripts under `skill/cleanup/scripts/` that implement the non-interactive behaviour described below. These scripts are the canonical implementation for automation and CI:
+  - `skill/cleanup/scripts/prune_local_branches.py`
+  - `skill/cleanup/scripts/cleanup_stale_remote_branches.py`
+  - `skill/cleanup/scripts/reconcile_worklog_items.py`
+  - `skill/cleanup/scripts/run_cleanup.py` (aggregator)
+
+Each script supports `--dry-run`, `--yes`, `--report <path>`, `--quiet`, and `--verbose`.
+
 ## Runtime flags (recommended)
 
 - `dry-run` (default): list actions without performing deletes or closes
@@ -33,6 +43,11 @@ Triggers
 - Default protected branches: `main`, `develop` (do not delete or target for deletion).
 - Detect default branch dynamically when possible (check `git remote show origin` or fallback to `main`).
 - Use conservative merge checks (`git merge-base --is-ancestor`) to determine whether a branch's HEAD is contained in the default branch.
+
+Integration notes
+
+- Before deleting remote branches, the scripts attempt to detect open PRs targeting the default branch using `gh pr list --state open --base <default> --json headRefName,url`. If `gh` is not available the scripts will log a warning and skip remote deletion unless explicit opt-in is provided.
+- Branch reports produced by the scripts include parsed work item tokens (branch name parsing) and — when `wl` is available — an enrichment section with `wl show <id> --json` output (title, status, assignee).
 
 ## High-level Steps
 
@@ -65,6 +80,16 @@ Triggers
     - `git merge-base --is-ancestor b origin/<default>` (exit code 0 => merged)
 - Present branch deletion list with metadata: last commit date, upstream (if any), work item id (if parseable), and open PR presence.
 - If not `dry-run` delete branches: `git branch -d <branch>` (safe delete). If `-d` fails, report and offer `-D` only with explicit permission.
+
+Example (script invocation)
+
+```bash
+# Dry-run and produce JSON report
+python skill/cleanup/scripts/prune_local_branches.py --dry-run --report reports/cleanup/local.json
+
+# Run aggregator in dry-run
+python skill/cleanup/scripts/run_cleanup.py --dry-run --report reports/cleanup/combined.json
+```
 
 5. Delete remote merged branches
 
