@@ -1,9 +1,6 @@
 ---
 name: find_related
-description: |
-  Discover related work for a Worklog work item and generate a concise, auditable "Related work"
-  report that can be appended to the work item description. This skill performs discovery and
-  reporting only — it does not perform intake interviews.
+description: Discover related work for a Worklog work item and generate a concise, auditable "Related work" report that can be appended to the work item description.
 ---
 
 ## Purpose
@@ -16,13 +13,12 @@ that is inserted into the work item description under a clearly-marked section.
 ## When to use
 
 - When a work item needs evidence of related or precedent work before planning or implementation.
-- When the intake process wants to augment context with an automated report without replacing human
-  authored intake drafts.
+- When the intake process wants to augment context with an automated report without replacing human authored intake drafts.
+- When a user or agent asks questions like "has this been done before?", "what's related?", or "is there existing context I should be aware of?" in relation to a work item.
 
 ## Inputs
 
 - work-item id (required)
-- flags: `--dry-run` (do not perform updates), `--verbose` (log steps), `--with-report` (generate and insert LLM-backed report)
 
 ## Outputs
 
@@ -31,31 +27,30 @@ that is inserted into the work item description under a clearly-marked section.
   - addedIds (array of work item ids appended)
   - reportInserted (boolean)
   - updatedDescription (string)
-  - dryRun (boolean)
 
 ## Decision logic
 
 1. Fetch work item: `wl show <id> --json`.
-2. If the description already contains related markers (e.g., `related-to:`) return quickly with found=true.
-3. Derive conservative keywords from the title/description and run `wl list <keyword> --json` to collect candidates.
-4. Inspect repository files (docs/README.md, README.md, and other top-level docs) for matching keywords; include those as repo matches.
-5. If `--with-report` is set, call the LLM report generator hook to produce a short informational report. The report MUST be clearly labeled and inserted under the heading "Related work (automated report)".
-6. If candidates are found and dry-run is false, append `related-to: <id>` lines and the report (if generated) to the work item description with `wl update`.
-7. Return the JSON summary.
+2. If the description already contains related markers (e.g., `related-to:`) extract these as existing related items and carry them into the following steps.
+3. Derive conservative keywords from the title/description/comments and run `wl list <keyword> --json` to collect candidates related issus.
+4. For each candidate, fetch details with `wl show <id> --json` and review title, description, acceptance criteria, and comments to determine if it is truly related. Only include items that have clear relevance to the work item goals or context.
+5. Use the `wl deps list <id> --json` command to identify any dependencies and include these in the list of repo matches to review for relevance.
+6. Search repository documentation and code files for matching keywords; include those as repo matches.
+
+- ignore data directories such as `node_modules`, `.git` and most "." named folders.
+
+7. Produce a short informational report describing related work in the repository, using the previously discovered items as seeds. The report MUST:
+
+- be clearly labeled and inserted under the heading "Related work (automated report)".
+- include links to any related work items or docs discovered, along with their titles or file paths.
+- Describe the relevance of each related item or doc in 1–2 sentences. This is the key value-add of the report, so it should not just be a list of links but should provide insight into why each item is related.
+
+8. Update the item description by appending the generated report. Note, if the existing description already contains a related items report or markers, the new report can replace this content, but ONLY this content. Use `wl update` to perform the update.
+9. Return the JSON summary.
 
 ## Hard requirements
 
-- Do not perform intake. This skill only discovers and reports.
-- Default behaviour must be conservative: prefer false negatives over false positives when appending `related-to:` lines.
-- Respect `--dry-run` flag: do not call `wl update` when dry-run is set.
-- The LLM report generator must be a pluggable hook so tests can mock it. The default implementation returns an empty string.
-
-## Tests
-
-- Unit tests must mock `wl` interactions and the LLM hook. Tests should cover dry-run, candidate discovery, and report insertion.
-
-## References to bundled resources
-
-- scripts/run.py — reference implementation providing a testable API and CLI.
+- Default behaviour must be conservative: prefer false negatives over false positives when writing the report.
+- Review each candidate item to ensure it is truly related before including it in the report. Do not include items that are only tangentially related or have low relevance.
 
 End.
