@@ -4,6 +4,7 @@ import argparse
 from typing import Any
 
 from skill.cleanup.scripts import lib
+from skill.cleanup.scripts.summarize_open_prs import main as _summarize_open_prs
 
 
 PROTECTED_BRANCHES = {"main", "master", "develop"}
@@ -58,6 +59,33 @@ def main(argv: list[str] | None = None) -> int:
         ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"]
     )
     branches = parse_branch_list(list_proc.stdout)
+
+    # fetch PR list to help avoid deleting branches with open PRs
+    pr_report = (
+        runner.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--base",
+                default_branch,
+                "--json",
+                "headRefName,number,url",
+            ]
+        )
+        if lib.ensure_tool_available("gh")
+        else None
+    )
+    open_pr_heads = set()
+    if pr_report and pr_report.returncode == 0:
+        try:
+            prs = lib.parse_json_payload(pr_report.stdout) or []
+            for p in prs:
+                open_pr_heads.add(p.get("headRefName"))
+        except Exception:
+            open_pr_heads = set()
 
     actions: list[dict[str, Any]] = []
     for branch in branches:
