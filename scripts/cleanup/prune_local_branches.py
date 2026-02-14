@@ -1,7 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from typing import Any
+
+# When this script is executed directly (for example in CI as
+# `python scripts/cleanup/prune_local_branches.py`) Python's
+# import search path may be `scripts/cleanup/` which prevents
+# importing the top-level `scripts` package. Ensure the repo
+# root is on `sys.path` so `from scripts.cleanup import lib`
+# works consistently both locally and in CI.
+repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
 from scripts.cleanup import lib
 

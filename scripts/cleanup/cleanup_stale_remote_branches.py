@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from datetime import timedelta
 from typing import Any
+
+# Ensure repository root is on sys.path so `scripts.cleanup` imports
+# work when the script is executed directly in CI or by tests.
+repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
 from scripts.cleanup import lib
 
