@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from typing import Any
@@ -40,6 +41,10 @@ def main(argv: list[str] | None = None) -> int:
         description="Prune local branches merged into the default branch."
     )
     lib.add_common_args(parser)
+    parser.add_argument(
+        "--branches-file",
+        help="Path to JSON (or newline-separated) file listing branches to consider for deletion",
+    )
     parser.add_argument("--default", help="Override default branch name")
     parser.add_argument(
         "--fetch",
@@ -70,6 +75,34 @@ def main(argv: list[str] | None = None) -> int:
         ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"]
     )
     branches = parse_branch_list(list_proc.stdout)
+
+    # If a branches-file was provided, use it to limit the set of branches we consider.
+    if args.branches_file:
+        try:
+            with open(args.branches_file, "r", encoding="utf-8") as fh:
+                payload = fh.read()
+        except FileNotFoundError:
+            lib.exit_with_error(f"branches file not found: {args.branches_file}")
+
+        # Try JSON first, fall back to newline-separated list
+        parsed: list[str] | None = None
+        try:
+            obj = json.loads(payload)
+            if isinstance(obj, list):
+                parsed = [str(x) for x in obj]
+            elif isinstance(obj, dict):
+                for key in ("branches", "items", "branch_list"):
+                    if key in obj and isinstance(obj[key], list):
+                        parsed = [str(x) for x in obj[key]]
+                        break
+        except json.JSONDecodeError:
+            parsed = None
+
+        if parsed is None:
+            parsed = [line.strip() for line in payload.splitlines() if line.strip()]
+
+        # Keep only branches that actually exist locally
+        branches = [b for b in branches if b in set(parsed)]
 
     actions: list[dict[str, Any]] = []
     for branch in branches:
