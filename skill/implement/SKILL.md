@@ -146,5 +146,5 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
     - reference the work item id(s) and link to any relevant documentation or PRDs.
     - Ensure that the desciption covers all commits and work items involved in the implementation
   - Do not escape the PR body; use markdown formatting as needed.
-- Link the PR to the work-item in a work-item comment to the work item as follows `wl comment <work-item-id> --body "PR created: <URL>\nBlocked on review and merge." --author "<AGENT>" --json`.
-- Mark the work item to completed/in-review with `wl update <work-item-id> --status blocked --stage in_review --json`
+- Link the PR to the work-item in a work-item comment to the work item as follows `wl comment <work-item-id> --body "PR created: <URL>\nReady for review and merge." --author "<AGENT>" --json`.
+- Mark the work item to completed/in-review with `wl update <work-item-id> --status completed --stage in_review --json`

@@ -1,6 +1,6 @@
 ---
 name: cleanup
-description: "Clean up completed work: inspect branches, update main, remove merged branches (local and optionally remote), reconcile work items, and produce a concise report. Trigger on queries like: 'clean up', 'tidy up', 'prune branches', 'housekeeping'."
+description: "Clean up completed work: inspect branches, update main, remove merged branches (local and optionally remote), and produce a concise report. Trigger on queries like: 'clean up', 'tidy up', 'prune branches', 'housekeeping'."
 ---
 
 # Cleanup Skill
@@ -14,96 +14,148 @@ Triggers
 
 ## Purpose
 
-- Inspect repository branches and Worklog work items, identify merged or stale work, remove safely deletable branches, propose work item closures, and produce a concise report of actions and next steps.
+Inspect repository branches, identify merged or stale work, remove safely deletable branches, and produce a concise report of actions and next steps.
 
 ## Required tools
 
 - `git` (required)
-- `wl` (Worklog CLI) — optional but recommended for work item metadata
 - `gh` (GitHub CLI) — optional for PR summaries
 
-## Runtime flags (recommended)
+Scripts (implementation)
 
-- `dry-run` (default): list actions without performing deletes or closes
-- `confirm_all`: allow single confirmation to apply a group of safe actions
+- The skill ships a set of deterministic scripts under `./scripts/` that implement the non-interactive behaviour described below. Each script supports `--dry-run`, `--yes`, `--report <path>`, `--quiet`, and `--verbose`.
+
+## Preferred execution behaviour (policy)
+
+- By default the agent MUST run the repository's official cleanup scripts listed in this document (for example, `inspect_current_branch.py`, `switch_to_default_and_update.py`, `summarize_branches.py`, `prune_local_branches.py`, `delete_remote_branches.py`). The agent SHOULD NOT substitute its own ad-hoc git commands for these scripts during normal operation.
+- The agent may fall back to built-in git inspections or other local checks ONLY in narrowly defined edge cases and only after explicit human instruction. Edge cases include:
+  - the expected script is missing or not executable,
+  - the script fails with an unexpected error and the user explicitly asks the agent to attempt a local-git fallback,
+- The agent MUST refuse to automatically run repository scripts when it detects potentially risky conditions (uncommitted changes, missing scripts, modified scripts) without explicit human confirmation.
+- Rationale: preferring the canonical in-repo scripts improves consistency and auditability while the guardrails reduce risk from modified or missing scripts.
+- If you offer choices to the user one of those options MUST be to use the audit skill to review the branch in more detail before proceeding. If the user chooses to review with the audit skill, present the report to the user and offer appropriate options for next steps based on that report before proceeding as instructed.
 
 ## Preconditions & safety
 
 - Never rewrite history or force-push without explicit permission.
 - Default protected branches: `main`, `develop` (do not delete or target for deletion).
-- Detect default branch dynamically when possible (check `git remote show origin` or fallback to `main`).
-- Use conservative merge checks (`git merge-base --is-ancestor`) to determine whether a branch's HEAD is contained in the default branch.
 
 ## High-level Steps
 
 1. Inspect current branch
 
-- Show current branch: `git rev-parse --abbrev-ref HEAD`.
-- Detect default branch (recommended): `git remote show origin` and parse "HEAD branch". Fallback to `main`.
-- If current branch is not the default branch:
-  - Fetch remote: `git fetch origin --prune`.
-  - Check whether current branch is merged into `origin/<default>`:
-    - `git merge-base --is-ancestor HEAD origin/<default>` (exit code 0 => merged)
-  - If not merged: present summary (branch name, last commit, unpushed commits, associated work item) and ask user: keep working / open PR / merge / skip deletion.
-  - If merged and user permits (or in `confirm_all`), allow continuing to default branch.
 
-2. Switch to default branch and update
+Use `skill/cleanup/scripts/inspect_current_branch.py` to inspect the current branch, detect the default branch, fetch `origin --prune` when needed, determine merge status, last commit, unpushed commits, and parse work item token. The agent MUST run this script by default and only perform inline git inspections if an edge case (see "Preferred execution behaviour") applies and the operator approves.
 
-- `git fetch origin --prune`.
-- `git checkout <default>`.
-- `git pull --ff-only origin <default>` (if fast-forward fails, report and ask).
+Output a human readable summary of this report using Markdown formatting. IMPORTANT: the agent MUST display the inspection report (or a concise excerpt of it) to the user before presenting any interactive prompts or choices. The displayed report should include at minimum:
 
-3. Summarize open PRs targeting default
+- current branch name and default branch
+- merge status (merged into default or not)
+- uncommitted changes list (git status-style short list)
+- unpushed commits count and last commit summary (author, date, sha)
+- the path to the full JSON report file when available (e.g. /tmp/cleanup/inspect_current.json)
 
-- If `gh` available: `gh pr list --state open --base <default> --json number,title,headRefName,url,author`.
-- Present any open PRs and their head branches; skip deleting branches that have open PRs unless user explicitly authorizes.
+If the report is large the agent should present a short, human-readable summary and offer to show the full diff or JSON report on demand. Example commands the agent may offer to the user to inspect details locally:
 
-4. Delete local merged branches
+```
+# show a short diff of uncommitted changes
+git --no-pager diff --name-status
 
-- List local branches merged into `origin/<default>` using conservative check per branch:
-  - For each branch `b` (excluding protected names and current):
-    - `git merge-base --is-ancestor b origin/<default>` (exit code 0 => merged)
-- Present branch deletion list with metadata: last commit date, upstream (if any), work item id (if parseable), and open PR presence.
-- If not `dry-run` delete branches: `git branch -d <branch>` (safe delete). If `-d` fails, report and offer `-D` only with explicit permission.
+# show the generated JSON report
+cat /tmp/cleanup/inspect_current.json
+```
 
-5. Delete remote merged branches
+If there are no uncommitted or unpushed changes then proceed to step 3.
 
-- For each deleted or candidate local branch with a remote `origin/<branch>`:
-  - Verify no open PR references it and that it is merged (use `git merge-base --is-ancestor origin/<branch> origin/<default>`).
-  - Present branch deletion list with metadata: last commit date, upstream (if any), work item id (if parseable), and open PR presence.
-  - If not `dry-run` delete branches: `git push origin --delete <branch>`.
+The agent should NOT proceed without approval when uncommitted changes are present and MUST always display the inspection report before asking the user how to proceed.
 
-6. Summarize remaining branches
+Examples:
 
-- Produce a table of remaining local and remote branches with: name, upstream, last commit, merged? (yes/no), work item id (if any), and open PR links (if available).
-- For each remaining branch, offer actions: keep / delete / create PR / assign work item / rebase / merge.
+```bash
+python skill/cleanup/scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json
+```
 
-7. Temporary File Rremoval
+2. Handle uncommitted and unpushed changes
 
-- If any temporary files were created (e.g., branch lists, reports), remove them to avoid clutter.
 
-8. Final report
+If the previous step detected uncommitted or unpushed changes, the agent MUST present the inspection report (see step 1) showing those changes and then provide sensible options with a recommendation based on the state (e.g., "Branch has unpushed commits. Would you like to push, stash, or skip?"). The report MUST be visible to the user before any choices are requested.
+
+The presented options must include the option to review the branch with the audit skill before proceeding, and if the user selects that option, the agent should run the audit skill and present the findings to the user before offering next steps.
+
+If the agent is unable to address the uncommitted/unpushed changes through the provided options, it should pause and provide guidance on how to resolve these issues manually before proceeding and stop further.
+
+3. Switch to default branch and update
+
+Only continue with this step if there are no uncommitted or unpushed changes in the current branch.
+
+Run `skill/cleanup/scripts/switch_to_default_and_update.py` to fetch, check out the default branch, and perform a fast-forward pull. The agent MUST run this script by default (see Preferred execution behaviour) and only attempt manual git switch/pull sequences when explicitly instructed by the human in an allowed edge case.
+
+If the pull fails (e.g., due to conflicts), the script will report the issue and you should work with the user to determine how to proceed (e.g., "Default branch cannot be fast-forwarded. Would you like to resolve conflicts manually and retry, or skip updating?"). The agent should NOT attempt to resolve conflicts automatically and should always defer to the human for next steps in this scenario.
+
+Example:
+
+```bash
+python skill/cleanup/scripts/switch_to_default_and_update.py --report /tmp/cleanup/switch_default.json
+```
+
+4. Summarize branches and open PRs
+
+Run `skill/cleanup/scripts/summarize_branches.py` to list local branches and include any open PRs targeting the default branch. The agent MUST run this script by default and present the script-generated report, in markdown format, for any deletion decisions.
+
+For branches with open PRs, present the PR details and skip deletion unless explicitly authorized.
+
+Example:
+
+```bash
+python skill/cleanup/scripts/summarize_branches.py --report /tmp/cleanup/branches.json
+```
+
+5. Delete local merged branches
+
+Use `skill/cleanup/scripts/prune_local_branches.py` with an explicit branch list derived from the summarize report and user input. The summarize report and user choice are the authoritative source; the prune script only deletes branches you pass in. The agent MUST NOT delete branches outside of the explicit branch list produced by the script and approved by the human.
+
+Example:
+
+```bash
+# delete branches identfied by the previous step
+python skill/cleanup/scripts/prune_local_branches.py \
+  --branches-file /tmp/cleanup/branches_to_delete.json \
+  --report /tmp/cleanup/prune_local.json
+
+# Dry-run and produce JSON report
+python ./scripts/prune_local_branches.py --dry-run \
+  --branches-file /tmp/cleanup/branches_to_delete.json \
+  --report /tmp/cleanup/local.json
+```
+
+6. Delete remote merged branches
+
+Run `skill/cleanup/scripts/delete_remote_branches.py` — deletes remote branches that are merged into default and older than a threshold (default 14 days). Report on branches deleted, skipped (e.g., due to open PRs), and any errors.
+
+Example:
+
+```bash
+# Delete all remote branches merged into default and older than 14 days
+python skill/cleanup/scripts/delete_remote_branches.py --days 14 --report /tmp/cleanup/delete_remote.json
+
+# Dry-run mode
+python skill/cleanup/scripts/delete_remote_branches.py --days 14 --dry-run --report /tmp/cleanup/delete_remote.json
+```
+
+7. Handle edge cases and manual review:
+
+Provide interactive options for handling remaining branches such as rebase, merge, create PR, or assign work item for any remaining branches. Where possible, provide guidance on next steps (e.g., "Branch X is not merged but has no open PR. Would you like to create a PR, rebase onto default, or assign to a work item?").
+
+8. Temporary File Removal
+
+If any temporary files were created (e.g., branch lists, reports), remove them to avoid clutter.
+
+9. Final report
 
 - Produce concise report including:
   - Branches deleted (local + remote)
   - Branches kept and reasons
-  - Work items closed
   - Any operations skipped or requiring manual intervention
-- Offer to save report: `history/cleanup-report-<timestamp>.md` (write only with confirmation).
-
-Branch ↔ Work item mapping
-
-- Parse branch names for work item tokens using the project's convention: `<prefix>-<id>/...` (example: `wl-123/feature`).
-- If found: `wl show <id> --json` to include title, status, priority, and comments.
-- If not found: flag branch for manual review and present guidance for associating to a work item.
-
-Commands (examples)
-
-- Detect default: `git remote show origin` or `git symbolic-ref refs/remotes/origin/HEAD`.
-- Conservative merge check: `git merge-base --is-ancestor <branch> origin/<default>`.
-- List branches for manual checking: `git for-each-ref --format='%(refname:short) %(committerdate:iso8601)' refs/heads/`.
-- PR summary: `gh pr list --state open --base <default> --json number,title,headRefName,url,author`.
-- Worklog: `wl list --status in_progress --json`, `wl show <id> --json`, `wl close <id> --reason "Completed" --json`, `wl sync`.
 
 Safety prompts (always asked)
 
@@ -112,17 +164,5 @@ Safety prompts (always asked)
 Outputs
 
 - Human-readable summary printed to terminal.
-
-Example short dialogue
-
-- Agent: "I can inspect merged branches and propose deletions in dry-run mode. Shall I proceed? (yes/no)"
-- User: "Yes — run dry-run and show candidates, do not delete remotes."
-- Agent: "Dry-run complete. Candidate local deletions: A, B. Remote candidates: C. Would you like to delete local A, B? (yes/no)"
-
-Notes for operators
-
-- Skill assumes `wl` and `gh` may be available; proceed gracefully if not.
-- Follow AGENTS.md work item/branch naming conventions. If conventions differ, flag branches for manual mapping.
-- Do not create or modify commits, force-push, or change remote configuration without explicit permission.
 
 End.
