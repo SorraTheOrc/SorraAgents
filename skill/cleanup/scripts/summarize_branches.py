@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import sys
 from typing import Any
+
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from skill.cleanup.scripts import lib
 
@@ -75,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
 
     branches = list_local_branches(runner)
     pr_report = None
+    open_prs: list[dict[str, Any]] = []
+    warning = ""
     if lib.ensure_tool_available("gh"):
         pr_report = runner.run(
             [
@@ -86,13 +95,18 @@ def main(argv: list[str] | None = None) -> int:
                 "--base",
                 default_branch,
                 "--json",
-                "headRefName,number,url",
+                "number,title,headRefName,url,author",
             ]
         )  # noqa: E501
-    open_pr_heads = set()
-    if pr_report and pr_report.returncode == 0:
-        for p in lib.parse_json_payload(pr_report.stdout) or []:
-            open_pr_heads.add(p.get("headRefName"))
+        if pr_report.returncode == 0:
+            open_prs = lib.parse_json_payload(pr_report.stdout) or []
+    else:
+        warning = "gh not available; cannot list PRs"
+
+    open_pr_by_head = {
+        pr.get("headRefName"): pr for pr in open_prs if pr.get("headRefName")
+    }
+    open_pr_heads = set(open_pr_by_head.keys())
 
     data = []
     for b in branches:
@@ -105,11 +119,14 @@ def main(argv: list[str] | None = None) -> int:
         entry["work_item_token"] = token
         entry["work_item_id"] = wid
         entry["open_pr"] = b in open_pr_heads
+        entry["open_pr_info"] = open_pr_by_head.get(b)
         data.append(entry)
 
     report = {
         "operation": "summarize_branches",
         "default_branch": default_branch,
+        "warning": warning,
+        "open_prs": open_prs,
         "branches": data,
     }
     lib.write_report(report, args.report, print_output=not args.quiet)

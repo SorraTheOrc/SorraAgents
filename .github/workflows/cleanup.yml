@@ -18,6 +18,7 @@ jobs:
         run: python -m pip install --upgrade pip
       - name: Run cleanup scripts in dry-run
         run: |
-          python scripts/cleanup/prune_local_branches.py --dry-run --report reports/cleanup/local.json
-          python scripts/cleanup/cleanup_stale_remote_branches.py --dry-run --days 30 --report reports/cleanup/remote.json
-          python scripts/cleanup/reconcile_worklog_items.py --dry-run --report reports/cleanup/worklog.json
+          mkdir -p /tmp/cleanup
+          printf '[]\n' > /tmp/cleanup/branches_to_delete.json
+          python scripts/cleanup/prune_local_branches.py --dry-run --branches-file /tmp/cleanup/branches_to_delete.json --report /tmp/cleanup/local.json
+          python scripts/cleanup/cleanup_stale_remote_branches.py --dry-run --days 30 --report /tmp/cleanup/remote.json

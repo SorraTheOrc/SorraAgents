@@ -2,7 +2,6 @@ import json
 
 from scripts.cleanup import prune_local_branches
 from scripts.cleanup import cleanup_stale_remote_branches
-from scripts.cleanup import reconcile_worklog_items
 from scripts.cleanup import lib
 
 
@@ -78,33 +77,3 @@ def test_cleanup_stale_remote_branches_dry_run(tmp_path, monkeypatch):
     assert payload["dry_run"] is True
 
 
-def test_reconcile_worklog_items_dry_run(tmp_path, monkeypatch):
-    payload = {
-        "items": [
-            {
-                "id": "SA-1",
-                "title": "Example",
-                "status": "in_progress",
-                "stage": "in_review",
-            }
-        ]
-    }
-    runner = DummyRunner(
-        {
-            "wl list --status in_progress --json": lib.CommandResult(
-                [], 0, json.dumps(payload), ""
-            )
-        }
-    )
-    monkeypatch.setattr(reconcile_worklog_items, "lib", lib)
-    monkeypatch.setattr(lib, "CommandRunner", lambda: runner)
-    monkeypatch.setattr(lib, "ensure_tool_available", lambda tool: True)
-
-    report_path = tmp_path / "worklog.json"
-    exit_code = reconcile_worklog_items.main(
-        ["--dry-run", "--report", str(report_path)]
-    )
-    assert exit_code == 0
-    payload = json.loads(report_path.read_text())
-    assert payload["operation"] == "reconcile_worklog_items"
-    assert payload["dry_run"] is True

@@ -1,0 +1,28 @@
+{
+  "operation": "run_cleanup",
+  "dry_run": true,
+  "steps": [],
+  "inspect_current_branch": {
+    "current_branch": "chore/SA-0MLAJNXE11LPQV66-cleanup-scripts",
+    "default_branch": "main",
+    "fetch": {
+      "attempted": true,
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    "merged_into_default": false,
+    "last_commit": {
+      "sha": "aa372d8a25ca7c2cbbd9aae02e2f391fbcdfb0d4",
+      "date": "2026-02-13 15:06:58 -0800",
+      "author": "rgardler-msft"
+    },
+    "unpushed_commits": 0,
+    "work_item_token": "SA-0",
+    "work_item_id": "SA-0",
+    "requires_interaction": true,
+    "recommended_action": "prompt_user",
+    "interactive_prompt": "Current branch is not merged into default. Choose: keep working / open PR / merge / skip deletion."
+  },
+  "halted_for_interaction": true
+}

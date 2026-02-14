@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import sys
 from typing import Any
+
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from skill.cleanup.scripts import lib
 
@@ -11,6 +19,37 @@ PROTECTED_BRANCHES = {"main", "master", "develop"}
 
 def parse_branch_list(output: str) -> list[str]:
     return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def parse_branches(values: list[str] | None) -> list[str]:
+    branches: list[str] = []
+    if not values:
+        return branches
+    for value in values:
+        for item in value.split(","):
+            item = item.strip()
+            if item:
+                branches.append(item)
+    return branches
+
+
+def load_branches_from_file(path: str) -> list[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return []
+    if isinstance(payload, list):
+        return [str(item).strip() for item in payload if str(item).strip()]
+    if isinstance(payload, dict):
+        for key in ("branches", "delete_branches"):
+            if isinstance(payload.get(key), list):
+                return [
+                    str(item).strip()
+                    for item in payload[key]
+                    if str(item).strip()
+                ]
+    return []
 
 
 def is_merged(runner: lib.CommandRunner, branch: str, default_ref: str) -> bool:
@@ -23,6 +62,11 @@ def get_current_branch(runner: lib.CommandRunner) -> str:
     return proc.stdout.strip()
 
 
+def branch_exists(runner: lib.CommandRunner, branch: str) -> bool:
+    proc = runner.run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"])
+    return proc.returncode == 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Prune local branches merged into the default branch."
@@ -33,6 +77,15 @@ def main(argv: list[str] | None = None) -> int:
         "--fetch",
         action="store_true",
         help="Fetch and prune remote tracking branches before scanning",
+    )
+    parser.add_argument(
+        "--branches",
+        action="append",
+        help="Branches to delete (comma-separated or repeatable)",
+    )
+    parser.add_argument(
+        "--branches-file",
+        help="Path to JSON file containing branches to delete",
     )
     args = parser.parse_args(argv)
 
@@ -54,40 +107,28 @@ def main(argv: list[str] | None = None) -> int:
     default_ref = lib.get_default_ref(runner, default_branch)
     current_branch = get_current_branch(runner)
 
-    list_proc = runner.run(
-        ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"]
-    )
-    branches = parse_branch_list(list_proc.stdout)
+    branches = parse_branches(args.branches)
+    if args.branches_file:
+        branches.extend(load_branches_from_file(args.branches_file))
+    unique_branches = list(dict.fromkeys(branches))
 
-    # fetch PR list to help avoid deleting branches with open PRs
-    pr_report = (
-        runner.run(
-            [
-                "gh",
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--base",
-                default_branch,
-                "--json",
-                "headRefName,number,url",
-            ]
-        )
-        if lib.ensure_tool_available("gh")
-        else None
-    )
-    open_pr_heads = set()
-    if pr_report and pr_report.returncode == 0:
-        try:
-            prs = lib.parse_json_payload(pr_report.stdout) or []
-            for p in prs:
-                open_pr_heads.add(p.get("headRefName"))
-        except Exception:
-            open_pr_heads = set()
+    if not unique_branches:
+        report = {
+            "operation": "prune_local_branches",
+            "default_branch": default_branch,
+            "dry_run": args.dry_run,
+            "warning": "no branches provided",
+            "actions": [],
+            "summary": {},
+        }
+        lib.write_report(report, args.report, print_output=not args.quiet)
+        return 0
 
     actions: list[dict[str, Any]] = []
-    for branch in branches:
+    for branch in unique_branches:
+        if not branch_exists(runner, branch):
+            actions.append({"branch": branch, "action": "skip", "result": "missing"})
+            continue
         if branch in PROTECTED_BRANCHES:
             actions.append({"branch": branch, "action": "skip", "result": "protected"})
             continue

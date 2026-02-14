@@ -9,10 +9,6 @@ with explicit flags for dry runs, confirmations, and JSON reporting.
   - Prunes local branches that are merged into the default branch.
 - `scripts/cleanup/cleanup_stale_remote_branches.py`
   - Lists (and optionally deletes) remote branches older than N days.
-- `scripts/cleanup/reconcile_worklog_items.py`
-  - Closes resolved work items (based on stage/status rules).
-- `scripts/cleanup/run_cleanup.py`
-  - Runs all cleanup routines and emits a combined report.
 
 ## Common flags
 
@@ -20,33 +16,24 @@ with explicit flags for dry runs, confirmations, and JSON reporting.
 - `--yes`: assume yes for prompts.
 - `--report <path>`: write JSON report to file.
 - `--verbose`: increase logging (repeat for more detail).
-- `--quiet`: suppress JSON output to stdout (useful when invoking via `run_cleanup.py`).
+- `--quiet`: suppress JSON output to stdout.
 
 ## Examples
 
 Dry-run local branch cleanup:
 
 ```bash
-python scripts/cleanup/prune_local_branches.py --dry-run --report reports/cleanup/local.json
+python scripts/cleanup/prune_local_branches.py --dry-run \
+  --branches-file /tmp/cleanup/branches_to_delete.json \
+  --report /tmp/cleanup/local.json
 ```
 
 Dry-run stale remote cleanup (90 days):
 
 ```bash
-python scripts/cleanup/cleanup_stale_remote_branches.py --days 90 --dry-run --report reports/cleanup/remote.json
+python scripts/cleanup/cleanup_stale_remote_branches.py --days 90 --dry-run --report /tmp/cleanup/remote.json
 ```
 
-Dry-run worklog reconciliation:
-
-```bash
-python scripts/cleanup/reconcile_worklog_items.py --status in_progress --stage in_review --dry-run --report reports/cleanup/worklog.json
-```
-
-Combined run (all steps):
-
-```bash
-python scripts/cleanup/run_cleanup.py --dry-run --report reports/cleanup/combined.json
-```
 
 ## Behavior notes vs cleanup skill
 
@@ -59,4 +46,3 @@ python scripts/cleanup/run_cleanup.py --dry-run --report reports/cleanup/combine
 ## Requirements
 
 - `git` for branch operations.
-- `wl` for worklog reconciliation.

@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import argparse
 from datetime import timedelta
+import os
+import sys
 from typing import Any
+
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from skill.cleanup.scripts import lib
 
@@ -10,18 +17,20 @@ from skill.cleanup.scripts import lib
 PROTECTED = {"main", "master", "develop"}
 
 
+def is_merged_remote(runner: lib.CommandRunner, branch: str, default_ref: str) -> bool:
+    proc = runner.run(
+        ["git", "merge-base", "--is-ancestor", f"origin/{branch}", default_ref]
+    )
+    return proc.returncode == 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Delete remote branches that meet criteria"
     )
     lib.add_common_args(parser)
-    parser.add_argument("--days", type=int, default=30)
+    parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--default", help="Override default branch name")
-    parser.add_argument(
-        "--allow-remote-delete",
-        action="store_true",
-        help="Explicit gate to allow remote deletions",
-    )
     args = parser.parse_args(argv)
 
     lib.configure_logging(args.verbose)
@@ -29,7 +38,8 @@ def main(argv: list[str] | None = None) -> int:
 
     default_branch = lib.parse_default_branch(runner, args.default)
     # fetch
-    runner.run(["git", "fetch", "origin", "--prune"])
+    fetch_proc = runner.run(["git", "fetch", "origin", "--prune"])
+    default_ref = lib.get_default_ref(runner, default_branch)
 
     # list remote branches
     list_proc = runner.run(
@@ -64,6 +74,10 @@ def main(argv: list[str] | None = None) -> int:
         if commit_time > threshold:
             actions.append({"branch": name, "action": "skip", "result": "recent"})
             continue
+        merged = is_merged_remote(runner, name, default_ref)
+        if not merged:
+            actions.append({"branch": name, "action": "skip", "result": "not_merged"})
+            continue
         # avoid deleting if PR is open
         if lib.ensure_tool_available("gh"):
             pr_proc = runner.run(
@@ -83,12 +97,6 @@ def main(argv: list[str] | None = None) -> int:
                 actions.append({"branch": name, "action": "skip", "result": "open_pr"})
                 continue
 
-        if not args.allow_remote_delete:
-            actions.append(
-                {"branch": name, "action": "skip", "result": "no_permission"}
-            )
-            continue
-
         proc = lib.run_command(
             ["git", "push", "origin", "--delete", name],
             dry_run=args.dry_run,
@@ -103,7 +111,19 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
 
-    report = {"operation": "delete_remote_branches", "actions": actions}
+    report = {
+        "operation": "delete_remote_branches",
+        "default_branch": default_branch,
+        "default_ref": default_ref,
+        "dry_run": args.dry_run,
+        "threshold_days": args.days,
+        "fetch": {
+            "returncode": fetch_proc.returncode,
+            "stderr": fetch_proc.stderr.strip(),
+        },
+        "actions": actions,
+        "summary": lib.render_summary(actions),
+    }
     lib.write_report(report, args.report, print_output=not args.quiet)
     return 0
 
