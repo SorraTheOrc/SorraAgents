@@ -44,7 +44,6 @@ Scripts (implementation)
 
 1. Inspect current branch
 
-
 Use `skill/cleanup/scripts/inspect_current_branch.py` to inspect the current branch, detect the default branch, fetch `origin --prune` when needed, determine merge status, last commit, unpushed commits, and parse work item token. The agent MUST run this script by default and only perform inline git inspections if an edge case (see "Preferred execution behaviour") applies and the operator approves.
 
 Output a human readable summary of this report using Markdown formatting. IMPORTANT: the agent MUST display the inspection report (or a concise excerpt of it) to the user before presenting any interactive prompts or choices. The displayed report should include at minimum:
@@ -77,7 +76,6 @@ python skill/cleanup/scripts/inspect_current_branch.py --report /tmp/cleanup/ins
 
 2. Handle uncommitted and unpushed changes
 
-
 If the previous step detected uncommitted or unpushed changes, the agent MUST present the inspection report (see step 1) showing those changes and then provide sensible options with a recommendation based on the state (e.g., "Branch has unpushed commits. Would you like to push, stash, or skip?"). The report MUST be visible to the user before any choices are requested.
 
 The presented options must include the option to review the branch with the audit skill before proceeding, and if the user selects that option, the agent should run the audit skill and present the findings to the user before offering next steps.
@@ -102,7 +100,9 @@ python skill/cleanup/scripts/switch_to_default_and_update.py --report /tmp/clean
 
 Run `skill/cleanup/scripts/summarize_branches.py` to list local branches and include any open PRs targeting the default branch. The agent MUST run this script by default and present the script-generated report, in markdown format, for any deletion decisions.
 
-For branches with open PRs, present the PR details and skip deletion unless explicitly authorized.
+For branches with unmerged commits or open PRs, present the PR details and skip deletion unless explicitly authorized. The agent should present a clear summary of these branches, including their merge status, last commit, and any associated work items, to help the user make informed decisions about which branches to delete.
+
+Branches that are merged into default, have no unmerged commits and have no open PRs should be listed as candidates for deletion without further permission.
 
 Example:
 
