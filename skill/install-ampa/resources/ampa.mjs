@@ -211,7 +211,10 @@ async function start(projectRoot, cmd, name = 'default', foreground = false) {
       proc = spawn(cmd[0], cmd.slice(1), { cwd: projectRoot, detached: true, stdio: ['ignore', out, out] });
     }
   } catch (e) {
-    console.error('failed to start:', e && e.message ? e.message : e);
+    const msg = e && e.message ? e.message : String(e);
+    console.error('failed to start:', msg);
+    // append the error message to the log file for easier diagnosis
+    try { fs.appendFileSync(lpath, `Failed to spawn process: ${msg}\n`); } catch (ex) {}
     return 1;
   }
   if (!proc || !proc.pid) {
@@ -224,6 +227,26 @@ async function start(projectRoot, cmd, name = 'default', foreground = false) {
   if (!isRunning(proc.pid)) {
     try { fs.unlinkSync(ppath); } catch (e) {}
     console.error('failed to start: process exited immediately');
+    // Collect a helpful diagnostic snapshot: append the tail of the log to
+    // the log itself with an explicit marker so operators can see what the
+    // child process printed before exiting.
+    try {
+      const maxBytes = 32 * 1024; // read up to last 32KB of log
+      const stat = fs.existsSync(lpath) && fs.statSync(lpath);
+      if (stat && stat.size > 0) {
+        const fd = fs.openSync(lpath, 'r');
+        const toRead = Math.min(stat.size, maxBytes);
+        const buf = Buffer.alloc(toRead);
+        const pos = stat.size - toRead;
+        fs.readSync(fd, buf, 0, toRead, pos);
+        fs.closeSync(fd);
+        fs.appendFileSync(lpath, `\n----- CHILD PROCESS OUTPUT (last ${toRead} bytes) -----\n`);
+        fs.appendFileSync(lpath, buf.toString('utf8') + '\n');
+        fs.appendFileSync(lpath, `----- END CHILD OUTPUT -----\n`);
+      }
+    } catch (ex) {
+      try { fs.appendFileSync(lpath, `Failed to capture child output: ${String(ex)}\n`); } catch (e) {}
+    }
     return 1;
   }
   console.log(`Started ${name} pid=${proc.pid} log=${lpath}`);
