@@ -1,4 +1,4 @@
-// Node ESM implementation of the wl 'ampa' plugin, namespaced under plugins/wl_ampa
+// Node ESM implementation of the wl 'ampa' plugin, moved into skill resources
 // Registers `wl ampa start|stop|status|run` and manages pid/log files under
 // `.worklog/ampa/<name>.(pid|log)`.
 
