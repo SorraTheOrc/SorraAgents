@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # Install a Worklog plugin into a project or user plugin directory.
 # Usage: ./skill/install-ampa/scripts/install-worklog-plugin.sh <source-file> [target-dir]
-# Example: ./skill/install-ampa/scripts/install-worklog-plugin.sh plugins/wl_ampa/ampa.mjs
+# Example: ./skill/install-ampa/scripts/install-worklog-plugin.sh skill/install-ampa/resources/ampa.mjs
 
 set -eu
 
@@ -9,7 +9,7 @@ set -eu
 # CONSTANTS
 # ============================================================================
 
-DEFAULT_SRC="skill/install-ampa/resources/wl_ampa/ampa.mjs"
+DEFAULT_SRC="skill/install-ampa/resources/ampa.mjs"
 LOCK_DIR="/tmp/ampa_install.lock"
 DECISION_LOG="/tmp/ampa_install_decisions.$$"
 PID_FILE=".worklog/ampa/default/default.pid"
