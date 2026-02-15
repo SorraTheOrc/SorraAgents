@@ -9,7 +9,7 @@ set -eu
 # CONSTANTS
 # ============================================================================
 
-DEFAULT_SRC="plugins/wl_ampa/ampa.mjs"
+DEFAULT_SRC="skill/install-ampa/resources/wl_ampa/ampa.mjs"
 LOCK_DIR="/tmp/ampa_install.lock"
 DECISION_LOG="/tmp/ampa_install_decisions.$$"
 PID_FILE=".worklog/ampa/default/default.pid"
