@@ -9,7 +9,15 @@ set -eu
 # CONSTANTS
 # ============================================================================
 
-DEFAULT_SRC="skill/install-ampa/resources/ampa.mjs"
+# Resolve paths relative to this script's location so the installer can be
+# executed from any working directory. SCRIPT_DIR points to
+# skill/install-ampa/scripts and the canonical resources live at
+# ../resources/ampa.mjs relative to this script.
+SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)"
+DEFAULT_SRC="$SCRIPT_DIR/../resources/ampa.mjs"
+# Directory to copy AMPA python package from when not present in the project.
+# Prefer XDG_CONFIG_HOME if set, otherwise default to $HOME/.config/opencode/ampa
+CONFIG_AMPA_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/ampa"
 LOCK_DIR="/tmp/ampa_install.lock"
 DECISION_LOG="/tmp/ampa_install_decisions.$$"
 PID_FILE=".worklog/ampa/default/default.pid"
@@ -440,6 +448,8 @@ install_worklog_plugin() {
 
 # Copy Python package into plugin directory
 copy_python_package() {
+   # Optional first arg: source dir to copy python package from. Defaults to "ampa"
+   local src_dir="${1:-ampa}"
    local py_target_dir="$TARGET_DIR/ampa_py"
    local env_backup=""
    local store_backup=""
@@ -461,9 +471,15 @@ copy_python_package() {
 
 
    # Remove old bundle and copy new one
-   mkdir -p "$py_target_dir"
-   rm -rf "$py_target_dir/ampa"
-   cp -R "ampa" "$py_target_dir/ampa"
+    mkdir -p "$py_target_dir"
+    rm -rf "$py_target_dir/ampa"
+    if [ -d "$src_dir" ]; then
+      cp -R "$src_dir" "$py_target_dir/ampa"
+    else
+      log_decision "COPY_SRC_MISSING=$src_dir"
+      log_error "AMPA source directory not found: $src_dir"
+      return 1
+    fi
    
     # Record post-copy state
     log_decision "POST_COPY_ls=$(ls -la \"$py_target_dir/ampa\" 2>/dev/null || true)"
@@ -680,31 +696,54 @@ main() {
   # Install plugin
   install_worklog_plugin
 
-  # Install Python package if present
-  if [ -d "ampa" ]; then
-    copy_python_package
-    setup_python_package
+   # Install Python package: prefer project-local `ampa/`, fall back to
+   # user's config directory (e.g. ~/.config/opencode/ampa). Missing AMPA is a
+   # critical error for installations that expect the daemon; report and exit.
+   if [ -d "ampa" ]; then
+     if ! copy_python_package "ampa"; then
+       log_error "Critical: failed to copy AMPA from project 'ampa' directory"
+       exit 2
+     fi
+     setup_python_package
+   elif [ -d "$CONFIG_AMPA_DIR" ]; then
+     log_info "Copying AMPA package from $CONFIG_AMPA_DIR"
+     if ! copy_python_package "$CONFIG_AMPA_DIR"; then
+       log_error "Critical: failed to copy AMPA from $CONFIG_AMPA_DIR"
+       exit 2
+     fi
+     setup_python_package
+   else
+     log_error "Critical: AMPA Python package not found in project (ampa/) or $CONFIG_AMPA_DIR"
+     log_error "Install cannot proceed without AMPA; aborting."
+     exit 2
+   fi
 
-    # Handle .env file configuration
-    if [ "$SKIP_WEBHOOK_UPDATE" -eq 1 ] || [ "$preserve_existing_env" -eq 1 ]; then
-      log_info "Preserving existing .env (user requested no webhook update or pre-existing .env)"
-    else
-      if [ "$REMOVE_WEBHOOK" -eq 1 ]; then
-        local env_file="$TARGET_DIR/ampa_py/ampa/.env"
-        remove_webhook_from_env "$env_file"
-      elif [ -n "$WEBHOOK" ]; then
-        local env_file="$TARGET_DIR/ampa_py/ampa/.env"
-        write_webhook_to_env "$env_file" "$WEBHOOK"
-      else
-        log_info "No webhook provided; skipping .env creation/update"
-      fi
-    fi
-  fi
+   # Handle .env file configuration
+   if [ "$SKIP_WEBHOOK_UPDATE" -eq 1 ] || [ "$preserve_existing_env" -eq 1 ]; then
+     log_info "Preserving existing .env (user requested no webhook update or pre-existing .env)"
+   else
+     if [ "$REMOVE_WEBHOOK" -eq 1 ]; then
+       local env_file="$TARGET_DIR/ampa_py/ampa/.env"
+       remove_webhook_from_env "$env_file"
+     elif [ -n "$WEBHOOK" ]; then
+       local env_file="$TARGET_DIR/ampa_py/ampa/.env"
+       write_webhook_to_env "$env_file" "$WEBHOOK"
+     else
+       log_info "No webhook provided; skipping .env creation/update"
+     fi
+   fi
 
-   # Start daemon after install/upgrade completes
+   # Start daemon after install/upgrade completes, but only if a Python ampa
+   # package was installed into the plugin directory. If no python bundle is
+   # present there's nothing sensible to start and calling `wl ampa start`
+   # will fail with "No command resolved".
    if [ -f "$TARGET_DIR/$(basename "$SRC")" ]; then
-     log_info "Starting daemon after installation..."
-     start_daemon
+     if [ -d "$TARGET_DIR/ampa_py/ampa" ]; then
+       log_info "Starting daemon after installation..."
+       start_daemon
+     else
+       log_info "No Python ampa package installed at $TARGET_DIR/ampa_py/ampa; skipping daemon restart."
+     fi
    fi
 
 
