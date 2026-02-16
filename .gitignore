@@ -13,6 +13,9 @@ Worklog Specific Ignores
 # opencode temporary files
 .opencode/tmp/
 
+# Local tmux window configuration
+scripts/tmux.windows.conf
+
 ### End of Worklog Specific Ignores
 
 # Node / package artifacts
