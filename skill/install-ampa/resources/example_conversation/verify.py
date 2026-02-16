@@ -16,7 +16,7 @@ def verify(path: str, rounds: int) -> int:
     # check alternation
     for i, e in enumerate(lines):
         sender = e.get("sender")
-        expected_sender = "CM-A" if i % 2 == 0 else "CM-B"
+        expected_sender = "AMPA" if i % 2 == 0 else "BUILD"
         if sender != expected_sender:
             print(
                 f"FAIL: message {i + 1} sender {sender} != expected {expected_sender}"
