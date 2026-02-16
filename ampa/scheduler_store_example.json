@@ -73,20 +73,6 @@
       "requires_llm": false,
       "type": "delegation"
     }
-    ,
-    "cleanup-runner": {
-      "command": "python -m ampa.run_cleanup",
-      "frequency_minutes": 360,
-      "id": "cleanup-runner",
-      "title": "Periodic repository cleanup",
-      "max_runtime_minutes": 30,
-      "metadata": {
-        "discord_label": "repo cleanup"
-      },
-      "priority": 0,
-      "requires_llm": false,
-      "type": "shell"
-    }
   },
   "last_global_start_ts": "2026-02-05T07:51:52.053932+00:00",
   "state": {
