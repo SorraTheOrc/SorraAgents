@@ -192,3 +192,52 @@ def test_responder_payload_action_accept(tmp_path, monkeypatch):
     assert result["status"] == "resumed"
     assert result["session"] == session_id
     assert result["response"] == "accept"
+
+
+def test_detect_and_surface_blocking_prompt_persists_state(tmp_path, monkeypatch):
+    tool_dir = str(tmp_path)
+    monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", tool_dir)
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid")
+    monkeypatch.setenv("AMPA_RESPONDER_URL", "http://localhost:8081/respond")
+
+    captured = {}
+
+    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["message_type"] = message_type
+        return 204
+
+    monkeypatch.setattr(session_block.webhook_module, "send_webhook", fake_send_webhook)
+
+    session_id = "s-blocked"
+    prompt = "Approve change?"
+
+    meta = session_block.detect_and_surface_blocking_prompt(
+        session_id,
+        "WL-44",
+        prompt,
+        choices=["yes", "no"],
+        context=[{"role": "user", "content": "review"}],
+    )
+
+    prompt_file = meta["prompt_file"]
+    assert os.path.exists(prompt_file)
+    with open(prompt_file, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    assert payload["prompt_text"] == prompt
+    assert payload["choices"] == ["yes", "no"]
+    assert payload["context"] == [{"role": "user", "content": "review"}]
+    assert payload["session_id"] == session_id
+
+    state_file = os.path.join(tool_dir, f"session_{session_id}.json")
+    assert os.path.exists(state_file)
+    with open(state_file, "r", encoding="utf-8") as fh:
+        state = json.load(fh)
+    assert state["state"] == "waiting_for_input"
+
+    assert captured["message_type"] == "waiting_for_input"
+    content = captured["payload"]["content"]
+    assert "Session: s-blocked" in content
+    assert "Work item: WL-44" in content
+    assert "Reason: Approve change?" in content
