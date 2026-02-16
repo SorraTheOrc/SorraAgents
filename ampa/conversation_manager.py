@@ -26,8 +26,11 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 try:
-    # when imported as a package during tests, use relative import
-    from ampa import session_block
+    # Prefer relative import when package-imported (ensures intra-package
+    # imports resolve correctly when the package is installed under
+    # .worklog/plugins/ampa_py/ampa). Fall back to top-level import for
+    # script execution contexts.
+    from . import session_block
 except Exception:
     import session_block
 

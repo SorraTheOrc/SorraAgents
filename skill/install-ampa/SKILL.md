@@ -14,6 +14,8 @@ User asks to "Install AMPA", "Install PM Agent", "Upgrade AMPA", "Upgrade PM Age
 
 ## Usage
 
+NOTE: the work carried out by this skill does not require a work item, but the agent may optionally parse a work item token from the prompt to link the installation activity to a work item.
+
 1. Establish current status
 
 Run `wl plugins --json` to discover whether the AMPA plugin is currently installed or not.
@@ -40,4 +42,6 @@ skill/install-ampa/scripts/install-worklog-plugin.sh --webhook <discord_webhook>
 ```
 
 Notes:
+
 - The script writes logs and decision traces under `/tmp` (e.g. `/tmp/ampa_install_decisions.<pid>` and `/tmp/ampa_install_*.log`).
+- The installer bundles a minimal Python `ampa` package in `skill/install-ampa/resources/ampa_py/ampa` so projects that lack a local `ampa/` get a working copy. The installer will also look in `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/ampa`.
