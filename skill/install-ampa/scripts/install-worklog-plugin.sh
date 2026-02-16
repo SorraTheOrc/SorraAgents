@@ -594,7 +594,42 @@ prompt_restart_daemon() {
 # Stop the running daemon
 stop_daemon() {
   log_info "Stopping running daemon before upgrade..."
-  wl ampa stop --name default || true
+
+  # Run the stop command and capture output so the operator sees what happened
+  local _out
+  if _out=$(wl ampa stop --name default 2>&1); then
+    log_info "wl ampa stop output:"
+    # Show each line to preserve formatting
+    printf "%s\n" "$_out"
+  else
+    log_info "wl ampa stop returned non-zero (output):"
+    printf "%s\n" "$_out"
+  fi
+
+  # Wait for the pid file to be removed or the process to exit. This provides
+  # observable feedback during upgrades so the operator knows the service was
+  # actually stopped before the installer proceeds.
+  local _wait=0
+  local _pid=""
+  while [ -f "$PID_FILE" ] && [ "$_wait" -lt 20 ]; do
+    _pid=$(sed -n '1p' "$PID_FILE" 2>/dev/null || true)
+    if [ -z "$_pid" ] || ! kill -0 "$_pid" 2>/dev/null; then
+      rm -f "$PID_FILE" 2>/dev/null || true
+      break
+    fi
+    _wait=$((_wait + 1))
+    sleep 0.5
+  done
+
+  if [ -f "$PID_FILE" ]; then
+    log_error "Timed out waiting for daemon to stop; pidfile $PID_FILE still exists."
+  else
+    if [ -n "$_pid" ]; then
+      log_info "Daemon stopped (pid=$_pid)"
+    else
+      log_info "Daemon stop completed (pid file removed)"
+    fi
+  fi
 }
 
 # Start the daemon
