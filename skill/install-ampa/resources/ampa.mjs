@@ -2,7 +2,7 @@
 // Registers `wl ampa start|stop|status|run` and manages pid/log files under
 // `.worklog/ampa/<name>.(pid|log)`.
 
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import fsPromises from 'fs/promises';
 import path from 'path';
@@ -164,8 +164,125 @@ function isRunning(pid) {
   }
 }
 
+function pidOwnedByProject(projectRoot, pid, lpath) {
+  // Try /proc first (Linux). Fallback to ps if needed. Return true when a
+  // substring that ties the process to this project is present in the cmdline.
+  let cmdline = '';
+  try {
+    const p = `/proc/${pid}/cmdline`;
+    if (fs.existsSync(p)) {
+      cmdline = fs.readFileSync(p, 'utf8').replace(/\0/g, ' ').trim();
+    }
+  } catch (e) {}
+  if (!cmdline) {
+    try {
+      const r = spawnSync('ps', ['-p', String(pid), '-o', 'args=']);
+      if (r && r.status === 0 && r.stdout) cmdline = String(r.stdout).trim();
+    } catch (e) {}
+  }
+  // Decide what patterns indicate ownership of the process by this project.
+  const candidates = [
+    projectRoot,
+    path.join(projectRoot, '.worklog', 'plugins', 'ampa_py'),
+    path.join(projectRoot, 'ampa'),
+    'ampa.daemon',
+    'ampa.scheduler',
+  ];
+  let matches = false;
+  try {
+    const lower = cmdline.toLowerCase();
+    for (const c of candidates) {
+      if (!c) continue;
+      if (lower.includes(String(c).toLowerCase())) {
+        matches = true;
+        break;
+      }
+    }
+  } catch (e) {}
+  // Append a short diagnostic entry to the log if available.
+  try {
+    if (lpath) {
+      fs.appendFileSync(lpath, `PID_VALIDATION pid=${pid} cmdline=${JSON.stringify(cmdline)} matches=${matches}\n`);
+    }
+  } catch (e) {}
+  return matches;
+}
+
 function writePid(ppath, pid) {
   fs.writeFileSync(ppath, String(pid), 'utf8');
+}
+
+function readLogTail(lpath, maxBytes = 64 * 1024) {
+  try {
+    if (!fs.existsSync(lpath)) return '';
+    const stat = fs.statSync(lpath);
+    if (!stat || stat.size === 0) return '';
+    const toRead = Math.min(stat.size, maxBytes);
+    const fd = fs.openSync(lpath, 'r');
+    const buf = Buffer.alloc(toRead);
+    const pos = stat.size - toRead;
+    fs.readSync(fd, buf, 0, toRead, pos);
+    fs.closeSync(fd);
+    return buf.toString('utf8');
+  } catch (e) {
+    return '';
+  }
+}
+
+function extractErrorLines(text) {
+  if (!text) return [];
+  const lines = text.split(/\r?\n/);
+  const re = /(ERROR|Traceback|Exception|AMPA_DISCORD_WEBHOOK)/i;
+  const out = [];
+  for (const l of lines) {
+    if (re.test(l)) out.push(l);
+  }
+  // return last 200 matching lines at most
+  return out.slice(-200);
+}
+
+function printLogErrors(lpath) {
+  try {
+    const tail = readLogTail(lpath);
+    const errs = extractErrorLines(tail);
+    if (errs.length > 0) {
+      console.log('Recent errors from log:');
+      for (const line of errs) console.log(line);
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+function findMostRecentLog(projectRoot) {
+  try {
+    const base = path.join(projectRoot, '.worklog', 'ampa');
+    if (!fs.existsSync(base)) return null;
+    let best = { p: null, m: 0 };
+    const names = fs.readdirSync(base);
+    for (const n of names) {
+      const sub = path.join(base, n);
+      try {
+        const st = fs.statSync(sub);
+        if (!st.isDirectory()) continue;
+      } catch (e) { continue; }
+      const files = fs.readdirSync(sub);
+      for (const f of files) {
+        if (!f.endsWith('.log')) continue;
+        const fp = path.join(sub, f);
+        try {
+          const s = fs.statSync(fp);
+          if (s && s.mtimeMs > best.m) {
+            best.p = fp;
+            best.m = s.mtimeMs;
+          }
+        } catch (e) {}
+      }
+    }
+    return best.p;
+  } catch (e) {
+    return null;
+  }
 }
 
 async function start(projectRoot, cmd, name = 'default', foreground = false) {
@@ -175,8 +292,15 @@ async function start(projectRoot, cmd, name = 'default', foreground = false) {
     try {
       const pid = parseInt(fs.readFileSync(ppath, 'utf8'), 10);
       if (isRunning(pid)) {
-        console.log(`Already running (pid=${pid})`);
-        return 0;
+        // Verify the pid actually belongs to this project's ampa daemon
+        const owned = pidOwnedByProject(projectRoot, pid, lpath);
+        if (owned) {
+          console.log(`Already running (pid=${pid})`);
+          return 0;
+        } else {
+          try { fs.unlinkSync(ppath); } catch (e) {}
+          console.log(`Stale pid file removed (pid=${pid} did not match project)`);
+        }
       }
     } catch (e) {}
   }
@@ -255,6 +379,7 @@ async function start(projectRoot, cmd, name = 'default', foreground = false) {
 
 async function stop(projectRoot, name = 'default', timeout = 10) {
   const ppath = pidPath(projectRoot, name);
+  const lpath = logPath(projectRoot, name);
   if (!fs.existsSync(ppath)) {
     console.log('Not running (no pid file)');
     return 0;
@@ -268,8 +393,15 @@ async function stop(projectRoot, name = 'default', timeout = 10) {
     return 0;
   }
   if (!isRunning(pid)) {
-    fs.unlinkSync(ppath);
+    try { fs.unlinkSync(ppath); } catch (e) {}
     console.log('Not running (stale pid file cleared)');
+    return 0;
+  }
+  // Ensure the running pid is our process
+  const owned = pidOwnedByProject(projectRoot, pid, lpath);
+  if (!owned) {
+    try { fs.unlinkSync(ppath); } catch (e) {}
+    console.log('Not running (pid belonged to another process)');
     return 0;
   }
   try {
@@ -301,6 +433,13 @@ async function status(projectRoot, name = 'default') {
   const ppath = pidPath(projectRoot, name);
   const lpath = logPath(projectRoot, name);
   if (!fs.existsSync(ppath)) {
+    // Even when there's no pidfile, the daemon may have started and exited
+    // quickly with an error recorded in the log. Surface any recent errors
+    // so `wl ampa status` provides helpful diagnostics. If the current
+    // daemon log path isn't present (no pidfile), attempt to find the most
+    // recent log under .worklog/ampa and show errors from there.
+    const alt = findMostRecentLog(projectRoot) || lpath;
+    try { printLogErrors(alt); } catch (e) {}
     console.log('stopped');
     return 3;
   }
@@ -309,14 +448,26 @@ async function status(projectRoot, name = 'default') {
     pid = parseInt(fs.readFileSync(ppath, 'utf8'), 10);
   } catch (e) {
     try { fs.unlinkSync(ppath); } catch (e2) {}
+    const alt = findMostRecentLog(projectRoot) || lpath;
+    try { printLogErrors(alt); } catch (e) {}
     console.log('stopped (cleared corrupt pid file)');
     return 3;
   }
-  if (isRunning(pid)) {
-    console.log(`running pid=${pid} log=${lpath}`);
-    return 0;
+    if (isRunning(pid)) {
+    // verify ownership before reporting running
+    const owned = pidOwnedByProject(projectRoot, pid, lpath);
+    if (owned) {
+      console.log(`running pid=${pid} log=${lpath}`);
+      return 0;
+    } else {
+      try { fs.unlinkSync(ppath); } catch (e) {}
+      console.log('stopped (stale pid file removed)');
+      return 3;
+    }
   } else {
     try { fs.unlinkSync(ppath); } catch (e) {}
+    const alt = findMostRecentLog(projectRoot) || lpath;
+    try { printLogErrors(alt); } catch (e) {}
     console.log('stopped (stale pid file removed)');
     return 3;
   }

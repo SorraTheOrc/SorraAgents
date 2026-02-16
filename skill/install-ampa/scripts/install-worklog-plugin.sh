@@ -476,9 +476,16 @@ copy_python_package() {
     if [ -d "$src_dir" ]; then
       cp -R "$src_dir" "$py_target_dir/ampa"
     else
-      log_decision "COPY_SRC_MISSING=$src_dir"
-      log_error "AMPA source directory not found: $src_dir"
-      return 1
+      # Fall back to bundled installer resources in the repo
+      local bundled="$SCRIPT_DIR/../resources/ampa_py/ampa"
+      if [ -d "$bundled" ]; then
+        cp -R "$bundled" "$py_target_dir/ampa"
+        log_decision "COPIED_FROM_BUNDLED_RESOURCES=$bundled"
+      else
+        log_decision "COPY_SRC_MISSING=$src_dir"
+        log_error "AMPA source directory not found: $src_dir"
+        return 1
+      fi
     fi
    
     # Record post-copy state
@@ -552,13 +559,47 @@ setup_python_package() {
 
 # Detect if a daemon is currently running
 detect_running_daemon() {
+  # Only consider a daemon running if the pidfile exists, the pid is alive,
+  # and the process command line indicates it is the AMPA daemon for this
+  # project (to avoid confusing unrelated processes that reused the same PID).
   if [ -f "$PID_FILE" ]; then
     local pid_val
     pid_val=$(sed -n '1p' "$PID_FILE" 2>/dev/null || true)
-    if [ -n "$pid_val" ] && kill -0 "$pid_val" 2>/dev/null; then
+    if [ -z "$pid_val" ]; then
+      return 1
+    fi
+    if ! kill -0 "$pid_val" 2>/dev/null; then
+      # stale pidfile
+      return 1
+    fi
+
+    # Attempt to verify the process belongs to this project's AMPA by
+    # inspecting its command line. Prefer /proc (Linux), fall back to ps.
+    local expected_path
+    # resolve expected python package path; TARGET_DIR may be relative
+    if [ -d "$TARGET_DIR/ampa_py" ]; then
+      expected_path="$(cd "$TARGET_DIR/ampa_py" >/dev/null 2>&1 && pwd || true)"
+    else
+      expected_path="$(pwd)/$TARGET_DIR/ampa_py"
+    fi
+
+    # read cmdline
+    local cmdline
+    if [ -r "/proc/$pid_val/cmdline" ]; then
+      cmdline=$(tr '\0' ' ' < "/proc/$pid_val/cmdline" 2>/dev/null || true)
+    else
+      cmdline=$(ps -p "$pid_val" -o args= 2>/dev/null || true)
+    fi
+
+    if [ -n "$cmdline" ] && [ -n "$expected_path" ] && echo "$cmdline" | grep -F -- "$expected_path" >/dev/null 2>&1; then
+      log_decision "DETECT_RUNNING=pid=$pid_val cmdline_matches=$expected_path"
       echo "$pid_val"
       return 0
     fi
+
+    # If we couldn't validate, log the discovered cmdline for diagnostics
+    log_decision "DETECT_RUNNING=pid=$pid_val cmdline_unverified: ${cmdline:-(empty)}"
+    return 1
   fi
   return 1
 }
@@ -573,6 +614,13 @@ prompt_restart_daemon() {
 
   if [ "$FORCE_NO_RESTART" -eq 1 ]; then
     return 1  # No, don't restart
+  fi
+
+  # Non-interactive default behaviour: when --yes/ AUTO_YES is provided,
+  # treat the answer as consent to restart. Otherwise prompt interactively
+  # if a tty is available; default to no restart in non-interactive shells.
+  if [ "$AUTO_YES" -eq 1 ]; then
+    return 0
   fi
 
   if [ -t 0 ]; then
@@ -595,15 +643,44 @@ prompt_restart_daemon() {
 stop_daemon() {
   log_info "Stopping running daemon before upgrade..."
 
-  # Run the stop command and capture output so the operator sees what happened
-  local _out
-  if _out=$(wl ampa stop --name default 2>&1); then
-    log_info "wl ampa stop output:"
-    # Show each line to preserve formatting
-    printf "%s\n" "$_out"
+  # Prefer to use `wl ampa stop` when the `wl` CLI actually exposes the
+  # ampa command. Some environments may have a `wl` installed that does not
+  # include the ampa plugin (or the installed plugin may be buggy). In that
+  # case avoid invoking `wl ampa` (which could load a broken plugin) and fall
+  # back to printing PID/command diagnostics and attempting a safe kill.
+  if command -v wl >/dev/null 2>&1 && wl --help 2>&1 | grep -E '\bampa\b' >/dev/null 2>&1; then
+    # Run the stop command and capture output so the operator sees what happened
+    local _out
+    if _out=$(wl ampa stop --name default 2>&1); then
+      log_info "wl ampa stop output:"
+      # Show each line to preserve formatting
+      printf "%s\n" "$_out"
+    else
+      log_info "wl ampa stop returned non-zero (output):"
+      printf "%s\n" "$_out"
+    fi
   else
-    log_info "wl ampa stop returned non-zero (output):"
-    printf "%s\n" "$_out"
+    log_info "Skipping 'wl ampa stop' because 'wl' does not expose the ampa command on PATH."
+    # Provide diagnostics: show pidfile and process info if available so the
+    # operator can act manually. Do not attempt to load the plugin.
+    if [ -f "$PID_FILE" ]; then
+      local _pidfile_pid
+      _pidfile_pid=$(sed -n '1p' "$PID_FILE" 2>/dev/null || true)
+      log_info "Observed pidfile $PID_FILE pid=${_pidfile_pid:-(none)}"
+      if [ -n "$_pidfile_pid" ]; then
+        if [ -r "/proc/$_pidfile_pid/cmdline" ]; then
+          log_info "Process cmdline:"
+          tr '\0' ' ' < "/proc/$_pidfile_pid/cmdline" 2>/dev/null || true
+          printf "\n"
+        else
+          log_info "ps output for pid=$_pidfile_pid:"
+          ps -p "$_pidfile_pid" -o pid,cmd= 2>/dev/null || true
+        fi
+        log_info "To stop the process manually: kill $_pidfile_pid (or use SIGTERM then SIGKILL if needed)."
+      fi
+    else
+      log_info "No pidfile $PID_FILE present; nothing to stop via installer fallback."
+    fi
   fi
 
   # Wait for the pid file to be removed or the process to exit. This provides
@@ -734,19 +811,26 @@ main() {
    # Install Python package: prefer project-local `ampa/`, fall back to
    # user's config directory (e.g. ~/.config/opencode/ampa). Missing AMPA is a
    # critical error for installations that expect the daemon; report and exit.
-   if [ -d "ampa" ]; then
-     if ! copy_python_package "ampa"; then
-       log_error "Critical: failed to copy AMPA from project 'ampa' directory"
-       exit 2
-     fi
-     setup_python_package
-   elif [ -d "$CONFIG_AMPA_DIR" ]; then
-     log_info "Copying AMPA package from $CONFIG_AMPA_DIR"
-     if ! copy_python_package "$CONFIG_AMPA_DIR"; then
-       log_error "Critical: failed to copy AMPA from $CONFIG_AMPA_DIR"
-       exit 2
-     fi
-     setup_python_package
+    if [ -d "ampa" ]; then
+      if ! copy_python_package "ampa"; then
+        log_error "Critical: failed to copy AMPA from project 'ampa' directory"
+        exit 2
+      fi
+      setup_python_package
+    elif [ -d "$CONFIG_AMPA_DIR" ]; then
+      log_info "Copying AMPA package from $CONFIG_AMPA_DIR"
+      if ! copy_python_package "$CONFIG_AMPA_DIR"; then
+        log_error "Critical: failed to copy AMPA from $CONFIG_AMPA_DIR"
+        exit 2
+      fi
+      setup_python_package
+    elif [ -d "$SCRIPT_DIR/../resources/ampa_py/ampa" ]; then
+      log_info "Copying AMPA package from bundled installer resources"
+      if ! copy_python_package "$SCRIPT_DIR/../resources/ampa_py/ampa"; then
+        log_error "Critical: failed to copy AMPA from bundled resources"
+        exit 2
+      fi
+      setup_python_package
    else
      log_error "Critical: AMPA Python package not found in project (ampa/) or $CONFIG_AMPA_DIR"
      log_error "Install cannot proceed without AMPA; aborting."
