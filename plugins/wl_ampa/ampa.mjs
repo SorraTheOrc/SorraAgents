@@ -1206,6 +1206,20 @@ async function startWork(projectRoot, workItemId, agentName) {
     `PROMPT_COMMAND=__ampa_prompt_cmd`,
     `PS1='\\[\\e[32m\\]${projectName}_sandbox\\[\\e[0m\\] - \\[\\e[36m\\]${branch}\\[\\e[0m\\]\\n\$__ampa_rel \\$ '`,
     `AMPA_PROMPT`,
+    // Sync worklog data on shell exit so changes are not lost if the user
+    // exits without running 'wl ampa finish-work'.  The trap runs on any
+    // clean exit (exit, Ctrl+D, etc.).  Uses a quoted heredoc to avoid
+    // JS template literal conflicts with bash ${...} syntax.
+    `cat >> ~/.bashrc << 'AMPA_EXIT_TRAP'`,
+    `__ampa_exit_sync() {`,
+    `  if command -v wl >/dev/null 2>&1 && [ -d /workdir/project/.worklog ]; then`,
+    `    echo ""`,
+    `    echo "Syncing worklog data before exit..."`,
+    `    ( cd /workdir/project && wl sync 2>/dev/null ) || true`,
+    `  fi`,
+    `}`,
+    `trap __ampa_exit_sync EXIT`,
+    `AMPA_EXIT_TRAP`,
     `echo 'cd /workdir/project' >> ~/.bashrc`,
     // Initialize worklog inside the cloned project.
     // .worklog/config.yaml may not be present in the clone (it's gitignored on
