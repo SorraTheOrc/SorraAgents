@@ -1065,6 +1065,9 @@ async function startWork(projectRoot, workItemId, agentName) {
     console.error('Could not determine git remote origin. Ensure this is a git repo with a remote named "origin".');
     return 2;
   }
+  // Extract project name from origin URL (e.g. "SorraAgents" from
+  // "git@github.com:Org/SorraAgents.git" or "https://…/SorraAgents.git")
+  const projectName = origin.replace(/\.git$/, '').split('/').pop().split(':').pop();
 
   // 5. Build image if needed
   if (!imageExists(CONTAINER_IMAGE)) {
@@ -1152,6 +1155,9 @@ async function startWork(projectRoot, workItemId, agentName) {
     `echo "export AMPA_WORK_ITEM_ID=${workItemId}" >> ~/.bashrc`,
     `echo "export AMPA_BRANCH=${branch}" >> ~/.bashrc`,
     `echo "export AMPA_PROJECT_ROOT=${projectRoot}" >> ~/.bashrc`,
+    // Set a custom prompt so the user knows they are in a sandbox
+    `echo 'export PS1="${projectName}_sandbox - ${branch}\\n\\$ "' >> ~/.bashrc`,
+    `echo 'cd /workdir/project' >> ~/.bashrc`,
     // Initialize worklog
     `if command -v wl >/dev/null 2>&1; then`,
     `  echo "Initializing worklog..."`,
