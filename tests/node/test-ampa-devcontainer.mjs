@@ -503,6 +503,88 @@ describe('findPoolContainerForWorkItem', () => {
 });
 
 // ---------------------------------------------------------------------------
+// poolCleanupPath / getCleanupList / saveCleanupList / markForCleanup / cleanupMarkedContainers
+// ---------------------------------------------------------------------------
+
+describe('poolCleanupPath', () => {
+  test('returns path inside .worklog/ampa/', () => {
+    const p = plugin.poolCleanupPath('/tmp/test-project');
+    assert.ok(p.includes('.worklog'));
+    assert.ok(p.includes('ampa'));
+    assert.ok(p.endsWith('pool-cleanup.json'));
+  });
+});
+
+describe('getCleanupList / saveCleanupList', () => {
+  test('returns empty array when no cleanup file exists', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-cleanup-test-'));
+    const list = plugin.getCleanupList(tmpDir);
+    assert.deepEqual(list, []);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('saveCleanupList creates directories and writes JSON array', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-cleanup-test-'));
+    plugin.saveCleanupList(tmpDir, ['ampa-pool-1', 'ampa-pool-3']);
+    const p = plugin.poolCleanupPath(tmpDir);
+    assert.ok(fs.existsSync(p), 'cleanup file should exist');
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    assert.deepEqual(data, ['ampa-pool-1', 'ampa-pool-3']);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('getCleanupList reads back saved list', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-cleanup-test-'));
+    plugin.saveCleanupList(tmpDir, ['ampa-pool-5']);
+    const list = plugin.getCleanupList(tmpDir);
+    assert.deepEqual(list, ['ampa-pool-5']);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+describe('markForCleanup', () => {
+  test('adds a container name to the cleanup list', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-cleanup-test-'));
+    plugin.markForCleanup(tmpDir, 'ampa-pool-2');
+    const list = plugin.getCleanupList(tmpDir);
+    assert.deepEqual(list, ['ampa-pool-2']);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('does not add duplicates', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-cleanup-test-'));
+    plugin.markForCleanup(tmpDir, 'ampa-pool-2');
+    plugin.markForCleanup(tmpDir, 'ampa-pool-2');
+    const list = plugin.getCleanupList(tmpDir);
+    assert.deepEqual(list, ['ampa-pool-2']);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('appends to existing list', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-cleanup-test-'));
+    plugin.markForCleanup(tmpDir, 'ampa-pool-1');
+    plugin.markForCleanup(tmpDir, 'ampa-pool-4');
+    const list = plugin.getCleanupList(tmpDir);
+    assert.deepEqual(list, ['ampa-pool-1', 'ampa-pool-4']);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+describe('cleanupMarkedContainers', () => {
+  test('is exported as a function', () => {
+    assert.equal(typeof plugin.cleanupMarkedContainers, 'function');
+  });
+
+  test('returns empty arrays when no containers are marked', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-cleanup-test-'));
+    const result = plugin.cleanupMarkedContainers(tmpDir);
+    assert.deepEqual(result.destroyed, []);
+    assert.deepEqual(result.errors, []);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // listAvailablePool (depends on podman state — mostly a shape test)
 // ---------------------------------------------------------------------------
 

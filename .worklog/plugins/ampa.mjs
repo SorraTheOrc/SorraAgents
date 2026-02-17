@@ -866,6 +866,88 @@ function releasePoolContainer(projectRoot, containerNameOrAll) {
 }
 
 /**
+ * Path to the pool cleanup JSON file.
+ * Stores an array of container names that should be destroyed from the host.
+ */
+function poolCleanupPath(projectRoot) {
+  return path.join(projectRoot, '.worklog', 'ampa', 'pool-cleanup.json');
+}
+
+/**
+ * Read the list of containers marked for cleanup.
+ */
+function getCleanupList(projectRoot) {
+  const p = poolCleanupPath(projectRoot);
+  try {
+    if (fs.existsSync(p)) {
+      const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+      return Array.isArray(data) ? data : [];
+    }
+  } catch (e) {}
+  return [];
+}
+
+/**
+ * Write the cleanup list to disk.
+ */
+function saveCleanupList(projectRoot, list) {
+  const p = poolCleanupPath(projectRoot);
+  const dir = path.dirname(p);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(list, null, 2), 'utf8');
+}
+
+/**
+ * Mark a container for cleanup.  Called from inside the container when
+ * finish-work cannot destroy itself.
+ */
+function markForCleanup(projectRoot, cName) {
+  const list = getCleanupList(projectRoot);
+  if (!list.includes(cName)) {
+    list.push(cName);
+    saveCleanupList(projectRoot, list);
+  }
+}
+
+/**
+ * Destroy containers that were marked for cleanup by finish-work running
+ * inside a container.  This must be called from the host side.
+ * Returns { destroyed: string[], errors: string[] }.
+ */
+function cleanupMarkedContainers(projectRoot) {
+  const list = getCleanupList(projectRoot);
+  if (list.length === 0) return { destroyed: [], errors: [] };
+
+  const destroyed = [];
+  const errors = [];
+  const remaining = [];
+
+  for (const cName of list) {
+    const rmResult = spawnSync('distrobox', ['rm', '--force', cName], {
+      encoding: 'utf8',
+      stdio: 'pipe',
+    });
+    if (rmResult.status === 0) {
+      destroyed.push(cName);
+    } else {
+      // Container may already be gone — check if it still exists
+      if (!checkContainerExists(cName)) {
+        destroyed.push(cName);
+      } else {
+        const msg = (rmResult.stderr || rmResult.stdout || '').trim();
+        errors.push(`Failed to destroy ${cName}: ${msg}`);
+        remaining.push(cName);
+      }
+    }
+  }
+
+  // Update cleanup list to only contain containers that failed to destroy
+  saveCleanupList(projectRoot, remaining);
+
+  return { destroyed, errors };
+}
+
+/**
  * Look up which pool container is assigned to a work item ID.
  * Returns the pool container name or null.
  */
@@ -887,6 +969,9 @@ function findPoolContainerForWorkItem(projectRoot, workItemId) {
  * and an array of error messages for any that failed.
  */
 function replenishPool(projectRoot) {
+  // Clean up any containers marked for destruction before counting slots
+  cleanupMarkedContainers(projectRoot);
+
   const state = getPoolState(projectRoot);
   let created = 0;
   const errors = [];
@@ -1043,6 +1128,12 @@ async function startWork(projectRoot, workItemId, agentName) {
   if (!workItem) {
     console.error(`Work item "${workItemId}" not found. Verify the ID with: wl show ${workItemId}`);
     return 2;
+  }
+
+  // 2b. Clean up any containers marked for destruction by finish-work
+  const cleanup = cleanupMarkedContainers(projectRoot);
+  if (cleanup.destroyed.length > 0) {
+    console.log(`Cleaned up ${cleanup.destroyed.length} finished container(s): ${cleanup.destroyed.join(', ')}`);
   }
 
   // 3. Check if this work item already has a claimed container — enter it
@@ -1448,11 +1539,20 @@ async function finishWork(force = false, workItemIdArg) {
       } catch (e) {
         // Non-fatal — pool state file may not be accessible from inside container
       }
+      try {
+        markForCleanup(projectRoot, cName);
+        console.log(`Container "${cName}" marked for cleanup — it will be destroyed automatically on the next host-side pool operation.`);
+      } catch (e) {
+        // Fallback to manual instructions if marker write fails
+        console.log(`Container "${cName}" marked for cleanup.`);
+        console.log('Run the following from the host to destroy the container:');
+        console.log(`  distrobox rm --force ${cName}`);
+      }
+    } else {
+      console.log(`Container "${cName}" marked for cleanup.`);
+      console.log('Run the following from the host to destroy the container:');
+      console.log(`  distrobox rm --force ${cName}`);
     }
-
-    console.log(`Container "${cName}" marked for cleanup.`);
-    console.log('Run the following from the host to destroy the container:');
-    console.log(`  distrobox rm --force ${cName}`);
 
     return 0;
   }
@@ -1546,6 +1646,12 @@ async function finishWork(force = false, workItemIdArg) {
  * Hides unclaimed pool containers and the template container.
  */
 function listContainers(projectRoot, useJson = false) {
+  // Clean up any containers marked for destruction before listing
+  const cleanup = cleanupMarkedContainers(projectRoot);
+  if (cleanup.destroyed.length > 0 && !useJson) {
+    console.log(`Cleaned up ${cleanup.destroyed.length} finished container(s): ${cleanup.destroyed.join(', ')}`);
+  }
+
   // Parse output of podman ps to find ampa-* containers
   const result = runSync('podman', ['ps', '-a', '--filter', `name=${CONTAINER_PREFIX}`, '--format', '{{.Names}}\\t{{.Status}}\\t{{.Created}}']);
   if (result.status !== 0) {
@@ -1883,20 +1989,25 @@ export {
   checkContainerExists,
   checkPrerequisites,
   claimPoolContainer,
+  cleanupMarkedContainers,
   containerName,
   ensureTemplate,
   existingPoolContainers,
   findPoolContainerForWorkItem,
+  getCleanupList,
   getGitOrigin,
   getPoolState,
   listAvailablePool,
   listContainers,
+  markForCleanup,
+  poolCleanupPath,
   poolContainerName,
   poolStatePath,
   releasePoolContainer,
   replenishPool,
   replenishPoolBackground,
   resolveDaemonStore,
+  saveCleanupList,
   savePoolState,
   start,
   startWork,
