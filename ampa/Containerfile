@@ -1,0 +1,56 @@
+# Minimal Containerfile for Distrobox development containers.
+#
+# Most developer tooling (Node.js, wl, gh, opencode) comes from the host
+# via Distrobox's home directory mount (~/.local/bin, ~/.cargo/bin, etc.).
+#
+# Git and SSH are installed in the image itself because they must be linked
+# against the container's own shared libraries (OpenSSL, libpcre, etc.).
+# Using the host's git/ssh via /run/host causes version-mismatch crashes
+# (e.g. "OpenSSL version mismatch") since the host and container ship
+# different library versions.
+#
+# Build:
+#   podman build -t ampa-dev:latest ampa/
+#
+# Verify:
+#   podman build -t ampa-dev:latest ampa/ && podman images | grep ampa-dev
+
+FROM debian:stable-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install packages needed by Distrobox, plus git and openssh-client which
+# must run natively inside the container to avoid shared-library conflicts
+# with the host.  Other developer tools (Python, Node.js, wl, gh) come
+# from the mounted home directory.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    bash \
+    bc \
+    bzip2 \
+    ca-certificates \
+    curl \
+    diffutils \
+    findutils \
+    git \
+    gnupg2 \
+    less \
+    lsof \
+    ncurses-base \
+    openssh-client \
+    passwd \
+    pinentry-curses \
+    procps \
+    sudo \
+    unzip \
+    wget \
+    xz-utils \
+    zip \
+ && rm -rf /var/lib/apt/lists/*
+
+# Working directory where the project will be cloned inside the container.
+WORKDIR /workdir
+
+# Default to an interactive shell. Distrobox will typically enter the container
+# with the user's UID and provide an interactive session; keep this image simple.
+CMD ["/bin/bash"]
