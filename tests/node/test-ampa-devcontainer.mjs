@@ -299,12 +299,19 @@ describe('command registration', () => {
 // ---------------------------------------------------------------------------
 
 describe('finish-work outside container', () => {
-  test('finish-work exits with code 2 when not in a container', async () => {
+  test('finish-work exits with code 2 when not in a container and no claimed containers', async () => {
     // Ensure env vars are not set
     const origName = process.env.AMPA_CONTAINER_NAME;
     const origId = process.env.AMPA_WORK_ITEM_ID;
     delete process.env.AMPA_CONTAINER_NAME;
     delete process.env.AMPA_WORK_ITEM_ID;
+
+    // Save and clear pool state so there are no claimed containers
+    const projectRoot = process.cwd();
+    const statePath = plugin.poolStatePath(projectRoot);
+    let origState;
+    try { origState = fs.readFileSync(statePath, 'utf8'); } catch (e) { origState = null; }
+    plugin.savePoolState(projectRoot, {});
 
     const ctx = { program: new FakeProgram() };
     plugin.default(ctx);
@@ -317,13 +324,18 @@ describe('finish-work outside container', () => {
     console.error = (...args) => { errorOutput += args.join(' ') + '\n'; };
 
     process.exitCode = undefined;
-    await fwCmd.actionFn({ force: false });
+    await fwCmd.actionFn(undefined, { force: false });
     console.error = originalError;
 
     assert.equal(process.exitCode, 2, 'should set exit code to 2');
-    assert.ok(errorOutput.includes('Not running inside a start-work container'), 'should print detection error');
+    assert.ok(errorOutput.includes('No claimed containers found'), 'should print no claimed containers error');
 
-    // Restore
+    // Restore pool state
+    if (origState !== null) {
+      fs.writeFileSync(statePath, origState);
+    }
+
+    // Restore env
     if (origName !== undefined) process.env.AMPA_CONTAINER_NAME = origName;
     if (origId !== undefined) process.env.AMPA_WORK_ITEM_ID = origId;
     process.exitCode = undefined;

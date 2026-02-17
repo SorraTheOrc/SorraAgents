@@ -1162,7 +1162,8 @@ async function startWork(projectRoot, workItemId, agentName) {
     `echo "export AMPA_BRANCH=${branch}" >> ~/.bashrc`,
     `echo "export AMPA_PROJECT_ROOT=${projectRoot}" >> ~/.bashrc`,
     // Set a custom prompt so the user knows they are in a sandbox
-    `echo 'export PS1="${projectName}_sandbox - ${branch}\\n\\$ "' >> ~/.bashrc`,
+    // Green for project_sandbox, cyan for branch, reset before newline/dollar
+    `echo 'export PS1="\\[\\e[32m\\]${projectName}_sandbox\\[\\e[0m\\] - \\[\\e[36m\\]${branch}\\[\\e[0m\\]\\n\\$ "' >> ~/.bashrc`,
     `echo 'cd /workdir/project' >> ~/.bashrc`,
     // Initialize worklog
     `if command -v wl >/dev/null 2>&1; then`,
@@ -1222,105 +1223,211 @@ async function startWork(projectRoot, workItemId, agentName) {
 /**
  * Finish work in a dev container: commit, push, update work item, destroy container.
  */
-async function finishWork(force = false) {
-  // 1. Detect container context
-  const cName = process.env.AMPA_CONTAINER_NAME;
-  const workItemId = process.env.AMPA_WORK_ITEM_ID;
-  const branch = process.env.AMPA_BRANCH;
-  const projectRoot = process.env.AMPA_PROJECT_ROOT;
+async function finishWork(force = false, workItemIdArg) {
+  // 1. Detect context — running inside a container or from the host?
+  const insideContainer = !!process.env.AMPA_CONTAINER_NAME;
+
+  let cName, workItemId, branch, projectRoot;
+
+  if (insideContainer) {
+    // Inside-container path: read env vars set by start-work
+    cName = process.env.AMPA_CONTAINER_NAME;
+    workItemId = process.env.AMPA_WORK_ITEM_ID;
+    branch = process.env.AMPA_BRANCH;
+    projectRoot = process.env.AMPA_PROJECT_ROOT;
+  } else {
+    // Host path: look up the container from pool state
+    projectRoot = process.cwd();
+    try { projectRoot = findProjectRoot(projectRoot); } catch (e) {
+      console.error(e.message);
+      return 2;
+    }
+
+    const state = getPoolState(projectRoot);
+    const claimed = Object.entries(state).filter(([, v]) => v.workItemId);
+
+    if (claimed.length === 0) {
+      console.error('No claimed containers found. Nothing to finish.');
+      return 2;
+    }
+
+    if (workItemIdArg) {
+      // Find the container for the given work item
+      const match = claimed.find(([, v]) => v.workItemId === workItemIdArg);
+      if (!match) {
+        console.error(`No container found for work item "${workItemIdArg}".`);
+        console.error('Claimed containers:');
+        for (const [name, v] of claimed) {
+          console.error(`  ${name} → ${v.workItemId} (${v.branch})`);
+        }
+        return 2;
+      }
+      [cName, { workItemId, branch }] = [match[0], match[1]];
+    } else if (claimed.length === 1) {
+      // Only one claimed container — use it automatically
+      [cName, { workItemId, branch }] = [claimed[0][0], claimed[0][1]];
+      console.log(`Using container "${cName}" (${workItemId})`);
+    } else {
+      // Multiple claimed containers — require explicit ID
+      console.error('Multiple claimed containers found. Specify a work item ID:');
+      for (const [name, v] of claimed) {
+        console.error(`  wl ampa finish-work ${v.workItemId}  (container: ${name}, branch: ${v.branch})`);
+      }
+      return 2;
+    }
+  }
 
   if (!cName || !workItemId) {
-    console.error('Not running inside a start-work container. Set AMPA_CONTAINER_NAME and AMPA_WORK_ITEM_ID or use this command from within a container created by "wl ampa start-work".');
+    console.error('Could not determine container or work item. Use "wl ampa finish-work <work-item-id>" from the host or run from inside a container.');
     return 2;
   }
 
-  // 2. Check for uncommitted changes
-  const statusResult = runSync('git', ['status', '--porcelain']);
-  const hasUncommitted = statusResult.stdout.length > 0;
+  if (insideContainer) {
+    // --- Inside-container path: commit, push, mark for cleanup ---
 
-  if (hasUncommitted && !force) {
-    // Commit and push
-    console.log('Uncommitted changes detected. Committing...');
-    const addResult = runSync('git', ['add', '-A']);
-    if (addResult.status !== 0) {
-      console.error(`git add failed: ${addResult.stderr}`);
-      return 1;
+    // 2. Check for uncommitted changes
+    const statusResult = runSync('git', ['status', '--porcelain']);
+    const hasUncommitted = statusResult.stdout.length > 0;
+
+    if (hasUncommitted && !force) {
+      console.log('Uncommitted changes detected. Committing...');
+      const addResult = runSync('git', ['add', '-A']);
+      if (addResult.status !== 0) {
+        console.error(`git add failed: ${addResult.stderr}`);
+        return 1;
+      }
+
+      const commitMsg = `${workItemId}: Work completed in dev container`;
+      const commitResult = runSync('git', ['commit', '-m', commitMsg]);
+      if (commitResult.status !== 0) {
+        console.error(`git commit failed: ${commitResult.stderr}`);
+        console.error('Uncommitted files:');
+        console.error(statusResult.stdout);
+        console.error('Use --force to destroy the container without committing (changes will be lost).');
+        return 1;
+      }
+      console.log(commitResult.stdout);
+    } else if (hasUncommitted && force) {
+      console.log('Warning: Discarding uncommitted changes (--force)');
+      console.log(statusResult.stdout);
     }
 
-    const commitMsg = `${workItemId}: Work completed in dev container`;
-    const commitResult = runSync('git', ['commit', '-m', commitMsg]);
+    // 3. Push if there are commits to push
+    if (!force) {
+      const pushBranch = branch || 'HEAD';
+      console.log(`Pushing ${pushBranch} to origin...`);
+      const pushResult = runSync('git', ['push', '-u', 'origin', pushBranch]);
+      if (pushResult.status !== 0) {
+        console.error(`git push failed: ${pushResult.stderr}`);
+        console.error('Use --force to destroy the container without pushing.');
+        return 1;
+      }
+      if (pushResult.stdout) console.log(pushResult.stdout);
+
+      const hashResult = runSync('git', ['rev-parse', '--short', 'HEAD']);
+      const commitHash = hashResult.stdout || 'unknown';
+
+      // 4. Update work item
+      console.log(`Updating work item ${workItemId}...`);
+      spawnSync('wl', ['update', workItemId, '--stage', 'in_review', '--status', 'completed', '--json'], {
+        stdio: 'pipe',
+        encoding: 'utf8',
+      });
+      spawnSync('wl', ['comment', 'add', workItemId, '--comment', `Work completed in dev container ${cName}. Branch: ${pushBranch}. Latest commit: ${commitHash}`, '--author', 'ampa', '--json'], {
+        stdio: 'pipe',
+        encoding: 'utf8',
+      });
+    }
+
+    // 5. Release pool claim and mark for cleanup
+    if (projectRoot) {
+      try {
+        releasePoolContainer(projectRoot, cName);
+      } catch (e) {
+        // Non-fatal — pool state file may not be accessible from inside container
+      }
+    }
+
+    console.log(`Container "${cName}" marked for cleanup.`);
+    console.log('Run the following from the host to destroy the container:');
+    console.log(`  distrobox rm --force ${cName}`);
+
+    return 0;
+  }
+
+  // --- Host path: enter container, commit/push, destroy, replenish ---
+
+  console.log(`Finishing work in container "${cName}" (${workItemId}, branch: ${branch})...`);
+
+  if (!force) {
+    // Build a script to commit and push inside the container
+    const commitPushScript = [
+      `set -e`,
+      `cd /workdir/project 2>/dev/null || { echo "No project directory found in container."; exit 1; }`,
+      // Check for uncommitted changes
+      `if [ -n "$(git status --porcelain)" ]; then`,
+      `  echo "Uncommitted changes detected. Committing..."`,
+      `  git add -A`,
+      `  git commit -m "${workItemId}: Work completed in dev container"`,
+      `fi`,
+      // Push
+      `PUSH_BRANCH="${branch || 'HEAD'}"`,
+      `echo "Pushing $PUSH_BRANCH to origin..."`,
+      `git push -u origin "$PUSH_BRANCH"`,
+      `echo "AMPA_COMMIT_HASH=$(git rev-parse --short HEAD)"`,
+    ].join('\n');
+
+    console.log('Entering container to commit and push...');
+    const commitResult = runSync('distrobox', [
+      'enter', cName, '--', 'bash', '--login', '-c', commitPushScript,
+    ]);
+
     if (commitResult.status !== 0) {
-      console.error(`git commit failed: ${commitResult.stderr}`);
-      console.error('Uncommitted files:');
-      console.error(statusResult.stdout);
+      console.error(`Commit/push inside container failed: ${commitResult.stderr || commitResult.stdout}`);
       console.error('Use --force to destroy the container without committing (changes will be lost).');
       return 1;
     }
-    console.log(commitResult.stdout);
-  } else if (hasUncommitted && force) {
-    console.log('Warning: Discarding uncommitted changes (--force)');
-    console.log(statusResult.stdout);
-  }
+    if (commitResult.stdout) console.log(commitResult.stdout);
 
-  // 3. Push if there are commits to push
-  if (!force) {
-    const pushBranch = branch || 'HEAD';
-    console.log(`Pushing ${pushBranch} to origin...`);
-    const pushResult = runSync('git', ['push', '-u', 'origin', pushBranch]);
-    if (pushResult.status !== 0) {
-      console.error(`git push failed: ${pushResult.stderr}`);
-      console.error('Use --force to destroy the container without pushing.');
-      return 1;
-    }
-    if (pushResult.stdout) console.log(pushResult.stdout);
+    // Extract commit hash from output
+    const hashMatch = (commitResult.stdout || '').match(/AMPA_COMMIT_HASH=(\S+)/);
+    const commitHash = hashMatch ? hashMatch[1] : 'unknown';
 
-    // Get the last commit hash for the work item comment
-    const hashResult = runSync('git', ['rev-parse', '--short', 'HEAD']);
-    const commitHash = hashResult.stdout || 'unknown';
-
-    // 4. Update work item
+    // Update work item from the host
     console.log(`Updating work item ${workItemId}...`);
     spawnSync('wl', ['update', workItemId, '--stage', 'in_review', '--status', 'completed', '--json'], {
       stdio: 'pipe',
       encoding: 'utf8',
     });
-    spawnSync('wl', ['comment', 'add', workItemId, '--comment', `Work completed in dev container ${cName}. Branch: ${pushBranch}. Latest commit: ${commitHash}`, '--author', 'ampa', '--json'], {
+    spawnSync('wl', ['comment', 'add', workItemId, '--comment', `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. Latest commit: ${commitHash}`, '--author', 'ampa', '--json'], {
       stdio: 'pipe',
       encoding: 'utf8',
     });
+  } else {
+    console.log('Warning: Skipping commit/push (--force). Uncommitted changes will be lost.');
   }
 
-  // 5. Exit and destroy container
-  console.log(`Destroying container "${cName}"...`);
-  // Release pool claim so the slot can be replenished
-  if (projectRoot) {
-    try {
-      releasePoolContainer(projectRoot, cName);
-    } catch (e) {
-      // Non-fatal — pool state file may not be accessible from inside container
-    }
-  }
-  // We need to exit the container first, then destroy from the host.
-  // When running inside the container, we signal completion and the
-  // host-side caller handles destruction.
-  // Write a marker file that the host can check.
-  const markerDir = path.join(process.env.HOME || '/tmp', '.ampa');
+  // Release pool claim
   try {
-    fs.mkdirSync(markerDir, { recursive: true });
-    fs.writeFileSync(path.join(markerDir, `${cName}.done`), JSON.stringify({
-      workItemId,
-      branch,
-      projectRoot,
-      timestamp: new Date().toISOString(),
-      force,
-    }));
+    releasePoolContainer(projectRoot, cName);
+    console.log(`Released pool claim for "${cName}".`);
   } catch (e) {
-    // Non-fatal: marker is just a convenience
+    console.error(`Warning: Could not release pool claim: ${e.message}`);
   }
 
-  console.log(`Container "${cName}" marked for cleanup.`);
-  console.log('Run the following from the host to destroy the container:');
-  console.log(`  distrobox rm --force ${cName}`);
+  // Destroy the container
+  console.log(`Destroying container "${cName}"...`);
+  const rmResult = runSync('distrobox', ['rm', '--force', cName]);
+  if (rmResult.status !== 0) {
+    console.error(`Warning: Container removal failed: ${rmResult.stderr || rmResult.stdout}`);
+    console.error(`You may need to run: distrobox rm --force ${cName}`);
+  } else {
+    console.log(`Container "${cName}" destroyed.`);
+  }
+
+  // Replenish pool in background
+  replenishPoolBackground(projectRoot);
+  console.log('Pool replenishment started in background.');
 
   return 0;
 }
@@ -1551,18 +1658,20 @@ export default function register(ctx) {
   ampa
     .command('finish-work')
     .description('Commit, push, and clean up a dev container')
+    .arguments('[work-item-id]')
     .option('--force', 'Destroy container even with uncommitted changes', false)
-    .action(async (opts) => {
-      const code = await finishWork(opts.force);
+    .action(async (workItemId, opts) => {
+      const code = await finishWork(opts.force, workItemId);
       process.exitCode = code;
     });
 
   ampa
     .command('fw')
     .description('Alias for finish-work')
+    .arguments('[work-item-id]')
     .option('--force', 'Destroy container even with uncommitted changes', false)
-    .action(async (opts) => {
-      const code = await finishWork(opts.force);
+    .action(async (workItemId, opts) => {
+      const code = await finishWork(opts.force, workItemId);
       process.exitCode = code;
     });
 
