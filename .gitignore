@@ -48,6 +48,3 @@ tmp/
 .env
 ampa/.env
 ampa/scheduler_store.json
-
-# Ignore local plugin source copies
-plugins/

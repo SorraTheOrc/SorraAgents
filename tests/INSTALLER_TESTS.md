@@ -266,5 +266,5 @@ The manual test suite runs in approximately 5-10 seconds depending on system per
 ## See Also
 
 - `plugins/install-worklog-plugin.sh` - The refactored installer script
-- `plugins/wl_ampa/README.md` - Installer documentation
+- `skill/install-ampa/resources/ampa.mjs` - Canonical AMPA plugin source
 - `ampa/README.md` - AMPA daemon documentation

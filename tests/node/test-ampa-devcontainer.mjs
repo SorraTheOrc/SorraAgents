@@ -5,7 +5,7 @@ import path from 'path';
 import os from 'os';
 
 // Import the plugin module — all new helpers/constants are named exports.
-const pluginModule = new URL('../../plugins/wl_ampa/ampa.mjs', import.meta.url);
+const pluginModule = new URL('../../skill/install-ampa/resources/ampa.mjs', import.meta.url);
 const plugin = await import(pluginModule.href);
 
 // Re-use the FakeProgram/FakeCommand pattern from test-ampa.mjs for command

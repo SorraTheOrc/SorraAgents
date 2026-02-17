@@ -7,7 +7,7 @@ import path from 'path';
 // Lightweight lifecycle test for the Node ampa plugin when installed into
 // .worklog/plugins in a temporary project directory.
 
-const pluginModule = new URL('../../plugins/wl_ampa/ampa.mjs', import.meta.url);
+const pluginModule = new URL('../../skill/install-ampa/resources/ampa.mjs', import.meta.url);
 const plugin = await import(pluginModule.href);
 
 class FakeProgram {
