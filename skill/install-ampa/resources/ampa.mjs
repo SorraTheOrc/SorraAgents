@@ -525,15 +525,55 @@ async function stop(projectRoot, name = 'default', timeout = 10) {
 }
 
 /**
- * Print pool container availability as part of status output.
+ * Print pool container status as a headed, indented block.
  */
 function printPoolStatus(projectRoot) {
   try {
-    const available = listAvailablePool(projectRoot);
+    const existing = existingPoolContainers();
     const state = getPoolState(projectRoot);
-    const claimed = Object.keys(state).length;
-    const total = available.length + claimed;
-    console.log(`Sandbox container pool: ${available.length} available, ${claimed} claimed (${total} total, target ${POOL_SIZE} available)`);
+    const cleanupList = getCleanupList(projectRoot);
+    const cleanupSet = new Set(cleanupList);
+
+    // Categorise containers
+    const claimed = [];
+    const pendingCleanup = [];
+    const available = [];
+
+    for (let i = 0; i < POOL_MAX_INDEX; i++) {
+      const name = poolContainerName(i);
+      if (!existing.has(name)) continue;
+      if (cleanupSet.has(name)) {
+        pendingCleanup.push(name);
+      } else if (state[name]) {
+        claimed.push({ name, ...state[name] });
+      } else {
+        available.push(name);
+      }
+    }
+
+    // Image status
+    const imgExists = imageExists(CONTAINER_IMAGE);
+    const stale = imgExists ? isImageStale(projectRoot) : false;
+    const templateExists = existing.has(TEMPLATE_CONTAINER_NAME) || checkContainerExists(TEMPLATE_CONTAINER_NAME);
+
+    console.log('Sandbox pool:');
+    console.log(`  Image:     ${imgExists ? CONTAINER_IMAGE : 'not built'}${stale ? ' (stale — run warm-pool to rebuild)' : ''}`);
+    console.log(`  Template:  ${templateExists ? TEMPLATE_CONTAINER_NAME : 'not created'}`);
+    console.log(`  Available: ${available.length} / ${POOL_SIZE} target`);
+    if (claimed.length > 0) {
+      console.log(`  Claimed:   ${claimed.length}`);
+      for (const c of claimed) {
+        console.log(`    - ${c.name} -> ${c.workItemId} (${c.branch || 'no branch'})`);
+      }
+    } else {
+      console.log('  Claimed:   0');
+    }
+    if (pendingCleanup.length > 0) {
+      console.log(`  Cleanup:   ${pendingCleanup.length} pending destruction`);
+      for (const name of pendingCleanup) {
+        console.log(`    - ${name}`);
+      }
+    }
   } catch (e) {
     // Pool status is best-effort; don't fail status if pool helpers error
   }
