@@ -5,7 +5,11 @@
 #      binaries in ~/.local/bin, ~/.cargo/bin, ~/.npm-global/bin, etc.
 #   2. Host filesystem at /run/host — Distrobox mounts the host root here.
 #      System binaries (git, ssh, etc.) live at /run/host/usr/bin and must
-#      be on PATH explicitly (Distrobox does not add them automatically).
+#      be added to PATH after Distrobox init completes. This is done by the
+#      start-work setup script (NOT here in the image) because adding
+#      /run/host paths to PATH at image build time causes Distrobox's own
+#      init to pick up host binaries linked against host-only shared
+#      libraries, which crash inside the container.
 #
 # Build:
 #   podman build -t ampa-dev:latest ampa/
@@ -23,7 +27,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 # tools to be available.
 #
 # Developer toolchain (Python, Node.js, wl, git, gh) is NOT installed here;
-# it comes from the mounted home directory and /run/host paths.
+# it comes from the host via the home directory mount and /run/host paths
+# (added to PATH by the start-work setup script after Distrobox init).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     bash \
@@ -46,12 +51,6 @@ RUN apt-get update \
     xz-utils \
     zip \
  && rm -rf /var/lib/apt/lists/*
-
-# Expose host system binaries inside the container.  Distrobox mounts the
-# host root at /run/host but does not add it to PATH automatically.
-# These paths make host-installed tools (git, ssh, etc.) available without
-# requiring distrobox-export or host-spawn wrappers.
-ENV PATH="/run/host/usr/local/sbin:/run/host/usr/local/bin:/run/host/usr/sbin:/run/host/usr/bin:/run/host/sbin:/run/host/bin:${PATH}"
 
 # Working directory where the project will be cloned inside the container.
 WORKDIR /workdir
