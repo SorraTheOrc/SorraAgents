@@ -1180,8 +1180,14 @@ async function startWork(projectRoot, workItemId, agentName) {
     `echo "export AMPA_BRANCH=${branch}" >> ~/.bashrc`,
     `echo "export AMPA_PROJECT_ROOT=${projectRoot}" >> ~/.bashrc`,
     // Set a custom prompt so the user knows they are in a sandbox
-    // Green for project_sandbox, cyan for branch, reset before newline/dollar
-    `echo 'export PS1="\\[\\e[32m\\]${projectName}_sandbox\\[\\e[0m\\] - \\[\\e[36m\\]${branch}\\[\\e[0m\\]\\n\\W \\$ "' >> ~/.bashrc`,
+    // Green for project_sandbox, cyan for branch, reset before newline
+    // PROMPT_COMMAND computes the path relative to /workdir/project each time
+    // Use cat with a quoted heredoc to avoid JS template literal conflicts
+    `cat >> ~/.bashrc << 'AMPA_PROMPT'`,
+    `__ampa_prompt_cmd() { __ampa_rel="\${PWD#/workdir/project}"; __ampa_rel="\${__ampa_rel:-/}"; }`,
+    `PROMPT_COMMAND=__ampa_prompt_cmd`,
+    `PS1='\\[\\e[32m\\]${projectName}_sandbox\\[\\e[0m\\] - \\[\\e[36m\\]${branch}\\[\\e[0m\\]\\n\$__ampa_rel \\$ '`,
+    `AMPA_PROMPT`,
     `echo 'cd /workdir/project' >> ~/.bashrc`,
     // Initialize worklog
     `if command -v wl >/dev/null 2>&1; then`,
