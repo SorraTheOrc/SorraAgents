@@ -684,6 +684,97 @@ function imageExists(imageName) {
 }
 
 /**
+ * Get the creation timestamp of a Podman image.
+ * Returns a Date, or null if the image does not exist or the date cannot be parsed.
+ */
+function imageCreatedDate(imageName) {
+  const result = spawnSync('podman', [
+    'image', 'inspect', imageName, '--format', '{{.Created}}',
+  ], { encoding: 'utf8', stdio: 'pipe' });
+  if (result.status !== 0) return null;
+  const raw = (result.stdout || '').trim();
+  if (!raw) return null;
+  const d = new Date(raw);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/**
+ * Check whether the container image is older than the Containerfile.
+ * Returns true if the image should be rebuilt (Containerfile is newer),
+ * false if the image is up-to-date or if either date cannot be determined.
+ */
+function isImageStale(projectRoot) {
+  const containerfilePath = path.join(projectRoot, 'ampa', 'Containerfile');
+  if (!fs.existsSync(containerfilePath)) return false;
+  if (!imageExists(CONTAINER_IMAGE)) return false; // no image to be stale
+
+  const fileMtime = fs.statSync(containerfilePath).mtime;
+  const imgDate = imageCreatedDate(CONTAINER_IMAGE);
+  if (!imgDate) return false; // can't determine — assume up-to-date
+
+  return fileMtime > imgDate;
+}
+
+/**
+ * Tear down stale pool infrastructure so it can be rebuilt from a new image.
+ * Destroys unclaimed pool containers and the template. Removes the image.
+ * Claimed containers (active work) are preserved — they were built from
+ * the old image but are still in use.
+ * Returns { destroyed: string[], kept: string[], errors: string[] }.
+ */
+function teardownStalePool(projectRoot) {
+  const destroyed = [];
+  const kept = [];
+  const errors = [];
+
+  const state = getPoolState(projectRoot);
+  const existing = existingPoolContainers();
+
+  // Destroy unclaimed pool containers
+  for (const name of existing) {
+    if (state[name] && state[name].workItemId) {
+      // Claimed — leave it alone
+      kept.push(name);
+      continue;
+    }
+    spawnSync('podman', ['stop', name], { stdio: 'pipe' });
+    const rm = spawnSync('distrobox', ['rm', '--force', name], { encoding: 'utf8', stdio: 'pipe' });
+    if (rm.status === 0) {
+      destroyed.push(name);
+    } else {
+      const msg = (rm.stderr || rm.stdout || '').trim();
+      errors.push(`Failed to remove ${name}: ${msg}`);
+    }
+  }
+
+  // Destroy the template container
+  if (checkContainerExists(TEMPLATE_CONTAINER_NAME)) {
+    spawnSync('podman', ['stop', TEMPLATE_CONTAINER_NAME], { stdio: 'pipe' });
+    const rm = spawnSync('distrobox', ['rm', '--force', TEMPLATE_CONTAINER_NAME], { encoding: 'utf8', stdio: 'pipe' });
+    if (rm.status === 0) {
+      destroyed.push(TEMPLATE_CONTAINER_NAME);
+    } else {
+      const msg = (rm.stderr || rm.stdout || '').trim();
+      errors.push(`Failed to remove ${TEMPLATE_CONTAINER_NAME}: ${msg}`);
+    }
+  }
+
+  // Remove the image
+  if (imageExists(CONTAINER_IMAGE)) {
+    const rm = spawnSync('podman', ['rmi', CONTAINER_IMAGE], { encoding: 'utf8', stdio: 'pipe' });
+    if (rm.status !== 0) {
+      const msg = (rm.stderr || rm.stdout || '').trim();
+      errors.push(`Failed to remove image ${CONTAINER_IMAGE}: ${msg}`);
+    }
+  }
+
+  // Clear cleanup list (stale entries no longer relevant)
+  saveCleanupList(projectRoot, []);
+
+  return { destroyed, kept, errors };
+}
+
+/**
  * Build the Podman image from the Containerfile.
  * Returns { ok, message }.
  */
@@ -1923,6 +2014,20 @@ export default function register(ctx) {
         process.exitCode = 1;
         return;
       }
+      // Check if the image is stale (Containerfile newer than image)
+      if (isImageStale(cwd)) {
+        console.log('Containerfile is newer than the current image — rebuilding...');
+        const teardown = teardownStalePool(cwd);
+        if (teardown.destroyed.length > 0) {
+          console.log(`Removed stale containers: ${teardown.destroyed.join(', ')}`);
+        }
+        if (teardown.kept.length > 0) {
+          console.log(`Kept claimed containers (still in use): ${teardown.kept.join(', ')}`);
+        }
+        if (teardown.errors.length > 0) {
+          teardown.errors.forEach(e => console.error(e));
+        }
+      }
       // Build image if needed
       if (!imageExists(CONTAINER_IMAGE)) {
         console.log('Building container image...');
@@ -1965,6 +2070,20 @@ export default function register(ctx) {
         process.exitCode = 1;
         return;
       }
+      // Check if the image is stale (Containerfile newer than image)
+      if (isImageStale(cwd)) {
+        console.log('Containerfile is newer than the current image — rebuilding...');
+        const teardown = teardownStalePool(cwd);
+        if (teardown.destroyed.length > 0) {
+          console.log(`Removed stale containers: ${teardown.destroyed.join(', ')}`);
+        }
+        if (teardown.kept.length > 0) {
+          console.log(`Kept claimed containers (still in use): ${teardown.kept.join(', ')}`);
+        }
+        if (teardown.errors.length > 0) {
+          teardown.errors.forEach(e => console.error(e));
+        }
+      }
       // Build image if needed
       if (!imageExists(CONTAINER_IMAGE)) {
         console.log('Building container image...');
@@ -2005,6 +2124,7 @@ export {
   POOL_MAX_INDEX,
   TEMPLATE_CONTAINER_NAME,
   branchName,
+  buildImage,
   checkBinary,
   checkContainerExists,
   checkPrerequisites,
@@ -2017,6 +2137,9 @@ export {
   getCleanupList,
   getGitOrigin,
   getPoolState,
+  imageCreatedDate,
+  imageExists,
+  isImageStale,
   listAvailablePool,
   listContainers,
   markForCleanup,
@@ -2031,6 +2154,7 @@ export {
   savePoolState,
   start,
   startWork,
+  teardownStalePool,
   status,
   stop,
   validateWorkItem,

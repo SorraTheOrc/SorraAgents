@@ -585,6 +585,40 @@ describe('cleanupMarkedContainers', () => {
 });
 
 // ---------------------------------------------------------------------------
+// imageCreatedDate / isImageStale / teardownStalePool
+// ---------------------------------------------------------------------------
+
+describe('imageCreatedDate', () => {
+  test('is exported as a function', () => {
+    assert.equal(typeof plugin.imageCreatedDate, 'function');
+  });
+
+  test('returns null for a non-existent image', () => {
+    const result = plugin.imageCreatedDate('no-such-image:never');
+    assert.equal(result, null);
+  });
+});
+
+describe('isImageStale', () => {
+  test('is exported as a function', () => {
+    assert.equal(typeof plugin.isImageStale, 'function');
+  });
+
+  test('returns false when Containerfile does not exist', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-stale-test-'));
+    // No ampa/Containerfile in tmpDir
+    assert.equal(plugin.isImageStale(tmpDir), false);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+describe('teardownStalePool', () => {
+  test('is exported as a function', () => {
+    assert.equal(typeof plugin.teardownStalePool, 'function');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // listAvailablePool (depends on podman state — mostly a shape test)
 // ---------------------------------------------------------------------------
 
