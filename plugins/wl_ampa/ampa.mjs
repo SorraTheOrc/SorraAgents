@@ -1391,6 +1391,11 @@ async function finishWork(force = false, workItemIdArg) {
       }
       if (pushResult.stdout) console.log(pushResult.stdout);
 
+      // Ensure worklog data is synced even if the push was a no-op (which
+      // skips the pre-push hook) or if there were only worklog changes.
+      console.log('Syncing worklog data...');
+      runSync('wl', ['sync']);
+
       const hashResult = runSync('git', ['rev-parse', '--short', 'HEAD']);
       const commitHash = hashResult.stdout || 'unknown';
 
@@ -1427,9 +1432,10 @@ async function finishWork(force = false, workItemIdArg) {
   console.log(`Finishing work in container "${cName}" (${workItemId}, branch: ${branch})...`);
 
   if (!force) {
-    // Build a script to commit and push inside the container
+    // Build a script to commit, push, and sync worklog inside the container
     const commitPushScript = [
       `set -e`,
+      `export PATH="$HOME/.npm-global/bin:$PATH"`,
       `cd /workdir/project 2>/dev/null || { echo "No project directory found in container."; exit 1; }`,
       // Check for uncommitted changes
       `if [ -n "$(git status --porcelain)" ]; then`,
@@ -1441,6 +1447,11 @@ async function finishWork(force = false, workItemIdArg) {
       `PUSH_BRANCH="${branch || 'HEAD'}"`,
       `echo "Pushing $PUSH_BRANCH to origin..."`,
       `git push -u origin "$PUSH_BRANCH"`,
+      // Ensure worklog data is synced even if the push was a no-op
+      `if command -v wl >/dev/null 2>&1; then`,
+      `  echo "Syncing worklog data..."`,
+      `  wl sync --json || echo "wl sync skipped"`,
+      `fi`,
       `echo "AMPA_COMMIT_HASH=$(git rev-parse --short HEAD)"`,
     ].join('\n');
 
