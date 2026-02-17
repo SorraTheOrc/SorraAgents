@@ -1220,7 +1220,7 @@ async function startWork(projectRoot, workItemId, agentName) {
     `cat >> ~/.bashrc << 'AMPA_PROMPT'`,
     `__ampa_prompt_cmd() { __ampa_rel="\${PWD#/workdir/project}"; __ampa_rel="\${__ampa_rel:-/}"; }`,
     `PROMPT_COMMAND=__ampa_prompt_cmd`,
-    `PS1='\\[\\e[32m\\]${projectName}_sandbox\\[\\e[0m\\] - \\[\\e[36m\\]${branch}\\[\\e[0m\\]\\n\$__ampa_rel \\$ '`,
+    `PS1='\\[\\e[32m\\]${projectName}_sandbox\\[\\e[0m\\] - \\[\\e[36m\\]${branch}\\[\\e[0m\\]\\n\\[\\e[38;5;208m\\]\$__ampa_rel\\[\\e[0m\\] \\$ '`,
     `AMPA_PROMPT`,
     // Sync worklog data on shell exit so changes are not lost if the user
     // exits without running 'wl ampa finish-work'.  The trap runs on any
