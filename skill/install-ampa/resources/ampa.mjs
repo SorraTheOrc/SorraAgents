@@ -1695,7 +1695,9 @@ async function finishWork(force = false, workItemIdArg) {
       console.log(`  distrobox rm --force ${cName}`);
     }
 
-    return 0;
+    // 6. Exit the container shell so the user is returned to the host.
+    console.log('Exiting container...');
+    process.exit(0);
   }
 
   // --- Host path: enter container, commit/push, destroy, replenish ---
