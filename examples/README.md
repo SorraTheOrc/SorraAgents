@@ -35,3 +35,20 @@ Environment variables:
 
 Verify in Discord/AMPA that the notification includes Session, Work item, Reason,
 Pending prompt file path, and Responder endpoint.
+
+## ampa_patch_flow.py
+
+Script a bidirectional AMPA/PATCH conversation and optionally run an audit.
+
+```sh
+python examples/ampa_patch_flow.py --work-item SA-12345
+python examples/ampa_patch_flow.py --work-item SA-12345 --run-audit
+python examples/ampa_patch_flow.py --work-item SA-12345 --run-audit --apply-update
+```
+
+Behavior:
+
+- Writes a newline-delimited JSON transcript to `ampa_patch_transcript.jsonl` (or `--out`).
+- When `--run-audit` is set, runs `/audit` and inspects the output for closure hints.
+- When `--apply-update` is set and the audit recommends closure, updates the work item to
+  `status completed`, `stage in_review`, and `needs-producer-review`.

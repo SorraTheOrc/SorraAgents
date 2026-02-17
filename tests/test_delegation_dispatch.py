@@ -133,3 +133,51 @@ def test_dispatch_logged_before_spawn(tmp_path, monkeypatch):
     content = (dispatch_calls[-1].get("payload") or {}).get("content", "")
     assert "Delegating" in content
     assert "SA-TEST-123" in content
+
+
+def test_dispatch_uses_implement_skill_command(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        s = cmd.strip()
+        if s == "wl in_progress --json":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"workItems": []}), stderr=""
+            )
+        if s.startswith("wl next") and "--json" in s:
+            payload = {
+                "workItem": {
+                    "id": "SA-IMPL-1",
+                    "title": "Plan item",
+                    "stage": "plan_complete",
+                }
+            }
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+            )
+        if s.startswith("opencode run"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="ok", stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+
+    spec = CommandSpec(
+        command_id="delegation",
+        command="",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={},
+        title="Delegation",
+        command_type="delegation",
+    )
+    sched.store.add_command(spec)
+
+    sched.start_command(spec)
+
+    assert any(
+        'opencode run "work on SA-IMPL-1 using the implement skill"' in c for c in calls
+    )
