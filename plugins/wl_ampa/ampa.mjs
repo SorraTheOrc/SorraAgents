@@ -1045,18 +1045,36 @@ async function startWork(projectRoot, workItemId, agentName) {
     return 2;
   }
 
-  // 3. Check if this work item already has a claimed container
+  // 3. Check if this work item already has a claimed container — enter it
   const existingPool = findPoolContainerForWorkItem(projectRoot, workItemId);
   if (existingPool) {
-    console.error(`Work item "${workItemId}" already has container "${existingPool}". Use 'wl ampa list-containers' to inspect or 'wl ampa finish-work' to clean up.`);
-    return 2;
+    console.log(`Work item "${workItemId}" already has container "${existingPool}". Entering...`);
+    const enterProc = spawn('distrobox', ['enter', existingPool, '--', 'bash', '--login', '-c', 'cd /workdir/project 2>/dev/null; exec bash --login'], {
+      stdio: 'inherit',
+    });
+    return new Promise((resolve) => {
+      enterProc.on('exit', (code) => resolve(code || 0));
+      enterProc.on('error', (err) => {
+        console.error(`Failed to enter container: ${err.message}`);
+        resolve(1);
+      });
+    });
   }
 
   // Also check legacy container name (ampa-<id>) for backwards compat
   const legacyName = containerName(workItemId);
   if (checkContainerExists(legacyName)) {
-    console.error(`Container "${legacyName}" already exists. Use 'wl ampa list-containers' to inspect or 'wl ampa finish-work' to clean up.`);
-    return 2;
+    console.log(`Container "${legacyName}" already exists. Entering...`);
+    const enterProc = spawn('distrobox', ['enter', legacyName, '--', 'bash', '--login', '-c', 'cd /workdir/project 2>/dev/null; exec bash --login'], {
+      stdio: 'inherit',
+    });
+    return new Promise((resolve) => {
+      enterProc.on('exit', (code) => resolve(code || 0));
+      enterProc.on('error', (err) => {
+        console.error(`Failed to enter container: ${err.message}`);
+        resolve(1);
+      });
+    });
   }
 
   // 4. Get git origin
