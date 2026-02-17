@@ -1,0 +1,31 @@
+# Minimal Containerfile for Distrobox development containers
+# - Base: debian:slim
+# - Installs only minimal runtime packages Distrobox needs (bash, curl, ca-certificates)
+# - Does NOT install Python, Node.js, wl, git, gh, or other developer tooling; those come
+#   from the mounted home directory inside Distrobox per project conventions.
+#
+# Build:
+#   podman build -t ampa-dev:latest ampa/
+#
+# Verify (example):
+#   podman build -t ampa-dev:latest ampa/ && podman images | grep ampa-dev
+
+FROM debian:slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install only the minimal packages Distrobox needs to operate and to provide a
+# usable shell. Keep image small and avoid developer toolchain install here.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    bash \
+    curl \
+    ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Working directory where the project will be cloned inside the container.
+WORKDIR /workdir
+
+# Default to an interactive shell. Distrobox will typically enter the container
+# with the user's UID and provide an interactive session; keep this image simple.
+CMD ["/bin/bash"]
