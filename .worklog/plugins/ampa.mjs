@@ -580,6 +580,9 @@ async function runOnce(projectRoot, cmdSpec) {
 
 const CONTAINER_IMAGE = 'ampa-dev:latest';
 const CONTAINER_PREFIX = 'ampa-';
+const TEMPLATE_CONTAINER_NAME = 'ampa-template';
+const POOL_PREFIX = 'ampa-pool-';
+const POOL_SIZE = 3;
 
 /**
  * Check if a binary exists in $PATH. Returns true if found, false otherwise.
@@ -680,6 +683,250 @@ function buildImage(projectRoot) {
 }
 
 /**
+ * Ensure the template container exists and is initialized.
+ * On first run, creates a Distrobox container from the image and enters it
+ * once to trigger full host-integration init (slow, one-off).
+ * On subsequent runs, returns immediately because the template already exists.
+ * Returns { ok, message }.
+ */
+function ensureTemplate() {
+  if (checkContainerExists(TEMPLATE_CONTAINER_NAME)) {
+    return { ok: true, message: 'Template container already exists' };
+  }
+
+  console.log('');
+  console.log('='.repeat(72));
+  console.log('  FIRST-TIME SETUP: Creating template container.');
+  console.log('  This is a one-off step that takes several minutes while');
+  console.log('  Distrobox integrates the host environment. Subsequent');
+  console.log('  start-work runs will be much faster.');
+  console.log('='.repeat(72));
+  console.log('');
+
+  console.log(`Creating template container "${TEMPLATE_CONTAINER_NAME}"...`);
+  const createResult = spawnSync('distrobox', [
+    'create',
+    '--name', TEMPLATE_CONTAINER_NAME,
+    '--image', CONTAINER_IMAGE,
+    '--yes',
+    '--no-entry',
+  ], { encoding: 'utf8', stdio: 'inherit' });
+  if (createResult.status !== 0) {
+    return { ok: false, message: `Failed to create template (exit code ${createResult.status})` };
+  }
+
+  // Enter the template once to trigger Distrobox's full init.
+  // Use stdio: inherit so the user sees real-time progress output.
+  console.log('Initializing template (this is the slow part)...');
+  const initResult = spawnSync('distrobox', [
+    'enter', TEMPLATE_CONTAINER_NAME, '--', 'true',
+  ], { encoding: 'utf8', stdio: 'inherit' });
+  if (initResult.status !== 0) {
+    // Clean up the broken template
+    spawnSync('distrobox', ['rm', '--force', TEMPLATE_CONTAINER_NAME], { stdio: 'pipe' });
+    return { ok: false, message: `Template init failed (exit code ${initResult.status})` };
+  }
+
+  // Stop the template — distrobox enter leaves it running and
+  // distrobox create --clone refuses to clone a running container.
+  spawnSync('podman', ['stop', TEMPLATE_CONTAINER_NAME], { stdio: 'pipe' });
+
+  console.log('Template container ready.');
+  return { ok: true, message: 'Template created and initialized' };
+}
+
+// ---------------------------------------------------------------------------
+// Container pool — pre-warmed containers for instant start-work
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate the name for pool container at the given index.
+ */
+function poolContainerName(index) {
+  return `${POOL_PREFIX}${index}`;
+}
+
+/**
+ * Path to the pool state JSON file.
+ * Stores a mapping of pool container name -> { workItemId, branch, claimedAt }
+ * for containers that have been claimed by start-work.
+ */
+function poolStatePath(projectRoot) {
+  return path.join(projectRoot, '.worklog', 'ampa', 'pool-state.json');
+}
+
+/**
+ * Read the pool state from disk. Returns an object keyed by container name.
+ */
+function getPoolState(projectRoot) {
+  const p = poolStatePath(projectRoot);
+  try {
+    if (fs.existsSync(p)) {
+      return JSON.parse(fs.readFileSync(p, 'utf8'));
+    }
+  } catch (e) {}
+  return {};
+}
+
+/**
+ * Persist pool state to disk.
+ */
+function savePoolState(projectRoot, state) {
+  const p = poolStatePath(projectRoot);
+  const dir = path.dirname(p);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(state, null, 2), 'utf8');
+}
+
+/**
+ * List pool containers that exist in Podman and are NOT currently claimed.
+ * Returns an array of container names that are available for use.
+ */
+function listAvailablePool(projectRoot) {
+  const state = getPoolState(projectRoot);
+  const available = [];
+  for (let i = 0; i < POOL_SIZE; i++) {
+    const name = poolContainerName(i);
+    if (checkContainerExists(name) && !state[name]) {
+      available.push(name);
+    }
+  }
+  return available;
+}
+
+/**
+ * Claim a pool container for a work item. Updates the pool state file.
+ * Returns the pool container name, or null if no pool containers are available.
+ */
+function claimPoolContainer(projectRoot, workItemId, branch) {
+  const available = listAvailablePool(projectRoot);
+  if (available.length === 0) return null;
+  const name = available[0];
+  const state = getPoolState(projectRoot);
+  state[name] = {
+    workItemId,
+    branch,
+    claimedAt: new Date().toISOString(),
+  };
+  savePoolState(projectRoot, state);
+  return name;
+}
+
+/**
+ * Release a pool container claim (after finish-work destroys it).
+ */
+function releasePoolContainer(projectRoot, containerNameOrAll) {
+  const state = getPoolState(projectRoot);
+  if (containerNameOrAll === '*') {
+    // Clear all claims
+    savePoolState(projectRoot, {});
+    return;
+  }
+  delete state[containerNameOrAll];
+  savePoolState(projectRoot, state);
+}
+
+/**
+ * Look up which pool container is assigned to a work item ID.
+ * Returns the pool container name or null.
+ */
+function findPoolContainerForWorkItem(projectRoot, workItemId) {
+  const state = getPoolState(projectRoot);
+  for (const [name, info] of Object.entries(state)) {
+    if (info && info.workItemId === workItemId) return name;
+  }
+  return null;
+}
+
+/**
+ * Synchronously fill the pool up to POOL_SIZE by cloning from the template.
+ * Stops the template first (clone requires it to be stopped).
+ * Returns { created, errors } — the count of newly created containers and
+ * an array of error messages for any that failed.
+ */
+function replenishPool(projectRoot) {
+  const state = getPoolState(projectRoot);
+  let created = 0;
+  const errors = [];
+
+  // Determine which slots need filling
+  const needed = [];
+  for (let i = 0; i < POOL_SIZE; i++) {
+    const name = poolContainerName(i);
+    if (!checkContainerExists(name)) {
+      needed.push(name);
+    }
+  }
+
+  if (needed.length === 0) {
+    return { created: 0, errors: [] };
+  }
+
+  // Ensure template exists
+  const tmpl = ensureTemplate();
+  if (!tmpl.ok) {
+    return { created: 0, errors: [`Template not available: ${tmpl.message}`] };
+  }
+
+  // Stop the template — clone requires it to be stopped
+  spawnSync('podman', ['stop', TEMPLATE_CONTAINER_NAME], { stdio: 'pipe' });
+
+  for (const name of needed) {
+    const result = spawnSync('distrobox', [
+      'create',
+      '--clone', TEMPLATE_CONTAINER_NAME,
+      '--name', name,
+      '--yes',
+      '--no-entry',
+    ], { encoding: 'utf8', stdio: 'pipe' });
+    if (result.status === 0) {
+      created++;
+    } else {
+      const msg = (result.stderr || result.stdout || '').trim();
+      errors.push(`Failed to create ${name}: ${msg}`);
+    }
+  }
+
+  return { created, errors };
+}
+
+/**
+ * Spawn a detached background process that replenishes the pool.
+ * Returns immediately — the replenish happens asynchronously.
+ */
+function replenishPoolBackground(projectRoot) {
+  // Build an inline Node script that does the replenish.
+  // We import the plugin and call replenishPool directly.
+  const pluginPath = path.resolve(projectRoot, 'plugins', 'wl_ampa', 'ampa.mjs');
+  // Fallback to installed copy if source of truth does not exist
+  const actualPath = fs.existsSync(pluginPath)
+    ? pluginPath
+    : path.resolve(projectRoot, '.worklog', 'plugins', 'ampa.mjs');
+
+  const script = [
+    `import('file://${actualPath}')`,
+    `.then(m => {`,
+    `  const r = m.replenishPool('${projectRoot.replace(/'/g, "\\'")}');`,
+    `  if (r.errors.length) r.errors.forEach(e => process.stderr.write(e + '\\n'));`,
+    `})`,
+    `.catch(e => { process.stderr.write(String(e) + '\\n'); process.exit(1); });`,
+  ].join('');
+
+  const logFile = path.join(projectRoot, '.worklog', 'ampa', 'pool-replenish.log');
+  const out = fs.openSync(logFile, 'a');
+  try {
+    fs.appendFileSync(logFile, `\n--- replenish started at ${new Date().toISOString()} ---\n`);
+  } catch (e) {}
+
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: projectRoot,
+    detached: true,
+    stdio: ['ignore', out, out],
+  });
+  child.unref();
+}
+
+/**
  * Run a command synchronously, returning { status, stdout, stderr }.
  */
 function runSync(cmd, args, opts = {}) {
@@ -695,6 +942,8 @@ function runSync(cmd, args, opts = {}) {
  * Create and enter a Distrobox container for a work item.
  */
 async function startWork(projectRoot, workItemId, agentName) {
+  console.log(`Creating sandbox container to work on ${workItemId}...`);
+
   // 1. Check prerequisites
   const prereqs = checkPrerequisites();
   if (!prereqs.ok) {
@@ -718,10 +967,17 @@ async function startWork(projectRoot, workItemId, agentName) {
     return 2;
   }
 
-  // 3. Check for existing container
-  const cName = containerName(workItemId);
-  if (checkContainerExists(cName)) {
-    console.error(`Container "${cName}" already exists. Use 'wl ampa list-containers' to inspect or 'wl ampa finish-work' to clean up.`);
+  // 3. Check if this work item already has a claimed container
+  const existingPool = findPoolContainerForWorkItem(projectRoot, workItemId);
+  if (existingPool) {
+    console.error(`Work item "${workItemId}" already has container "${existingPool}". Use 'wl ampa list-containers' to inspect or 'wl ampa finish-work' to clean up.`);
+    return 2;
+  }
+
+  // Also check legacy container name (ampa-<id>) for backwards compat
+  const legacyName = containerName(workItemId);
+  if (checkContainerExists(legacyName)) {
+    console.error(`Container "${legacyName}" already exists. Use 'wl ampa list-containers' to inspect or 'wl ampa finish-work' to clean up.`);
     return 2;
   }
 
@@ -741,26 +997,51 @@ async function startWork(projectRoot, workItemId, agentName) {
     }
   }
 
-  // 6. Derive branch name
-  const branch = branchName(workItemId, workItem.issueType);
-
-  // 7. Create Distrobox container
-  console.log(`Creating container "${cName}" from image ${CONTAINER_IMAGE}...`);
-  const createResult = runSync('distrobox', [
-    'create',
-    '--name', cName,
-    '--image', CONTAINER_IMAGE,
-    '--yes',
-    '--no-entry',
-  ]);
-  if (createResult.status !== 0) {
-    console.error(`Failed to create container: ${createResult.stderr || createResult.stdout}`);
+  // 6. Ensure template container exists (one-off slow init)
+  const tmpl = ensureTemplate();
+  if (!tmpl.ok) {
+    console.error(`Failed to prepare template container: ${tmpl.message}`);
     return 1;
   }
 
-  // 8. Run setup inside the container:
+  // 7. Derive branch name
+  const branch = branchName(workItemId, workItem.issueType);
+
+  // 8. Claim a pre-warmed pool container, or fall back to direct clone
+  let cName = claimPoolContainer(projectRoot, workItemId, branch);
+  if (cName) {
+    console.log(`Using pre-warmed container "${cName}".`);
+  } else {
+    // Pool is empty — fall back to cloning from template directly
+    console.log('No pre-warmed containers available, cloning from template...');
+    spawnSync('podman', ['stop', TEMPLATE_CONTAINER_NAME], { stdio: 'pipe' });
+    // Use the first pool slot name so it integrates with the pool system
+    cName = poolContainerName(0);
+    const createResult = runSync('distrobox', [
+      'create',
+      '--clone', TEMPLATE_CONTAINER_NAME,
+      '--name', cName,
+      '--yes',
+      '--no-entry',
+    ]);
+    if (createResult.status !== 0) {
+      console.error(`Failed to create container: ${createResult.stderr || createResult.stdout}`);
+      return 1;
+    }
+    // Record the claim
+    const state = getPoolState(projectRoot);
+    state[cName] = {
+      workItemId,
+      branch,
+      claimedAt: new Date().toISOString(),
+    };
+    savePoolState(projectRoot, state);
+  }
+
+  // 9. Run setup inside the container:
   //    - Clone the project (shallow)
   //    - Create/checkout branch
+  //    - Set env vars for container detection
   //    - Run wl init + wl sync
   const setupScript = [
     `set -e`,
@@ -781,6 +1062,7 @@ async function startWork(projectRoot, workItemId, agentName) {
     `echo "export AMPA_CONTAINER_NAME=${cName}" >> ~/.bashrc`,
     `echo "export AMPA_WORK_ITEM_ID=${workItemId}" >> ~/.bashrc`,
     `echo "export AMPA_BRANCH=${branch}" >> ~/.bashrc`,
+    `echo "export AMPA_PROJECT_ROOT=${projectRoot}" >> ~/.bashrc`,
     // Initialize worklog
     `if command -v wl >/dev/null 2>&1; then`,
     `  echo "Initializing worklog..."`,
@@ -799,12 +1081,13 @@ async function startWork(projectRoot, workItemId, agentName) {
   if (setupResult.status !== 0) {
     console.error(`Container setup failed: ${setupResult.stderr || setupResult.stdout}`);
     // Attempt cleanup
+    releasePoolContainer(projectRoot, cName);
     spawnSync('distrobox', ['rm', '--force', cName], { stdio: 'pipe' });
     return 1;
   }
   if (setupResult.stdout) console.log(setupResult.stdout);
 
-  // 9. Claim work item if agent name provided
+  // 10. Claim work item if agent name provided
   if (agentName) {
     spawnSync('wl', ['update', workItemId, '--status', 'in_progress', '--assignee', agentName, '--json'], {
       stdio: 'pipe',
@@ -812,7 +1095,10 @@ async function startWork(projectRoot, workItemId, agentName) {
     });
   }
 
-  // 10. Enter the container interactively
+  // 11. Replenish the pool in the background (replace the container we just used)
+  replenishPoolBackground(projectRoot);
+
+  // 12. Enter the container interactively
   console.log(`\nEntering container "${cName}"...`);
   console.log(`Work directory: /workdir/project`);
   console.log(`Branch: ${branch}`);
@@ -840,6 +1126,7 @@ async function finishWork(force = false) {
   const cName = process.env.AMPA_CONTAINER_NAME;
   const workItemId = process.env.AMPA_WORK_ITEM_ID;
   const branch = process.env.AMPA_BRANCH;
+  const projectRoot = process.env.AMPA_PROJECT_ROOT;
 
   if (!cName || !workItemId) {
     console.error('Not running inside a start-work container. Set AMPA_CONTAINER_NAME and AMPA_WORK_ITEM_ID or use this command from within a container created by "wl ampa start-work".');
@@ -904,6 +1191,14 @@ async function finishWork(force = false) {
 
   // 5. Exit and destroy container
   console.log(`Destroying container "${cName}"...`);
+  // Release pool claim so the slot can be replenished
+  if (projectRoot) {
+    try {
+      releasePoolContainer(projectRoot, cName);
+    } catch (e) {
+      // Non-fatal — pool state file may not be accessible from inside container
+    }
+  }
   // We need to exit the container first, then destroy from the host.
   // When running inside the container, we signal completion and the
   // host-side caller handles destruction.
@@ -914,6 +1209,7 @@ async function finishWork(force = false) {
     fs.writeFileSync(path.join(markerDir, `${cName}.done`), JSON.stringify({
       workItemId,
       branch,
+      projectRoot,
       timestamp: new Date().toISOString(),
       force,
     }));
@@ -930,8 +1226,10 @@ async function finishWork(force = false) {
 
 /**
  * List all dev containers created by start-work.
+ * Shows claimed pool containers with their work item mapping.
+ * Hides unclaimed pool containers and the template container.
  */
-function listContainers(useJson = false) {
+function listContainers(projectRoot, useJson = false) {
   // Parse output of podman ps to find ampa-* containers
   const result = runSync('podman', ['ps', '-a', '--filter', `name=${CONTAINER_PREFIX}`, '--format', '{{.Names}}\\t{{.Status}}\\t{{.Created}}']);
   if (result.status !== 0) {
@@ -944,16 +1242,30 @@ function listContainers(useJson = false) {
     return 1;
   }
 
+  const poolState = getPoolState(projectRoot);
+
   const lines = result.stdout.split('\n').filter(Boolean);
   const containers = lines.map((line) => {
     const parts = line.split('\t');
     const name = parts[0] || '';
     const status = parts[1] || 'unknown';
     const created = parts[2] || 'unknown';
-    // Extract work item ID from container name (ampa-<work-item-id>)
-    const workItemIdMatch = name.startsWith(CONTAINER_PREFIX) ? name.slice(CONTAINER_PREFIX.length) : null;
-    return { name, workItemId: workItemIdMatch, status, created };
-  });
+
+    // Check if this is a pool container with a work item claim
+    const claim = poolState[name];
+    if (claim) {
+      return { name, workItemId: claim.workItemId, branch: claim.branch, status, created };
+    }
+
+    // Legacy container name: ampa-<work-item-id> (not pool, not template)
+    if (name.startsWith(CONTAINER_PREFIX) && !name.startsWith(POOL_PREFIX) && name !== TEMPLATE_CONTAINER_NAME) {
+      const workItemId = name.slice(CONTAINER_PREFIX.length);
+      return { name, workItemId, status, created };
+    }
+
+    // Unclaimed pool container or template — mark for filtering
+    return null;
+  }).filter(Boolean);
 
   if (useJson) {
     console.log(JSON.stringify({ containers }, null, 2));
@@ -1158,7 +1470,9 @@ export default function register(ctx) {
     .description('List dev containers created by start-work')
     .option('--json', 'Output JSON')
     .action(async (opts) => {
-      const code = listContainers(!!opts.json);
+      let cwd = process.cwd();
+      try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
+      const code = listContainers(cwd, !!opts.json);
       process.exitCode = code;
     });
 
@@ -1167,8 +1481,74 @@ export default function register(ctx) {
     .description('Alias for list-containers')
     .option('--json', 'Output JSON')
     .action(async (opts) => {
-      const code = listContainers(!!opts.json);
+      let cwd = process.cwd();
+      try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
+      const code = listContainers(cwd, !!opts.json);
       process.exitCode = code;
+    });
+
+  ampa
+    .command('warm-pool')
+    .description('Pre-warm the container pool (ensure template exists and fill empty pool slots)')
+    .action(async () => {
+      let cwd = process.cwd();
+      try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
+      const prereqs = checkPrerequisites();
+      if (!prereqs.ok) {
+        console.error(prereqs.message);
+        process.exitCode = 1;
+        return;
+      }
+      console.log('Ensuring template container exists...');
+      const tmpl = ensureTemplate();
+      if (!tmpl.ok) {
+        console.error(`Failed to create template: ${tmpl.message}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log('Template ready. Filling pool slots...');
+      const result = replenishPool(cwd);
+      if (result.errors.length) {
+        result.errors.forEach(e => console.error(e));
+      }
+      if (result.created > 0) {
+        console.log(`Created ${result.created} pool container(s). Pool is now warm.`);
+      } else {
+        console.log('Pool is already fully warm — no new containers needed.');
+      }
+      process.exitCode = result.errors.length > 0 ? 1 : 0;
+    });
+
+  ampa
+    .command('wp')
+    .description('Alias for warm-pool')
+    .action(async () => {
+      let cwd = process.cwd();
+      try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
+      const prereqs = checkPrerequisites();
+      if (!prereqs.ok) {
+        console.error(prereqs.message);
+        process.exitCode = 1;
+        return;
+      }
+      console.log('Ensuring template container exists...');
+      const tmpl = ensureTemplate();
+      if (!tmpl.ok) {
+        console.error(`Failed to create template: ${tmpl.message}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log('Template ready. Filling pool slots...');
+      const result = replenishPool(cwd);
+      if (result.errors.length) {
+        result.errors.forEach(e => console.error(e));
+      }
+      if (result.created > 0) {
+        console.log(`Created ${result.created} pool container(s). Pool is now warm.`);
+      } else {
+        console.log('Pool is already fully warm — no new containers needed.');
+      }
+      process.exitCode = result.errors.length > 0 ? 1 : 0;
     });
 }
 
@@ -1176,14 +1556,28 @@ export {
   CONTAINER_IMAGE,
   CONTAINER_PREFIX,
   DAEMON_NOT_RUNNING_MESSAGE,
+  POOL_PREFIX,
+  POOL_SIZE,
+  TEMPLATE_CONTAINER_NAME,
   branchName,
   checkBinary,
   checkContainerExists,
   checkPrerequisites,
+  claimPoolContainer,
   containerName,
+  ensureTemplate,
+  findPoolContainerForWorkItem,
   getGitOrigin,
+  getPoolState,
+  listAvailablePool,
   listContainers,
+  poolContainerName,
+  poolStatePath,
+  releasePoolContainer,
+  replenishPool,
+  replenishPoolBackground,
   resolveDaemonStore,
+  savePoolState,
   start,
   startWork,
   status,

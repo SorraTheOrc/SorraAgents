@@ -2,6 +2,7 @@ import { test, describe, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 
 // Import the plugin module — all new helpers/constants are named exports.
 const pluginModule = new URL('../../plugins/wl_ampa/ampa.mjs', import.meta.url);
@@ -64,6 +65,10 @@ describe('dev container constants', () => {
 
   test('CONTAINER_PREFIX is ampa-', () => {
     assert.equal(plugin.CONTAINER_PREFIX, 'ampa-');
+  });
+
+  test('TEMPLATE_CONTAINER_NAME is ampa-template', () => {
+    assert.equal(plugin.TEMPLATE_CONTAINER_NAME, 'ampa-template');
   });
 });
 
@@ -196,6 +201,28 @@ describe('checkContainerExists', () => {
 });
 
 // ---------------------------------------------------------------------------
+// ensureTemplate
+// ---------------------------------------------------------------------------
+
+describe('ensureTemplate', () => {
+  test('is exported as a function', () => {
+    assert.equal(typeof plugin.ensureTemplate, 'function');
+  });
+
+  test('returns ok: true when template already exists', () => {
+    // Only test the return shape when the template container already exists,
+    // otherwise calling ensureTemplate() would attempt a slow distrobox create.
+    const templateExists = plugin.checkContainerExists(plugin.TEMPLATE_CONTAINER_NAME);
+    if (!templateExists) {
+      // Skip — cannot test without triggering a slow distrobox create
+      return;
+    }
+    const result = plugin.ensureTemplate();
+    assert.ok(typeof result === 'object' && result !== null, 'should return an object');
+    assert.equal(result.ok, true);
+    assert.ok(typeof result.message === 'string', 'message should be a string');
+  });
+});
 // Command registration
 // ---------------------------------------------------------------------------
 
@@ -300,5 +327,209 @@ describe('finish-work outside container', () => {
     if (origName !== undefined) process.env.AMPA_CONTAINER_NAME = origName;
     if (origId !== undefined) process.env.AMPA_WORK_ITEM_ID = origId;
     process.exitCode = undefined;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pool constants
+// ---------------------------------------------------------------------------
+
+describe('pool constants', () => {
+  test('POOL_PREFIX is ampa-pool-', () => {
+    assert.equal(plugin.POOL_PREFIX, 'ampa-pool-');
+  });
+
+  test('POOL_SIZE is 3', () => {
+    assert.equal(plugin.POOL_SIZE, 3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// poolContainerName
+// ---------------------------------------------------------------------------
+
+describe('poolContainerName', () => {
+  test('generates ampa-pool-0 for index 0', () => {
+    assert.equal(plugin.poolContainerName(0), 'ampa-pool-0');
+  });
+
+  test('generates ampa-pool-2 for index 2', () => {
+    assert.equal(plugin.poolContainerName(2), 'ampa-pool-2');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// poolStatePath
+// ---------------------------------------------------------------------------
+
+describe('poolStatePath', () => {
+  test('returns path under .worklog/ampa/', () => {
+    const p = plugin.poolStatePath('/tmp/test-project');
+    assert.equal(p, '/tmp/test-project/.worklog/ampa/pool-state.json');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pool state read/write (using a temp directory)
+// ---------------------------------------------------------------------------
+
+describe('getPoolState / savePoolState', () => {
+  let tmpDir;
+
+  // Create a fresh temp dir for each test to avoid cross-contamination
+  function makeTmpProject() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-pool-test-'));
+    return dir;
+  }
+
+  test('getPoolState returns empty object when no state file exists', () => {
+    tmpDir = makeTmpProject();
+    const state = plugin.getPoolState(tmpDir);
+    assert.deepEqual(state, {});
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('savePoolState creates directories and writes JSON', () => {
+    tmpDir = makeTmpProject();
+    const testState = { 'ampa-pool-0': { workItemId: 'WL-1', branch: 'feature/WL-1', claimedAt: '2025-01-01T00:00:00.000Z' } };
+    plugin.savePoolState(tmpDir, testState);
+    const stateFile = plugin.poolStatePath(tmpDir);
+    assert.ok(fs.existsSync(stateFile), 'state file should be created');
+    const read = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert.deepEqual(read, testState);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('getPoolState reads back saved state', () => {
+    tmpDir = makeTmpProject();
+    const testState = { 'ampa-pool-1': { workItemId: 'SA-42', branch: 'bug/SA-42', claimedAt: '2025-06-15T12:00:00.000Z' } };
+    plugin.savePoolState(tmpDir, testState);
+    const read = plugin.getPoolState(tmpDir);
+    assert.deepEqual(read, testState);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// claimPoolContainer / releasePoolContainer / findPoolContainerForWorkItem
+// ---------------------------------------------------------------------------
+
+describe('claimPoolContainer', () => {
+  test('returns null when no pool containers exist', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-pool-test-'));
+    // No actual pool containers exist in podman, so listAvailablePool returns []
+    const result = plugin.claimPoolContainer(tmpDir, 'WL-1', 'feature/WL-1');
+    assert.equal(result, null);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+describe('releasePoolContainer', () => {
+  test('removes a specific container claim from state', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-pool-test-'));
+    const state = {
+      'ampa-pool-0': { workItemId: 'WL-1', branch: 'feature/WL-1', claimedAt: '2025-01-01T00:00:00.000Z' },
+      'ampa-pool-1': { workItemId: 'WL-2', branch: 'task/WL-2', claimedAt: '2025-01-02T00:00:00.000Z' },
+    };
+    plugin.savePoolState(tmpDir, state);
+    plugin.releasePoolContainer(tmpDir, 'ampa-pool-0');
+    const updated = plugin.getPoolState(tmpDir);
+    assert.equal(updated['ampa-pool-0'], undefined, 'ampa-pool-0 should be removed');
+    assert.ok(updated['ampa-pool-1'], 'ampa-pool-1 should remain');
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('clears all claims with wildcard *', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-pool-test-'));
+    const state = {
+      'ampa-pool-0': { workItemId: 'WL-1', branch: 'feature/WL-1', claimedAt: '2025-01-01T00:00:00.000Z' },
+      'ampa-pool-1': { workItemId: 'WL-2', branch: 'task/WL-2', claimedAt: '2025-01-02T00:00:00.000Z' },
+    };
+    plugin.savePoolState(tmpDir, state);
+    plugin.releasePoolContainer(tmpDir, '*');
+    const updated = plugin.getPoolState(tmpDir);
+    assert.deepEqual(updated, {});
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+describe('findPoolContainerForWorkItem', () => {
+  test('returns the container name for a claimed work item', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-pool-test-'));
+    const state = {
+      'ampa-pool-0': { workItemId: 'WL-1', branch: 'feature/WL-1', claimedAt: '2025-01-01T00:00:00.000Z' },
+      'ampa-pool-2': { workItemId: 'SA-99', branch: 'bug/SA-99', claimedAt: '2025-02-01T00:00:00.000Z' },
+    };
+    plugin.savePoolState(tmpDir, state);
+    assert.equal(plugin.findPoolContainerForWorkItem(tmpDir, 'SA-99'), 'ampa-pool-2');
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('returns null for an unclaimed work item', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-pool-test-'));
+    plugin.savePoolState(tmpDir, {});
+    assert.equal(plugin.findPoolContainerForWorkItem(tmpDir, 'WL-999'), null);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('returns null when state file does not exist', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-pool-test-'));
+    assert.equal(plugin.findPoolContainerForWorkItem(tmpDir, 'WL-1'), null);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listAvailablePool (depends on podman state — mostly a shape test)
+// ---------------------------------------------------------------------------
+
+describe('listAvailablePool', () => {
+  test('returns an array', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-pool-test-'));
+    const result = plugin.listAvailablePool(tmpDir);
+    assert.ok(Array.isArray(result), 'should return an array');
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// replenishPool (shape test — does not require podman)
+// ---------------------------------------------------------------------------
+
+describe('replenishPool', () => {
+  test('is exported as a function', () => {
+    assert.equal(typeof plugin.replenishPool, 'function');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// replenishPoolBackground
+// ---------------------------------------------------------------------------
+
+describe('replenishPoolBackground', () => {
+  test('is exported as a function', () => {
+    assert.equal(typeof plugin.replenishPoolBackground, 'function');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Command registration — warm-pool
+// ---------------------------------------------------------------------------
+
+describe('warm-pool command registration', () => {
+  test('registers warm-pool subcommand', () => {
+    const ctx = { program: new FakeProgram() };
+    plugin.default(ctx);
+    const ampa = ctx.program.commands.get('ampa');
+    assert.ok(ampa.subcommands.has('warm-pool'), 'warm-pool should be registered');
+    assert.ok(ampa.subcommands.get('warm-pool').actionFn, 'warm-pool should have an action');
+  });
+
+  test('registers wp alias', () => {
+    const ctx = { program: new FakeProgram() };
+    plugin.default(ctx);
+    const ampa = ctx.program.commands.get('ampa');
+    assert.ok(ampa.subcommands.has('wp'), 'wp alias should be registered');
+    assert.ok(ampa.subcommands.get('wp').actionFn, 'wp should have an action');
   });
 });

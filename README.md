@@ -13,6 +13,40 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 - Workflow.md: high-level workflow for using this repository.
 - package.json: basic metadata used by tooling.
 
+## Prerequisites
+
+The dev container commands (`wl ampa start-work`, `finish-work`, `list-containers`) require the following tools on the host:
+
+- **Podman** — container runtime (rootless mode)
+  - Install: https://podman.io/getting-started/installation
+- **Distrobox** — manages dev containers on top of Podman
+  - Install: `curl -s https://raw.githubusercontent.com/89luca89/distrobox/main/install | sudo sh`
+  - Alternative methods: https://github.com/89luca89/distrobox?tab=readme-ov-file#installation
+- **Git** and **wl** (Worklog CLI) — assumed to already be available
+
+Verify the installations:
+
+```sh
+command -v podman && podman --version
+command -v distrobox && distrobox version
+```
+
+### Podman runtime directory error
+
+If `podman --version` prints an error like:
+
+```
+ERRO[0000] stat /run/user/1000/: no such file or directory
+```
+
+the XDG runtime directory expected by rootless Podman does not exist. This typically happens in environments that were not started via a full login session (containers, SSH without `pam_systemd`, WSL, etc.). Create it manually:
+
+```sh
+sudo mkdir -p /run/user/$(id -u) && sudo chown $(id -u):$(id -g) /run/user/$(id -u) && sudo chmod 700 /run/user/$(id -u)
+```
+
+After that, `podman --version` should work without errors.
+
 ## Getting started
 1. Read the main workflow: [Workflow.md](Workflow.md).
 2. Pick a folder to work in (e.g., `skill/` or `agent/`).
