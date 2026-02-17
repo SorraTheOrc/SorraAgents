@@ -1226,6 +1226,17 @@ async function startWork(projectRoot, workItemId, agentName) {
     `  wl init --project-name "${wlProjectName}" --prefix "${wlPrefix}" --auto-export yes --auto-sync no --agents-template skip --workflow-inline no --stats-plugin-overwrite no --json || echo "wl init skipped (may already be initialized)"`,
     `  echo "Syncing worklog data..."`,
     `  wl sync --json || echo "wl sync skipped"`,
+    // Copy the ampa plugin from the host project into the container's project.
+    // The host home dir is mounted by Distrobox, so projectRoot is accessible.
+    `  echo "Installing wl ampa plugin..."`,
+    `  mkdir -p .worklog/plugins`,
+    `  if [ -f "${projectRoot}/.worklog/plugins/ampa.mjs" ]; then`,
+    `    cp "${projectRoot}/.worklog/plugins/ampa.mjs" .worklog/plugins/ampa.mjs`,
+    `  elif [ -f "${projectRoot}/plugins/wl_ampa/ampa.mjs" ]; then`,
+    `    cp "${projectRoot}/plugins/wl_ampa/ampa.mjs" .worklog/plugins/ampa.mjs`,
+    `  else`,
+    `    echo "Warning: ampa plugin not found on host — wl ampa will not be available."`,
+    `  fi`,
     `else`,
     `  echo "Warning: wl not found in PATH. Worklog will not be initialized."`,
     `fi`,
