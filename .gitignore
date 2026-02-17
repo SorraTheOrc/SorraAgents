@@ -5,11 +5,13 @@ Worklog Specific Ignores
 # Ignore Worklog directory by default
 .worklog/
 
-# Keep config, defaults, and plugins tracked
+# Keep config and defaults tracked
 !.worklog/config.yaml
 !.worklog/config.defaults.yaml
+
+# Only track plugin config (yaml), not the plugin code itself
 !.worklog/plugins/
-!.worklog/plugins/**
+!.worklog/plugins/**/*.yaml
 
 # opencode temporary files
 .opencode/tmp/
