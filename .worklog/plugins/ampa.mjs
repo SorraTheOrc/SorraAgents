@@ -1137,6 +1137,12 @@ async function startWork(projectRoot, workItemId, agentName) {
   //    - Run wl init + wl sync
   const setupScript = [
     `set -e`,
+    // Symlink host Node.js into the container so tools like wl work.
+    // Node bundles its own OpenSSL so it is safe to use from /run/host
+    // (unlike git/ssh which must be installed natively).
+    `if [ -x /run/host/usr/bin/node ] && [ ! -e /usr/local/bin/node ]; then`,
+    `  sudo ln -s /run/host/usr/bin/node /usr/local/bin/node`,
+    `fi`,
     `cd /workdir`,
     `echo "Cloning project from ${origin}..."`,
     `git clone --depth 1 "${origin}" project`,
