@@ -524,7 +524,8 @@ function printPoolStatus(projectRoot) {
     const available = listAvailablePool(projectRoot);
     const state = getPoolState(projectRoot);
     const claimed = Object.keys(state).length;
-    console.log(`pool: ${available.length}/${POOL_SIZE} available, ${claimed} claimed`);
+    const total = available.length + claimed;
+    console.log(`Sandbox container pool: ${available.length} available, ${claimed} claimed (${total} total, target ${POOL_SIZE} available)`);
   } catch (e) {
     // Pool status is best-effort; don't fail status if pool helpers error
   }
@@ -797,16 +798,35 @@ function savePoolState(projectRoot, state) {
   fs.writeFileSync(p, JSON.stringify(state, null, 2), 'utf8');
 }
 
+// Maximum pool index to scan.  This caps the total number of pool
+// containers (claimed + unclaimed) to avoid runaway index growth.
+const POOL_MAX_INDEX = POOL_SIZE * 3; // e.g. 9
+
+/**
+ * Return a Set of pool container names that currently exist in Podman.
+ * Uses a single `podman ps -a` call instead of per-container checks.
+ */
+function existingPoolContainers() {
+  const result = spawnSync('podman', [
+    'ps', '-a', '--filter', `name=${POOL_PREFIX}`, '--format', '{{.Names}}',
+  ], { encoding: 'utf8', stdio: 'pipe' });
+  if (result.status !== 0) return new Set();
+  return new Set(result.stdout.split('\n').filter(Boolean));
+}
+
 /**
  * List pool containers that exist in Podman and are NOT currently claimed.
+ * Scans up to POOL_MAX_INDEX so we can find unclaimed containers even when
+ * some lower-indexed slots are occupied by claimed (in-use) containers.
  * Returns an array of container names that are available for use.
  */
 function listAvailablePool(projectRoot) {
   const state = getPoolState(projectRoot);
+  const existing = existingPoolContainers();
   const available = [];
-  for (let i = 0; i < POOL_SIZE; i++) {
+  for (let i = 0; i < POOL_MAX_INDEX; i++) {
     const name = poolContainerName(i);
-    if (checkContainerExists(name) && !state[name]) {
+    if (existing.has(name) && !state[name]) {
       available.push(name);
     }
   }
@@ -858,27 +878,45 @@ function findPoolContainerForWorkItem(projectRoot, workItemId) {
 }
 
 /**
- * Synchronously fill the pool up to POOL_SIZE by cloning from the template.
- * Stops the template first (clone requires it to be stopped).
- * Returns { created, errors } — the count of newly created containers and
- * an array of error messages for any that failed.
+ * Synchronously fill the pool so that at least POOL_SIZE unclaimed
+ * containers are available.  Scans up to POOL_MAX_INDEX to find free
+ * slot indices (no existing container), creates new clones there, and
+ * enters each one to trigger Distrobox init.
+ *
+ * Returns { created, errors } — the count of newly created containers
+ * and an array of error messages for any that failed.
  */
 function replenishPool(projectRoot) {
   const state = getPoolState(projectRoot);
   let created = 0;
   const errors = [];
 
-  // Determine which slots need filling
-  const needed = [];
-  for (let i = 0; i < POOL_SIZE; i++) {
+  // Count how many unclaimed containers already exist
+  const existing = existingPoolContainers();
+  let unclaimed = 0;
+  for (let i = 0; i < POOL_MAX_INDEX; i++) {
     const name = poolContainerName(i);
-    if (!checkContainerExists(name)) {
-      needed.push(name);
+    if (existing.has(name) && !state[name]) {
+      unclaimed++;
     }
   }
 
-  if (needed.length === 0) {
+  const deficit = POOL_SIZE - unclaimed;
+  if (deficit <= 0) {
     return { created: 0, errors: [] };
+  }
+
+  // Collect free slot indices (where no container exists at all)
+  const freeSlots = [];
+  for (let i = 0; i < POOL_MAX_INDEX && freeSlots.length < deficit; i++) {
+    const name = poolContainerName(i);
+    if (!existing.has(name)) {
+      freeSlots.push(name);
+    }
+  }
+
+  if (freeSlots.length === 0) {
+    return { created: 0, errors: [`No free pool slots available (all ${POOL_MAX_INDEX} indices occupied)`] };
   }
 
   // Ensure template exists
@@ -890,7 +928,7 @@ function replenishPool(projectRoot) {
   // Stop the template — clone requires it to be stopped
   spawnSync('podman', ['stop', TEMPLATE_CONTAINER_NAME], { stdio: 'pipe' });
 
-  for (const name of needed) {
+  for (const name of freeSlots) {
     const result = spawnSync('distrobox', [
       'create',
       '--clone', TEMPLATE_CONTAINER_NAME,
@@ -1609,6 +1647,7 @@ export {
   DAEMON_NOT_RUNNING_MESSAGE,
   POOL_PREFIX,
   POOL_SIZE,
+  POOL_MAX_INDEX,
   TEMPLATE_CONTAINER_NAME,
   branchName,
   checkBinary,
@@ -1617,6 +1656,7 @@ export {
   claimPoolContainer,
   containerName,
   ensureTemplate,
+  existingPoolContainers,
   findPoolContainerForWorkItem,
   getGitOrigin,
   getPoolState,
