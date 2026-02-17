@@ -140,6 +140,93 @@ async function resolveRunOnceCommand(projectRoot, commandId) {
   };
 }
 
+async function resolveListCommand(projectRoot, useJson) {
+  const args = ['-m', 'ampa.scheduler', 'list'];
+  if (useJson) args.push('--json');
+  // Prefer bundled python package if available.
+  try {
+    const pyBundle = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py', 'ampa');
+    if (fs.existsSync(path.join(pyBundle, '__init__.py'))) {
+      const pyPath = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py');
+      const venvPython = path.join(pyPath, 'venv', 'bin', 'python');
+      const pythonBin = fs.existsSync(venvPython) ? venvPython : 'python3';
+      return {
+        cmd: [pythonBin, '-u', ...args],
+        env: { PYTHONPATH: pyPath },
+        envPaths: [path.join(pyPath, 'ampa', '.env')],
+      };
+    }
+  } catch (e) {}
+  return {
+    cmd: ['python3', '-u', ...args],
+    env: {},
+    envPaths: [path.join(projectRoot, 'ampa', '.env')],
+  };
+}
+
+const DAEMON_NOT_RUNNING_MESSAGE = 'Daemon is not running. Start it with: wl ampa start';
+
+function readDaemonEnv(pid) {
+  try {
+    const envRaw = fs.readFileSync(`/proc/${pid}/environ`, 'utf8');
+    const out = {};
+    for (const entry of envRaw.split('\0')) {
+      if (!entry) continue;
+      const idx = entry.indexOf('=');
+      if (idx === -1) continue;
+      const key = entry.slice(0, idx);
+      const val = entry.slice(idx + 1);
+      out[key] = val;
+    }
+    return out;
+  } catch (e) {
+    return null;
+  }
+}
+
+function resolveDaemonStore(projectRoot, name = 'default') {
+  const ppath = pidPath(projectRoot, name);
+  if (!fs.existsSync(ppath)) return { running: false };
+  let pid;
+  try {
+    pid = parseInt(fs.readFileSync(ppath, 'utf8'), 10);
+  } catch (e) {
+    return { running: false };
+  }
+  if (!isRunning(pid)) return { running: false };
+  const owned = pidOwnedByProject(projectRoot, pid, logPath(projectRoot, name));
+  if (!owned) return { running: false };
+
+  let cwd = projectRoot;
+  try {
+    cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+  } catch (e) {}
+  const env = readDaemonEnv(pid) || {};
+  let storePath = env.AMPA_SCHEDULER_STORE || '';
+  if (!storePath) {
+    const candidates = [];
+    if (env.PYTHONPATH) {
+      for (const entry of env.PYTHONPATH.split(path.delimiter)) {
+        if (entry) candidates.push(entry);
+      }
+    }
+    candidates.push(path.join(projectRoot, '.worklog', 'plugins', 'ampa_py'));
+    for (const candidate of candidates) {
+      const ampaPath = path.join(candidate, 'ampa');
+      if (fs.existsSync(path.join(ampaPath, 'scheduler.py'))) {
+        storePath = path.join(ampaPath, 'scheduler_store.json');
+        break;
+      }
+    }
+  }
+  if (!storePath) {
+    storePath = path.join(cwd, 'ampa', 'scheduler_store.json');
+  } else if (!path.isAbsolute(storePath)) {
+    storePath = path.resolve(cwd, storePath);
+  }
+  return { running: true, pid, cwd, env, storePath };
+}
+
 function ensureDirs(projectRoot, name) {
   const base = path.join(projectRoot, '.worklog', 'ampa', name);
   fs.mkdirSync(base, { recursive: true });
@@ -561,5 +648,77 @@ export default function register(ctx) {
       process.exitCode = code;
     });
 
+  ampa
+    .command('list')
+    .description('List scheduled commands')
+    .option('--json', 'Output JSON')
+    .option('--name <name>', 'Daemon name', 'default')
+    .option('--verbose', 'Print resolved store path', false)
+    .action(async (opts) => {
+      const verbose = !!opts.verbose || process.argv.includes('--verbose');
+      let cwd = process.cwd();
+      try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
+      const daemon = resolveDaemonStore(cwd, opts.name);
+      if (!daemon.running) {
+        console.log(DAEMON_NOT_RUNNING_MESSAGE);
+        process.exitCode = 3;
+        return;
+      }
+      const cmdSpec = await resolveListCommand(cwd, !!opts.json);
+      if (!cmdSpec) {
+        console.error('No list command resolved.');
+        process.exitCode = 2;
+        return;
+      }
+      if (daemon.storePath) {
+        if (verbose) {
+          console.log(`Using scheduler store: ${daemon.storePath}`);
+        }
+        cmdSpec.env = Object.assign({}, cmdSpec.env || {}, { AMPA_SCHEDULER_STORE: daemon.storePath });
+      }
+      const code = await runOnce(cwd, cmdSpec);
+      process.exitCode = code;
+    });
+
+  ampa
+    .command('ls')
+    .description('Alias for list')
+    .option('--json', 'Output JSON')
+    .option('--name <name>', 'Daemon name', 'default')
+    .option('--verbose', 'Print resolved store path', false)
+    .action(async (opts) => {
+      const verbose = !!opts.verbose || process.argv.includes('--verbose');
+      let cwd = process.cwd();
+      try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
+      const daemon = resolveDaemonStore(cwd, opts.name);
+      if (!daemon.running) {
+        console.log(DAEMON_NOT_RUNNING_MESSAGE);
+        process.exitCode = 3;
+        return;
+      }
+      const cmdSpec = await resolveListCommand(cwd, !!opts.json);
+      if (!cmdSpec) {
+        console.error('No list command resolved.');
+        process.exitCode = 2;
+        return;
+      }
+      if (daemon.storePath) {
+        if (verbose) {
+          console.log(`Using scheduler store: ${daemon.storePath}`);
+        }
+        cmdSpec.env = Object.assign({}, cmdSpec.env || {}, { AMPA_SCHEDULER_STORE: daemon.storePath });
+      }
+      const code = await runOnce(cwd, cmdSpec);
+      process.exitCode = code;
+    });
+
 
 }
+
+export {
+  DAEMON_NOT_RUNNING_MESSAGE,
+  resolveDaemonStore,
+  start,
+  status,
+  stop,
+};
