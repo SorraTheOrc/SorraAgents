@@ -1,15 +1,13 @@
 # Minimal Containerfile for Distrobox development containers.
-# Tooling (Python, Node.js, wl, git, gh, opencode) comes from the host via
-# two mechanisms:
-#   1. Home directory mount — Distrobox mounts ~ automatically, providing
-#      binaries in ~/.local/bin, ~/.cargo/bin, ~/.npm-global/bin, etc.
-#   2. Host filesystem at /run/host — Distrobox mounts the host root here.
-#      System binaries (git, ssh, etc.) live at /run/host/usr/bin and must
-#      be added to PATH after Distrobox init completes. This is done by the
-#      start-work setup script (NOT here in the image) because adding
-#      /run/host paths to PATH at image build time causes Distrobox's own
-#      init to pick up host binaries linked against host-only shared
-#      libraries, which crash inside the container.
+#
+# Most developer tooling (Node.js, wl, gh, opencode) comes from the host
+# via Distrobox's home directory mount (~/.local/bin, ~/.cargo/bin, etc.).
+#
+# Git and SSH are installed in the image itself because they must be linked
+# against the container's own shared libraries (OpenSSL, libpcre, etc.).
+# Using the host's git/ssh via /run/host causes version-mismatch crashes
+# (e.g. "OpenSSL version mismatch") since the host and container ship
+# different library versions.
 #
 # Build:
 #   podman build -t ampa-dev:latest ampa/
@@ -21,14 +19,10 @@ FROM debian:stable-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install only the packages Distrobox needs to function correctly inside the
-# container plus basic utilities for shell sessions.  Distrobox injects its
-# own init system and expects coreutils, bash, and a few networking/system
-# tools to be available.
-#
-# Developer toolchain (Python, Node.js, wl, git, gh) is NOT installed here;
-# it comes from the host via the home directory mount and /run/host paths
-# (added to PATH by the start-work setup script after Distrobox init).
+# Install packages needed by Distrobox, plus git and openssh-client which
+# must run natively inside the container to avoid shared-library conflicts
+# with the host.  Other developer tools (Python, Node.js, wl, gh) come
+# from the mounted home directory.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     bash \
@@ -38,10 +32,12 @@ RUN apt-get update \
     curl \
     diffutils \
     findutils \
+    git \
     gnupg2 \
     less \
     lsof \
     ncurses-base \
+    openssh-client \
     passwd \
     pinentry-curses \
     procps \
