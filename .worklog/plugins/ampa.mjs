@@ -1923,6 +1923,16 @@ export default function register(ctx) {
         process.exitCode = 1;
         return;
       }
+      // Build image if needed
+      if (!imageExists(CONTAINER_IMAGE)) {
+        console.log('Building container image...');
+        const build = buildImage(cwd);
+        if (!build.ok) {
+          console.error(`Failed to build container image: ${build.message}`);
+          process.exitCode = 1;
+          return;
+        }
+      }
       console.log('Ensuring template container exists...');
       const tmpl = ensureTemplate();
       if (!tmpl.ok) {
@@ -1954,6 +1964,16 @@ export default function register(ctx) {
         console.error(prereqs.message);
         process.exitCode = 1;
         return;
+      }
+      // Build image if needed
+      if (!imageExists(CONTAINER_IMAGE)) {
+        console.log('Building container image...');
+        const build = buildImage(cwd);
+        if (!build.ok) {
+          console.error(`Failed to build container image: ${build.message}`);
+          process.exitCode = 1;
+          return;
+        }
       }
       console.log('Ensuring template container exists...');
       const tmpl = ensureTemplate();

@@ -49,13 +49,36 @@ After that, `podman --version` should work without errors.
 
 ### Pre-warming the container pool
 
-The dev container workflow uses a pool of pre-warmed containers so that `wl ampa start-work` can claim one instantly instead of waiting for a slow clone. After installing the prerequisites, run:
+The dev container workflow uses a pool of pre-warmed containers so that `wl ampa start-work` can claim one instantly instead of waiting for a slow clone. After installing the prerequisites, set everything up with a single command:
 
 ```sh
 wl ampa warm-pool
 ```
 
-This creates the template container and fills 3 pool slots. The pool is replenished automatically in the background after each `start-work`, but running `warm-pool` once up front avoids the initial wait.
+This will:
+
+1. **Build the container image** (`ampa-dev:latest`) from `ampa/Containerfile` if it does not already exist
+2. **Create the template container** (`ampa-template`) via Distrobox and run its one-off host-integration init (this is the slowest step on first run)
+3. **Fill the pool** with 3 pre-warmed containers cloned from the template
+
+The pool is replenished automatically in the background after each `start-work`, but running `warm-pool` once up front avoids the initial wait.
+
+To rebuild everything from scratch (e.g. after a Containerfile change), tear down first:
+
+```sh
+# Stop and remove all pool containers, the template, and any legacy containers
+for i in $(seq 0 9); do podman stop "ampa-pool-$i" 2>/dev/null; distrobox rm --force "ampa-pool-$i" 2>/dev/null; done
+podman stop ampa-template 2>/dev/null; distrobox rm --force ampa-template 2>/dev/null
+podman ps -a --filter "name=ampa-" --format '{{.Names}}' | while read name; do podman stop "$name" 2>/dev/null; distrobox rm --force "$name" 2>/dev/null; done
+
+# Remove the image
+podman rmi ampa-dev:latest 2>/dev/null
+
+# Clear pool state
+rm -f .worklog/ampa/pool-state.json .worklog/ampa/pool-cleanup.json
+```
+
+Then run `wl ampa warm-pool` again to rebuild from a clean slate.
 
 ## Getting started
 1. Read the main workflow: [Workflow.md](Workflow.md).
