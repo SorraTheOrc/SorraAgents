@@ -1,26 +1,45 @@
-# Minimal Containerfile for Distrobox development containers
-# - Base: debian:slim
-# - Installs only minimal runtime packages Distrobox needs (bash, curl, ca-certificates)
-# - Does NOT install Python, Node.js, wl, git, gh, or other developer tooling; those come
-#   from the mounted home directory inside Distrobox per project conventions.
+# Minimal Containerfile for Distrobox development containers.
+# Tooling (Python, Node.js, wl, git, gh, opencode) comes from the host's
+# home directory, which Distrobox mounts automatically.
 #
 # Build:
 #   podman build -t ampa-dev:latest ampa/
 #
-# Verify (example):
+# Verify:
 #   podman build -t ampa-dev:latest ampa/ && podman images | grep ampa-dev
 
-FROM debian:slim
+FROM debian:stable-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install only the minimal packages Distrobox needs to operate and to provide a
-# usable shell. Keep image small and avoid developer toolchain install here.
+# Install only the packages Distrobox needs to function correctly inside the
+# container plus basic utilities for shell sessions.  Distrobox injects its
+# own init system and expects coreutils, bash, and a few networking/system
+# tools to be available.
+#
+# Developer toolchain (Python, Node.js, wl, git, gh) is NOT installed here;
+# it comes from the mounted home directory.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     bash \
-    curl \
+    bc \
+    bzip2 \
     ca-certificates \
+    curl \
+    diffutils \
+    findutils \
+    gnupg2 \
+    less \
+    lsof \
+    ncurses-base \
+    passwd \
+    pinentry-curses \
+    procps \
+    sudo \
+    unzip \
+    wget \
+    xz-utils \
+    zip \
  && rm -rf /var/lib/apt/lists/*
 
 # Working directory where the project will be cloned inside the container.
