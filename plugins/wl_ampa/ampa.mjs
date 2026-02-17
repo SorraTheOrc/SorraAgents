@@ -898,12 +898,33 @@ function replenishPool(projectRoot) {
       '--yes',
       '--no-entry',
     ], { encoding: 'utf8', stdio: 'pipe' });
-    if (result.status === 0) {
-      created++;
-    } else {
+    if (result.status !== 0) {
       const msg = (result.stderr || result.stdout || '').trim();
       errors.push(`Failed to create ${name}: ${msg}`);
+      continue;
     }
+
+    // Enter the container once to trigger Distrobox's full init.
+    // Without this step the first distrobox-enter at claim time would
+    // run init and the bash --login shell would source profile files
+    // before Distrobox finishes writing them, leaving host binaries
+    // (git, wl, etc.) off the PATH.
+    const initResult = spawnSync('distrobox', [
+      'enter', name, '--', 'true',
+    ], { encoding: 'utf8', stdio: 'pipe' });
+    if (initResult.status !== 0) {
+      const msg = (initResult.stderr || initResult.stdout || '').trim();
+      errors.push(`Failed to init ${name}: ${msg}`);
+      // Clean up the broken container
+      spawnSync('distrobox', ['rm', '--force', name], { stdio: 'pipe' });
+      continue;
+    }
+
+    // Stop the container — it must not be running when start-work
+    // enters it later (and also so future --clone operations work).
+    spawnSync('podman', ['stop', name], { stdio: 'pipe' });
+
+    created++;
   }
 
   return { created, errors };
@@ -1031,7 +1052,7 @@ async function startWork(projectRoot, workItemId, agentName) {
   if (cName) {
     console.log(`Using pre-warmed container "${cName}".`);
   } else {
-    // Pool is empty — fall back to cloning from template directly
+     // Pool is empty — fall back to cloning from template directly
     console.log('No pre-warmed containers available, cloning from template...');
     spawnSync('podman', ['stop', TEMPLATE_CONTAINER_NAME], { stdio: 'pipe' });
     // Use the first pool slot name so it integrates with the pool system
@@ -1047,6 +1068,17 @@ async function startWork(projectRoot, workItemId, agentName) {
       console.error(`Failed to create container: ${createResult.stderr || createResult.stdout}`);
       return 1;
     }
+    // Enter once to trigger Distrobox init (sets up host PATH integration)
+    console.log('Initializing container...');
+    const initResult = spawnSync('distrobox', [
+      'enter', cName, '--', 'true',
+    ], { encoding: 'utf8', stdio: 'inherit' });
+    if (initResult.status !== 0) {
+      console.error('Container init failed');
+      spawnSync('distrobox', ['rm', '--force', cName], { stdio: 'pipe' });
+      return 1;
+    }
+    spawnSync('podman', ['stop', cName], { stdio: 'pipe' });
     // Record the claim
     const state = getPoolState(projectRoot);
     state[cName] = {
