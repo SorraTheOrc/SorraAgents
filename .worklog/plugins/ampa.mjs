@@ -1049,7 +1049,15 @@ async function startWork(projectRoot, workItemId, agentName) {
   const existingPool = findPoolContainerForWorkItem(projectRoot, workItemId);
   if (existingPool) {
     console.log(`Work item "${workItemId}" already has container "${existingPool}". Entering...`);
-    const enterProc = spawn('distrobox', ['enter', existingPool, '--', 'bash', '--login', '-c', 'cd /workdir/project 2>/dev/null; exec bash --login'], {
+    // Sync worklog on re-entry so the container picks up changes from other agents
+    const reentryCmd = [
+      'export PATH="$HOME/.npm-global/bin:$PATH"',
+      'cd /workdir/project 2>/dev/null',
+      'echo "Syncing worklog data..."',
+      'wl sync 2>/dev/null || true',
+      'exec bash --login',
+    ].join('; ');
+    const enterProc = spawn('distrobox', ['enter', existingPool, '--', 'bash', '--login', '-c', reentryCmd], {
       stdio: 'inherit',
     });
     return new Promise((resolve) => {
@@ -1065,7 +1073,15 @@ async function startWork(projectRoot, workItemId, agentName) {
   const legacyName = containerName(workItemId);
   if (checkContainerExists(legacyName)) {
     console.log(`Container "${legacyName}" already exists. Entering...`);
-    const enterProc = spawn('distrobox', ['enter', legacyName, '--', 'bash', '--login', '-c', 'cd /workdir/project 2>/dev/null; exec bash --login'], {
+    // Sync worklog on re-entry so the container picks up changes from other agents
+    const reentryCmd = [
+      'export PATH="$HOME/.npm-global/bin:$PATH"',
+      'cd /workdir/project 2>/dev/null',
+      'echo "Syncing worklog data..."',
+      'wl sync 2>/dev/null || true',
+      'exec bash --login',
+    ].join('; ');
+    const enterProc = spawn('distrobox', ['enter', legacyName, '--', 'bash', '--login', '-c', reentryCmd], {
       stdio: 'inherit',
     });
     return new Promise((resolve) => {
