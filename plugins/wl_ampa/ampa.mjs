@@ -1293,7 +1293,7 @@ async function startWork(projectRoot, workItemId, agentName) {
     // Check if branch exists on remote
     `if git ls-remote --heads origin "${branch}" | grep -q "${branch}"; then`,
     `  echo "Branch ${branch} exists on remote, checking out..."`,
-    `  git fetch origin "${branch}" --depth 1`,
+    `  git fetch origin "${branch}:refs/remotes/origin/${branch}" --depth 1`,
     `  git checkout -b "${branch}" "origin/${branch}"`,
     `else`,
     `  echo "Creating new branch ${branch}..."`,
