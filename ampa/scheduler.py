@@ -3007,10 +3007,99 @@ def _store_from_env() -> SchedulerStore:
     return SchedulerStore(config.store_path)
 
 
+def _command_description(spec: CommandSpec) -> str:
+    meta = spec.metadata if isinstance(spec.metadata, dict) else {}
+    desc = meta.get("description") if isinstance(meta, dict) else None
+    if desc:
+        return str(desc)
+    if spec.command:
+        return str(spec.command)
+    if spec.command_type:
+        return str(spec.command_type)
+    return ""
+
+
+def _build_command_listing(
+    store: SchedulerStore, now: Optional[dt.datetime] = None
+) -> List[Dict[str, Any]]:
+    now = now or _utc_now()
+    rows: List[Dict[str, Any]] = []
+    for spec in store.list_commands():
+        state = store.get_state(spec.command_id)
+        last_run = _from_iso(state.get("last_run_ts"))
+        next_run: Optional[dt.datetime] = None
+        if last_run is not None and spec.frequency_minutes > 0:
+            next_run = last_run + dt.timedelta(minutes=spec.frequency_minutes)
+        rows.append(
+            {
+                "id": spec.command_id,
+                "name": spec.title or spec.command_id,
+                "description": _command_description(spec),
+                "last_run": _to_iso(last_run),
+                "next_run": _to_iso(next_run),
+            }
+        )
+    rows.sort(key=lambda row: row.get("id") or "")
+    return rows
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    if limit <= 3:
+        return value[:limit]
+    return value[: limit - 3] + "..."
+
+
+def _format_command_table(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "No commands configured."
+
+    headers = ["id", "name", "description", "last_run", "next_run"]
+    formatted: List[List[str]] = []
+    for row in rows:
+        description = _truncate_text(str(row.get("description") or ""), 60)
+        last_run = row.get("last_run") or "never"
+        next_run = row.get("next_run") or "n/a"
+        if last_run not in ("never", None):
+            parsed = _from_iso(str(last_run))
+            if parsed is not None:
+                last_run = parsed.astimezone().strftime("%d-%b-%Y %H:%M")
+        if next_run not in ("n/a", None):
+            parsed = _from_iso(str(next_run))
+            if parsed is not None:
+                next_run = parsed.astimezone().strftime("%d-%b-%Y %H:%M")
+        formatted.append(
+            [
+                str(row.get("id") or ""),
+                str(row.get("name") or ""),
+                description,
+                str(last_run),
+                str(next_run),
+            ]
+        )
+
+    widths = [len(h) for h in headers]
+    for row in formatted:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], len(value))
+
+    lines = ["  ".join(h.ljust(widths[idx]) for idx, h in enumerate(headers))]
+    lines.append("  ".join("-" * width for width in widths))
+    for row in formatted:
+        lines.append(
+            "  ".join(row[idx].ljust(widths[idx]) for idx in range(len(headers)))
+        )
+    return "\n".join(lines)
+
+
 def _cli_list(args: argparse.Namespace) -> int:
     store = _store_from_env()
-    commands = [spec.to_dict() for spec in store.list_commands()]
-    print(json.dumps(commands, indent=2, sort_keys=True))
+    rows = _build_command_listing(store)
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        print(_format_command_table(rows))
     return 0
 
 
@@ -3118,7 +3207,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AMPA scheduler")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("list", help="List scheduled commands")
+    list_cmd = sub.add_parser("list", help="List scheduled commands")
+    list_cmd.add_argument("--json", action="store_true", help="Output JSON")
+    ls_cmd = sub.add_parser("ls", help="Alias for list")
+    ls_cmd.add_argument("--json", action="store_true", help="Output JSON")
 
     add = sub.add_parser("add", help="Add a scheduled command")
     add.add_argument("command_id")
@@ -3167,6 +3259,7 @@ def main() -> None:
         return
     handlers = {
         "list": _cli_list,
+        "ls": _cli_list,
         "add": _cli_add,
         "update": _cli_update,
         "remove": _cli_remove,

@@ -104,6 +104,8 @@ The store is a JSON file with the following top-level structure (see `ampa/sched
 
 ## Admin CLI
 
+- `python -m ampa.scheduler list [--json]`: list configured scheduler commands.
+- `python -m ampa.scheduler ls`: alias for `list`.
 - `python -m ampa.scheduler run-once <command-id>`: execute a stored command immediately and
   return its exit code.
 

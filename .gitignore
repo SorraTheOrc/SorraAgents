@@ -37,12 +37,15 @@ bun.lock
 __pycache__/
 *.pyc
 
+# Local build artifacts
+ampa.egg-info/
+build/
+tmp/
+
 # Local env files
 .env
 ampa/.env
 ampa/scheduler_store.json
 
-# Track the source copy of the ampa node plugin directory so the installer
-# has a canonical plugin to copy from.
-!plugins/wl_ampa/
-!plugins/wl_ampa/**
+# Ignore local plugin source copies
+plugins/

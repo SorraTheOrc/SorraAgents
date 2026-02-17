@@ -38,6 +38,21 @@
       "type": "shell"
     }
     ,
+    "cleanup-runner": {
+      "command": "python -m ampa.run_cleanup",
+      "frequency_minutes": 360,
+      "id": "cleanup-runner",
+      "title": "Cleanup Runner",
+      "max_runtime_minutes": 30,
+      "metadata": {
+        "discord_label": "cleanup runner",
+        "truncate_chars": 65536
+      },
+      "priority": 2,
+      "requires_llm": false,
+      "type": "command"
+    }
+    ,
     "wl-triage-audit": {
       "command": "true",
       "frequency_minutes": 2,
