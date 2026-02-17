@@ -1,6 +1,11 @@
 # Minimal Containerfile for Distrobox development containers.
-# Tooling (Python, Node.js, wl, git, gh, opencode) comes from the host's
-# home directory, which Distrobox mounts automatically.
+# Tooling (Python, Node.js, wl, git, gh, opencode) comes from the host via
+# two mechanisms:
+#   1. Home directory mount — Distrobox mounts ~ automatically, providing
+#      binaries in ~/.local/bin, ~/.cargo/bin, ~/.npm-global/bin, etc.
+#   2. Host filesystem at /run/host — Distrobox mounts the host root here.
+#      System binaries (git, ssh, etc.) live at /run/host/usr/bin and must
+#      be on PATH explicitly (Distrobox does not add them automatically).
 #
 # Build:
 #   podman build -t ampa-dev:latest ampa/
@@ -18,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # tools to be available.
 #
 # Developer toolchain (Python, Node.js, wl, git, gh) is NOT installed here;
-# it comes from the mounted home directory.
+# it comes from the mounted home directory and /run/host paths.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     bash \
@@ -41,6 +46,12 @@ RUN apt-get update \
     xz-utils \
     zip \
  && rm -rf /var/lib/apt/lists/*
+
+# Expose host system binaries inside the container.  Distrobox mounts the
+# host root at /run/host but does not add it to PATH automatically.
+# These paths make host-installed tools (git, ssh, etc.) available without
+# requiring distrobox-export or host-spawn wrappers.
+ENV PATH="/run/host/usr/local/sbin:/run/host/usr/local/bin:/run/host/usr/sbin:/run/host/usr/bin:/run/host/sbin:/run/host/bin:${PATH}"
 
 # Working directory where the project will be cloned inside the container.
 WORKDIR /workdir

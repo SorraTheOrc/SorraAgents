@@ -1134,6 +1134,11 @@ async function startWork(projectRoot, workItemId, agentName) {
   //    - Run wl init + wl sync
   const setupScript = [
     `set -e`,
+    // Ensure host system binaries are on PATH.  Distrobox mounts the host
+    // root at /run/host but does not add it to PATH automatically.  This
+    // is also baked into the Containerfile for new images, but we set it
+    // here too for containers built from older images.
+    `export PATH="/run/host/usr/local/sbin:/run/host/usr/local/bin:/run/host/usr/sbin:/run/host/usr/bin:/run/host/sbin:/run/host/bin:$PATH"`,
     `cd /workdir`,
     `echo "Cloning project from ${origin}..."`,
     `git clone --depth 1 "${origin}" project`,
@@ -1147,7 +1152,8 @@ async function startWork(projectRoot, workItemId, agentName) {
     `  echo "Creating new branch ${branch}..."`,
     `  git checkout -b "${branch}"`,
     `fi`,
-    // Set environment variables for container detection
+    // Set environment variables for container detection and host PATH
+    `echo 'export PATH="/run/host/usr/local/sbin:/run/host/usr/local/bin:/run/host/usr/sbin:/run/host/usr/bin:/run/host/sbin:/run/host/bin:$PATH"' >> ~/.bashrc`,
     `echo "export AMPA_CONTAINER_NAME=${cName}" >> ~/.bashrc`,
     `echo "export AMPA_WORK_ITEM_ID=${workItemId}" >> ~/.bashrc`,
     `echo "export AMPA_BRANCH=${branch}" >> ~/.bashrc`,
