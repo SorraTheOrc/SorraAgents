@@ -585,7 +585,8 @@ const CONTAINER_PREFIX = 'ampa-';
  * Check if a binary exists in $PATH. Returns true if found, false otherwise.
  */
 function checkBinary(name) {
-  const result = spawnSync('command', ['-v', name], { shell: true, stdio: 'pipe' });
+  const whichCmd = process.platform === 'win32' ? 'where' : 'which';
+  const result = spawnSync(whichCmd, [name], { stdio: 'pipe' });
   return result.status === 0;
 }
 
