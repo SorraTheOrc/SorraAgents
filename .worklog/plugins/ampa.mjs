@@ -516,6 +516,20 @@ async function stop(projectRoot, name = 'default', timeout = 10) {
   return 1;
 }
 
+/**
+ * Print pool container availability as part of status output.
+ */
+function printPoolStatus(projectRoot) {
+  try {
+    const available = listAvailablePool(projectRoot);
+    const state = getPoolState(projectRoot);
+    const claimed = Object.keys(state).length;
+    console.log(`pool: ${available.length}/${POOL_SIZE} available, ${claimed} claimed`);
+  } catch (e) {
+    // Pool status is best-effort; don't fail status if pool helpers error
+  }
+}
+
 async function status(projectRoot, name = 'default') {
   const ppath = pidPath(projectRoot, name);
   const lpath = logPath(projectRoot, name);
@@ -528,6 +542,7 @@ async function status(projectRoot, name = 'default') {
     const alt = findMostRecentLog(projectRoot) || lpath;
     try { printLogErrors(alt); } catch (e) {}
     console.log('stopped');
+    printPoolStatus(projectRoot);
     return 3;
   }
   let pid;
@@ -538,6 +553,7 @@ async function status(projectRoot, name = 'default') {
     const alt = findMostRecentLog(projectRoot) || lpath;
     try { printLogErrors(alt); } catch (e) {}
     console.log('stopped (cleared corrupt pid file)');
+    printPoolStatus(projectRoot);
     return 3;
   }
     if (isRunning(pid)) {
@@ -545,10 +561,12 @@ async function status(projectRoot, name = 'default') {
     const owned = pidOwnedByProject(projectRoot, pid, lpath);
     if (owned) {
       console.log(`running pid=${pid} log=${lpath}`);
+      printPoolStatus(projectRoot);
       return 0;
     } else {
       try { fs.unlinkSync(ppath); } catch (e) {}
       console.log('stopped (stale pid file removed)');
+      printPoolStatus(projectRoot);
       return 3;
     }
   } else {
@@ -556,6 +574,7 @@ async function status(projectRoot, name = 'default') {
     const alt = findMostRecentLog(projectRoot) || lpath;
     try { printLogErrors(alt); } catch (e) {}
     console.log('stopped (stale pid file removed)');
+    printPoolStatus(projectRoot);
     return 3;
   }
 }
@@ -1076,7 +1095,7 @@ async function startWork(projectRoot, workItemId, agentName) {
 
   console.log('Running setup inside container...');
   const setupResult = runSync('distrobox', [
-    'enter', cName, '--', 'bash', '-c', setupScript,
+    'enter', cName, '--', 'bash', '--login', '-c', setupScript,
   ]);
   if (setupResult.status !== 0) {
     console.error(`Container setup failed: ${setupResult.stderr || setupResult.stdout}`);

@@ -415,11 +415,22 @@ describe('getPoolState / savePoolState', () => {
 // ---------------------------------------------------------------------------
 
 describe('claimPoolContainer', () => {
-  test('returns null when no pool containers exist', () => {
+  test('returns null or a pool container name depending on pool state', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-pool-test-'));
-    // No actual pool containers exist in podman, so listAvailablePool returns []
     const result = plugin.claimPoolContainer(tmpDir, 'WL-1', 'feature/WL-1');
-    assert.equal(result, null);
+    if (result === null) {
+      // No pool containers exist in podman — expected in CI or fresh hosts
+      assert.equal(result, null);
+    } else {
+      // Pool containers exist on this host — claim should return a valid name
+      assert.ok(result.startsWith(plugin.POOL_PREFIX), `expected pool name, got: ${result}`);
+      // Verify the claim was persisted
+      const state = plugin.getPoolState(tmpDir);
+      assert.ok(state[result], 'claimed container should appear in pool state');
+      assert.equal(state[result].workItemId, 'WL-1');
+      // Clean up claim
+      plugin.releasePoolContainer(tmpDir, result);
+    }
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 });

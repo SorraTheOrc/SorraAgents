@@ -47,6 +47,16 @@ sudo mkdir -p /run/user/$(id -u) && sudo chown $(id -u):$(id -g) /run/user/$(id 
 
 After that, `podman --version` should work without errors.
 
+### Pre-warming the container pool
+
+The dev container workflow uses a pool of pre-warmed containers so that `wl ampa start-work` can claim one instantly instead of waiting for a slow clone. After installing the prerequisites, run:
+
+```sh
+wl ampa warm-pool
+```
+
+This creates the template container and fills 3 pool slots. The pool is replenished automatically in the background after each `start-work`, but running `warm-pool` once up front avoids the initial wait.
+
 ## Getting started
 1. Read the main workflow: [Workflow.md](Workflow.md).
 2. Pick a folder to work in (e.g., `skill/` or `agent/`).
