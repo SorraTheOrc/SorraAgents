@@ -1152,7 +1152,25 @@ async function startWork(projectRoot, workItemId, agentName) {
   //    - Clone the project (shallow)
   //    - Create/checkout branch
   //    - Set env vars for container detection
-  //    - Run wl init + wl sync
+  //    - Copy host worklog config and run wl init + wl sync
+  //
+  // Read the host's worklog config so we can inject it into the container.
+  // The config.yaml may not be in the clone (it's gitignored on older branches).
+  const hostConfigPath = path.join(projectRoot, '.worklog', 'config.yaml');
+  let hostConfig = '';
+  let wlProjectName = 'Project';
+  let wlPrefix = 'WL';
+  try {
+    hostConfig = fs.readFileSync(hostConfigPath, 'utf8').trim();
+    // Parse simple YAML key: value pairs
+    const prefixMatch = hostConfig.match(/^prefix:\s*(.+)$/m);
+    const nameMatch = hostConfig.match(/^projectName:\s*(.+)$/m);
+    if (prefixMatch) wlPrefix = prefixMatch[1].trim();
+    if (nameMatch) wlProjectName = nameMatch[1].trim();
+  } catch {
+    console.log('Warning: Could not read host .worklog/config.yaml — worklog init may prompt interactively.');
+  }
+
   const setupScript = [
     `set -e`,
     // Symlink host Node.js into the container so tools like wl work.
@@ -1189,11 +1207,23 @@ async function startWork(projectRoot, workItemId, agentName) {
     `PS1='\\[\\e[32m\\]${projectName}_sandbox\\[\\e[0m\\] - \\[\\e[36m\\]${branch}\\[\\e[0m\\]\\n\$__ampa_rel \\$ '`,
     `AMPA_PROMPT`,
     `echo 'cd /workdir/project' >> ~/.bashrc`,
-    // Initialize worklog — config.yaml is tracked in git so it's already present
-    // from the clone.  Pass explicit flags so wl init runs non-interactively.
+    // Initialize worklog inside the cloned project.
+    // .worklog/config.yaml may not be present in the clone (it's gitignored on
+    // older branches / main).  Read the host's config and write it into the
+    // container's project so wl init can bootstrap from it.
+    // The setup script runs as a non-interactive login shell (bash --login -c)
+    // which does NOT source .bashrc, so wl (~/.npm-global/bin) must be added
+    // to PATH explicitly.
+    `export PATH="$HOME/.npm-global/bin:$PATH"`,
     `if command -v wl >/dev/null 2>&1; then`,
+    `  mkdir -p .worklog`,
+    `  if [ ! -f .worklog/config.yaml ]; then`,
+    `    cat > .worklog/config.yaml << 'WLCFG'`,
+    `${hostConfig}`,
+    `WLCFG`,
+    `  fi`,
     `  echo "Initializing worklog..."`,
-    `  wl init --auto-export yes --auto-sync no --agents-template skip --workflow-inline no --stats-plugin-overwrite no --json || echo "wl init skipped (may already be initialized)"`,
+    `  wl init --project-name "${wlProjectName}" --prefix "${wlPrefix}" --auto-export yes --auto-sync no --agents-template skip --workflow-inline no --stats-plugin-overwrite no --json || echo "wl init skipped (may already be initialized)"`,
     `  echo "Syncing worklog data..."`,
     `  wl sync --json || echo "wl sync skipped"`,
     `else`,
