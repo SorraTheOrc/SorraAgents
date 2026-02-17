@@ -1189,11 +1189,13 @@ async function startWork(projectRoot, workItemId, agentName) {
     `PS1='\\[\\e[32m\\]${projectName}_sandbox\\[\\e[0m\\] - \\[\\e[36m\\]${branch}\\[\\e[0m\\]\\n\$__ampa_rel \\$ '`,
     `AMPA_PROMPT`,
     `echo 'cd /workdir/project' >> ~/.bashrc`,
-    // Initialize worklog
+    // Initialize worklog — config.yaml is tracked in git so it's already present
+    // from the clone.  Pass explicit flags so wl init runs non-interactively.
     `if command -v wl >/dev/null 2>&1; then`,
     `  echo "Initializing worklog..."`,
-    `  wl init --json || echo "wl init skipped (may already be initialized)"`,
-    `  wl sync || echo "wl sync skipped"`,
+    `  wl init --auto-export yes --auto-sync no --agents-template skip --workflow-inline no --stats-plugin-overwrite no --json || echo "wl init skipped (may already be initialized)"`,
+    `  echo "Syncing worklog data..."`,
+    `  wl sync --json || echo "wl sync skipped"`,
     `else`,
     `  echo "Warning: wl not found in PATH. Worklog will not be initialized."`,
     `fi`,

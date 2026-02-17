@@ -5,7 +5,8 @@ Worklog Specific Ignores
 # Ignore Worklog directory by default
 .worklog/
 
-# Keep defaults and plugins tracked
+# Keep config, defaults, and plugins tracked
+!.worklog/config.yaml
 !.worklog/config.defaults.yaml
 !.worklog/plugins/
 !.worklog/plugins/**
@@ -25,7 +26,6 @@ bun.lock
 .gitignore
 
 # worklog:gitignore:v1
-.worklog/config.yaml
 .worklog/initialized
 .worklog/worklog.db
 .worklog/worklog.db-shm
