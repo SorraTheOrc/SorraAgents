@@ -3186,21 +3186,266 @@ def _cli_dry_run(args: argparse.Namespace) -> int:
 
 
 def _cli_run_once(args: argparse.Namespace) -> int:
-    daemon.load_env()
-    scheduler = load_scheduler(command_cwd=os.getcwd())
-    spec = scheduler.store.get_command(args.command_id)
-    if spec is None:
-        print(f"Unknown command id: {args.command_id}")
-        return 2
+    """Legacy run-once handler — delegates to _cli_run."""
+    return _cli_run(args)
+
+
+def _format_run_result_json(
+    spec: CommandSpec,
+    run: RunResult,
+    instance: str,
+) -> str:
+    """Format a run result as a JSON string."""
+    output: Optional[str] = None
+    if isinstance(run, CommandRunResult):
+        output = run.output
+    data = {
+        "id": spec.command_id,
+        "name": spec.title or spec.command_id,
+        "status": "success" if run.exit_code == 0 else "failed",
+        "started_at": _to_iso(run.start_ts),
+        "finished_at": _to_iso(run.end_ts),
+        "exit_code": run.exit_code,
+        "output": output,
+        "instance": instance,
+    }
+    return json.dumps(data, indent=2, sort_keys=True)
+
+
+def _format_run_result_human(
+    spec: CommandSpec,
+    run: RunResult,
+    fmt: str,
+    instance: str,
+) -> str:
+    """Format a run result for human-readable output."""
+    output: Optional[str] = None
+    if isinstance(run, CommandRunResult):
+        output = run.output
+
+    if fmt == "raw":
+        return output or ""
+
+    if fmt == "concise":
+        status = "OK" if run.exit_code == 0 else f"FAIL({run.exit_code})"
+        duration = f"{run.duration_seconds:.1f}s"
+        return f"{spec.command_id}  {status}  {duration}"
+
+    # 'normal' (default) and 'full'
+    lines: List[str] = []
+    status = "success" if run.exit_code == 0 else "failed"
+    lines.append(f"Command:   {spec.command_id}")
+    lines.append(f"Name:      {spec.title or spec.command_id}")
+    lines.append(f"Status:    {status}")
+    lines.append(f"Exit code: {run.exit_code}")
+    lines.append(
+        f"Started:   {run.start_ts.astimezone().strftime('%d-%b-%Y %H:%M:%S')}"
+    )
+    lines.append(f"Finished:  {run.end_ts.astimezone().strftime('%d-%b-%Y %H:%M:%S')}")
+    lines.append(f"Duration:  {run.duration_seconds:.1f}s")
+
+    if fmt == "full":
+        lines.append(f"Instance:  {instance}")
+        lines.append(f"Type:      {spec.command_type}")
+        lines.append(f"Command:   {spec.command}")
+        if output:
+            lines.append("")
+            lines.append("--- output ---")
+            lines.append(output)
+            lines.append("--- end output ---")
+        elif output is not None:
+            lines.append("")
+            lines.append("(no output)")
+
+    return "\n".join(lines)
+
+
+def _format_command_detail(
+    spec: CommandSpec,
+    state: Dict[str, Any],
+    fmt: str,
+) -> Dict[str, Any]:
+    """Build a detail dict for a command suitable for JSON or human output."""
+    last_run = _from_iso(state.get("last_run_ts"))
+    last_exit = state.get("last_exit_code")
+    running = state.get("running", False)
+    next_run: Optional[dt.datetime] = None
+    if last_run is not None and spec.frequency_minutes > 0:
+        next_run = last_run + dt.timedelta(minutes=spec.frequency_minutes)
+    return {
+        "id": spec.command_id,
+        "name": spec.title or spec.command_id,
+        "description": _command_description(spec),
+        "type": spec.command_type,
+        "frequency_minutes": spec.frequency_minutes,
+        "priority": spec.priority,
+        "requires_llm": spec.requires_llm,
+        "running": running,
+        "last_run": _to_iso(last_run),
+        "last_exit_code": last_exit,
+        "next_run": _to_iso(next_run),
+    }
+
+
+def _format_command_details_table(
+    details: List[Dict[str, Any]],
+    fmt: str,
+) -> str:
+    """Format a list of command details for human output."""
+    if not details:
+        return "No commands configured."
+
+    if fmt == "concise":
+        lines: List[str] = []
+        for d in details:
+            status = "running" if d.get("running") else "idle"
+            lines.append(f"{d['id']}  {d['name']}  {status}")
+        return "\n".join(lines)
+
+    if fmt == "raw":
+        # raw format shows the same table as 'list'
+        return _format_command_table(
+            [
+                {
+                    "id": d["id"],
+                    "name": d["name"],
+                    "description": d.get("description", ""),
+                    "last_run": d.get("last_run"),
+                    "next_run": d.get("next_run"),
+                }
+                for d in details
+            ]
+        )
+
+    # 'normal' or 'full'
+    blocks: List[str] = []
+    for d in details:
+        lines = []
+        lines.append(f"  ID:          {d['id']}")
+        lines.append(f"  Name:        {d['name']}")
+        desc = d.get("description") or ""
+        if desc:
+            lines.append(f"  Description: {_truncate_text(desc, 80)}")
+        last_run = d.get("last_run") or "never"
+        if last_run not in ("never", None):
+            parsed = _from_iso(str(last_run))
+            if parsed is not None:
+                last_run = parsed.astimezone().strftime("%d-%b-%Y %H:%M:%S")
+        lines.append(f"  Last run:    {last_run}")
+        next_run = d.get("next_run") or "n/a"
+        if next_run not in ("n/a", None):
+            parsed = _from_iso(str(next_run))
+            if parsed is not None:
+                next_run = parsed.astimezone().strftime("%d-%b-%Y %H:%M:%S")
+        lines.append(f"  Next run:    {next_run}")
+        if fmt == "full":
+            lines.append(f"  Type:        {d.get('type', 'shell')}")
+            lines.append(f"  Frequency:   {d.get('frequency_minutes', 0)}m")
+            lines.append(f"  Priority:    {d.get('priority', 0)}")
+            lines.append(f"  Requires LLM: {d.get('requires_llm', False)}")
+            lines.append(f"  Running:     {d.get('running', False)}")
+            last_exit = d.get("last_exit_code")
+            if last_exit is not None:
+                lines.append(f"  Last exit:   {last_exit}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _get_instance_name() -> str:
+    """Return a short identifier for this AMPA instance."""
     try:
-        run = scheduler.start_command(spec)
+        return os.uname().nodename
     except Exception:
-        LOG.exception("Run-once failed for %s", args.command_id)
-        print(f"Run-once failed for {args.command_id}")
-        return 1
-    exit_code = getattr(run, "exit_code", 1)
-    print(f"Run-once complete for {args.command_id} exit={exit_code}")
-    return int(exit_code)
+        return "(unknown)"
+
+
+def _cli_run(args: argparse.Namespace) -> int:
+    """Enhanced run command: run a command by id or list all commands."""
+    daemon.load_env()
+    verbose = getattr(args, "verbose", False)
+    if verbose:
+        logging.getLogger("ampa").setLevel(logging.DEBUG)
+
+    use_json = getattr(args, "json", False)
+    fmt = getattr(args, "format", "normal") or "normal"
+    watch_interval = getattr(args, "watch", None)
+    command_id = getattr(args, "command_id", None)
+    instance = _get_instance_name()
+
+    # No command-id: list available commands
+    if not command_id:
+        store = _store_from_env()
+        details = []
+        for spec in store.list_commands():
+            state = store.get_state(spec.command_id)
+            details.append(_format_command_detail(spec, state, fmt))
+        details.sort(key=lambda d: d.get("id") or "")
+        if use_json:
+            print(json.dumps(details, indent=2, sort_keys=True))
+        else:
+            print(_format_command_details_table(details, fmt))
+        return 0
+
+    # Run a specific command
+    scheduler = load_scheduler(command_cwd=os.getcwd())
+    spec = scheduler.store.get_command(command_id)
+    if spec is None:
+        if use_json:
+            print(
+                json.dumps(
+                    {"error": f"Unknown command id: {command_id}"},
+                    indent=2,
+                )
+            )
+        else:
+            print(f"Unknown command id: {command_id}")
+        return 2
+
+    def _execute_once() -> int:
+        if watch_interval is not None:
+            ts = _utc_now().astimezone().strftime("%d-%b-%Y %H:%M:%S")
+            if not use_json:
+                print(f"[{ts}]")
+        try:
+            run = scheduler.start_command(spec)
+        except Exception:
+            LOG.exception("Run failed for %s", command_id)
+            if use_json:
+                print(
+                    json.dumps(
+                        {
+                            "id": spec.command_id,
+                            "name": spec.title or spec.command_id,
+                            "status": "error",
+                            "error": f"Run failed for {command_id}",
+                            "instance": instance,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"Run failed for {command_id}")
+            return 1
+        if use_json:
+            print(_format_run_result_json(spec, run, instance))
+        else:
+            print(_format_run_result_human(spec, run, fmt, instance))
+        return int(run.exit_code)
+
+    if watch_interval is not None:
+        interval = max(1, int(watch_interval))
+        last_exit = 0
+        try:
+            while True:
+                last_exit = _execute_once()
+                if not use_json and fmt != "concise":
+                    print()  # blank line between runs
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            return last_exit
+    else:
+        return _execute_once()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -3240,8 +3485,65 @@ def _build_parser() -> argparse.ArgumentParser:
     dry_run = sub.add_parser("delegation", help="Generate a delegation report")
     dry_run.add_argument("--discord", action="store_true")
 
-    run_once = sub.add_parser("run-once", help="Run a command immediately by id")
-    run_once.add_argument("command_id")
+    run_once = sub.add_parser(
+        "run-once", help="Run a command immediately by id (legacy alias for 'run')"
+    )
+    run_once.add_argument("command_id", nargs="?", default=None)
+    run_once.add_argument("--json", action="store_true", help="Output in JSON format")
+    run_once.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show verbose output including debug messages",
+    )
+    run_once.add_argument(
+        "-F",
+        "--format",
+        choices=["concise", "normal", "full", "raw"],
+        default="normal",
+        help="Human display format",
+    )
+    run_once.add_argument(
+        "-w",
+        "--watch",
+        type=int,
+        nargs="?",
+        const=5,
+        default=None,
+        help="Rerun the command every N seconds (default: 5)",
+    )
+
+    run_cmd = sub.add_parser(
+        "run",
+        help="Run a scheduler command immediately by id, or list available commands",
+    )
+    run_cmd.add_argument(
+        "command_id",
+        nargs="?",
+        default=None,
+        help="Command id to run; omit to list available commands",
+    )
+    run_cmd.add_argument("--json", action="store_true", help="Output in JSON format")
+    run_cmd.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show verbose output including debug messages",
+    )
+    run_cmd.add_argument(
+        "-F",
+        "--format",
+        choices=["concise", "normal", "full", "raw"],
+        default="normal",
+        help="Human display format",
+    )
+    run_cmd.add_argument(
+        "-w",
+        "--watch",
+        type=int,
+        nargs="?",
+        const=5,
+        default=None,
+        help="Rerun the command every N seconds (default: 5)",
+    )
 
     return parser
 
@@ -3265,6 +3567,7 @@ def main() -> None:
         "remove": _cli_remove,
         "delegation": _cli_dry_run,
         "run-once": _cli_run_once,
+        "run": _cli_run,
     }
     handler = handlers.get(args.command)
     if handler is None:

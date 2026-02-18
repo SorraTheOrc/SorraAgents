@@ -124,8 +124,13 @@ async function resolveCommand(cliCmd, projectRoot) {
   return null;
 }
 
-async function resolveRunOnceCommand(projectRoot, commandId) {
-  if (!commandId) return null;
+async function resolveRunOnceCommand(projectRoot, commandId, extraArgs = []) {
+  // Build base args: use 'run' subcommand (enhanced version).
+  const subcommand = 'run';
+  const baseArgs = ['-u', '-m', 'ampa.scheduler', subcommand];
+  if (commandId) baseArgs.push(commandId);
+  if (extraArgs.length) baseArgs.push(...extraArgs);
+
   // Prefer bundled python package if available.
   try {
     const pyBundle = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py', 'ampa');
@@ -134,7 +139,7 @@ async function resolveRunOnceCommand(projectRoot, commandId) {
       const venvPython = path.join(pyPath, 'venv', 'bin', 'python');
       const pythonBin = fs.existsSync(venvPython) ? venvPython : 'python3';
       return {
-        cmd: [pythonBin, '-u', '-m', 'ampa.scheduler', 'run-once', commandId],
+        cmd: [pythonBin, ...baseArgs],
         env: { PYTHONPATH: pyPath },
         envPaths: [path.join(pyPath, 'ampa', '.env')],
       };
@@ -142,7 +147,7 @@ async function resolveRunOnceCommand(projectRoot, commandId) {
   } catch (e) {}
   // Fallback to repo/local package
   return {
-    cmd: ['python3', '-m', 'ampa.scheduler', 'run-once', commandId],
+    cmd: ['python3', ...baseArgs],
     env: {},
     envPaths: [path.join(projectRoot, 'ampa', '.env')],
   };
@@ -1943,14 +1948,31 @@ export default function register(ctx) {
 
   ampa
     .command('run')
-    .description('Run a scheduler command immediately by id')
-    .arguments('<command-id>')
-    .action(async (commandId) => {
+    .description('Run a scheduler command immediately by id, or list available commands')
+    .arguments('[command-id]')
+    .option('--json', 'Output in JSON format')
+    .option('-F, --format <format>', 'Human display format (concise|normal|full|raw)')
+    .option('-w, --watch [seconds]', 'Rerun the command every N seconds (default: 5)')
+    .option('--verbose', 'Show verbose output including debug messages')
+    .action(async (commandId, opts) => {
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
-      const cmdSpec = await resolveRunOnceCommand(cwd, commandId);
+      // Build extra CLI args to pass through to the Python scheduler
+      const extraArgs = [];
+      if (opts.json) extraArgs.push('--json');
+      if (opts.format) extraArgs.push('--format', opts.format);
+      if (opts.watch !== undefined) {
+        if (opts.watch === true) {
+          extraArgs.push('--watch');
+        } else {
+          extraArgs.push('--watch', String(opts.watch));
+        }
+      }
+      if (opts.verbose) extraArgs.push('--verbose');
+
+      const cmdSpec = await resolveRunOnceCommand(cwd, commandId || null, extraArgs);
       if (!cmdSpec) {
-        console.error('No run-once command resolved.');
+        console.error('No run command resolved.');
         process.exitCode = 2;
         return;
       }
