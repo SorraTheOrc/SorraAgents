@@ -17,25 +17,81 @@ import path from 'path';
 import os from 'os';
 
 /**
+ * Resolve the global OpenCode base directory.
+ * Returns ${XDG_CONFIG_HOME}/opencode or $HOME/.config/opencode.
+ * Throws if neither XDG_CONFIG_HOME nor HOME is available.
+ */
+function globalOpenCodeDir() {
+  const xdg = process.env.XDG_CONFIG_HOME;
+  if (xdg) {
+    return path.join(xdg, 'opencode');
+  }
+  const home = process.env.HOME || os.homedir();
+  if (!home) {
+    throw new Error(
+      'Cannot determine global directory: neither XDG_CONFIG_HOME nor HOME is set'
+    );
+  }
+  return path.join(home, '.config', 'opencode');
+}
+
+/**
  * Resolve the global AMPA data directory.
  * Pool state files (pool-state.json, pool-cleanup.json, pool-replenish.log)
  * are stored here so they are shared across all projects.
  *
  * Respects XDG_CONFIG_HOME; falls back to $HOME/.config.
- * Throws if neither XDG_CONFIG_HOME nor HOME is available.
+ * Throws if neither XDG_CONFIG_HOME nor HOME is set.
  */
 function globalAmpaDir() {
-  const xdg = process.env.XDG_CONFIG_HOME;
-  if (xdg) {
-    return path.join(xdg, 'opencode', '.worklog', 'ampa');
+  return path.join(globalOpenCodeDir(), '.worklog', 'ampa');
+}
+
+/**
+ * Resolve the global plugins directory.
+ * Returns ${XDG_CONFIG_HOME}/opencode/.worklog/plugins or
+ * $HOME/.config/opencode/.worklog/plugins.
+ */
+function globalPluginsDir() {
+  return path.join(globalOpenCodeDir(), '.worklog', 'plugins');
+}
+
+/**
+ * Resolve the per-project AMPA config directory.
+ * Per-project configuration (.env, scheduler_store.json) and daemon runtime
+ * files (PID, log) are stored here.
+ *
+ * Path: <projectRoot>/.worklog/ampa/
+ */
+function projectAmpaDir(projectRoot) {
+  return path.join(projectRoot, '.worklog', 'ampa');
+}
+
+/**
+ * Locate the bundled AMPA Python package (ampa_py).
+ *
+ * Resolution order:
+ *   1. <projectRoot>/.worklog/plugins/ampa_py/  (local override)
+ *   2. <globalPluginsDir>/ampa_py/              (global install)
+ *
+ * Returns { pyPath, pythonBin } or null if the package is not found in
+ * either location.
+ */
+function resolveAmpaPackage(projectRoot) {
+  const locations = [
+    path.join(projectRoot, '.worklog', 'plugins', 'ampa_py'),
+    path.join(globalPluginsDir(), 'ampa_py'),
+  ];
+  for (const pyPath of locations) {
+    try {
+      if (fs.existsSync(path.join(pyPath, 'ampa', '__init__.py'))) {
+        const venvPython = path.join(pyPath, 'venv', 'bin', 'python');
+        const pythonBin = fs.existsSync(venvPython) ? venvPython : 'python3';
+        return { pyPath, pythonBin };
+      }
+    } catch (e) {}
   }
-  const home = process.env.HOME || os.homedir();
-  if (!home) {
-    throw new Error(
-      'Cannot determine global AMPA directory: neither XDG_CONFIG_HOME nor HOME is set'
-    );
-  }
-  return path.join(home, '.config', 'opencode', '.worklog', 'ampa');
+  return null;
 }
 
 function findProjectRoot(start) {
@@ -101,10 +157,10 @@ function readDotEnv(projectRoot, extraPaths = []) {
 async function resolveCommand(cliCmd, projectRoot) {
   if (cliCmd) return Array.isArray(cliCmd) ? cliCmd : shellSplit(cliCmd);
   if (process.env.WL_AMPA_CMD) return shellSplit(process.env.WL_AMPA_CMD);
-  const wl = path.join(projectRoot, 'worklog.json');
-  if (fs.existsSync(wl)) {
+  const wlJson = path.join(projectRoot, 'worklog.json');
+  if (fs.existsSync(wlJson)) {
     try {
-      const data = JSON.parse(await fsPromises.readFile(wl, 'utf8'));
+      const data = JSON.parse(await fsPromises.readFile(wlJson, 'utf8'));
       if (data && typeof data === 'object' && 'ampa' in data) {
         const val = data.ampa;
         if (typeof val === 'string') return shellSplit(val);
@@ -112,10 +168,10 @@ async function resolveCommand(cliCmd, projectRoot) {
       }
     } catch (e) {}
   }
-  const pkg = path.join(projectRoot, 'package.json');
-  if (fs.existsSync(pkg)) {
+  const pkgJson = path.join(projectRoot, 'package.json');
+  if (fs.existsSync(pkgJson)) {
     try {
-      const pj = JSON.parse(await fsPromises.readFile(pkg, 'utf8'));
+      const pj = JSON.parse(await fsPromises.readFile(pkgJson, 'utf8'));
       const scripts = pj.scripts || {};
       if (scripts.ampa) return shellSplit(scripts.ampa);
     } catch (e) {}
@@ -126,24 +182,21 @@ async function resolveCommand(cliCmd, projectRoot) {
       if (fs.existsSync(c) && fs.accessSync(c, fs.constants.X_OK) === undefined) return [c];
     } catch (e) {}
   }
-  // Fallback: if a bundled Python package 'ampa' was installed into
-  // .worklog/plugins/ampa_py/ampa, prefer running it with Python -m ampa.daemon
-  try {
-    const pyBundle = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py', 'ampa');
-    if (fs.existsSync(path.join(pyBundle, '__init__.py'))) {
-      const pyPath = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py');
-      const venvPython = path.join(pyPath, 'venv', 'bin', 'python');
-      const pythonBin = fs.existsSync(venvPython) ? venvPython : 'python3';
-      const launcher = `import sys; sys.path.insert(0, ${JSON.stringify(pyPath)}); import ampa.daemon as d; d.main()`;
-      // Run the daemon in long-running mode by default (start scheduler).
-      // Users can override via --cmd or AMPA_RUN_SCHEDULER env var if desired.
-      // use -u to force unbuffered stdout/stderr so logs show up promptly
-      return {
-        cmd: [pythonBin, '-u', '-c', launcher, '--start-scheduler'],
-        env: { PYTHONPATH: pyPath, AMPA_RUN_SCHEDULER: '1' },
-      };
-    }
-  } catch (e) {}
+  // Fallback: look for the bundled Python package 'ampa' in the local or global
+  // plugins directory.  resolveAmpaPackage() checks project-local first, then
+  // the global install path — there is no fallback to a development source tree.
+  const pkg = resolveAmpaPackage(projectRoot);
+  if (pkg) {
+    const { pyPath, pythonBin } = pkg;
+    const launcher = `import sys; sys.path.insert(0, ${JSON.stringify(pyPath)}); import ampa.daemon as d; d.main()`;
+    // Run the daemon in long-running mode by default (start scheduler).
+    // Users can override via --cmd or AMPA_RUN_SCHEDULER env var if desired.
+    // use -u to force unbuffered stdout/stderr so logs show up promptly
+    return {
+      cmd: [pythonBin, '-u', '-c', launcher, '--start-scheduler'],
+      env: { PYTHONPATH: pyPath, AMPA_RUN_SCHEDULER: '1' },
+    };
+  }
   return null;
 }
 
@@ -154,50 +207,52 @@ async function resolveRunOnceCommand(projectRoot, commandId, extraArgs = []) {
   if (commandId) baseArgs.push(commandId);
   if (extraArgs.length) baseArgs.push(...extraArgs);
 
-  // Prefer bundled python package if available.
-  try {
-    const pyBundle = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py', 'ampa');
-    if (fs.existsSync(path.join(pyBundle, '__init__.py'))) {
-      const pyPath = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py');
-      const venvPython = path.join(pyPath, 'venv', 'bin', 'python');
-      const pythonBin = fs.existsSync(venvPython) ? venvPython : 'python3';
-      return {
-        cmd: [pythonBin, ...baseArgs],
-        env: { PYTHONPATH: pyPath },
-        envPaths: [path.join(pyPath, 'ampa', '.env')],
-      };
-    }
-  } catch (e) {}
-  // Fallback to repo/local package
-  return {
-    cmd: ['python3', ...baseArgs],
-    env: {},
-    envPaths: [path.join(projectRoot, 'ampa', '.env')],
-  };
+  // Per-project config: .env is always loaded from <projectRoot>/.worklog/ampa/.env
+  const envPath = path.join(projectAmpaDir(projectRoot), '.env');
+
+  // Locate the bundled Python package (local override or global install).
+  const pkg = resolveAmpaPackage(projectRoot);
+  if (pkg) {
+    const { pyPath, pythonBin } = pkg;
+    return {
+      cmd: [pythonBin, ...baseArgs],
+      env: { PYTHONPATH: pyPath },
+      envPaths: [envPath],
+    };
+  }
+  // No bundled package found — report error instead of falling back to dev tree.
+  throw new Error(
+    'AMPA Python package not found. Install the plugin with:\n' +
+    '  skill/install-ampa/scripts/install-worklog-plugin.sh --yes\n' +
+    'Expected at: <projectRoot>/.worklog/plugins/ampa_py/ or ' +
+    globalPluginsDir() + '/ampa_py/'
+  );
 }
 
 async function resolveListCommand(projectRoot, useJson) {
   const args = ['-m', 'ampa.scheduler', 'list'];
   if (useJson) args.push('--json');
-  // Prefer bundled python package if available.
-  try {
-    const pyBundle = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py', 'ampa');
-    if (fs.existsSync(path.join(pyBundle, '__init__.py'))) {
-      const pyPath = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py');
-      const venvPython = path.join(pyPath, 'venv', 'bin', 'python');
-      const pythonBin = fs.existsSync(venvPython) ? venvPython : 'python3';
-      return {
-        cmd: [pythonBin, '-u', ...args],
-        env: { PYTHONPATH: pyPath },
-        envPaths: [path.join(pyPath, 'ampa', '.env')],
-      };
-    }
-  } catch (e) {}
-  return {
-    cmd: ['python3', '-u', ...args],
-    env: {},
-    envPaths: [path.join(projectRoot, 'ampa', '.env')],
-  };
+
+  // Per-project config: .env is always loaded from <projectRoot>/.worklog/ampa/.env
+  const envPath = path.join(projectAmpaDir(projectRoot), '.env');
+
+  // Locate the bundled Python package (local override or global install).
+  const pkg = resolveAmpaPackage(projectRoot);
+  if (pkg) {
+    const { pyPath, pythonBin } = pkg;
+    return {
+      cmd: [pythonBin, '-u', ...args],
+      env: { PYTHONPATH: pyPath },
+      envPaths: [envPath],
+    };
+  }
+  // No bundled package found — report error instead of falling back to dev tree.
+  throw new Error(
+    'AMPA Python package not found. Install the plugin with:\n' +
+    '  skill/install-ampa/scripts/install-worklog-plugin.sh --yes\n' +
+    'Expected at: <projectRoot>/.worklog/plugins/ampa_py/ or ' +
+    globalPluginsDir() + '/ampa_py/'
+  );
 }
 
 const DAEMON_NOT_RUNNING_MESSAGE = 'Daemon is not running. Start it with: wl ampa start';
@@ -247,6 +302,10 @@ function resolveDaemonStore(projectRoot, name = 'default') {
       }
     }
     candidates.push(path.join(projectRoot, '.worklog', 'plugins', 'ampa_py'));
+    // Also check the global plugins directory for the Python package.
+    try {
+      candidates.push(path.join(globalPluginsDir(), 'ampa_py'));
+    } catch (e) {}
     for (const candidate of candidates) {
       const ampaPath = path.join(candidate, 'ampa');
       if (fs.existsSync(path.join(ampaPath, 'scheduler.py'))) {
@@ -256,7 +315,8 @@ function resolveDaemonStore(projectRoot, name = 'default') {
     }
   }
   if (!storePath) {
-    storePath = path.join(cwd, 'ampa', 'scheduler_store.json');
+    // Canonical per-project location for scheduler state.
+    storePath = path.join(projectAmpaDir(projectRoot), 'scheduler_store.json');
   } else if (!path.isAbsolute(storePath)) {
     storePath = path.resolve(cwd, storePath);
   }
@@ -2288,6 +2348,7 @@ export {
   getGitOrigin,
   getPoolState,
   globalAmpaDir,
+  globalPluginsDir,
   imageCreatedDate,
   imageExists,
   isImageStale,
@@ -2297,9 +2358,11 @@ export {
   poolCleanupPath,
   poolContainerName,
   poolStatePath,
+  projectAmpaDir,
   releasePoolContainer,
   replenishPool,
   replenishPoolBackground,
+  resolveAmpaPackage,
   resolveDaemonStore,
   saveCleanupList,
   savePoolState,
