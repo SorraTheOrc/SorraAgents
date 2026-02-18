@@ -1438,25 +1438,32 @@ async function startWork(projectRoot, workItemId, agentName) {
     `  echo "Creating new branch ${branch}..."`,
     `  git checkout -b "${branch}"`,
     `fi`,
-    // Set environment variables for container detection
-    `echo "export AMPA_CONTAINER_NAME=${cName}" >> ~/.bashrc`,
-    `echo "export AMPA_WORK_ITEM_ID=${workItemId}" >> ~/.bashrc`,
-    `echo "export AMPA_BRANCH=${branch}" >> ~/.bashrc`,
-    `echo "export AMPA_PROJECT_ROOT=${projectRoot}" >> ~/.bashrc`,
-    // Set a custom prompt so the user knows they are in a sandbox
+    // Write all AMPA container configuration to /etc/ampa_bashrc — a file on
+    // the container's own overlay filesystem, invisible to the host and other
+    // containers.  We overwrite (not append) so the file always has correct
+    // values and duplication is impossible.  Uses sudo because /etc is
+    // root-owned inside the container.
+    `sudo tee /etc/ampa_bashrc > /dev/null << 'AMPA_BASHRC_EOF'`,
+    `# AMPA container shell configuration`,
+    `# Written by wl ampa start-work — do not edit manually.`,
+    `export AMPA_CONTAINER_NAME=${cName}`,
+    `export AMPA_WORK_ITEM_ID=${workItemId}`,
+    `export AMPA_BRANCH=${branch}`,
+    `export AMPA_PROJECT_ROOT=${projectRoot}`,
+    `AMPA_BASHRC_EOF`,
+    // Append the prompt and exit trap via separate heredocs so that the
+    // quoted delimiters prevent shell expansion of bash escape sequences.
     // Green for project_sandbox, cyan for branch, reset before newline
     // PROMPT_COMMAND computes the path relative to /workdir/project each time
-    // Use cat with a quoted heredoc to avoid JS template literal conflicts
-    `cat >> ~/.bashrc << 'AMPA_PROMPT'`,
+    `sudo tee -a /etc/ampa_bashrc > /dev/null << 'AMPA_PROMPT'`,
     `__ampa_prompt_cmd() { __ampa_rel="\${PWD#/workdir/project}"; __ampa_rel="\${__ampa_rel:-/}"; }`,
     `PROMPT_COMMAND=__ampa_prompt_cmd`,
     `PS1='\\[\\e[32m\\]${projectName}_sandbox\\[\\e[0m\\] - \\[\\e[36m\\]${branch}\\[\\e[0m\\]\\n\\[\\e[38;5;208m\\]\$__ampa_rel\\[\\e[0m\\] \\$ '`,
     `AMPA_PROMPT`,
     // Sync worklog data on shell exit so changes are not lost if the user
     // exits without running 'wl ampa finish-work'.  The trap runs on any
-    // clean exit (exit, Ctrl+D, etc.).  Uses a quoted heredoc to avoid
-    // JS template literal conflicts with bash ${...} syntax.
-    `cat >> ~/.bashrc << 'AMPA_EXIT_TRAP'`,
+    // clean exit (exit, Ctrl+D, etc.).
+    `sudo tee -a /etc/ampa_bashrc > /dev/null << 'AMPA_EXIT_TRAP'`,
     `__ampa_exit_sync() {`,
     `  if command -v wl >/dev/null 2>&1 && [ -d /workdir/project/.worklog ]; then`,
     `    echo ""`,
@@ -1466,7 +1473,13 @@ async function startWork(projectRoot, workItemId, agentName) {
     `}`,
     `trap __ampa_exit_sync EXIT`,
     `AMPA_EXIT_TRAP`,
-    `echo 'cd /workdir/project' >> ~/.bashrc`,
+    `echo 'cd /workdir/project' | sudo tee -a /etc/ampa_bashrc > /dev/null`,
+    // Add a one-line source guard to ~/.bashrc (idempotently) so that
+    // /etc/ampa_bashrc is sourced only inside AMPA containers.  On the host
+    // the file does not exist, so the guard is a no-op.
+    `if ! grep -q '/etc/ampa_bashrc' ~/.bashrc 2>/dev/null; then`,
+    `  echo '[ -f /etc/ampa_bashrc ] && . /etc/ampa_bashrc' >> ~/.bashrc`,
+    `fi`,
     // Initialize worklog inside the cloned project.
     // .worklog/config.yaml may not be present in the clone (it's gitignored on
     // older branches / main).  Read the host's config and write it into the
