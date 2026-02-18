@@ -1989,17 +1989,18 @@ export default function register(ctx) {
     .option('--json', 'Output JSON')
     .option('--name <name>', 'Daemon name', 'default')
     .option('--verbose', 'Print resolved store path', false)
-    .action(async (opts) => {
-      const verbose = !!opts.verbose || process.argv.includes('--verbose');
+    .action(async (opts, cmd) => {
+      const allOpts = cmd.optsWithGlobals();
+      const verbose = !!allOpts.verbose || process.argv.includes('--verbose');
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
-      const daemon = resolveDaemonStore(cwd, opts.name);
+      const daemon = resolveDaemonStore(cwd, allOpts.name);
       if (!daemon.running) {
         console.log(DAEMON_NOT_RUNNING_MESSAGE);
         process.exitCode = 3;
         return;
       }
-      const cmdSpec = await resolveListCommand(cwd, !!opts.json);
+      const cmdSpec = await resolveListCommand(cwd, !!allOpts.json);
       if (!cmdSpec) {
         console.error('No list command resolved.');
         process.exitCode = 2;
@@ -2021,17 +2022,18 @@ export default function register(ctx) {
     .option('--json', 'Output JSON')
     .option('--name <name>', 'Daemon name', 'default')
     .option('--verbose', 'Print resolved store path', false)
-    .action(async (opts) => {
-      const verbose = !!opts.verbose || process.argv.includes('--verbose');
+    .action(async (opts, cmd) => {
+      const allOpts = cmd.optsWithGlobals();
+      const verbose = !!allOpts.verbose || process.argv.includes('--verbose');
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
-      const daemon = resolveDaemonStore(cwd, opts.name);
+      const daemon = resolveDaemonStore(cwd, allOpts.name);
       if (!daemon.running) {
         console.log(DAEMON_NOT_RUNNING_MESSAGE);
         process.exitCode = 3;
         return;
       }
-      const cmdSpec = await resolveListCommand(cwd, !!opts.json);
+      const cmdSpec = await resolveListCommand(cwd, !!allOpts.json);
       if (!cmdSpec) {
         console.error('No list command resolved.');
         process.exitCode = 2;
@@ -2097,10 +2099,11 @@ export default function register(ctx) {
     .command('list-containers')
     .description('List dev containers created by start-work')
     .option('--json', 'Output JSON')
-    .action(async (opts) => {
+    .action(async (opts, cmd) => {
+      const allOpts = cmd.optsWithGlobals();
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
-      const code = listContainers(cwd, !!opts.json);
+      const code = listContainers(cwd, !!allOpts.json);
       process.exitCode = code;
     });
 
@@ -2108,10 +2111,11 @@ export default function register(ctx) {
     .command('lc')
     .description('Alias for list-containers')
     .option('--json', 'Output JSON')
-    .action(async (opts) => {
+    .action(async (opts, cmd) => {
+      const allOpts = cmd.optsWithGlobals();
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
-      const code = listContainers(cwd, !!opts.json);
+      const code = listContainers(cwd, !!allOpts.json);
       process.exitCode = code;
     });
 
