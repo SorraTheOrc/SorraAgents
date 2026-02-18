@@ -1262,20 +1262,28 @@ async function startWork(projectRoot, workItemId, agentName) {
     return 2;
   }
 
-  // 2. Validate work item
+  // 2. Sync worklog data so the container starts with the latest state
+  console.log('Syncing worklog data...');
+  const syncResult = runSync('wl', ['sync', '--json']);
+  if (syncResult.status !== 0) {
+    console.warn(`Warning: wl sync failed (exit ${syncResult.status}). Continuing with local data.`);
+    if (syncResult.stderr) console.warn(`  ${syncResult.stderr}`);
+  }
+
+  // 3. Validate work item
   const workItem = validateWorkItem(workItemId);
   if (!workItem) {
     console.error(`Work item "${workItemId}" not found. Verify the ID with: wl show ${workItemId}`);
     return 2;
   }
 
-  // 2b. Clean up any containers marked for destruction by finish-work
+  // 3b. Clean up any containers marked for destruction by finish-work
   const cleanup = cleanupMarkedContainers(projectRoot);
   if (cleanup.destroyed.length > 0) {
     console.log(`Cleaned up ${cleanup.destroyed.length} finished container(s): ${cleanup.destroyed.join(', ')}`);
   }
 
-  // 3. Check if this work item already has a claimed container — enter it
+  // 4. Check if this work item already has a claimed container — enter it
   const existingPool = findPoolContainerForWorkItem(projectRoot, workItemId);
   if (existingPool) {
     console.log(`Work item "${workItemId}" already has container "${existingPool}". Entering...`);
@@ -1323,7 +1331,7 @@ async function startWork(projectRoot, workItemId, agentName) {
     });
   }
 
-  // 4. Get git origin
+  // 5. Get git origin
   const origin = getGitOrigin();
   if (!origin) {
     console.error('Could not determine git remote origin. Ensure this is a git repo with a remote named "origin".');
@@ -1333,7 +1341,7 @@ async function startWork(projectRoot, workItemId, agentName) {
   // "git@github.com:Org/SorraAgents.git" or "https://…/SorraAgents.git")
   const projectName = origin.replace(/\.git$/, '').split('/').pop().split(':').pop();
 
-  // 5. Build image if needed
+  // 6. Build image if needed
   if (!imageExists(CONTAINER_IMAGE)) {
     const build = buildImage(projectRoot);
     if (!build.ok) {
@@ -1342,17 +1350,17 @@ async function startWork(projectRoot, workItemId, agentName) {
     }
   }
 
-  // 6. Ensure template container exists (one-off slow init)
+  // 7. Ensure template container exists (one-off slow init)
   const tmpl = ensureTemplate();
   if (!tmpl.ok) {
     console.error(`Failed to prepare template container: ${tmpl.message}`);
     return 1;
   }
 
-  // 7. Derive branch name
+  // 8. Derive branch name
   const branch = branchName(workItemId, workItem.issueType);
 
-  // 8. Claim a pre-warmed pool container, or fall back to direct clone
+  // 9. Claim a pre-warmed pool container, or fall back to direct clone
   let cName = claimPoolContainer(projectRoot, workItemId, branch);
   if (cName) {
     console.log(`Using pre-warmed container "${cName}".`);
