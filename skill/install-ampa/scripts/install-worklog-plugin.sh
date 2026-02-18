@@ -1,6 +1,8 @@
 #!/usr/bin/env sh
-# Install a Worklog plugin into a project or user plugin directory.
-# Usage: ./skill/install-ampa/scripts/install-worklog-plugin.sh <source-file> [target-dir]
+# Install a Worklog plugin into the global or per-project plugin directory.
+# By default, installs to ${XDG_CONFIG_HOME:-$HOME/.config}/opencode/.worklog/plugins/.
+# Use --local to install to the current project's .worklog/plugins/ directory.
+# Usage: ./skill/install-ampa/scripts/install-worklog-plugin.sh [--local] <source-file> [target-dir]
 # Example: ./skill/install-ampa/scripts/install-worklog-plugin.sh skill/install-ampa/resources/ampa.mjs
 
 set -eu
@@ -18,6 +20,8 @@ DEFAULT_SRC="$SCRIPT_DIR/../resources/ampa.mjs"
 # Directory to copy AMPA python package from when not present in the project.
 # Prefer XDG_CONFIG_HOME if set, otherwise default to $HOME/.config/opencode/ampa
 CONFIG_AMPA_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/ampa"
+# Global plugin install directory (default when --local is not specified)
+GLOBAL_PLUGINS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/.worklog/plugins"
 LOCK_DIR="/tmp/ampa_install.lock"
 DECISION_LOG="/tmp/ampa_install_decisions.$$"
 PID_FILE=".worklog/ampa/default/default.pid"
@@ -70,7 +74,7 @@ acquire_lock() {
 # ============================================================================
 
 # Parse command-line arguments and populate global variables.
-# Global variables set: WEBHOOK, SRC, TARGET_DIR, AUTO_YES, FORCE_RESTART, FORCE_NO_RESTART
+# Global variables set: WEBHOOK, SRC, TARGET_DIR, AUTO_YES, FORCE_RESTART, FORCE_NO_RESTART, LOCAL_INSTALL
 parse_args() {
   # Initialize output variables with defaults
   WEBHOOK=""
@@ -79,6 +83,7 @@ parse_args() {
   AUTO_YES=0
   FORCE_RESTART=0
   FORCE_NO_RESTART=0
+  LOCAL_INSTALL=0
 
   # Parse options
   while [ "$#" -gt 0 ]; do
@@ -105,8 +110,23 @@ parse_args() {
         FORCE_NO_RESTART=1
         shift
         ;;
+      --local)
+        LOCAL_INSTALL=1
+        shift
+        ;;
       --help|-h)
-        echo "Usage: $0 [--webhook <url>] [--yes] [--restart|--no-restart] [source-file] [target-dir]"
+        echo "Usage: $0 [--webhook <url>] [--yes] [--restart|--no-restart] [--local] [source-file] [target-dir]"
+        echo ""
+        echo "Options:"
+        echo "  --webhook <url>  Set the webhook URL in .env"
+        echo "  --yes, -y        Non-interactive mode (auto-accept prompts)"
+        echo "  --restart        Force daemon restart after install"
+        echo "  --no-restart     Skip daemon restart after install"
+        echo "  --local          Install to per-project .worklog/plugins/ instead of global"
+        echo ""
+        echo "By default, plugins are installed globally to:"
+        echo "  \${XDG_CONFIG_HOME:-\$HOME/.config}/opencode/.worklog/plugins/"
+        echo "Use --local to install into the current project's .worklog/plugins/ directory."
         exit 0
         ;;
       --*)
@@ -135,7 +155,16 @@ parse_args() {
 
   # Set final values with defaults
   SRC="${SRC_ARG:-$DEFAULT_SRC}"
-  TARGET_DIR="${TARGET_ARG:-.worklog/plugins}"
+  if [ -n "$TARGET_ARG" ]; then
+    # Explicit target directory takes highest precedence
+    TARGET_DIR="$TARGET_ARG"
+  elif [ "$LOCAL_INSTALL" -eq 1 ]; then
+    # --local flag: install to per-project directory (legacy behaviour)
+    TARGET_DIR=".worklog/plugins"
+  else
+    # Default: global install directory
+    TARGET_DIR="$GLOBAL_PLUGINS_DIR"
+  fi
 }
 
 # ============================================================================
@@ -441,7 +470,10 @@ validate_source_file() {
 install_worklog_plugin() {
   local basename="$(basename "$SRC")"
   
-  mkdir -p "$TARGET_DIR"
+  if ! mkdir -p "$TARGET_DIR" 2>/dev/null; then
+    log_error "Error: cannot create plugin directory: $TARGET_DIR"
+    exit 1
+  fi
   cp -f "$SRC" "$TARGET_DIR/$basename"
   log_info "Installed Worklog plugin $SRC to $TARGET_DIR/$basename"
 }
