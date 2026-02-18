@@ -1954,21 +1954,24 @@ export default function register(ctx) {
     .option('-F, --format <format>', 'Human display format (concise|normal|full|raw)')
     .option('-w, --watch [seconds]', 'Rerun the command every N seconds (default: 5)')
     .option('--verbose', 'Show verbose output including debug messages')
-    .action(async (commandId, opts) => {
+    .action(async (commandId, opts, cmd) => {
+      // Use optsWithGlobals() because wl defines a global --json flag that
+      // captures the option before it reaches the local opts object.
+      const allOpts = cmd.optsWithGlobals();
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
       // Build extra CLI args to pass through to the Python scheduler
       const extraArgs = [];
-      if (opts.json) extraArgs.push('--json');
-      if (opts.format) extraArgs.push('--format', opts.format);
-      if (opts.watch !== undefined) {
-        if (opts.watch === true) {
+      if (allOpts.json) extraArgs.push('--json');
+      if (allOpts.format) extraArgs.push('--format', allOpts.format);
+      if (allOpts.watch !== undefined) {
+        if (allOpts.watch === true) {
           extraArgs.push('--watch');
         } else {
-          extraArgs.push('--watch', String(opts.watch));
+          extraArgs.push('--watch', String(allOpts.watch));
         }
       }
-      if (opts.verbose) extraArgs.push('--verbose');
+      if (allOpts.verbose) extraArgs.push('--verbose');
 
       const cmdSpec = await resolveRunOnceCommand(cwd, commandId || null, extraArgs);
       if (!cmdSpec) {
