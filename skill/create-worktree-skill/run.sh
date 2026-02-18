@@ -63,6 +63,16 @@ fi
 
 echo "Using branch: ${BRANCH}"
 
+# Push the new branch to origin and set up remote tracking so subsequent
+# git push / git pull commands work without --set-upstream.
+echo "Pushing branch '${BRANCH}' to origin and setting up tracking"
+if git push -u origin "${BRANCH}" 2>/dev/null; then
+  echo "Branch '${BRANCH}' pushed to origin and tracking configured"
+else
+  echo "Warning: failed to push branch '${BRANCH}' to origin. The branch is available locally but does not track a remote branch." >&2
+  echo "You may need to run 'git push -u origin ${BRANCH}' manually when network/permissions are available." >&2
+fi
+
 pushd "$WORKTREE_DIR" >/dev/null
 ROOT_DIR=$(git rev-parse --show-toplevel)
 
