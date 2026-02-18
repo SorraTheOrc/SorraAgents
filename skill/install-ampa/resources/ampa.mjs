@@ -1425,6 +1425,21 @@ async function startWork(projectRoot, workItemId, agentName) {
     `if [ -x /run/host/usr/bin/node ] && [ ! -e /usr/local/bin/node ]; then`,
     `  sudo ln -s /run/host/usr/bin/node /usr/local/bin/node`,
     `fi`,
+    // Symlink host gh (GitHub CLI) into the container.  gh is a statically
+    // linked Go binary so it has no shared-library dependencies and is safe
+    // to use from /run/host.
+    `if [ -x /run/host/usr/bin/gh ] && [ ! -e /usr/local/bin/gh ]; then`,
+    `  sudo ln -s /run/host/usr/bin/gh /usr/local/bin/gh`,
+    `fi`,
+    // Create a wrapper for npm that delegates to the host's npm module tree
+    // via the already-symlinked node.  npm is a Node.js script (not a native
+    // binary) so a simple symlink won't work — the require() paths would
+    // resolve against the container's filesystem where the npm module tree
+    // doesn't exist.
+    `if [ -f /run/host/usr/lib/node_modules/npm/bin/npm-cli.js ] && [ ! -e /usr/local/bin/npm ]; then`,
+    `  printf '#!/bin/sh\\nexec /usr/local/bin/node /run/host/usr/lib/node_modules/npm/bin/npm-cli.js "$@"\\n' | sudo tee /usr/local/bin/npm > /dev/null`,
+    `  sudo chmod +x /usr/local/bin/npm`,
+    `fi`,
     `cd /workdir`,
     `echo "Cloning project from ${origin}..."`,
     `git clone --depth 1 "${origin}" project`,
