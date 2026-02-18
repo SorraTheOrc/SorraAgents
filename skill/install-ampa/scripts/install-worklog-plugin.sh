@@ -1087,7 +1087,8 @@ main() {
    # package was installed into the plugin directory. If no python bundle is
    # present there's nothing sensible to start and calling `wl ampa start`
    # will fail with "No command resolved".
-   if [ -f "$TARGET_DIR/$(basename "$SRC")" ]; then
+   # Respect --no-restart flag.
+   if [ "$FORCE_NO_RESTART" -eq 0 ] && [ -f "$TARGET_DIR/$(basename "$SRC")" ]; then
      if [ -d "$TARGET_DIR/ampa_py/ampa" ]; then
        log_info "Starting daemon after installation..."
        start_daemon

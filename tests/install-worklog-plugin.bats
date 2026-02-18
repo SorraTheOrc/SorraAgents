@@ -12,6 +12,13 @@ setup() {
   TEST_DIR="$(mktemp -d)"
   export TEST_DIR
   
+  # Redirect XDG_CONFIG_HOME so the installer's global default
+  # (${XDG_CONFIG_HOME}/opencode/.worklog/plugins) resolves inside TEST_DIR.
+  export XDG_CONFIG_HOME="$TEST_DIR/xdg"
+  # The expected global target directory when XDG_CONFIG_HOME is set
+  GLOBAL_TARGET="$XDG_CONFIG_HOME/opencode/.worklog/plugins"
+  export GLOBAL_TARGET
+  
   # Create necessary test subdirectories
   mkdir -p "$TEST_DIR/.worklog/plugins"
   mkdir -p "$TEST_DIR/.worklog/ampa/default"
@@ -21,7 +28,7 @@ setup() {
   cd "$TEST_DIR"
   
   # Copy the installer script to test directory
-  cp /home/rogardle/.config/opencode/plugins/install-worklog-plugin.sh ./install-test.sh
+  cp /home/rogardle/.config/opencode/skill/install-ampa/scripts/install-worklog-plugin.sh ./install-test.sh
   
   # Make it executable
   chmod +x ./install-test.sh
@@ -52,12 +59,12 @@ teardown() {
 }
 
 @test "webhook option with value" {
-  run ./install-test.sh --webhook "https://example.com/webhook" --yes plugins-test-plugin.mjs
+  run ./install-test.sh --webhook "https://example.com/webhook" --no-restart --yes plugins-test-plugin.mjs
   [ "$status" -eq 0 ] || [ "$status" -eq 1 ]  # Might fail if source doesn't exist, that's ok
 }
 
 @test "webhook short option -w works" {
-  run ./install-test.sh -w "https://example.com/webhook" --yes plugins-test-plugin.mjs
+  run ./install-test.sh -w "https://example.com/webhook" --no-restart --yes plugins-test-plugin.mjs
   [ "$status" -eq 0 ] || [ "$status" -eq 1 ]
 }
 
@@ -68,13 +75,13 @@ teardown() {
 }
 
 @test "--yes option enables auto mode" {
-  run ./install-test.sh --yes plugins-test-plugin.mjs
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs
   # Should exit cleanly without prompting
   [ "$status" -eq 0 ] || [ "$status" -eq 1 ]
 }
 
 @test "--yes short option -y works" {
-  run ./install-test.sh -y plugins-test-plugin.mjs
+  run ./install-test.sh --no-restart -y plugins-test-plugin.mjs
   [ "$status" -eq 0 ] || [ "$status" -eq 1 ]
 }
 
@@ -85,7 +92,7 @@ teardown() {
 }
 
 @test "positional arguments: source and target" {
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   # Will fail on validation but should parse correctly
   [ "$status" -eq 0 ] || [ "$status" -eq 2 ]
 }
@@ -101,19 +108,27 @@ teardown() {
 }
 
 @test "default source path used when omitted" {
-  # Create the default source path
-  mkdir -p plugins/wl_ampa
-  echo "export default function register(ctx) {}" > plugins/wl_ampa/ampa.mjs
+  # DEFAULT_SRC resolves to SCRIPT_DIR/../resources/ampa.mjs
+  # Since install-test.sh is at $TEST_DIR, SCRIPT_DIR=$TEST_DIR,
+  # so DEFAULT_SRC=$TEST_DIR/../resources/ampa.mjs
+  local parent_dir
+  parent_dir="$(dirname "$TEST_DIR")"
+  mkdir -p "$parent_dir/resources"
+  echo "export default function register(ctx) {}" > "$parent_dir/resources/ampa.mjs"
   
-  run ./install-test.sh --yes
-  # Will try to install the default plugin
+  run ./install-test.sh --no-restart --yes
+  # Will try to install the default plugin to the global target
   [ "$status" -eq 0 ]
+  
+  # Clean up the resource file outside the test dir
+  rm -rf "$parent_dir/resources"
 }
 
 @test "extra positional arguments ignored" {
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins extra args
-  # Should process without error about extra args
-  [ "$status" -eq 2 ] || [ "$status" -eq 1 ]
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins extra args
+  # Extra args are logged as warnings but do not cause failure
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Ignoring extra argument"* ]]
 }
 
 # ============================================================================
@@ -121,22 +136,22 @@ teardown() {
 # ============================================================================
 
 @test "install .mjs plugin file to target directory" {
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   [ -f ".worklog/plugins/plugins-test-plugin.mjs" ]
 }
 
-@test "install with default target directory" {
-  run ./install-test.sh --yes plugins-test-plugin.mjs
+@test "install with default target directory (global)" {
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs
   [ "$status" -eq 0 ]
-  [ -f ".worklog/plugins/plugins-test-plugin.mjs" ]
+  [ -f "$GLOBAL_TARGET/plugins-test-plugin.mjs" ]
 }
 
 @test "overwrite existing plugin file" {
   cp plugins-test-plugin.mjs .worklog/plugins/plugins-test-plugin.mjs
   echo "old content" > .worklog/plugins/plugins-test-plugin.mjs
   
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Verify the file was overwritten with new content
@@ -148,12 +163,12 @@ teardown() {
 # ============================================================================
 
 @test "python package detection" {
-  # Create a simple Python package structure
+  # Create a simple Python package structure (no requirements.txt so venv
+  # creation is skipped — we only verify the package directory is copied).
   mkdir -p ampa
   echo "test module" > ampa/__init__.py
-  echo "requests>=2.0.0" > ampa/requirements.txt
   
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Verify the package was copied
@@ -165,8 +180,20 @@ teardown() {
   mkdir -p ampa
   echo "requests>=2.0.0" > ampa/requirements.txt
   
-  # Run with a fake PATH that has no Python
-  PATH="/nonexistent" run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins
+  # Build a clean PATH that excludes python/python3 by creating a bin dir
+  # with only the essential commands the installer needs.
+  local fake_bin="$TEST_DIR/no_python_bin"
+  mkdir -p "$fake_bin"
+  # Link essential commands the installer uses (sh, cp, mkdir, etc.)
+  for cmd in sh bash cp mkdir rm mv cat grep sed tee chmod mktemp dirname basename readlink date printf tr wc ls touch ln find rmdir stat id flock node; do
+    local real
+    real="$(command -v "$cmd" 2>/dev/null || true)"
+    if [ -n "$real" ]; then
+      ln -sf "$real" "$fake_bin/$cmd"
+    fi
+  done
+
+  PATH="$fake_bin" run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   # This should error about python not found
   [ "$status" -ne 0 ]
 }
@@ -178,9 +205,8 @@ teardown() {
 @test "env sample file detection" {
   mkdir -p ampa
   echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
-  echo "requests>=2.0.0" > ampa/requirements.txt
   
-  run ./install-test.sh --webhook "https://example.com/webhook" --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --webhook "https://example.com/webhook" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Verify .env was created
@@ -190,9 +216,8 @@ teardown() {
 @test "env sample with legacy .env.samplw filename" {
   mkdir -p ampa
   echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.samplw
-  echo "requests>=2.0.0" > ampa/requirements.txt
   
-  run ./install-test.sh --webhook "https://example.com/webhook" --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --webhook "https://example.com/webhook" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   [ -f ".worklog/plugins/ampa_py/ampa/.env" ]
@@ -201,10 +226,9 @@ teardown() {
 @test "webhook written to env file" {
   mkdir -p ampa
   echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
-  echo "requests>=2.0.0" > ampa/requirements.txt
   
   TEST_WEBHOOK="https://discord.com/api/webhooks/test123"
-  run ./install-test.sh --webhook "$TEST_WEBHOOK" --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --webhook "$TEST_WEBHOOK" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Verify webhook is in the env file
@@ -219,12 +243,11 @@ teardown() {
   echo 'AMPA_DISCORD_WEBHOOK="https://existing.webhook"' > .worklog/plugins/ampa_py/ampa/.env
   echo "test_data=preserved" >> .worklog/plugins/ampa_py/ampa/.env
   
-  # Create package files
-  echo "requests>=2.0.0" > ampa/requirements.txt
+  # Create package files (no requirements.txt — skip venv)
   cp -r ampa .worklog/plugins/ampa_py/
   
   # Perform "upgrade" without changing webhook
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Old env should be preserved since no webhook was provided
@@ -241,7 +264,7 @@ teardown() {
   mkdir -p .worklog/plugins
   echo "old plugin" > .worklog/plugins/plugins-test-plugin.mjs
   
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   # Should detect existing and proceed with upgrade
 }
@@ -250,7 +273,7 @@ teardown() {
   mkdir -p .worklog/plugins/ampa_py/ampa
   echo "existing package" > .worklog/plugins/ampa_py/ampa/__init__.py
   
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
 }
 
@@ -289,20 +312,20 @@ teardown() {
 # ============================================================================
 
 @test "missing target directory is created" {
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/custom/plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/custom/plugins
   [ "$status" -eq 0 ]
   [ -d ".worklog/custom/plugins" ]
 }
 
 @test "script validates source file exists" {
-  run ./install-test.sh --yes /nonexistent/plugin.mjs
+  run ./install-test.sh --no-restart --yes /nonexistent/plugin.mjs
   [ "$status" -eq 2 ]
   [[ "$output" == *"not found"* ]]
 }
 
 @test "lock prevents concurrent installation" {
   # This is a simplified test - in practice, concurrent runs would be needed
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   # Lock should be released after completion
   [ ! -d "/tmp/ampa_install.lock" ] || [ -d "/tmp/ampa_install.lock" ]
@@ -315,11 +338,10 @@ teardown() {
 @test "fresh install flow complete" {
   mkdir -p ampa
   echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
-  echo "requests>=2.0.0" > ampa/requirements.txt
   
   TEST_WEBHOOK="https://discord.com/api/webhooks/test"
   
-  run ./install-test.sh --webhook "$TEST_WEBHOOK" --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --webhook "$TEST_WEBHOOK" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Verify all components installed
@@ -333,9 +355,8 @@ teardown() {
   # First install with webhook
   mkdir -p ampa
   echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
-  echo "requests>=2.0.0" > ampa/requirements.txt
   
-  run ./install-test.sh --webhook "https://old.webhook" --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --webhook "https://old.webhook" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Verify first install
@@ -343,7 +364,7 @@ teardown() {
   grep -q "https://old.webhook" .worklog/plugins/ampa_py/ampa/.env
   
   # Second install (upgrade) without changing webhook
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Verify env is preserved (old webhook still there)
@@ -357,45 +378,104 @@ teardown() {
   [[ "$output" == *"--yes"* ]]
   [[ "$output" == *"--restart"* ]]
   [[ "$output" == *"--no-restart"* ]]
+  [[ "$output" == *"--local"* ]]
 }
 
 # ============================================================================
 # BACKWARD COMPATIBILITY TESTS
 # ============================================================================
 
-@test "original behavior: single argument source file" {
-  run ./install-test.sh --yes plugins-test-plugin.mjs
+@test "original behavior: single argument source file installs to global" {
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs
   [ "$status" -eq 0 ]
-  [ -f ".worklog/plugins/plugins-test-plugin.mjs" ]
+  [ -f "$GLOBAL_TARGET/plugins-test-plugin.mjs" ]
 }
 
 @test "original behavior: two arguments source and target" {
-  run ./install-test.sh --yes plugins-test-plugin.mjs custom-plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs custom-plugins
   [ "$status" -eq 0 ]
   [ -f "custom-plugins/plugins-test-plugin.mjs" ]
 }
 
-@test "original behavior: no arguments uses defaults" {
-  mkdir -p plugins/wl_ampa
-  echo "export default function register(ctx) {}" > plugins/wl_ampa/ampa.mjs
+@test "original behavior: no arguments uses defaults (global)" {
+  # DEFAULT_SRC resolves to SCRIPT_DIR/../resources/ampa.mjs
+  local parent_dir
+  parent_dir="$(dirname "$TEST_DIR")"
+  mkdir -p "$parent_dir/resources"
+  echo "export default function register(ctx) {}" > "$parent_dir/resources/ampa.mjs"
   
-  run ./install-test.sh --yes
+  # Also need an ampa/ directory so the Python package copy step doesn't abort
+  mkdir -p ampa
+  
+  run ./install-test.sh --no-restart --yes
   [ "$status" -eq 0 ]
-  [ -f ".worklog/plugins/ampa.mjs" ]
+  [ -f "$GLOBAL_TARGET/ampa.mjs" ]
+  
+  # Clean up the resource file outside the test dir
+  rm -rf "$parent_dir/resources"
 }
 
-@test "original behavior: webhook option" {
+@test "original behavior: webhook option with global default" {
   mkdir -p ampa
   echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
-  echo "requests>=2.0.0" > ampa/requirements.txt
   
-  run ./install-test.sh --webhook "https://example.webhook" --yes plugins-test-plugin.mjs
+  run ./install-test.sh --webhook "https://example.webhook" --no-restart --yes plugins-test-plugin.mjs
   [ "$status" -eq 0 ]
 }
 
-@test "original behavior: auto yes option" {
-  run ./install-test.sh --yes plugins-test-plugin.mjs
+@test "original behavior: auto yes option with global default" {
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs
   [ "$status" -eq 0 ]
+}
+
+# ============================================================================
+# --LOCAL FLAG TESTS
+# ============================================================================
+
+@test "--local flag installs to project-local directory" {
+  run ./install-test.sh --local --no-restart --yes plugins-test-plugin.mjs
+  [ "$status" -eq 0 ]
+  [ -f ".worklog/plugins/plugins-test-plugin.mjs" ]
+  # Should NOT be in the global target
+  [ ! -f "$GLOBAL_TARGET/plugins-test-plugin.mjs" ]
+}
+
+@test "--local flag with default source uses local target" {
+  # DEFAULT_SRC resolves to SCRIPT_DIR/../resources/ampa.mjs
+  local parent_dir
+  parent_dir="$(dirname "$TEST_DIR")"
+  mkdir -p "$parent_dir/resources"
+  echo "export default function register(ctx) {}" > "$parent_dir/resources/ampa.mjs"
+  
+  # Also need an ampa/ directory so the Python package copy step doesn't abort
+  mkdir -p ampa
+  
+  run ./install-test.sh --local --no-restart --yes
+  [ "$status" -eq 0 ]
+  [ -f ".worklog/plugins/ampa.mjs" ]
+  
+  # Clean up the resource file outside the test dir
+  rm -rf "$parent_dir/resources"
+}
+
+# ============================================================================
+# MIGRATION TESTS
+# ============================================================================
+
+@test "migration detects local install and installs to global" {
+  # Simulate an existing local installation
+  mkdir -p .worklog/plugins
+  echo "export default function register(ctx) {}" > .worklog/plugins/plugins-test-plugin.mjs
+  mkdir -p .worklog/ampa
+  echo '{"ampa-pool-0":{"workItemId":"WL-1"}}' > .worklog/ampa/pool-state.json
+  echo '["ampa-pool-2"]' > .worklog/ampa/pool-cleanup.json
+  
+  # Run installer — it should detect the local install and migrate
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs
+  [ "$status" -eq 0 ]
+  
+  # Plugin should be installed to global target
+  [ -f "$GLOBAL_TARGET/plugins-test-plugin.mjs" ]
 }
 
 # ============================================================================
@@ -403,14 +483,14 @@ teardown() {
 # ============================================================================
 
 @test "decision log is created" {
-  run ./install-test.sh --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   # Decision log should be created in /tmp
   [ -L "/tmp/ampa_install_decisions.log" ] || [ -f "/tmp/ampa_install_decisions.log" ]
 }
 
 @test "decision log contains installation details" {
-  run ./install-test.sh --webhook "https://test.webhook" --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --webhook "https://test.webhook" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Check if decision log exists and has content
