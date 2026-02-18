@@ -63,6 +63,8 @@ This will:
 
 The pool is replenished automatically in the background after each `start-work`, but running `warm-pool` once up front avoids the initial wait.
 
+Pool state (`pool-state.json`, `pool-cleanup.json`, `pool-replenish.log`) is stored globally at `~/.config/opencode/.worklog/ampa/` so that container claims and cleanup records are shared across all projects on the host. Per-project config (`.env`, `scheduler_store.json`, daemon PID/log) remains under `<project>/.worklog/ampa/`.
+
 If the `ampa/Containerfile` has been modified since the image was last built, `warm-pool` will automatically tear down unclaimed pool containers and the template, rebuild the image, and re-fill the pool. Simply run `wl ampa warm-pool` again — no manual cleanup is needed.
 
 ## Getting started
@@ -92,11 +94,11 @@ The canonical source for the AMPA Worklog plugin is:
 skill/install-ampa/resources/ampa.mjs
 ```
 
-**Do not create copies in other directories** (e.g. `plugins/`, `.worklog/plugins/`). The installer (`skill/install-ampa/scripts/install-worklog-plugin.sh`) deploys the canonical source into `.worklog/plugins/ampa.mjs` at install time. To develop or modify the plugin:
+**Do not create copies in other directories** (e.g. `plugins/`, `.worklog/plugins/`). The installer (`skill/install-ampa/scripts/install-worklog-plugin.sh`) deploys the canonical source to the global plugin directory at `~/.config/opencode/.worklog/plugins/ampa.mjs` by default. Use `--local` to install to the current project's `.worklog/plugins/` instead. To develop or modify the plugin:
 
 1. Edit `skill/install-ampa/resources/ampa.mjs` directly.
 2. Run `node --test tests/node/test-ampa.mjs tests/node/test-ampa-devcontainer.mjs` to verify.
-3. Re-install with `skill/install-ampa/scripts/install-worklog-plugin.sh --yes` to deploy changes locally.
+3. Re-install with `skill/install-ampa/scripts/install-worklog-plugin.sh --yes` to deploy changes globally.
 
 ## Next steps / Suggestions
 - Add a CI workflow to validate new skills and docs.
