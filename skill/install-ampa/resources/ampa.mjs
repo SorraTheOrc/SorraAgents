@@ -14,6 +14,29 @@ import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import fsPromises from 'fs/promises';
 import path from 'path';
+import os from 'os';
+
+/**
+ * Resolve the global AMPA data directory.
+ * Pool state files (pool-state.json, pool-cleanup.json, pool-replenish.log)
+ * are stored here so they are shared across all projects.
+ *
+ * Respects XDG_CONFIG_HOME; falls back to $HOME/.config.
+ * Throws if neither XDG_CONFIG_HOME nor HOME is available.
+ */
+function globalAmpaDir() {
+  const xdg = process.env.XDG_CONFIG_HOME;
+  if (xdg) {
+    return path.join(xdg, 'opencode', '.worklog', 'ampa');
+  }
+  const home = process.env.HOME || os.homedir();
+  if (!home) {
+    throw new Error(
+      'Cannot determine global AMPA directory: neither XDG_CONFIG_HOME nor HOME is set'
+    );
+  }
+  return path.join(home, '.config', 'opencode', '.worklog', 'ampa');
+}
 
 function findProjectRoot(start) {
   let cur = path.resolve(start);
@@ -914,9 +937,13 @@ function poolContainerName(index) {
  * Path to the pool state JSON file.
  * Stores a mapping of pool container name -> { workItemId, branch, claimedAt }
  * for containers that have been claimed by start-work.
+ *
+ * Pool state is stored in the global AMPA directory so it is shared across
+ * all projects. The projectRoot parameter is accepted for API compatibility
+ * but is no longer used for path resolution.
  */
-function poolStatePath(projectRoot) {
-  return path.join(projectRoot, '.worklog', 'ampa', 'pool-state.json');
+function poolStatePath(_projectRoot) {
+  return path.join(globalAmpaDir(), 'pool-state.json');
 }
 
 /**
@@ -1012,9 +1039,13 @@ function releasePoolContainer(projectRoot, containerNameOrAll) {
 /**
  * Path to the pool cleanup JSON file.
  * Stores an array of container names that should be destroyed from the host.
+ *
+ * Pool cleanup state is stored in the global AMPA directory so it is shared
+ * across all projects. The projectRoot parameter is accepted for API
+ * compatibility but is no longer used for path resolution.
  */
-function poolCleanupPath(projectRoot) {
-  return path.join(projectRoot, '.worklog', 'ampa', 'pool-cleanup.json');
+function poolCleanupPath(_projectRoot) {
+  return path.join(globalAmpaDir(), 'pool-cleanup.json');
 }
 
 /**
@@ -1219,7 +1250,9 @@ function replenishPoolBackground(projectRoot) {
     `.catch(e => { process.stderr.write(String(e) + '\\n'); process.exit(1); });`,
   ].join('');
 
-  const logFile = path.join(projectRoot, '.worklog', 'ampa', 'pool-replenish.log');
+  const logDir = globalAmpaDir();
+  fs.mkdirSync(logDir, { recursive: true });
+  const logFile = path.join(logDir, 'pool-replenish.log');
   const out = fs.openSync(logFile, 'a');
   try {
     fs.appendFileSync(logFile, `\n--- replenish started at ${new Date().toISOString()} ---\n`);
@@ -2254,6 +2287,7 @@ export {
   getCleanupList,
   getGitOrigin,
   getPoolState,
+  globalAmpaDir,
   imageCreatedDate,
   imageExists,
   isImageStale,

@@ -1,6 +1,8 @@
 #!/usr/bin/env sh
-# Install a Worklog plugin into a project or user plugin directory.
-# Usage: ./skill/install-ampa/scripts/install-worklog-plugin.sh <source-file> [target-dir]
+# Install a Worklog plugin into the global or per-project plugin directory.
+# By default, installs to ${XDG_CONFIG_HOME:-$HOME/.config}/opencode/.worklog/plugins/.
+# Use --local to install to the current project's .worklog/plugins/ directory.
+# Usage: ./skill/install-ampa/scripts/install-worklog-plugin.sh [--local] <source-file> [target-dir]
 # Example: ./skill/install-ampa/scripts/install-worklog-plugin.sh skill/install-ampa/resources/ampa.mjs
 
 set -eu
@@ -18,6 +20,8 @@ DEFAULT_SRC="$SCRIPT_DIR/../resources/ampa.mjs"
 # Directory to copy AMPA python package from when not present in the project.
 # Prefer XDG_CONFIG_HOME if set, otherwise default to $HOME/.config/opencode/ampa
 CONFIG_AMPA_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/ampa"
+# Global plugin install directory (default when --local is not specified)
+GLOBAL_PLUGINS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/.worklog/plugins"
 LOCK_DIR="/tmp/ampa_install.lock"
 DECISION_LOG="/tmp/ampa_install_decisions.$$"
 PID_FILE=".worklog/ampa/default/default.pid"
@@ -70,7 +74,7 @@ acquire_lock() {
 # ============================================================================
 
 # Parse command-line arguments and populate global variables.
-# Global variables set: WEBHOOK, SRC, TARGET_DIR, AUTO_YES, FORCE_RESTART, FORCE_NO_RESTART
+# Global variables set: WEBHOOK, SRC, TARGET_DIR, AUTO_YES, FORCE_RESTART, FORCE_NO_RESTART, LOCAL_INSTALL
 parse_args() {
   # Initialize output variables with defaults
   WEBHOOK=""
@@ -79,6 +83,7 @@ parse_args() {
   AUTO_YES=0
   FORCE_RESTART=0
   FORCE_NO_RESTART=0
+  LOCAL_INSTALL=0
 
   # Parse options
   while [ "$#" -gt 0 ]; do
@@ -105,8 +110,23 @@ parse_args() {
         FORCE_NO_RESTART=1
         shift
         ;;
+      --local)
+        LOCAL_INSTALL=1
+        shift
+        ;;
       --help|-h)
-        echo "Usage: $0 [--webhook <url>] [--yes] [--restart|--no-restart] [source-file] [target-dir]"
+        echo "Usage: $0 [--webhook <url>] [--yes] [--restart|--no-restart] [--local] [source-file] [target-dir]"
+        echo ""
+        echo "Options:"
+        echo "  --webhook <url>  Set the webhook URL in .env"
+        echo "  --yes, -y        Non-interactive mode (auto-accept prompts)"
+        echo "  --restart        Force daemon restart after install"
+        echo "  --no-restart     Skip daemon restart after install"
+        echo "  --local          Install to per-project .worklog/plugins/ instead of global"
+        echo ""
+        echo "By default, plugins are installed globally to:"
+        echo "  \${XDG_CONFIG_HOME:-\$HOME/.config}/opencode/.worklog/plugins/"
+        echo "Use --local to install into the current project's .worklog/plugins/ directory."
         exit 0
         ;;
       --*)
@@ -135,7 +155,16 @@ parse_args() {
 
   # Set final values with defaults
   SRC="${SRC_ARG:-$DEFAULT_SRC}"
-  TARGET_DIR="${TARGET_ARG:-.worklog/plugins}"
+  if [ -n "$TARGET_ARG" ]; then
+    # Explicit target directory takes highest precedence
+    TARGET_DIR="$TARGET_ARG"
+  elif [ "$LOCAL_INSTALL" -eq 1 ]; then
+    # --local flag: install to per-project directory (legacy behaviour)
+    TARGET_DIR=".worklog/plugins"
+  else
+    # Default: global install directory
+    TARGET_DIR="$GLOBAL_PLUGINS_DIR"
+  fi
 }
 
 # ============================================================================
@@ -175,6 +204,193 @@ prompt_upgrade_or_abort() {
   fi
 
   return 0  # Default to upgrade
+}
+
+# ============================================================================
+# LOCAL-TO-GLOBAL MIGRATION
+# ============================================================================
+
+# Detect a per-project (local) installation that should be migrated to global.
+# Only relevant when installing to the global target (not --local).
+detect_local_install() {
+  if [ -f ".worklog/plugins/ampa.mjs" ] || [ -d ".worklog/plugins/ampa_py" ]; then
+    return 0  # Local install found
+  fi
+  return 1  # No local install
+}
+
+# Prompt user whether to migrate a local install to global.
+# Returns 0 (yes, migrate) or 1 (no, skip).
+prompt_migrate() {
+  if [ "$AUTO_YES" -eq 1 ]; then
+    return 0  # Auto-migrate
+  fi
+
+  if [ -t 0 ]; then
+    printf "Detected per-project plugin in .worklog/plugins/. Migrate to global install? [Y/n]: "
+    if ! read -r MIGRATE_ANS; then MIGRATE_ANS=""; fi
+    case "$(printf "%s" "$MIGRATE_ANS" | tr '[:upper:]' '[:lower:]')" in
+      n|no)
+        return 1  # Skip migration
+        ;;
+      *)
+        return 0  # Yes, migrate (default)
+        ;;
+    esac
+  fi
+
+  return 1  # Non-interactive, non-auto: skip
+}
+
+# Merge two pool-state.json files. When the same container name exists in both,
+# keep the entry with the more recent claimedAt timestamp.
+# Usage: merge_pool_state <local_file> <global_file> <output_file>
+merge_pool_state() {
+  local local_file="$1"
+  local global_file="$2"
+  local output_file="$3"
+
+  # If only one file exists, just copy it
+  if [ ! -f "$local_file" ] && [ ! -f "$global_file" ]; then
+    return 0  # Nothing to merge
+  fi
+  if [ ! -f "$local_file" ]; then
+    cp -f "$global_file" "$output_file"
+    return 0
+  fi
+  if [ ! -f "$global_file" ]; then
+    cp -f "$local_file" "$output_file"
+    return 0
+  fi
+
+  # Both files exist — merge using Node.js
+  node -e "
+    const fs = require('fs');
+    const local = JSON.parse(fs.readFileSync('$local_file', 'utf8'));
+    const global = JSON.parse(fs.readFileSync('$global_file', 'utf8'));
+    const merged = { ...global };
+    for (const [name, entry] of Object.entries(local)) {
+      if (!merged[name]) {
+        merged[name] = entry;
+      } else {
+        const localTime = new Date(entry.claimedAt || 0).getTime();
+        const globalTime = new Date(merged[name].claimedAt || 0).getTime();
+        if (localTime > globalTime) {
+          merged[name] = entry;
+        }
+      }
+    }
+    fs.writeFileSync('$output_file', JSON.stringify(merged, null, 2), 'utf8');
+  " 2>/dev/null
+
+  if [ $? -ne 0 ]; then
+    log_error "Warning: pool-state merge failed; keeping global copy"
+    if [ -f "$global_file" ]; then
+      cp -f "$global_file" "$output_file"
+    fi
+  fi
+}
+
+# Merge two pool-cleanup.json files (arrays). Union of both lists, deduplicated.
+# Usage: merge_cleanup_list <local_file> <global_file> <output_file>
+merge_cleanup_list() {
+  local local_file="$1"
+  local global_file="$2"
+  local output_file="$3"
+
+  if [ ! -f "$local_file" ] && [ ! -f "$global_file" ]; then
+    return 0
+  fi
+  if [ ! -f "$local_file" ]; then
+    cp -f "$global_file" "$output_file"
+    return 0
+  fi
+  if [ ! -f "$global_file" ]; then
+    cp -f "$local_file" "$output_file"
+    return 0
+  fi
+
+  # Both files exist — merge using Node.js
+  node -e "
+    const fs = require('fs');
+    const local = JSON.parse(fs.readFileSync('$local_file', 'utf8'));
+    const global = JSON.parse(fs.readFileSync('$global_file', 'utf8'));
+    const merged = [...new Set([...(Array.isArray(global) ? global : []), ...(Array.isArray(local) ? local : [])])];
+    fs.writeFileSync('$output_file', JSON.stringify(merged, null, 2), 'utf8');
+  " 2>/dev/null
+
+  if [ $? -ne 0 ]; then
+    log_error "Warning: pool-cleanup merge failed; keeping global copy"
+    if [ -f "$global_file" ]; then
+      cp -f "$global_file" "$output_file"
+    fi
+  fi
+}
+
+# Migrate a per-project installation to the global location.
+# Moves pool state files, removes old plugin, preserves per-project config.
+migrate_to_global() {
+  local local_ampa_dir=".worklog/ampa"
+  # Construct global ampa dir from the same XDG base as GLOBAL_PLUGINS_DIR
+  local xdg_base="${XDG_CONFIG_HOME:-$HOME/.config}"
+  local global_ampa_dir="$xdg_base/opencode/.worklog/ampa"
+
+  log_info "Migrating per-project install to global location..."
+  log_decision "MIGRATION_START local_ampa=$local_ampa_dir global_ampa=$global_ampa_dir"
+
+  # Ensure global ampa directory exists
+  mkdir -p "$global_ampa_dir"
+
+  # Migrate pool-state.json (merge if both exist)
+  if [ -f "$local_ampa_dir/pool-state.json" ]; then
+    merge_pool_state "$local_ampa_dir/pool-state.json" "$global_ampa_dir/pool-state.json" "$global_ampa_dir/pool-state.json"
+    log_info "Migrated pool-state.json to $global_ampa_dir/"
+    rm -f "$local_ampa_dir/pool-state.json"
+    log_decision "MIGRATED_POOL_STATE=1"
+  else
+    log_decision "MIGRATED_POOL_STATE=0 (not found)"
+  fi
+
+  # Migrate pool-cleanup.json (merge if both exist)
+  if [ -f "$local_ampa_dir/pool-cleanup.json" ]; then
+    merge_cleanup_list "$local_ampa_dir/pool-cleanup.json" "$global_ampa_dir/pool-cleanup.json" "$global_ampa_dir/pool-cleanup.json"
+    log_info "Migrated pool-cleanup.json to $global_ampa_dir/"
+    rm -f "$local_ampa_dir/pool-cleanup.json"
+    log_decision "MIGRATED_POOL_CLEANUP=1"
+  else
+    log_decision "MIGRATED_POOL_CLEANUP=0 (not found)"
+  fi
+
+  # Migrate pool-replenish.log (append local to global)
+  if [ -f "$local_ampa_dir/pool-replenish.log" ]; then
+    cat "$local_ampa_dir/pool-replenish.log" >> "$global_ampa_dir/pool-replenish.log" 2>/dev/null || true
+    log_info "Migrated pool-replenish.log to $global_ampa_dir/"
+    rm -f "$local_ampa_dir/pool-replenish.log"
+    log_decision "MIGRATED_REPLENISH_LOG=1"
+  else
+    log_decision "MIGRATED_REPLENISH_LOG=0 (not found)"
+  fi
+
+  # Remove old plugin file from per-project location
+  if [ -f ".worklog/plugins/ampa.mjs" ]; then
+    rm -f ".worklog/plugins/ampa.mjs"
+    log_info "Removed old .worklog/plugins/ampa.mjs"
+    log_decision "REMOVED_LOCAL_PLUGIN=1"
+  fi
+
+  # Note: we do NOT remove .worklog/plugins/ampa_py/ here because the
+  # new install will deploy to the global target. The old ampa_py contains
+  # .env and scheduler_store.json which are per-project config and should
+  # be preserved. Cleanup of the old ampa_py is left to the user.
+  if [ -d ".worklog/plugins/ampa_py" ]; then
+    log_info "Note: .worklog/plugins/ampa_py/ preserved (contains per-project config)."
+    log_info "You may remove it manually after verifying your .env and scheduler_store.json"
+    log_info "are configured at the project level (.worklog/ampa/)."
+    log_decision "OLD_AMPA_PY_PRESERVED=1"
+  fi
+
+  log_info "Migration complete."
+  log_decision "MIGRATION_COMPLETE=1"
 }
 
 # ============================================================================
@@ -441,7 +657,10 @@ validate_source_file() {
 install_worklog_plugin() {
   local basename="$(basename "$SRC")"
   
-  mkdir -p "$TARGET_DIR"
+  if ! mkdir -p "$TARGET_DIR" 2>/dev/null; then
+    log_error "Error: cannot create plugin directory: $TARGET_DIR"
+    exit 1
+  fi
   cp -f "$SRC" "$TARGET_DIR/$basename"
   log_info "Installed Worklog plugin $SRC to $TARGET_DIR/$basename"
 }
@@ -756,6 +975,18 @@ main() {
   # Validate source
   validate_source_file
 
+  # Migrate per-project install to global (only when installing globally)
+  if [ "$LOCAL_INSTALL" -eq 0 ] && [ -z "$TARGET_ARG" ]; then
+    if detect_local_install; then
+      if prompt_migrate; then
+        migrate_to_global
+      else
+        log_info "Skipping migration; local install preserved."
+        log_decision "MIGRATION_SKIPPED=user_declined"
+      fi
+    fi
+  fi
+
   # Check for existing installation
   local existing_install=0
   if detect_existing_installation; then
@@ -856,7 +1087,8 @@ main() {
    # package was installed into the plugin directory. If no python bundle is
    # present there's nothing sensible to start and calling `wl ampa start`
    # will fail with "No command resolved".
-   if [ -f "$TARGET_DIR/$(basename "$SRC")" ]; then
+   # Respect --no-restart flag.
+   if [ "$FORCE_NO_RESTART" -eq 0 ] && [ -f "$TARGET_DIR/$(basename "$SRC")" ]; then
      if [ -d "$TARGET_DIR/ampa_py/ampa" ]; then
        log_info "Starting daemon after installation..."
        start_daemon
