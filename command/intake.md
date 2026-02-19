@@ -110,7 +110,9 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
   3. Related-work & traceability
   - Confirm related docs/work items are correctly referenced and that the recommended next step references the correct path/work item ids.
   4. Risks & assumptions
-     - Add missing risks and mitigations, failure modes, and assumptions in short bullets. Do not invent mitigations beyond note-level comments.
+     - Add missing risks and mitigations, failure modes, and assumptions in short bullets.
+     - Ensure that a risk addressing scope screep is present. The mitigaation is to record opportunities for additional features/refactorings as work items linked to the main item, rather than expanding the scope of the current item.
+     - Do not invent mitigations beyond note-level comments.
   5. Polish & handoff
   - Tighten language for reading speed, ensure copy-paste-ready commands, and produce the final 1–2 sentence summary used as the work item body headline.
 
