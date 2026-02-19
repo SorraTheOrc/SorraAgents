@@ -7,9 +7,9 @@ of the state machine, transitions, and AMPA delegation constraints.
 ## References
 
 - `workflow-language.md` — Validation Rules section (6 base rules)
-- `docs/workflow-schema.json` — JSON Schema (structural validation)
-- `docs/workflow.yaml` — Canonical workflow descriptor
-- `docs/engine-prd.md` — Engine execution semantics
+- `docs/workflow/workflow-schema.json` — JSON Schema (structural validation)
+- `docs/workflow/workflow.yaml` — Canonical workflow descriptor
+- `docs/workflow/engine-prd.md` — Engine execution semantics
 
 ---
 

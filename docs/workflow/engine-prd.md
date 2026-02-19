@@ -9,13 +9,13 @@
 | Status | Draft |
 | Author | opencode |
 | Date | 2026-02-19 |
-| Schema Ref | docs/workflow-schema.json, docs/workflow.yaml (SA-0MLT1ELCS16VDQV6) |
+| Schema Ref | docs/workflow/workflow-schema.json, docs/workflow/workflow.yaml (SA-0MLT1ELCS16VDQV6) |
 
 ---
 
 ## 1. Introduction
 
-This document describes how the AMPA engine consumes a workflow descriptor (as defined in `docs/workflow.yaml` / `docs/workflow.json`) to drive agent delegation and work item lifecycle management. It formalizes the behavior currently implemented in `scheduler.py` and maps it to the workflow descriptor schema.
+This document describes how the AMPA engine consumes a workflow descriptor (as defined in `docs/workflow/workflow.yaml` / `docs/workflow/workflow.json`) to drive agent delegation and work item lifecycle management. It formalizes the behavior currently implemented in `scheduler.py` and maps it to the workflow descriptor schema.
 
 ### 1.1 Delegation Pattern: Unidirectional
 
@@ -78,7 +78,7 @@ The engine operates as a **scheduler loop** that periodically:
 
 ### 2.2 Workflow Descriptor Loading
 
-The engine loads the workflow descriptor at startup and validates it against `docs/workflow-schema.json`. The descriptor provides:
+The engine loads the workflow descriptor at startup and validates it against `docs/workflow/workflow-schema.json`. The descriptor provides:
 
 - **Status and stage dimensions**: The valid values for work item `status` and `stage` fields.
 - **State aliases**: Friendly names for `(status, stage)` tuples used in command definitions.

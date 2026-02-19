@@ -54,14 +54,17 @@ def main():
     parser.add_argument(
         "--descriptor",
         type=Path,
-        default=Path(__file__).parent.parent / "docs" / "workflow.json",
-        help="Path to workflow descriptor JSON file (default: docs/workflow.json)",
+        default=Path(__file__).parent.parent / "docs" / "workflow" / "workflow.json",
+        help="Path to workflow descriptor JSON file (default: docs/workflow/workflow.json)",
     )
     parser.add_argument(
         "--schema",
         type=Path,
-        default=Path(__file__).parent.parent / "docs" / "workflow-schema.json",
-        help="Path to JSON Schema file (default: docs/workflow-schema.json)",
+        default=Path(__file__).parent.parent
+        / "docs"
+        / "workflow"
+        / "workflow-schema.json",
+        help="Path to JSON Schema file (default: docs/workflow/workflow-schema.json)",
     )
     args = parser.parse_args()
 

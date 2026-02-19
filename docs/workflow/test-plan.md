@@ -6,11 +6,11 @@ engine behavior described in `engine-prd.md`.
 
 ## References
 
-- `docs/validation-rules.md` — Formalized validation rules (V-S, V-SM, V-I, V-R, V-D)
-- `docs/workflow-schema.json` — JSON Schema
-- `docs/workflow.yaml` / `docs/workflow.json` — Canonical workflow descriptor
-- `docs/engine-prd.md` — Engine execution semantics
-- `docs/examples/` — Delegation flow examples
+- `docs/workflow/validation-rules.md` — Formalized validation rules (V-S, V-SM, V-I, V-R, V-D)
+- `docs/workflow/workflow-schema.json` — JSON Schema
+- `docs/workflow/workflow.yaml` / `docs/workflow/workflow.json` — Canonical workflow descriptor
+- `docs/workflow/engine-prd.md` — Engine execution semantics
+- `docs/workflow/examples/` — Delegation flow examples
 
 ---
 
@@ -40,8 +40,8 @@ and rejects invalid ones. Implemented via `jsonschema` library.
 
 | Field | Value |
 |---|---|
-| **Input** | `docs/workflow.json` |
-| **Schema** | `docs/workflow-schema.json` |
+| **Input** | `docs/workflow/workflow.json` |
+| **Schema** | `docs/workflow/workflow-schema.json` |
 | **Expected** | Validation passes with no errors |
 | **Validates** | V-S1 through V-S5 |
 
@@ -346,7 +346,7 @@ Integration tests that run all validators against the canonical descriptor.
 
 | Field | Value |
 |---|---|
-| **Input** | `docs/workflow.json` validated against `docs/workflow-schema.json` |
+| **Input** | `docs/workflow/workflow.json` validated against `docs/workflow/workflow-schema.json` |
 | **Expected** | No schema errors |
 | **CI** | `tests/validate_schema.py` |
 
@@ -354,7 +354,7 @@ Integration tests that run all validators against the canonical descriptor.
 
 | Field | Value |
 |---|---|
-| **Input** | `docs/workflow.json` |
+| **Input** | `docs/workflow/workflow.json` |
 | **Expected** | No V-SM errors or warnings |
 | **CI** | `tests/validate_state_machine.py` |
 
@@ -362,7 +362,7 @@ Integration tests that run all validators against the canonical descriptor.
 
 | Field | Value |
 |---|---|
-| **Input** | `docs/workflow.json` |
+| **Input** | `docs/workflow/workflow.json` |
 | **Expected** | No V-I errors |
 | **CI** | `tests/validate_state_machine.py` (combined) |
 
@@ -370,7 +370,7 @@ Integration tests that run all validators against the canonical descriptor.
 
 | Field | Value |
 |---|---|
-| **Input** | `docs/workflow.json` |
+| **Input** | `docs/workflow/workflow.json` |
 | **Expected** | No V-R errors |
 | **CI** | `tests/validate_state_machine.py` (combined) |
 
@@ -378,7 +378,7 @@ Integration tests that run all validators against the canonical descriptor.
 
 | Field | Value |
 |---|---|
-| **Input** | `docs/workflow.json` |
+| **Input** | `docs/workflow/workflow.json` |
 | **Expected** | No V-D errors |
 | **CI** | `tests/validate_state_machine.py` (combined) |
 
@@ -403,7 +403,7 @@ Specification-only — describe expected behavior for engine implementation test
 | **Initial State** | `idea` (open/idea) |
 | **Commands** | intake → author_prd → plan → delegate → complete_work → submit_review → audit_result → close_with_audit → approve |
 | **Expected States** | idea → intake → prd → plan → delegated → building → review → audit_passed → completed/in_review → shipped |
-| **Reference** | `docs/examples/01-happy-path.md` |
+| **Reference** | `docs/workflow/examples/01-happy-path.md` |
 
 ### T-ST-02: Audit Failure and Retry
 
@@ -412,7 +412,7 @@ Specification-only — describe expected behavior for engine implementation test
 | **Initial State** | `review` (in_progress/in_review) |
 | **Commands** | audit_fail → retry_delegation → delegate → complete_work → submit_review → audit_result |
 | **Expected States** | review → audit_failed → plan → delegated → building → review → audit_passed |
-| **Reference** | `docs/examples/02-audit-failure.md` |
+| **Reference** | `docs/workflow/examples/02-audit-failure.md` |
 
 ### T-ST-03: Blocked and Unblocked
 
@@ -421,7 +421,7 @@ Specification-only — describe expected behavior for engine implementation test
 | **Initial State** | `delegated` (in_progress/delegated) |
 | **Commands** | block → unblock |
 | **Expected States** | delegated → blocked_delegated → delegated |
-| **Reference** | `docs/examples/03-blocked-flow.md` |
+| **Reference** | `docs/workflow/examples/03-blocked-flow.md` |
 
 ### T-ST-04: Escalation Flow
 
@@ -430,7 +430,7 @@ Specification-only — describe expected behavior for engine implementation test
 | **Initial State** | `audit_failed` (in_progress/audit_failed) |
 | **Commands** | escalate → de_escalate → delegate |
 | **Expected States** | audit_failed → escalated → plan → delegated |
-| **Reference** | `docs/examples/06-escalation.md` |
+| **Reference** | `docs/workflow/examples/06-escalation.md` |
 
 ### T-ST-05: Manual Build Path (No Delegation)
 
@@ -492,7 +492,7 @@ Specification-only — describe pre/post invariant behavior.
 | **State** | `plan` |
 | **Setup** | Another work item is in `in_progress` status |
 | **Expected** | Command rejected: `no_in_progress_items` fails |
-| **Reference** | `docs/examples/05-work-in-progress.md` |
+| **Reference** | `docs/workflow/examples/05-work-in-progress.md` |
 
 ### T-IE-04: Pre-Invariant — No Acceptance Criteria
 
@@ -546,7 +546,7 @@ Specification-only — end-to-end scenarios testing AMPA engine behavior.
 | **Input** | Work item with AC, sufficient description, plan_complete stage |
 | **Expected Flow** | select → delegate → complete_work → submit_review → audit_result → close_with_audit → approve |
 | **Verification** | Final state is `shipped`, all audit comments present, Discord notifications sent |
-| **Reference** | `docs/examples/01-happy-path.md` |
+| **Reference** | `docs/workflow/examples/01-happy-path.md` |
 
 ### T-DL-02: Delegation — Audit Failure with Retry
 
@@ -555,7 +555,7 @@ Specification-only — end-to-end scenarios testing AMPA engine behavior.
 | **Scenario** | Audit finds gaps, engine retries, second audit passes |
 | **Expected Flow** | delegate → ... → audit_fail → retry_delegation → delegate → ... → audit_result → close |
 | **Verification** | Two audit comments present, `audit_failed` tag removed after retry |
-| **Reference** | `docs/examples/02-audit-failure.md` |
+| **Reference** | `docs/workflow/examples/02-audit-failure.md` |
 
 ### T-DL-03: Delegation — Escalation
 
@@ -564,7 +564,7 @@ Specification-only — end-to-end scenarios testing AMPA engine behavior.
 | **Scenario** | Two audit failures trigger escalation to Producer |
 | **Expected Flow** | delegate → ... → audit_fail → retry → delegate → ... → audit_fail → escalate |
 | **Verification** | Status is `blocked`, stage is `escalated`, assignee is `Producer`, Discord notification sent |
-| **Reference** | `docs/examples/06-escalation.md` |
+| **Reference** | `docs/workflow/examples/06-escalation.md` |
 
 ### T-DL-04: Delegation — Blocked During Implementation
 
@@ -573,7 +573,7 @@ Specification-only — end-to-end scenarios testing AMPA engine behavior.
 | **Scenario** | Patch encounters a blocker during implementation |
 | **Expected Flow** | delegate → block → unblock → complete_work → submit_review |
 | **Verification** | Block comment recorded, status transitions through blocked back to in_progress |
-| **Reference** | `docs/examples/03-blocked-flow.md` |
+| **Reference** | `docs/workflow/examples/03-blocked-flow.md` |
 
 ### T-DL-05: Delegation — No Candidates
 
@@ -581,7 +581,7 @@ Specification-only — end-to-end scenarios testing AMPA engine behavior.
 |---|---|
 | **Scenario** | Scheduler runs but `wl next` returns no candidates |
 | **Expected** | No delegation occurs, idle state logged, Discord notification sent |
-| **Reference** | `docs/examples/04-no-candidates.md` |
+| **Reference** | `docs/workflow/examples/04-no-candidates.md` |
 
 ### T-DL-06: Delegation — Concurrent Work In Progress
 
@@ -589,7 +589,7 @@ Specification-only — end-to-end scenarios testing AMPA engine behavior.
 |---|---|
 | **Scenario** | Scheduler runs but another item is already in progress |
 | **Expected** | `no_in_progress_items` invariant fails, delegation skipped |
-| **Reference** | `docs/examples/05-work-in-progress.md` |
+| **Reference** | `docs/workflow/examples/05-work-in-progress.md` |
 
 ---
 

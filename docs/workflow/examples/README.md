@@ -1,6 +1,6 @@
 # Delegation Flow Examples
 
-This directory contains structured examples showing how the AMPA engine uses the workflow descriptor (`docs/workflow.yaml`) to delegate work items to Patch agents and manage the lifecycle through to completion.
+This directory contains structured examples showing how the AMPA engine uses the workflow descriptor (`docs/workflow/workflow.yaml`) to delegate work items to Patch agents and manage the lifecycle through to completion.
 
 Each example traces a work item through state transitions, showing the workflow commands executed, invariants checked, and external actions triggered at each step.
 
