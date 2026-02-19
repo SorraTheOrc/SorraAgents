@@ -1,0 +1,373 @@
+"""Tests for delegation report deduplication.
+
+Verifies that duplicate delegation report Discord messages are suppressed
+when the report content has not changed between scheduler runs.
+
+Covers acceptance criteria from SA-0MLPPFNVO1Y7X717:
+  (a) First report is always sent
+  (b) Identical consecutive reports are suppressed
+  (c) Changed reports are sent
+"""
+
+import datetime as dt
+import json
+import subprocess
+
+from ampa.scheduler import (
+    CommandRunResult,
+    CommandSpec,
+    Scheduler,
+    SchedulerConfig,
+    SchedulerStore,
+    _content_hash,
+)
+from ampa import webhook as webhook_module
+
+
+class DummyStore(SchedulerStore):
+    def __init__(self) -> None:
+        self.path = ":memory:"
+        self.data = {
+            "commands": {},
+            "state": {},
+            "last_global_start_ts": None,
+            "dispatches": [],
+        }
+
+    def save(self) -> None:
+        return None
+
+
+def _make_scheduler(run_shell_callable, tmp_path):
+    store = DummyStore()
+    config = SchedulerConfig(
+        poll_interval_seconds=1,
+        global_min_interval_seconds=1,
+        priority_weight=0.1,
+        store_path=str(tmp_path / "store.json"),
+        llm_healthcheck_url="http://localhost/health",
+        max_run_history=5,
+    )
+
+    def _executor(_spec):
+        now_dt = dt.datetime.now(dt.timezone.utc)
+        return CommandRunResult(start_ts=now_dt, end_ts=now_dt, exit_code=0, output="")
+
+    return Scheduler(
+        store,
+        config,
+        run_shell=run_shell_callable,
+        command_cwd=str(tmp_path),
+        executor=_executor,
+    )
+
+
+def _delegation_spec():
+    return CommandSpec(
+        command_id="delegation",
+        command="",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={},
+        title="Delegation Report",
+        command_type="delegation",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _content_hash
+# ---------------------------------------------------------------------------
+
+
+def test_content_hash_deterministic():
+    assert _content_hash("hello") == _content_hash("hello")
+
+
+def test_content_hash_differs_for_different_input():
+    assert _content_hash("hello") != _content_hash("world")
+
+
+def test_content_hash_handles_none():
+    assert _content_hash(None) == _content_hash("")
+
+
+# ---------------------------------------------------------------------------
+# Unit test for _is_delegation_report_changed
+# ---------------------------------------------------------------------------
+
+
+def test_is_delegation_report_changed_first_call(tmp_path):
+    """First call should always return True (no previous hash)."""
+    sched = _make_scheduler(lambda *a, **kw: None, tmp_path)
+    assert sched._is_delegation_report_changed("delegation", "some report") is True
+
+
+def test_is_delegation_report_changed_same_content(tmp_path):
+    """Same content on second call should return False."""
+    sched = _make_scheduler(lambda *a, **kw: None, tmp_path)
+    sched._is_delegation_report_changed("delegation", "same report")
+    assert sched._is_delegation_report_changed("delegation", "same report") is False
+
+
+def test_is_delegation_report_changed_different_content(tmp_path):
+    """Different content on second call should return True."""
+    sched = _make_scheduler(lambda *a, **kw: None, tmp_path)
+    sched._is_delegation_report_changed("delegation", "report A")
+    assert sched._is_delegation_report_changed("delegation", "report B") is True
+
+
+def test_hash_persisted_in_state(tmp_path):
+    """Verify the hash is stored in the scheduler state dict."""
+    sched = _make_scheduler(lambda *a, **kw: None, tmp_path)
+    sched._is_delegation_report_changed("delegation", "test content")
+    state = sched.store.get_state("delegation")
+    assert "last_delegation_report_hash" in state
+    assert state["last_delegation_report_hash"] == _content_hash("test content")
+
+
+# ---------------------------------------------------------------------------
+# Integration: pre-dispatch report dedup via start_command
+# ---------------------------------------------------------------------------
+
+
+def _make_in_progress_shell(in_progress_text):
+    """Return a fake run_shell that simulates in-progress items."""
+
+    def fake_run_shell(cmd, **kwargs):
+        s = cmd.strip()
+        if s == "wl in_progress --json":
+            payload = {"workItems": [{"id": "SA-1", "title": "Busy"}]}
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+            )
+        if s == "wl in_progress":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=in_progress_text, stderr=""
+            )
+        if s == "wl next --json":
+            payload = {
+                "items": [{"id": "SA-999", "title": "Next work", "status": "open"}]
+            }
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    return fake_run_shell
+
+
+def test_first_report_always_sent(tmp_path, monkeypatch):
+    """AC (a): The very first delegation report should always be sent."""
+    webhook_calls = []
+
+    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
+        webhook_calls.append({"url": url, "payload": payload, "type": message_type})
+        return 204
+
+    monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    shell = _make_in_progress_shell("Found 1 in_progress:\n- SA-1 Busy item")
+    sched = _make_scheduler(shell, tmp_path)
+    spec = _delegation_spec()
+
+    sched.start_command(spec)
+
+    # The pre-dispatch report webhook should have been sent
+    command_calls = [c for c in webhook_calls if c["type"] == "command"]
+    assert len(command_calls) >= 1, "First report should be sent to Discord"
+
+
+def test_identical_report_suppressed(tmp_path, monkeypatch):
+    """AC (b): Identical consecutive reports should be suppressed."""
+    webhook_calls = []
+
+    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
+        webhook_calls.append({"url": url, "payload": payload, "type": message_type})
+        return 204
+
+    monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    shell = _make_in_progress_shell("Found 1 in_progress:\n- SA-1 Busy item")
+    sched = _make_scheduler(shell, tmp_path)
+    spec = _delegation_spec()
+
+    # First run: should send
+    sched.start_command(spec)
+    first_count = len([c for c in webhook_calls if c["type"] == "command"])
+    assert first_count >= 1
+
+    # Second run with identical content: should NOT send additional webhooks
+    sched.start_command(spec)
+    second_count = len([c for c in webhook_calls if c["type"] == "command"])
+    assert second_count == first_count, (
+        f"Duplicate report should be suppressed; "
+        f"expected {first_count} but got {second_count}"
+    )
+
+
+def test_changed_report_sent(tmp_path, monkeypatch):
+    """AC (c): Report with different content should be sent."""
+    webhook_calls = []
+
+    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
+        webhook_calls.append({"url": url, "payload": payload, "type": message_type})
+        return 204
+
+    monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    # First run: one in-progress item
+    shell1 = _make_in_progress_shell("Found 1 in_progress:\n- SA-1 Busy item")
+    sched = _make_scheduler(shell1, tmp_path)
+    spec = _delegation_spec()
+    sched.start_command(spec)
+    first_count = len([c for c in webhook_calls if c["type"] == "command"])
+    assert first_count >= 1
+
+    # Now change the in-progress items -> different report content
+    def shell2(cmd, **kwargs):
+        s = cmd.strip()
+        if s == "wl in_progress --json":
+            payload = {"workItems": [{"id": "SA-2", "title": "Different task"}]}
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+            )
+        if s == "wl in_progress":
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout="Found 1 in_progress:\n- SA-2 Different task",
+                stderr="",
+            )
+        if s == "wl next --json":
+            payload = {
+                "items": [{"id": "SA-888", "title": "Another", "status": "open"}]
+            }
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched.run_shell = shell2
+
+    sched.start_command(spec)
+    second_count = len([c for c in webhook_calls if c["type"] == "command"])
+    assert second_count > first_count, "Changed report should be sent to Discord"
+
+
+# ---------------------------------------------------------------------------
+# Integration: idle-no-candidate dedup
+# ---------------------------------------------------------------------------
+
+
+def test_idle_no_candidate_dedup(tmp_path, monkeypatch):
+    """Idle 'no candidate' messages should be deduped on consecutive runs."""
+    webhook_calls = []
+
+    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
+        webhook_calls.append({"type": message_type})
+        return 204
+
+    monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    def shell(cmd, **kwargs):
+        s = cmd.strip()
+        if s == "wl in_progress --json":
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps({"workItems": []}),
+                stderr="",
+            )
+        if s == "wl in_progress":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+        if "wl next" in s and "--json" in s:
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps({"items": []}),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = _make_scheduler(shell, tmp_path)
+    spec = _delegation_spec()
+
+    # First run
+    sched.start_command(spec)
+    first_count = len([c for c in webhook_calls if c["type"] == "command"])
+
+    # Second run with same state
+    sched.start_command(spec)
+    second_count = len([c for c in webhook_calls if c["type"] == "command"])
+
+    assert second_count == first_count, "Duplicate idle message should be suppressed"
+
+
+# ---------------------------------------------------------------------------
+# Dispatch notifications should NOT be deduped
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_notification_always_sent(tmp_path, monkeypatch):
+    """Dispatch notifications (message_type='dispatch') should not be suppressed."""
+    webhook_calls = []
+
+    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
+        webhook_calls.append({"type": message_type, "payload": payload})
+        return 204
+
+    monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    def shell(cmd, **kwargs):
+        s = cmd.strip()
+        if s == "wl in_progress --json":
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps({"workItems": []}),
+                stderr="",
+            )
+        if s == "wl in_progress":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+        if "wl next" in s and "--json" in s:
+            payload = {
+                "workItem": {
+                    "id": "SA-DISPATCH-1",
+                    "title": "Dispatch me",
+                    "stage": "idea",
+                }
+            }
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+            )
+        if s.startswith("opencode run"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="ok", stderr=""
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = _make_scheduler(shell, tmp_path)
+    spec = _delegation_spec()
+    sched.store.add_command(spec)
+
+    # Run twice; dispatch notification should appear both times
+    sched.start_command(spec)
+    first_dispatch = len([c for c in webhook_calls if c["type"] == "dispatch"])
+
+    sched.start_command(spec)
+    second_dispatch = len([c for c in webhook_calls if c["type"] == "dispatch"])
+
+    assert first_dispatch >= 1, "Dispatch notification should be sent on first run"
+    assert second_dispatch >= 2, (
+        "Dispatch notification should always be sent (not deduped)"
+    )

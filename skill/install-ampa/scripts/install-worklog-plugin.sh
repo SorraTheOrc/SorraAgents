@@ -212,8 +212,18 @@ prompt_upgrade_or_abort() {
 
 # Detect a per-project (local) installation that should be migrated to global.
 # Only relevant when installing to the global target (not --local).
+# Returns 1 (no local install / same as global) when the local and global
+# plugin directories resolve to the same path — there is nothing to migrate.
 detect_local_install() {
   if [ -f ".worklog/plugins/ampa.mjs" ] || [ -d ".worklog/plugins/ampa_py" ]; then
+    # Resolve both paths to absolute to detect the same-directory case
+    local local_abs global_abs
+    local_abs="$(cd ".worklog/plugins" 2>/dev/null && pwd)" || true
+    global_abs="$(cd "$GLOBAL_PLUGINS_DIR" 2>/dev/null && pwd)" || true
+    if [ -n "$local_abs" ] && [ "$local_abs" = "$global_abs" ]; then
+      log_decision "DETECT_LOCAL_INSTALL=same_as_global ($local_abs)"
+      return 1  # Same directory — not a separate local install
+    fi
     return 0  # Local install found
   fi
   return 1  # No local install
@@ -221,20 +231,23 @@ detect_local_install() {
 
 # Prompt user whether to migrate a local install to global.
 # Returns 0 (yes, migrate) or 1 (no, skip).
+# Migration is a destructive action so the default is to skip it.
+# The user must explicitly opt in by answering 'y' or 'yes'.
 prompt_migrate() {
   if [ "$AUTO_YES" -eq 1 ]; then
-    return 0  # Auto-migrate
+    return 1  # Auto-yes should not auto-migrate; upgrade in place instead
   fi
 
   if [ -t 0 ]; then
-    printf "Detected per-project plugin in .worklog/plugins/. Migrate to global install? [Y/n]: "
+    printf "Detected existing per-project plugin in .worklog/plugins/.\n"
+    printf "Migrate to global install? [y/N]: "
     if ! read -r MIGRATE_ANS; then MIGRATE_ANS=""; fi
     case "$(printf "%s" "$MIGRATE_ANS" | tr '[:upper:]' '[:lower:]')" in
-      n|no)
-        return 1  # Skip migration
+      y|yes)
+        return 0  # Yes, migrate (explicit opt-in)
         ;;
       *)
-        return 0  # Yes, migrate (default)
+        return 1  # Skip migration (default)
         ;;
     esac
   fi
@@ -981,8 +994,16 @@ main() {
       if prompt_migrate; then
         migrate_to_global
       else
-        log_info "Skipping migration; local install preserved."
-        log_decision "MIGRATION_SKIPPED=user_declined"
+        # User declined migration — upgrade the existing local install in
+        # place instead of installing a second copy into the global dir.
+        TARGET_DIR=".worklog/plugins"
+        log_info "Upgrading existing local install at $TARGET_DIR"
+        log_info ""
+        log_info "To migrate to a global install later, re-run the installer and"
+        log_info "answer 'y' when prompted, or run:"
+        log_info "  $SCRIPT_DIR/install-worklog-plugin.sh"
+        log_info ""
+        log_decision "MIGRATION_SKIPPED=user_declined TARGET_DIR=$TARGET_DIR"
       fi
     fi
   fi
