@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
@@ -378,6 +379,15 @@ def _summarize_for_discord(text: Optional[str], max_chars: int = 1000) -> str:
 
 def _trim_text(value: Optional[str]) -> str:
     return value.strip() if value else ""
+
+
+def _content_hash(text: Optional[str]) -> str:
+    """Return a SHA-256 hex digest of *text* for change detection.
+
+    Used to suppress duplicate delegation report Discord messages when the
+    report content has not changed since the previous run.
+    """
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
 def _bool_meta(value: Any) -> bool:
@@ -853,6 +863,34 @@ class Scheduler:
         except Exception:
             LOG.exception("Unexpected error while clearing stale running states")
 
+    def _is_delegation_report_changed(self, command_id: str, report_text: str) -> bool:
+        """Check whether the delegation report content has changed.
+
+        Compares a SHA-256 hash of *report_text* against the hash stored in the
+        scheduler state under ``last_delegation_report_hash``.  Returns True if
+        the content differs (or no previous hash exists) and updates the stored
+        hash.  Returns False when the content is identical to suppress duplicate
+        Discord messages.
+        """
+        new_hash = _content_hash(report_text)
+        state = self.store.get_state(command_id)
+        old_hash = state.get("last_delegation_report_hash")
+        if old_hash == new_hash:
+            LOG.info(
+                "Delegation report unchanged (hash=%s); suppressing Discord webhook",
+                new_hash[:12],
+            )
+            return False
+        # Content changed – persist the new hash
+        state["last_delegation_report_hash"] = new_hash
+        self.store.update_state(command_id, state)
+        LOG.info(
+            "Delegation report changed (old=%s new=%s); sending Discord webhook",
+            (old_hash or "(none)")[:12],
+            new_hash[:12],
+        )
+        return True
+
     def _global_rate_limited(self, now: dt.datetime) -> bool:
         last_start = self.store.last_global_start()
         if last_start is None:
@@ -1123,9 +1161,15 @@ class Scheduler:
                         "Pre-dispatch delegation report generated (len=%d)", len(report)
                     )
                     output = report
+                    # A pre-report was generated so the idle-no-candidate
+                    # fallback webhook should not fire regardless of whether
+                    # the dedup check suppresses this particular send.
+                    sent_pre_report = True
                     try:
                         webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                        if webhook:
+                        if webhook and self._is_delegation_report_changed(
+                            spec.command_id, report
+                        ):
                             message = _build_delegation_discord_message(report)
                             payload = webhook_module.build_command_payload(
                                 os.uname().nodename,
@@ -1142,7 +1186,6 @@ class Scheduler:
                             webhook_module.send_webhook(
                                 webhook, payload, message_type="command"
                             )
-                            sent_pre_report = True
                             LOG.info(
                                 "Sent pre-dispatch webhook for %s", spec.command_id
                             )
@@ -1182,7 +1225,9 @@ class Scheduler:
                 if not sent_pre_report:
                     try:
                         webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                        if webhook:
+                        if webhook and self._is_delegation_report_changed(
+                            spec.command_id, idle_msg
+                        ):
                             payload = webhook_module.build_command_payload(
                                 os.uname().nodename,
                                 run.end_ts.isoformat(),
@@ -1240,7 +1285,9 @@ class Scheduler:
                         # current idle state.
                         if not sent_pre_report and not idle_webhook_sent:
                             webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                            if webhook:
+                            if webhook and self._is_delegation_report_changed(
+                                spec.command_id, idle_msg
+                            ):
                                 try:
                                     payload = webhook_module.build_command_payload(
                                         os.uname().nodename,
@@ -1284,6 +1331,12 @@ class Scheduler:
                         try:
                             post_report = self._run_delegation_report(spec)
                             if post_report:
+                                # Update the stored hash so the next cycle
+                                # compares against this post-dispatch state
+                                # rather than the stale pre-dispatch content.
+                                self._is_delegation_report_changed(
+                                    spec.command_id, post_report
+                                )
                                 post_message = _build_delegation_discord_message(
                                     post_report
                                 )
@@ -2546,8 +2599,11 @@ class Scheduler:
             # Send a short idle notification to Discord so operators see that
             # the delegation run completed but there was nothing to act on.
             idle_webhook_sent = False
+            dedup_id = spec.command_id if spec is not None else "delegation"
             try:
-                if webhook:
+                if webhook and self._is_delegation_report_changed(
+                    dedup_id, "Agents are idle: nothing to delegate"
+                ):
                     msg = "Agents are idle: nothing to delegate"
                     payload = webhook_module.build_command_payload(
                         os.uname().nodename,
@@ -2674,18 +2730,20 @@ class Scheduler:
                             f"- {r.get('id')} — {r.get('title')}: {r.get('reason')}"
                         )
                     message = "\n".join(lines)
-                    payload = webhook_module.build_command_payload(
-                        os.uname().nodename,
-                        _utc_now().isoformat(),
-                        "delegation_idle_detailed",
-                        message,
-                        0,
-                        title=("Delegation: idle — candidates considered"),
-                    )
-                    webhook_module.send_webhook(
-                        webhook, payload, message_type="command"
-                    )
-                    idle_webhook_sent = True
+                    dedup_id = spec.command_id if spec is not None else "delegation"
+                    if self._is_delegation_report_changed(dedup_id, message):
+                        payload = webhook_module.build_command_payload(
+                            os.uname().nodename,
+                            _utc_now().isoformat(),
+                            "delegation_idle_detailed",
+                            message,
+                            0,
+                            title=("Delegation: idle — candidates considered"),
+                        )
+                        webhook_module.send_webhook(
+                            webhook, payload, message_type="command"
+                        )
+                        idle_webhook_sent = True
             except Exception:
                 LOG.exception("Failed to send detailed idle-state webhook")
             return {
