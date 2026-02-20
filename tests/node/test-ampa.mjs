@@ -29,6 +29,7 @@ class FakeCommand {
     this.program = program;
     this.subcommands = new Map();
     this.actionFn = null;
+    this._opts = {};
   }
 
   command(name) {
@@ -52,6 +53,16 @@ class FakeCommand {
   action(fn) {
     this.actionFn = fn;
     return this;
+  }
+
+  /** Mimic Commander.js Command.optsWithGlobals(). */
+  optsWithGlobals() {
+    return Object.assign({}, this._opts);
+  }
+
+  /** Set options so optsWithGlobals() returns them. */
+  setOpts(opts) {
+    this._opts = opts || {};
   }
 }
 
@@ -253,6 +264,11 @@ test('ampa list verbose prints store path', async (t) => {
     const ampaCmd = ctx.program.commands.get('ampa');
     const listCmd = ampaCmd.subcommands.get('list');
 
+    // The action handler signature is (opts, cmd) where cmd must have
+    // optsWithGlobals(). Set opts on the FakeCommand and pass it as the
+    // second argument.
+    listCmd.setOpts({ name: 't1', json: true, verbose: true });
+
     let output = '';
     const originalLog = console.log;
     console.log = (...args) => {
@@ -261,7 +277,7 @@ test('ampa list verbose prints store path', async (t) => {
     const originalCwd = process.cwd();
     try {
       process.chdir(tmp);
-      await listCmd.actionFn({ name: 't1', json: true, verbose: true });
+      await listCmd.actionFn({}, listCmd);
     } finally {
       process.chdir(originalCwd);
       console.log = originalLog;
