@@ -143,7 +143,7 @@ test('ampa list resolves daemon store env', async (t) => {
   });
 });
 
-test('ampa list uses bundled ampa store when no env override', async (t) => {
+test('resolveDaemonStore defaults to per-project path when no store file exists anywhere', async (t) => {
   await withTempDir('tmp-ampa-store-bundle-test', async (tmp) => {
     const daemon = path.join(tmp, 'daemon.js');
     fs.writeFileSync(daemon, 'setInterval(()=>{},1000);');
@@ -165,9 +165,50 @@ test('ampa list uses bundled ampa store when no env override', async (t) => {
     fs.mkdirSync(bundlePath, { recursive: true });
     fs.writeFileSync(path.join(bundlePath, 'scheduler.py'), '# placeholder');
 
+    // With per-project isolation, when no scheduler_store.json exists in either
+    // the per-project dir or the package dir, defaults to per-project path.
     const state = plugin.resolveDaemonStore(tmp, 't1');
     assert.equal(state.running, true, 'daemon should be reported running');
-    assert.equal(state.storePath, path.join(bundlePath, 'scheduler_store.json'));
+    assert.equal(state.storePath, path.join(tmp, '.worklog', 'ampa', 'scheduler_store.json'),
+      'should default to per-project path when no store file exists');
+
+    try {
+      process.kill(-proc.pid, 'SIGTERM');
+    } catch (e) {
+      try { process.kill(proc.pid, 'SIGTERM'); } catch (e2) {}
+    }
+    proc.unref();
+  });
+});
+
+test('resolveDaemonStore uses package-dir store for backward compat when file exists there', async (t) => {
+  await withTempDir('tmp-ampa-store-compat-test', async (tmp) => {
+    const daemon = path.join(tmp, 'daemon.js');
+    fs.writeFileSync(daemon, 'setInterval(()=>{},1000);');
+    fs.chmodSync(daemon, 0o755);
+    const proc = spawn('node', [daemon], {
+      cwd: tmp,
+      env: Object.assign({}, process.env),
+      stdio: 'ignore',
+      detached: true,
+    });
+    assert.ok(proc.pid, 'expected daemon pid');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const base = path.join(tmp, '.worklog', 'ampa', 't1');
+    fs.mkdirSync(base, { recursive: true });
+    fs.writeFileSync(path.join(base, 't1.pid'), String(proc.pid));
+
+    const bundlePath = path.join(tmp, '.worklog', 'plugins', 'ampa_py', 'ampa');
+    fs.mkdirSync(bundlePath, { recursive: true });
+    fs.writeFileSync(path.join(bundlePath, 'scheduler.py'), '# placeholder');
+    // Create the store file in the package dir to trigger backward compat
+    fs.writeFileSync(path.join(bundlePath, 'scheduler_store.json'), '{}');
+
+    const state = plugin.resolveDaemonStore(tmp, 't1');
+    assert.equal(state.running, true, 'daemon should be reported running');
+    assert.equal(state.storePath, path.join(bundlePath, 'scheduler_store.json'),
+      'should use package-dir store for backward compat when file exists there');
 
     try {
       process.kill(-proc.pid, 'SIGTERM');
@@ -386,7 +427,7 @@ test('resolveDaemonStore falls back to projectAmpaDir when no package found', as
   }
 });
 
-test('resolveDaemonStore finds global ampa_py package', async () => {
+test('resolveDaemonStore defaults to per-project path when global package has no store file', async () => {
   const savedXdg = process.env.XDG_CONFIG_HOME;
   const xdgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-store-gbl-'));
   try {
@@ -409,15 +450,119 @@ test('resolveDaemonStore finds global ampa_py package', async () => {
       fs.mkdirSync(base, { recursive: true });
       fs.writeFileSync(path.join(base, 't1.pid'), String(proc.pid));
 
-      // Create global ampa_py package with scheduler.py
+      // Create global ampa_py package with scheduler.py but no store file
       const globalPy = path.join(xdgDir, 'opencode', '.worklog', 'plugins', 'ampa_py', 'ampa');
       fs.mkdirSync(globalPy, { recursive: true });
       fs.writeFileSync(path.join(globalPy, 'scheduler.py'), '# placeholder');
 
+      // With per-project isolation, when no store file exists in either location,
+      // defaults to per-project path
+      const state = plugin.resolveDaemonStore(tmp, 't1');
+      assert.equal(state.running, true, 'daemon should be running');
+      assert.equal(state.storePath, path.join(tmp, '.worklog', 'ampa', 'scheduler_store.json'),
+        'should default to per-project path when global package has no store file');
+
+      try {
+        process.kill(-proc.pid, 'SIGTERM');
+      } catch (e) {
+        try { process.kill(proc.pid, 'SIGTERM'); } catch (e2) {}
+      }
+      proc.unref();
+    });
+  } finally {
+    if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = savedXdg;
+    try { fs.rmSync(xdgDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+test('resolveDaemonStore uses global package store for backward compat when file exists', async () => {
+  const savedXdg = process.env.XDG_CONFIG_HOME;
+  const xdgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-store-gbl-compat-'));
+  try {
+    process.env.XDG_CONFIG_HOME = xdgDir;
+
+    await withTempDir('tmp-ampa-store-global-compat', async (tmp) => {
+      const daemon = path.join(tmp, 'daemon.js');
+      fs.writeFileSync(daemon, 'setInterval(()=>{},1000);');
+      fs.chmodSync(daemon, 0o755);
+      const proc = spawn('node', [daemon], {
+        cwd: tmp,
+        env: Object.assign({}, process.env, { XDG_CONFIG_HOME: xdgDir }),
+        stdio: 'ignore',
+        detached: true,
+      });
+      assert.ok(proc.pid, 'expected daemon pid');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const base = path.join(tmp, '.worklog', 'ampa', 't1');
+      fs.mkdirSync(base, { recursive: true });
+      fs.writeFileSync(path.join(base, 't1.pid'), String(proc.pid));
+
+      // Create global ampa_py package with scheduler.py AND scheduler_store.json
+      const globalPy = path.join(xdgDir, 'opencode', '.worklog', 'plugins', 'ampa_py', 'ampa');
+      fs.mkdirSync(globalPy, { recursive: true });
+      fs.writeFileSync(path.join(globalPy, 'scheduler.py'), '# placeholder');
+      fs.writeFileSync(path.join(globalPy, 'scheduler_store.json'), '{}');
+
+      // With backward compat, when store file exists in the package dir and not
+      // in the per-project dir, should use the package dir store
       const state = plugin.resolveDaemonStore(tmp, 't1');
       assert.equal(state.running, true, 'daemon should be running');
       assert.equal(state.storePath, path.join(globalPy, 'scheduler_store.json'),
-        'should find scheduler_store.json via global ampa_py package');
+        'should use global package store for backward compat when file exists there');
+
+      try {
+        process.kill(-proc.pid, 'SIGTERM');
+      } catch (e) {
+        try { process.kill(proc.pid, 'SIGTERM'); } catch (e2) {}
+      }
+      proc.unref();
+    });
+  } finally {
+    if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = savedXdg;
+    try { fs.rmSync(xdgDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+test('resolveDaemonStore prefers per-project store over package-dir store', async () => {
+  const savedXdg = process.env.XDG_CONFIG_HOME;
+  const xdgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ampa-store-pref-'));
+  try {
+    process.env.XDG_CONFIG_HOME = xdgDir;
+
+    await withTempDir('tmp-ampa-store-prefer', async (tmp) => {
+      const daemon = path.join(tmp, 'daemon.js');
+      fs.writeFileSync(daemon, 'setInterval(()=>{},1000);');
+      fs.chmodSync(daemon, 0o755);
+      const proc = spawn('node', [daemon], {
+        cwd: tmp,
+        env: Object.assign({}, process.env, { XDG_CONFIG_HOME: xdgDir }),
+        stdio: 'ignore',
+        detached: true,
+      });
+      assert.ok(proc.pid, 'expected daemon pid');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const base = path.join(tmp, '.worklog', 'ampa', 't1');
+      fs.mkdirSync(base, { recursive: true });
+      fs.writeFileSync(path.join(base, 't1.pid'), String(proc.pid));
+
+      // Create BOTH per-project and global package store files
+      const projectStore = path.join(tmp, '.worklog', 'ampa', 'scheduler_store.json');
+      fs.writeFileSync(projectStore, '{"source":"project"}');
+
+      const globalPy = path.join(xdgDir, 'opencode', '.worklog', 'plugins', 'ampa_py', 'ampa');
+      fs.mkdirSync(globalPy, { recursive: true });
+      fs.writeFileSync(path.join(globalPy, 'scheduler.py'), '# placeholder');
+      fs.writeFileSync(path.join(globalPy, 'scheduler_store.json'), '{"source":"global"}');
+
+      // Per-project store should take precedence
+      const state = plugin.resolveDaemonStore(tmp, 't1');
+      assert.equal(state.running, true, 'daemon should be running');
+      assert.equal(state.storePath, projectStore,
+        'should prefer per-project store over package-dir store');
 
       try {
         process.kill(-proc.pid, 'SIGTERM');

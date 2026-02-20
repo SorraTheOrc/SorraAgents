@@ -145,9 +145,28 @@ class SchedulerConfig:
                 LOG.warning("Invalid %s=%r; using %s", name, raw, default)
                 return default
 
-        store_path = os.getenv("AMPA_SCHEDULER_STORE") or os.path.join(
-            os.path.dirname(__file__), "scheduler_store.json"
-        )
+        # Resolution order for scheduler_store.json:
+        #   1. AMPA_SCHEDULER_STORE env var (explicit override)
+        #   2. <projectRoot>/.worklog/ampa/scheduler_store.json (per-project)
+        #   3. <packageDir>/scheduler_store.json (backward compat)
+        # The daemon is spawned with cwd=projectRoot (ampa.mjs) so
+        # os.getcwd() gives the correct project root at startup.
+        env_store = os.getenv("AMPA_SCHEDULER_STORE")
+        if env_store:
+            store_path = env_store
+        else:
+            project_store = os.path.join(
+                os.getcwd(), ".worklog", "ampa", "scheduler_store.json"
+            )
+            pkg_store = os.path.join(os.path.dirname(__file__), "scheduler_store.json")
+            if os.path.isfile(project_store):
+                store_path = project_store
+            elif os.path.isfile(pkg_store):
+                store_path = pkg_store
+            else:
+                # Default to per-project path even if file doesn't exist yet;
+                # SchedulerStore will create it (or initialise from example).
+                store_path = project_store
         return SchedulerConfig(
             poll_interval_seconds=_int("AMPA_SCHEDULER_POLL_INTERVAL_SECONDS", 5),
             global_min_interval_seconds=_int(

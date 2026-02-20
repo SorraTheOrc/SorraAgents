@@ -45,30 +45,53 @@ from .metrics import (
 from .metrics import start_metrics_server
 
 
+def _project_ampa_dir() -> str:
+    """Return the per-project AMPA config directory.
+
+    Path: ``<cwd>/.worklog/ampa/``.  The daemon is always spawned with
+    ``cwd = projectRoot`` (see ampa.mjs) so ``os.getcwd()`` gives the
+    correct project root at startup.
+    """
+    return os.path.join(os.getcwd(), ".worklog", "ampa")
+
+
 def load_env() -> None:
-    """Load environment overrides from .env when available."""
-    # If an .env file exists in the package directory, load it so values there
-    # override the environment. Loading is optional; if python-dotenv is not
-    # installed we skip loading the file.
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
-    # Allow callers/tests to disable loading the package .env file by setting
-    # AMPA_LOAD_DOTENV=0. By default the package .env is loaded when python-dotenv
-    # is available and a package-local .env exists. Note: .env values override
-    # the environment per user request.
+    """Load environment overrides from .env when available.
+
+    Resolution order (first file found wins):
+      1. ``<projectRoot>/.worklog/ampa/.env``  (per-project config)
+      2. ``<packageDir>/.env``                 (backward compat / single-project)
+      3. ``<projectRoot>/.env``                (legacy repo-root fallback)
+    """
+    # Allow callers/tests to disable loading the .env file by setting
+    # AMPA_LOAD_DOTENV=0.
     if (
-        os.getenv("AMPA_LOAD_DOTENV", "1").lower() in ("1", "true", "yes")
-        and load_dotenv
-        and find_dotenv
+        os.getenv("AMPA_LOAD_DOTENV", "1").lower() not in ("1", "true", "yes")
+        or not load_dotenv
     ):
-        # prefer package-local .env when present
-        pkg_env = find_dotenv(env_path, usecwd=True)
-        if pkg_env:
-            load_dotenv(pkg_env, override=True)
-        else:
-            # Fallback to a repo root .env (e.g. /opt/ampa/.env) when present.
-            root_env = os.path.join(os.getcwd(), ".env")
-            if os.path.isfile(root_env):
-                load_dotenv(root_env, override=True)
+        return
+
+    # 1. Per-project .env  (<projectRoot>/.worklog/ampa/.env)
+    project_env = os.path.join(_project_ampa_dir(), ".env")
+    if os.path.isfile(project_env):
+        load_dotenv(project_env, override=True)
+        return
+
+    # 2. Package-local .env (backward compat for single-project / local installs)
+    pkg_env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if find_dotenv:
+        found = find_dotenv(pkg_env_path, usecwd=True)
+        if found:
+            load_dotenv(found, override=True)
+            return
+    elif os.path.isfile(pkg_env_path):
+        load_dotenv(pkg_env_path, override=True)
+        return
+
+    # 3. Legacy repo-root .env
+    root_env = os.path.join(os.getcwd(), ".env")
+    if os.path.isfile(root_env):
+        load_dotenv(root_env, override=True)
 
 
 def get_env_config() -> Dict[str, Any]:

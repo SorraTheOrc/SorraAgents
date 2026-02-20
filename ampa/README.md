@@ -32,15 +32,57 @@ See `ampa/scheduler_schema.md` for the command field schema, store layout, and t
 
 Configuration via .env
 
-Place a `.env` file in the `ampa/` directory (it is ignored by git by default). The daemon will load `ampa/.env` if present and values there override environment variables.
+When AMPA is installed globally (under `~/.config/opencode/.worklog/plugins/ampa_py/`),
+each project gets its own isolated configuration and state.
 
-Example `ampa/.env` contents:
+**Per-project config directory:** `<projectRoot>/.worklog/ampa/`
+
+The daemon resolves `.env` and `scheduler_store.json` relative to the project root
+(the directory the daemon was started from). Resolution order:
+
+**.env resolution (first file found wins):**
+1. `<projectRoot>/.worklog/ampa/.env` — per-project config (recommended)
+2. `<packageDir>/.env` — backward compat for single-project / local installs
+3. `<projectRoot>/.env` — legacy repo-root fallback
+
+**scheduler_store.json resolution:**
+1. `AMPA_SCHEDULER_STORE` env var — explicit override (always takes precedence)
+2. `<projectRoot>/.worklog/ampa/scheduler_store.json` — per-project state
+3. `<packageDir>/scheduler_store.json` — backward compat (only if the file exists there)
+4. Defaults to per-project path if no file exists yet
+
+**Migrating from a global install (shared config):**
+
+If you previously had a single `.env` and `scheduler_store.json` inside the
+AMPA package directory (e.g. `~/.config/opencode/.worklog/plugins/ampa_py/ampa/`),
+move them to each project that needs them:
+
+```sh
+# For each project that uses AMPA:
+mkdir -p <projectRoot>/.worklog/ampa/
+
+# Copy .env
+cp ~/.config/opencode/.worklog/plugins/ampa_py/ampa/.env \
+   <projectRoot>/.worklog/ampa/.env
+
+# Copy scheduler_store.json (if it exists)
+cp ~/.config/opencode/.worklog/plugins/ampa_py/ampa/scheduler_store.json \
+   <projectRoot>/.worklog/ampa/scheduler_store.json
+```
+
+After migrating, each project can have independent webhook URLs, scheduler state,
+and other configuration. The old files in the package directory are still used as
+a fallback if no per-project files are found, so existing single-project setups
+continue to work without changes.
+
+Example `<projectRoot>/.worklog/ampa/.env` contents:
 
 AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/...."
 AMPA_HEARTBEAT_MINUTES=1
 AMPA_VERIFY_PR_WITH_GH=1
 
-Environment variables are used if `.env` is not present. The daemon prefers values from the `.env` file when available.
+Environment variables are used if `.env` is not present. The daemon prefers
+values from the `.env` file when available.
 
 Installing dependencies (if running locally)
 

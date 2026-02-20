@@ -293,30 +293,46 @@ function resolveDaemonStore(projectRoot, name = 'default') {
     cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
   } catch (e) {}
   const env = readDaemonEnv(pid) || {};
+
+  // Resolution order (matches the Python daemon's SchedulerConfig.from_env):
+  //   1. AMPA_SCHEDULER_STORE env var (explicit override)
+  //   2. <projectRoot>/.worklog/ampa/scheduler_store.json (per-project)
+  //   3. <packageDir>/ampa/scheduler_store.json (backward compat)
   let storePath = env.AMPA_SCHEDULER_STORE || '';
   if (!storePath) {
-    const candidates = [];
-    if (env.PYTHONPATH) {
-      for (const entry of env.PYTHONPATH.split(path.delimiter)) {
-        if (entry) candidates.push(entry);
+    // Per-project path (preferred)
+    const projectStore = path.join(projectAmpaDir(projectRoot), 'scheduler_store.json');
+    if (fs.existsSync(projectStore)) {
+      storePath = projectStore;
+    } else {
+      // Backward compat: look inside the Python package directory
+      const candidates = [];
+      if (env.PYTHONPATH) {
+        for (const entry of env.PYTHONPATH.split(path.delimiter)) {
+          if (entry) candidates.push(entry);
+        }
+      }
+      candidates.push(path.join(projectRoot, '.worklog', 'plugins', 'ampa_py'));
+      try {
+        candidates.push(path.join(globalPluginsDir(), 'ampa_py'));
+      } catch (e) {}
+      let foundPkg = false;
+      for (const candidate of candidates) {
+        const ampaPath = path.join(candidate, 'ampa');
+        if (fs.existsSync(path.join(ampaPath, 'scheduler.py'))) {
+          const pkgStore = path.join(ampaPath, 'scheduler_store.json');
+          if (fs.existsSync(pkgStore)) {
+            storePath = pkgStore;
+            foundPkg = true;
+          }
+          break;
+        }
+      }
+      // Default to per-project path even if file doesn't exist yet
+      if (!storePath) {
+        storePath = projectStore;
       }
     }
-    candidates.push(path.join(projectRoot, '.worklog', 'plugins', 'ampa_py'));
-    // Also check the global plugins directory for the Python package.
-    try {
-      candidates.push(path.join(globalPluginsDir(), 'ampa_py'));
-    } catch (e) {}
-    for (const candidate of candidates) {
-      const ampaPath = path.join(candidate, 'ampa');
-      if (fs.existsSync(path.join(ampaPath, 'scheduler.py'))) {
-        storePath = path.join(ampaPath, 'scheduler_store.json');
-        break;
-      }
-    }
-  }
-  if (!storePath) {
-    // Canonical per-project location for scheduler state.
-    storePath = path.join(projectAmpaDir(projectRoot), 'scheduler_store.json');
   } else if (!path.isAbsolute(storePath)) {
     storePath = path.resolve(cwd, storePath);
   }
