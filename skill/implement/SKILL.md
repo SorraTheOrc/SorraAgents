@@ -120,6 +120,10 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Run the entire test suite.
     - Report the reults
     - Fix any failing tests before continuing.
+    - If the test run discovers failing tests that appear to be outside the scope or ownership of the current work item (e.g., failures in files not modified by this branch), invoke the triage helper to search or create a critical test-failure issue:
+      - Example: `python3 skill/triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"..."}'`
+      - If `check_or_create` returns that it created a NEW critical issue for this run, record the created issue id in the agent's local run-state and DO NOT proceed to create a PR for the current work item while that issue remains open, unless the PR will explicitly reference and close that issue.
+      - If an existing incomplete critical issue was matched, append any new evidence as a comment (the helper will do this) and proceed: pre-existing critical issues do not block PR creation for unrelated agent work.
   - Update or create relevant documentation.
   - Summarize changes made in the work item description or comments.
   - Do not proceed to the next step until the user confirms it is OK to do so.
@@ -148,3 +152,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Do not escape the PR body; use markdown formatting as needed.
 - Link the PR to the work-item in a work-item comment to the work item as follows `wl comment <work-item-id> --body "PR created: <URL>\nReady for review and merge." --author "<AGENT>" --json`.
 - Mark the work item to completed/in-review with `wl update <work-item-id> --status completed --stage in_review --json`
+
+Pre-PR blocking check
+---------------------
+- Before creating a PR, inspect the agent-run local state for any NEW critical test-failure issues created during this run. If any exist and remain open, the agent MUST not create a PR for the current work item unless the PR explicitly references and closes the created critical issue(s). Pre-existing critical issues (created prior to this agent run) are informational and do not block PR creation.

@@ -168,6 +168,13 @@ Worklog does not enforce these relationships but they can be used for planning a
 - Use `risk` and `effort` fields to track complexity and potential issues.
   - If available use the `effort_and_risk` agent skill to estimate these values.
 
+### Test-failure triage policy
+
+- When an agent discovers a failing test that appears to be outside its ownership/scope, it should call the triage helper `skill/triage/scripts/check_or_create.py` with structured evidence (test name, stdout excerpt, optional stack trace/commit/CI URL).
+- Any incomplete (open or in_progress) work item tagged `test-failure` that matches the failing test name in title or body should be considered a match and will be linked/updated. If no match exists the helper will create a `critical` work item using the repository template `skill/triage/resources/test-failure-template.md`.
+- If the agent creates a NEW critical test-failure issue during its run, the agent MUST not create or merge a PR for its current work item while that newly-created issue remains open unless the PR explicitly references and closes that issue. Pre-existing critical issues do not block PR creation.
+- Agents may continue to use `gh` or other tooling directly; this policy is enforced by agent workflow conventions and the implement skill.
+
 1. Check ready work: `wl next`
 2. Claim your task: `wl update <id> --status in_progress`
 3. Work on it: implement, test, document
