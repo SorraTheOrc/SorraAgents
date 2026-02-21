@@ -27,6 +27,49 @@ Unblocking by humans
 --------------------
 - If a human determines the match is a false positive, they should add a comment explaining why and close or retag the issue. Agents follow the issue state and may resume PR creation once the issue is closed or retagged.
 
+Sample `wl create` invocation
+-----------------------------
+```bash
+wl create \
+  --title "[test-failure] test_scheduler_heartbeat — AttributeError in heartbeat loop" \
+  --description "## Failure Signature
+
+- Test name: test_scheduler_heartbeat
+- Failing commit: abc1234 (if available)
+- CI job: (not available)
+
+## Evidence
+
+- Short stderr/stdout excerpt (first 1k characters):
+
+\`\`\`
+AttributeError: 'NoneType' object has no attribute 'send_heartbeat'
+\`\`\`
+
+## Steps To Reproduce
+
+1. Checkout the commit: git checkout abc1234
+2. Run the failing test: pytest -k \"test_scheduler_heartbeat\" -q
+3. Capture full logs and attach to the work item
+
+## Impact
+
+Blocks scheduler test suite; does not affect other test modules.
+
+## Suggested Triage Steps
+
+1. Verify flakiness: rerun CI/test locally once.
+2. If reproducible, add owner from owner-inference heuristics and assign for triage.
+3. If flaky, tag flaky and route to flaky-test queue.
+
+## Links
+
+- Runbook: skill/triage/resources/runbook-test-failure.md" \
+  --priority critical \
+  --tags "test-failure" \
+  --json
+```
+
 Notes
 -----
 - Keep the issue body concise and include exact commands to reproduce the failure.
