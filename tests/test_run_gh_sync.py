@@ -133,10 +133,10 @@ class TestEnsureRepoConfigured:
             repo = ensure_repo_configured()
 
         assert repo == "auto/detected"
-        # Verify the config file was updated
-        import yaml
+        # Verify the config file was updated (simple key: value format)
+        from ampa.run_gh_sync import _read_config
 
-        updated = yaml.safe_load(cfg_path.read_text())
+        updated = _read_config(cfg_path)
         assert updated["githubRepo"] == "auto/detected"
         assert updated["projectName"] == "Test"
 

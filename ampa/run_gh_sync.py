@@ -23,11 +23,6 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-try:
-    import yaml  # type: ignore[import-untyped]
-except ImportError:  # pragma: no cover
-    yaml = None  # type: ignore[assignment]
-
 LOG = logging.getLogger(__name__)
 
 _MODES = {"import", "push"}
@@ -45,23 +40,54 @@ def _config_path() -> Path:
 
 
 def _read_config(path: Path) -> dict:
-    """Read and return the worklog config as a dict."""
-    if yaml is None:
-        raise RuntimeError("PyYAML is required but not installed")
+    """Read and return the worklog config as a dict.
+
+    Uses simple ``key: value`` line parsing — no PyYAML dependency required.
+    The worklog config is a flat mapping (no nesting) so this is sufficient.
+    """
     if not path.is_file():
         return {}
+    data: dict[str, str] = {}
     with open(path, "r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
-    return data if isinstance(data, dict) else {}
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Split on first colon only
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            # Handle YAML-style booleans and unquoted strings
+            if value.lower() in ("true",):
+                data[key] = True  # type: ignore[assignment]
+            elif value.lower() in ("false",):
+                data[key] = False  # type: ignore[assignment]
+            elif value in ('""', "''"):
+                data[key] = ""  # type: ignore[assignment]
+            else:
+                # Strip surrounding quotes if present
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                data[key] = value  # type: ignore[assignment]
+    return data
 
 
 def _write_config(path: Path, data: dict) -> None:
-    """Write *data* back to the worklog config file."""
-    if yaml is None:
-        raise RuntimeError("PyYAML is required but not installed")
+    """Write *data* back to the worklog config file.
+
+    Produces simple ``key: value`` lines (one per entry).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    for key, value in data.items():
+        if isinstance(value, bool):
+            lines.append(f"{key}: {'true' if value else 'false'}")
+        else:
+            lines.append(f"{key}: {value}")
     with open(path, "w", encoding="utf-8") as fh:
-        yaml.safe_dump(data, fh, default_flow_style=False, sort_keys=False)
+        fh.write("\n".join(lines) + "\n")
 
 
 def _repo_from_config(cfg: dict) -> Optional[str]:
