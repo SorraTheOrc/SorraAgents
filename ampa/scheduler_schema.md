@@ -17,7 +17,7 @@ Each scheduled command is represented by a `CommandSpec` entry.
 
 ## Config knobs (env)
 
-- `AMPA_SCHEDULER_STORE`: file path for the scheduler store (default: `ampa/scheduler_store.json` next to the module).
+- `AMPA_SCHEDULER_STORE`: **deprecated** — the scheduler store is now always resolved to `<projectRoot>/.worklog/ampa/scheduler_store.json`.
 - `AMPA_SCHEDULER_POLL_INTERVAL_SECONDS`: scheduler loop interval in seconds (default: 5).
 - `AMPA_SCHEDULER_GLOBAL_MIN_INTERVAL_SECONDS`: global minimum interval between command starts (default: 60).
 - `AMPA_SCHEDULER_PRIORITY_WEIGHT`: priority multiplier weight (default: 0.1).
@@ -78,6 +78,26 @@ The store is a JSON file with the following top-level structure (see `ampa/sched
       "priority": 0,
       "metadata": {},
       "max_runtime_minutes": 1,
+      "type": "shell"
+    },
+    "gh-import": {
+      "id": "gh-import",
+      "command": "python -m ampa.run_gh_sync import",
+      "requires_llm": false,
+      "frequency_minutes": 30,
+      "priority": 0,
+      "metadata": { "discord_label": "gh import" },
+      "max_runtime_minutes": 5,
+      "type": "shell"
+    },
+    "gh-push": {
+      "id": "gh-push",
+      "command": "python -m ampa.run_gh_sync push",
+      "requires_llm": false,
+      "frequency_minutes": 180,
+      "priority": 0,
+      "metadata": { "discord_label": "gh push" },
+      "max_runtime_minutes": 5,
       "type": "shell"
     }
   },

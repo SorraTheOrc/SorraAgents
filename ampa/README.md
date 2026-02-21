@@ -163,6 +163,37 @@ The repository includes integration tests that start the server on an ephemeral
 port. Run them with `pytest -q` and confirm the new `tests/test_metrics_and_health.py`
 passes.
 
+GitHub sync
+-----------
+
+The scheduler runs two commands to keep Worklog work items and GitHub Issues
+in sync automatically:
+
+- **gh-import** — runs `wl github import --create-new` every 30 minutes to
+  pull new and updated GitHub Issues into the local worklog.
+- **gh-push** — runs `wl github push` every 3 hours to mirror local work
+  item changes back to GitHub Issues.
+
+Both commands use the `ampa.run_gh_sync` wrapper module which handles:
+
+- **Auto-detection of GitHub repo:** if `githubRepo` is not set in
+  `.worklog/config.yaml` (or is `"(not set)"`), the wrapper parses
+  `git remote get-url origin` (SSH and HTTPS formats) and writes the
+  detected `owner/repo` value back to the config idempotently.
+- **Error handling:** non-zero exit codes from `wl github` are propagated
+  to the scheduler, which posts Discord alerts via the existing webhook.
+- **Timeout:** commands are killed after 300 seconds.
+
+Manual usage:
+
+```sh
+# Import GitHub Issues into worklog
+python -m ampa.run_gh_sync import
+
+# Push worklog changes to GitHub Issues
+python -m ampa.run_gh_sync push
+```
+
 Scheduler admin CLI
 
   Use the scheduler CLI for admin tasks (listing, adding, updating commands):
