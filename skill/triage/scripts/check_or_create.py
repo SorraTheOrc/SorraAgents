@@ -96,8 +96,8 @@ def main():
     if match:
         # Attach a comment summarising new evidence
         issue_id = match.get("id") or (match.get("workItem") or {}).get("id")
-        comment = f"Additional evidence: stdout excerpt:\n``\n{stdout_excerpt}\n```\n``\n{stack}\n```"
-        run_wl(["comment", "add", issue_id, "--body", comment])
+        comment = f"Additional evidence: stdout excerpt:\n```\n{stdout_excerpt}\n```\nStack trace:\n```\n{stack}\n```"
+        run_wl(["comment", "add", issue_id, "--comment", comment])
         result = {
             "issueId": issue_id,
             "created": False,
