@@ -145,28 +145,12 @@ class SchedulerConfig:
                 LOG.warning("Invalid %s=%r; using %s", name, raw, default)
                 return default
 
-        # Resolution order for scheduler_store.json:
-        #   1. AMPA_SCHEDULER_STORE env var (explicit override)
-        #   2. <projectRoot>/.worklog/ampa/scheduler_store.json (per-project)
-        #   3. <packageDir>/scheduler_store.json (backward compat)
+        # The scheduler store MUST exist at the local per-project path.
         # The daemon is spawned with cwd=projectRoot (ampa.mjs) so
         # os.getcwd() gives the correct project root at startup.
-        env_store = os.getenv("AMPA_SCHEDULER_STORE")
-        if env_store:
-            store_path = env_store
-        else:
-            project_store = os.path.join(
-                os.getcwd(), ".worklog", "ampa", "scheduler_store.json"
-            )
-            pkg_store = os.path.join(os.path.dirname(__file__), "scheduler_store.json")
-            if os.path.isfile(project_store):
-                store_path = project_store
-            elif os.path.isfile(pkg_store):
-                store_path = pkg_store
-            else:
-                # Default to per-project path even if file doesn't exist yet;
-                # SchedulerStore will create it (or initialise from example).
-                store_path = project_store
+        store_path = os.path.join(
+            os.getcwd(), ".worklog", "ampa", "scheduler_store.json"
+        )
         return SchedulerConfig(
             poll_interval_seconds=_int("AMPA_SCHEDULER_POLL_INTERVAL_SECONDS", 5),
             global_min_interval_seconds=_int(
@@ -215,55 +199,16 @@ class SchedulerStore:
                 data.setdefault("dispatches", [])
                 return data
         except FileNotFoundError:
-            # Try to initialize from example file if available
-            self._initialize_from_example()
-            # Try loading again after initialization
-            try:
-                with open(self.path, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-                    if not isinstance(data, dict):
-                        raise ValueError("store root must be object")
-                    return data
-            except Exception:
-                # Fall back to empty store if initialization or re-load fails
-                return {
-                    "commands": {},
-                    "state": {},
-                    "last_global_start_ts": None,
-                }
+            raise FileNotFoundError(
+                f"Scheduler store not found at {self.path}. "
+                "The local scheduler_store.json must exist at "
+                "<projectRoot>/.worklog/ampa/scheduler_store.json before "
+                "starting the scheduler. Copy scheduler_store_example.json "
+                "to this location and configure your commands."
+            ) from None
         except Exception:
-            LOG.exception("Failed to read scheduler store; starting empty")
-            return {
-                "commands": {},
-                "state": {},
-                "last_global_start_ts": None,
-                "dispatches": [],
-            }
-
-    def _initialize_from_example(self) -> None:
-        """Initialize scheduler_store.json from scheduler_store_example.json if available."""
-        try:
-            # Look for example file in same directory as this module
-            example_path = os.path.join(
-                os.path.dirname(__file__), "scheduler_store_example.json"
-            )
-            if not os.path.exists(example_path):
-                LOG.debug("No example file found at %s", example_path)
-                return
-
-            # Ensure target directory exists
-            dir_name = os.path.dirname(self.path)
-            if dir_name:
-                os.makedirs(dir_name, exist_ok=True)
-
-            # Copy example to target location
-            shutil.copy(example_path, self.path)
-            LOG.info(
-                "Initialized scheduler_store.json from example at %s", example_path
-            )
-        except Exception:
-            LOG.debug("Failed to initialize scheduler_store from example")
-            # Not fatal - we'll use an empty store
+            LOG.exception("Failed to read scheduler store at %s", self.path)
+            raise
 
     def save(self) -> None:
         dir_name = os.path.dirname(self.path)

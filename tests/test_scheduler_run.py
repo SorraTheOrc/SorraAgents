@@ -703,3 +703,43 @@ def test_cli_run_list_format_full():
     assert "cmd-y" in output
     assert "Type:" in output
     assert "delegation" in output
+
+
+def test_scheduler_store_raises_on_missing_file(tmp_path):
+    """SchedulerStore must raise FileNotFoundError when the store file does not exist."""
+    missing_path = tmp_path / "nonexistent" / "scheduler_store.json"
+    import pytest
+
+    with pytest.raises(FileNotFoundError, match="Scheduler store not found"):
+        SchedulerStore(str(missing_path))
+
+
+def test_scheduler_store_raises_on_invalid_json(tmp_path):
+    """SchedulerStore must raise on corrupt/unreadable store files."""
+    bad_path = tmp_path / "scheduler_store.json"
+    bad_path.write_text("NOT VALID JSON")
+    import pytest
+
+    with pytest.raises(Exception):
+        SchedulerStore(str(bad_path))
+
+
+def test_scheduler_config_from_env_uses_local_path_only(monkeypatch, tmp_path):
+    """from_env() must resolve only to <cwd>/.worklog/ampa/scheduler_store.json."""
+    monkeypatch.chdir(tmp_path)
+    # Ensure env var is NOT honoured
+    monkeypatch.delenv("AMPA_SCHEDULER_STORE", raising=False)
+
+    config = SchedulerConfig.from_env()
+    expected = str(tmp_path / ".worklog" / "ampa" / "scheduler_store.json")
+    assert config.store_path == expected
+
+
+def test_scheduler_config_from_env_ignores_env_var(monkeypatch, tmp_path):
+    """from_env() must ignore the AMPA_SCHEDULER_STORE env var."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AMPA_SCHEDULER_STORE", "/some/other/path.json")
+
+    config = SchedulerConfig.from_env()
+    expected = str(tmp_path / ".worklog" / "ampa" / "scheduler_store.json")
+    assert config.store_path == expected
