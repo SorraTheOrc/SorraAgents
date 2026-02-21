@@ -356,3 +356,33 @@ Mode behavior (planned direction)
 - `discuss-options`: hold a short conversation with the agent to decide, which may still resolve to hold for human input.
 
 Longer term we expect per-decision overrides (for example: always approve running tests, require discussion for opening PRs), but the current config applies a single mode to all decisions for a project.
+
+Error Reporting
+---------------
+
+All CLI commands use a centralised error report helper (`ampa/error_report.py`) for
+unhandled errors. When a command encounters an unexpected exception, a structured
+Error Report is printed to stderr containing:
+
+- Command name and arguments
+- Error type and message
+- Timestamp, hostname, Python version, and platform
+- Full traceback (in verbose/human mode)
+- Suggested exit code
+
+The helper exposes three public functions:
+
+```python
+from ampa.error_report import build_error_report, render_error_report, render_error_report_json
+
+try:
+    do_work()
+except Exception as exc:
+    report = build_error_report(exc, command="my-cmd", args={"id": "foo"})
+    render_error_report(report, file=sys.stderr, verbose=True)   # human-readable
+    render_error_report_json(report, file=sys.stderr)            # JSON
+```
+
+When implementing new CLI commands, unhandled errors will automatically be
+caught and rendered by the `main()` entry point. For command-internal error
+paths (e.g. inside `_cli_run`), call the helper directly.
