@@ -7,6 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
   "requests",
   "python-dotenv",
+  "prometheus-client",
 ]
 
 [build-system]
