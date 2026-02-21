@@ -1,0 +1,8 @@
+# Owner map — path-glob to owner alias mappings
+# Used by the owner-inference skill to override heuristic detection.
+# Format: glob-pattern: owner-alias
+#
+# Examples:
+# skill/triage/*: triage-team
+# ampa/*: scheduler-team
+# tests/test_scheduler*: scheduler-team
