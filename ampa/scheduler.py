@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 import re
 import uuid
@@ -28,6 +29,11 @@ try:
     from . import webhook as webhook_module
     from . import selection
     from . import fallback
+    from .error_report import (
+        build_error_report,
+        render_error_report,
+        render_error_report_json,
+    )
 except ImportError:  # pragma: no cover - allow running as script
     import importlib
     import sys
@@ -37,6 +43,10 @@ except ImportError:  # pragma: no cover - allow running as script
     webhook_module = importlib.import_module("ampa.webhook")
     selection = importlib.import_module("ampa.selection")
     fallback = importlib.import_module("ampa.fallback")
+    _er = importlib.import_module("ampa.error_report")
+    build_error_report = _er.build_error_report
+    render_error_report = _er.render_error_report
+    render_error_report_json = _er.render_error_report_json
 
 LOG = logging.getLogger("ampa.scheduler")
 
@@ -3430,25 +3440,18 @@ def _cli_run(args: argparse.Namespace) -> int:
                 print(f"[{ts}]")
         try:
             run = scheduler.start_command(spec)
-        except Exception:
+        except Exception as exc:
             LOG.exception("Run failed for %s", command_id)
+            report = build_error_report(
+                exc,
+                command="run",
+                args={"command_id": command_id, "instance": instance},
+            )
             if use_json:
-                print(
-                    json.dumps(
-                        {
-                            "id": spec.command_id,
-                            "name": spec.title or spec.command_id,
-                            "status": "error",
-                            "error": f"Run failed for {command_id}",
-                            "instance": instance,
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    )
-                )
+                render_error_report_json(report, file=sys.stderr)
             else:
-                print(f"Run failed for {command_id}")
-            return 1
+                render_error_report(report, file=sys.stderr, verbose=True)
+            return report.exit_code
         if use_json:
             print(_format_run_result_json(spec, run, instance))
         else:
@@ -3594,7 +3597,25 @@ def main() -> None:
     handler = handlers.get(args.command)
     if handler is None:
         raise SystemExit(2)
-    handler(args)
+    try:
+        exit_code = handler(args)
+        if exit_code:
+            raise SystemExit(exit_code)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        LOG.exception("Unhandled error in command '%s'", args.command)
+        report = build_error_report(
+            exc,
+            command=args.command,
+            args=vars(args),
+        )
+        use_json = getattr(args, "json", False)
+        if use_json:
+            render_error_report_json(report, file=sys.stderr)
+        else:
+            render_error_report(report, file=sys.stderr, verbose=True)
+        raise SystemExit(report.exit_code)
 
 
 if __name__ == "__main__":
