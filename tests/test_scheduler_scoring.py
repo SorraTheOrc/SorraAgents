@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import os
 
 from ampa.scheduler import (
@@ -100,6 +101,7 @@ def test_global_rate_limiter_blocks_selection():
 def test_scheduler_runs_commands_from_start_cwd(tmp_path):
     now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     store_path = tmp_path / "scheduler_store.json"
+    store_path.write_text(json.dumps({"commands": {}, "state": {}}))
     store = SchedulerStore(str(store_path))
     config = SchedulerConfig(
         poll_interval_seconds=10,

@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 
 from ampa.scheduler import (
     CommandSpec,
@@ -30,6 +31,7 @@ def _seed_last_runs(scheduler: Scheduler, now: dt.datetime) -> None:
 def test_simulated_schedule_within_expected_deviation(tmp_path):
     now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
     store_path = tmp_path / "scheduler_store.json"
+    store_path.write_text(json.dumps({"commands": {}, "state": {}}))
     store = SchedulerStore(str(store_path))
     config = SchedulerConfig(
         poll_interval_seconds=10,
