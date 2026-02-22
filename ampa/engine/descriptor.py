@@ -134,6 +134,7 @@ class Command:
     inputs: dict[str, InputField] = field(default_factory=dict)
     prompt_ref: str = ""
     effects: Effects | None = None
+    dispatch_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -200,6 +201,26 @@ class WorkflowDescriptor:
                     result.append(cmd)
                     break
         return result
+
+    def resolve_from_state_alias(
+        self, command: Command, state: StateTuple
+    ) -> str | None:
+        """Return the from-state alias in *command* that matches *state*.
+
+        Iterates over *command.from_states*, resolves each ``StateRef`` and
+        returns the first alias string whose resolved ``StateTuple`` equals
+        *state*.  Returns ``None`` if no match is found or if the matching
+        ``StateRef`` is an inline ``StateTuple`` rather than an alias string.
+        """
+        for ref in command.from_states:
+            if isinstance(ref, str):
+                try:
+                    resolved = self.resolve_alias(ref)
+                except KeyError:
+                    continue
+                if resolved == state:
+                    return ref
+        return None
 
     def get_command(self, name: str) -> Command:
         """Look up a command by name.
@@ -344,6 +365,7 @@ def _parse_command(name: str, raw: dict[str, Any]) -> Command:
         inputs=inputs,
         prompt_ref=raw.get("prompt_ref", ""),
         effects=_parse_effects(raw.get("effects")),
+        dispatch_map=dict(raw.get("dispatch_map", {})),
     )
 
 

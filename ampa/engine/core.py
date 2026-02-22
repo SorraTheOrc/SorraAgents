@@ -38,7 +38,6 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Protocol
 
 from ampa.engine.candidates import CandidateResult, CandidateSelector
-from ampa.engine.commands import build_dispatch_command, stage_to_action
 from ampa.engine.descriptor import StateTuple, WorkflowDescriptor
 from ampa.engine.dispatch import DispatchResult, Dispatcher
 from ampa.engine.invariants import InvariantEvaluator, InvariantResult
@@ -509,8 +508,12 @@ class Engine:
         )
 
         # --- Step 4: Execute command logic ---
-        # Determine action from stage
-        action = stage_to_action(item_stage)
+        # Resolve the matching from-state alias so we can look up the
+        # dispatch template from the command's dispatch_map.
+        from_alias = self._descriptor.resolve_from_state_alias(
+            delegate_cmd, current_state
+        )
+        action = from_alias  # Used in logs, notifications, EngineResult
 
         # Apply fallback mode overrides
         if self._config.fallback_mode == "auto-decline":
@@ -519,7 +522,10 @@ class Engine:
             action = "accept"
 
         if action is None:
-            reason = f"No delegation action defined for stage '{item_stage}'"
+            reason = (
+                f"No from-state alias matched state "
+                f"({item_status}, {item_stage}) in delegate command"
+            )
             LOG.error("Step 4 failed: %s", reason)
             return EngineResult(
                 status=EngineStatus.ERROR,
@@ -530,10 +536,13 @@ class Engine:
                 timestamp=ts,
             )
 
-        # Build dispatch command
-        command_str = build_dispatch_command(work_item_id, action)
-        if command_str is None:
-            reason = f"No command template for action '{action}'"
+        # Look up the dispatch template from the descriptor
+        template = delegate_cmd.dispatch_map.get(action) if action else None
+        if template is None:
+            reason = (
+                f"No dispatch template for from-state alias '{action}' "
+                f"in delegate command's dispatch_map"
+            )
             LOG.error("Step 4 failed: %s", reason)
             return EngineResult(
                 status=EngineStatus.ERROR,
@@ -543,6 +552,8 @@ class Engine:
                 action=action,
                 timestamp=ts,
             )
+
+        command_str = template.format(id=work_item_id)
 
         # Dispatch
         dispatch_result = self._dispatcher.dispatch(

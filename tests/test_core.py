@@ -58,6 +58,7 @@ def _make_descriptor(
     effects: Effects | None = None,
     extra_commands: dict[str, Command] | None = None,
     invariants: tuple[Invariant, ...] | None = None,
+    dispatch_map: dict[str, str] | None = None,
 ) -> WorkflowDescriptor:
     """Build a minimal descriptor with a delegate command."""
     states = {
@@ -75,6 +76,13 @@ def _make_descriptor(
         "ready_for_impl",
     ]
 
+    if dispatch_map is None:
+        dispatch_map = {
+            "ready_for_intake": 'opencode run "/intake {id} do not ask questions"',
+            "ready_for_plan": 'opencode run "/plan {id}"',
+            "ready_for_impl": 'opencode run "work on {id} using the implement skill"',
+        }
+
     commands = {
         "delegate": Command(
             name="delegate",
@@ -85,6 +93,7 @@ def _make_descriptor(
             pre=pre_invariants,
             post=post_invariants,
             effects=effects,
+            dispatch_map=dispatch_map,
         ),
     }
 
@@ -352,7 +361,7 @@ class TestHappyPathDelegation:
         assert result.status == EngineStatus.SUCCESS
         assert result.work_item_id == "WL-1"
         assert result.command_name == "delegate"
-        assert result.action == "implement"
+        assert result.action == "ready_for_impl"
         assert result.dispatch_result is not None
         assert result.dispatch_result.success is True
 
@@ -363,7 +372,7 @@ class TestHappyPathDelegation:
         rec = deps["recorder"]
         assert len(rec.records) == 1
         assert rec.records[0]["work_item_id"] == "WL-1"
-        assert rec.records[0]["action"] == "implement"
+        assert rec.records[0]["action"] == "ready_for_impl"
         assert rec.records[0]["status"] == "dispatched"
 
     def test_state_transition_applied(self):
@@ -409,9 +418,9 @@ class TestHappyPathDelegation:
 
 
 class TestStageToActionMapping:
-    """Test that different stages map to correct actions."""
+    """Test that different stages resolve to correct dispatch templates."""
 
-    def test_idea_maps_to_intake(self):
+    def test_idea_dispatches_intake(self):
         candidate = _make_candidate(stage="idea")
         cr = _make_candidate_result(selected=candidate)
         wi = _make_work_item_data(stage="idea")
@@ -419,10 +428,10 @@ class TestStageToActionMapping:
         engine, deps = _build_engine(candidate_result=cr, work_item_data=wi)
         result = engine.process_delegation()
 
-        assert result.action == "intake"
+        assert result.action == "ready_for_intake"
         assert "/intake" in deps["dispatcher"].calls[0].command
 
-    def test_intake_complete_maps_to_plan(self):
+    def test_intake_complete_dispatches_plan(self):
         candidate = _make_candidate(stage="intake_complete")
         cr = _make_candidate_result(selected=candidate)
         wi = _make_work_item_data(stage="intake_complete")
@@ -430,10 +439,10 @@ class TestStageToActionMapping:
         engine, deps = _build_engine(candidate_result=cr, work_item_data=wi)
         result = engine.process_delegation()
 
-        assert result.action == "plan"
+        assert result.action == "ready_for_plan"
         assert "/plan" in deps["dispatcher"].calls[0].command
 
-    def test_plan_complete_maps_to_implement(self):
+    def test_plan_complete_dispatches_implement(self):
         candidate = _make_candidate(stage="plan_complete")
         cr = _make_candidate_result(selected=candidate)
         wi = _make_work_item_data(stage="plan_complete")
@@ -441,7 +450,7 @@ class TestStageToActionMapping:
         engine, deps = _build_engine(candidate_result=cr, work_item_data=wi)
         result = engine.process_delegation()
 
-        assert result.action == "implement"
+        assert result.action == "ready_for_impl"
         assert "implement" in deps["dispatcher"].calls[0].command
 
 

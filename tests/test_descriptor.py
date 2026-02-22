@@ -171,6 +171,56 @@ class TestLoadRealWorkflow:
         # delegate from: [idea, intake, plan]
         assert len(cmd.from_states) == 3
 
+    def test_delegate_dispatch_map(self, descriptor: WorkflowDescriptor) -> None:
+        cmd = descriptor.get_command("delegate")
+        assert len(cmd.dispatch_map) == 3
+        assert "idea" in cmd.dispatch_map
+        assert "intake" in cmd.dispatch_map
+        assert "plan" in cmd.dispatch_map
+        assert "/intake" in cmd.dispatch_map["idea"]
+        assert "/plan" in cmd.dispatch_map["intake"]
+        assert "implement" in cmd.dispatch_map["plan"]
+
+    def test_delegate_dispatch_map_template_substitution(
+        self, descriptor: WorkflowDescriptor
+    ) -> None:
+        cmd = descriptor.get_command("delegate")
+        result = cmd.dispatch_map["idea"].format(id="WL-99")
+        assert "WL-99" in result
+        assert result == 'opencode run "/intake WL-99 do not ask questions"'
+
+    def test_command_without_dispatch_map(self, descriptor: WorkflowDescriptor) -> None:
+        cmd = descriptor.get_command("intake")
+        assert cmd.dispatch_map == {}
+
+    def test_resolve_from_state_alias_idea(
+        self, descriptor: WorkflowDescriptor
+    ) -> None:
+        cmd = descriptor.get_command("delegate")
+        state = descriptor.resolve_alias("idea")
+        assert descriptor.resolve_from_state_alias(cmd, state) == "idea"
+
+    def test_resolve_from_state_alias_intake(
+        self, descriptor: WorkflowDescriptor
+    ) -> None:
+        cmd = descriptor.get_command("delegate")
+        state = descriptor.resolve_alias("intake")
+        assert descriptor.resolve_from_state_alias(cmd, state) == "intake"
+
+    def test_resolve_from_state_alias_plan(
+        self, descriptor: WorkflowDescriptor
+    ) -> None:
+        cmd = descriptor.get_command("delegate")
+        state = descriptor.resolve_alias("plan")
+        assert descriptor.resolve_from_state_alias(cmd, state) == "plan"
+
+    def test_resolve_from_state_alias_no_match(
+        self, descriptor: WorkflowDescriptor
+    ) -> None:
+        cmd = descriptor.get_command("delegate")
+        state = StateTuple(status="in_progress", stage="in_review")
+        assert descriptor.resolve_from_state_alias(cmd, state) is None
+
     def test_close_with_audit_inline_to(self, descriptor: WorkflowDescriptor) -> None:
         cmd = descriptor.get_command("close_with_audit")
         # close_with_audit uses inline StateTuple for "to"
