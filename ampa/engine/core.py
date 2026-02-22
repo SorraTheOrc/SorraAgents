@@ -23,7 +23,7 @@ Usage::
         dispatcher=dispatcher,
         candidate_selector=selector,
         invariant_evaluator=evaluator,
-        context_assembler=assembler,
+        work_item_fetcher=fetcher,
         config=EngineConfig(descriptor_path="docs/workflow/workflow.yaml"),
     )
     result = engine.process_delegation()
@@ -38,12 +38,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Protocol
 
 from ampa.engine.candidates import CandidateResult, CandidateSelector
-from ampa.engine.context import (
-    ContextAssembler,
-    DelegationContext,
-    build_dispatch_command,
-    stage_to_action,
-)
+from ampa.engine.context import build_dispatch_command, stage_to_action
 from ampa.engine.descriptor import StateTuple, WorkflowDescriptor
 from ampa.engine.dispatch import DispatchResult, Dispatcher
 from ampa.engine.invariants import InvariantEvaluator, InvariantResult
@@ -97,6 +92,18 @@ class NotificationSender(Protocol):
 
     def send(self, message: str, *, title: str = "", level: str = "info") -> bool:
         """Send a notification. Returns ``True`` on success."""
+        ...
+
+
+class WorkItemFetcher(Protocol):
+    """Protocol for fetching work item data from ``wl show``.
+
+    Returns the raw ``wl show {id} --children --json`` output as a dict,
+    or ``None`` on failure.
+    """
+
+    def fetch(self, work_item_id: str) -> dict[str, Any] | None:
+        """Fetch work item data.  Returns the JSON dict or ``None``."""
         ...
 
 
@@ -253,8 +260,8 @@ class Engine:
         Implementation for selecting work item candidates.
     invariant_evaluator:
         Implementation for evaluating pre/post invariants.
-    context_assembler:
-        Implementation for building delegation context.
+    work_item_fetcher:
+        Implementation for fetching work item data (``wl show``).
     updater:
         Implementation for applying ``wl update`` state transitions.
     comment_writer:
@@ -275,7 +282,7 @@ class Engine:
         dispatcher: Dispatcher,
         candidate_selector: CandidateSelector,
         invariant_evaluator: InvariantEvaluator,
-        context_assembler: ContextAssembler,
+        work_item_fetcher: WorkItemFetcher,
         updater: WorkItemUpdater | None = None,
         comment_writer: WorkItemCommentWriter | None = None,
         dispatch_recorder: DispatchRecorder | None = None,
@@ -287,7 +294,7 @@ class Engine:
         self._dispatcher = dispatcher
         self._selector = candidate_selector
         self._evaluator = invariant_evaluator
-        self._assembler = context_assembler
+        self._fetcher = work_item_fetcher
         self._updater = updater or NullUpdater()
         self._comment_writer = comment_writer or NullCommentWriter()
         self._recorder = dispatch_recorder or NullDispatchRecorder()
@@ -363,16 +370,17 @@ class Engine:
         else:
             candidate_result = None
             # Fetch work item to get current state
-            ctx = self._assembler.assemble(work_item_id)
-            if ctx is None:
+            wi_data = self._fetcher.fetch(work_item_id)
+            if wi_data is None:
                 return EngineResult(
                     status=EngineStatus.ERROR,
                     reason=f"Failed to fetch work item {work_item_id}",
                     work_item_id=work_item_id,
                     timestamp=ts,
                 )
-            item_stage = ctx.stage
-            item_status = ctx.status
+            wi = wi_data.get("workItem", wi_data)
+            item_stage = str(wi.get("stage", ""))
+            item_status = str(wi.get("status", ""))
 
         # --- Look up the delegate command ---
         try:
@@ -736,12 +744,12 @@ class Engine:
     # ------------------------------------------------------------------
 
     def _fetch_work_item_data(self, work_item_id: str) -> dict[str, Any] | None:
-        """Fetch work item data via the context assembler's fetcher.
+        """Fetch work item data via the work item fetcher.
 
         Returns the raw ``wl show`` JSON or ``None`` on failure.
         """
         try:
-            return self._assembler._fetcher.fetch(work_item_id)
+            return self._fetcher.fetch(work_item_id)
         except Exception:
             LOG.exception("Failed to fetch work item %s", work_item_id)
             return None

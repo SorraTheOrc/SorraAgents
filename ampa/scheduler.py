@@ -53,7 +53,7 @@ except ImportError:  # pragma: no cover - allow running as script
 from .engine.core import Engine, EngineConfig, EngineResult, EngineStatus
 from .engine.descriptor import load_descriptor
 from .engine.candidates import CandidateSelector
-from .engine.context import ContextAssembler
+
 from .engine.dispatch import OpenCodeRunDispatcher
 from .engine.invariants import InvariantEvaluator
 from .engine.adapters import (
@@ -851,7 +851,6 @@ class Scheduler:
                 run_shell=self.run_shell,
                 command_cwd=self.command_cwd,
             )
-            assembler = ContextAssembler(work_item_fetcher=fetcher)
             candidate_fetcher = ShellCandidateFetcher(
                 run_shell=self.run_shell,
                 command_cwd=self.command_cwd,
@@ -900,7 +899,7 @@ class Scheduler:
                 dispatcher=dispatcher,
                 candidate_selector=selector,
                 invariant_evaluator=evaluator,
-                context_assembler=assembler,
+                work_item_fetcher=fetcher,
                 updater=updater,
                 comment_writer=comment_writer,
                 dispatch_recorder=recorder,

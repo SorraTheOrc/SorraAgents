@@ -13,7 +13,6 @@ from ampa.engine.candidates import (
     CandidateSelector,
     WorkItemCandidate,
 )
-from ampa.engine.context import ContextAssembler, DelegationContext, WorkItemFetcher
 from ampa.engine.core import (
     Engine,
     EngineConfig,
@@ -24,6 +23,7 @@ from ampa.engine.core import (
     NullNotificationSender,
     NullUpdater,
     WorkItemCommentWriter,
+    WorkItemFetcher,
     WorkItemUpdater,
 )
 from ampa.engine.descriptor import (
@@ -296,7 +296,6 @@ def _build_engine(
         work_item_data = _make_work_item_data()
 
     fetcher = MockFetcher(work_item_data)
-    assembler = ContextAssembler(work_item_fetcher=fetcher)
 
     if candidate_result is None:
         candidate_result = _make_candidate_result()
@@ -317,7 +316,7 @@ def _build_engine(
         dispatcher=disp,
         candidate_selector=mock_selector,
         invariant_evaluator=evaluator,
-        context_assembler=assembler,
+        work_item_fetcher=fetcher,
         updater=upd,
         comment_writer=cw,
         dispatch_recorder=rec,
