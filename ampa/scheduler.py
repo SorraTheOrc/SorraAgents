@@ -48,6 +48,29 @@ except ImportError:  # pragma: no cover - allow running as script
     render_error_report = _er.render_error_report
     render_error_report_json = _er.render_error_report_json
 
+# Engine imports — soft-import so that missing engine package does not break
+# the scheduler entirely (graceful degradation).
+try:
+    from .engine.core import Engine, EngineConfig, EngineResult, EngineStatus
+    from .engine.descriptor import load_descriptor
+    from .engine.candidates import CandidateSelector
+    from .engine.context import ContextAssembler
+    from .engine.dispatch import OpenCodeRunDispatcher
+    from .engine.invariants import InvariantEvaluator
+    from .engine.adapters import (
+        ShellCandidateFetcher,
+        ShellInProgressQuerier,
+        ShellWorkItemFetcher,
+        ShellWorkItemUpdater,
+        ShellCommentWriter,
+        StoreDispatchRecorder,
+        DiscordNotificationSender,
+    )
+
+    _ENGINE_AVAILABLE = True
+except ImportError:  # pragma: no cover - engine may not be installed yet
+    _ENGINE_AVAILABLE = False
+
 LOG = logging.getLogger("ampa.scheduler")
 
 
@@ -682,6 +705,7 @@ class Scheduler:
         executor: Optional[Callable[[CommandSpec], RunResult]] = None,
         command_cwd: Optional[str] = None,
         run_shell: Optional[Callable[..., subprocess.CompletedProcess]] = None,
+        engine: Optional[Any] = None,
     ) -> None:
         self.store = store
         self.config = config
@@ -753,6 +777,16 @@ class Scheduler:
                 )
 
         self.run_shell = _run_shell_with_timeout
+
+        # --- Engine initialization ---
+        # If an engine is explicitly provided, use it.  Otherwise, attempt to
+        # build one from the workflow descriptor if the engine package is
+        # available.  The engine is optional — if it cannot be constructed the
+        # scheduler falls back to the legacy delegation path.
+        self.engine: Optional[Any] = engine
+        if self.engine is None and _ENGINE_AVAILABLE:
+            self.engine = self._build_engine()
+
         LOG.info("Command runner timeout configured: %ss", _default_timeout)
         LOG.info(
             "Scheduler initialized: store=%s poll_interval=%s global_min_interval=%s",
@@ -793,6 +827,99 @@ class Scheduler:
             self._clear_stale_running_states()
         except Exception:
             LOG.exception("Failed to clear stale running states")
+
+    def _build_engine(self) -> Optional[Any]:
+        """Attempt to construct an Engine from the workflow descriptor.
+
+        Returns ``None`` when the descriptor cannot be loaded (e.g. the YAML
+        file is missing or malformed).  In that case the scheduler will
+        fall back to the legacy delegation path.
+        """
+        try:
+            descriptor_path = os.getenv(
+                "AMPA_WORKFLOW_DESCRIPTOR",
+                os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    "docs",
+                    "workflow",
+                    "workflow.yaml",
+                ),
+            )
+
+            descriptor = load_descriptor(descriptor_path)
+
+            # Shell-based adapters for wl CLI calls
+            fetcher = ShellWorkItemFetcher(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+            )
+            assembler = ContextAssembler(work_item_fetcher=fetcher)
+            candidate_fetcher = ShellCandidateFetcher(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+            )
+            in_progress_querier = ShellInProgressQuerier(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+            )
+            selector = CandidateSelector(
+                descriptor=descriptor,
+                fetcher=candidate_fetcher,
+                in_progress_querier=in_progress_querier,
+            )
+            evaluator = InvariantEvaluator(
+                invariants=descriptor.invariants,
+                querier=in_progress_querier,
+            )
+            dispatcher = OpenCodeRunDispatcher(cwd=self.command_cwd)
+
+            # Protocol adapters for external dependencies
+            updater = ShellWorkItemUpdater(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+            )
+            comment_writer = ShellCommentWriter(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+            )
+            recorder = StoreDispatchRecorder(store=self.store)
+            notifier = DiscordNotificationSender()
+
+            # Resolve fallback mode at engine init time so it is consistent
+            # for the lifetime of this scheduler instance.
+            try:
+                fb_mode = fallback.resolve_mode(None, require_config=True)
+            except Exception:
+                fb_mode = None
+
+            engine_config = EngineConfig(
+                descriptor_path=descriptor_path,
+                fallback_mode=fb_mode,
+            )
+
+            engine = Engine(
+                descriptor=descriptor,
+                dispatcher=dispatcher,
+                candidate_selector=selector,
+                invariant_evaluator=evaluator,
+                context_assembler=assembler,
+                updater=updater,
+                comment_writer=comment_writer,
+                dispatch_recorder=recorder,
+                notifier=notifier,
+                config=engine_config,
+            )
+            LOG.info(
+                "Engine initialized with descriptor=%s fallback_mode=%s",
+                descriptor_path,
+                fb_mode,
+            )
+            return engine
+        except Exception:
+            LOG.exception(
+                "Failed to initialize engine — falling back to legacy delegation"
+            )
+            return None
 
     def _clear_stale_running_states(self) -> None:
         """Clear `running` flags for commands whose last_start_ts is older
@@ -2459,6 +2586,132 @@ class Scheduler:
         )
         webhook_module.send_webhook(webhook, payload, message_type="command")
 
+    def _run_idle_delegation_via_engine(
+        self, *, audit_only: bool, spec: Optional[CommandSpec] = None
+    ) -> Dict[str, Any]:
+        """Engine-based delegation: delegate to the engine and convert the
+        result back to the legacy dict format expected by callers.
+
+        This method is only called when ``self.engine`` is not None.
+        """
+        assert self.engine is not None  # guaranteed by caller
+
+        # If the engine's config needs to reflect the current audit_only
+        # state (it may differ from the init-time config), rebuild a
+        # transient config.  However, for now we simply check audit_only
+        # locally since the engine was constructed with the scheduler-level
+        # default; per-call audit_only is more granular.
+        if audit_only:
+            return {
+                "note": "Delegation: skipped (audit_only)",
+                "dispatched": False,
+                "rejected": [],
+                "idle_webhook_sent": False,
+            }
+
+        try:
+            result = self.engine.process_delegation()
+        except Exception:
+            LOG.exception("Engine process_delegation raised an exception")
+            return {
+                "note": "Delegation: engine error",
+                "dispatched": False,
+                "rejected": [],
+                "idle_webhook_sent": False,
+                "error": "engine exception",
+            }
+
+        # Convert EngineResult to legacy dict format.
+        status = result.status
+
+        if status == EngineStatus.SUCCESS:
+            action = result.action or "unknown"
+            wid = result.work_item_id or "?"
+            delegate_title = ""
+            if result.candidate_result and result.candidate_result.selected:
+                delegate_title = result.candidate_result.selected.title
+            delegate_info: Dict[str, Any] = {
+                "action": action,
+                "id": wid,
+                "title": delegate_title,
+                "stdout": "",
+                "stderr": "",
+            }
+            if result.dispatch_result:
+                delegate_info["pid"] = result.dispatch_result.pid
+            return {
+                "note": f"Delegation: dispatched {action} {wid}",
+                "dispatched": True,
+                "delegate_info": delegate_info,
+                "rejected": self._engine_rejections(result),
+                "idle_webhook_sent": False,
+            }
+
+        if status == EngineStatus.NO_CANDIDATES:
+            # The engine already sent a Discord notification via its notifier.
+            return {
+                "note": "Delegation: skipped (no wl next candidates)",
+                "dispatched": False,
+                "rejected": self._engine_rejections(result),
+                "idle_webhook_sent": True,
+            }
+
+        if status == EngineStatus.SKIPPED:
+            return {
+                "note": f"Delegation: skipped ({result.reason})",
+                "dispatched": False,
+                "rejected": [],
+                "idle_webhook_sent": False,
+            }
+
+        if status in (
+            EngineStatus.REJECTED,
+            EngineStatus.INVARIANT_FAILED,
+        ):
+            return {
+                "note": f"Delegation: blocked ({result.reason})",
+                "dispatched": False,
+                "rejected": self._engine_rejections(result),
+                "idle_webhook_sent": False,
+            }
+
+        if status == EngineStatus.DISPATCH_FAILED:
+            return {
+                "note": f"Delegation: failed ({result.reason})",
+                "dispatched": False,
+                "rejected": self._engine_rejections(result),
+                "idle_webhook_sent": False,
+                "error": result.reason,
+            }
+
+        # ERROR or any other unexpected status
+        return {
+            "note": f"Delegation: engine error ({result.reason})",
+            "dispatched": False,
+            "rejected": self._engine_rejections(result),
+            "idle_webhook_sent": False,
+            "error": result.reason,
+        }
+
+    @staticmethod
+    def _engine_rejections(result: Any) -> List[Dict[str, str]]:
+        """Extract rejected-candidate summaries from an EngineResult for
+        backward compatibility with the legacy delegation dict format."""
+        rejected: List[Dict[str, str]] = []
+        cr = getattr(result, "candidate_result", None)
+        if cr is None:
+            return rejected
+        for rej in getattr(cr, "rejections", ()):
+            c = getattr(rej, "candidate", None)
+            rejected.append(
+                {
+                    "id": getattr(c, "id", "?") if c else "?",
+                    "title": getattr(c, "title", "(unknown)") if c else "(unknown)",
+                    "reason": getattr(rej, "reason", "rejected"),
+                }
+            )
+        return rejected
+
     def _run_idle_delegation(
         self, *, audit_only: bool, spec: Optional[CommandSpec] = None
     ) -> Dict[str, Any]:
@@ -2471,6 +2724,19 @@ class Scheduler:
         - idle_webhook_sent: bool (True if a detailed idle webhook was posted)
         - delegate_info: optional dict with dispatch details when dispatched
         """
+        # --- Engine-based delegation path ---
+        # When the engine is available, delegate all candidate selection,
+        # invariant evaluation, state transitions, and dispatch to it.
+        # The engine handles recording, notification, and error handling
+        # internally.  We convert the EngineResult back into the legacy
+        # dict format so callers in start_command() and _run_triage_audit()
+        # continue to work unchanged.
+        if self.engine is not None and _ENGINE_AVAILABLE:
+            return self._run_idle_delegation_via_engine(
+                audit_only=audit_only, spec=spec
+            )
+
+        # --- Legacy delegation path ---
         if audit_only:
             return {
                 "note": "Delegation: skipped (audit_only)",
