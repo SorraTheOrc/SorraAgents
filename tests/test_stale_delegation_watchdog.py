@@ -12,8 +12,10 @@ These tests verify that:
 5. Items below the threshold are not recovered.
 6. The watchdog is a no-op when no delegated items exist.
 7. The watchdog handles errors gracefully (wl failures, parse errors).
-8. The watchdog runs as part of the delegation command flow.
-9. The AMPA_STALE_DELEGATION_THRESHOLD_SECONDS env var is respected.
+8. The watchdog runs as its own scheduled command (command_type
+   'stale-delegation-watchdog'), not embedded in the delegation flow.
+9. The watchdog command is auto-registered at scheduler init.
+10. The AMPA_STALE_DELEGATION_THRESHOLD_SECONDS env var is respected.
 """
 
 import datetime as dt
@@ -819,17 +821,22 @@ class TestErrorHandling:
 
 
 # ---------------------------------------------------------------------------
-# 6. Integration with delegation command flow
+# 6. Scheduled command integration
 # ---------------------------------------------------------------------------
 
 
-class TestDelegationFlowIntegration:
-    """Verify the watchdog runs as part of the delegation command flow."""
+class TestScheduledCommandIntegration:
+    """Verify the watchdog runs as its own scheduled command type."""
 
-    def test_watchdog_called_during_delegation_start_command(self):
-        """_recover_stale_delegations is called when processing a delegation command."""
+    def test_watchdog_runs_for_stale_delegation_watchdog_command_type(self):
+        """start_command calls _recover_stale_delegations for the watchdog command type."""
         store = DummyStore()
-        spec = _make_spec(command_type="delegation")
+        spec = _make_spec(
+            command_id="stale-delegation-watchdog",
+            command_type="stale-delegation-watchdog",
+            command="echo watchdog",
+            title="Stale Delegation Watchdog",
+        )
         store.add_command(spec)
 
         def noop_executor(_spec):
@@ -839,7 +846,6 @@ class TestDelegationFlowIntegration:
             )
 
         shell = ShellRecorder()
-        # Return empty in-progress for the watchdog
         shell.add_response(
             "wl in_progress",
             subprocess.CompletedProcess(
@@ -865,33 +871,8 @@ class TestDelegationFlowIntegration:
             scheduler.start_command(spec)
             mock_recover.assert_called_once()
 
-    def test_watchdog_not_called_for_non_delegation_commands(self):
-        """_recover_stale_delegations is NOT called for shell/heartbeat commands."""
-        store = DummyStore()
-        spec = _make_spec(
-            command_id="heartbeat-1", command_type="shell", command="echo hi"
-        )
-        store.add_command(spec)
-
-        def noop_executor(_spec):
-            start = _utc_now()
-            return CommandRunResult(
-                start_ts=start, end_ts=_utc_now(), exit_code=0, output=""
-            )
-
-        scheduler = Scheduler(
-            store,
-            _make_config(),
-            executor=noop_executor,
-            run_shell=ShellRecorder(),
-        )
-
-        with mock.patch.object(scheduler, "_recover_stale_delegations") as mock_recover:
-            scheduler.start_command(spec)
-            mock_recover.assert_not_called()
-
-    def test_watchdog_failure_does_not_block_delegation(self):
-        """If the watchdog raises, delegation proceeds normally."""
+    def test_watchdog_not_called_for_delegation_commands(self):
+        """_recover_stale_delegations is NOT called for delegation command type."""
         store = DummyStore()
         spec = _make_spec(command_type="delegation")
         store.add_command(spec)
@@ -920,15 +901,65 @@ class TestDelegationFlowIntegration:
             run_shell=shell,
         )
 
+        with mock.patch.object(scheduler, "_recover_stale_delegations") as mock_recover:
+            scheduler.start_command(spec)
+            mock_recover.assert_not_called()
+
+    def test_watchdog_not_called_for_shell_commands(self):
+        """_recover_stale_delegations is NOT called for shell/heartbeat commands."""
+        store = DummyStore()
+        spec = _make_spec(
+            command_id="heartbeat-1", command_type="shell", command="echo hi"
+        )
+        store.add_command(spec)
+
+        def noop_executor(_spec):
+            start = _utc_now()
+            return CommandRunResult(
+                start_ts=start, end_ts=_utc_now(), exit_code=0, output=""
+            )
+
+        scheduler = Scheduler(
+            store,
+            _make_config(),
+            executor=noop_executor,
+            run_shell=ShellRecorder(),
+        )
+
+        with mock.patch.object(scheduler, "_recover_stale_delegations") as mock_recover:
+            scheduler.start_command(spec)
+            mock_recover.assert_not_called()
+
+    def test_watchdog_failure_does_not_crash_start_command(self):
+        """If the watchdog raises, start_command still returns a result."""
+        store = DummyStore()
+        spec = _make_spec(
+            command_id="stale-delegation-watchdog",
+            command_type="stale-delegation-watchdog",
+            command="echo watchdog",
+        )
+        store.add_command(spec)
+
+        def noop_executor(_spec):
+            start = _utc_now()
+            return CommandRunResult(
+                start_ts=start, end_ts=_utc_now(), exit_code=0, output=""
+            )
+
+        scheduler = Scheduler(
+            store,
+            _make_config(),
+            executor=noop_executor,
+            run_shell=ShellRecorder(),
+        )
+
         with mock.patch.object(
             scheduler,
             "_recover_stale_delegations",
             side_effect=RuntimeError("watchdog exploded"),
         ):
-            # Should not raise — the watchdog failure is caught
             result = scheduler.start_command(spec)
 
-        # Delegation still ran (exit code recorded)
         assert result is not None
 
     def test_recovered_items_appear_in_logs(self, caplog):
@@ -936,7 +967,11 @@ class TestDelegationFlowIntegration:
         import logging
 
         store = DummyStore()
-        spec = _make_spec(command_type="delegation")
+        spec = _make_spec(
+            command_id="stale-delegation-watchdog",
+            command_type="stale-delegation-watchdog",
+            command="echo watchdog",
+        )
         store.add_command(spec)
 
         def noop_executor(_spec):
@@ -971,11 +1006,71 @@ class TestDelegationFlowIntegration:
         with caplog.at_level(logging.INFO, logger="ampa.scheduler"):
             scheduler.start_command(spec)
 
-        # Check that the integration-level log about recovery was emitted
         watchdog_logs = [
             r for r in caplog.records if "watchdog recovered" in r.message.lower()
         ]
         assert len(watchdog_logs) >= 1
+
+
+class TestWatchdogAutoRegistration:
+    """Verify the watchdog command is auto-registered at scheduler init."""
+
+    def test_watchdog_command_registered_on_init(self):
+        """Scheduler.__init__ auto-registers the stale-delegation-watchdog command."""
+        store = DummyStore()
+
+        def noop_executor(_spec):
+            start = _utc_now()
+            return CommandRunResult(
+                start_ts=start, end_ts=_utc_now(), exit_code=0, output=""
+            )
+
+        Scheduler(
+            store,
+            _make_config(),
+            executor=noop_executor,
+            run_shell=ShellRecorder(),
+        )
+
+        commands = store.list_commands()
+        watchdog_cmds = [
+            c for c in commands if c.command_id == "stale-delegation-watchdog"
+        ]
+        assert len(watchdog_cmds) == 1
+        wd = watchdog_cmds[0]
+        assert wd.command_type == "stale-delegation-watchdog"
+        assert wd.frequency_minutes == 30
+        assert wd.requires_llm is False
+
+    def test_watchdog_not_duplicated_on_reinit(self):
+        """If the watchdog command already exists, init does not duplicate it."""
+        store = DummyStore()
+
+        def noop_executor(_spec):
+            start = _utc_now()
+            return CommandRunResult(
+                start_ts=start, end_ts=_utc_now(), exit_code=0, output=""
+            )
+
+        # Init twice
+        Scheduler(
+            store,
+            _make_config(),
+            executor=noop_executor,
+            run_shell=ShellRecorder(),
+        )
+        Scheduler(
+            store,
+            _make_config(),
+            executor=noop_executor,
+            run_shell=ShellRecorder(),
+        )
+
+        commands = store.list_commands()
+        watchdog_cmds = [
+            c for c in commands if c.command_id == "stale-delegation-watchdog"
+        ]
+        assert len(watchdog_cmds) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -823,6 +823,11 @@ class Scheduler:
         except Exception:
             LOG.exception("Failed to clear stale running states")
 
+        # Auto-register the stale delegation watchdog as a scheduled command
+        # so it runs on its own cadence (every 30 minutes) independently of
+        # delegation timing.
+        self._ensure_watchdog_command()
+
     def _build_engine(self) -> Optional[Engine]:
         """Construct an Engine from the workflow descriptor.
 
@@ -959,6 +964,48 @@ class Scheduler:
                     )
         except Exception:
             LOG.exception("Unexpected error while clearing stale running states")
+
+    # ------------------------------------------------------------------
+    # Auto-registration of built-in commands
+    # ------------------------------------------------------------------
+
+    _WATCHDOG_COMMAND_ID = "stale-delegation-watchdog"
+
+    def _ensure_watchdog_command(self) -> None:
+        """Register the stale-delegation-watchdog command if absent.
+
+        The watchdog runs on its own cadence (default 30 minutes) so that
+        stuck delegated items are detected even when the delegation command
+        itself is not being selected by the scheduler.
+        """
+        try:
+            existing = self.store.list_commands()
+            for cmd in existing:
+                if cmd.command_id == self._WATCHDOG_COMMAND_ID:
+                    LOG.debug(
+                        "Watchdog command already registered: %s",
+                        self._WATCHDOG_COMMAND_ID,
+                    )
+                    return
+            watchdog_spec = CommandSpec(
+                command_id=self._WATCHDOG_COMMAND_ID,
+                command="echo watchdog",  # placeholder; actual work is in start_command
+                requires_llm=False,
+                frequency_minutes=30,
+                priority=0,
+                metadata={},
+                title="Stale Delegation Watchdog",
+                max_runtime_minutes=5,
+                command_type="stale-delegation-watchdog",
+            )
+            self.store.add_command(watchdog_spec)
+            LOG.info(
+                "Auto-registered watchdog command: %s (every %dm)",
+                self._WATCHDOG_COMMAND_ID,
+                watchdog_spec.frequency_minutes,
+            )
+        except Exception:
+            LOG.exception("Failed to auto-register watchdog command")
 
     # ------------------------------------------------------------------
     # Stale delegation watchdog
@@ -1428,19 +1475,6 @@ class Scheduler:
                 spec.command_id,
                 _bool_meta(spec.metadata.get("audit_only")),
             )
-            # --- Stale delegation watchdog ---
-            # Before attempting new delegation, check for and recover any
-            # work items stuck in delegated state from previous runs.
-            try:
-                stale_recovered = self._recover_stale_delegations()
-                if stale_recovered:
-                    LOG.info(
-                        "Stale delegation watchdog recovered %d item(s) before delegation",
-                        len(stale_recovered),
-                    )
-            except Exception:
-                LOG.exception("Stale delegation watchdog failed")
-            # --- End watchdog ---
             # Inspect current state first. If there is a candidate that will be
             # dispatched we want to avoid sending the pre-dispatch report to
             # Discord (otherwise operators see two nearly-identical messages).
@@ -1697,6 +1731,18 @@ class Scheduler:
                 triage_audited = False
             # triage-audit posts its own discord summary; avoid generic post
             return run
+        if spec.command_type == "stale-delegation-watchdog":
+            try:
+                stale_recovered = self._recover_stale_delegations()
+                if stale_recovered:
+                    LOG.info(
+                        "Stale delegation watchdog recovered %d item(s)",
+                        len(stale_recovered),
+                    )
+            except Exception:
+                LOG.exception("Stale delegation watchdog failed")
+            return run
+
         # always post the generic discord message afterwards
         self._post_discord(spec, run, output)
         return run

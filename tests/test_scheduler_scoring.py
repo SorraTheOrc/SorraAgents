@@ -40,6 +40,13 @@ def _make_scheduler(now: dt.datetime, llm_available: bool) -> Scheduler:
         llm_probe=lambda _url: llm_available,
         executor=_executor,
     )
+    # The watchdog command is auto-registered at init.  Give it a recent
+    # last_run_ts so it doesn't interfere with scoring tests that care
+    # about specific command ordering.
+    scheduler.store.update_state(
+        "stale-delegation-watchdog",
+        {"last_run_ts": now.isoformat()},
+    )
     return scheduler
 
 
