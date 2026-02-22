@@ -2,3 +2,4 @@ projectName: Sorra Agents
 prefix: SA
 autoExport: true
 autoSync: false
+githubRepo: SorraTheOrc/SorraAgents
