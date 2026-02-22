@@ -9,6 +9,8 @@ from ampa.scheduler import (
     SchedulerConfig,
     SchedulerStore,
 )
+from ampa.engine.core import EngineConfig
+from ampa.engine.dispatch import DispatchResult
 
 
 class DummyStore(SchedulerStore):
@@ -85,7 +87,7 @@ def test_delegation_in_progress_prints_single_line(tmp_path, capsys):
     )
 
 
-def test_delegation_idle_prints_markdown_summary(tmp_path, capsys):
+def test_delegation_idle_prints_markdown_summary(tmp_path, capsys, monkeypatch):
     def fake_run_shell(cmd, **kwargs):
         if cmd.strip() == "wl in_progress --json":
             return subprocess.CompletedProcess(
@@ -97,42 +99,71 @@ def test_delegation_idle_prints_markdown_summary(tmp_path, capsys):
             )
         if cmd.strip() == "wl next --json":
             payload = {
-                "workItem": {"id": "SA-42", "title": "Do thing", "stage": "idea"}
+                "workItem": {
+                    "id": "SA-42",
+                    "title": "Do thing",
+                    "status": "open",
+                    "stage": "idea",
+                }
             }
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
             )
-        if cmd.strip() == "wl show SA-42 --json":
+        if "wl show" in cmd and "SA-42" in cmd:
             item = {
                 "id": "SA-42",
                 "title": "Do thing",
+                "status": "open",
                 "stage": "idea",
                 "priority": 2,
                 "assignee": "alex",
-                "description": "A short description that should be included in the summary.",
+                "description": (
+                    "This is a sufficiently long description for the Do thing "
+                    "work item that satisfies the engine requires_work_item_context "
+                    "invariant needing more than 100 characters.\n\n"
+                    "Acceptance Criteria:\n"
+                    "- [ ] Summary is printed correctly\n"
+                    "- [ ] Markdown includes JSON block"
+                ),
             }
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=json.dumps(item), stderr=""
             )
-        if cmd.strip().startswith("opencode run"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="ok", stderr=""
-            )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
+    monkeypatch.delenv("AMPA_FALLBACK_MODE", raising=False)
     sched = _make_scheduler(fake_run_shell, tmp_path)
+
+    # Override fallback_mode to None so engine uses natural stage-to-action
+    sched.engine._config = EngineConfig(  # type: ignore[union-attr]
+        descriptor_path=sched.engine._config.descriptor_path,  # type: ignore[union-attr]
+        fallback_mode=None,
+    )
+
+    # Mock engine dispatcher to avoid real subprocess spawning
+    def fake_dispatch(command, work_item_id):
+        return DispatchResult(
+            success=True,
+            command=command,
+            work_item_id=work_item_id,
+            pid=99999,
+            timestamp=dt.datetime.now(dt.timezone.utc),
+        )
+
+    monkeypatch.setattr(sched.engine._dispatcher, "dispatch", fake_dispatch)  # type: ignore[union-attr]
+
     sched.start_command(_delegation_spec())
     out = capsys.readouterr().out
 
     assert out.startswith("Starting work on")
     assert "# Do thing - SA-42" in out
     assert "- ID: SA-42" in out
-    assert "- Status/Stage: idea" in out
+    assert "- Status/Stage: open" in out
     assert "- Assignee: alex" in out
     assert "```json" in out
 
 
-def test_delegation_idle_falls_back_when_show_invalid(tmp_path, capsys):
+def test_delegation_idle_falls_back_when_show_invalid(tmp_path, capsys, monkeypatch):
     def fake_run_shell(cmd, **kwargs):
         if cmd.strip() == "wl in_progress --json":
             return subprocess.CompletedProcess(
@@ -144,7 +175,12 @@ def test_delegation_idle_falls_back_when_show_invalid(tmp_path, capsys):
             )
         if cmd.strip() == "wl next --json":
             payload = {
-                "workItem": {"id": "SA-99", "title": "Fallback", "stage": "idea"}
+                "workItem": {
+                    "id": "SA-99",
+                    "title": "Fallback",
+                    "status": "open",
+                    "stage": "idea",
+                }
             }
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
@@ -153,13 +189,29 @@ def test_delegation_idle_falls_back_when_show_invalid(tmp_path, capsys):
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="{bad json", stderr=""
             )
-        if cmd.strip().startswith("opencode run"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="ok", stderr=""
-            )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
+    monkeypatch.delenv("AMPA_FALLBACK_MODE", raising=False)
     sched = _make_scheduler(fake_run_shell, tmp_path)
+
+    # Override fallback_mode to None so engine uses natural stage-to-action
+    sched.engine._config = EngineConfig(  # type: ignore[union-attr]
+        descriptor_path=sched.engine._config.descriptor_path,  # type: ignore[union-attr]
+        fallback_mode=None,
+    )
+
+    # Mock engine dispatcher to avoid real subprocess spawning
+    def fake_dispatch(command, work_item_id):
+        return DispatchResult(
+            success=True,
+            command=command,
+            work_item_id=work_item_id,
+            pid=99999,
+            timestamp=dt.datetime.now(dt.timezone.utc),
+        )
+
+    monkeypatch.setattr(sched.engine._dispatcher, "dispatch", fake_dispatch)  # type: ignore[union-attr]
+
     sched.start_command(_delegation_spec())
     out = capsys.readouterr().out
 

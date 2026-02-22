@@ -1,8 +1,7 @@
 """Integration tests: Scheduler + Engine delegation path.
 
-Tests that the scheduler correctly routes delegation through the engine
-when ``self.engine`` is not None and ``_ENGINE_AVAILABLE`` is True, and
-falls back to the legacy code path when the engine is absent.
+Tests that the scheduler correctly routes delegation through the engine.
+The engine is a hard dependency — there is no legacy fallback path.
 """
 
 import datetime as dt
@@ -51,7 +50,7 @@ class DummyStore(SchedulerStore):
     def save(self):
         return None
 
-    def append_dispatch(self, record: dict) -> str:
+    def append_dispatch(self, record: dict, retain_last: int = 100) -> str:
         self._dispatches.append(record)
         return f"dispatch-{len(self._dispatches)}"
 
@@ -102,9 +101,8 @@ def _make_scheduler(
     store = DummyStore()
     config = _make_config()
 
-    # Prevent auto-construction of engine by patching _ENGINE_AVAILABLE
-    # when we want to control it.
-    with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", False):
+    # Suppress auto-construction of engine so we can inject our own
+    with mock.patch.object(Scheduler, "_build_engine", return_value=None):
         scheduler = Scheduler(
             store=store,
             config=config,
@@ -168,19 +166,17 @@ def _make_engine_result(
 
 
 class TestEngineRouting:
-    """Tests that _run_idle_delegation routes to the engine when available."""
+    """Tests that _run_idle_delegation routes to the engine."""
 
     def test_routes_to_engine_when_available(self):
-        """When engine is set and _ENGINE_AVAILABLE, delegation uses engine."""
+        """When engine is set, delegation uses engine."""
         engine = mock.MagicMock(spec=Engine)
         engine.process_delegation.return_value = _make_engine_result(
             status=EngineStatus.SUCCESS,
         )
 
         scheduler = _make_scheduler(engine=engine)
-
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
 
         engine.process_delegation.assert_called_once()
         assert result["dispatched"] is True
@@ -189,68 +185,19 @@ class TestEngineRouting:
         assert result["delegate_info"]["action"] == "intake"
         assert result["delegate_info"]["pid"] == 12345
 
-    def test_falls_back_to_legacy_when_engine_is_none(self):
-        """When engine is None, _run_idle_delegation uses the legacy path."""
+    def test_engine_none_raises_assertion(self):
+        """When engine is None, _run_idle_delegation raises AssertionError."""
         scheduler = _make_scheduler(engine=None)
 
-        # Legacy path calls _load_in_progress inside → needs run_shell stub
-        # that returns empty in_progress and empty candidates.
-        def stub_run_shell(cmd, **kwargs):
-            if "in_progress" in cmd:
-                return subprocess.CompletedProcess(
-                    args=cmd, returncode=0, stdout="[]", stderr=""
-                )
-            if "next" in cmd:
-                return subprocess.CompletedProcess(
-                    args=cmd, returncode=0, stdout="[]", stderr=""
-                )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="{}", stderr=""
-            )
-
-        scheduler = _make_scheduler(engine=None, run_shell=stub_run_shell)
-
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
-
-        # Legacy path: no candidates → skipped
-        assert result["dispatched"] is False
-        assert "no wl next candidates" in result["note"]
-
-    def test_falls_back_when_engine_available_false(self):
-        """Even if engine is set, _ENGINE_AVAILABLE=False → legacy path."""
-        engine = mock.MagicMock(spec=Engine)
-        scheduler = _make_scheduler(engine=engine)
-
-        def stub_run_shell(cmd, **kwargs):
-            if "in_progress" in cmd:
-                return subprocess.CompletedProcess(
-                    args=cmd, returncode=0, stdout="[]", stderr=""
-                )
-            if "next" in cmd:
-                return subprocess.CompletedProcess(
-                    args=cmd, returncode=0, stdout="[]", stderr=""
-                )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="{}", stderr=""
-            )
-
-        scheduler.run_shell = stub_run_shell
-
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", False):
-            result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
-
-        # Engine not called
-        engine.process_delegation.assert_not_called()
-        assert result["dispatched"] is False
+        with pytest.raises(AssertionError):
+            scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
 
     def test_audit_only_skips_engine(self):
         """audit_only=True returns early without calling the engine."""
         engine = mock.MagicMock(spec=Engine)
         scheduler = _make_scheduler(engine=engine)
 
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            result = scheduler._run_idle_delegation(audit_only=True, spec=_make_spec())
+        result = scheduler._run_idle_delegation(audit_only=True, spec=_make_spec())
 
         engine.process_delegation.assert_not_called()
         assert result["dispatched"] is False
@@ -274,9 +221,7 @@ class TestEngineResultConversion:
             work_item_id="WL-99",
         )
         scheduler = _make_scheduler(engine=engine)
-
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
 
         assert result["dispatched"] is True
         assert result["note"] == "Delegation: dispatched plan WL-99"
@@ -292,9 +237,7 @@ class TestEngineResultConversion:
             with_candidate=False,
         )
         scheduler = _make_scheduler(engine=engine)
-
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
 
         assert result["dispatched"] is False
         assert result["idle_webhook_sent"] is True
@@ -309,9 +252,7 @@ class TestEngineResultConversion:
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
         scheduler = _make_scheduler(engine=engine)
-
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
 
         assert result["dispatched"] is False
         assert "hold" in result["note"]
@@ -342,9 +283,7 @@ class TestEngineResultConversion:
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
         scheduler = _make_scheduler(engine=engine)
-
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
 
         assert result["dispatched"] is False
         assert "blocked" in result["note"]
@@ -362,9 +301,7 @@ class TestEngineResultConversion:
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
         scheduler = _make_scheduler(engine=engine)
-
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
 
         assert result["dispatched"] is False
         assert "blocked" in result["note"]
@@ -382,9 +319,7 @@ class TestEngineResultConversion:
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
         scheduler = _make_scheduler(engine=engine)
-
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
 
         assert result["dispatched"] is False
         assert "failed" in result["note"]
@@ -399,9 +334,7 @@ class TestEngineResultConversion:
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
         scheduler = _make_scheduler(engine=engine)
-
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
 
         assert result["dispatched"] is False
         assert "engine error" in result["note"]
@@ -412,9 +345,7 @@ class TestEngineResultConversion:
         engine = mock.MagicMock(spec=Engine)
         engine.process_delegation.side_effect = RuntimeError("boom")
         scheduler = _make_scheduler(engine=engine)
-
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
 
         assert result["dispatched"] is False
         assert "engine error" in result["note"]
@@ -493,11 +424,10 @@ class TestBuildEngine:
         """When the descriptor file doesn't exist, _build_engine returns None."""
         scheduler = _make_scheduler(engine=None)
 
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            with mock.patch.dict(
-                "os.environ", {"AMPA_WORKFLOW_DESCRIPTOR": "/nonexistent/path.yaml"}
-            ):
-                result = scheduler._build_engine()
+        with mock.patch.dict(
+            "os.environ", {"AMPA_WORKFLOW_DESCRIPTOR": "/nonexistent/path.yaml"}
+        ):
+            result = scheduler._build_engine()
 
         assert result is None
 
@@ -516,11 +446,10 @@ class TestBuildEngine:
 
         scheduler = _make_scheduler(engine=None)
 
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            with mock.patch.dict(
-                "os.environ", {"AMPA_WORKFLOW_DESCRIPTOR": descriptor_path}
-            ):
-                result = scheduler._build_engine()
+        with mock.patch.dict(
+            "os.environ", {"AMPA_WORKFLOW_DESCRIPTOR": descriptor_path}
+        ):
+            result = scheduler._build_engine()
 
         assert result is not None
         assert isinstance(result, Engine)
@@ -538,7 +467,7 @@ class TestSchedulerEngineInit:
         """Passing engine= to Scheduler sets self.engine."""
         engine = mock.MagicMock(spec=Engine)
 
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", False):
+        with mock.patch.object(Scheduler, "_build_engine", return_value=None):
             scheduler = Scheduler(
                 store=DummyStore(),
                 config=_make_config(),
@@ -549,20 +478,8 @@ class TestSchedulerEngineInit:
 
         assert scheduler.engine is engine
 
-    def test_engine_is_none_when_not_available(self):
-        """When _ENGINE_AVAILABLE is False and no engine passed, engine is None."""
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", False):
-            scheduler = Scheduler(
-                store=DummyStore(),
-                config=_make_config(),
-                executor=_noop_executor,
-                run_shell=_noop_run_shell,
-            )
-
-        assert scheduler.engine is None
-
-    def test_auto_builds_engine_when_available(self):
-        """When _ENGINE_AVAILABLE is True, constructor auto-builds engine."""
+    def test_auto_builds_engine_when_descriptor_available(self):
+        """Constructor auto-builds engine when workflow descriptor exists."""
         import os
 
         descriptor_path = os.path.join(
@@ -574,16 +491,15 @@ class TestSchedulerEngineInit:
         if not os.path.isfile(descriptor_path):
             pytest.skip("workflow.yaml not found")
 
-        with mock.patch("ampa.scheduler._ENGINE_AVAILABLE", True):
-            with mock.patch.dict(
-                "os.environ", {"AMPA_WORKFLOW_DESCRIPTOR": descriptor_path}
-            ):
-                scheduler = Scheduler(
-                    store=DummyStore(),
-                    config=_make_config(),
-                    executor=_noop_executor,
-                    run_shell=_noop_run_shell,
-                )
+        with mock.patch.dict(
+            "os.environ", {"AMPA_WORKFLOW_DESCRIPTOR": descriptor_path}
+        ):
+            scheduler = Scheduler(
+                store=DummyStore(),
+                config=_make_config(),
+                executor=_noop_executor,
+                run_shell=_noop_run_shell,
+            )
 
         assert scheduler.engine is not None
 
