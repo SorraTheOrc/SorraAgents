@@ -960,6 +960,227 @@ class Scheduler:
         except Exception:
             LOG.exception("Unexpected error while clearing stale running states")
 
+    # ------------------------------------------------------------------
+    # Stale delegation watchdog
+    # ------------------------------------------------------------------
+
+    def _recover_stale_delegations(self) -> List[Dict[str, Any]]:
+        """Detect work items stuck in ``delegated`` stage and reset them.
+
+        When an ``opencode run`` agent process crashes or hangs without
+        updating the work item, the item remains in
+        ``(in_progress, delegated)`` forever, blocking all future
+        delegations via the ``no_in_progress_items`` invariant.
+
+        This method:
+
+        1. Queries ``wl in_progress --json`` for items with
+           ``stage == "delegated"``.
+        2. Checks each item's ``updatedAt`` against
+           ``AMPA_STALE_DELEGATION_THRESHOLD_SECONDS`` (default 7200s).
+        3. Resets stale items to ``(open, plan_complete)`` so delegation
+           can be retried on the next cycle.
+        4. Posts a ``wl comment`` documenting the recovery.
+        5. Sends a Discord notification.
+
+        Returns a list of dicts describing recovered items (empty list
+        when nothing was stale).
+        """
+        try:
+            thresh_raw = os.getenv("AMPA_STALE_DELEGATION_THRESHOLD_SECONDS", "7200")
+            try:
+                threshold = int(thresh_raw)
+            except Exception:
+                threshold = 7200
+        except Exception:
+            threshold = 7200
+
+        now = _utc_now()
+        recovered: List[Dict[str, Any]] = []
+
+        # 1. Query in-progress items
+        try:
+            proc = self.run_shell(
+                "wl in_progress --json",
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+        except Exception:
+            LOG.exception("Stale delegation watchdog: wl in_progress failed")
+            return recovered
+
+        if proc.returncode != 0:
+            LOG.warning(
+                "Stale delegation watchdog: wl in_progress returned rc=%s",
+                proc.returncode,
+            )
+            return recovered
+
+        # Parse items
+        try:
+            raw = json.loads(proc.stdout or "null")
+        except Exception:
+            LOG.exception("Stale delegation watchdog: failed to parse wl in_progress")
+            return recovered
+
+        items: List[Dict[str, Any]] = []
+        if isinstance(raw, list):
+            items = [it for it in raw if isinstance(it, dict)]
+        elif isinstance(raw, dict):
+            for key in ("workItems", "work_items", "items", "data"):
+                val = raw.get(key)
+                if isinstance(val, list):
+                    items = [it for it in val if isinstance(it, dict)]
+                    break
+
+        # 2. Filter to delegated items that are stale
+        for item in items:
+            try:
+                stage = item.get("stage") or item.get("currentStage") or ""
+                if stage != "delegated":
+                    continue
+
+                work_id = (
+                    item.get("id") or item.get("work_item_id") or item.get("work_item")
+                )
+                if not work_id:
+                    continue
+
+                # Determine age from updatedAt
+                updated_str = None
+                for k in (
+                    "updated_at",
+                    "updatedAt",
+                    "last_updated_at",
+                    "updated_ts",
+                    "updated",
+                ):
+                    v = item.get(k)
+                    if v:
+                        updated_str = v
+                        break
+
+                updated_dt = _from_iso(updated_str) if updated_str else None
+                age_s = (
+                    int((now - updated_dt).total_seconds())
+                    if updated_dt is not None
+                    else None
+                )
+
+                if age_s is None or age_s <= threshold:
+                    LOG.debug(
+                        "Stale delegation watchdog: %s age=%s <= threshold=%s, skipping",
+                        work_id,
+                        age_s,
+                        threshold,
+                    )
+                    continue
+
+                # 3. Reset the work item to (open, plan_complete)
+                LOG.warning(
+                    "Stale delegation watchdog: recovering %s (age=%ss, threshold=%ss)",
+                    work_id,
+                    age_s,
+                    threshold,
+                )
+                title = item.get("title", "(unknown)")
+                reset_proc = self.run_shell(
+                    f"wl update {work_id} --status open --stage plan_complete --json",
+                    shell=True,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    cwd=self.command_cwd,
+                )
+                if reset_proc.returncode != 0:
+                    LOG.error(
+                        "Stale delegation watchdog: failed to reset %s rc=%s stderr=%r",
+                        work_id,
+                        reset_proc.returncode,
+                        (reset_proc.stderr or "")[:512],
+                    )
+                    continue
+
+                # 4. Post a wl comment documenting the recovery
+                comment_text = (
+                    f"[watchdog] Stale delegation recovery: this item was stuck in "
+                    f"(in_progress, delegated) for {age_s}s "
+                    f"(threshold: {threshold}s). "
+                    f"Reset to (open, plan_complete) for re-delegation. "
+                    f"The previous agent session likely crashed or hung "
+                    f"without updating the work item."
+                )
+                try:
+                    self.run_shell(
+                        f'wl comment add {work_id} --comment "{comment_text}" '
+                        f"--author ampa-watchdog --json",
+                        shell=True,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        cwd=self.command_cwd,
+                    )
+                except Exception:
+                    LOG.exception(
+                        "Stale delegation watchdog: failed to post comment on %s",
+                        work_id,
+                    )
+
+                recovery_info = {
+                    "work_item_id": str(work_id),
+                    "title": title,
+                    "age_seconds": age_s,
+                    "threshold_seconds": threshold,
+                    "reset_to": "open/plan_complete",
+                }
+                recovered.append(recovery_info)
+                LOG.info(
+                    "Stale delegation watchdog: recovered %s (%s)",
+                    work_id,
+                    title,
+                )
+
+            except Exception:
+                LOG.exception(
+                    "Stale delegation watchdog: error processing item %s",
+                    item.get("id", "?"),
+                )
+
+        # 5. Discord notification (batched)
+        if recovered:
+            try:
+                webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
+                if webhook and webhook_module is not None:
+                    lines = [
+                        f"Stale delegation watchdog recovered {len(recovered)} item(s):"
+                    ]
+                    for info in recovered:
+                        lines.append(
+                            f"- {info['work_item_id']}: {info['title']} "
+                            f"(stale {info['age_seconds']}s, reset to {info['reset_to']})"
+                        )
+                    msg = "\n".join(lines)
+                    payload = webhook_module.build_command_payload(
+                        os.uname().nodename,
+                        now.isoformat(),
+                        "stale_delegation_watchdog",
+                        msg,
+                        0,
+                        title="Stale Delegation Recovery",
+                    )
+                    webhook_module.send_webhook(
+                        webhook, payload, message_type="warning"
+                    )
+            except Exception:
+                LOG.exception(
+                    "Stale delegation watchdog: failed to send Discord notification"
+                )
+
+        return recovered
+
     def _is_delegation_report_changed(self, command_id: str, report_text: str) -> bool:
         """Check whether the delegation report content has changed.
 
@@ -1207,6 +1428,19 @@ class Scheduler:
                 spec.command_id,
                 _bool_meta(spec.metadata.get("audit_only")),
             )
+            # --- Stale delegation watchdog ---
+            # Before attempting new delegation, check for and recover any
+            # work items stuck in delegated state from previous runs.
+            try:
+                stale_recovered = self._recover_stale_delegations()
+                if stale_recovered:
+                    LOG.info(
+                        "Stale delegation watchdog recovered %d item(s) before delegation",
+                        len(stale_recovered),
+                    )
+            except Exception:
+                LOG.exception("Stale delegation watchdog failed")
+            # --- End watchdog ---
             # Inspect current state first. If there is a candidate that will be
             # dispatched we want to avoid sending the pre-dispatch report to
             # Discord (otherwise operators see two nearly-identical messages).
