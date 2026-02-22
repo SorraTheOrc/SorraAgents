@@ -180,7 +180,7 @@ class ShellInProgressQuerier:
 class ShellWorkItemFetcher:
     """Fetches full work item data via ``wl show <id> --children --json``.
 
-    Satisfies :class:`ampa.engine.context.WorkItemFetcher`.
+    Satisfies :class:`ampa.engine.core.WorkItemFetcher`.
     """
 
     def __init__(

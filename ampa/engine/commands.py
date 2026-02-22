@@ -1,11 +1,11 @@
-"""Context helpers — stage-to-action mapping and dispatch command building.
+"""Command helpers — stage-to-action mapping and dispatch command building.
 
 Maps work item stages to delegation actions and builds the shell commands
 used to spawn agent sessions.
 
 Usage::
 
-    from ampa.engine.context import stage_to_action, build_dispatch_command
+    from ampa.engine.commands import stage_to_action, build_dispatch_command
 
     action = stage_to_action("plan_complete")       # -> "implement"
     cmd = build_dispatch_command("WL-123", action)   # -> 'opencode run "work on WL-123 ..."'

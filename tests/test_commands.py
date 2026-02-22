@@ -1,4 +1,4 @@
-"""Tests for ampa.engine.context — stage-to-action mapping and command building.
+"""Tests for ampa.engine.commands — stage-to-action mapping and command building.
 
 Covers:
 - Shell command building for each action (intake, plan, implement)
@@ -7,7 +7,7 @@ Covers:
 
 from __future__ import annotations
 
-from ampa.engine.context import (
+from ampa.engine.commands import (
     build_dispatch_command,
     stage_to_action,
 )

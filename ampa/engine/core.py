@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Protocol
 
 from ampa.engine.candidates import CandidateResult, CandidateSelector
-from ampa.engine.context import build_dispatch_command, stage_to_action
+from ampa.engine.commands import build_dispatch_command, stage_to_action
 from ampa.engine.descriptor import StateTuple, WorkflowDescriptor
 from ampa.engine.dispatch import DispatchResult, Dispatcher
 from ampa.engine.invariants import InvariantEvaluator, InvariantResult

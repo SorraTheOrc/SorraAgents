@@ -3,7 +3,7 @@
 __all__ = [
     "adapters",
     "candidates",
-    "context",
+    "commands",
     "core",
     "descriptor",
     "dispatch",
