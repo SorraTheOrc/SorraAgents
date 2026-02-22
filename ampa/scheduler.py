@@ -48,6 +48,24 @@ except ImportError:  # pragma: no cover - allow running as script
     render_error_report = _er.render_error_report
     render_error_report_json = _er.render_error_report_json
 
+# Engine imports — the engine package is part of the ampa package and must
+# always be available.
+from .engine.core import Engine, EngineConfig, EngineResult, EngineStatus
+from .engine.descriptor import load_descriptor
+from .engine.candidates import CandidateSelector
+
+from .engine.dispatch import OpenCodeRunDispatcher
+from .engine.invariants import InvariantEvaluator
+from .engine.adapters import (
+    ShellCandidateFetcher,
+    ShellInProgressQuerier,
+    ShellWorkItemFetcher,
+    ShellWorkItemUpdater,
+    ShellCommentWriter,
+    StoreDispatchRecorder,
+    DiscordNotificationSender,
+)
+
 LOG = logging.getLogger("ampa.scheduler")
 
 
@@ -682,6 +700,7 @@ class Scheduler:
         executor: Optional[Callable[[CommandSpec], RunResult]] = None,
         command_cwd: Optional[str] = None,
         run_shell: Optional[Callable[..., subprocess.CompletedProcess]] = None,
+        engine: Optional[Any] = None,
     ) -> None:
         self.store = store
         self.config = config
@@ -753,6 +772,16 @@ class Scheduler:
                 )
 
         self.run_shell = _run_shell_with_timeout
+
+        # --- Engine initialization ---
+        # If an engine is explicitly provided, use it.  Otherwise, build one
+        # from the workflow descriptor.  The engine is a hard dependency — if
+        # it cannot be constructed the scheduler will raise.
+        self._candidate_selector: Optional[CandidateSelector] = None
+        self.engine: Optional[Engine] = engine
+        if self.engine is None:
+            self.engine = self._build_engine()
+
         LOG.info("Command runner timeout configured: %ss", _default_timeout)
         LOG.info(
             "Scheduler initialized: store=%s poll_interval=%s global_min_interval=%s",
@@ -793,6 +822,100 @@ class Scheduler:
             self._clear_stale_running_states()
         except Exception:
             LOG.exception("Failed to clear stale running states")
+
+    def _build_engine(self) -> Optional[Engine]:
+        """Construct an Engine from the workflow descriptor.
+
+        Also stores the ``CandidateSelector`` on ``self._candidate_selector``
+        so that ``_inspect_idle_delegation`` can perform lightweight pre-flight
+        checks without invoking the full engine pipeline.
+
+        Returns ``None`` when the descriptor cannot be loaded (e.g. the YAML
+        file is missing or malformed).
+        """
+        try:
+            descriptor_path = os.getenv(
+                "AMPA_WORKFLOW_DESCRIPTOR",
+                os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    "docs",
+                    "workflow",
+                    "workflow.yaml",
+                ),
+            )
+
+            descriptor = load_descriptor(descriptor_path)
+
+            # Shell-based adapters for wl CLI calls
+            fetcher = ShellWorkItemFetcher(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+            )
+            candidate_fetcher = ShellCandidateFetcher(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+            )
+            in_progress_querier = ShellInProgressQuerier(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+            )
+            selector = CandidateSelector(
+                descriptor=descriptor,
+                fetcher=candidate_fetcher,
+                in_progress_querier=in_progress_querier,
+            )
+            evaluator = InvariantEvaluator(
+                invariants=descriptor.invariants,
+                querier=in_progress_querier,
+            )
+            dispatcher = OpenCodeRunDispatcher(cwd=self.command_cwd)
+
+            # Protocol adapters for external dependencies
+            updater = ShellWorkItemUpdater(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+            )
+            comment_writer = ShellCommentWriter(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+            )
+            recorder = StoreDispatchRecorder(store=self.store)
+            notifier = DiscordNotificationSender()
+
+            # Resolve fallback mode at engine init time so it is consistent
+            # for the lifetime of this scheduler instance.
+            try:
+                fb_mode = fallback.resolve_mode(None, require_config=True)
+            except Exception:
+                fb_mode = None
+
+            engine_config = EngineConfig(
+                descriptor_path=descriptor_path,
+                fallback_mode=fb_mode,
+            )
+
+            engine = Engine(
+                descriptor=descriptor,
+                dispatcher=dispatcher,
+                candidate_selector=selector,
+                invariant_evaluator=evaluator,
+                work_item_fetcher=fetcher,
+                updater=updater,
+                comment_writer=comment_writer,
+                dispatch_recorder=recorder,
+                notifier=notifier,
+                config=engine_config,
+            )
+            LOG.info(
+                "Engine initialized with descriptor=%s fallback_mode=%s",
+                descriptor_path,
+                fb_mode,
+            )
+            self._candidate_selector = selector
+            return engine
+        except Exception:
+            LOG.exception("Failed to initialize engine")
+            return None
 
     def _clear_stale_running_states(self) -> None:
         """Clear `running` flags for commands whose last_start_ts is older
@@ -949,77 +1072,54 @@ class Scheduler:
         self.store.update_state(spec.command_id, state)
 
     def _inspect_idle_delegation(self) -> Dict[str, Any]:
-        # timeout (seconds) for delegation-invoked shell commands. Respect a
-        # dedicated environment override `AMPA_DELEGATION_OPENCODE_TIMEOUT`; if
-        # not set fall back to the general `AMPA_CMD_TIMEOUT_SECONDS` default.
+        """Lightweight pre-flight check for delegation state.
+
+        Uses the engine's ``CandidateSelector`` to determine whether agents
+        are idle and whether there is a candidate to delegate.  Returns a
+        status dict consumed by ``start_command()`` to decide what to print
+        and whether to proceed with full engine delegation.
+
+        Possible status values:
+        - ``"in_progress"`` — work is already in progress (items in dict)
+        - ``"idle_no_candidate"`` — idle but no actionable candidates
+        - ``"idle_with_candidate"`` — idle with a selected candidate (raw dict)
+        - ``"error"`` — the pre-flight check itself failed
+        """
+        selector = self._candidate_selector
+        if selector is None:
+            LOG.warning("No candidate selector available for inspect")
+            return {"status": "error", "reason": "no_candidate_selector"}
+
         try:
-            _delegate_timeout = int(
-                os.getenv("AMPA_DELEGATION_OPENCODE_TIMEOUT")
-                or os.getenv("AMPA_CMD_TIMEOUT_SECONDS", "300")
-            )
+            result = selector.select()
         except Exception:
-            _delegate_timeout = 300
+            LOG.exception("CandidateSelector.select() raised during inspect")
+            return {"status": "error", "reason": "selector_exception"}
 
-        def _call(cmd: str) -> subprocess.CompletedProcess:
-            LOG.debug("Running shell (delegation): %s", cmd)
-            return self.run_shell(
-                cmd,
-                shell=True,
-                check=False,
-                capture_output=True,
-                text=True,
-                cwd=self.command_cwd,
-                timeout=_delegate_timeout,
-            )
+        # Global rejections indicate in-progress items or fetch failures
+        if result.global_rejections:
+            for reason in result.global_rejections:
+                if "in-progress" in reason.lower() or "in_progress" in reason.lower():
+                    # Convert candidates back to raw dicts for the items list
+                    items = (
+                        [c.raw for c in result.candidates] if result.candidates else []
+                    )
+                    return {"status": "in_progress", "items": items}
+            # Other global rejection (e.g. fetch failure)
+            return {
+                "status": "error",
+                "reason": "; ".join(result.global_rejections),
+            }
 
-        def _parse_in_progress(payload: Any) -> List[Dict[str, Any]]:
-            if isinstance(payload, list):
-                return [item for item in payload if isinstance(item, dict)]
-            if isinstance(payload, dict):
-                for key in ("workItems", "work_items", "items", "data"):
-                    val = payload.get(key)
-                    if isinstance(val, list):
-                        return [item for item in val if isinstance(item, dict)]
-            return []
+        if result.selected is None:
+            return {"status": "idle_no_candidate", "payload": None}
 
-        def _load_in_progress() -> Optional[List[Dict[str, Any]]]:
-            proc = _call("wl in_progress --json")
-            if proc.returncode != 0:
-                LOG.warning(
-                    "Delegation check failed: wl in_progress rc=%s stderr=%r",
-                    proc.returncode,
-                    (proc.stderr or "")[:512],
-                )
-                return None
-            try:
-                raw = json.loads(proc.stdout or "null")
-            except Exception:
-                LOG.exception(
-                    "Failed to parse wl in_progress output for delegation payload=%r",
-                    (proc.stdout or "")[:1024],
-                )
-                return None
-            return _parse_in_progress(raw)
-
-        idle_items = _load_in_progress()
-        if idle_items is None:
-            idle_items = _load_in_progress()
-            if idle_items is None:
-                return {"status": "error", "reason": "in_progress_failed"}
-        if idle_items:
-            return {"status": "in_progress", "items": idle_items}
-
-        # read webhook early so idle/no-candidate branches can post a short
-        # notification when appropriate. Defining it once avoids warnings
-        # from static analysis and keeps behavior consistent across branches.
-        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-
-        candidates, payload = selection.fetch_candidates(
-            run_shell=self.run_shell, command_cwd=self.command_cwd
-        )
-        if not candidates:
-            return {"status": "idle_no_candidate", "payload": payload}
-        return {"status": "idle_with_candidate", "candidate": candidates[0]}
+        return {
+            "status": "idle_with_candidate",
+            "candidate": result.selected.raw,
+            "candidate_id": result.selected.id,
+            "candidate_title": result.selected.title,
+        }
 
     def _fetch_work_item_markdown(self, work_id: str) -> Optional[str]:
         cmd = f"wl show {work_id} --json"
@@ -1221,8 +1321,12 @@ class Scheduler:
                         LOG.exception("Failed to send idle-state webhook")
             elif status == "idle_with_candidate":
                 candidate = inspect.get("candidate") or {}
-                delegate_id = _extract_work_item_id(candidate)
-                delegate_title = _extract_work_item_title(candidate)
+                delegate_id = inspect.get("candidate_id") or _extract_work_item_id(
+                    candidate
+                )
+                delegate_title = inspect.get(
+                    "candidate_title"
+                ) or _extract_work_item_title(candidate)
                 markdown = (
                     self._fetch_work_item_markdown(delegate_id) if delegate_id else None
                 )
@@ -2464,6 +2568,11 @@ class Scheduler:
     ) -> Dict[str, Any]:
         """Attempt to dispatch work when agents are idle.
 
+        Delegates all candidate selection, invariant evaluation, state
+        transitions, and dispatch to the engine.  Converts the EngineResult
+        back into the dict format expected by callers in start_command()
+        and _run_triage_audit().
+
         Returns a dict with at least the following keys:
         - note: human-readable summary
         - dispatched: bool (True if a delegation was dispatched)
@@ -2471,6 +2580,8 @@ class Scheduler:
         - idle_webhook_sent: bool (True if a detailed idle webhook was posted)
         - delegate_info: optional dict with dispatch details when dispatched
         """
+        assert self.engine is not None  # guaranteed by __init__
+
         if audit_only:
             return {
                 "note": "Delegation: skipped (audit_only)",
@@ -2479,377 +2590,108 @@ class Scheduler:
                 "idle_webhook_sent": False,
             }
 
-        # Ensure `webhook` is bound for all branches below to avoid static
-        # analysis errors and NameError at runtime when branches reference
-        # the variable before a later assignment. Other codepaths may
-        # re-read the env as needed, but having a single early definition
-        # avoids unbound-variable issues.
-        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-
-        def _call(cmd: str) -> subprocess.CompletedProcess:
-            # Use the same delegation timeout as above; compute lazily in case
-            # this method is called independently.
-            try:
-                _delegate_timeout = int(
-                    os.getenv("AMPA_DELEGATION_OPENCODE_TIMEOUT")
-                    or os.getenv("AMPA_CMD_TIMEOUT_SECONDS", "300")
-                )
-            except Exception:
-                _delegate_timeout = 300
-            LOG.debug("Running shell (delegation): %s", cmd)
-            return self.run_shell(
-                cmd,
-                shell=True,
-                check=False,
-                capture_output=True,
-                text=True,
-                cwd=self.command_cwd,
-                timeout=_delegate_timeout,
-            )
-
-        def _parse_in_progress(payload: Any) -> List[Dict[str, Any]]:
-            if isinstance(payload, list):
-                return [item for item in payload if isinstance(item, dict)]
-            if isinstance(payload, dict):
-                for key in ("workItems", "work_items", "items", "data"):
-                    val = payload.get(key)
-                    if isinstance(val, list):
-                        return [item for item in val if isinstance(item, dict)]
-            return []
-
-        def _load_in_progress() -> Optional[List[Dict[str, Any]]]:
-            proc = _call("wl in_progress --json")
-            if proc.returncode != 0:
-                LOG.warning(
-                    "Delegation check failed: wl in_progress rc=%s stderr=%r",
-                    proc.returncode,
-                    (proc.stderr or "")[:512],
-                )
-                return None
-            try:
-                raw = json.loads(proc.stdout or "null")
-            except Exception:
-                LOG.exception(
-                    "Failed to parse wl in_progress output for delegation payload=%r",
-                    (proc.stdout or "")[:1024],
-                )
-                return None
-            return _parse_in_progress(raw)
-
-        idle_items = _load_in_progress()
-        if idle_items is None:
-            idle_items = _load_in_progress()
-            if idle_items is None:
-                return {
-                    "note": "Delegation: skipped (in_progress check failed)",
-                    "dispatched": False,
-                    "rejected": [],
-                    "idle_webhook_sent": False,
-                }
-        if idle_items:
-            LOG.info("Delegation skipped: in-progress items exist")
+        try:
+            result = self.engine.process_delegation()
+        except Exception:
+            LOG.exception("Engine process_delegation raised an exception")
             return {
-                "note": "Delegation: skipped (in_progress items)",
+                "note": "Delegation: engine error",
                 "dispatched": False,
                 "rejected": [],
                 "idle_webhook_sent": False,
+                "error": "engine exception",
             }
 
-        candidates, payload = selection.fetch_candidates(
-            run_shell=self.run_shell, command_cwd=self.command_cwd
-        )
-        if not candidates:
-            if payload is None:
-                LOG.warning("Delegation skipped: wl next returned no payload")
-            else:
-                try:
-                    payload_preview = json.dumps(payload)[:1024]
-                except Exception:
-                    payload_preview = str(payload)[:1024]
-                LOG.warning(
-                    "Delegation skipped: no wl next candidates payload=%r",
-                    payload_preview,
-                )
-            # Send a short idle notification to Discord so operators see that
-            # the delegation run completed but there was nothing to act on.
-            idle_webhook_sent = False
-            dedup_id = spec.command_id if spec is not None else "delegation"
-            try:
-                if webhook and self._is_delegation_report_changed(
-                    dedup_id, "Agents are idle: nothing to delegate"
-                ):
-                    msg = "Agents are idle: nothing to delegate"
-                    payload = webhook_module.build_command_payload(
-                        os.uname().nodename,
-                        _utc_now().isoformat(),
-                        "delegation_idle",
-                        msg,
-                        0,
-                        title=(
-                            (spec.title if spec is not None else None)
-                            or (
-                                spec.metadata.get("discord_label")
-                                if spec is not None
-                                else None
-                            )
-                            or "Delegation: idle"
-                        ),
-                    )
-                    webhook_module.send_webhook(
-                        webhook, payload, message_type="command"
-                    )
-                    idle_webhook_sent = True
-            except Exception:
-                LOG.exception("Failed to send no-candidate idle-state webhook")
+        # Convert EngineResult to dict format.
+        status = result.status
+
+        if status == EngineStatus.SUCCESS:
+            action = result.action or "unknown"
+            wid = result.work_item_id or "?"
+            delegate_title = ""
+            if result.candidate_result and result.candidate_result.selected:
+                delegate_title = result.candidate_result.selected.title
+            delegate_info: Dict[str, Any] = {
+                "action": action,
+                "id": wid,
+                "title": delegate_title,
+                "stdout": "",
+                "stderr": "",
+            }
+            if result.dispatch_result:
+                delegate_info["pid"] = result.dispatch_result.pid
+            return {
+                "note": f"Delegation: dispatched {action} {wid}",
+                "dispatched": True,
+                "delegate_info": delegate_info,
+                "rejected": self._engine_rejections(result),
+                "idle_webhook_sent": False,
+            }
+
+        if status == EngineStatus.NO_CANDIDATES:
+            # The engine already sent a Discord notification via its notifier.
             return {
                 "note": "Delegation: skipped (no wl next candidates)",
                 "dispatched": False,
+                "rejected": self._engine_rejections(result),
+                "idle_webhook_sent": True,
+            }
+
+        if status == EngineStatus.SKIPPED:
+            return {
+                "note": f"Delegation: skipped ({result.reason})",
+                "dispatched": False,
                 "rejected": [],
-                "idle_webhook_sent": idle_webhook_sent,
-            }
-
-        # Try candidates in order until we find one with a supported stage.
-        command = None
-        action = ""
-        delegate_id = None
-        delegate_title = None
-        delegate_stage = None
-
-        # Track rejected candidates for reporting
-        rejected: List[Dict[str, str]] = []
-
-        for candidate in candidates:
-            cid = _extract_work_item_id(candidate)
-            if not cid:
-                LOG.warning("Delegation skipping candidate with missing id")
-                rejected.append(
-                    {"id": "?", "title": "(unknown)", "reason": "missing id"}
-                )
-                continue
-            ctitle = _extract_work_item_title(candidate)
-            cstage = _extract_work_item_stage(candidate)
-
-            # Honor per-item "do-not-delegate" signal
-            try:
-                if _is_do_not_delegate(candidate):
-                    LOG.info(
-                        "Delegation skipping candidate %s (%s): marked do-not-delegate",
-                        cid,
-                        ctitle,
-                    )
-                    rejected.append(
-                        {"id": cid, "title": ctitle, "reason": "do-not-delegate"}
-                    )
-                    continue
-            except Exception:
-                LOG.exception("Failed to evaluate do-not-delegate for %s", cid)
-
-            if cstage == "idea":
-                # Use opencode with an explicit instruction to avoid follow-up
-                # questions from the agent when performing intake.
-                command = f'opencode run "/intake {cid} do not ask questions"'
-                action = "intake"
-            elif cstage == "intake_complete":
-                command = f'opencode run "/plan {cid}"'
-                action = "plan"
-            elif cstage == "plan_complete":
-                command = f'opencode run "work on {cid} using the implement skill"'
-                action = "implement"
-            else:
-                # Unsupported candidate stage -> log as an error and continue to
-                # the next candidate. We do not send per-candidate webhooks here
-                # to avoid noisy Discord messages; a single detailed idle message
-                # is emitted below if no candidate is actionable.
-                LOG.error(
-                    'Delegation encountered unsupported stage "%s" for %s (%s); trying next candidate',
-                    cstage,
-                    cid,
-                    ctitle,
-                )
-                rejected.append(
-                    {
-                        "id": cid,
-                        "title": ctitle,
-                        "reason": f"unsupported stage '{cstage}'",
-                    }
-                )
-                continue
-
-            # found actionable candidate
-            delegate_id = cid
-            delegate_title = ctitle
-            delegate_stage = cstage
-            LOG.debug(
-                "Delegation candidate selected id=%s title=%s stage=%s",
-                delegate_id,
-                delegate_title,
-                delegate_stage,
-            )
-            break
-
-        if not command or not delegate_id:
-            LOG.info("Delegation skipped: no actionable candidates found")
-            idle_webhook_sent = False
-            # Post a detailed Discord message listing rejected candidates so
-            # operators can see why items were skipped (do-not-delegate, wrong
-            # stage, missing id, etc.). Keep the message concise.
-            try:
-                if webhook and rejected:
-                    lines = [
-                        "Agents are idle: no actionable items found",
-                        "Considered candidates:",
-                    ]
-                    for r in rejected:
-                        lines.append(
-                            f"- {r.get('id')} — {r.get('title')}: {r.get('reason')}"
-                        )
-                    message = "\n".join(lines)
-                    dedup_id = spec.command_id if spec is not None else "delegation"
-                    if self._is_delegation_report_changed(dedup_id, message):
-                        payload = webhook_module.build_command_payload(
-                            os.uname().nodename,
-                            _utc_now().isoformat(),
-                            "delegation_idle_detailed",
-                            message,
-                            0,
-                            title=("Delegation: idle — candidates considered"),
-                        )
-                        webhook_module.send_webhook(
-                            webhook, payload, message_type="command"
-                        )
-                        idle_webhook_sent = True
-            except Exception:
-                LOG.exception("Failed to send detailed idle-state webhook")
-            return {
-                "note": "Delegation: skipped (no wl next actionable candidates)",
-                "dispatched": False,
-                "rejected": rejected,
-                "idle_webhook_sent": idle_webhook_sent,
-            }
-
-        project_id = spec.metadata.get("project_id") if spec else None
-        mode = fallback.resolve_mode(project_id, require_config=True)
-        if mode == "hold":
-            LOG.info(
-                "Delegation dispatch skipped due to fallback hold mode (project=%s)",
-                project_id,
-            )
-            return {
-                "note": "Delegation: skipped (fallback hold)",
-                "dispatched": False,
-                "rejected": rejected,
                 "idle_webhook_sent": False,
             }
-        if mode == "auto-decline":
-            action = "decline"
-        elif mode == "auto-accept":
-            action = "accept"
 
-        # Before spawning opencode, record a dispatch record and notify
-        LOG.info("Delegation dispatch: %s", command)
-        LOG.debug("Prepared delegation command=%s delegate_id=%s", command, delegate_id)
-        dispatch_record = {
-            "work_item_id": delegate_id,
-            "action": action,
-            "command": command,
-            "delegate_title": delegate_title,
-            "delegate_stage": delegate_stage,
-            "ts": _utc_now().isoformat(),
-            "fallback_mode": mode,
-        }
-        try:
-            # Persist dispatch record atomically in the scheduler store and
-            # include the generated id in Discord messages so operators can
-            # reference the record even if the opencode child process dies.
-            store_id = None
-            try:
-                store_id = self.store.append_dispatch(dispatch_record)
-                dispatch_record["id"] = store_id
-            except Exception:
-                LOG.exception("Failed to persist delegation dispatch record")
-        except Exception:
-            LOG.exception("Unexpected error while preparing dispatch record")
-
-        # Send a quick notification to Discord/AMPA before spawning opencode
-        try:
-            if webhook:
-                # Human-friendly pre-dispatch message: include action, title and id
-                # Keep the message concise for Discord; do not include internal
-                # dispatch record or runner metadata.
-                pre_msg_lines = [
-                    f"Delegating '{action}' task for '{delegate_title}' ({delegate_id})",
-                ]
-                pre_msg = "\n".join(pre_msg_lines)
-                payload = webhook_module.build_command_payload(
-                    os.uname().nodename,
-                    _utc_now().isoformat(),
-                    dispatch_record.get("id", "delegation_dispatch"),
-                    pre_msg,
-                    0,
-                    title=(
-                        (spec.title if spec is not None else None)
-                        or (
-                            spec.metadata.get("discord_label")
-                            if spec is not None
-                            else None
-                        )
-                        or "Delegation Dispatch"
-                    ),
-                )
-                webhook_module.send_webhook(webhook, payload, message_type="dispatch")
-        except Exception:
-            LOG.exception("Failed to send pre-dispatch webhook")
-
-        proc_delegate = _call(command)
-        # Log opencode command response to the console for operator observability.
-        try:
-            out = (proc_delegate.stdout or "").strip()
-            err = (proc_delegate.stderr or "").strip()
-        except Exception:
-            out = ""
-            err = ""
-
-        # Truncate long outputs to keep logs concise
-        def _preview(s: str, limit: int = 4000) -> str:
-            return s if len(s) <= limit else s[:limit] + "..."
-
-        if out:
-            LOG.info("Delegation command stdout: %s", _preview(out))
-        if err:
-            LOG.info("Delegation command stderr: %s", _preview(err))
-
-        if proc_delegate.returncode != 0:
-            LOG.warning(
-                "Delegation dispatch failed rc=%s stderr=%s",
-                proc_delegate.returncode,
-                err,
-            )
+        if status in (
+            EngineStatus.REJECTED,
+            EngineStatus.INVARIANT_FAILED,
+        ):
             return {
-                "note": f"Delegation: failed ({action} {delegate_id})",
+                "note": f"Delegation: blocked ({result.reason})",
                 "dispatched": False,
-                "rejected": rejected,
+                "rejected": self._engine_rejections(result),
                 "idle_webhook_sent": False,
-                "error": err,
             }
-        LOG.info(
-            "Delegation dispatched %s for %s — %s",
-            action,
-            delegate_id,
-            delegate_title,
-        )
+
+        if status == EngineStatus.DISPATCH_FAILED:
+            return {
+                "note": f"Delegation: failed ({result.reason})",
+                "dispatched": False,
+                "rejected": self._engine_rejections(result),
+                "idle_webhook_sent": False,
+                "error": result.reason,
+            }
+
+        # ERROR or any other unexpected status
         return {
-            "note": f"Delegation: dispatched {action} {delegate_id}",
-            "dispatched": True,
-            "delegate_info": {
-                "action": action,
-                "id": delegate_id,
-                "title": delegate_title,
-                "stdout": out,
-                "stderr": err,
-            },
-            "rejected": rejected,
+            "note": f"Delegation: engine error ({result.reason})",
+            "dispatched": False,
+            "rejected": self._engine_rejections(result),
             "idle_webhook_sent": False,
+            "error": result.reason,
         }
+
+    @staticmethod
+    def _engine_rejections(result: EngineResult) -> List[Dict[str, str]]:
+        """Extract rejected-candidate summaries from an EngineResult for
+        backward compatibility with the legacy delegation dict format."""
+        rejected: List[Dict[str, str]] = []
+        cr = getattr(result, "candidate_result", None)
+        if cr is None:
+            return rejected
+        for rej in getattr(cr, "rejections", ()):
+            c = getattr(rej, "candidate", None)
+            rejected.append(
+                {
+                    "id": getattr(c, "id", "?") if c else "?",
+                    "title": getattr(c, "title", "(unknown)") if c else "(unknown)",
+                    "reason": getattr(rej, "reason", "rejected"),
+                }
+            )
+        return rejected
 
     def _run_delegation_report(
         self, spec: Optional[CommandSpec] = None
@@ -2971,67 +2813,6 @@ def _extract_work_item_id(candidate: Dict[str, Any]) -> Optional[str]:
 
 def _extract_work_item_title(candidate: Dict[str, Any]) -> str:
     return str(candidate.get("title") or candidate.get("name") or "(no title)")
-
-
-def _extract_work_item_stage(candidate: Dict[str, Any]) -> str:
-    # Prefer an explicit 'stage' or 'state' field when determining workflow stage.
-    # Do NOT fall back to the work item's 'status' (which is often a lifecycle
-    # flag like 'open'/'closed') because that is a different concept and causes
-    # misleading messages. Return a clear sentinel when no stage is present.
-    val = candidate.get("stage") or candidate.get("state")
-    if not val:
-        return "undefined"
-    return str(val).strip().lower()
-
-
-def _is_do_not_delegate(candidate: Dict[str, Any]) -> bool:
-    """Return True when a candidate declares it should not be delegated.
-
-    Check common places where this signal may appear:
-    - a `tags` list containing `do-not-delegate` (case-insensitive)
-    - a metadata key `do_not_delegate` or `no_delegation` truthy value
-    """
-    try:
-        tags = candidate.get("tags") or candidate.get("tag") or []
-        if isinstance(tags, str):
-            tags_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
-        elif isinstance(tags, list):
-            tags_list = [str(t).strip().lower() for t in tags if t]
-        else:
-            tags_list = []
-        if "do-not-delegate" in tags_list or "do_not_delegate" in tags_list:
-            return True
-    except Exception:
-        pass
-
-    try:
-        meta = candidate.get("metadata") or candidate.get("meta") or {}
-        if isinstance(meta, dict):
-            if str(meta.get("do_not_delegate", "")).strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "y",
-            ):
-                return True
-            if str(meta.get("no_delegation", "")).strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "y",
-            ):
-                return True
-    except Exception:
-        pass
-
-    # explicit field support
-    try:
-        if candidate.get("do_not_delegate") in (True, "true", "1", 1):
-            return True
-    except Exception:
-        pass
-
-    return False
 
 
 def _store_from_env() -> SchedulerStore:

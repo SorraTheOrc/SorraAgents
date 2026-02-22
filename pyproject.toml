@@ -8,6 +8,8 @@ dependencies = [
   "requests",
   "python-dotenv",
   "prometheus-client",
+  "pyyaml>=6.0",
+  "jsonschema>=4.0",
 ]
 
 [build-system]

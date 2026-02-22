@@ -316,6 +316,11 @@
         "effects": {
           "$ref": "#/$defs/Effects",
           "description": "Optional additional side effects (tags, notifications, audit records)."
+        },
+        "dispatch_map": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Maps each from-state alias to a shell command template. Templates may use {id} for work item ID substitution."
         }
       }
     }

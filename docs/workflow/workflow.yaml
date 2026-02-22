@@ -304,10 +304,6 @@ commands:
       AMPA selects a work item via wl next and delegates it to a Patch agent
       with full context. The Patch agent works autonomously using the implement
       skill. Maps to scheduler.py _run_idle_delegation dispatch.
-      Stage-to-action mapping:
-        idea         -> opencode run "/intake {id}"
-        intake_complete -> opencode run "/plan {id}"
-        plan_complete   -> opencode run "work on {id} using the implement skill"
     from: [idea, intake, plan]
     to: delegated
     actor: PM
@@ -330,6 +326,10 @@ commands:
           (intake_complete), or implement (plan_complete).
         enum: [intake, plan, implement]
     prompt_ref: prompts/delegate.md
+    dispatch_map:
+      idea: 'opencode run "/intake {id} do not ask questions"'
+      intake: 'opencode run "/plan {id}"'
+      plan: 'opencode run "work on {id} using the implement skill"'
     effects:
       set_assignee: Patch
       add_tags: [delegated]

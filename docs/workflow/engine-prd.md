@@ -15,20 +15,23 @@
 
 ## 1. Introduction
 
-This document describes how the AMPA engine consumes a workflow descriptor (as defined in `docs/workflow/workflow.yaml` / `docs/workflow/workflow.json`) to drive agent delegation and work item lifecycle management. It formalizes the behavior currently implemented in `scheduler.py` and maps it to the workflow descriptor schema.
+This document describes how the AMPA engine consumes a workflow descriptor (as defined in `docs/workflow/workflow.yaml` / `docs/workflow/workflow.json`) to drive agent delegation and work item lifecycle management. The engine is a **one-off command** that processes a given work item according to the defined workflow — it is not a scheduler loop. The existing AMPA scheduler is responsible for deciding when to invoke the engine.
 
-### 1.1 Delegation Pattern: Unidirectional
+### 1.1 Delegation Pattern: Unidirectional, Fire-and-Forget
 
-The AMPA engine uses a **unidirectional delegation** pattern:
+The AMPA engine uses a **unidirectional, fire-and-forget delegation** pattern:
 
-1. **AMPA selects** a work item via `wl next` and evaluates delegation preconditions.
-2. **AMPA delegates** the work item to a Patch agent with full context (description, acceptance criteria, comments).
-3. **Patch works autonomously** using the `implement` skill — no back-and-forth conversation.
-4. **Patch reports completion** by returning from the `opencode run` invocation.
-5. **AMPA audits** the result using the `audit` skill.
-6. **AMPA closes or escalates** based on the audit outcome.
+1. **Engine selects** a work item via `wl next` and evaluates delegation preconditions.
+2. **Engine delegates** the work item to an agent with full context (description, acceptance criteria, comments).
+3. **Agent works autonomously** — no back-and-forth conversation with the engine.
+4. **Agent completes independently** — the delegated session runs independently of the engine process. On completion, the agent updates the work item stage to reflect the outcome (e.g. `in_review` for implementation work). The engine does not wait for or receive a return from the agent.
 
-This pattern avoids the complexity of bidirectional conversation protocols. Patch has all required context from the work item and its comments at delegation time.
+The completion state set by the agent depends on its role:
+- **Patch** (implementation): sets stage to `in_review`
+- **PM** (intake/planning): sets stage to `intake_complete` or `plan_complete`
+- Other roles update stage as appropriate to their function
+
+This pattern avoids the complexity of both bidirectional conversation protocols and tightly-coupled process lifecycles. The agent has all required context from the work item and its comments at delegation time, and signals completion through work item state rather than process exit.
 
 ### 1.2 Scope
 
@@ -36,14 +39,15 @@ This PRD covers:
 - How the engine loads and validates a workflow descriptor
 - How commands are executed against work items
 - How roles are resolved to concrete agents or humans
-- The complete delegation lifecycle (select, delegate, implement, audit, close/escalate)
-- Error handling and recovery
-- Observability and audit trail
+- The delegation lifecycle (select, delegate, dispatch independent agent session)
+- Error handling and recovery for delegation
+- Observability and audit trail for delegation
 
 Out of scope:
 - The workflow descriptor schema itself (covered in SA-0MLT1ELCS16VDQV6)
 - Detailed delegation flow examples (covered in SA-0MLT1EPPK1HRBTPG)
 - Test specifications (covered in SA-0MLT1ES320XPRCU8)
+- **Post-delegation audit flow**: Auditing completed work items, interpreting audit results, auto-completion, audit cooldowns, and escalation based on audit outcomes are part of a separate audit flow (covered in SA-0MLWQI6DC09TF7IY). The audit flow picks up work items that have been set to `in_review` by a delegated agent and determines the next step independently of the engine.
 
 ---
 
@@ -55,7 +59,7 @@ Out of scope:
 +------------------+     +---------------------+     +------------------+
 |                  |     |                     |     |                  |
 |  Workflow        |---->|  AMPA Engine        |---->|  Work Item Store |
-|  Descriptor      |     |  (scheduler.py)     |     |  (Worklog / wl)  |
+|  Descriptor      |     |  (one-off command)  |     |  (Worklog / wl)  |
 |  (workflow.json) |     |                     |     |                  |
 +------------------+     +----------+----------+     +------------------+
                                     |
@@ -68,13 +72,15 @@ Out of scope:
                     +---------+          +-----------+
 ```
 
-The engine operates as a **scheduler loop** that periodically:
+The engine operates as a **one-off command** that processes a given work item according to the defined workflow. It is invoked by the AMPA scheduler (or manually) when a work item needs to be advanced. Each invocation:
 
 1. Loads the workflow descriptor from `workflow.json`.
 2. Queries the work item store (`wl`) for current state.
 3. Determines which commands are available given the current state.
-4. Executes commands by resolving actors to agents and invoking them.
-5. Records transitions and audit details as work item comments.
+4. Executes the appropriate command by resolving actors to agents and dispatching an independent agent session.
+5. Records the dispatch and audit details as work item comments.
+
+The engine does not loop or poll — it performs a single delegation action and exits. The existing AMPA scheduler is responsible for periodically invoking the engine when work items need processing.
 
 ### 2.2 Workflow Descriptor Loading
 
@@ -103,9 +109,9 @@ The workflow descriptor declares roles in `metadata.roles`. Each role has a `typ
 | Role | Type | Current Resolution |
 |---|---|---|
 | **Producer** | `human` | Human operator. Cannot be automated. Gates approval and escalation review. |
-| **PM** | `either` | AMPA scheduler agent. Handles intake, planning, delegation, and audit coordination. |
-| **Patch** | `agent` | OpenCode agent spawned via `opencode run`. Implements delegated work autonomously. |
-| **QA** | `agent` | AMPA scheduler executing the `audit` skill. Verifies acceptance criteria. |
+| **PM** | `either` | AMPA scheduler agent. Handles intake, planning, and delegation coordination. |
+| **Patch** | `agent` | OpenCode agent spawned via `opencode run`. Implements delegated work autonomously. Session is independent of the engine. |
+| **QA** | `agent` | Audit flow agent executing the `audit` skill. Verifies acceptance criteria. Out of engine scope (SA-0MLWQI6DC09TF7IY). |
 | **DevOps** | `either` | CI/CD systems or human operators. Handles deployment and infrastructure. |
 | **TechnicalWriter** | `either` | Agent or human. Produces documentation. |
 
@@ -113,8 +119,8 @@ The workflow descriptor declares roles in `metadata.roles`. Each role has a `typ
 
 When a command specifies `actor: <Role>`, the engine resolves the role as follows:
 
-1. **Agent roles** (`Patch`, `QA`): The engine spawns an `opencode run` session with the appropriate skill/command. The agent is given full work item context.
-2. **Human roles** (`Producer`): The engine sets `needs_producer_review: true` on the work item and sends a Discord notification. The engine pauses and waits for human action.
+1. **Agent roles** (`Patch`, `QA`): The engine spawns an independent `opencode run` session with the appropriate skill/command. The agent is given full work item context and works autonomously. The engine does not wait for the session to complete.
+2. **Human roles** (`Producer`): The engine sets `needs_producer_review: true` on the work item and sends a Discord notification. The engine exits; human action is asynchronous.
 3. **Either roles** (`PM`, `DevOps`, `TechnicalWriter`): Resolved based on engine configuration. In the current AMPA implementation, `PM` is always the AMPA scheduler itself.
 
 ### 3.3 Assignment Policy
@@ -123,18 +129,17 @@ Per the workflow-language.md specification:
 
 - When a work item enters a new state, the engine assigns the item per its controller policy.
 - While a command runs, temporary ownership belongs to the command's `actor` role.
-- On success or failure, ownership returns per the engine's policy and the audit comment is appended.
+- On completion, the delegated agent is responsible for updating work item state and ownership.
 
-In practice (scheduler.py):
-- Delegation (`delegate` command): assigns to `Patch` via `effects.set_assignee`.
-- Audit completion (`close_with_audit`): sets `needs_producer_review: true` for Producer attention.
+In practice:
+- Delegation (`delegate` command): assigns to the delegated agent role via `effects.set_assignee`.
 - Escalation (`escalate`): assigns to `Producer` via `effects.set_assignee`.
 
 ---
 
 ## 4. Command Execution Lifecycle
 
-Per workflow-language.md Section "Execution Semantics", each command attempt follows these 6 steps:
+Per workflow-language.md Section "Execution Semantics", the engine is responsible for the first 4 steps of command execution. Steps 5 and 6 are the responsibility of the delegated agent and the audit flow respectively.
 
 ### Step 1: Confirm From State
 
@@ -148,64 +153,61 @@ Each invariant name in the command's `pre` list is looked up in the `invariants`
 
 **Failure behavior**: If any pre invariant fails, the command is aborted. No state change occurs. The engine records the failure as a work item comment and may notify via Discord.
 
-### Step 3: Execute Command Logic
+### Step 3: Apply State Transition
 
-The engine resolves the `actor` role to a concrete agent or human and invokes the command:
+On successful evaluation of pre invariants, the engine writes the dispatch state tuple to the work item. This sets the work item to its in-progress/delegated state — it does **not** set the completion state.
 
-- **For agent actors**: Spawns `opencode run` with the appropriate command string (determined by stage-to-action mapping, see Section 5.2).
-- **For human actors**: Sets flags on the work item and waits for human action.
-
-The command logic itself is outside the workflow descriptor — it is the agent's autonomous work or the human's decision.
-
-### Step 4: Apply State Transition
-
-On successful completion of command logic, the engine writes the `to` state tuple to the work item:
 ```
 wl update <id> --status <to.status> --stage <to.stage>
 ```
 
-### Step 5: Evaluate Post Invariants
+### Step 4: Execute Command Logic
 
-Each invariant name in the command's `post` list is evaluated against the updated work item state.
+The engine resolves the `actor` role to a concrete agent or human and dispatches the command:
 
-**Failure behavior**: If any post invariant fails, the engine **rolls back** to the prior state tuple and reports the failure. The rollback is recorded in the work item comments.
+- **For agent actors**: Spawns an independent `opencode run` session with the appropriate command string (determined by stage-to-action mapping, see Section 5.2). The engine does not wait for the session to complete.
+- **For human actors**: Sets flags on the work item and sends notifications. The engine does not wait for human action.
 
-### Step 6: Record Audit Comment
+The engine records the dispatch in its audit trail and exits. The command logic itself is outside the workflow descriptor — it is the agent's autonomous work or the human's decision.
 
-The engine appends a comment to the work item recording:
-- Command name
-- Actor role and resolved agent
-- Timestamp
-- Outcome (success/failure)
-- For AI-driven commands: prompt reference (or hash), model, response IDs (per `effects.audit` configuration)
+### Step 5: Evaluate Post Invariants (Agent Responsibility)
 
-```
-wl comment add <id> --comment "<audit details>" --author "ampa-scheduler"
-```
+Post invariants are **not evaluated by the engine**. They are the responsibility of the delegated agent.
+
+When the agent has completed its work, it must request a state transition by calling the engine. The engine evaluates the post invariants for the target transition against the updated work item state.
+
+- **If post invariants pass**: The engine applies the requested state transition (e.g. `in_review`).
+- **If post invariants fail**: The engine refuses the transition. The agent records the failure in a work item comment (including a summary of work completed) and awaits further instructions. The work item remains in its current state.
+
+This ensures that agents cannot advance a work item to a completion state without meeting the required quality criteria.
+
+### Step 6: Record Audit Comment (Audit Flow)
+
+Recording structured audit comments (prompt hash, model, response IDs, etc.) is the responsibility of the audit flow (SA-0MLWQI6DC09TF7IY), not the engine. The engine records only dispatch-level information (command name, actor, timestamp, dispatch status) in its own audit trail.
 
 ### 4.1 Command-to-Engine Behavior Mapping
 
-The following table maps each workflow command to its engine behavior:
+The following table maps each workflow command to its engine behavior. Commands marked *(audit flow)* are out of scope for the engine and are handled by the separate audit flow (SA-0MLWQI6DC09TF7IY).
 
-| Command | Actor | Engine Action | scheduler.py Mapping |
+| Command | Actor | Engine Action | Notes |
 |---|---|---|---|
-| `intake` | PM | `opencode run "/intake {id} do not ask questions"` | `_run_idle_delegation` (stage=idea) |
+| `intake` | PM | Spawn independent `opencode run "/intake {id} do not ask questions"` | Agent sets stage to `intake_complete` on completion |
 | `author_prd` | PM | PM drafts PRD, links to work item | Manual or AMPA-assisted |
-| `plan` | PM | `opencode run "/plan {id}"` | `_run_idle_delegation` (stage=intake_complete) |
+| `plan` | PM | Spawn independent `opencode run "/plan {id}"` | Agent sets stage to `plan_complete` on completion |
 | `start_build` | Patch | Developer picks up work manually | N/A (manual path) |
-| `delegate` | PM | `opencode run "work on {id} using the implement skill"` | `_run_idle_delegation` (stage=plan_complete) |
-| `complete_work` | Patch | Patch returns from `opencode run` | Implicit on process exit |
+| `delegate` | PM | Spawn independent `opencode run "work on {id} using the implement skill"` | Agent sets stage to `in_review` on completion |
+| `complete_work` | Patch | Agent updates work item stage (e.g. `in_review`) | Performed by delegated agent, not the engine |
 | `block` | Patch | `wl update {id} --status blocked` | Agent or manual |
 | `block_delegated` | Patch | `wl update {id} --status blocked --stage delegated` | Agent or manual |
 | `unblock` | Patch | `wl update {id} --status in_progress` | Agent or manual |
 | `unblock_delegated` | Patch | `wl update {id} --status in_progress --stage delegated` | Agent or manual |
 | `submit_review` | Patch | Push branch, create PR | Agent workflow |
-| `audit_result` | QA | `opencode run "/audit {id}"` → passes | `_run_triage_audit` |
-| `audit_fail` | QA | `opencode run "/audit {id}"` → finds gaps | `_run_triage_audit` |
-| `close_with_audit` | PM | `wl update {id} --status completed --stage in_review` | `_run_triage_audit` auto-completion |
+| `audit_result` | QA | *(audit flow)* `opencode run "/audit {id}"` -> passes | SA-0MLWQI6DC09TF7IY |
+| `audit_fail` | QA | *(audit flow)* `opencode run "/audit {id}"` -> finds gaps | SA-0MLWQI6DC09TF7IY |
+| `close_with_audit` | PM | *(audit flow)* `wl update {id} --status completed --stage in_review` | SA-0MLWQI6DC09TF7IY |
 | `escalate` | PM | Set `needs_producer_review`, notify Discord | Manual escalation |
 | `approve` | Producer | Human merges PR, confirms | Manual human step |
-| `retry_delegation` | PM | Re-delegate after fixing gaps | `_run_idle_delegation` re-entry |
+| `retry_delegation` | PM | Re-delegate after fixing gaps | Engine re-entry |
 | `de_escalate` | Producer | Human resolves escalation | Manual human step |
 | `reopen` | Producer | Re-plan closed item | Manual human step |
 
@@ -217,7 +219,10 @@ The following table maps each workflow command to its engine behavior:
 
 Before the engine can execute the `delegate` command, all of the following must be true (matching the pre invariants defined in the schema):
 
-1. **requires_work_item_context**: Description length > 100 characters (sufficient context for autonomous work).
+1. **requires_work_item_context**: The PM agent runs a quality gate that audits the work item against the requirements for the target state transition. This is not a raw character count — it uses a prompt (from the audit skill) to evaluate whether the work item has sufficient context for the next step. The quality criteria vary by transition:
+   - **idea → intake_complete**: Requires a clear description of the desired behavior change (user story or equivalent).
+   - **intake_complete → plan_complete**: Requires a problem description, use cases, acceptance criteria, and implementation approach.
+   - **plan_complete → delegated**: Requires acceptance criteria that are measurable and testable, plus sufficient context for autonomous implementation.
 2. **requires_acceptance_criteria**: Description contains acceptance criteria (checkbox list or section header).
 3. **requires_stage_for_delegation**: Work item stage is one of `idea`, `intake_complete`, or `plan_complete`.
 4. **not_do_not_delegate**: Work item is not tagged `do-not-delegate` or `do_not_delegate`.
@@ -230,13 +235,17 @@ Additionally, the engine checks (outside invariant system):
 
 ### 5.2 Stage-to-Action Mapping
 
-The delegation command determines which `opencode run` invocation to use based on the work item's current stage:
+The possible state transitions — and therefore which actions are available for a given stage — are defined in the **workflow descriptor** (`workflow.yaml` / `workflow.json`), not hardcoded in the engine or this PRD. The engine reads the command definitions from the descriptor and determines which commands are valid for the work item's current `(status, stage)` tuple.
+
+The current workflow descriptor defines the following delegation actions:
 
 | Current Stage | Action | Shell Command |
 |---|---|---|
 | `idea` | `intake` | `opencode run "/intake {id} do not ask questions"` |
 | `intake_complete` | `plan` | `opencode run "/plan {id}"` |
 | `plan_complete` | `implement` | `opencode run "work on {id} using the implement skill"` |
+
+If the workflow descriptor is updated with new stages or transitions, the engine will automatically support them without code changes.
 
 The action label can be overridden by the fallback mode configuration:
 - `auto-decline` → action becomes `decline`
@@ -248,71 +257,36 @@ The action label can be overridden by the fallback mode configuration:
 When all preconditions pass:
 
 1. Engine selects the top candidate from `wl next -n 3`.
-2. Engine determines the action from the stage-to-action mapping.
-3. Engine sends a pre-dispatch Discord notification: `"Delegating '{action}' task for '{title}' ({id})"`.
-4. Engine spawns `opencode run` with the appropriate command.
-5. Engine waits for process completion (with timeout).
-6. Engine records the dispatch in its append-only audit trail (`store.append_dispatch`).
-7. Engine sends a post-dispatch report via Discord.
+2. Engine determines the action from the stage-to-action mapping (see Section 5.2).
+3. Engine applies the dispatch state transition to the work item. This sets the work item to its in-progress/delegated state — it does **not** set the completion state. The completion state is set by the agent upon finishing its work.
+4. Engine spawns an independent `opencode run` session with the appropriate command. This session is **not** tied to the engine's process — the engine does not wait for it to complete.
+5. Engine records the dispatch in its append-only audit trail (`store.append_dispatch`).
+6. Engine sends a post-dispatch report via Discord.
+7. Engine exits. The delegated agent session continues independently.
 
-### 5.4 Post-Delegation Audit
-
-After Patch completes work and the item reaches `in_review` state:
-
-1. Engine runs `opencode run "/audit {id}"` (via `_run_triage_audit`).
-2. Engine parses audit output for closure recommendation.
-3. **If audit passes** (all acceptance criteria met):
-   - Engine checks for merged PR evidence (via `gh pr view` or textual heuristics).
-   - If confirmed: executes `close_with_audit` → `wl update {id} --status completed --stage in_review`.
-   - Sets `needs_producer_review: true`.
-   - Sends Discord notification: `"Audit Completed -- {title}"`.
-4. **If audit fails** (gaps found):
-   - Engine records gaps as a work item comment.
-   - Work item stays in current state or moves to `audit_failed`.
-   - Engine may schedule retry or escalation based on failure count.
-
-### 5.5 Audit Cooldown
-
-The engine enforces per-item cooldown periods to avoid redundant audits:
-
-| Work Item Status | Default Cooldown |
-|---|---|
-| `in_review` | Configurable (default: 6 hours) |
-| `in_progress` | Configurable (default: 6 hours) |
-| `blocked` | Configurable (default: 6 hours) |
-
-Cooldowns are tracked in `store.state[command_id].last_audit_at_by_item[work_id]`.
+The delegated agent is responsible for updating the work item stage on completion (e.g. setting stage to `in_review` for implementation work). This stage update signals to downstream flows (such as the audit flow) that the work item is ready for further processing.
 
 ---
 
 ## 6. Error Handling
 
-### 6.1 Invariant Failures
+### 6.1 Pre-Invariant Failures
 
 | Scenario | Engine Response |
 |---|---|
-| Pre invariant fails before delegation | Command rejected. Work item unchanged. Warning logged. Candidate may be skipped in favor of next candidate. |
-| Post invariant fails after transition | State rolled back to prior tuple. Failure recorded as work item comment. Discord notification sent. |
-| Multiple pre invariants fail | All failures reported. Command not executed. |
+| Pre invariant fails before delegation | Command rejected. Work item unchanged. Warning logged. Failure recorded via Discord notification. Candidate may be skipped in favor of next candidate. |
+| Multiple pre invariants fail | All failures reported via Discord. Command not executed. |
 
 ### 6.2 Execution Errors
 
 | Scenario | Engine Response |
 |---|---|
-| `opencode run` times out | Timeout notification sent via Discord. Work item left in current state. Engine records timeout in dispatch audit trail. |
-| `opencode run` exits with error | Error captured in stderr. Work item left in current state. Dispatch record includes exit code and output. |
+| `opencode run` fails to spawn | Error captured. Work item left in current state. Dispatch record includes error details. Discord notification sent. |
 | `wl update` fails | Retry once. If still fails, log error and abort transition. Work item left in prior state. |
-| `wl next` returns no candidates | Engine enters idle state. Discord notification: `"Agents are idle: no actionable items found"`. |
-| `wl in_progress` check fails | Retry once. On double failure, abort delegation cycle with error status. |
+| `wl next` returns no candidates | Engine exits with idle status. Discord notification: `"Agents are idle: no actionable items found"`. |
+| `wl in_progress` check fails | Retry once. On double failure, abort delegation with error status. |
 
-### 6.3 Audit Failures
-
-| Scenario | Engine Response |
-|---|---|
-| Audit finds unmet acceptance criteria | Gaps documented in work item comment. Item stays open. Next action depends on gap severity. |
-| Audit cannot determine status | Item left in current state. Comment added noting ambiguity. Producer notification may be triggered. |
-| Repeated audit failures | After configurable threshold, engine may execute `escalate` command to transfer to Producer. |
-| PR not merged but audit passes | Engine waits — `close_with_audit` requires merged PR evidence (via `gh pr view` verification). |
+Note: Since the engine dispatches agent sessions independently and does not wait for completion, timeouts and agent process errors are not handled by the engine. The delegated agent is responsible for updating the work item state on failure (e.g. setting status to `blocked`).
 
 ---
 
@@ -328,7 +302,7 @@ For every command execution, the engine records a work item comment containing:
 | Actor role | Command `actor` field | Always |
 | Resolved agent | Engine actor resolution | For agent roles |
 | Timestamp | System clock | Always |
-| Outcome | Success / failure / timeout | Always |
+| Outcome | Success / failure (dispatch) | Always |
 | Prompt hash | `effects.audit.record_prompt_hash` | For AI commands |
 | Model | `effects.audit.record_model` | For AI commands |
 | Response IDs | `effects.audit.record_response_ids` | For AI commands |
@@ -341,7 +315,7 @@ The engine maintains an append-only dispatch log (last 100 records) in `store.ap
 - Work item ID and title
 - Action taken (intake, plan, implement, decline, accept)
 - Timestamp
-- Exit code and output (stdout, stderr)
+- Dispatch status (spawned / failed to spawn)
 - Rejection reasons for skipped candidates
 
 ### 7.3 Discord Notifications
@@ -350,156 +324,115 @@ The engine sends structured notifications to Discord via webhook:
 
 | Event | Channel Type | Content |
 |---|---|---|
-| Pre-dispatch report | `command` | Delegation state overview |
-| Dispatch notification | `dispatch` | `"Delegating '{action}' task for '{title}' ({id})"` |
-| Post-dispatch report | `command` | Updated delegation state |
+| Post-dispatch report | `command` | Delegation state overview and dispatch details |
 | Idle state | `command` | `"Agents are idle: no actionable items found"` or rejected candidate details |
-| Audit summary | `command` | Audit result with optional PR URL |
-| Auto-completion | `completion` | `"Audit Completed -- {title}"` with result summary |
-| Timeout | `error` | Command ID and duration |
 
 ---
 
 ## 8. Sequence Diagrams
 
-### 8.1 Happy Path: Idea to Closure
+### 8.1 Happy Path: Idea to In-Review
 
 ```mermaid
 sequenceDiagram
+    participant Scheduler as AMPA Scheduler
     participant WL as Worklog (wl)
     participant Engine as AMPA Engine
-    participant Patch as Patch Agent
+    participant Agent as Delegated Agent
     participant Discord as Discord
 
     Note over WL: Work item created<br/>status: open, stage: idea
 
+    Scheduler->>Engine: Process work item
+
     Engine->>WL: wl next -n 3 --json
     WL-->>Engine: Candidate: {id, stage: idea}
 
-    Engine->>Engine: Check pre invariants<br/>(context, AC, stage, tags, no WIP)
-
-    Engine->>Discord: "Delegating 'intake' task for '{title}'"
-    Engine->>Patch: opencode run "/intake {id} do not ask questions"
-    Patch-->>Engine: Process exits (success)
+    Engine->>Engine: Check pre invariants<br/>(context quality gate, AC, stage, tags, no WIP)
 
     Engine->>WL: wl update {id} --status in_progress --stage delegated
-    Note over WL: status: in_progress, stage: delegated
+    Engine->>Agent: Spawn independent opencode run "/intake {id} do not ask questions"
+    Engine->>WL: wl comment add {id} --comment "Dispatched intake..."
+    Engine->>Discord: Post-dispatch report
+    Note over Engine: Engine exits
 
-    Note over Engine: Next scheduler cycle...
+    Note over Agent: Agent works autonomously
+    Agent->>WL: wl update {id} --stage intake_complete
+    Note over Agent: Agent session ends
+
+    Note over Scheduler: Next scheduler cycle...
+    Scheduler->>Engine: Process work item
 
     Engine->>WL: wl next -n 3 --json
     WL-->>Engine: Candidate: {id, stage: intake_complete}
-    Engine->>Patch: opencode run "/plan {id}"
-    Patch-->>Engine: Process exits (success)
+    Engine->>Agent: Spawn independent opencode run "/plan {id}"
+    Note over Engine: Engine exits
 
-    Note over Engine: Next scheduler cycle...
+    Note over Agent: Agent works autonomously
+    Agent->>WL: wl update {id} --stage plan_complete
+    Note over Agent: Agent session ends
+
+    Note over Scheduler: Next scheduler cycle...
+    Scheduler->>Engine: Process work item
 
     Engine->>WL: wl next -n 3 --json
     WL-->>Engine: Candidate: {id, stage: plan_complete}
-    Engine->>Patch: opencode run "work on {id} using the implement skill"
+    Engine->>Agent: Spawn independent opencode run "work on {id} using the implement skill"
+    Note over Engine: Engine exits
 
-    Note over Patch: Patch implements autonomously:<br/>writes code, tests, docs<br/>creates PR, pushes branch
+    Note over Agent: Agent implements autonomously:<br/>writes code, tests, docs<br/>creates PR, pushes branch
+    Agent->>WL: wl update {id} --stage in_review
+    Note over Agent: Agent session ends
 
-    Patch-->>Engine: Process exits (success)
-
-    Note over WL: status: in_progress, stage: in_review
-
-    Engine->>Patch: opencode run "/audit {id}"
-    Patch-->>Engine: Audit result: all AC met, PR merged
-
-    Engine->>WL: wl update {id} --status completed --stage in_review
-    Engine->>WL: wl comment add {id} --comment "AMPA Audit Result: ..."
-    Engine->>Discord: "Audit Completed -- '{title}'"
-
-    Note over WL: status: completed, stage: in_review<br/>needs_producer_review: true
-
-    Note over Engine: Producer reviews and approves
-
-    Engine->>WL: wl update {id} --status closed --stage done
-    Note over WL: status: closed, stage: done (shipped)
+    Note over WL: status: in_progress, stage: in_review<br/>Ready for audit flow (separate process)
 ```
 
-### 8.2 Audit Failure: Gaps Found, Escalation
+### 8.2 Blocked Flow: Blocker During Implementation
 
 ```mermaid
 sequenceDiagram
+    participant Scheduler as AMPA Scheduler
     participant WL as Worklog (wl)
     participant Engine as AMPA Engine
-    participant Patch as Patch Agent
-    participant Producer as Producer (Human)
-    participant Discord as Discord
-
-    Note over WL: Work item in review<br/>status: in_progress, stage: in_review
-
-    Engine->>Patch: opencode run "/audit {id}"
-    Patch-->>Engine: Audit result: 2/5 AC unmet
-
-    Engine->>WL: wl comment add {id} --comment "Audit: 2 AC unmet..."
-    Note over WL: status: in_progress, stage: audit_failed
-
-    Note over Engine: First failure — schedule retry
-
-    Engine->>Patch: opencode run "work on {id} using the implement skill"
-    Note over Patch: Patch addresses gaps
-
-    Patch-->>Engine: Process exits (success)
-
-    Engine->>Patch: opencode run "/audit {id}"
-    Patch-->>Engine: Audit result: 1/5 AC still unmet
-
-    Engine->>WL: wl comment add {id} --comment "Audit: 1 AC still unmet..."
-    Note over Engine: Second failure — escalate
-
-    Engine->>WL: wl update {id} --status blocked --stage escalated
-    Engine->>Discord: "Escalation: '{title}' requires producer review"
-
-    Producer->>WL: Reviews gaps, provides guidance
-    Producer->>WL: wl update {id} --status open --stage plan_complete
-
-    Note over Engine: Re-enter delegation cycle
-    Engine->>Patch: opencode run "work on {id} using the implement skill"
-```
-
-### 8.3 Blocked Flow: Blocker During Implementation
-
-```mermaid
-sequenceDiagram
-    participant WL as Worklog (wl)
-    participant Engine as AMPA Engine
-    participant Patch as Patch Agent
+    participant Agent as Delegated Agent
     participant Discord as Discord
 
     Note over WL: Work item delegated<br/>status: in_progress, stage: delegated
 
-    Engine->>Patch: opencode run "work on {id} using the implement skill"
+    Scheduler->>Engine: Process work item
+    Engine->>Agent: Spawn independent opencode run "work on {id} using the implement skill"
+    Note over Engine: Engine exits
 
-    Note over Patch: Patch encounters blocker<br/>(missing dependency, unclear requirements)
+    Note over Agent: Agent encounters blocker<br/>(missing dependency, unclear requirements)
 
-    Patch->>WL: wl update {id} --status blocked --stage in_progress
-    Patch->>WL: wl comment add {id} --comment "Blocked: {reason}"
+    Agent->>WL: wl update {id} --status blocked --stage in_progress
+    Agent->>WL: wl comment add {id} --comment "Blocked: {reason}"
+    Note over Agent: Agent session ends
 
     Note over WL: status: blocked, stage: in_progress
 
-    Engine->>Discord: Work item blocked notification
+    Note over Scheduler: Scheduler detects blocked item,<br/>sends Discord notification
+    Scheduler->>Discord: Work item blocked notification
 
-    Note over Engine: Blocker resolved (by human or another agent)
+    Note over Scheduler: Blocker resolved (by human or another agent)
 
+    Scheduler->>Engine: Process work item
     Engine->>WL: wl update {id} --status in_progress --stage in_progress
-    Note over WL: status: in_progress, stage: in_progress (building)
+    Engine->>Agent: Spawn independent opencode run "work on {id} using the implement skill"
+    Note over Engine: Engine exits
 
-    Engine->>Patch: opencode run "work on {id} using the implement skill"
-    Note over Patch: Patch resumes implementation
+    Note over Agent: Agent resumes implementation
+    Agent->>WL: wl update {id} --stage in_review
+    Note over Agent: Agent session ends
 
-    Patch-->>Engine: Process exits (success)
-
-    Note over WL: Continues to review and audit flow...
+    Note over WL: Continues to audit flow (separate process)...
 ```
 
 ---
 
 ## 9. Mapping: scheduler.py to Workflow Commands
 
-This section traces the existing scheduler.py implementation to the formalized workflow commands, confirming that all current behavior is expressible in the schema.
+This section traces the existing scheduler.py implementation to the formalized workflow commands as a reference for migration. Note that the engine is a new component distinct from the scheduler — the scheduler continues to exist and is responsible for deciding when to invoke the engine.
 
 ### 9.1 `_inspect_idle_delegation` → Pre-invariant Checks
 
@@ -517,24 +450,26 @@ This section traces the existing scheduler.py implementation to the formalized w
 |---|---|
 | Select candidate from `wl next -n 3` | Command input: `work_item_id` |
 | Determine action from stage | Command input: `action` (intake/plan/implement) |
-| Discord pre-dispatch notification | `effects.notifications[0]` |
+| Discord pre-dispatch notification | *(removed — only post-dispatch notification in engine)* |
 | `opencode run "/intake {id}"` (stage=idea) | `delegate` command execution for idea state |
 | `opencode run "/plan {id}"` (stage=intake_complete) | `delegate` command execution for intake state |
 | `opencode run "work on {id} using the implement skill"` (stage=plan_complete) | `delegate` command execution for plan state |
-| `store.append_dispatch(record)` | Step 6: Record audit comment + dispatch trail |
+| `store.append_dispatch(record)` | Dispatch audit trail |
 | Post-dispatch Discord report | `effects.notifications` |
 
-### 9.3 `_run_triage_audit` → `audit_result` / `audit_fail` / `close_with_audit`
+### 9.3 `_run_triage_audit` → Audit Flow (Out of Scope)
 
-| scheduler.py Behavior | Workflow Mapping |
-|---|---|
-| `opencode run "/audit {id}"` | `audit_result` or `audit_fail` command execution |
-| Parse audit output for closure recommendation | `audit_recommends_closure` / `audit_does_not_recommend_closure` invariants |
-| Check for merged PR via `gh pr view` | Additional engine-level verification |
-| `wl update {id} --status completed --stage in_review` | `close_with_audit` command: `to` state = `{status: completed, stage: in_review}` |
-| Post audit comment | Step 6: Record audit comment |
-| Discord "Audit Completed" notification | `close_with_audit` effects.notifications |
-| Cooldown enforcement | Engine-level scheduling (not in workflow descriptor) |
+> **Note:** The `_run_triage_audit` logic maps to the audit flow (SA-0MLWQI6DC09TF7IY), not the engine. This mapping is preserved here for reference only.
+>
+> | scheduler.py Behavior | Workflow Mapping |
+> |---|---|
+> | `opencode run "/audit {id}"` | `audit_result` or `audit_fail` command execution |
+> | Parse audit output for closure recommendation | `audit_recommends_closure` / `audit_does_not_recommend_closure` invariants |
+> | Check for merged PR via `gh pr view` | Additional verification |
+> | `wl update {id} --status completed --stage in_review` | `close_with_audit` command |
+> | Post audit comment | Record audit comment |
+> | Discord "Audit Completed" notification | `close_with_audit` effects.notifications |
+> | Cooldown enforcement | Scheduling concern (not in workflow descriptor) |
 
 ---
 
@@ -544,11 +479,11 @@ This section traces the existing scheduler.py implementation to the formalized w
 
 2. **Fallback modes**: The `auto-decline`, `auto-accept`, and `hold` modes are engine configuration, not workflow descriptor features. Consider whether these should be expressible as workflow-level guards.
 
-3. **Sub-task delegation**: When a delegated work item has children, should AMPA delegate children individually or delegate the parent and let Patch handle decomposition? Current behavior: Patch handles decomposition via the `implement` skill.
+3. **Sub-task delegation**: When a delegated work item has children, should the engine delegate children individually or delegate the parent and let the agent handle decomposition? Current behavior: Patch handles decomposition via the `implement` skill.
 
-4. **Timeout policy**: Command timeouts are engine configuration. Consider adding a `timeout` field to the command definition in the workflow descriptor schema.
+4. **Agent session monitoring**: Since the engine dispatches independent agent sessions without waiting, there is currently no mechanism for the engine to detect agent failures (crashes, hangs). Consider whether a monitoring/watchdog component is needed, or whether the scheduler should handle this by detecting stale `in_progress` items.
 
-5. **Retry policy**: The number of audit retries before escalation is currently implicit. Consider adding a `max_retries` field to relevant commands.
+5. **Engine/scheduler boundary**: The engine is a one-off command invoked by the scheduler. The exact interface contract between scheduler and engine (CLI arguments, return codes, shared state) should be formalized.
 
 ---
 
@@ -559,7 +494,7 @@ This section traces the existing scheduler.py implementation to the formalized w
 | Producer | human | No | **Yes** | Human operator |
 | PM | either | **Yes** | No | AMPA scheduler |
 | Patch | agent | **Yes** | No | OpenCode (opencode run) |
-| QA | agent | **Yes** | No | AMPA scheduler (audit skill) |
+| QA | agent | **Yes** | No | Audit flow (SA-0MLWQI6DC09TF7IY) |
 | DevOps | either | Partial | Partial | CI/CD + human |
 | TechnicalWriter | either | **Yes** | No | OpenCode agent |
 
@@ -568,9 +503,12 @@ This section traces the existing scheduler.py implementation to the formalized w
 - `reopen`: Reopen a closed item
 - `de_escalate`: Resolve an escalation
 
-**AI-driven commands** (automated by AMPA/Patch):
-- `intake`, `plan`, `delegate`, `complete_work`, `audit_result`, `audit_fail`, `close_with_audit`, `retry_delegation`
+**AI-driven commands — engine scope** (automated by engine):
+- `intake`, `plan`, `delegate`, `complete_work`, `retry_delegation`
 - `block`, `block_delegated`, `unblock`, `unblock_delegated`, `submit_review`
+
+**AI-driven commands — audit flow** (SA-0MLWQI6DC09TF7IY):
+- `audit_result`, `audit_fail`, `close_with_audit`
 
 **Mixed commands**:
 - `escalate`: Initiated by PM (AMPA) but requires Producer attention

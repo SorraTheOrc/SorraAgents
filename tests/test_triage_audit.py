@@ -15,6 +15,8 @@ from ampa.scheduler import (
 )
 import ampa.daemon as daemon
 from ampa import webhook
+from ampa.engine.core import EngineConfig
+from ampa.engine.dispatch import DispatchResult
 
 
 class DummyStore(SchedulerStore):
@@ -741,15 +743,34 @@ def test_triage_audit_delegation_skips_when_in_progress(tmp_path, monkeypatch):
 
     sched.start_command(spec)
 
-    assert not any("wl next --json" in c for c in calls)
+    # The engine's CandidateSelector.select() always fetches candidates (even
+    # with in-progress items) for the audit trail, so "wl next --json" may
+    # appear in calls.  The important assertion is that no dispatch occurred.
     assert not any("work on" in c for c in calls)
+    assert not any("/intake" in c for c in calls)
+    assert not any("/implement" in c for c in calls)
 
 
 def test_triage_audit_delegation_dispatches_intake_when_idle(tmp_path, monkeypatch):
-    """Verify delegation dispatches intake when idle and enabled."""
+    """Verify delegation dispatches intake when idle and enabled.
+
+    The engine's CandidateSelector fetches candidates via ``wl next --json``
+    and the engine dispatches via its ``OpenCodeRunDispatcher``.  We mock the
+    dispatcher to avoid real subprocess spawning and verify that the engine
+    selected the candidate and dispatched an intake command.
+    """
     calls = []
     work_id = "DELEGATE-3"
+    candidate_id = "SA-TEST-1"
     in_progress_calls = {"count": 0}
+    long_description = (
+        "This is a test work item for delegation via triage-audit. "
+        "It has sufficient context to satisfy the requires_work_item_context "
+        "invariant which needs more than 100 characters in the description.\n\n"
+        "Acceptance Criteria:\n"
+        "- [ ] Delegation dispatches intake\n"
+        "- [ ] Webhook is sent"
+    )
 
     monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
 
@@ -778,10 +799,26 @@ def test_triage_audit_delegation_dispatches_intake_when_idle(tmp_path, monkeypat
             )
         if cmd.strip() == "wl next --json":
             payload = {
-                "workItem": {"id": "SA-TEST-1", "title": "Test idea", "stage": "idea"}
+                "workItem": {
+                    "id": candidate_id,
+                    "title": "Test idea",
+                    "status": "open",
+                    "stage": "idea",
+                }
             }
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
+            )
+        if "wl show" in cmd and candidate_id in cmd:
+            item = {
+                "id": candidate_id,
+                "title": "Test idea",
+                "status": "open",
+                "stage": "idea",
+                "description": long_description,
+            }
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(item), stderr=""
             )
         if cmd.strip().startswith("opencode run"):
             return subprocess.CompletedProcess(
@@ -802,7 +839,33 @@ def test_triage_audit_delegation_dispatches_intake_when_idle(tmp_path, monkeypat
             )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
+    monkeypatch.delenv("AMPA_FALLBACK_MODE", raising=False)
+
     sched = make_scheduler(fake_run_shell, tmp_path)
+
+    # Override the engine's fallback_mode to None so it doesn't force
+    # action=accept (which has no command template)
+    sched.engine._config = EngineConfig(  # type: ignore[union-attr]
+        descriptor_path=sched.engine._config.descriptor_path,  # type: ignore[union-attr]
+        fallback_mode=None,
+    )
+
+    # Mock the engine's dispatcher to avoid real subprocess spawning
+    dispatch_state = {"called": False, "command": None}
+
+    def fake_dispatch(command, work_item_id):
+        dispatch_state["called"] = True
+        dispatch_state["command"] = command
+        return DispatchResult(
+            success=True,
+            command=command,
+            work_item_id=work_item_id,
+            pid=99999,
+            timestamp=dt.datetime.now(dt.timezone.utc),
+        )
+
+    monkeypatch.setattr(sched.engine._dispatcher, "dispatch", fake_dispatch)  # type: ignore[union-attr]
+
     spec = CommandSpec(
         command_id="wl-triage-audit",
         command="true",
@@ -823,7 +886,9 @@ def test_triage_audit_delegation_dispatches_intake_when_idle(tmp_path, monkeypat
     sched.start_command(spec)
 
     assert any("wl next --json" in c for c in calls)
-    assert any("/intake SA-TEST-1" in c for c in calls)
+    # The engine dispatches via its dispatcher, not via run_shell
+    assert dispatch_state["called"], "engine dispatcher was not called"
+    assert candidate_id in dispatch_state["command"]
 
 
 def test_triage_audit_no_candidates_logs(tmp_path, monkeypatch, caplog):

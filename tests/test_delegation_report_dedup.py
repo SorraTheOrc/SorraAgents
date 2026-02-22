@@ -22,6 +22,8 @@ from ampa.scheduler import (
     _content_hash,
 )
 from ampa import webhook as webhook_module
+from ampa.engine.core import EngineConfig
+from ampa.engine.dispatch import DispatchResult
 
 
 class DummyStore(SchedulerStore):
@@ -325,6 +327,7 @@ def test_dispatch_notification_always_sent(tmp_path, monkeypatch):
 
     monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
     monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.delenv("AMPA_FALLBACK_MODE", raising=False)
 
     def shell(cmd, **kwargs):
         s = cmd.strip()
@@ -344,28 +347,64 @@ def test_dispatch_notification_always_sent(tmp_path, monkeypatch):
                 "workItem": {
                     "id": "SA-DISPATCH-1",
                     "title": "Dispatch me",
+                    "status": "open",
                     "stage": "idea",
                 }
             }
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
             )
-        if s.startswith("opencode run"):
+        if "wl show" in s and "SA-DISPATCH-1" in s:
+            item = {
+                "id": "SA-DISPATCH-1",
+                "title": "Dispatch me",
+                "status": "open",
+                "stage": "idea",
+                "description": (
+                    "This is a work item for dispatch notification testing. "
+                    "It contains sufficient context to satisfy the "
+                    "requires_work_item_context invariant which needs "
+                    "more than 100 characters in the description.\n\n"
+                    "Acceptance Criteria:\n"
+                    "- [ ] Dispatch notification is sent\n"
+                    "- [ ] Notification is not deduped"
+                ),
+            }
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="ok", stderr=""
+                args=cmd, returncode=0, stdout=json.dumps(item), stderr=""
             )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     sched = _make_scheduler(shell, tmp_path)
+
+    # Override fallback_mode to None so engine uses natural stage-to-action
+    sched.engine._config = EngineConfig(  # type: ignore[union-attr]
+        descriptor_path=sched.engine._config.descriptor_path,  # type: ignore[union-attr]
+        fallback_mode=None,
+    )
+
+    # Mock engine dispatcher to avoid real subprocess spawning
+    def fake_dispatch(command, work_item_id):
+        return DispatchResult(
+            success=True,
+            command=command,
+            work_item_id=work_item_id,
+            pid=12345,
+            timestamp=dt.datetime.now(dt.timezone.utc),
+        )
+
+    monkeypatch.setattr(sched.engine._dispatcher, "dispatch", fake_dispatch)  # type: ignore[union-attr]
+
     spec = _delegation_spec()
     sched.store.add_command(spec)
 
-    # Run twice; dispatch notification should appear both times
+    # Run twice; dispatch notification should appear both times.
+    # The engine sends dispatch notifications with message_type="engine".
     sched.start_command(spec)
-    first_dispatch = len([c for c in webhook_calls if c["type"] == "dispatch"])
+    first_dispatch = len([c for c in webhook_calls if c["type"] == "engine"])
 
     sched.start_command(spec)
-    second_dispatch = len([c for c in webhook_calls if c["type"] == "dispatch"])
+    second_dispatch = len([c for c in webhook_calls if c["type"] == "engine"])
 
     assert first_dispatch >= 1, "Dispatch notification should be sent on first run"
     assert second_dispatch >= 2, (
