@@ -499,73 +499,6 @@ def _build_delegation_discord_message(report: str) -> str:
     return _build_dry_run_discord_message(report)
 
 
-def _normalize_work_item_payload(payload: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(payload, dict):
-        return None
-    for key in ("workItem", "work_item", "item", "data"):
-        val = payload.get(key)
-        if isinstance(val, dict):
-            return val
-    return payload
-
-
-def _excerpt_text(value: Optional[str], limit: int = 300) -> str:
-    if not value:
-        return ""
-    text = " ".join(value.split())
-    if len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + "..."
-
-
-def _format_assignee(value: Any) -> str:
-    if not value:
-        return "(none)"
-    if isinstance(value, dict):
-        return str(value.get("name") or value.get("id") or value.get("email") or value)
-    if isinstance(value, list):
-        names = [
-            _format_assignee(item)
-            for item in value
-            if item and _format_assignee(item) != "(none)"
-        ]
-        return ", ".join(names) if names else "(none)"
-    return str(value)
-
-
-def _build_work_item_markdown(item: Dict[str, Any]) -> str:
-    work_id = str(
-        item.get("id")
-        or item.get("work_item_id")
-        or item.get("workItemId")
-        or "(unknown id)"
-    )
-    title = str(item.get("title") or item.get("name") or "(no title)")
-    status = str(item.get("status") or item.get("stage") or item.get("state") or "")
-    if not status:
-        status = "(unknown)"
-    priority = item.get("priority")
-    priority_text = str(priority) if priority is not None else "(none)"
-    assignee_text = _format_assignee(item.get("assignee") or item.get("owner"))
-    description = item.get("description") or item.get("desc") or ""
-    excerpt = _excerpt_text(str(description)) or "(none)"
-    lines = [
-        f"# {title} - {work_id}",
-        f"- ID: {work_id}",
-        f"- Status/Stage: {status}",
-        f"- Priority: {priority_text}",
-        f"- Assignee: {assignee_text}",
-        "",
-        "Description:",
-        excerpt,
-        "",
-        "```json",
-        json.dumps(item, indent=2, sort_keys=True),
-        "```",
-    ]
-    return "\n".join(lines)
-
-
 def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> RunResult:
     if spec.command_type == "heartbeat":
         start = _utc_now()
@@ -1389,34 +1322,6 @@ class Scheduler:
             "candidate_title": result.selected.title,
         }
 
-    def _fetch_work_item_markdown(self, work_id: str) -> Optional[str]:
-        cmd = f"wl show {work_id} --json"
-        proc = self.run_shell(
-            cmd,
-            shell=True,
-            check=False,
-            capture_output=True,
-            text=True,
-            cwd=self.command_cwd,
-        )
-        if proc.returncode != 0:
-            LOG.warning(
-                "wl show failed for %s rc=%s stderr=%r",
-                work_id,
-                proc.returncode,
-                (proc.stderr or "")[:512],
-            )
-            return None
-        try:
-            payload = json.loads(proc.stdout or "null")
-        except Exception:
-            LOG.exception("Failed to parse wl show output for %s", work_id)
-            return None
-        item = _normalize_work_item_payload(payload)
-        if not item:
-            return None
-        return _build_work_item_markdown(item)
-
     def start_command(
         self, spec: CommandSpec, now: Optional[dt.datetime] = None
     ) -> RunResult:
@@ -1588,24 +1493,9 @@ class Scheduler:
                     except Exception:
                         LOG.exception("Failed to send idle-state webhook")
             elif status == "idle_with_candidate":
-                candidate = inspect.get("candidate") or {}
-                delegate_id = inspect.get("candidate_id") or _extract_work_item_id(
-                    candidate
-                )
-                delegate_title = inspect.get(
-                    "candidate_title"
-                ) or _extract_work_item_title(candidate)
-                markdown = (
-                    self._fetch_work_item_markdown(delegate_id) if delegate_id else None
-                )
-                if markdown:
-                    # Print the operator-facing lead line exactly, then the
-                    # readable markdown summary (including fenced JSON) on the
-                    # following lines without extra blank lines.
-                    print("Starting work on")
-                    print(markdown)
-                else:
-                    print(f"Starting work on: {delegate_title} - {delegate_id or '?'}")
+                delegate_id = inspect.get("candidate_id")
+                delegate_title = inspect.get("candidate_title") or "(no title)"
+                print(f"Starting work on: {delegate_title} - {delegate_id or '?'}")
                 result = self._run_idle_delegation(audit_only=audit_only, spec=spec)
                 # If delegation did not dispatch anything, ensure operators see
                 # an idle-state message unless a detailed idle webhook was
@@ -3081,18 +2971,6 @@ def _parse_metadata(value: Optional[str]) -> Dict[str, Any]:
     except Exception:
         pass
     raise ValueError("metadata must be a JSON object")
-
-
-def _extract_work_item_id(candidate: Dict[str, Any]) -> Optional[str]:
-    for key in ("id", "work_item_id", "workItemId", "workItemID"):
-        val = candidate.get(key)
-        if val:
-            return str(val)
-    return None
-
-
-def _extract_work_item_title(candidate: Dict[str, Any]) -> str:
-    return str(candidate.get("title") or candidate.get("name") or "(no title)")
 
 
 def _store_from_env() -> SchedulerStore:
