@@ -651,23 +651,21 @@ class TestFallbackModes:
 
     def test_auto_decline_overrides_action(self):
         config = EngineConfig(fallback_mode="auto-decline")
-        # auto-decline changes action but there's no "decline" template,
-        # so command building should fail gracefully
+        # auto-decline skips dispatch entirely and returns SKIPPED
         engine, deps = _build_engine(config=config)
         result = engine.process_delegation()
 
-        # The action is overridden but "decline" has no command template
-        assert result.status == EngineStatus.ERROR
-        assert result.action == "decline"
+        assert result.status == EngineStatus.SKIPPED
+        assert "auto-decline" in result.reason
 
     def test_auto_accept_overrides_action(self):
         config = EngineConfig(fallback_mode="auto-accept")
         engine, deps = _build_engine(config=config)
         result = engine.process_delegation()
 
-        # "accept" has no command template either
-        assert result.status == EngineStatus.ERROR
-        assert result.action == "accept"
+        # auto-accept proceeds normally using the from-state alias
+        # for dispatch template lookup (not "accept" as a template key)
+        assert result.status == EngineStatus.SUCCESS
 
 
 class TestSpecificWorkItemId:

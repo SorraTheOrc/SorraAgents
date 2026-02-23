@@ -75,7 +75,6 @@ stage:
   - intake_complete
   - prd_complete
   - plan_complete
-  - delegated
   - in_progress
   - in_review
   - audit_passed
@@ -94,14 +93,17 @@ states:
   shipped:    { status: closed, stage: done }
 
   # --- AMPA delegation states ---
-  delegated:     { status: in_progress, stage: delegated }
+  # Note: worklog has no "delegated" stage; we use (in-progress, in_progress)
+  # and rely on the "delegated" tag (added by the delegate command's effects)
+  # to distinguish delegated items from manually-started ones.
+  delegated:     { status: in-progress, stage: in_progress }
   audit_passed:  { status: completed, stage: audit_passed }
   audit_failed:  { status: in_progress, stage: audit_failed }
   escalated:     { status: blocked, stage: escalated }
 
   # --- Blocking states ---
   blocked_in_progress: { status: blocked, stage: in_progress }
-  blocked_delegated:   { status: blocked, stage: delegated }
+  blocked_delegated:   { status: blocked, stage: in_progress }
 
 terminal_states:
   - shipped

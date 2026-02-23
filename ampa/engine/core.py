@@ -515,11 +515,19 @@ class Engine:
         )
         action = from_alias  # Used in logs, notifications, EngineResult
 
-        # Apply fallback mode overrides
+        # Apply fallback mode overrides — these affect the proceed/decline
+        # decision but do NOT change the dispatch template lookup, which
+        # must always use the from-state alias.
         if self._config.fallback_mode == "auto-decline":
-            action = "decline"
-        elif self._config.fallback_mode == "auto-accept":
-            action = "accept"
+            LOG.info("Fallback mode auto-decline: skipping dispatch")
+            return EngineResult(
+                status=EngineStatus.SKIPPED,
+                reason="fallback mode auto-decline",
+                work_item_id=work_item_id,
+                command_name="delegate",
+                action=action,
+                timestamp=ts,
+            )
 
         if action is None:
             reason = (

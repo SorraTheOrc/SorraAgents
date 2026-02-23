@@ -198,6 +198,7 @@ class RunResult:
     start_ts: dt.datetime
     end_ts: dt.datetime
     exit_code: int
+    metadata: Optional[Dict[str, Any]] = dataclasses.field(default=None)
 
     @property
     def duration_seconds(self) -> float:
@@ -206,7 +207,7 @@ class RunResult:
 
 @dataclasses.dataclass(frozen=True)
 class CommandRunResult(RunResult):
-    output: str
+    output: str = ""
 
 
 class SchedulerStore:
@@ -1606,19 +1607,47 @@ class Scheduler:
                 except Exception:
                     summary_note = None
             LOG.info("Delegation summary: %s", summary_note)
+            # Attach delegation result as metadata on the RunResult so
+            # formatters can include the action taken.
+            delegation_meta: Dict[str, Any] = {}
+            if isinstance(result, dict):
+                delegation_meta["delegation"] = result
+            if isinstance(run, CommandRunResult):
+                run = CommandRunResult(
+                    start_ts=run.start_ts,
+                    end_ts=run.end_ts,
+                    exit_code=run.exit_code,
+                    output=output or run.output,
+                    metadata=delegation_meta or None,
+                )
+            else:
+                run = RunResult(
+                    start_ts=run.start_ts,
+                    end_ts=run.end_ts,
+                    exit_code=run.exit_code,
+                    metadata=delegation_meta or None,
+                )
             self._record_run(spec, run, exit_code, output)
             return run
         self._record_run(spec, run, exit_code, output)
         # After recording run, perform any command-specific post actions
         if spec.command_id == "wl-triage-audit" or spec.command_type == "triage-audit":
-            triage_audited = False
+            # delegate triage-audit processing to extracted module
             try:
-                # run triage-audit handler which posts WL comments and Discord summary
-                # returns True if an item was audited
-                triage_audited = self._run_triage_audit(spec, run, output)
+                from .triage_audit import TriageAuditRunner
+
+                runner = TriageAuditRunner(
+                    run_shell=self.run_shell,
+                    command_cwd=self.command_cwd,
+                    store=self.store,
+                    engine=getattr(self, "engine", None),
+                )
+                try:
+                    runner.run(spec, run, output)
+                except Exception:
+                    LOG.exception("TriageAuditRunner.run() failed")
             except Exception:
-                LOG.exception("Triage audit post-processing failed")
-                triage_audited = False
+                LOG.exception("Failed to import/execute TriageAuditRunner")
             # triage-audit posts its own discord summary; avoid generic post
             return run
         if spec.command_type == "stale-delegation-watchdog":
@@ -2007,12 +2036,41 @@ class Scheduler:
             # logic after audit completes so we can include its note in the
             # Discord summary and optionally dispatch intake/plan work.
             try:
+                # Suppress engine-level Discord notifications while we run an
+                # opportunistic delegation from triage so that the triage
+                # audit summary remains the canonical Discord message for this
+                # run. Swap the engine notifier to a no-op implementation
+                # for the duration of the call.
+                old_notifier = None
+                try:
+                    if (
+                        hasattr(self, "engine")
+                        and getattr(self.engine, "_notifier", None) is not None
+                    ):
+                        old_notifier = self.engine._notifier
+                        # Use the engine's NullNotificationSender to avoid an import
+                        # cycle by referencing the class dynamically from the
+                        # engine module.
+                        from ampa.engine.core import NullNotificationSender
+
+                        self.engine._notifier = NullNotificationSender()
+                except Exception:
+                    old_notifier = None
+
                 delegation_result = self._run_idle_delegation(
                     audit_only=audit_only, spec=spec
                 )
             except Exception:
                 LOG.exception("Delegation run failed during triage audit")
                 delegation_result = None
+            finally:
+                try:
+                    if old_notifier is not None and hasattr(self, "engine"):
+                        self.engine._notifier = old_notifier
+                except Exception:
+                    LOG.exception(
+                        "Failed to restore engine notifier after triage delegation"
+                    )
 
             # 3) post a short Discord summary (1-3 lines)
             # helper to extract a human-facing 'Summary' section from audit output
@@ -3176,10 +3234,26 @@ def _format_run_result_json(
         "status": "success" if run.exit_code == 0 else "failed",
         "started_at": _to_iso(run.start_ts),
         "finished_at": _to_iso(run.end_ts),
+        "duration_seconds": round(run.duration_seconds, 3),
         "exit_code": run.exit_code,
         "output": output,
         "instance": instance,
     }
+    # Include delegation details when available
+    if run.metadata and isinstance(run.metadata.get("delegation"), dict):
+        deleg = run.metadata["delegation"]
+        delegation_data: Dict[str, Any] = {
+            "dispatched": deleg.get("dispatched", False),
+            "note": deleg.get("note"),
+        }
+        if deleg.get("dispatched") and deleg.get("delegate_info"):
+            info = deleg["delegate_info"]
+            delegation_data["action"] = info.get("action")
+            delegation_data["work_item_id"] = info.get("id")
+            delegation_data["work_item_title"] = info.get("title")
+        if deleg.get("rejected"):
+            delegation_data["rejected_count"] = len(deleg["rejected"])
+        data["delegation"] = delegation_data
     return json.dumps(data, indent=2, sort_keys=True)
 
 
@@ -3199,8 +3273,17 @@ def _format_run_result_human(
 
     if fmt == "concise":
         status = "OK" if run.exit_code == 0 else f"FAIL({run.exit_code})"
-        duration = f"{run.duration_seconds:.1f}s"
-        return f"{spec.command_id}  {status}  {duration}"
+        duration = f"{run.duration_seconds:.3f}s"
+        line = f"{spec.command_id}  {status}  {duration}"
+        # Append delegation action if present
+        if run.metadata and isinstance(run.metadata.get("delegation"), dict):
+            deleg = run.metadata["delegation"]
+            if deleg.get("dispatched"):
+                info = deleg.get("delegate_info") or {}
+                line += f"  -> {info.get('action', '?')} {info.get('id', '?')}"
+            elif deleg.get("note"):
+                line += f"  [{deleg['note']}]"
+        return line
 
     # 'normal' (default) and 'full'
     lines: List[str] = []
@@ -3213,7 +3296,22 @@ def _format_run_result_human(
         f"Started:   {run.start_ts.astimezone().strftime('%d-%b-%Y %H:%M:%S')}"
     )
     lines.append(f"Finished:  {run.end_ts.astimezone().strftime('%d-%b-%Y %H:%M:%S')}")
-    lines.append(f"Duration:  {run.duration_seconds:.1f}s")
+    lines.append(f"Duration:  {run.duration_seconds:.3f}s")
+
+    # Include delegation action details when available
+    if run.metadata and isinstance(run.metadata.get("delegation"), dict):
+        deleg = run.metadata["delegation"]
+        if deleg.get("dispatched"):
+            info = deleg.get("delegate_info") or {}
+            lines.append(
+                f"Delegation: dispatched {info.get('action', '?')} "
+                f"{info.get('id', '?')} ({info.get('title', '')})"
+            )
+        elif deleg.get("note"):
+            lines.append(f"Delegation: {deleg['note']}")
+        rejected = deleg.get("rejected")
+        if rejected:
+            lines.append(f"Rejected:  {len(rejected)} candidate(s)")
 
     if fmt == "full":
         lines.append(f"Instance:  {instance}")

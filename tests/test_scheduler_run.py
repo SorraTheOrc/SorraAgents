@@ -123,7 +123,7 @@ def test_format_human_concise():
     text = _format_run_result_human(spec, run, "concise", "host")
     assert "test-cmd" in text
     assert "OK" in text
-    assert "5.0s" in text
+    assert "5.000s" in text
 
 
 def test_format_human_concise_failure():
