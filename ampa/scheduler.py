@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -632,6 +633,102 @@ class Scheduler:
         # delegation timing.
         self._ensure_watchdog_command()
 
+        # --- Discord bot process supervision ---
+        self._bot_process: Optional[subprocess.Popen] = None
+        self._bot_consecutive_failures: int = 0
+        self._BOT_MAX_CONSECUTIVE_FAILURES: int = 3
+
+    # ------------------------------------------------------------------
+    # Discord bot process supervision
+    # ------------------------------------------------------------------
+
+    def _ensure_bot_running(self) -> None:
+        """Ensure the Discord bot process is alive, starting it if needed.
+
+        Called at scheduler startup and at the top of each cycle.  If
+        ``AMPA_DISCORD_BOT_TOKEN`` is not set, this is a no-op — notifications
+        are silently disabled.
+
+        If the bot fails to start on 3 consecutive attempts the supervisor logs
+        an error and stops retrying until the scheduler is restarted (to avoid
+        spamming logs and wasting resources).
+        """
+        token = os.getenv("AMPA_DISCORD_BOT_TOKEN")
+        if not token:
+            return
+
+        # Already exceeded consecutive failure limit — don't keep retrying.
+        if self._bot_consecutive_failures >= self._BOT_MAX_CONSECUTIVE_FAILURES:
+            return
+
+        # Check if existing process is still alive.
+        if self._bot_process is not None:
+            rc = self._bot_process.poll()
+            if rc is None:
+                # Process is alive — nothing to do.
+                return
+            # Process has exited.
+            LOG.warning(
+                "Discord bot process (pid=%d) exited with code %s – restarting",
+                self._bot_process.pid,
+                rc,
+            )
+            self._bot_process = None
+
+        # Attempt to start the bot.
+        try:
+            self._bot_process = subprocess.Popen(
+                [sys.executable, "-m", "ampa.discord_bot"],
+                start_new_session=True,
+            )
+            LOG.info(
+                "Started Discord bot process (pid=%d)",
+                self._bot_process.pid,
+            )
+            self._bot_consecutive_failures = 0
+        except Exception:
+            self._bot_consecutive_failures += 1
+            LOG.exception(
+                "Failed to start Discord bot process (attempt %d/%d)",
+                self._bot_consecutive_failures,
+                self._BOT_MAX_CONSECUTIVE_FAILURES,
+            )
+            if self._bot_consecutive_failures >= self._BOT_MAX_CONSECUTIVE_FAILURES:
+                LOG.error(
+                    "Discord bot failed to start %d consecutive times – "
+                    "giving up until scheduler restart",
+                    self._BOT_MAX_CONSECUTIVE_FAILURES,
+                )
+
+    def _shutdown_bot(self) -> None:
+        """Send SIGTERM to the bot process and wait briefly for it to exit."""
+        if self._bot_process is None:
+            return
+        rc = self._bot_process.poll()
+        if rc is not None:
+            # Already exited.
+            self._bot_process = None
+            return
+        pid = self._bot_process.pid
+        LOG.info("Sending SIGTERM to Discord bot process (pid=%d)", pid)
+        try:
+            self._bot_process.terminate()
+            try:
+                self._bot_process.wait(timeout=5)
+                LOG.info("Discord bot process (pid=%d) exited cleanly", pid)
+            except subprocess.TimeoutExpired:
+                LOG.warning(
+                    "Discord bot process (pid=%d) did not exit after SIGTERM; "
+                    "sending SIGKILL",
+                    pid,
+                )
+                self._bot_process.kill()
+                self._bot_process.wait(timeout=2)
+        except Exception:
+            LOG.exception("Error shutting down Discord bot process (pid=%d)", pid)
+        finally:
+            self._bot_process = None
+
     def _build_engine(self) -> Optional[Engine]:
         """Construct an Engine from the workflow descriptor.
 
@@ -1025,7 +1122,6 @@ class Scheduler:
         self._post_discord(spec, run, output)
         return run
 
-
     def run_once(self) -> Optional[RunResult]:
         now = _utc_now()
         next_cmd = self.select_next(now)
@@ -1036,27 +1132,53 @@ class Scheduler:
     def run_forever(self) -> None:
         LOG.info("Starting scheduler loop")
         self._post_startup_message()
+
+        # Start the Discord bot process (no-op if token not configured).
+        self._ensure_bot_running()
+
+        # Install a shutdown handler so the bot is terminated when the
+        # scheduler exits (SIGTERM / SIGINT / normal exit).
+        def _shutdown_handler(signum, frame):
+            LOG.info("Received signal %s – shutting down bot", signum)
+            self._shutdown_bot()
+            # Re-raise to let the default handler terminate the scheduler.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, _shutdown_handler)
+            except (OSError, ValueError):
+                # ValueError: signal only works in main thread
+                pass
+
         # periodic health reporting accumulator (seconds)
         _health_accum = 0
         _health_interval = max(1, self.config.global_min_interval_seconds)
-        while True:
-            try:
-                self.run_once()
-            except Exception:
-                LOG.exception("Scheduler iteration failed")
-            # sleep then accumulate for periodic health reporting
-            try:
-                time.sleep(self.config.poll_interval_seconds)
-            except Exception:
-                # sleep can be interrupted (signals); continue loop
-                pass
-            _health_accum += self.config.poll_interval_seconds
-            if _health_accum >= _health_interval:
+        try:
+            while True:
+                # Ensure bot is alive at the top of each cycle.
+                self._ensure_bot_running()
                 try:
-                    self._log_health()
+                    self.run_once()
                 except Exception:
-                    LOG.exception("Failed to emit periodic health report")
-                _health_accum = 0
+                    LOG.exception("Scheduler iteration failed")
+                # sleep then accumulate for periodic health reporting
+                try:
+                    time.sleep(self.config.poll_interval_seconds)
+                except Exception:
+                    # sleep can be interrupted (signals); continue loop
+                    pass
+                _health_accum += self.config.poll_interval_seconds
+                if _health_accum >= _health_interval:
+                    try:
+                        self._log_health()
+                    except Exception:
+                        LOG.exception("Failed to emit periodic health report")
+                    _health_accum = 0
+        finally:
+            # Best-effort cleanup on exit.
+            self._shutdown_bot()
 
     def _log_health(self) -> None:
         """Emit a periodic health report about scheduled commands.
