@@ -36,25 +36,86 @@ Provide a concise, human-friendly summary of project status or a specific work i
   - Total number of blocked work items.
 - Present a summary of actively in_progress work items (`wl in-progress --json`). For each in_progress item, include: title, id, assignee, priority, and a one line summary of the description.
 
-Skip to step 4.
+Skip to step 6.
 
 3. If a work item id is provided:
 
-- Run `wl show <work-item-id> --json` to fetch work item details (with all comments).
-- Extracts the acceptance criteria from the description (they are usually in a markdown section starting with `## Acceptance Criteria` and formatted as a list).
-  - For each acceptance criterion, provide a concise summary of whether it is met or unmet based on the work item description and comments and, where appropriate, code in the repository. If any criterion is unmet, provide a concise summary of what is missing.
-- Walk through all child work-items (subtasks) and list each items title, id, status and stage.
+- Run `wl show <work-item-id> --children --json` to fetch work item details (with all comments and children).
+- Extract the acceptance criteria from the description (they are usually in a markdown section starting with `## Acceptance Criteria` or `### Acceptance Criteria` and formatted as a numbered or bulleted list).
+  - If no acceptance criteria section is found, note: "No acceptance criteria defined."
 - Walk through all dependencies (`wl dep list <work-item-id> --json`) and list each dependent work-item's status, title (using strike through if the item has a "completed" status), id, and stage.
 
-4. Provide a final section titled "# Summary" containing the following optional items as applicable:
+4. **Deep code review of acceptance criteria (parent work item):**
 
-- If the item cannot be closed, this will be stated along with a summary of the work that needs to be completed before the item can be closed. If the item can be closed, skip this point.
-- If there is an open PR request a review and provide the URL. If there is no open PR, skip this point.
-- If the item can be closed (all acceptance criteria met, all children completed, PR merged) a recommendation to close will be included. If the item cannot be closed, skip this point.
+For each acceptance criterion found in step 3, perform a thorough code review:
+- Read the actual implementation files referenced in the work item description, comments, or discoverable from the codebase.
+- Assess correctness: does the code implement what the criterion requires?
+- Assess completeness: are edge cases handled? Are there missing branches or error paths?
+- Check for test coverage: are there tests that validate this criterion?
+- Assign a verdict to each criterion:
+  - `met` — the criterion is fully satisfied by the implementation
+  - `unmet` — the criterion is not satisfied or the implementation is missing
+  - `partial` — the criterion is partially satisfied but incomplete
+- For each verdict, provide a one-line evidence note referencing the relevant file and line number (e.g., `src/handler.ts:42 — rate limiter middleware correctly intercepts requests`).
+- Do NOT rely solely on work item descriptions and comments. You MUST read the actual code to verify.
 
-DO NOT output anything after the summary section.
+5. **Deep code review of children's acceptance criteria:**
+
+For each direct child work item (do NOT recurse into grandchildren):
+- Run `wl show <child-id> --json` to fetch the child's details.
+- Extract the child's acceptance criteria from its description.
+  - If no acceptance criteria section is found, note: "No acceptance criteria defined."
+- Perform the same deep code review as described in step 4 for each of the child's acceptance criteria.
+- Assign per-criterion verdicts (`met`/`unmet`/`partial`) with file:line evidence.
+
+6. **Produce the structured audit report:**
+
+Wrap the final report output in delimiter markers. The report MUST follow this exact structure:
+
+```
+--- AUDIT REPORT START ---
+## Summary
+
+<concise 2-4 sentence summary of overall status, key findings, and whether the item can be closed>
+
+## Acceptance Criteria Status
+
+| # | Criterion | Verdict | Evidence |
+|---|-----------|---------|----------|
+| 1 | <criterion text> | met/unmet/partial | <file_path:line_number — one-line note> |
+| 2 | ... | ... | ... |
+
+<If no acceptance criteria were found, write: "No acceptance criteria defined.">
+
+## Children Status
+
+### <child-title> (<child-id>) — <status>/<stage>
+
+| # | Criterion | Verdict | Evidence |
+|---|-----------|---------|----------|
+| 1 | <criterion text> | met/unmet/partial | <file_path:line_number — one-line note> |
+
+<Repeat for each direct child. If a child has no acceptance criteria, write: "No acceptance criteria defined.">
+<If there are no children, write: "No children.">
+
+## Recommendation
+
+<One of the following:>
+<- "This item can be closed: all acceptance criteria are met, all children are completed, and the PR is merged.">
+<- "This item cannot be closed: <brief reason — e.g., 2 acceptance criteria are unmet, 1 child is still open>.">
+<- If there is an open PR, note: "Open PR awaiting review: <PR URL>">
+--- AUDIT REPORT END ---
+```
+
+CRITICAL rules for the structured report:
+- The `--- AUDIT REPORT START ---` and `--- AUDIT REPORT END ---` delimiters MUST appear on their own lines.
+- DO NOT output anything after the `--- AUDIT REPORT END ---` marker.
+- Keep the report concise despite the deep analysis. Each evidence note should be ONE line.
+- For project-level audits (no work item id), omit the `## Acceptance Criteria Status` and `## Children Status` sections. Include only `## Summary` and `## Recommendation`.
+- Review only direct children, never grandchildren. If there are many children (>10), note in the report that only the first 10 were reviewed and the rest were omitted for brevity.
 
 ## Notes
 
 - Keep the output concise and actionable for quick human consumption.
 - Handle errors gracefully: if `wl` or any other command is not available or return invalid JSON, present a helpful error and possible remediation steps.
+- The depth of code review is critical: read implementation files, check function signatures, verify test coverage, and assess edge cases. Do not just check that files exist.
