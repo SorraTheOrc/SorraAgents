@@ -111,11 +111,6 @@ def _format_in_progress_items(text: str) -> List[str]:
             continue
         cleaned = stripped.lstrip("├└│ ")
         items.append(cleaned)
-    if not items:
-        for line in lines:
-            stripped = line.strip()
-            if stripped:
-                items.append(stripped)
     return items
 
 
