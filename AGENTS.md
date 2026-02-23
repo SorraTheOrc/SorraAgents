@@ -8,9 +8,9 @@ Follow thhe steps below whn completing tasks. If you are already working on a sp
    - Claim it with `wl update <id> --status in_progress --assignee <your-agent-name>`
 1. **Ensure the work-item is clearly defined**:
    - Review the description, acceptance criteria, and any related files/paths in the work item description and comments (retrieved with `wl show <id> --children --json`)
-   - Review any existing work-items in the repository that may be related to this work-item (`wl list <search-terms> --include-closed` and `wl show <id> --children --json`).
+   - Review any existing work-items in the repository that may be related to this work-item (`wl search <search-terms> --json` and `wl show <id> --children --json`).
    - If the work-item is not clearly defined (it _MUST_ included a clear description of the goal and how it will change behaviour, preferably in the form of a user story, along with acceptance criteria that can be used to verify completion and references to important specifications, user-stories, designs, or other important context):
-     - Search the worklog (`wl list <search-terms> --include-closed` and `wl show <id> --children --json`) and repository for any existing information that may clarify the requirements
+     - Search the worklog (`wl search <search-terms> --json` and `wl show <id> --children --json`) and repository for any existing information that may clarify the requirements
      - If the operator has allowed further questions ask for clarification on specific requirements, acceptance criteria, and context. Where possible provide suggested responses, but always allow for a free form text response.
      - If the operator has not allowed further questions attempt to clarify the requirements based on the existing information in the repository and worklog.
      - Update the work-item description and acceptance criteria with any clarifications found `wl update <id> --description "<updated-description>"`. DO NOT remove existing content unless it is incorrect, ONLY add to it with appropriate clarifications.
@@ -35,9 +35,9 @@ Follow thhe steps below whn completing tasks. If you are already working on a sp
 4. **Implement the work-item**:
    - Review the content of the selected work-item
    - Review the description, acceptance criteria, and any related files/paths in the work item description and comments (retrieved with `wl show <WIP-id> --children --json`)
-   - Review any existing work-items in the repository that may be related to this work-item (`wl list <search-terms> --include-closed` and `wl show <id> --children --json`).
+   - Review any existing work-items in the repository that may be related to this work-item (`wl search <search-terms> --json` and `wl show <id> --children --json`).
    - If the work-item is not clearly defined:
-     - Search the worklog (`wl list <search-terms> --include-closed` and `wl show <id> --children --json`) and repository for any existing information that may clarify the requirements
+     - Search the worklog (`wl search <search-terms> --json` and `wl show <id> --children --json`) and repository for any existing information that may clarify the requirements
      - If the operator has allowed further questions ask for clarification on specific requirements, acceptance criteria, and context. Where possible provide suggested responses, but always allow for a free form text response.
      - If the operator has not allowed further questions attempt to clarify the requirements based on the existing information in the repository and worklog.
      - Update the work-item description and acceptance criteria with any clarifications found with `wl update <WIP-id> --description "<updated-description>"`. DO NOT remove existing content unless it is incorrect, ONLY add to it with appropriate clarifications.
@@ -260,6 +260,11 @@ wl list --tags "frontend,bug" --json
 wl list --assignee "<assignee-name>" --json
 # List items filtered by stage (e.g. triage, review, done)
 wl list --stage review --json
+
+# Full-text search across all work items (title, description, comments, tags)
+wl search <keywords> --json
+# Search with status filter
+wl search <keywords> --status open --json
 
 # Show full details for a specific work item
 wl show <work-item-id> --format full --json

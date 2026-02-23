@@ -32,7 +32,7 @@ that is inserted into the work item description under a clearly-marked section.
 
 1. Fetch work item: `wl show <id> --json`.
 2. If the description already contains related markers (e.g., `related-to:`) extract these as existing related items and carry them into the following steps.
-3. Derive conservative keywords from the title/description/comments and run `wl list <keyword> --json` to collect candidates related issus.
+3. Derive conservative keywords from the title/description/comments and run `wl search <keyword> --json` to collect candidates related issus.
 4. For each candidate, fetch details with `wl show <id> --json` and review title, description, acceptance criteria, and comments to determine if it is truly related. Only include items that have clear relevance to the work item goals or context.
 5. Use the `wl deps list <id> --json` command to identify any dependencies and include these in the list of repo matches to review for relevance.
 6. Search repository documentation and code files for matching keywords; include those as repo matches.

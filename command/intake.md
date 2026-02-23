@@ -51,7 +51,7 @@ The command implements the procedural workflow below. Each numbered step is part
 1. Gather context (agent responsibility)
 
 - Derive 2–6 keywords from the <seed-context> and user input to guide repository.
-- Use derived keywords to search work items (`wl list <search> --json`) and the repository for additional context.
+- Use derived keywords to search work items (`wl search <keywords> --json`) and the repository for additional context.
   - ignore data directories such as `node_modules`, `.git` and most "." named folders.
 - If any likely duplicates are found:
   - Highlight them to the user and ask if any represent the work to be done.
