@@ -88,30 +88,30 @@ test_unknown_option() {
   fi
 }
 
-# Test: Webhook option works
-test_webhook_option() {
-  if ./install-test.sh --webhook "https://test.webhook" --yes plugins-test-plugin.mjs .worklog/plugins 2>&1 > /dev/null; then
-    test_result "Webhook option parsing" "pass"
+# Test: Bot token option works
+test_bot_token_option() {
+  if ./install-test.sh --bot-token "test-bot-token-123" --channel-id "123456789" --yes plugins-test-plugin.mjs .worklog/plugins 2>&1 > /dev/null; then
+    test_result "Bot token option parsing" "pass"
   else
-    test_result "Webhook option parsing" "fail" "Webhook option not processed correctly"
+    test_result "Bot token option parsing" "fail" "Bot token option not processed correctly"
   fi
 }
 
-# Test: Webhook short option
-test_webhook_short_option() {
-  if ./install-test.sh -w "https://test.webhook" --yes plugins-test-plugin.mjs .worklog/plugins 2>&1 > /dev/null; then
-    test_result "Webhook short option -w" "pass"
+# Test: Channel ID option works
+test_channel_id_option() {
+  if ./install-test.sh --bot-token "test-bot-token-123" --channel-id "123456789" --yes plugins-test-plugin.mjs .worklog/plugins 2>&1 > /dev/null; then
+    test_result "Channel ID option parsing" "pass"
   else
-    test_result "Webhook short option -w" "fail" "Short option not working"
+    test_result "Channel ID option parsing" "fail" "Channel ID option not processed correctly"
   fi
 }
 
-# Test: Webhook without value fails
-test_webhook_without_value() {
-  if ! ./install-test.sh --webhook 2>&1 | grep -q "requires a value"; then
-    test_result "Webhook without value fails" "fail" "Should require value"
+# Test: Bot token without value fails
+test_bot_token_without_value() {
+  if ! ./install-test.sh --bot-token 2>&1 | grep -q "requires a value"; then
+    test_result "Bot token without value fails" "fail" "Should require value"
   else
-    test_result "Webhook without value fails" "pass"
+    test_result "Bot token without value fails" "pass"
   fi
 }
 
@@ -181,9 +181,9 @@ test_python_package() {
 
 # Test: Env sample file
 test_env_sample() {
-  echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
+  echo 'AMPA_DISCORD_BOT_TOKEN=""' > ampa/.env.sample
   
-  if ./install-test.sh --webhook "https://test.webhook" --yes plugins-test-plugin.mjs .worklog/plugins 2>&1 > /dev/null; then
+  if ./install-test.sh --bot-token "test-bot-token-123" --channel-id "123456789" --yes plugins-test-plugin.mjs .worklog/plugins 2>&1 > /dev/null; then
     if [ -f ".worklog/plugins/ampa_py/ampa/.env" ]; then
       test_result "Env sample file detection" "pass"
     else
@@ -194,19 +194,20 @@ test_env_sample() {
   fi
 }
 
-# Test: Webhook in env file
-test_webhook_in_env() {
-  echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
-  TEST_WEBHOOK="https://discord.com/api/webhooks/test123"
+# Test: Bot config in env file
+test_bot_config_in_env() {
+  echo 'AMPA_DISCORD_BOT_TOKEN=""' > ampa/.env.sample
+  TEST_BOT_TOKEN="test-bot-token-456"
+  TEST_CHANNEL_ID="987654321"
   
-  if ./install-test.sh --webhook "$TEST_WEBHOOK" --yes plugins-test-plugin.mjs .worklog/plugins 2>&1 > /dev/null; then
-    if grep -q "AMPA_DISCORD_WEBHOOK=$TEST_WEBHOOK" .worklog/plugins/ampa_py/ampa/.env 2>/dev/null; then
-      test_result "Webhook written to env file" "pass"
+  if ./install-test.sh --bot-token "$TEST_BOT_TOKEN" --channel-id "$TEST_CHANNEL_ID" --yes plugins-test-plugin.mjs .worklog/plugins 2>&1 > /dev/null; then
+    if grep -q "AMPA_DISCORD_BOT_TOKEN=$TEST_BOT_TOKEN" .worklog/plugins/ampa_py/ampa/.env 2>/dev/null; then
+      test_result "Bot token written to env file" "pass"
     else
-      test_result "Webhook written to env file" "fail" "Webhook not in env"
+      test_result "Bot token written to env file" "fail" "Bot token not in env"
     fi
   else
-    test_result "Webhook written to env file" "fail" "Installation failed"
+    test_result "Bot token written to env file" "fail" "Installation failed"
   fi
 }
 
@@ -270,11 +271,11 @@ test_strict_mode() {
 test_help_completeness() {
   local help_output=$(./install-test.sh --help 2>&1)
   
-  local has_webhook=0
+  local has_bot_token=0
   local has_yes=0
   local has_restart=0
   
-  if echo "$help_output" | grep -q "\--webhook\|--yes\|--restart"; then
+  if echo "$help_output" | grep -q "\--bot-token\|--yes\|--restart"; then
     test_result "Help text contains all options" "pass"
   else
     test_result "Help text contains all options" "fail" "Missing option descriptions"
@@ -339,9 +340,9 @@ main() {
   print_section "Argument Parsing Tests"
   test_help_flag
   test_unknown_option
-  test_webhook_option
-  test_webhook_short_option
-  test_webhook_without_value
+  test_bot_token_option
+  test_channel_id_option
+  test_bot_token_without_value
   test_exclusive_options
   
   print_section "Source File Tests"
@@ -357,7 +358,7 @@ main() {
   
   print_section "Environment File Tests"
   test_env_sample
-  test_webhook_in_env
+  test_bot_config_in_env
   
   print_section "Installation Flow Tests"
   test_existing_install_detection

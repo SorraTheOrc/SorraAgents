@@ -25,11 +25,11 @@ the existing configuration and instructing the requestor to request to "Configur
 
 If there is currently no installation or the skill was activated with a request to configure or change AMPA continue to step 2, otherwise skip to step 3.
 
-2. Discord Webhook
+2. Discord Bot Token
 
-If a webhook was provided in the prompt that triggered this skill skip ahead to the next step.
+If a bot token was provided in the prompt that triggered this skill skip ahead to the next step.
 
-Explain that a discord webhook is required for notifications from the AMPA agent and request the URL for the webhook.
+Explain that a Discord bot token and channel ID are required for notifications from the AMPA agent and request the bot token and channel ID.
 
 3. Install/Upgrade AMPA
 
@@ -38,7 +38,7 @@ Run the installer from the repository root providing any configuration options w
 For example:
 
 ```
-skill/install-ampa/scripts/install-worklog-plugin.sh --webhook <discord_webhook> --yes
+skill/install-ampa/scripts/install-worklog-plugin.sh --bot-token <discord_bot_token> --channel-id <discord_channel_id> --yes
 ```
 
 Notes:

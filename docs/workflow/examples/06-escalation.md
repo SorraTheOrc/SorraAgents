@@ -179,7 +179,7 @@ reason: "2 audit failures. Remaining gap: timestamp replay protection not implem
 **Effects:**
 - `set_assignee: Producer`
 - `add_tags: [escalated]`
-- Notification: Discord webhook fires
+- Notification: Discord bot notification fires
 
 **Engine Actions:**
 ```bash
@@ -318,5 +318,5 @@ review → audit_failed → plan → delegated → review → audit_failed → e
 3. **Producer adds value**: The escalation is not just a notification — the Producer provides concrete implementation guidance that resolves the ambiguity that caused repeated failures.
 4. **`de_escalate` resets to `plan`**: After Producer review, `de_escalate` moves the item to the same state as `retry_delegation` (`open/plan_complete`), allowing it to re-enter the normal delegation cycle.
 5. **Audit trail preserved**: All three audit comments remain on the work item, documenting the progression from 2 unmet criteria → 1 unmet → all met. The escalation reason and Producer guidance are also preserved as comments.
-6. **Discord notifications**: The `escalate` command fires a Discord webhook, ensuring the Producer is notified promptly rather than having to poll the worklog.
+6. **Discord notifications**: The `escalate` command fires a Discord bot notification, ensuring the Producer is notified promptly rather than having to poll the worklog.
 7. **No infinite loops**: The escalation threshold guarantees that the engine cannot retry indefinitely. A human must intervene to unblock progress.

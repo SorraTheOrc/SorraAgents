@@ -25,7 +25,7 @@ References:
    - If the markers are missing (e.g., the audit agent failed or produced legacy output), fall back to using the full raw output and log a warning.
 
 4. **Post a Discord summary (optional)**
-   - If `AMPA_DISCORD_WEBHOOK` is set, extract the `## Summary` section from the structured report.
+   - If `AMPA_DISCORD_BOT_TOKEN` is set, extract the `## Summary` section from the structured report.
    - If no `## Summary` heading is found, fall back to the legacy regex extraction (`_extract_summary()`).
    - If neither produces a summary, fall back to a short line with the work id, title, and exit code.
    - Send a Discord message capped to ~1000 chars.
@@ -96,7 +96,7 @@ The `_extract_audit_report()` function in `triage_audit.py` extracts content bet
 ## Configuration and metadata
 
 Environment variables:
-- `AMPA_DISCORD_WEBHOOK`: If set, Discord summary messages are sent.
+- `AMPA_DISCORD_BOT_TOKEN`: If set, Discord summary messages are sent via the bot.
 - `AMPA_VERIFY_PR_WITH_GH`: If set to `1|true|yes`, verifies PR merge status with `gh` when a PR URL appears in output. If unset, defaults to enabled.
 
 Per-command metadata (from the scheduler command spec):

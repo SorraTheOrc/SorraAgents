@@ -44,7 +44,7 @@ Logging & Discord
 
 - When a candidate is skipped due to the tag, AMPA logs at INFO level (see above). This keeps the decision visible but non-fatal in logs.
 - Unsupported stages are logged at ERROR and reported to Discord (AMPA will continue trying later candidates).
-- When AMPA dispatches a delegation it posts a follow-up delegation report to the configured Discord webhook summarizing the post-dispatch state.
+- When AMPA dispatches a delegation it posts a follow-up delegation report to the configured Discord bot channel summarizing the post-dispatch state.
 
 Recommended practice
 

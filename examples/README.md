@@ -21,14 +21,16 @@ Environment variables:
 Trigger a waiting_for_input notification to Discord/AMPA.
 
 ```sh
-AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/..." \
+AMPA_DISCORD_BOT_TOKEN="your-bot-token" \
+AMPA_DISCORD_CHANNEL_ID="your-channel-id" \
 AMPA_RESPONDER_URL="http://localhost:8081/respond" \
 python examples/waiting_for_input_notification.py
 ```
 
 Environment variables:
 
-- `AMPA_DISCORD_WEBHOOK` (required): Discord webhook for notifications.
+- `AMPA_DISCORD_BOT_TOKEN` (required): Discord bot token for notifications.
+- `AMPA_DISCORD_CHANNEL_ID` (required): Discord channel ID for notifications.
 - `AMPA_RESPONDER_URL` (required): responder endpoint URL shown in the notification.
 - `AMPA_EXAMPLE_WORK_ITEM` (optional): work item id shown in the message (default `WL-EXAMPLE`).
 - `AMPA_TOOL_OUTPUT_DIR` (optional): override tool-output directory for pending prompt files.
