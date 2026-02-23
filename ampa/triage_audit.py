@@ -48,41 +48,15 @@ def _from_iso(value: Optional[str]) -> Optional[dt.datetime]:
         return None
 
 
-def _summarize_for_discord(text: Optional[str], max_chars: int = 1000) -> str:
-    if not text:
-        return ""
-    try:
-        if len(text) <= max_chars:
-            return text
-        cap = 20000
-        input_text = text[:cap]
-        cmd = [
-            "opencode",
-            "run",
-            f"summarize this content in under {max_chars} characters: {input_text}",
-        ]
-        LOG.info("Summarizing content for Discord (len=%d) via opencode", len(text))
-        proc = subprocess.run(
-            cmd, check=False, capture_output=True, text=True, timeout=30
-        )
-        if proc.returncode != 0:
-            LOG.warning(
-                "opencode summarizer failed rc=%s stderr=%r",
-                getattr(proc, "returncode", None),
-                getattr(proc, "stderr", None),
-            )
-            return text
-        summary = (proc.stdout or "").strip()
-        if not summary:
-            return text
-        return summary
-    except Exception:
-        LOG.exception("Failed to summarize content for Discord")
-        return text
-
-
-def _trim_text(value: Optional[str]) -> str:
-    return value.strip() if value else ""
+# ---------------------------------------------------------------------------
+# Delegation helpers — canonical implementations live in ampa.delegation.
+# ---------------------------------------------------------------------------
+from .delegation import (  # noqa: E402
+    _summarize_for_discord,
+    _trim_text,
+    _build_delegation_report,
+    DelegationOrchestrator,
+)
 
 
 def _bool_meta(value: Any) -> bool:
@@ -962,11 +936,15 @@ class TriageAuditRunner:
             return False
         return True
 
-    # helper to delegate to existing scheduler delegation API when available
+    # helper to delegate to DelegationOrchestrator when available
     def _run_delegation_from_runner(
         self, *, audit_only: bool, spec: Any
     ) -> Optional[Dict[str, Any]]:
-        # If an engine with the expected helper exists, call similar logic to scheduler._run_idle_delegation
+        """Delegate idle-delegation logic to ``DelegationOrchestrator``.
+
+        Falls back to a minimal engine-only path when the orchestrator cannot
+        be constructed (e.g. missing dependencies in test environments).
+        """
         if audit_only:
             return {
                 "note": "Delegation: skipped (audit_only)",
@@ -977,128 +955,37 @@ class TriageAuditRunner:
         try:
             if self.engine is None:
                 return None
-            # try to call engine-based delegation flow if present
-            if hasattr(self.engine, "process_delegation"):
-                try:
-                    result = self.engine.process_delegation()
-                except Exception:
-                    LOG.exception("Engine process_delegation raised an exception")
-                    return {
-                        "note": "Delegation: engine error",
-                        "dispatched": False,
-                        "rejected": [],
-                        "idle_webhook_sent": False,
-                    }
-                # Mirror the scheduler conversion minimally
-                status = getattr(result, "status", None)
-                from ampa.engine.core import EngineStatus
-
-                if status == EngineStatus.SUCCESS:
-                    action = result.action or "unknown"
-                    wid = result.work_item_id or "?"
-                    delegate_title = ""
-                    if result.candidate_result and result.candidate_result.selected:
-                        delegate_title = result.candidate_result.selected.title
-                    delegate_info = {
-                        "action": action,
-                        "id": wid,
-                        "title": delegate_title,
-                    }
-                    if result.dispatch_result:
-                        delegate_info["pid"] = result.dispatch_result.pid
-                    return {
-                        "note": f"Delegation: dispatched {action} {wid}",
-                        "dispatched": True,
-                        "delegate_info": delegate_info,
-                        "rejected": [],
-                        "idle_webhook_sent": False,
-                    }
-                if status == EngineStatus.NO_CANDIDATES:
-                    return {
-                        "note": "Delegation: skipped (no wl next candidates)",
-                        "dispatched": False,
-                        "rejected": [],
-                        "idle_webhook_sent": True,
-                    }
-                if status == EngineStatus.SKIPPED:
-                    return {
-                        "note": f"Delegation: skipped ({result.reason})",
-                        "dispatched": False,
-                        "rejected": [],
-                        "idle_webhook_sent": False,
-                    }
-                if status in (EngineStatus.REJECTED, EngineStatus.INVARIANT_FAILED):
-                    return {
-                        "note": f"Delegation: blocked ({result.reason})",
-                        "dispatched": False,
-                        "rejected": [],
-                        "idle_webhook_sent": False,
-                    }
-                if status == EngineStatus.DISPATCH_FAILED:
-                    return {
-                        "note": f"Delegation: failed ({result.reason})",
-                        "dispatched": False,
-                        "rejected": [],
-                        "idle_webhook_sent": False,
-                        "error": result.reason,
-                    }
-                return {
-                    "note": f"Delegation: engine error ({result.reason})",
-                    "dispatched": False,
-                    "rejected": [],
-                    "idle_webhook_sent": False,
-                    "error": result.reason,
-                }
-            return None
+            orchestrator = DelegationOrchestrator(
+                store=self.store,
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+                engine=self.engine,
+                candidate_selector=None,
+                webhook_module=webhook_module,
+                selection_module=None,
+            )
+            return orchestrator.run_idle_delegation(audit_only=audit_only, spec=spec)
         except Exception:
             LOG.exception("_run_delegation_from_runner failed")
             return None
 
     def _run_delegation_report_for_preview(self, spec: Any) -> Optional[str]:
-        # Lightweight replication of scheduler._run_delegation_report used for preview embedding
-        try:
-            proc = self.run_shell(
-                "wl in_progress",
-                shell=True,
-                check=False,
-                capture_output=True,
-                text=True,
-                cwd=self.command_cwd,
-            )
-            in_progress_text = ""
-            if getattr(proc, "stdout", None):
-                in_progress_text += proc.stdout
-            if getattr(proc, "stderr", None) and not in_progress_text:
-                in_progress_text += proc.stderr
-            # import selection lazily to avoid cycles
-            try:
-                from . import selection as _selection
-            except Exception:
-                import ampa.selection as _selection
-            candidates, _payload = _selection.fetch_candidates(
-                run_shell=self.run_shell, command_cwd=self.command_cwd
-            )
-            top_candidate = candidates[0] if candidates else None
-            report = "".join(
-                ["AMPA Delegation\n"]
-            )  # minimal fallback if selection unavailable
-            # Try to build a simple delegation report similar to scheduler
-            try:
-                from .scheduler import _build_delegation_report
+        """Build a delegation report for embedding in triage Discord messages.
 
-                report = _build_delegation_report(
-                    in_progress_output=_trim_text(in_progress_text),
-                    candidates=candidates,
-                    top_candidate=top_candidate,
-                )
-            except Exception:
-                try:
-                    # fallback minimal formatting
-                    lines = ["AMPA Delegation", "In-progress items:", "- (none)"]
-                    report = "\n".join(lines)
-                except Exception:
-                    report = "(no report)"
-            return report
+        Delegates to ``DelegationOrchestrator.run_delegation_report()`` which
+        contains the canonical report-building logic.
+        """
+        try:
+            orchestrator = DelegationOrchestrator(
+                store=self.store,
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+                engine=self.engine,
+                candidate_selector=None,
+                webhook_module=webhook_module,
+                selection_module=None,
+            )
+            return orchestrator.run_delegation_report(spec)
         except Exception:
             LOG.exception("Failed to build delegation preview")
             return None

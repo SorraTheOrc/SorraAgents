@@ -195,93 +195,15 @@ def _cli_run_once(args: argparse.Namespace) -> int:
     return _cli_run(args)
 
 
-def _trim_text(value: Optional[str]) -> str:
-    return value.strip() if value else ""
-
-
-def _build_delegation_report(
-    *,
-    in_progress_output: str,
-    candidates: List[Dict[str, Any]],
-    top_candidate: Optional[Dict[str, Any]],
-) -> str:
-    # replicate minimal dry-run report logic used by CLI
-    def _format_in_progress_items(text: str) -> List[str]:
-        lines = [line.rstrip() for line in (text or "").splitlines()]
-        items: List[str] = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if "- SA-" not in stripped:
-                continue
-            cleaned = stripped.lstrip("├└│ ")
-            items.append(cleaned)
-        if not items:
-            for line in lines:
-                stripped = line.strip()
-                if stripped:
-                    items.append(stripped)
-        return items
-
-    def _format_candidate_line(candidate: Dict[str, Any]) -> str:
-        work_id = str(candidate.get("id") or "?")
-        title = candidate.get("title") or candidate.get("name") or "(no title)"
-        status = candidate.get("status") or candidate.get("stage") or ""
-        priority = candidate.get("priority")
-        parts = [f"{title} - {work_id}"]
-        meta: List[str] = []
-        if status:
-            meta.append(f"status: {status}")
-        if priority is not None:
-            meta.append(f"priority: {priority}")
-        if meta:
-            parts.append("(" + ", ".join(meta) + ")")
-        return " ".join(parts)
-
-    in_progress_items = _format_in_progress_items(in_progress_output)
-    if in_progress_items:
-        lines: List[str] = ["Agents are currently busy with:"]
-        for item in in_progress_items:
-            lines.append(f"── {item}")
-        return "\n".join(lines)
-
-    sections: List[str] = []
-    sections.append("AMPA Delegation")
-    sections.append("In-progress items:")
-    sections.append("- (none)")
-
-    sections.append("Candidates:")
-    if candidates:
-        for cand in candidates:
-            sections.append(f"- {_format_candidate_line(cand)}")
-    else:
-        sections.append("- (none)")
-
-    sections.append("Top candidate:")
-    if top_candidate:
-        sections.append(f"- {_format_candidate_line(top_candidate)}")
-        sections.append("Rationale: selected by wl next (highest priority ready item).")
-    else:
-        sections.append("- (none)")
-        sections.append("Rationale: no candidates returned by wl next.")
-
-    if not candidates and not top_candidate:
-        sections.append(
-            "Summary: delegation is idle (no in-progress items or candidates)."
-        )
-
-    return "\n".join(sections)
-
-
-def _build_delegation_discord_message(report: str) -> str:
-    # reuse summarize behaviour from scheduler via webhook summarizer when available
-    try:
-        from .scheduler import _summarize_for_discord
-
-        return _summarize_for_discord(report, max_chars=1000)
-    except Exception:
-        return report if report and report.strip() else "(no report details)"
+# ---------------------------------------------------------------------------
+# Delegation helpers — canonical implementations live in ampa.delegation.
+# Imported here to avoid duplicating code that was previously inlined.
+# ---------------------------------------------------------------------------
+from .delegation import (  # noqa: E402
+    _trim_text,
+    _build_delegation_report,
+    _build_delegation_discord_message,
+)
 
 
 def _cli_dry_run(args: argparse.Namespace) -> int:
