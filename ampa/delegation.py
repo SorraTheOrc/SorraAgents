@@ -135,6 +135,8 @@ def _build_dry_run_report(
     in_progress_output: str,
     candidates: List[Dict[str, Any]],
     top_candidate: Optional[Dict[str, Any]],
+    skip_reasons: Optional[List[str]] = None,
+    rejections: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     # If there are in-progress items, produce a concise, operator-friendly
     # message listing those items and skip the verbose candidate/top-candidate
@@ -169,6 +171,21 @@ def _build_dry_run_report(
         sections.append("- (none)")
         sections.append("Rationale: no candidates returned by wl next.")
 
+    # Surface rejection reasons when candidates were evaluated but rejected
+    if rejections:
+        sections.append("Rejected candidates:")
+        for rej in rejections:
+            rej_id = rej.get("id", "?")
+            rej_title = rej.get("title", "(unknown)")
+            rej_reason = rej.get("reason", "rejected")
+            sections.append(f"- {rej_title} - {rej_id}: {rej_reason}")
+
+    # Surface skip reasons (invariant failures, no candidates, etc.)
+    if skip_reasons:
+        sections.append("Delegation skip reasons:")
+        for reason in skip_reasons:
+            sections.append(f"- {reason}")
+
     if not candidates and not top_candidate:
         sections.append(
             "Summary: delegation is idle (no in-progress items or candidates)."
@@ -192,11 +209,15 @@ def _build_delegation_report(
     in_progress_output: str,
     candidates: List[Dict[str, Any]],
     top_candidate: Optional[Dict[str, Any]],
+    skip_reasons: Optional[List[str]] = None,
+    rejections: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     return _build_dry_run_report(
         in_progress_output=in_progress_output,
         candidates=candidates,
         top_candidate=top_candidate,
+        skip_reasons=skip_reasons,
+        rejections=rejections,
     )
 
 
@@ -819,7 +840,7 @@ class DelegationOrchestrator:
             }
         elif status == "idle_no_candidate":
             # More descriptive idle message for operators
-            idle_msg = "Agents are idle: no actionable items found"
+            idle_msg = "Delegation idle: no candidates returned"
             print(idle_msg)
             LOG.info("Delegation: idle_no_candidate - %s", idle_msg)
             result = {
@@ -865,7 +886,27 @@ class DelegationOrchestrator:
                     else False
                 )
                 if not dispatched:
-                    idle_msg = "Agents are idle: no actionable items found"
+                    # Build an idle message that includes the actual reason
+                    # delegation was skipped so operators can diagnose without
+                    # checking logs.
+                    rejection_details: List[str] = []
+                    if isinstance(result, dict):
+                        if result.get("rejected"):
+                            for rej in result["rejected"]:
+                                rej_id = rej.get("id", "?")
+                                rej_reason = rej.get("reason", "rejected")
+                                rejection_details.append(f"{rej_id}: {rej_reason}")
+                    if note and "blocked" in str(note).lower():
+                        idle_msg = str(note)
+                    elif note and "skipped" in str(note).lower():
+                        idle_msg = str(note)
+                    elif rejection_details:
+                        idle_msg = (
+                            "Delegation skipped: all candidates rejected\n"
+                            + "\n".join(f"── {d}" for d in rejection_details)
+                        )
+                    else:
+                        idle_msg = "Agents are idle: no actionable items found"
                     print(idle_msg)
                     # If we didn't already send a detailed pre-report or the
                     # delegation routine didn't post its detailed idle notification,
