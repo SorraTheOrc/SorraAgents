@@ -19,5 +19,12 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["ampa*", "plan*"]
 
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-timeout",
+]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
+timeout = 30
