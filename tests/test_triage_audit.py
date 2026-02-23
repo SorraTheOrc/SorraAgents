@@ -938,3 +938,302 @@ def test_scheduler_run_once_unknown_command(tmp_path, monkeypatch, capsys):
 
     assert exit_code == 2
     assert "Unknown command id" in out
+
+
+# ---------------------------------------------------------------------------
+# _extract_audit_report tests
+# ---------------------------------------------------------------------------
+from ampa.triage_audit import _extract_audit_report
+from ampa.triage_audit import _extract_summary_from_report
+
+
+def test_extract_audit_report_happy_path():
+    """Extracts content between start and end markers."""
+    raw = (
+        "Some preamble noise from the agent\n"
+        "--- AUDIT REPORT START ---\n"
+        "## Summary\n"
+        "\n"
+        "Everything looks great.\n"
+        "\n"
+        "## Recommendation\n"
+        "\n"
+        "This item can be closed.\n"
+        "--- AUDIT REPORT END ---\n"
+        "trailing noise\n"
+    )
+    result = _extract_audit_report(raw)
+    assert result.startswith("## Summary")
+    assert "Everything looks great." in result
+    assert "This item can be closed." in result
+    assert "--- AUDIT REPORT START ---" not in result
+    assert "--- AUDIT REPORT END ---" not in result
+    assert "preamble" not in result
+    assert "trailing noise" not in result
+
+
+def test_extract_audit_report_missing_start_marker(caplog):
+    """Falls back to full output when start marker is missing."""
+    raw = "No markers here, just plain audit output."
+    with caplog.at_level("WARNING"):
+        result = _extract_audit_report(raw)
+    assert result == raw
+    assert any("missing start marker" in m.lower() for m in caplog.messages)
+
+
+def test_extract_audit_report_missing_end_marker(caplog):
+    """Uses content after start marker when end marker is missing."""
+    raw = (
+        "preamble\n--- AUDIT REPORT START ---\n## Summary\n\nThe end marker was lost.\n"
+    )
+    with caplog.at_level("WARNING"):
+        result = _extract_audit_report(raw)
+    assert "The end marker was lost." in result
+    assert "## Summary" in result
+    assert "preamble" not in result
+    assert any("missing end marker" in m.lower() for m in caplog.messages)
+
+
+def test_extract_audit_report_empty_content(caplog):
+    """Falls back to full output when content between markers is empty."""
+    raw = "--- AUDIT REPORT START ---\n--- AUDIT REPORT END ---\n"
+    with caplog.at_level("WARNING"):
+        result = _extract_audit_report(raw)
+    assert result == raw
+    assert any("empty" in m.lower() for m in caplog.messages)
+
+
+def test_extract_audit_report_whitespace_only_content(caplog):
+    """Falls back to full output when content between markers is whitespace-only."""
+    raw = "--- AUDIT REPORT START ---\n   \n\n--- AUDIT REPORT END ---\n"
+    with caplog.at_level("WARNING"):
+        result = _extract_audit_report(raw)
+    assert result == raw
+    assert any("empty" in m.lower() for m in caplog.messages)
+
+
+def test_extract_audit_report_multiple_marker_pairs():
+    """Only the first pair of markers is used."""
+    raw = (
+        "--- AUDIT REPORT START ---\n"
+        "First report.\n"
+        "--- AUDIT REPORT END ---\n"
+        "--- AUDIT REPORT START ---\n"
+        "Second report.\n"
+        "--- AUDIT REPORT END ---\n"
+    )
+    result = _extract_audit_report(raw)
+    assert result == "First report."
+    assert "Second report." not in result
+
+
+def test_extract_audit_report_empty_input():
+    """Returns empty string for empty input."""
+    assert _extract_audit_report("") == ""
+    assert _extract_audit_report(None) == ""  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# _extract_summary_from_report tests
+# ---------------------------------------------------------------------------
+
+
+def test_extract_summary_from_report_happy_path():
+    """Extracts the Summary section from a structured report."""
+    report = (
+        "## Summary\n"
+        "\n"
+        "Everything looks great. All criteria are met.\n"
+        "\n"
+        "## Acceptance Criteria Status\n"
+        "\n"
+        "| # | Criterion | Verdict |\n"
+    )
+    result = _extract_summary_from_report(report)
+    assert result == "Everything looks great. All criteria are met."
+
+
+def test_extract_summary_from_report_no_heading():
+    """Returns empty string when no ## Summary heading exists."""
+    report = "## Acceptance Criteria Status\n\nSome table here.\n"
+    assert _extract_summary_from_report(report) == ""
+
+
+def test_extract_summary_from_report_summary_at_end():
+    """Extracts summary when it is the last section."""
+    report = "## Summary\n\nFinal summary with no sections after it.\n"
+    result = _extract_summary_from_report(report)
+    assert result == "Final summary with no sections after it."
+
+
+def test_extract_summary_from_report_empty_input():
+    """Returns empty string for empty input."""
+    assert _extract_summary_from_report("") == ""
+
+
+def test_extract_summary_from_report_multiline():
+    """Extracts multi-line summary content."""
+    report = (
+        "## Summary\n"
+        "\n"
+        "Line one of the summary.\n"
+        "Line two continues.\n"
+        "\n"
+        "Another paragraph in summary.\n"
+        "\n"
+        "## Recommendation\n"
+        "\n"
+        "Close it.\n"
+    )
+    result = _extract_summary_from_report(report)
+    assert "Line one of the summary." in result
+    assert "Line two continues." in result
+    assert "Another paragraph in summary." in result
+    assert "Close it." not in result
+
+
+# ---------------------------------------------------------------------------
+# End-to-end integration test (mock-based)
+# ---------------------------------------------------------------------------
+
+
+def test_structured_audit_end_to_end(tmp_path, monkeypatch):
+    """Integration test: canned structured audit output flows through
+    marker extraction → comment posting (structured report only) →
+    Discord summary extraction from ## Summary section.
+
+    Verifies:
+    1. The posted WL comment contains the structured report (not raw output).
+    2. The posted WL comment does NOT contain the old "Audit output:" label.
+    3. The Discord webhook payload includes the summary extracted from ## Summary.
+    4. Preamble/trailing noise from the raw output is excluded from the comment.
+    """
+    calls = []
+    webhook_payloads = []
+    posted_comments = []
+    work_id = "TEST-E2E-STRUCT-001"
+
+    canned_audit_output = (
+        "Some preamble noise from the agent stdout\n"
+        "--- AUDIT REPORT START ---\n"
+        "## Summary\n"
+        "\n"
+        "All 3 acceptance criteria are met. The implementation is correct and tests pass.\n"
+        "\n"
+        "## Acceptance Criteria Status\n"
+        "\n"
+        "| # | Criterion | Verdict | Evidence |\n"
+        "|---|-----------|---------|----------|\n"
+        "| 1 | Widget renders | met | src/widget.tsx:15 |\n"
+        "| 2 | API returns 200 | met | src/api.ts:42 |\n"
+        "| 3 | Tests pass | met | tests/widget.test.ts:8 |\n"
+        "\n"
+        "## Children Status\n"
+        "\n"
+        "No children.\n"
+        "\n"
+        "## Recommendation\n"
+        "\n"
+        "This item can be closed: all acceptance criteria are met.\n"
+        "--- AUDIT REPORT END ---\n"
+        "trailing agent noise\n"
+    )
+
+    def capture_webhook(url, payload, **kwargs):
+        webhook_payloads.append(payload)
+
+    monkeypatch.setattr(webhook, "send_webhook", capture_webhook)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl in_progress --json":
+            out = json.dumps(
+                {
+                    "workItems": [
+                        {
+                            "id": work_id,
+                            "title": "Structured audit test item",
+                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        }
+                    ]
+                }
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment list {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=canned_audit_output, stderr=""
+            )
+        if cmd.strip().startswith(f"wl comment add {work_id}"):
+            posted_comments.append(cmd)
+            # Extract the comment file path from the command to read its content
+            import re as _re
+
+            m = _re.search(r"cat '([^']+)'", cmd)
+            if m:
+                try:
+                    with open(m.group(1), "r") as f:
+                        posted_comments.append(f.read())
+                except Exception:
+                    pass
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
+            )
+        if cmd.strip().startswith(f"wl show {work_id}"):
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps({"id": work_id, "status": "in_progress"}),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+
+    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+
+    sched.start_command(spec)
+
+    # --- Verify comment posting ---
+    # A wl comment add should have been attempted
+    comment_cmds = [c for c in calls if c.startswith(f"wl comment add {work_id}")]
+    assert comment_cmds, "Expected at least one wl comment add call"
+
+    # The posted comment content should contain the structured report
+    comment_content = "\n".join(posted_comments)
+    assert "# AMPA Audit Result" in comment_content
+    assert "## Summary" in comment_content
+    assert "All 3 acceptance criteria are met" in comment_content
+    assert "## Acceptance Criteria Status" in comment_content
+    assert "Widget renders" in comment_content
+    assert "## Recommendation" in comment_content
+
+    # The posted comment should NOT contain old-style labels or raw noise
+    assert "Audit output:" not in comment_content
+    assert "preamble noise" not in comment_content
+    assert "trailing agent noise" not in comment_content
+    # Delimiters themselves should not be in the comment
+    assert "--- AUDIT REPORT START ---" not in comment_content
+    assert "--- AUDIT REPORT END ---" not in comment_content
+
+    # --- Verify Discord webhook ---
+    assert webhook_payloads, "Expected at least one webhook payload"
+    # The webhook should include the Summary section text
+    payload_str = json.dumps(webhook_payloads[0])
+    assert "All 3 acceptance criteria are met" in payload_str

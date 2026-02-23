@@ -51,15 +51,27 @@ The engine's triage audit cycle picks up WL-EXAMPLE-002 in `in_review` state.
 ```
 # AMPA Audit Result
 
-- Work item: WL-EXAMPLE-002 — "Implement rate limiting middleware"
-- Acceptance Criteria:
-  - [x] Rate limiting middleware intercepts requests — Met
-  - [x] Configurable rate limits per endpoint — Met
-  - [ ] Rate limit headers included in response — Unmet: no X-RateLimit-* headers found
-  - [x] 429 status code returned when limit exceeded — Met
-  - [ ] Rate limit state persisted across restarts — Unmet: using in-memory store only
-- Can this item be closed? No — 2 acceptance criteria are not met.
-- What remains: Add rate limit response headers and implement persistent storage.
+## Summary
+
+WL-EXAMPLE-002 — "Implement rate limiting middleware" has 2 of 5 acceptance criteria unmet. Rate limit response headers are missing and rate limit state uses in-memory storage only without persistence across restarts.
+
+## Acceptance Criteria Status
+
+| # | Criterion | Verdict | Evidence |
+|---|-----------|---------|----------|
+| 1 | Rate limiting middleware intercepts requests | met | src/middleware/rateLimit.ts:15 — middleware correctly intercepts requests |
+| 2 | Configurable rate limits per endpoint | met | src/config/rateLimits.ts:8 — per-endpoint config loaded from env |
+| 3 | Rate limit headers included in response | unmet | No X-RateLimit-* headers found in middleware response |
+| 4 | 429 status code returned when limit exceeded | met | src/middleware/rateLimit.ts:42 — returns 429 on limit exceeded |
+| 5 | Rate limit state persisted across restarts | unmet | src/middleware/rateLimit.ts:5 — using in-memory Map only |
+
+## Children Status
+
+No children.
+
+## Recommendation
+
+This item cannot be closed: 2 acceptance criteria are unmet (rate limit headers, persistent storage).
 ```
 
 **Engine Action:**
@@ -120,9 +132,27 @@ Patch reads the audit comment, addresses the gaps:
 ```
 # AMPA Audit Result
 
-- All 5 acceptance criteria now met
-- PR #57 merged
-- Can this item be closed? Yes
+## Summary
+
+All 5 acceptance criteria are now met. Rate limit headers and Redis-backed persistent storage have been implemented. PR #57 is merged.
+
+## Acceptance Criteria Status
+
+| # | Criterion | Verdict | Evidence |
+|---|-----------|---------|----------|
+| 1 | Rate limiting middleware intercepts requests | met | src/middleware/rateLimit.ts:15 |
+| 2 | Configurable rate limits per endpoint | met | src/config/rateLimits.ts:8 |
+| 3 | Rate limit headers included in response | met | src/middleware/rateLimit.ts:35 — X-RateLimit-* headers added |
+| 4 | 429 status code returned when limit exceeded | met | src/middleware/rateLimit.ts:42 |
+| 5 | Rate limit state persisted across restarts | met | src/middleware/rateLimit.ts:7 — Redis adapter used |
+
+## Children Status
+
+No children.
+
+## Recommendation
+
+This item can be closed: all acceptance criteria are met, all children are completed, and the PR is merged.
 ```
 
 ### Step 7: Close and Approve

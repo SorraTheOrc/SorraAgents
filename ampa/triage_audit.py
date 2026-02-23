@@ -25,6 +25,77 @@ except Exception:  # pragma: no cover - defensive
 
 LOG = logging.getLogger("ampa.triage_audit")
 
+# ---------------------------------------------------------------------------
+# Structured audit report extraction
+# ---------------------------------------------------------------------------
+_AUDIT_REPORT_START = "--- AUDIT REPORT START ---"
+_AUDIT_REPORT_END = "--- AUDIT REPORT END ---"
+
+
+def _extract_audit_report(text: str) -> str:
+    """Extract the structured audit report from raw audit output.
+
+    Looks for ``--- AUDIT REPORT START ---`` and ``--- AUDIT REPORT END ---``
+    delimiter lines.  Returns the content between these markers (stripped of
+    leading/trailing whitespace).
+
+    If the start marker is missing the full *text* is returned and a warning is
+    logged.  If the start marker is present but the end marker is missing, all
+    content after the start marker is returned (with a warning).  If the
+    extracted content is empty, the full *text* is returned with a warning.
+
+    When multiple pairs of markers exist only the **first** pair is used.
+    """
+    if not text:
+        return ""
+
+    start_idx = text.find(_AUDIT_REPORT_START)
+    if start_idx == -1:
+        LOG.warning(
+            "Audit output missing start marker (%s); using full output",
+            _AUDIT_REPORT_START,
+        )
+        return text
+
+    content_start = start_idx + len(_AUDIT_REPORT_START)
+    end_idx = text.find(_AUDIT_REPORT_END, content_start)
+    if end_idx == -1:
+        LOG.warning(
+            "Audit output missing end marker (%s); using content after start marker",
+            _AUDIT_REPORT_END,
+        )
+        extracted = text[content_start:].strip()
+    else:
+        extracted = text[content_start:end_idx].strip()
+
+    if not extracted:
+        LOG.warning("Extracted audit report is empty; falling back to full output")
+        return text
+
+    return extracted
+
+
+def _extract_summary_from_report(report: str) -> str:
+    """Extract the ``## Summary`` section from a structured audit report.
+
+    Returns the text between the ``## Summary`` heading and the next ``##``
+    heading (or end of string), stripped of leading/trailing whitespace.
+    Returns an empty string if no ``## Summary`` heading is found.
+    """
+    if not report:
+        return ""
+    m = re.search(r"^##\s+Summary\s*$", report, re.IGNORECASE | re.MULTILINE)
+    if not m:
+        return ""
+    start = m.end()
+    # Find the next ## heading or end of string
+    m2 = re.search(r"^##\s+", report[start:], re.MULTILINE)
+    if m2:
+        section = report[start : start + m2.start()]
+    else:
+        section = report[start:]
+    return section.strip()
+
 
 def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
@@ -456,7 +527,11 @@ class TriageAuditRunner:
                 return ""
 
             if webhook:
-                summary_text = _extract_summary(audit_out or "")
+                # Try structured report summary first, then legacy regex fallback
+                report_for_summary = _extract_audit_report(audit_out or "")
+                summary_text = _extract_summary_from_report(report_for_summary)
+                if not summary_text:
+                    summary_text = _extract_summary(audit_out or "")
                 if not summary_text:
                     summary_text = f"{work_id} — {title} | exit={exit_code}"
                 if delegation_result:
@@ -582,13 +657,12 @@ class TriageAuditRunner:
                     LOG.exception("Failed to send discord summary")
 
             full_output = audit_out or ""
-            if len(full_output) <= truncate_chars:
-                comment_text = full_output or "(no output)"
+            report = _extract_audit_report(full_output) or "(no output)"
+            if len(report) <= truncate_chars:
+                comment_text = report
                 try:
                     comment_parts = [
                         "# AMPA Audit Result",
-                        "",
-                        "Audit output:",
                         "",
                         comment_text,
                     ]
@@ -659,16 +733,13 @@ class TriageAuditRunner:
                                     or ""
                                 )
                                 stripped = re.sub(
-                                    r"(?i)^\s*#\s*AMPA Audit Result\s*", "", body
-                                )
-                                stripped = re.sub(
-                                    r"(?i)^\s*Audit output:\s*", "", stripped
+                                    r"(?i)^\s*#\s*AMPA Audit Result\s*\n*", "", body
                                 ).strip()
                                 if not stripped or stripped == "(no output)":
                                     LOG.error(
-                                        "Posted AMPA audit comment for %s appears heading-only or empty; audit_out_len=%d posted_body_len=%d",
+                                        "Posted AMPA audit comment for %s appears heading-only or empty; report_len=%d posted_body_len=%d",
                                         work_id,
-                                        len(full_output or ""),
+                                        len(report or ""),
                                         len(body or ""),
                                     )
                     except Exception:
@@ -681,11 +752,11 @@ class TriageAuditRunner:
                         prefix=f"wl-audit-{work_id}-", suffix=".log"
                     )
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                        fh.write(full_output)
+                        fh.write(report)
                     comment_parts = [
                         "# AMPA Audit Result",
                         "",
-                        f"Audit output too large; full output saved to: {path}",
+                        f"Audit report too large; full report saved to: {path}",
                     ]
                     comment = "\n".join(comment_parts)
                     fd2, cpath = tempfile.mkstemp(
@@ -754,16 +825,13 @@ class TriageAuditRunner:
                                     or ""
                                 )
                                 stripped = re.sub(
-                                    r"(?i)^\s*#\s*AMPA Audit Result\s*", "", body
-                                )
-                                stripped = re.sub(
-                                    r"(?i)^\s*Audit output:\s*", "", stripped
+                                    r"(?i)^\s*#\s*AMPA Audit Result\s*\n*", "", body
                                 ).strip()
                                 if not stripped or stripped == "(no output)":
                                     LOG.error(
-                                        "Posted AMPA audit comment (artifact path) for %s appears heading-only or empty; audit_out_len=%d posted_body_len=%d",
+                                        "Posted AMPA audit comment (artifact path) for %s appears heading-only or empty; report_len=%d posted_body_len=%d",
                                         work_id,
-                                        len(full_output or ""),
+                                        len(report or ""),
                                         len(body or ""),
                                     )
                     except Exception:
@@ -907,9 +975,16 @@ class TriageAuditRunner:
                             if webhook:
                                 heading_title = f"Audit Completed — {title}"
                                 try:
-                                    short = _extract_summary(audit_out or "") or (
+                                    report_for_short = _extract_audit_report(
                                         audit_out or ""
                                     )
+                                    short = _extract_summary_from_report(
+                                        report_for_short
+                                    )
+                                    if not short:
+                                        short = _extract_summary(audit_out or "")
+                                    if not short:
+                                        short = audit_out or ""
                                     short = _summarize_for_discord(
                                         short, max_chars=1000
                                     )
