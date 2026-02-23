@@ -1,6 +1,7 @@
 import datetime as dt
 
-from ampa.scheduler import SchedulerStore, CommandSpec, _build_command_listing
+from ampa.scheduler import SchedulerStore, CommandSpec
+from ampa.scheduler_cli import _build_command_listing
 
 
 class DummyStore(SchedulerStore):
@@ -41,7 +42,7 @@ def test_format_command_table_uses_local_time():
     store.update_state("cmd", {"last_run_ts": last_run.isoformat()})
 
     rows = _build_command_listing(store, now=last_run)
-    from ampa.scheduler import _format_command_table
+    from ampa.scheduler_cli import _format_command_table
 
     table = _format_command_table(rows)
     local_last = last_run.astimezone().strftime("%d-%b-%Y %H:%M")

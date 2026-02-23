@@ -15,6 +15,8 @@ from ampa.scheduler import (
     Scheduler,
     SchedulerConfig,
     SchedulerStore,
+)
+from ampa.scheduler_cli import (
     _cli_run,
     _format_run_result_json,
     _format_run_result_human,
@@ -279,7 +281,7 @@ def _capture_cli_run(args_ns):
     old_stdout = sys.stdout
     sys.stdout = captured
     try:
-        with mock.patch("ampa.scheduler.daemon") as mock_daemon:
+        with mock.patch("ampa.scheduler_cli.daemon") as mock_daemon:
             mock_daemon.load_env = mock.MagicMock()
             exit_code = _cli_run(args_ns)
     finally:
@@ -294,7 +296,7 @@ def test_cli_run_list_no_command_id():
     store.add_command(_make_spec("cmd-b", title="Beta"))
 
     args = _make_args()
-    with mock.patch("ampa.scheduler._store_from_env", return_value=store):
+    with mock.patch("ampa.scheduler_cli._store_from_env", return_value=store):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 0
@@ -308,7 +310,7 @@ def test_cli_run_list_json():
     store.add_command(_make_spec("cmd-a", title="Alpha"))
 
     args = _make_args(json=True)
-    with mock.patch("ampa.scheduler._store_from_env", return_value=store):
+    with mock.patch("ampa.scheduler_cli._store_from_env", return_value=store):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 0
@@ -325,7 +327,7 @@ def test_cli_run_list_empty():
     """Listing with no commands shows 'No commands configured.'"""
     store = DummyStore()
     args = _make_args()
-    with mock.patch("ampa.scheduler._store_from_env", return_value=store):
+    with mock.patch("ampa.scheduler_cli._store_from_env", return_value=store):
         exit_code, output = _capture_cli_run(args)
     assert exit_code == 0
     assert "No commands configured" in output
@@ -354,7 +356,7 @@ def test_cli_run_success():
     scheduler = Scheduler(store, config, executor=mock_executor)
 
     args = _make_args(command_id="test-cmd")
-    with mock.patch("ampa.scheduler.load_scheduler", return_value=scheduler):
+    with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 0
@@ -382,7 +384,7 @@ def test_cli_run_failure():
     scheduler = Scheduler(store, config, executor=lambda _: run_result)
 
     args = _make_args(command_id="fail-cmd")
-    with mock.patch("ampa.scheduler.load_scheduler", return_value=scheduler):
+    with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 42
@@ -409,7 +411,7 @@ def test_cli_run_json_output_shape():
     scheduler = Scheduler(store, config, executor=lambda _: run_result)
 
     args = _make_args(command_id="json-cmd", json=True)
-    with mock.patch("ampa.scheduler.load_scheduler", return_value=scheduler):
+    with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 0
@@ -445,7 +447,7 @@ def test_cli_run_unknown_command():
     scheduler = Scheduler(store, config, executor=lambda _: None)
 
     args = _make_args(command_id="nonexistent")
-    with mock.patch("ampa.scheduler.load_scheduler", return_value=scheduler):
+    with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 2
@@ -466,7 +468,7 @@ def test_cli_run_unknown_command_json():
     scheduler = Scheduler(store, config, executor=lambda _: None)
 
     args = _make_args(command_id="nonexistent", json=True)
-    with mock.patch("ampa.scheduler.load_scheduler", return_value=scheduler):
+    with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 2
@@ -493,7 +495,7 @@ def test_cli_run_format_concise():
     scheduler = Scheduler(store, config, executor=lambda _: run_result)
 
     args = _make_args(command_id="concise-cmd", format="concise")
-    with mock.patch("ampa.scheduler.load_scheduler", return_value=scheduler):
+    with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 0
@@ -522,7 +524,7 @@ def test_cli_run_format_raw():
     scheduler = Scheduler(store, config, executor=lambda _: run_result)
 
     args = _make_args(command_id="raw-cmd", format="raw")
-    with mock.patch("ampa.scheduler.load_scheduler", return_value=scheduler):
+    with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 0
@@ -548,7 +550,7 @@ def test_cli_run_format_full():
     scheduler = Scheduler(store, config, executor=lambda _: run_result)
 
     args = _make_args(command_id="full-cmd", format="full")
-    with mock.patch("ampa.scheduler.load_scheduler", return_value=scheduler):
+    with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 0
@@ -594,8 +596,10 @@ def test_cli_run_watch_mocked():
             raise KeyboardInterrupt()
 
     args = _make_args(command_id="watch-cmd", watch=1)
-    with mock.patch("ampa.scheduler.load_scheduler", return_value=scheduler):
-        with mock.patch("ampa.scheduler.time.sleep", side_effect=interruptible_sleep):
+    with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
+        with mock.patch(
+            "ampa.scheduler_cli.time.sleep", side_effect=interruptible_sleep
+        ):
             exit_code, output = _capture_cli_run(args)
 
     # The watch loop runs the command, sleeps, runs again, sleeps, and the
@@ -626,7 +630,7 @@ def test_cli_run_exception_handling():
     scheduler = Scheduler(store, config, executor=exploding_executor)
 
     args = _make_args(command_id="err-cmd")
-    with mock.patch("ampa.scheduler.load_scheduler", return_value=scheduler):
+    with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
         exit_code, output = _capture_cli_run(args)
 
     # start_command wraps exceptions into RunResult so exit_code should be non-zero
@@ -661,7 +665,7 @@ def test_cli_run_exception_json():
     scheduler = Scheduler(store, config, executor=exploding_executor)
 
     args = _make_args(command_id="err-json-cmd", json=True)
-    with mock.patch("ampa.scheduler.load_scheduler", return_value=scheduler):
+    with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
         exit_code, output = _capture_cli_run(args)
 
     # Should be valid JSON (either error or result with non-zero exit_code)
@@ -682,7 +686,7 @@ def test_cli_run_list_format_concise():
     store.add_command(_make_spec("cmd-x", title="X"))
 
     args = _make_args(format="concise")
-    with mock.patch("ampa.scheduler._store_from_env", return_value=store):
+    with mock.patch("ampa.scheduler_cli._store_from_env", return_value=store):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 0
@@ -696,7 +700,7 @@ def test_cli_run_list_format_full():
     store.add_command(_make_spec("cmd-y", title="Y", command_type="delegation"))
 
     args = _make_args(format="full")
-    with mock.patch("ampa.scheduler._store_from_env", return_value=store):
+    with mock.patch("ampa.scheduler_cli._store_from_env", return_value=store):
         exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 0

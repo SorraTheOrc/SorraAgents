@@ -190,13 +190,13 @@ def _cli_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_run_once(args: argparse.Namespace) -> int:
+    """Legacy run-once handler -- delegates to _cli_run."""
+    return _cli_run(args)
+
+
 def _trim_text(value: Optional[str]) -> str:
     return value.strip() if value else ""
-
-
-def _command_description(spec: CommandSpec) -> str:
-    # already defined above but keep for completeness if imported elsewhere
-    return _command_description(spec)
 
 
 def _build_delegation_report(
