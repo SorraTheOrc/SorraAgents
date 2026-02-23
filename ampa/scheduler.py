@@ -688,6 +688,43 @@ class Scheduler:
                     self._BOT_MAX_CONSECUTIVE_FAILURES,
                 )
 
+    def _wait_for_bot_socket(self, timeout: float = 15.0) -> None:
+        """Block until the bot's Unix socket appears or *timeout* expires.
+
+        Called once at startup between ``_ensure_bot_running()`` and
+        ``_post_startup_message()`` so the startup notification is not
+        dead-lettered due to a race condition.
+
+        A stale socket file from a previous bot process is deleted first so
+        we only return once the **new** bot has created its socket and is
+        actually listening.
+        """
+        if self._bot_process is None:
+            # Bot not started (token not set or exceeded failure limit).
+            return
+        socket_path = os.getenv("AMPA_BOT_SOCKET_PATH", "/tmp/ampa_bot.sock")
+
+        # Remove stale socket from a previous run so we wait for the new one.
+        if os.path.exists(socket_path):
+            try:
+                os.unlink(socket_path)
+                LOG.info("Removed stale bot socket %s before waiting", socket_path)
+            except OSError:
+                LOG.warning("Could not remove stale socket %s", socket_path)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if os.path.exists(socket_path):
+                LOG.info("Bot socket ready at %s", socket_path)
+                return
+            time.sleep(0.5)
+        LOG.warning(
+            "Bot socket not found at %s after %.0fs – "
+            "startup message may be dead-lettered",
+            socket_path,
+            timeout,
+        )
+
     def _shutdown_bot(self) -> None:
         """Send SIGTERM to the bot process and wait briefly for it to exit."""
         if self._bot_process is None:
@@ -1119,10 +1156,13 @@ class Scheduler:
 
     def run_forever(self) -> None:
         LOG.info("Starting scheduler loop")
-        self._post_startup_message()
 
         # Start the Discord bot process (no-op if token not configured).
+        # Must happen before the startup message so the socket is ready.
         self._ensure_bot_running()
+        self._wait_for_bot_socket()
+
+        self._post_startup_message()
 
         # Install a shutdown handler so the bot is terminated when the
         # scheduler exits (SIGTERM / SIGINT / normal exit).
@@ -1332,6 +1372,7 @@ class Scheduler:
             body=status_out,
             message_type="startup",
         )
+        LOG.info("Startup notification dispatched")
 
 
 def load_scheduler(command_cwd: Optional[str] = None) -> Scheduler:
