@@ -4,6 +4,8 @@ import time
 import urllib.error
 import urllib.request
 
+import pytest
+
 from ampa.metrics import start_metrics_server, ampa_heartbeat_sent_total
 from ampa.metrics import (
     ampa_heartbeat_failure_total,
@@ -13,11 +15,31 @@ from ampa import conversation_manager
 import session_block
 
 
-def test_health_and_metrics_ok(tmp_path, monkeypatch):
+@pytest.fixture()
+def metrics_server(monkeypatch):
+    """Start a metrics server and shut it down after the test.
+
+    Yields (base_url, server) so tests can make requests and the server
+    is properly cleaned up, preventing leaked threads.
+    """
+    servers = []
+
+    def _start(**kwargs):
+        server, port = start_metrics_server(port=0, **kwargs)
+        servers.append(server)
+        return f"http://127.0.0.1:{port}", server
+
+    yield _start
+
+    for srv in servers:
+        if srv._server:
+            srv._server[0].shutdown()
+
+
+def test_health_and_metrics_ok(tmp_path, monkeypatch, metrics_server):
     # Ensure webhook env is present -> /health returns 200
     monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "https://example.com/webhook")
-    server, port = start_metrics_server(port=0)
-    url = f"http://127.0.0.1:{port}"
+    url, server = metrics_server()
 
     # Health should be OK
     resp = urllib.request.urlopen(f"{url}/health")
@@ -33,11 +55,10 @@ def test_health_and_metrics_ok(tmp_path, monkeypatch):
     assert "ampa_last_heartbeat_timestamp_seconds" in data
 
 
-def test_health_misconfigured(tmp_path, monkeypatch):
+def test_health_misconfigured(tmp_path, monkeypatch, metrics_server):
     # Remove webhook -> /health returns 503
     monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
-    server, port = start_metrics_server(port=0)
-    url = f"http://127.0.0.1:{port}"
+    url, server = metrics_server()
 
     try:
         urllib.request.urlopen(f"{url}/health")
@@ -48,16 +69,15 @@ def test_health_misconfigured(tmp_path, monkeypatch):
     assert raised
 
 
-def test_responder_endpoint_resumes_session(tmp_path, monkeypatch):
+def test_responder_endpoint_resumes_session(tmp_path, monkeypatch, metrics_server):
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
     session_id = "s-respond"
     conversation_manager.start_conversation(session_id, "Approve?")
 
-    server, port = start_metrics_server(port=0)
-    url = f"http://127.0.0.1:{port}/respond"
+    url, server = metrics_server()
     payload = json.dumps({"session_id": session_id, "response": "yes"}).encode("utf-8")
     req = urllib.request.Request(
-        url,
+        f"{url}/respond",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -69,21 +89,20 @@ def test_responder_endpoint_resumes_session(tmp_path, monkeypatch):
     assert body["session"] == session_id
 
 
-def test_session_state_endpoint_returns_state(tmp_path, monkeypatch):
+def test_session_state_endpoint_returns_state(tmp_path, monkeypatch, metrics_server):
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
     session_id = "s-session"
     conversation_manager.start_conversation(session_id, "Confirm?")
 
-    server, port = start_metrics_server(port=0)
-    url = f"http://127.0.0.1:{port}/session/{session_id}"
-    resp = urllib.request.urlopen(url)
+    url, server = metrics_server()
+    resp = urllib.request.urlopen(f"{url}/session/{session_id}")
     assert resp.status == 200
     body = json.loads(resp.read().decode())
     assert body["session"] == session_id
     assert body["state"] == "waiting_for_input"
 
 
-def test_admin_fallback_controls_responder(tmp_path, monkeypatch):
+def test_admin_fallback_controls_responder(tmp_path, monkeypatch, metrics_server):
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
     monkeypatch.setenv("AMPA_ADMIN_TOKEN", "secret-token")
     monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "https://example.com/webhook")
@@ -97,8 +116,7 @@ def test_admin_fallback_controls_responder(tmp_path, monkeypatch):
     session_id = "s-fallback"
     conversation_manager.start_conversation(session_id, "Approve?")
 
-    server, port = start_metrics_server(port=0)
-    base = f"http://127.0.0.1:{port}"
+    base, server = metrics_server()
 
     cfg_payload = json.dumps(
         {
@@ -135,12 +153,13 @@ def test_admin_fallback_controls_responder(tmp_path, monkeypatch):
     assert body["response"] == "accept"
 
 
-def test_responder_public_default_applies_when_project_missing(tmp_path, monkeypatch):
+def test_responder_public_default_applies_when_project_missing(
+    tmp_path, monkeypatch, metrics_server
+):
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
     monkeypatch.setenv("AMPA_ADMIN_TOKEN", "secret-token")
 
-    server, port = start_metrics_server(port=0)
-    base = f"http://127.0.0.1:{port}"
+    base, server = metrics_server()
 
     cfg_payload = json.dumps(
         {"default": "auto-accept", "public_default": "hold", "projects": {}}
@@ -177,12 +196,11 @@ def test_responder_public_default_applies_when_project_missing(tmp_path, monkeyp
     assert raised
 
 
-def test_admin_fallback_requires_token(tmp_path, monkeypatch):
+def test_admin_fallback_requires_token(tmp_path, monkeypatch, metrics_server):
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
     monkeypatch.setenv("AMPA_ADMIN_TOKEN", "secret-token")
 
-    server, port = start_metrics_server(port=0)
-    base = f"http://127.0.0.1:{port}"
+    base, server = metrics_server()
 
     req = urllib.request.Request(
         f"{base}/admin/fallback",
