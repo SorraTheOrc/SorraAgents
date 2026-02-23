@@ -29,31 +29,28 @@ def test_post_startup_message_uses_wl_status(tmp_path, monkeypatch):
             returncode=0, stdout="WL status: all good\n1 in_progress\n", stderr=""
         )
 
-    # capture payload sent to webhook
+    # capture notification calls
     captured = {}
 
-    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
-        captured["url"] = url
-        captured["payload"] = payload
+    def fake_notify(title="", body="", message_type="other", **kwargs):
+        captured["title"] = title
+        captured["body"] = body
         captured["message_type"] = message_type
+        return True
 
-    # ensure daemon.get_env_config returns a webhook so _post_startup_message proceeds
-    monkeypatch.setattr(
-        sched_mod.daemon,
-        "get_env_config",
-        lambda: {"webhook": "http://example.com/webhook"},
-    )
-    # replace send_webhook on the imported webhook_module used by scheduler
-    monkeypatch.setattr(sched_mod.webhook_module, "send_webhook", fake_send_webhook)
+    # set the bot token so _post_startup_message proceeds
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
+    # replace notify on the imported notifications_module used by scheduler
+    monkeypatch.setattr(sched_mod.notifications_module, "notify", fake_notify)
 
     sched = Scheduler(
         store, config, run_shell=fake_run_shell, command_cwd=str(tmp_path)
     )
 
-    # call the protected method directly and assert the payload contains the wl status text
+    # call the protected method directly and assert the notification contains the wl status text
     sched._post_startup_message()
 
-    assert "payload" in captured, "send_webhook was not called"
-    content = captured["payload"]["content"]
-    assert content.startswith("# Scheduler Started")
-    assert "WL status: all good" in content
+    assert "title" in captured, "notify() was not called"
+    assert captured["title"] == "Scheduler Started"
+    assert "WL status: all good" in captured["body"]
+    assert captured["message_type"] == "startup"

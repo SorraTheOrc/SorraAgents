@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover - optional dependency in tests
 try:
     from . import daemon
     from . import webhook as webhook_module
+    from . import notifications as notifications_module
     from . import selection
     from . import fallback
     from .error_report import (
@@ -42,6 +43,7 @@ except ImportError:  # pragma: no cover - allow running as script
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     daemon = importlib.import_module("ampa.daemon")
     webhook_module = importlib.import_module("ampa.webhook")
+    notifications_module = importlib.import_module("ampa.notifications")
     selection = importlib.import_module("ampa.selection")
     fallback = importlib.import_module("ampa.fallback")
     _er = importlib.import_module("ampa.error_report")
@@ -427,20 +429,16 @@ def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> Ru
             timeout,
         )
         try:
-            webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-            if webhook and webhook_module is not None:
-                msg = f"Command {spec.command_id} timed out after {timeout}s: {spec.command}"
-                payload = webhook_module.build_command_payload(
-                    os.uname().nodename,
-                    _utc_now().isoformat(),
-                    spec.command_id,
-                    msg,
-                    124,
-                    title=(spec.title or spec.command)[:128],
-                )
-                webhook_module.send_webhook(webhook, payload, message_type="error")
+            msg = (
+                f"Command {spec.command_id} timed out after {timeout}s: {spec.command}"
+            )
+            notifications_module.notify(
+                title=(spec.title or spec.command)[:128],
+                body=msg,
+                message_type="error",
+            )
         except Exception:
-            LOG.exception("Failed to send timeout webhook")
+            LOG.exception("Failed to send timeout notification")
         result = subprocess.CompletedProcess(
             args=spec.command,
             returncode=124,
@@ -541,22 +539,14 @@ class Scheduler:
                 )
                 # send a Discord error notification when configured
                 try:
-                    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                    if webhook and webhook_module is not None:
-                        msg = f"Command timed out after {p_kwargs.get('timeout')}s: {p_args[0] if p_args else '(command)'}"
-                        payload = webhook_module.build_command_payload(
-                            os.uname().nodename,
-                            _utc_now().isoformat(),
-                            "command_timeout",
-                            msg,
-                            124,
-                            title=(p_args[0] if p_args else "Timed-out command")[:128],
-                        )
-                        webhook_module.send_webhook(
-                            webhook, payload, message_type="error"
-                        )
+                    msg = f"Command timed out after {p_kwargs.get('timeout')}s: {p_args[0] if p_args else '(command)'}"
+                    notifications_module.notify(
+                        title=(p_args[0] if p_args else "Timed-out command")[:128],
+                        body=msg,
+                        message_type="error",
+                    )
                 except Exception:
-                    LOG.exception("Failed to send timeout webhook")
+                    LOG.exception("Failed to send timeout notification")
                 return subprocess.CompletedProcess(
                     args=p_args[0] if p_args else "",
                     returncode=124,
@@ -1262,14 +1252,6 @@ class Scheduler:
     ) -> None:
         if spec.command_type == "heartbeat":
             return
-        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-        if not webhook:
-            return
-        hostname = os.uname().nodename
-        ts = run.end_ts.isoformat()
-        command_id = spec.command_id
-        if spec.metadata.get("discord_label"):
-            command_id = str(spec.metadata.get("discord_label"))
         # ensure Discord-safe summary for output
         try:
             short_output = _summarize_for_discord(output, max_chars=1000)
@@ -1277,15 +1259,12 @@ class Scheduler:
             LOG.exception("Failed to summarize output for discord post")
             short_output = output
 
-        payload = webhook_module.build_command_payload(
-            hostname,
-            ts,
-            command_id,
-            short_output,
-            run.exit_code,
-            title=(spec.title or spec.metadata.get("discord_label") or spec.command_id),
+        title = spec.title or spec.metadata.get("discord_label") or spec.command_id
+        notifications_module.notify(
+            title=title,
+            body=short_output or "",
+            message_type="command",
         )
-        webhook_module.send_webhook(webhook, payload, message_type="command")
 
     def _run_idle_delegation(
         self, *, audit_only: bool, spec: Optional[CommandSpec] = None
@@ -1309,15 +1288,9 @@ class Scheduler:
         return self._delegation_orchestrator.run_delegation_report(spec)
 
     def _post_startup_message(self) -> None:
-        try:
-            config = daemon.get_env_config()
-        except SystemExit:
+        # Only attempt startup notification if Discord bot is configured.
+        if not os.getenv("AMPA_DISCORD_BOT_TOKEN"):
             return
-        webhook = config.get("webhook")
-        if not webhook:
-            return
-        hostname = os.uname().nodename
-        ts = _utc_now().isoformat()
         # Capture the human-facing output of `wl status` for the startup message
         try:
             proc = self.run_shell(
@@ -1356,15 +1329,11 @@ class Scheduler:
             LOG.exception("Failed to run 'wl status' for startup message")
             status_out = "(wl status unavailable)"
 
-        payload = webhook_module.build_command_payload(
-            hostname,
-            ts,
-            "scheduler_start",
-            status_out,
-            0,
+        notifications_module.notify(
             title="Scheduler Started",
+            body=status_out,
+            message_type="startup",
         )
-        webhook_module.send_webhook(webhook, payload, message_type="startup")
 
 
 def load_scheduler(command_cwd: Optional[str] = None) -> Scheduler:
