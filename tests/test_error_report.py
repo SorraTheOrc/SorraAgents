@@ -266,12 +266,12 @@ class TestCommandsCallErrorReport:
 
     def test_main_catches_unhandled_error_human(self):
         """main() should render an error report on unhandled exceptions."""
-        from ampa.scheduler import main
+        from ampa.scheduler_cli import main
 
         test_args = ["ampa", "list"]
         with mock.patch("sys.argv", test_args):
             with mock.patch(
-                "ampa.scheduler._cli_list", side_effect=RuntimeError("test boom")
+                "ampa.scheduler_cli._cli_list", side_effect=RuntimeError("test boom")
             ):
                 buf = io.StringIO()
                 with mock.patch("sys.stderr", buf):
@@ -285,12 +285,12 @@ class TestCommandsCallErrorReport:
 
     def test_main_catches_unhandled_error_json(self):
         """main() should render JSON error report when --json flag is set."""
-        from ampa.scheduler import main
+        from ampa.scheduler_cli import main
 
         test_args = ["ampa", "list", "--json"]
         with mock.patch("sys.argv", test_args):
             with mock.patch(
-                "ampa.scheduler._cli_list", side_effect=RuntimeError("json boom")
+                "ampa.scheduler_cli._cli_list", side_effect=RuntimeError("json boom")
             ):
                 buf = io.StringIO()
                 with mock.patch("sys.stderr", buf):
@@ -305,11 +305,11 @@ class TestCommandsCallErrorReport:
 
     def test_main_passes_through_system_exit(self):
         """SystemExit should not be caught and rendered as an error report."""
-        from ampa.scheduler import main
+        from ampa.scheduler_cli import main
 
         test_args = ["ampa", "list"]
         with mock.patch("sys.argv", test_args):
-            with mock.patch("ampa.scheduler._cli_list", side_effect=SystemExit(3)):
+            with mock.patch("ampa.scheduler_cli._cli_list", side_effect=SystemExit(3)):
                 with pytest.raises(SystemExit) as exc_info:
                     main()
                 # Should be the original SystemExit, not our wrapper
@@ -317,7 +317,7 @@ class TestCommandsCallErrorReport:
 
     def test_cli_run_execute_once_uses_error_report(self):
         """_cli_run should produce an error report when start_command raises."""
-        from ampa.scheduler import _cli_run
+        from ampa.scheduler_cli import _cli_run
 
         args = argparse.Namespace(
             command_id="test-cmd",
@@ -326,7 +326,7 @@ class TestCommandsCallErrorReport:
             format="normal",
             watch=None,
         )
-        with mock.patch("ampa.scheduler.load_scheduler") as mock_load:
+        with mock.patch("ampa.scheduler_cli.load_scheduler") as mock_load:
             mock_scheduler = mock.MagicMock()
             mock_scheduler.store.get_command.return_value = mock.MagicMock(
                 command_id="test-cmd",

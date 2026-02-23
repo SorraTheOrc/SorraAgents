@@ -926,12 +926,14 @@ def test_triage_audit_no_candidates_logs(tmp_path, monkeypatch, caplog):
 
 
 def test_scheduler_run_once_unknown_command(tmp_path, monkeypatch, capsys):
+    from ampa import scheduler_cli
+
     sched = make_scheduler(lambda *a, **k: subprocess.CompletedProcess("", 0), tmp_path)
-    monkeypatch.setattr(scheduler, "load_scheduler", lambda command_cwd=None: sched)
-    monkeypatch.setattr(scheduler.daemon, "load_env", lambda: None)
+    monkeypatch.setattr(scheduler_cli, "load_scheduler", lambda command_cwd=None: sched)
+    monkeypatch.setattr(scheduler_cli.daemon, "load_env", lambda: None)
     args = SimpleNamespace(command_id="missing")
 
-    exit_code = scheduler._cli_run_once(args)
+    exit_code = scheduler_cli._cli_run_once(args)
     out = capsys.readouterr().out
 
     assert exit_code == 2

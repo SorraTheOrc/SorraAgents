@@ -967,6 +967,13 @@ class TriageAuditRunner:
         self, *, audit_only: bool, spec: Any
     ) -> Optional[Dict[str, Any]]:
         # If an engine with the expected helper exists, call similar logic to scheduler._run_idle_delegation
+        if audit_only:
+            return {
+                "note": "Delegation: skipped (audit_only)",
+                "dispatched": False,
+                "rejected": [],
+                "idle_webhook_sent": False,
+            }
         try:
             if self.engine is None:
                 return None
