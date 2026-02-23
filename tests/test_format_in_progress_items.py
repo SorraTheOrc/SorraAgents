@@ -1,4 +1,4 @@
-"""Tests for _format_in_progress_items() parsing logic.
+"""Tests for _format_in_progress_items() parsing logic and skip reason display.
 
 Covers acceptance criteria from SA-0MLZSJP7T0FR5F90:
   - Empty string returns []
@@ -6,6 +6,12 @@ Covers acceptance criteria from SA-0MLZSJP7T0FR5F90:
   - Error messages return []
   - Real SA- item lines are correctly extracted
   - _build_dry_run_report() produces idle messaging when items list is empty
+
+Covers acceptance criteria from SA-0MLZSJZMR15ZVSR3:
+  - Report includes invariant failure reasons when delegation is skipped
+  - Report says 'no candidates returned' when no candidates exist
+  - Report lists rejection reasons when candidates are rejected
+  - Busy format still works when there ARE actual in-progress items
 """
 
 import pytest
@@ -112,3 +118,137 @@ class TestBuildDryRunReportIdleBranch:
         assert "Agents are currently busy" not in report
         assert "SA-42" in report
         assert "Do thing" in report
+
+
+class TestReportSkipReasons:
+    """Verify _build_dry_run_report() surfaces skip/rejection reasons."""
+
+    def test_invariant_failure_included_in_report(self):
+        """When delegation is skipped due to invariant failure, the report
+        includes the invariant name and failure reason."""
+        report = _build_dry_run_report(
+            in_progress_output="",
+            candidates=[
+                {"id": "SA-10", "title": "Some task", "status": "open"},
+            ],
+            top_candidate={"id": "SA-10", "title": "Some task", "status": "open"},
+            skip_reasons=[
+                "Delegation skipped: invariant requires_acceptance_criteria failed"
+            ],
+        )
+        assert "Agents are currently busy" not in report
+        assert "requires_acceptance_criteria" in report
+        assert "Delegation skip reasons:" in report
+
+    def test_no_candidates_report_text(self):
+        """When no candidates exist, the report says so clearly."""
+        report = _build_dry_run_report(
+            in_progress_output="",
+            candidates=[],
+            top_candidate=None,
+            skip_reasons=["Delegation idle: no candidates returned"],
+        )
+        assert "no candidates returned" in report
+        assert "Delegation skip reasons:" in report
+
+    def test_rejection_reasons_listed(self):
+        """When candidates are rejected, the report lists rejection reasons."""
+        report = _build_dry_run_report(
+            in_progress_output="",
+            candidates=[
+                {"id": "SA-20", "title": "Rejected task", "status": "open"},
+            ],
+            top_candidate=None,
+            rejections=[
+                {
+                    "id": "SA-20",
+                    "title": "Rejected task",
+                    "reason": "stage 'closed' is not delegatable",
+                },
+            ],
+        )
+        assert "Rejected candidates:" in report
+        assert "SA-20" in report
+        assert "stage 'closed' is not delegatable" in report
+
+    def test_multiple_rejections_listed(self):
+        """Multiple rejection reasons are all surfaced."""
+        rejections = [
+            {
+                "id": "SA-A",
+                "title": "Task A",
+                "reason": "stage 'closed' is not delegatable",
+            },
+            {"id": "SA-B", "title": "Task B", "reason": "do-not-delegate tag"},
+        ]
+        report = _build_dry_run_report(
+            in_progress_output="",
+            candidates=[],
+            top_candidate=None,
+            rejections=rejections,
+        )
+        assert "SA-A" in report
+        assert "SA-B" in report
+        assert "stage 'closed' is not delegatable" in report
+        assert "do-not-delegate tag" in report
+
+    def test_busy_format_unchanged_with_skip_reasons(self):
+        """Even if skip_reasons are passed, the busy format is used when
+        there ARE actual in-progress items (regression check)."""
+        report = _build_dry_run_report(
+            in_progress_output="- SA-001 Working on something",
+            candidates=[],
+            top_candidate=None,
+            skip_reasons=["should not appear"],
+            rejections=[{"id": "SA-X", "title": "X", "reason": "should not appear"}],
+        )
+        assert "Agents are currently busy" in report
+        assert "SA-001" in report
+        assert "should not appear" not in report
+
+    def test_no_skip_reasons_produces_original_report(self):
+        """When no skip_reasons or rejections are passed, the report is
+        identical to the original format (backward compatibility)."""
+        report_without = _build_dry_run_report(
+            in_progress_output="",
+            candidates=[],
+            top_candidate=None,
+        )
+        report_with_none = _build_dry_run_report(
+            in_progress_output="",
+            candidates=[],
+            top_candidate=None,
+            skip_reasons=None,
+            rejections=None,
+        )
+        assert report_without == report_with_none
+
+    def test_empty_skip_reasons_list_produces_original_report(self):
+        """Empty lists for skip_reasons/rejections don't add extra sections."""
+        report = _build_dry_run_report(
+            in_progress_output="",
+            candidates=[],
+            top_candidate=None,
+            skip_reasons=[],
+            rejections=[],
+        )
+        assert "Delegation skip reasons:" not in report
+        assert "Rejected candidates:" not in report
+
+    def test_skip_reason_with_candidates_and_rejections(self):
+        """Combined skip reasons and rejections both appear in the report."""
+        report = _build_dry_run_report(
+            in_progress_output="",
+            candidates=[
+                {"id": "SA-30", "title": "Good task", "status": "open"},
+            ],
+            top_candidate=None,
+            skip_reasons=["invariant requires_work_item_context failed"],
+            rejections=[
+                {"id": "SA-30", "title": "Good task", "reason": "missing description"},
+            ],
+        )
+        assert "Delegation skip reasons:" in report
+        assert "requires_work_item_context" in report
+        assert "Rejected candidates:" in report
+        assert "missing description" in report
