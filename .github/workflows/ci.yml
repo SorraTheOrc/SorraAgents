@@ -24,3 +24,23 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+  integration-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+
+      - name: Run per-project isolation integration tests
+        run: pytest tests/test_per_project_isolation.py -v
