@@ -87,7 +87,7 @@ class DispatchRecorder(Protocol):
 
 
 class NotificationSender(Protocol):
-    """Protocol for sending notifications (e.g. Discord webhooks)."""
+    """Protocol for sending notifications (e.g. Discord bot messages)."""
 
     def send(self, message: str, *, title: str = "", level: str = "info") -> bool:
         """Send a notification. Returns ``True`` on success."""

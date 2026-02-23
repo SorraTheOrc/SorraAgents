@@ -10,7 +10,7 @@ Responsibilities:
  2. Run ``wl github import --create-new`` (import mode) or
     ``wl github push`` (push mode) as a subprocess.
  3. Exit 0 on success, non-zero on failure.  The scheduler's existing
-    Discord webhook integration handles failure alerts.
+    Discord notification integration handles failure alerts.
 """
 
 from __future__ import annotations

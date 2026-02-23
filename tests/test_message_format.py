@@ -26,7 +26,6 @@ def test_build_payload_includes_hostname_and_timestamp():
 
 def test_get_env_config_missing_bot_token(monkeypatch):
     monkeypatch.delenv("AMPA_DISCORD_BOT_TOKEN", raising=False)
-    monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
     monkeypatch.setenv("AMPA_HEARTBEAT_MINUTES", "1")
     # Ensure package .env is not loaded during this test so the missing-token
     # behavior is exercised even when ampa/.env exists in the repository.

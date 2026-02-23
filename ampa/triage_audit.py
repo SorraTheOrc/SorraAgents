@@ -1003,7 +1003,7 @@ class TriageAuditRunner:
                                     payload=payload,
                                 )
                         except Exception:
-                            LOG.exception("Failed to send completion webhook")
+                            LOG.exception("Failed to send completion notification")
                     except Exception:
                         LOG.exception("Failed to auto-update work item %s", work_id)
             except Exception:
@@ -1027,7 +1027,7 @@ class TriageAuditRunner:
                 "note": "Delegation: skipped (audit_only)",
                 "dispatched": False,
                 "rejected": [],
-                "idle_webhook_sent": False,
+                "idle_notification_sent": False,
             }
         try:
             if self.engine is None:

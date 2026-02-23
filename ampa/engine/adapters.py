@@ -1,7 +1,7 @@
 """Adapter classes bridging scheduler infrastructure to engine protocols.
 
 These adapters wrap the scheduler's existing ``run_shell`` subprocess runner,
-``SchedulerStore``, and Discord webhook infrastructure so the engine's
+``SchedulerStore``, and Discord notification infrastructure so the engine's
 protocol-based dependencies can be satisfied without duplicating logic.
 
 Usage::
@@ -365,19 +365,14 @@ class DiscordNotificationSender:
 
     Parameters
     ----------
-    webhook_url:
-        Ignored (kept for backward compatibility). Notifications are
-        routed through the notification API's Unix socket.
     hostname:
         Machine hostname for message context.
     """
 
     def __init__(
         self,
-        webhook_url: str | None = None,
         hostname: str | None = None,
     ) -> None:
-        self._url = webhook_url  # kept for backward compat but unused
         self._hostname = hostname or _safe_hostname()
 
     def send(

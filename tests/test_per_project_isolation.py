@@ -95,7 +95,7 @@ def project_a(tmp_path: Path) -> Path:
     _write_env(
         proj,
         {
-            "AMPA_DISCORD_WEBHOOK": "https://discord.example.com/webhook/project-a",
+            "AMPA_DISCORD_BOT_TOKEN": "https://discord.example.com/bot-token/project-a",
             "AMPA_HEARTBEAT_MINUTES": "5",
         },
     )
@@ -131,7 +131,7 @@ def project_b(tmp_path: Path) -> Path:
     _write_env(
         proj,
         {
-            "AMPA_DISCORD_WEBHOOK": "https://discord.example.com/webhook/project-b",
+            "AMPA_DISCORD_BOT_TOKEN": "https://discord.example.com/bot-token/project-b",
             "AMPA_HEARTBEAT_MINUTES": "10",
         },
     )
@@ -170,10 +170,10 @@ def global_install_dir(tmp_path: Path) -> Path:
     """
     gdir = tmp_path / "global_ampa_install"
     gdir.mkdir()
-    # Place a global .env with a DIFFERENT webhook value -- tests verify that
+    # Place a global .env with a DIFFERENT bot token value -- tests verify that
     # project-local .env takes precedence over package-local .env.
     (gdir / ".env").write_text(
-        "AMPA_DISCORD_WEBHOOK=https://discord.example.com/webhook/global\n"
+        "AMPA_DISCORD_BOT_TOKEN=https://discord.example.com/bot-token/global\n"
     )
     return gdir
 
@@ -218,14 +218,14 @@ class TestLoadEnvIsolation:
     ):
         """Daemon started in project A reads project A's .env values."""
         # Clear any existing env vars that would interfere
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
+        monkeypatch.delenv("AMPA_DISCORD_BOT_TOKEN", raising=False)
         monkeypatch.delenv("AMPA_HEARTBEAT_MINUTES", raising=False)
         monkeypatch.chdir(project_a)
 
         load_env()
 
-        assert os.getenv("AMPA_DISCORD_WEBHOOK") == (
-            "https://discord.example.com/webhook/project-a"
+        assert os.getenv("AMPA_DISCORD_BOT_TOKEN") == (
+            "https://discord.example.com/bot-token/project-a"
         )
         assert os.getenv("AMPA_HEARTBEAT_MINUTES") == "5"
 
@@ -233,14 +233,14 @@ class TestLoadEnvIsolation:
         self, project_b: Path, global_install_dir: Path, monkeypatch
     ):
         """Daemon started in project B reads project B's .env values."""
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
+        monkeypatch.delenv("AMPA_DISCORD_BOT_TOKEN", raising=False)
         monkeypatch.delenv("AMPA_HEARTBEAT_MINUTES", raising=False)
         monkeypatch.chdir(project_b)
 
         load_env()
 
-        assert os.getenv("AMPA_DISCORD_WEBHOOK") == (
-            "https://discord.example.com/webhook/project-b"
+        assert os.getenv("AMPA_DISCORD_BOT_TOKEN") == (
+            "https://discord.example.com/bot-token/project-b"
         )
         assert os.getenv("AMPA_HEARTBEAT_MINUTES") == "10"
 
@@ -248,36 +248,36 @@ class TestLoadEnvIsolation:
         self, project_a: Path, project_b: Path, monkeypatch
     ):
         """Loading .env from project A then project B gives B's values."""
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
+        monkeypatch.delenv("AMPA_DISCORD_BOT_TOKEN", raising=False)
         monkeypatch.delenv("AMPA_HEARTBEAT_MINUTES", raising=False)
 
         # Load project A
         monkeypatch.chdir(project_a)
         load_env()
-        webhook_a = os.getenv("AMPA_DISCORD_WEBHOOK")
+        token_a = os.getenv("AMPA_DISCORD_BOT_TOKEN")
 
         # Load project B (overrides)
         monkeypatch.chdir(project_b)
         load_env()
-        webhook_b = os.getenv("AMPA_DISCORD_WEBHOOK")
+        token_b = os.getenv("AMPA_DISCORD_BOT_TOKEN")
 
-        assert webhook_a == "https://discord.example.com/webhook/project-a"
-        assert webhook_b == "https://discord.example.com/webhook/project-b"
-        assert webhook_a != webhook_b
+        assert token_a == "https://discord.example.com/bot-token/project-a"
+        assert token_b == "https://discord.example.com/bot-token/project-b"
+        assert token_a != token_b
 
     def test_project_env_takes_precedence_over_global(
         self, project_a: Path, global_install_dir: Path, monkeypatch
     ):
         """Per-project .env takes precedence over the global install .env."""
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
+        monkeypatch.delenv("AMPA_DISCORD_BOT_TOKEN", raising=False)
         monkeypatch.chdir(project_a)
 
         load_env()
 
         # project_a's .env should win over global_install_dir's .env
-        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-        assert webhook == "https://discord.example.com/webhook/project-a"
-        assert "global" not in webhook
+        token = os.getenv("AMPA_DISCORD_BOT_TOKEN")
+        assert token == "https://discord.example.com/bot-token/project-a"
+        assert "global" not in token
 
 
 # ---------------------------------------------------------------------------
@@ -586,36 +586,36 @@ class TestDaemonInitIsolation:
         """Two daemons initialized in different project dirs get fully
         isolated configurations and store paths."""
         # Simulate daemon A initialization
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
+        monkeypatch.delenv("AMPA_DISCORD_BOT_TOKEN", raising=False)
         monkeypatch.delenv("AMPA_HEARTBEAT_MINUTES", raising=False)
         monkeypatch.chdir(project_a)
         load_env()
-        webhook_a = os.getenv("AMPA_DISCORD_WEBHOOK")
+        token_a = os.getenv("AMPA_DISCORD_BOT_TOKEN")
         config_a = SchedulerConfig.from_env()
         store_a = SchedulerStore(config_a.store_path)
 
         # Capture state from daemon A
-        a_webhook = webhook_a
+        a_token = token_a
         a_store_path = config_a.store_path
         a_commands = {c.command_id for c in store_a.list_commands()}
         a_dedup_hash = store_a.get_state("cmd-a").get("last_delegation_report_hash")
 
         # Simulate daemon B initialization
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
+        monkeypatch.delenv("AMPA_DISCORD_BOT_TOKEN", raising=False)
         monkeypatch.delenv("AMPA_HEARTBEAT_MINUTES", raising=False)
         monkeypatch.chdir(project_b)
         load_env()
-        webhook_b = os.getenv("AMPA_DISCORD_WEBHOOK")
+        token_b = os.getenv("AMPA_DISCORD_BOT_TOKEN")
         config_b = SchedulerConfig.from_env()
         store_b = SchedulerStore(config_b.store_path)
 
-        b_webhook = webhook_b
+        b_token = token_b
         b_store_path = config_b.store_path
         b_commands = {c.command_id for c in store_b.list_commands()}
         b_dedup_hash = store_b.get_state("cmd-b").get("last_delegation_report_hash")
 
         # Assertions: everything is isolated
-        assert a_webhook != b_webhook, "Webhook URLs must differ"
+        assert a_token != b_token, "Bot tokens must differ"
         assert a_store_path != b_store_path, "Store paths must differ"
         assert a_commands != b_commands, "Commands must differ"
         assert a_commands == {"cmd-a"}
