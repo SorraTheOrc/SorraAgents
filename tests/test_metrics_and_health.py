@@ -12,7 +12,7 @@ from ampa.metrics import (
     ampa_last_heartbeat_timestamp_seconds,
 )
 from ampa import conversation_manager
-import session_block
+from ampa import session_block
 
 
 @pytest.fixture()
@@ -37,8 +37,8 @@ def metrics_server(monkeypatch):
 
 
 def test_health_and_metrics_ok(tmp_path, monkeypatch, metrics_server):
-    # Ensure webhook env is present -> /health returns 200
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "https://example.com/webhook")
+    # Ensure bot token env is present -> /health returns 200
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-bot-token")
     url, server = metrics_server()
 
     # Health should be OK
@@ -56,8 +56,8 @@ def test_health_and_metrics_ok(tmp_path, monkeypatch, metrics_server):
 
 
 def test_health_misconfigured(tmp_path, monkeypatch, metrics_server):
-    # Remove webhook -> /health returns 503
-    monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
+    # Remove bot token -> /health returns 503
+    monkeypatch.delenv("AMPA_DISCORD_BOT_TOKEN", raising=False)
     url, server = metrics_server()
 
     try:
@@ -105,12 +105,12 @@ def test_session_state_endpoint_returns_state(tmp_path, monkeypatch, metrics_ser
 def test_admin_fallback_controls_responder(tmp_path, monkeypatch, metrics_server):
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
     monkeypatch.setenv("AMPA_ADMIN_TOKEN", "secret-token")
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "https://example.com/webhook")
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-bot-token")
 
     monkeypatch.setattr(
-        session_block.webhook_module,
-        "send_webhook",
-        lambda *args, **kwargs: 204,
+        session_block.notifications_module,
+        "notify",
+        lambda *args, **kwargs: True,
     )
 
     session_id = "s-fallback"

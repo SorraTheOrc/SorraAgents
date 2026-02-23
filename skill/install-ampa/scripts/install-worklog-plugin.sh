@@ -74,10 +74,11 @@ acquire_lock() {
 # ============================================================================
 
 # Parse command-line arguments and populate global variables.
-# Global variables set: WEBHOOK, SRC, TARGET_DIR, AUTO_YES, FORCE_RESTART, FORCE_NO_RESTART, LOCAL_INSTALL
+# Global variables set: BOT_TOKEN, CHANNEL_ID, SRC, TARGET_DIR, AUTO_YES, FORCE_RESTART, FORCE_NO_RESTART, LOCAL_INSTALL
 parse_args() {
   # Initialize output variables with defaults
-  WEBHOOK=""
+  BOT_TOKEN=""
+  CHANNEL_ID=""
   SRC_ARG=""
   TARGET_ARG=""
   AUTO_YES=0
@@ -88,14 +89,31 @@ parse_args() {
   # Parse options
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --webhook|-w)
+      --bot-token)
         shift
         if [ "$#" -gt 0 ]; then
-          WEBHOOK="$1"
+          BOT_TOKEN="$1"
           shift
         else
-          log_error "--webhook requires a value"
+          log_error "--bot-token requires a value"
           exit 2
+        fi
+        ;;
+      --channel-id)
+        shift
+        if [ "$#" -gt 0 ]; then
+          CHANNEL_ID="$1"
+          shift
+        else
+          log_error "--channel-id requires a value"
+          exit 2
+        fi
+        ;;
+      --webhook|-w)
+        log_error "Warning: --webhook is deprecated. Use --bot-token and --channel-id instead."
+        shift
+        if [ "$#" -gt 0 ]; then
+          shift  # consume the value but ignore it
         fi
         ;;
       --yes|-y)
@@ -115,14 +133,15 @@ parse_args() {
         shift
         ;;
       --help|-h)
-        echo "Usage: $0 [--webhook <url>] [--yes] [--restart|--no-restart] [--local] [source-file] [target-dir]"
+        echo "Usage: $0 [--bot-token <token>] [--channel-id <id>] [--yes] [--restart|--no-restart] [--local] [source-file] [target-dir]"
         echo ""
         echo "Options:"
-        echo "  --webhook <url>  Set the webhook URL in .env"
-        echo "  --yes, -y        Non-interactive mode (auto-accept prompts)"
-        echo "  --restart        Force daemon restart after install"
-        echo "  --no-restart     Skip daemon restart after install"
-        echo "  --local          Install to per-project .worklog/plugins/ instead of global"
+        echo "  --bot-token <token>  Set the Discord bot token in .env"
+        echo "  --channel-id <id>    Set the Discord channel ID in .env"
+        echo "  --yes, -y            Non-interactive mode (auto-accept prompts)"
+        echo "  --restart            Force daemon restart after install"
+        echo "  --no-restart         Skip daemon restart after install"
+        echo "  --local              Install to per-project .worklog/plugins/ instead of global"
         echo ""
         echo "By default, plugins are installed globally to:"
         echo "  \${XDG_CONFIG_HOME:-\$HOME/.config}/opencode/.worklog/plugins/"
@@ -418,71 +437,106 @@ check_for_bundled_env() {
   return 1  # No bundled .env
 }
 
-# Detect existing webhook in current install or repo
-detect_existing_webhook() {
+# Detect existing bot token in current install or repo
+detect_existing_bot_token() {
   if [ -f "$TARGET_DIR/ampa_py/ampa/.env" ]; then
-    awk -F= '/AMPA_DISCORD_WEBHOOK/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "$TARGET_DIR/ampa_py/ampa/.env" | tr -d '"' | tr -d "'"
+    awk -F= '/AMPA_DISCORD_BOT_TOKEN/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "$TARGET_DIR/ampa_py/ampa/.env" | tr -d '"' | tr -d "'"
   elif [ -f "ampa/.env" ]; then
-    awk -F= '/AMPA_DISCORD_WEBHOOK/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "ampa/.env" | tr -d '"' | tr -d "'"
+    awk -F= '/AMPA_DISCORD_BOT_TOKEN/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "ampa/.env" | tr -d '"' | tr -d "'"
   fi
 }
 
-# Prompt user whether to change webhook during upgrade
-prompt_webhook_change() {
-  local existing_webhook="$1"
+# Detect existing channel ID in current install or repo
+detect_existing_channel_id() {
+  if [ -f "$TARGET_DIR/ampa_py/ampa/.env" ]; then
+    awk -F= '/AMPA_DISCORD_CHANNEL_ID/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "$TARGET_DIR/ampa_py/ampa/.env" | tr -d '"' | tr -d "'"
+  elif [ -f "ampa/.env" ]; then
+    awk -F= '/AMPA_DISCORD_CHANNEL_ID/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "ampa/.env" | tr -d '"' | tr -d "'"
+  fi
+}
+
+# Prompt user whether to change bot config during upgrade
+prompt_bot_config_change() {
+  local existing_token="$1"
+  local existing_channel="$2"
   
-  if [ -z "$existing_webhook" ]; then
-    # No existing webhook, allow entering new one
+  if [ -z "$existing_token" ] && [ -z "$existing_channel" ]; then
+    # No existing config, allow entering new one
     if [ "$AUTO_YES" -eq 1 ]; then
-      WEBHOOK=""
+      BOT_TOKEN=""
+      CHANNEL_ID=""
     else
       if [ -t 0 ]; then
-        printf "Enter Discord webhook URL to use for installation (leave empty to skip): "
-        if ! read -r NEW_WH; then NEW_WH=""; fi
-        WEBHOOK="$NEW_WH"
+        printf "Enter Discord bot token to use for installation (leave empty to skip): "
+        if ! read -r NEW_TK; then NEW_TK=""; fi
+        BOT_TOKEN="$NEW_TK"
+        printf "Enter Discord channel ID to use for installation (leave empty to skip): "
+        if ! read -r NEW_CH; then NEW_CH=""; fi
+        CHANNEL_ID="$NEW_CH"
       fi
     fi
   else
-    # Existing webhook found
+    # Existing config found
     if [ -t 0 ]; then
-      printf "Existing webhook detected: %s\n" "$existing_webhook"
-      printf "Change webhook? [y/N]: "
+      if [ -n "$existing_token" ]; then
+        printf "Existing bot token detected: %.8s...\n" "$existing_token"
+      fi
+      if [ -n "$existing_channel" ]; then
+        printf "Existing channel ID detected: %s\n" "$existing_channel"
+      fi
+      printf "Change Discord bot config? [y/N]: "
       if ! read -r CHW; then CHW=""; fi
       case "$(printf "%s" "$CHW" | tr '[:upper:]' '[:lower:]')" in
         y|yes)
-          printf "Enter new webhook (leave empty to reuse existing, or '-' to remove): "
-          if ! read -r NEW_WH; then NEW_WH=""; fi
-          if [ "$NEW_WH" = "-" ]; then
-            WEBHOOK=""
-            REMOVE_WEBHOOK=1
-          elif [ -n "$NEW_WH" ]; then
-            WEBHOOK="$NEW_WH"
+          printf "Enter new bot token (leave empty to reuse existing, or '-' to remove): "
+          if ! read -r NEW_TK; then NEW_TK=""; fi
+          if [ "$NEW_TK" = "-" ]; then
+            BOT_TOKEN=""
+            REMOVE_BOT_CONFIG=1
+          elif [ -n "$NEW_TK" ]; then
+            BOT_TOKEN="$NEW_TK"
           else
-            SKIP_WEBHOOK_UPDATE=1
+            SKIP_BOT_CONFIG_UPDATE=1
+          fi
+          printf "Enter new channel ID (leave empty to reuse existing): "
+          if ! read -r NEW_CH; then NEW_CH=""; fi
+          if [ -n "$NEW_CH" ]; then
+            CHANNEL_ID="$NEW_CH"
           fi
           ;;
         *)
-          SKIP_WEBHOOK_UPDATE=1
+          SKIP_BOT_CONFIG_UPDATE=1
           ;;
       esac
     fi
   fi
 }
 
-# Prompt user for webhook during fresh install
-prompt_webhook_new() {
+# Prompt user for bot config during fresh install
+prompt_bot_config_new() {
   if [ -t 0 ]; then
     if [ "$AUTO_YES" -eq 1 ]; then
-      WEBHOOK=""
+      BOT_TOKEN=""
+      CHANNEL_ID=""
     else
       while true; do
-        printf "Enter Discord webhook URL to use for installation: "
-        if ! read -r NEW_WH; then NEW_WH=""; fi
-        if [ -n "$NEW_WH" ]; then
-          WEBHOOK="$NEW_WH"
+        printf "Enter Discord bot token to use for installation: "
+        if ! read -r NEW_TK; then NEW_TK=""; fi
+        if [ -n "$NEW_TK" ]; then
+          BOT_TOKEN="$NEW_TK"
           break
         else
-          printf "Webhook is required for a new installation.\n"
+          printf "Bot token is required for a new installation.\n"
+        fi
+      done
+      while true; do
+        printf "Enter Discord channel ID to use for installation: "
+        if ! read -r NEW_CH; then NEW_CH=""; fi
+        if [ -n "$NEW_CH" ]; then
+          CHANNEL_ID="$NEW_CH"
+          break
+        else
+          printf "Channel ID is required for a new installation.\n"
         fi
       done
     fi
@@ -520,18 +574,31 @@ backup_env_file() {
   return 1
 }
 
-# Write webhook to .env file
-write_webhook_to_env() {
+# Write bot token and channel ID to .env file
+write_bot_config_to_env() {
   local env_file="$1"
-  local webhook="$2"
+  local bot_token="$2"
+  local channel_id="$3"
   
   if [ -f "$env_file" ]; then
     if command -v awk >/dev/null 2>&1; then
-      awk -v w="$webhook" 'BEGIN{r=0} /^AMPA_DISCORD_WEBHOOK=/ {print "AMPA_DISCORD_WEBHOOK=" w; r=1; next} {print} END{if(r==0) print "AMPA_DISCORD_WEBHOOK=" w}' "$env_file" > "$env_file.tmp" && mv "$env_file.tmp" "$env_file"
-      log_info "Updated webhook in $env_file"
+      if [ -n "$bot_token" ]; then
+        awk -v t="$bot_token" 'BEGIN{r=0} /^AMPA_DISCORD_BOT_TOKEN=/ {print "AMPA_DISCORD_BOT_TOKEN=" t; r=1; next} {print} END{if(r==0) print "AMPA_DISCORD_BOT_TOKEN=" t}' "$env_file" > "$env_file.tmp" && mv "$env_file.tmp" "$env_file"
+        log_info "Updated bot token in $env_file"
+      fi
+      if [ -n "$channel_id" ]; then
+        awk -v c="$channel_id" 'BEGIN{r=0} /^AMPA_DISCORD_CHANNEL_ID=/ {print "AMPA_DISCORD_CHANNEL_ID=" c; r=1; next} {print} END{if(r==0) print "AMPA_DISCORD_CHANNEL_ID=" c}' "$env_file" > "$env_file.tmp" && mv "$env_file.tmp" "$env_file"
+        log_info "Updated channel ID in $env_file"
+      fi
     else
-      echo "AMPA_DISCORD_WEBHOOK=$webhook" >> "$env_file"
-      log_info "Appended webhook to $env_file"
+      if [ -n "$bot_token" ]; then
+        echo "AMPA_DISCORD_BOT_TOKEN=$bot_token" >> "$env_file"
+        log_info "Appended bot token to $env_file"
+      fi
+      if [ -n "$channel_id" ]; then
+        echo "AMPA_DISCORD_CHANNEL_ID=$channel_id" >> "$env_file"
+        log_info "Appended channel ID to $env_file"
+      fi
     fi
   else
     # Try to create from sample
@@ -539,29 +606,39 @@ write_webhook_to_env() {
     if [ -n "$sample" ] && [ -f "$sample" ]; then
       cp -f "$sample" "$env_file"
       if command -v awk >/dev/null 2>&1; then
-        awk -v w="$webhook" 'BEGIN{r=0} /^AMPA_DISCORD_WEBHOOK=/ {print "AMPA_DISCORD_WEBHOOK=" w; r=1; next} {print} END{if(r==0) print "AMPA_DISCORD_WEBHOOK=" w}' "$env_file" > "$env_file.tmp" && mv "$env_file.tmp" "$env_file"
-        log_info "Copied sample and wrote webhook to $env_file"
+        if [ -n "$bot_token" ]; then
+          awk -v t="$bot_token" 'BEGIN{r=0} /^AMPA_DISCORD_BOT_TOKEN=/ {print "AMPA_DISCORD_BOT_TOKEN=" t; r=1; next} {print} END{if(r==0) print "AMPA_DISCORD_BOT_TOKEN=" t}' "$env_file" > "$env_file.tmp" && mv "$env_file.tmp" "$env_file"
+        fi
+        if [ -n "$channel_id" ]; then
+          awk -v c="$channel_id" 'BEGIN{r=0} /^AMPA_DISCORD_CHANNEL_ID=/ {print "AMPA_DISCORD_CHANNEL_ID=" c; r=1; next} {print} END{if(r==0) print "AMPA_DISCORD_CHANNEL_ID=" c}' "$env_file" > "$env_file.tmp" && mv "$env_file.tmp" "$env_file"
+        fi
+        log_info "Copied sample and wrote bot config to $env_file"
       else
-        echo "AMPA_DISCORD_WEBHOOK=$webhook" >> "$env_file"
-        log_info "Copied sample and appended webhook to $env_file"
+        if [ -n "$bot_token" ]; then
+          echo "AMPA_DISCORD_BOT_TOKEN=$bot_token" >> "$env_file"
+        fi
+        if [ -n "$channel_id" ]; then
+          echo "AMPA_DISCORD_CHANNEL_ID=$channel_id" >> "$env_file"
+        fi
+        log_info "Copied sample and appended bot config to $env_file"
       fi
     else
-      log_info "No .env or .env.sample available; skipping webhook write"
+      log_info "No .env or .env.sample available; skipping bot config write"
     fi
   fi
 }
 
-# Remove webhook from .env file
-remove_webhook_from_env() {
+# Remove bot config from .env file
+remove_bot_config_from_env() {
   local env_file="$1"
   
   if [ -f "$env_file" ]; then
     if command -v awk >/dev/null 2>&1; then
-      awk '!/^AMPA_DISCORD_WEBHOOK=/' "$env_file" > "$env_file.tmp" && mv "$env_file.tmp" "$env_file"
+      awk '!/^AMPA_DISCORD_BOT_TOKEN=/ && !/^AMPA_DISCORD_CHANNEL_ID=/' "$env_file" > "$env_file.tmp" && mv "$env_file.tmp" "$env_file"
     else
-      grep -v '^AMPA_DISCORD_WEBHOOK=' "$env_file" > "$env_file.tmp" && mv "$env_file.tmp" "$env_file" || true
+      grep -v '^AMPA_DISCORD_BOT_TOKEN=' "$env_file" | grep -v '^AMPA_DISCORD_CHANNEL_ID=' > "$env_file.tmp" && mv "$env_file.tmp" "$env_file" || true
     fi
-    log_info "Removed AMPA_DISCORD_WEBHOOK from $env_file"
+    log_info "Removed AMPA_DISCORD_BOT_TOKEN and AMPA_DISCORD_CHANNEL_ID from $env_file"
   fi
 }
 
@@ -1020,9 +1097,9 @@ main() {
     log_decision "ACTION_PROCEED=1 EXISTING_INST=0"
   fi
 
-  # Handle webhook configuration
-  REMOVE_WEBHOOK=0
-  SKIP_WEBHOOK_UPDATE=0
+  # Handle bot config configuration
+  REMOVE_BOT_CONFIG=0
+  SKIP_BOT_CONFIG_UPDATE=0
   local preserve_existing_env=0
   
   if check_for_bundled_env; then
@@ -1030,14 +1107,16 @@ main() {
     log_decision "PRESERVE_EXISTING_ENV_DETECTED=1 PATH=$TARGET_DIR/ampa_py/ampa/.env"
   fi
 
-  if [ -z "$WEBHOOK" ]; then
-    local existing_webhook
-    existing_webhook=$(detect_existing_webhook)
+  if [ -z "$BOT_TOKEN" ] && [ -z "$CHANNEL_ID" ]; then
+    local existing_token
+    local existing_channel
+    existing_token=$(detect_existing_bot_token)
+    existing_channel=$(detect_existing_channel_id)
     
     if [ "$existing_install" -eq 1 ]; then
-      prompt_webhook_change "$existing_webhook"
+      prompt_bot_config_change "$existing_token" "$existing_channel"
     else
-      prompt_webhook_new
+      prompt_bot_config_new
     fi
   fi
 
@@ -1050,12 +1129,12 @@ main() {
     stop_daemon
   fi
 
-  # Mask webhook for logging
-  local wh_mask="(empty)"
-  if [ -n "$WEBHOOK" ]; then
-    wh_mask="$(printf "%.8s" "$WEBHOOK")..."
+  # Mask bot token for logging
+  local tk_mask="(empty)"
+  if [ -n "$BOT_TOKEN" ]; then
+    tk_mask="$(printf "%.8s" "$BOT_TOKEN")..."
   fi
-  log_decision "SRC=$SRC TARGET=$TARGET_DIR WEBHOOK=$wh_mask"
+  log_decision "SRC=$SRC TARGET=$TARGET_DIR BOT_TOKEN=$tk_mask CHANNEL_ID=${CHANNEL_ID:-(empty)}"
 
   # Install plugin
   install_worklog_plugin
@@ -1090,17 +1169,17 @@ main() {
    fi
 
    # Handle .env file configuration
-   if [ "$SKIP_WEBHOOK_UPDATE" -eq 1 ] || [ "$preserve_existing_env" -eq 1 ]; then
-     log_info "Preserving existing .env (user requested no webhook update or pre-existing .env)"
+   if [ "$SKIP_BOT_CONFIG_UPDATE" -eq 1 ] || [ "$preserve_existing_env" -eq 1 ]; then
+     log_info "Preserving existing .env (user requested no bot config update or pre-existing .env)"
    else
-     if [ "$REMOVE_WEBHOOK" -eq 1 ]; then
+     if [ "$REMOVE_BOT_CONFIG" -eq 1 ]; then
        local env_file="$TARGET_DIR/ampa_py/ampa/.env"
-       remove_webhook_from_env "$env_file"
-     elif [ -n "$WEBHOOK" ]; then
+       remove_bot_config_from_env "$env_file"
+     elif [ -n "$BOT_TOKEN" ] || [ -n "$CHANNEL_ID" ]; then
        local env_file="$TARGET_DIR/ampa_py/ampa/.env"
-       write_webhook_to_env "$env_file" "$WEBHOOK"
+       write_bot_config_to_env "$env_file" "$BOT_TOKEN" "$CHANNEL_ID"
      else
-       log_info "No webhook provided; skipping .env creation/update"
+       log_info "No bot config provided; skipping .env creation/update"
      fi
    fi
 

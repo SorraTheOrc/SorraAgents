@@ -108,8 +108,6 @@ class TestDefaultExecutorTimeout:
             raise subprocess.TimeoutExpired(cmd=spec.command, timeout=5)
 
         monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
-        # Suppress Discord webhook to avoid side effects
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
 
         result = default_executor(spec)
 
@@ -131,7 +129,6 @@ class TestDefaultExecutorTimeout:
             raise subprocess.TimeoutExpired(cmd=spec.command, timeout=3600)
 
         monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
 
         result = default_executor(spec)
 
@@ -149,7 +146,6 @@ class TestDefaultExecutorTimeout:
             )
 
         monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
 
         default_executor(spec)
 
@@ -169,7 +165,6 @@ class TestDefaultExecutorTimeout:
 
         monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
         monkeypatch.setenv("AMPA_DELEGATION_OPENCODE_TIMEOUT", "300")
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
 
         default_executor(spec)
 
@@ -187,7 +182,6 @@ class TestDefaultExecutorTimeout:
             raise exc
 
         monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
 
         result = default_executor(spec)
 
@@ -465,7 +459,6 @@ class TestRunShellWithTimeout:
     def test_timeout_expired_converted_to_exit_124(self, monkeypatch):
         """When run_shell raises TimeoutExpired, it returns exit code 124."""
         monkeypatch.setenv("AMPA_CMD_TIMEOUT_SECONDS", "5")
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
 
         def hanging_shell(*args, **kwargs):
             raise subprocess.TimeoutExpired(cmd=args[0], timeout=5)
@@ -549,7 +542,6 @@ class TestEndToEndHungChild:
         - failure is recorded in state and run_history
         - command can run successfully on retry
         """
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
         monkeypatch.setenv("AMPA_CMD_TIMEOUT_SECONDS", "3600")
 
         store = DummyStore()
@@ -625,7 +617,6 @@ class TestEndToEndHungChild:
         full subprocess.run -> TimeoutExpired -> exit 124 path without mocks
         on the subprocess layer itself.
         """
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
 
         spec = _make_spec(
             command_id="slow-cmd",
@@ -655,7 +646,6 @@ class TestEndToEndHungChild:
         This avoids actually sleeping for 60+ seconds while still exercising
         the real default_executor (not a test double).
         """
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
         monkeypatch.setenv("AMPA_CMD_TIMEOUT_SECONDS", "5")
 
         store = DummyStore()
@@ -687,40 +677,34 @@ class TestEndToEndHungChild:
 
 
 # ---------------------------------------------------------------------------
-# 6. Discord webhook notification on timeout
+# 6. Discord notification on timeout
 # ---------------------------------------------------------------------------
 
 
 class TestTimeoutDiscordNotification:
-    """Verify Discord webhook is called when a command times out."""
+    """Verify Discord notification is sent when a command times out."""
 
     def test_default_executor_sends_discord_on_timeout(self, monkeypatch):
-        """When a command times out, a Discord webhook notification is sent."""
+        """When a command times out, a notification is sent via notifications.notify()."""
         spec = _make_spec()
-        webhook_calls = []
+        notify_calls = []
 
         def mock_subprocess_run(*args, **kwargs):
             raise subprocess.TimeoutExpired(cmd=spec.command, timeout=5)
 
-        def mock_send_webhook(url, payload, message_type="command"):
-            webhook_calls.append(
-                {"url": url, "payload": payload, "message_type": message_type}
+        def mock_notify(title="", body="", message_type="other", **kwargs):
+            notify_calls.append(
+                {"title": title, "body": body, "message_type": message_type}
             )
+            return True
 
         monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
-        monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "https://discord.test/webhook")
 
-        # Mock the webhook module
-        monkeypatch.setattr(
-            "ampa.scheduler.webhook_module.send_webhook", mock_send_webhook
-        )
-        monkeypatch.setattr(
-            "ampa.scheduler.webhook_module.build_command_payload",
-            lambda *a, **kw: {"content": "timeout notification"},
-        )
+        # Mock the notifications module
+        monkeypatch.setattr("ampa.scheduler.notifications_module.notify", mock_notify)
 
         result = default_executor(spec)
 
         assert result.exit_code == 124
-        assert len(webhook_calls) == 1
-        assert webhook_calls[0]["message_type"] == "error"
+        assert len(notify_calls) == 1
+        assert notify_calls[0]["message_type"] == "error"

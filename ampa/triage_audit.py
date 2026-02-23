@@ -18,10 +18,10 @@ import tempfile
 from typing import Any, Dict, List, Optional
 
 try:
-    # relative import to allow tests to monkeypatch ampa.webhook
-    from . import webhook as webhook_module
+    # relative import to allow tests to monkeypatch ampa.notifications
+    from . import notifications as notifications_module
 except Exception:  # pragma: no cover - defensive
-    import ampa.webhook as webhook_module
+    import ampa.notifications as notifications_module
 
 LOG = logging.getLogger("ampa.triage_audit")
 
@@ -165,8 +165,6 @@ class TriageAuditRunner:
             truncate_chars = 65536
 
         audit_only = _bool_meta(spec.metadata.get("audit_only"))
-
-        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
 
         try:
             _audit_timeout = int(
@@ -526,7 +524,7 @@ class TriageAuditRunner:
                     return m2.group(1).strip().split("\n\n")[0].strip()
                 return ""
 
-            if webhook:
+            if True:  # notifications_module handles availability internally
                 # Try structured report summary first, then legacy regex fallback
                 report_for_summary = _extract_audit_report(audit_out or "")
                 summary_text = _extract_summary_from_report(report_for_summary)
@@ -643,15 +641,17 @@ class TriageAuditRunner:
                         extra.append({"name": "Delegation", "value": "(skipped)"})
                     if pr_url:
                         extra.append({"name": "PR", "value": pr_url})
-                    payload = webhook_module.build_payload(
+                    payload = notifications_module.build_payload(
                         hostname=os.uname().nodename,
                         timestamp_iso=_utc_now().isoformat(),
                         work_item_id=None,
                         extra_fields=extra,
                         title=heading_title,
                     )
-                    webhook_module.send_webhook(
-                        webhook, payload, message_type="command"
+                    notifications_module.notify(
+                        heading_title,
+                        message_type="command",
+                        payload=payload,
                     )
                 except Exception:
                     LOG.exception("Failed to send discord summary")
@@ -972,7 +972,7 @@ class TriageAuditRunner:
                         upd_cmd = f"wl update {work_id} --status completed --stage in_review --json"
                         _call(upd_cmd)
                         try:
-                            if webhook:
+                            if True:
                                 heading_title = f"Audit Completed — {title}"
                                 try:
                                     report_for_short = _extract_audit_report(
@@ -990,18 +990,20 @@ class TriageAuditRunner:
                                     )
                                 except Exception:
                                     short = (audit_out or "")[:1000]
-                                payload = webhook_module.build_payload(
+                                payload = notifications_module.build_payload(
                                     hostname=os.uname().nodename,
                                     timestamp_iso=_utc_now().isoformat(),
                                     work_item_id=None,
                                     extra_fields=[{"name": "Result", "value": short}],
                                     title=heading_title,
                                 )
-                                webhook_module.send_webhook(
-                                    webhook, payload, message_type="completion"
+                                notifications_module.notify(
+                                    heading_title,
+                                    message_type="completion",
+                                    payload=payload,
                                 )
                         except Exception:
-                            LOG.exception("Failed to send completion webhook")
+                            LOG.exception("Failed to send completion notification")
                     except Exception:
                         LOG.exception("Failed to auto-update work item %s", work_id)
             except Exception:
@@ -1025,7 +1027,7 @@ class TriageAuditRunner:
                 "note": "Delegation: skipped (audit_only)",
                 "dispatched": False,
                 "rejected": [],
-                "idle_webhook_sent": False,
+                "idle_notification_sent": False,
             }
         try:
             if self.engine is None:
@@ -1036,7 +1038,7 @@ class TriageAuditRunner:
                 command_cwd=self.command_cwd,
                 engine=self.engine,
                 candidate_selector=None,
-                webhook_module=webhook_module,
+                notifications_module=notifications_module,
                 selection_module=None,
             )
             return orchestrator.run_idle_delegation(audit_only=audit_only, spec=spec)
@@ -1057,7 +1059,7 @@ class TriageAuditRunner:
                 command_cwd=self.command_cwd,
                 engine=self.engine,
                 candidate_selector=None,
-                webhook_module=webhook_module,
+                notifications_module=notifications_module,
                 selection_module=None,
             )
             return orchestrator.run_delegation_report(spec)

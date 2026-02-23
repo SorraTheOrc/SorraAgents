@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -26,7 +27,7 @@ except Exception:  # pragma: no cover - optional dependency in tests
 
 try:
     from . import daemon
-    from . import webhook as webhook_module
+    from . import notifications as notifications_module
     from . import selection
     from . import fallback
     from .error_report import (
@@ -40,7 +41,7 @@ except ImportError:  # pragma: no cover - allow running as script
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     daemon = importlib.import_module("ampa.daemon")
-    webhook_module = importlib.import_module("ampa.webhook")
+    notifications_module = importlib.import_module("ampa.notifications")
     selection = importlib.import_module("ampa.selection")
     fallback = importlib.import_module("ampa.fallback")
     _er = importlib.import_module("ampa.error_report")
@@ -426,20 +427,16 @@ def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> Ru
             timeout,
         )
         try:
-            webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-            if webhook and webhook_module is not None:
-                msg = f"Command {spec.command_id} timed out after {timeout}s: {spec.command}"
-                payload = webhook_module.build_command_payload(
-                    os.uname().nodename,
-                    _utc_now().isoformat(),
-                    spec.command_id,
-                    msg,
-                    124,
-                    title=(spec.title or spec.command)[:128],
-                )
-                webhook_module.send_webhook(webhook, payload, message_type="error")
+            msg = (
+                f"Command {spec.command_id} timed out after {timeout}s: {spec.command}"
+            )
+            notifications_module.notify(
+                title=(spec.title or spec.command)[:128],
+                body=msg,
+                message_type="error",
+            )
         except Exception:
-            LOG.exception("Failed to send timeout webhook")
+            LOG.exception("Failed to send timeout notification")
         result = subprocess.CompletedProcess(
             args=spec.command,
             returncode=124,
@@ -540,22 +537,14 @@ class Scheduler:
                 )
                 # send a Discord error notification when configured
                 try:
-                    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                    if webhook and webhook_module is not None:
-                        msg = f"Command timed out after {p_kwargs.get('timeout')}s: {p_args[0] if p_args else '(command)'}"
-                        payload = webhook_module.build_command_payload(
-                            os.uname().nodename,
-                            _utc_now().isoformat(),
-                            "command_timeout",
-                            msg,
-                            124,
-                            title=(p_args[0] if p_args else "Timed-out command")[:128],
-                        )
-                        webhook_module.send_webhook(
-                            webhook, payload, message_type="error"
-                        )
+                    msg = f"Command timed out after {p_kwargs.get('timeout')}s: {p_args[0] if p_args else '(command)'}"
+                    notifications_module.notify(
+                        title=(p_args[0] if p_args else "Timed-out command")[:128],
+                        body=msg,
+                        message_type="error",
+                    )
                 except Exception:
-                    LOG.exception("Failed to send timeout webhook")
+                    LOG.exception("Failed to send timeout notification")
                 return subprocess.CompletedProcess(
                     args=p_args[0] if p_args else "",
                     returncode=124,
@@ -582,7 +571,7 @@ class Scheduler:
             command_cwd=self.command_cwd,
             engine=self.engine,
             candidate_selector=self._candidate_selector,
-            webhook_module=webhook_module,
+            notifications_module=notifications_module,
             selection_module=selection,
         )
 
@@ -631,6 +620,139 @@ class Scheduler:
         # so it runs on its own cadence (every 30 minutes) independently of
         # delegation timing.
         self._ensure_watchdog_command()
+
+        # --- Discord bot process supervision ---
+        self._bot_process: Optional[subprocess.Popen] = None
+        self._bot_consecutive_failures: int = 0
+        self._BOT_MAX_CONSECUTIVE_FAILURES: int = 3
+
+    # ------------------------------------------------------------------
+    # Discord bot process supervision
+    # ------------------------------------------------------------------
+
+    def _ensure_bot_running(self) -> None:
+        """Ensure the Discord bot process is alive, starting it if needed.
+
+        Called at scheduler startup and at the top of each cycle.  If
+        ``AMPA_DISCORD_BOT_TOKEN`` is not set, this is a no-op — notifications
+        are silently disabled.
+
+        If the bot fails to start on 3 consecutive attempts the supervisor logs
+        an error and stops retrying until the scheduler is restarted (to avoid
+        spamming logs and wasting resources).
+        """
+        token = os.getenv("AMPA_DISCORD_BOT_TOKEN")
+        if not token:
+            return
+
+        # Already exceeded consecutive failure limit — don't keep retrying.
+        if self._bot_consecutive_failures >= self._BOT_MAX_CONSECUTIVE_FAILURES:
+            return
+
+        # Check if existing process is still alive.
+        if self._bot_process is not None:
+            rc = self._bot_process.poll()
+            if rc is None:
+                # Process is alive — nothing to do.
+                return
+            # Process has exited.
+            LOG.warning(
+                "Discord bot process (pid=%d) exited with code %s – restarting",
+                self._bot_process.pid,
+                rc,
+            )
+            self._bot_process = None
+
+        # Attempt to start the bot.
+        try:
+            self._bot_process = subprocess.Popen(
+                [sys.executable, "-m", "ampa.discord_bot"],
+                start_new_session=True,
+            )
+            LOG.info(
+                "Started Discord bot process (pid=%d)",
+                self._bot_process.pid,
+            )
+            self._bot_consecutive_failures = 0
+        except Exception:
+            self._bot_consecutive_failures += 1
+            LOG.exception(
+                "Failed to start Discord bot process (attempt %d/%d)",
+                self._bot_consecutive_failures,
+                self._BOT_MAX_CONSECUTIVE_FAILURES,
+            )
+            if self._bot_consecutive_failures >= self._BOT_MAX_CONSECUTIVE_FAILURES:
+                LOG.error(
+                    "Discord bot failed to start %d consecutive times – "
+                    "giving up until scheduler restart",
+                    self._BOT_MAX_CONSECUTIVE_FAILURES,
+                )
+
+    def _wait_for_bot_socket(self, timeout: float = 15.0) -> None:
+        """Block until the bot's Unix socket appears or *timeout* expires.
+
+        Called once at startup between ``_ensure_bot_running()`` and
+        ``_post_startup_message()`` so the startup notification is not
+        dead-lettered due to a race condition.
+
+        A stale socket file from a previous bot process is deleted first so
+        we only return once the **new** bot has created its socket and is
+        actually listening.
+        """
+        if self._bot_process is None:
+            # Bot not started (token not set or exceeded failure limit).
+            return
+        socket_path = os.getenv("AMPA_BOT_SOCKET_PATH", "/tmp/ampa_bot.sock")
+
+        # Remove stale socket from a previous run so we wait for the new one.
+        if os.path.exists(socket_path):
+            try:
+                os.unlink(socket_path)
+                LOG.info("Removed stale bot socket %s before waiting", socket_path)
+            except OSError:
+                LOG.warning("Could not remove stale socket %s", socket_path)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if os.path.exists(socket_path):
+                LOG.info("Bot socket ready at %s", socket_path)
+                return
+            time.sleep(0.5)
+        LOG.warning(
+            "Bot socket not found at %s after %.0fs – "
+            "startup message may be dead-lettered",
+            socket_path,
+            timeout,
+        )
+
+    def _shutdown_bot(self) -> None:
+        """Send SIGTERM to the bot process and wait briefly for it to exit."""
+        if self._bot_process is None:
+            return
+        rc = self._bot_process.poll()
+        if rc is not None:
+            # Already exited.
+            self._bot_process = None
+            return
+        pid = self._bot_process.pid
+        LOG.info("Sending SIGTERM to Discord bot process (pid=%d)", pid)
+        try:
+            self._bot_process.terminate()
+            try:
+                self._bot_process.wait(timeout=5)
+                LOG.info("Discord bot process (pid=%d) exited cleanly", pid)
+            except subprocess.TimeoutExpired:
+                LOG.warning(
+                    "Discord bot process (pid=%d) did not exit after SIGTERM; "
+                    "sending SIGKILL",
+                    pid,
+                )
+                self._bot_process.kill()
+                self._bot_process.wait(timeout=2)
+        except Exception:
+            LOG.exception("Error shutting down Discord bot process (pid=%d)", pid)
+        finally:
+            self._bot_process = None
 
     def _build_engine(self) -> Optional[Engine]:
         """Construct an Engine from the workflow descriptor.
@@ -819,14 +941,14 @@ class Scheduler:
         """Keep the delegation orchestrator in sync with mutable scheduler state.
 
         Callers (including tests) may reassign ``self.run_shell``,
-        ``self.engine``, or patch ``webhook_module`` / ``selection``
+        ``self.engine``, or patch ``notifications_module`` / ``selection``
         after construction.  This method propagates those references to
         the orchestrator so delegation code paths see the current values.
         """
         orch = self._delegation_orchestrator
         orch.run_shell = self.run_shell
         orch.engine = self.engine
-        orch._webhook_module = webhook_module
+        orch._notifications_module = notifications_module
         orch._selection_module = selection
 
     def _recover_stale_delegations(self) -> List[Dict[str, Any]]:
@@ -1025,7 +1147,6 @@ class Scheduler:
         self._post_discord(spec, run, output)
         return run
 
-
     def run_once(self) -> Optional[RunResult]:
         now = _utc_now()
         next_cmd = self.select_next(now)
@@ -1035,28 +1156,57 @@ class Scheduler:
 
     def run_forever(self) -> None:
         LOG.info("Starting scheduler loop")
+
+        # Start the Discord bot process (no-op if token not configured).
+        # Must happen before the startup message so the socket is ready.
+        self._ensure_bot_running()
+        self._wait_for_bot_socket()
+
         self._post_startup_message()
+
+        # Install a shutdown handler so the bot is terminated when the
+        # scheduler exits (SIGTERM / SIGINT / normal exit).
+        def _shutdown_handler(signum, frame):
+            LOG.info("Received signal %s – shutting down bot", signum)
+            self._shutdown_bot()
+            # Re-raise to let the default handler terminate the scheduler.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, _shutdown_handler)
+            except (OSError, ValueError):
+                # ValueError: signal only works in main thread
+                pass
+
         # periodic health reporting accumulator (seconds)
         _health_accum = 0
         _health_interval = max(1, self.config.global_min_interval_seconds)
-        while True:
-            try:
-                self.run_once()
-            except Exception:
-                LOG.exception("Scheduler iteration failed")
-            # sleep then accumulate for periodic health reporting
-            try:
-                time.sleep(self.config.poll_interval_seconds)
-            except Exception:
-                # sleep can be interrupted (signals); continue loop
-                pass
-            _health_accum += self.config.poll_interval_seconds
-            if _health_accum >= _health_interval:
+        try:
+            while True:
+                # Ensure bot is alive at the top of each cycle.
+                self._ensure_bot_running()
                 try:
-                    self._log_health()
+                    self.run_once()
                 except Exception:
-                    LOG.exception("Failed to emit periodic health report")
-                _health_accum = 0
+                    LOG.exception("Scheduler iteration failed")
+                # sleep then accumulate for periodic health reporting
+                try:
+                    time.sleep(self.config.poll_interval_seconds)
+                except Exception:
+                    # sleep can be interrupted (signals); continue loop
+                    pass
+                _health_accum += self.config.poll_interval_seconds
+                if _health_accum >= _health_interval:
+                    try:
+                        self._log_health()
+                    except Exception:
+                        LOG.exception("Failed to emit periodic health report")
+                    _health_accum = 0
+        finally:
+            # Best-effort cleanup on exit.
+            self._shutdown_bot()
 
     def _log_health(self) -> None:
         """Emit a periodic health report about scheduled commands.
@@ -1140,14 +1290,6 @@ class Scheduler:
     ) -> None:
         if spec.command_type == "heartbeat":
             return
-        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-        if not webhook:
-            return
-        hostname = os.uname().nodename
-        ts = run.end_ts.isoformat()
-        command_id = spec.command_id
-        if spec.metadata.get("discord_label"):
-            command_id = str(spec.metadata.get("discord_label"))
         # ensure Discord-safe summary for output
         try:
             short_output = _summarize_for_discord(output, max_chars=1000)
@@ -1155,15 +1297,12 @@ class Scheduler:
             LOG.exception("Failed to summarize output for discord post")
             short_output = output
 
-        payload = webhook_module.build_command_payload(
-            hostname,
-            ts,
-            command_id,
-            short_output,
-            run.exit_code,
-            title=(spec.title or spec.metadata.get("discord_label") or spec.command_id),
+        title = spec.title or spec.metadata.get("discord_label") or spec.command_id
+        notifications_module.notify(
+            title=title,
+            body=short_output or "",
+            message_type="command",
         )
-        webhook_module.send_webhook(webhook, payload, message_type="command")
 
     def _run_idle_delegation(
         self, *, audit_only: bool, spec: Optional[CommandSpec] = None
@@ -1187,15 +1326,9 @@ class Scheduler:
         return self._delegation_orchestrator.run_delegation_report(spec)
 
     def _post_startup_message(self) -> None:
-        try:
-            config = daemon.get_env_config()
-        except SystemExit:
+        # Only attempt startup notification if Discord bot is configured.
+        if not os.getenv("AMPA_DISCORD_BOT_TOKEN"):
             return
-        webhook = config.get("webhook")
-        if not webhook:
-            return
-        hostname = os.uname().nodename
-        ts = _utc_now().isoformat()
         # Capture the human-facing output of `wl status` for the startup message
         try:
             proc = self.run_shell(
@@ -1234,15 +1367,12 @@ class Scheduler:
             LOG.exception("Failed to run 'wl status' for startup message")
             status_out = "(wl status unavailable)"
 
-        payload = webhook_module.build_command_payload(
-            hostname,
-            ts,
-            "scheduler_start",
-            status_out,
-            0,
+        notifications_module.notify(
             title="Scheduler Started",
+            body=status_out,
+            message_type="startup",
         )
-        webhook_module.send_webhook(webhook, payload, message_type="startup")
+        LOG.info("Startup notification dispatched")
 
 
 def load_scheduler(command_cwd: Optional[str] = None) -> Scheduler:

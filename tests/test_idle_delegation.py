@@ -1,5 +1,6 @@
 import json
 import subprocess
+import types
 
 from ampa.scheduler import (
     CommandRunResult,
@@ -63,15 +64,17 @@ def _delegation_spec():
 def test_idle_delegation_posts_single_detailed_webhook(tmp_path, monkeypatch):
     calls = []
 
-    def fake_send_webhook(webhook, payload, message_type=None):
-        calls.append((webhook, payload, message_type))
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        calls.append((title, body, message_type))
+        return True
 
-    # patch the webhook sender used by scheduler
+    # patch the notifications module used by scheduler
     import ampa.scheduler as schedmod
 
-    monkeypatch.setattr(schedmod.webhook_module, "send_webhook", fake_send_webhook)
-    # ensure scheduler believes a webhook is configured
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "https://example.invalid/webhook")
+    fake_mod = types.SimpleNamespace(notify=fake_notify)
+    monkeypatch.setattr(schedmod, "notifications_module", fake_mod)
+    # ensure scheduler believes notifications are configured
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     def fake_run_shell(cmd, **kwargs):
         s = cmd.strip()
@@ -109,9 +112,9 @@ def test_idle_delegation_posts_single_detailed_webhook(tmp_path, monkeypatch):
     # Ensure a detailed idle webhook is sent. When all candidates are
     # rejected the pre-dispatch report path runs and sends a report
     # that includes the considered candidates.
-    assert len(calls) >= 1, "Expected at least one webhook to be sent"
-    webhook, payload, mtype = calls[0]
+    assert len(calls) >= 1, "Expected at least one notification to be sent"
+    title, body, mtype = calls[0]
     assert mtype == "command"
-    # payload content should include the considered candidates in the report
-    content = payload.get("content") or ""
+    # body content should include the considered candidates in the report
+    content = body
     assert "SA-unsupported" in content and "SA-skip" in content

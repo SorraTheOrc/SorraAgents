@@ -16,9 +16,11 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 try:
-    from . import webhook as webhook_module
-except Exception:
-    webhook_module = None
+    # Use package-relative import to avoid circular import when ampa package
+    # is imported by other modules in the installed layout.
+    from . import notifications as notifications_module
+except Exception:  # pragma: no cover - optional dependency
+    notifications_module = None
 
 LOG = logging.getLogger("session_block")
 
@@ -101,17 +103,13 @@ def _responder_endpoint_url() -> str:
 
 
 def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[int]:
-    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-    if not webhook:
-        return None
-    if webhook_module is None:
-        LOG.warning("ampa.webhook is unavailable; cannot send notification")
+    if notifications_module is None:
+        LOG.warning("ampa.notifications is unavailable; cannot send notification")
         return None
     try:
         hostname = os.uname().nodename
     except Exception:
         hostname = "(unknown host)"
-    ts = datetime.utcnow().isoformat() + "Z"
     actions = _waiting_actions_text()
     summary = metadata.get("summary") or "(no summary)"
     work_item = metadata.get("work_item") or "(none)"
@@ -133,18 +131,13 @@ def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[i
         f"Pending prompt file: {pending_prompt_file}\n"
         f"Tool output dir: {tool_dir}"
     )
-    payload = webhook_module.build_command_payload(
-        hostname,
-        ts,
-        "waiting_for_input",
-        output,
-        0,
-        title="Session Waiting For Input",
-    )
     try:
-        return webhook_module.send_webhook(
-            webhook, payload, message_type="waiting_for_input"
+        ok = notifications_module.notify(
+            "Session Waiting For Input",
+            output,
+            message_type="waiting_for_input",
         )
+        return 200 if ok else 0
     except Exception:
         LOG.exception("Failed to send waiting_for_input notification")
         return None

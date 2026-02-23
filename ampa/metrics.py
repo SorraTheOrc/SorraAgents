@@ -113,9 +113,9 @@ def _wsgi_app(environ, start_response):
         return [data]
 
     if path == "/health":
-        # Fatal misconfiguration = missing AMPA_DISCORD_WEBHOOK
-        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-        if webhook and webhook.strip():
+        # Fatal misconfiguration = missing AMPA_DISCORD_BOT_TOKEN
+        bot_token = os.getenv("AMPA_DISCORD_BOT_TOKEN")
+        if bot_token and bot_token.strip():
             start_response("200 OK", [("Content-Type", "text/plain")])
             return [b"OK"]
         start_response("503 Service Unavailable", [("Content-Type", "text/plain")])

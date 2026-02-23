@@ -1,7 +1,7 @@
 """Adapter classes bridging scheduler infrastructure to engine protocols.
 
 These adapters wrap the scheduler's existing ``run_shell`` subprocess runner,
-``SchedulerStore``, and Discord webhook infrastructure so the engine's
+``SchedulerStore``, and Discord notification infrastructure so the engine's
 protocol-based dependencies can be satisfied without duplicating logic.
 
 Usage::
@@ -359,24 +359,20 @@ class StoreDispatchRecorder:
 
 
 class DiscordNotificationSender:
-    """Sends notifications via Discord webhook.
+    """Sends notifications via the notification API.
 
     Satisfies :class:`ampa.engine.core.NotificationSender`.
 
     Parameters
     ----------
-    webhook_url:
-        Discord webhook URL. If ``None`` or empty, notifications are skipped.
     hostname:
         Machine hostname for message context.
     """
 
     def __init__(
         self,
-        webhook_url: str | None = None,
         hostname: str | None = None,
     ) -> None:
-        self._url = webhook_url or os.getenv("AMPA_DISCORD_WEBHOOK")
         self._hostname = hostname or _safe_hostname()
 
     def send(
@@ -387,22 +383,14 @@ class DiscordNotificationSender:
         level: str = "info",
     ) -> bool:
         """Send a Discord notification. Returns True on success."""
-        if not self._url:
-            return True  # No webhook configured — succeed silently
-
         try:
-            from ampa import webhook as wh_mod
+            from ampa import notifications as notif_mod
 
-            payload = wh_mod.build_command_payload(
-                self._hostname,
-                _iso_now(),
-                "engine",
+            return notif_mod.notify(
+                title or "AMPA Engine",
                 message,
-                0,
-                title=title or "AMPA Engine",
+                message_type="engine",
             )
-            wh_mod.send_webhook(self._url, payload, message_type="engine")
-            return True
         except Exception:
             LOG.exception("Failed to send Discord notification")
             return False

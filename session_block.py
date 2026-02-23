@@ -22,9 +22,9 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 try:
-    from ampa import webhook as webhook_module
+    from ampa import notifications as notifications_module
 except Exception:  # pragma: no cover - optional dependency
-    webhook_module = None
+    notifications_module = None
 
 LOG = logging.getLogger("session_block")
 
@@ -114,18 +114,10 @@ def _responder_endpoint_url() -> str:
     return os.getenv("AMPA_RESPONDER_URL", "http://localhost:8081/respond")
 
 
-def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[int]:
-    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-    if not webhook:
+def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[bool]:
+    if notifications_module is None:
+        LOG.warning("ampa.notifications is unavailable; cannot send notification")
         return None
-    if webhook_module is None:
-        LOG.warning("ampa.webhook is unavailable; cannot send notification")
-        return None
-    try:
-        hostname = os.uname().nodename
-    except Exception:
-        hostname = "(unknown host)"
-    ts = datetime.utcnow().isoformat() + "Z"
     actions = _waiting_actions_text()
     summary = metadata.get("summary") or "(no summary)"
     work_item = metadata.get("work_item") or "(none)"
@@ -135,7 +127,7 @@ def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[i
     tool_dir = metadata.get("tool_output_dir") or _tool_output_dir()
     responder_url = _responder_endpoint_url()
     call_to_action = f"Respond now: {responder_url}"
-    output = (
+    body = (
         "Session is waiting for input\n"
         f"Session: {session_id}\n"
         f"Work item: {work_item}\n"
@@ -147,17 +139,11 @@ def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[i
         f"Pending prompt file: {pending_prompt_file}\n"
         f"Tool output dir: {tool_dir}"
     )
-    payload = webhook_module.build_command_payload(
-        hostname,
-        ts,
-        "waiting_for_input",
-        output,
-        0,
-        title="Session Waiting For Input",
-    )
     try:
-        return webhook_module.send_webhook(
-            webhook, payload, message_type="waiting_for_input"
+        return notifications_module.notify(
+            "Session Waiting For Input",
+            body,
+            message_type="waiting_for_input",
         )
     except Exception:
         LOG.exception("Failed to send waiting_for_input notification")

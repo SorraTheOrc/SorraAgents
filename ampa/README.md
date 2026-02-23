@@ -2,7 +2,7 @@ AMPA Core Heartbeat Sender
 
 Run locally:
 
-AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon
+AMPA_DISCORD_BOT_TOKEN="your-bot-token" AMPA_DISCORD_CHANNEL_ID="your-channel-id" python -m ampa.daemon
 
 Scheduler
 
@@ -70,14 +70,15 @@ cp ~/.config/opencode/.worklog/plugins/ampa_py/ampa/scheduler_store.json \
    <projectRoot>/.worklog/ampa/scheduler_store.json
 ```
 
-After migrating, each project can have independent webhook URLs, scheduler state,
+After migrating, each project can have independent bot tokens, scheduler state,
 and other configuration. The old files in the package directory are still used as
 a fallback if no per-project files are found, so existing single-project setups
 continue to work without changes.
 
 Example `<projectRoot>/.worklog/ampa/.env` contents:
 
-AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/...."
+AMPA_DISCORD_BOT_TOKEN="your-bot-token"
+AMPA_DISCORD_CHANNEL_ID="your-channel-id"
 AMPA_HEARTBEAT_MINUTES=1
 AMPA_VERIFY_PR_WITH_GH=1
 
@@ -102,21 +103,22 @@ variable.
 Examples:
 
   # Run daemon in the foreground and start the scheduler loop (recommended for testing)
-  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon --start-scheduler
+  AMPA_DISCORD_BOT_TOKEN="your-bot-token" AMPA_DISCORD_CHANNEL_ID="your-channel-id" python -m ampa.daemon --start-scheduler
 
   # Enable scheduler via environment variable instead of the CLI flag
-  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" AMPA_RUN_SCHEDULER=1 python -m ampa.daemon
+  AMPA_DISCORD_BOT_TOKEN="your-bot-token" AMPA_DISCORD_CHANNEL_ID="your-channel-id" AMPA_RUN_SCHEDULER=1 python -m ampa.daemon
 
   # Send a single heartbeat and exit
-  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.daemon --once
+  AMPA_DISCORD_BOT_TOKEN="your-bot-token" AMPA_DISCORD_CHANNEL_ID="your-channel-id" python -m ampa.daemon --once
 
 Notes:
 
 - The scheduler uses the current working directory as the `command_cwd` for
   commands it runs, so start the daemon from the directory you want commands
   to execute in.
-- Ensure `AMPA_DISCORD_WEBHOOK` is set (or `ampa/.env` is present) before
-  starting the daemon; missing webhook will cause the daemon to exit.
+- Ensure `AMPA_DISCORD_BOT_TOKEN` and `AMPA_DISCORD_CHANNEL_ID` are set (or
+  `ampa/.env` is present) before starting the daemon; missing bot token will
+  cause the daemon to exit.
 - Install runtime dependencies when running locally:
 
   pip install -r ampa/requirements.txt
@@ -130,7 +132,7 @@ Prometheus-compatible systems. The package provides a combined `/metrics` and
 
 Environment variables:
 
-- `AMPA_DISCORD_WEBHOOK` (required by the daemon): when unset or empty the
+- `AMPA_DISCORD_BOT_TOKEN` (required by the daemon): when unset or empty the
   `/health` endpoint returns `503 Service Unavailable` to indicate fatal
   misconfiguration.
 - `AMPA_METRICS_PORT` (optional): port to serve `/metrics` and `/health` on
@@ -154,7 +156,7 @@ start_metrics_server(port=8000)
 ```
 
 3. Verify health: `curl -sSf http://127.0.0.1:8000/health` (returns HTTP 200 when
-   `AMPA_DISCORD_WEBHOOK` is set).
+   `AMPA_DISCORD_BOT_TOKEN` is set).
 4. Verify metrics: `curl http://127.0.0.1:8000/metrics | grep ampa_heartbeat`
 
 Integration test example (pytest)
@@ -181,7 +183,7 @@ Both commands use the `ampa.run_gh_sync` wrapper module which handles:
   `git remote get-url origin` (SSH and HTTPS formats) and writes the
   detected `owner/repo` value back to the config idempotently.
 - **Error handling:** non-zero exit codes from `wl github` are propagated
-  to the scheduler, which posts Discord alerts via the existing webhook.
+  to the scheduler, which posts Discord alerts via the bot notification system.
 - **Timeout:** commands are killed after 300 seconds.
 
 Manual usage:
@@ -224,9 +226,9 @@ to skip dispatch.
 
   python -m ampa.scheduler delegation
 
-Send the report to Discord (requires `AMPA_DISCORD_WEBHOOK`):
+Send the report to Discord (requires `AMPA_DISCORD_BOT_TOKEN`):
 
-  AMPA_DISCORD_WEBHOOK="https://discord.com/api/webhooks/XXX" python -m ampa.scheduler delegation --discord
+  AMPA_DISCORD_BOT_TOKEN="your-bot-token" AMPA_DISCORD_CHANNEL_ID="your-channel-id" python -m ampa.scheduler delegation --discord
 
 Candidate selection
 

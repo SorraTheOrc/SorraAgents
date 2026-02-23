@@ -51,7 +51,7 @@ The test suite covers the following areas:
 
 ### Argument Parsing
 - Help flag (`--help`, `-h`)
-- Webhook option (`--webhook`, `-w`) with and without values
+- Bot token option (`--bot-token`) and channel ID option (`--channel-id`) with and without values
 - Auto-yes option (`--yes`, `-y`)
 - Restart options (`--restart`, `--no-restart`)
 - Mutually exclusive option validation
@@ -74,9 +74,9 @@ The test suite covers the following areas:
 ### Environment File Handling
 - Detect `.env.sample` and `.env.samplw` files
 - Create `.env` from sample template
-- Write webhook to `.env` file
+- Write bot token and channel ID to `.env` file
 - Preserve existing `.env` during upgrade
-- Handle webhook removal
+- Handle bot token removal
 - Backup and restore `.env` files
 
 ### Installation Flow
@@ -90,7 +90,7 @@ The test suite covers the following areas:
 - Single argument: source file only
 - Two arguments: source and target directory
 - No arguments: use default paths
-- Original webhook option behavior
+- Original bot token option behavior
 - Original auto-yes behavior
 
 ### Script Quality
@@ -107,9 +107,9 @@ The test suite covers the following areas:
 ```bash
 ✓ Help flag shows usage
 ✓ Unknown option fails with error
-✓ Webhook option parsing
-✓ Webhook short option -w
-✓ Webhook without value fails
+✓ Bot token option parsing
+✓ Channel ID option parsing
+✓ Bot token without value fails
 ✓ Mutually exclusive options error
 ```
 
@@ -137,7 +137,7 @@ The test suite covers the following areas:
 
 ```bash
 ✓ Env sample file detection
-✓ Webhook written to env file
+✓ Bot token written to env file
 ```
 
 ### Installation Flow Tests (3 tests)

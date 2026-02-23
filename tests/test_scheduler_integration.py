@@ -229,7 +229,7 @@ class TestEngineResultConversion:
         assert result["delegate_info"]["id"] == "WL-99"
 
     def test_no_candidates_result(self):
-        """NO_CANDIDATES maps to dispatched=False, idle_webhook_sent=True."""
+        """NO_CANDIDATES maps to dispatched=False, idle_notification_sent=True."""
         engine = mock.MagicMock(spec=Engine)
         engine.process_delegation.return_value = _make_engine_result(
             status=EngineStatus.NO_CANDIDATES,
@@ -240,7 +240,7 @@ class TestEngineResultConversion:
         result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
 
         assert result["dispatched"] is False
-        assert result["idle_webhook_sent"] is True
+        assert result["idle_notification_sent"] is True
         assert "no wl next candidates" in result["note"]
 
     def test_skipped_result(self):
@@ -656,9 +656,9 @@ class TestShellAdapters:
     def test_discord_notification_sender_no_webhook(self):
         from ampa.engine.adapters import DiscordNotificationSender
 
-        with mock.patch.dict("os.environ", {}, clear=True):
-            sender = DiscordNotificationSender(webhook_url=None)
-            # No webhook → succeeds silently
+        with mock.patch("ampa.notifications.notify", return_value=True):
+            sender = DiscordNotificationSender()
+            # notify() is mocked → succeeds
             assert sender.send("test message") is True
 
     def test_candidate_fetcher_nested_format(self):

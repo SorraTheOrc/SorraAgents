@@ -51,7 +51,7 @@ No commands are executed. The engine enters idle state.
   "note": "Delegation: skipped (no wl next candidates)",
   "dispatched": false,
   "rejected": [],
-  "idle_webhook_sent": true,
+  "idle_notification_sent": true,
   "delegate_info": null
 }
 ```
@@ -101,7 +101,7 @@ Rejected:
     {"id": "WL-103", "title": "Fix login page", "reason": "do-not-delegate tag"},
     {"id": "WL-104", "title": "Update docs", "reason": "unsupported stage"}
   ],
-  "idle_webhook_sent": true,
+  "idle_notification_sent": true,
   "delegate_info": null
 }
 ```

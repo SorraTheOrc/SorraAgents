@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Interactive wrapper around install-worklog-plugin.sh to request a Discord webhook
+# Interactive wrapper around install-worklog-plugin.sh to request Discord bot config
 set -eu
 
 SCRIPT_DIR=$(dirname "$0")
@@ -10,7 +10,8 @@ if [ ! -x "$INSTALL_SH" ] && [ ! -f "$INSTALL_SH" ]; then
   exit 2
 fi
 
-WEBHOOK=""
+BOT_TOKEN=""
+CHANNEL_ID=""
 AUTO_YES=0
 EXTRA_ARGS=
 
@@ -20,13 +21,18 @@ while [ "$#" -gt 0 ]; do
       AUTO_YES=1
       shift
       ;;
-    --webhook)
+    --bot-token)
       shift
-      WEBHOOK="$1"
+      BOT_TOKEN="$1"
+      shift
+      ;;
+    --channel-id)
+      shift
+      CHANNEL_ID="$1"
       shift
       ;;
     --help|-h)
-      echo "Usage: $0 [--webhook <url>] [--yes] [-- <installer-args>]"
+      echo "Usage: $0 [--bot-token <token>] [--channel-id <id>] [--yes] [-- <installer-args>]"
       exit 0
       ;;
     --)
@@ -42,34 +48,24 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-# Simple Discord webhook validation
-is_valid_webhook() {
-  case "$1" in
-    *"/webhooks/"*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+if [ -z "$BOT_TOKEN" ] && [ "$AUTO_YES" -ne 1 ]; then
+  printf "Enter Discord bot token to use for AMPA notifications (leave empty to skip): \n> "
+  if ! read -r BOT_TOKEN; then BOT_TOKEN=""; fi
+  BOT_TOKEN=$(printf "%s" "$BOT_TOKEN" | sed 's/^\s*//;s/\s*$//')
+fi
 
-if [ -z "$WEBHOOK" ] && [ "$AUTO_YES" -ne 1 ]; then
-  printf "Enter Discord webhook URL to use for AMPA notifications (leave empty to skip): \n> "
-  if ! read -r WEBHOOK; then WEBHOOK=""; fi
-  WEBHOOK=$(printf "%s" "$WEBHOOK" | sed 's/^\s*//;s/\s*$//')
-  if [ -n "$WEBHOOK" ] && ! is_valid_webhook "$WEBHOOK"; then
-    printf "Note: the value you entered does not look like a Discord webhook. Continue anyway? [y/N]: "
-    if ! read -r CH; then CH=""; fi
-    case "$(printf "%s" "$CH" | tr '[:upper:]' '[:lower:]')" in
-      y|yes) ;;
-      *)
-        echo "Aborting; no webhook configured." >&2
-        WEBHOOK=""
-        ;;
-    esac
-  fi
+if [ -z "$CHANNEL_ID" ] && [ -n "$BOT_TOKEN" ] && [ "$AUTO_YES" -ne 1 ]; then
+  printf "Enter Discord channel ID for AMPA notifications: \n> "
+  if ! read -r CHANNEL_ID; then CHANNEL_ID=""; fi
+  CHANNEL_ID=$(printf "%s" "$CHANNEL_ID" | sed 's/^\s*//;s/\s*$//')
 fi
 
 CMD="$INSTALL_SH"
-if [ -n "$WEBHOOK" ]; then
-  CMD="$CMD --webhook $WEBHOOK"
+if [ -n "$BOT_TOKEN" ]; then
+  CMD="$CMD --bot-token $BOT_TOKEN"
+fi
+if [ -n "$CHANNEL_ID" ]; then
+  CMD="$CMD --channel-id $CHANNEL_ID"
 fi
 
 if [ -n "$EXTRA_ARGS" ]; then

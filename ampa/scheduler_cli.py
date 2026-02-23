@@ -18,7 +18,7 @@ import datetime as dt
 import re
 from typing import Any, Dict, List, Optional
 
-from . import daemon, webhook as webhook_module, selection
+from . import daemon, notifications as notifications_module, selection
 from .scheduler import (
     CommandSpec,
     SchedulerStore,
@@ -218,31 +218,19 @@ def _cli_dry_run(args: argparse.Namespace) -> int:
         title="Delegation Report",
         command_type="delegation",
     )
-    if args.discord and not os.getenv("AMPA_DISCORD_WEBHOOK"):
-        LOG.warning("AMPA_DISCORD_WEBHOOK not set; discord flag will be ignored")
+    if args.discord and not os.getenv("AMPA_DISCORD_BOT_TOKEN"):
+        LOG.warning("AMPA_DISCORD_BOT_TOKEN not set; discord flag will be ignored")
     report = scheduler._run_delegation_report(spec)
     if report:
         print(report)
         if args.discord:
             try:
-                webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                if webhook:
-                    message = _build_delegation_discord_message(report)
-                    payload = webhook_module.build_command_payload(
-                        os.uname().nodename,
-                        _utc_now().isoformat(),
-                        spec.command_id,
-                        message,
-                        0,
-                        title="Delegation Report",
-                    )
-                    webhook_module.send_webhook(
-                        webhook, payload, message_type="command"
-                    )
-                else:
-                    LOG.warning(
-                        "AMPA_DISCORD_WEBHOOK not set; skipping discord notification"
-                    )
+                message = _build_delegation_discord_message(report)
+                notifications_module.notify(
+                    "Delegation Report",
+                    message,
+                    message_type="command",
+                )
             except Exception:
                 LOG.exception("Failed to send delegation discord notification")
     return 0

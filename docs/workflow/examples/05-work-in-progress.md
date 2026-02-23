@@ -40,7 +40,7 @@ The engine does not proceed to candidate selection. No commands are executed.
 | **Commands Executed** | None |
 | **State Changes** | None |
 | **Candidates Evaluated** | None (skipped before candidate fetch) |
-| **Discord** | (no webhook — silent skip to avoid noise) |
+| **Discord** | (no notification — silent skip to avoid noise) |
 
 **Engine Inspection Result:**
 ```json

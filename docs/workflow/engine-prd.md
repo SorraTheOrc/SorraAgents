@@ -320,7 +320,7 @@ The engine maintains an append-only dispatch log (last 100 records) in `store.ap
 
 ### 7.3 Discord Notifications
 
-The engine sends structured notifications to Discord via webhook:
+The engine sends structured notifications to Discord via the bot:
 
 | Event | Channel Type | Content |
 |---|---|---|
