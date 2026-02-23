@@ -71,6 +71,22 @@ def _content_hash(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _isolate_environ():
+    """Save and restore os.environ around every test.
+
+    load_env() calls load_dotenv(override=True) which mutates os.environ
+    directly.  monkeypatch only restores values it explicitly patches, so
+    without this fixture env vars leak across test boundaries and cause
+    downstream tests (test_scheduler_run, test_scheduler_scoring,
+    test_stale_delegation_watchdog) to hang.
+    """
+    saved = os.environ.copy()
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+
+
 @pytest.fixture()
 def project_a(tmp_path: Path) -> Path:
     """Temporary project directory A with its own .env and store."""
