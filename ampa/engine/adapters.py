@@ -359,14 +359,15 @@ class StoreDispatchRecorder:
 
 
 class DiscordNotificationSender:
-    """Sends notifications via Discord webhook.
+    """Sends notifications via the notification API.
 
     Satisfies :class:`ampa.engine.core.NotificationSender`.
 
     Parameters
     ----------
     webhook_url:
-        Discord webhook URL. If ``None`` or empty, notifications are skipped.
+        Ignored (kept for backward compatibility). Notifications are
+        routed through the notification API's Unix socket.
     hostname:
         Machine hostname for message context.
     """
@@ -376,7 +377,7 @@ class DiscordNotificationSender:
         webhook_url: str | None = None,
         hostname: str | None = None,
     ) -> None:
-        self._url = webhook_url or os.getenv("AMPA_DISCORD_WEBHOOK")
+        self._url = webhook_url  # kept for backward compat but unused
         self._hostname = hostname or _safe_hostname()
 
     def send(
@@ -387,22 +388,14 @@ class DiscordNotificationSender:
         level: str = "info",
     ) -> bool:
         """Send a Discord notification. Returns True on success."""
-        if not self._url:
-            return True  # No webhook configured — succeed silently
-
         try:
-            from ampa import webhook as wh_mod
+            from ampa import notifications as notif_mod
 
-            payload = wh_mod.build_command_payload(
-                self._hostname,
-                _iso_now(),
-                "engine",
+            return notif_mod.notify(
+                title or "AMPA Engine",
                 message,
-                0,
-                title=title or "AMPA Engine",
+                message_type="engine",
             )
-            wh_mod.send_webhook(self._url, payload, message_type="engine")
-            return True
         except Exception:
             LOG.exception("Failed to send Discord notification")
             return False

@@ -6,14 +6,13 @@ from datetime import datetime, timedelta
 import pytest
 
 from ampa import conversation_manager
-import session_block
+from ampa import session_block
 from ampa import responder
 
 
 def test_start_and_resume(tmp_path, monkeypatch):
     tool_dir = str(tmp_path)
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", tool_dir)
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid")
     monkeypatch.setenv("AMPA_RESPONDER_URL", "http://localhost:8081/respond")
 
     session_id = "s-123"
@@ -21,13 +20,13 @@ def test_start_and_resume(tmp_path, monkeypatch):
 
     captured = {}
 
-    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
-        captured["url"] = url
-        captured["payload"] = payload
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        captured["title"] = title
+        captured["body"] = body
         captured["message_type"] = message_type
-        return 204
+        return True
 
-    monkeypatch.setattr(session_block.webhook_module, "send_webhook", fake_send_webhook)
+    monkeypatch.setattr(session_block.notifications_module, "notify", fake_notify)
 
     meta = conversation_manager.start_conversation(
         session_id, prompt, {"work_item": "WL-1"}
@@ -46,14 +45,14 @@ def test_start_and_resume(tmp_path, monkeypatch):
     assert payload["session_id"] == session_id
     assert payload["stamp"]
     assert captured["message_type"] == "waiting_for_input"
-    content = captured["payload"]["content"]
-    assert "Session: s-123" in content
-    assert "Work item: WL-1" in content
-    assert "Reason: Please confirm this change" in content
-    assert "Call to action:" in content
-    assert "Pending prompt file:" in content
-    assert "Responder endpoint: http://localhost:8081/respond" in content
-    assert "Persisted prompt path:" in content
+    body = captured["body"]
+    assert "Session: s-123" in body
+    assert "Work item: WL-1" in body
+    assert "Reason: Please confirm this change" in body
+    assert "Call to action:" in body
+    assert "Pending prompt file:" in body
+    assert "Responder endpoint: http://localhost:8081/respond" in body
+    assert "Persisted prompt path:" in body
 
     # resume
     res = conversation_manager.resume_session(session_id, "yes")
@@ -197,18 +196,17 @@ def test_responder_payload_action_accept(tmp_path, monkeypatch):
 def test_detect_and_surface_blocking_prompt_persists_state(tmp_path, monkeypatch):
     tool_dir = str(tmp_path)
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", tool_dir)
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid")
     monkeypatch.setenv("AMPA_RESPONDER_URL", "http://localhost:8081/respond")
 
     captured = {}
 
-    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
-        captured["url"] = url
-        captured["payload"] = payload
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        captured["title"] = title
+        captured["body"] = body
         captured["message_type"] = message_type
-        return 204
+        return True
 
-    monkeypatch.setattr(session_block.webhook_module, "send_webhook", fake_send_webhook)
+    monkeypatch.setattr(session_block.notifications_module, "notify", fake_notify)
 
     session_id = "s-blocked"
     prompt = "Approve change?"
@@ -237,7 +235,7 @@ def test_detect_and_surface_blocking_prompt_persists_state(tmp_path, monkeypatch
     assert state["state"] == "waiting_for_input"
 
     assert captured["message_type"] == "waiting_for_input"
-    content = captured["payload"]["content"]
-    assert "Session: s-blocked" in content
-    assert "Work item: WL-44" in content
-    assert "Reason: Approve change?" in content
+    body = captured["body"]
+    assert "Session: s-blocked" in body
+    assert "Work item: WL-44" in body
+    assert "Reason: Approve change?" in body

@@ -656,9 +656,9 @@ class TestShellAdapters:
     def test_discord_notification_sender_no_webhook(self):
         from ampa.engine.adapters import DiscordNotificationSender
 
-        with mock.patch.dict("os.environ", {}, clear=True):
+        with mock.patch("ampa.notifications.notify", return_value=True):
             sender = DiscordNotificationSender(webhook_url=None)
-            # No webhook → succeeds silently
+            # notify() is mocked → succeeds
             assert sender.send("test message") is True
 
     def test_candidate_fetcher_nested_format(self):

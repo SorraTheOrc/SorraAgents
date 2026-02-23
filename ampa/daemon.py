@@ -28,11 +28,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 __all__ = ["get_env_config", "run_once", "load_env"]
 
-# Use webhook helpers from ampa.webhook as the single source of truth.
-from .webhook import (
-    build_command_payload,
-    build_payload,
-    send_webhook,
+# Use notification helpers from ampa.notifications as the single source of truth.
+from .notifications import (
+    notify,
     dead_letter,
     _read_state,
     _write_state,
@@ -97,21 +95,16 @@ def load_env() -> None:
 def get_env_config() -> Dict[str, Any]:
     """Read and validate environment configuration.
 
-    Raises SystemExit (2) if AMPA_DISCORD_WEBHOOK is not set.
+    Raises SystemExit (2) if AMPA_DISCORD_BOT_TOKEN is not set.
     """
     load_env()
 
-    # Read webhook and be tolerant of values coming from Docker `--env-file`
-    # which preserve surrounding quotes. Strip whitespace and surrounding
-    # single/double quotes so both dotenv and Docker env-file formats work.
-    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-    if webhook:
-        webhook = webhook.strip()
-        # remove surrounding single/double quotes if present (handles values
-        # coming from dotenv or Docker env-file which may include quotes)
-        webhook = webhook.strip("'\"")
-    if not webhook:
-        LOG.error("AMPA_DISCORD_WEBHOOK is not set; cannot send heartbeats")
+    # Check for bot token — the new mechanism for Discord notifications.
+    bot_token = os.getenv("AMPA_DISCORD_BOT_TOKEN")
+    if bot_token:
+        bot_token = bot_token.strip().strip("'\"")
+    if not bot_token:
+        LOG.error("AMPA_DISCORD_BOT_TOKEN is not set; cannot send heartbeats")
         raise SystemExit(2)
 
     minutes_raw = os.getenv("AMPA_HEARTBEAT_MINUTES", "1")
@@ -123,7 +116,7 @@ def get_env_config() -> Dict[str, Any]:
         LOG.warning("Invalid AMPA_HEARTBEAT_MINUTES=%r, falling back to 1", minutes_raw)
         minutes = 1
 
-    return {"webhook": webhook, "minutes": minutes}
+    return {"bot_token": bot_token, "minutes": minutes}
 
 
 def _truncate_output(output: str, limit: int = 900) -> str:
@@ -135,11 +128,10 @@ def _truncate_output(output: str, limit: int = 900) -> str:
 def run_once(config: Dict[str, Any]) -> int:
     """Send a single heartbeat using the provided config.
 
-    Returns the HTTP status code (or raises if requests is missing).
+    Returns 200 on success, 0 on skip/failure.
     """
     hostname = socket.gethostname()
     ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    payload = build_payload(hostname, ts, None)
     LOG.info("Evaluating whether to send heartbeat for host=%s", hostname)
 
     state_file = os.getenv("AMPA_STATE_FILE") or os.path.join(
@@ -178,8 +170,11 @@ def run_once(config: Dict[str, Any]) -> int:
             )
             return 0
 
-    # Send heartbeat and update heartbeat timestamp
-    status = send_webhook(config["webhook"], payload, message_type="heartbeat")
+    # Send heartbeat via notification API and update heartbeat timestamp.
+    # notify() updates the state file internally (last_message_ts /
+    # last_message_type) so we only need to write last_heartbeat_ts here.
+    ok = notify("AMPA Heartbeat", message_type="heartbeat")
+    status = 200 if ok else 0
     try:
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _write_state(
@@ -194,7 +189,7 @@ def run_once(config: Dict[str, Any]) -> int:
         LOG.exception("Failed to update state after heartbeat")
     # Update Prometheus metrics
     try:
-        if int(status) >= 200 and int(status) < 300:
+        if ok:
             ampa_heartbeat_sent_total.inc()
             ampa_last_heartbeat_timestamp_seconds.set(
                 int(datetime.datetime.now(datetime.timezone.utc).timestamp())

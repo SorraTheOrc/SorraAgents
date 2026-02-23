@@ -3,7 +3,7 @@ import json
 import subprocess
 
 from ampa.scheduler import Scheduler, SchedulerConfig, SchedulerStore, CommandSpec
-from ampa import webhook
+from ampa import notifications
 
 
 class DummyStore(SchedulerStore):
@@ -54,14 +54,16 @@ def test_dry_run_report_and_discord_message(tmp_path, monkeypatch):
 
     captured = {}
 
-    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
-        captured["url"] = url
-        captured["payload"] = payload
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        captured["title"] = title
+        captured["body"] = body
         captured["message_type"] = message_type
-        return 204
+        if payload is not None:
+            captured["payload"] = payload
+        return True
 
-    monkeypatch.setattr(webhook, "send_webhook", fake_send_webhook)
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setattr(notifications, "notify", fake_notify)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     sched = _make_scheduler(fake_run_shell, tmp_path)
     spec = CommandSpec(
@@ -86,7 +88,7 @@ def test_dry_run_report_and_discord_message(tmp_path, monkeypatch):
 
     message = sched._run_delegation_report(spec)
     assert message is not None
-    payload = webhook.build_command_payload(
+    payload = notifications.build_command_payload(
         "host",
         "2026-01-01T00:00:00+00:00",
         "delegation",
@@ -94,9 +96,10 @@ def test_dry_run_report_and_discord_message(tmp_path, monkeypatch):
         0,
         title="Delegation Report",
     )
-    webhook.send_webhook(
-        "http://example.invalid/webhook", payload, message_type="command"
+    notifications.notify(
+        title="Delegation Report",
+        message_type="command",
+        payload=payload,
     )
 
-    assert "url" in captured
     assert captured["message_type"] == "command"

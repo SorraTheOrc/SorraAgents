@@ -240,6 +240,7 @@ class DelegationOrchestrator:
         # Callers pass these modules/functions so this module does not import
         # ``ampa.webhook`` or ``ampa.selection`` directly.
         webhook_module: Any = None,
+        notifications_module: Any = None,
         selection_module: Any = None,
     ) -> None:
         self.store = store
@@ -248,6 +249,7 @@ class DelegationOrchestrator:
         self.engine = engine
         self._candidate_selector = candidate_selector
         self._webhook_module = webhook_module
+        self._notifications_module = notifications_module
         self._selection_module = selection_module
 
     # -- report dedup -------------------------------------------------------
@@ -699,9 +701,8 @@ class DelegationOrchestrator:
         # 5. Discord notification (batched)
         if recovered:
             try:
-                webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                wh_mod = self._webhook_module
-                if webhook and wh_mod is not None:
+                notif = self._notifications_module
+                if notif is not None:
                     lines = [
                         f"Stale delegation watchdog recovered {len(recovered)} item(s):"
                     ]
@@ -711,15 +712,11 @@ class DelegationOrchestrator:
                             f"(stale {info['age_seconds']}s, reset to {info['reset_to']})"
                         )
                     msg = "\n".join(lines)
-                    payload = wh_mod.build_command_payload(
-                        os.uname().nodename,
-                        now.isoformat(),
-                        "stale_delegation_watchdog",
+                    notif.notify(
+                        "Stale Delegation Recovery",
                         msg,
-                        0,
-                        title="Stale Delegation Recovery",
+                        message_type="warning",
                     )
-                    wh_mod.send_webhook(webhook, payload, message_type="warning")
             except Exception:
                 LOG.exception(
                     "Stale delegation watchdog: failed to send Discord notification"
@@ -753,7 +750,7 @@ class DelegationOrchestrator:
         # These are only needed when execute() is called.
         from .scheduler import _bool_meta, CommandRunResult, RunResult
 
-        wh_mod = self._webhook_module
+        notif = self._notifications_module
 
         LOG.info(
             "Handling delegation command: %s (audit_only=%s)",
@@ -793,25 +790,22 @@ class DelegationOrchestrator:
                 # the dedup check suppresses this particular send.
                 sent_pre_report = True
                 try:
-                    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                    if webhook and self._is_delegation_report_changed(
-                        spec.command_id, report
-                    ):
+                    if self._is_delegation_report_changed(spec.command_id, report):
                         message = _build_delegation_discord_message(report)
-                        payload = wh_mod.build_command_payload(
-                            os.uname().nodename,
-                            run.end_ts.isoformat(),
-                            spec.command_id,
-                            message,
-                            run.exit_code,
-                            title=(
-                                spec.title
-                                or spec.metadata.get("discord_label")
-                                or "Delegation Report"
-                            ),
+                        report_title = (
+                            spec.title
+                            or spec.metadata.get("discord_label")
+                            or "Delegation Report"
                         )
-                        wh_mod.send_webhook(webhook, payload, message_type="command")
-                        LOG.info("Sent pre-dispatch webhook for %s", spec.command_id)
+                        if notif is not None:
+                            notif.notify(
+                                report_title,
+                                message,
+                                message_type="command",
+                            )
+                        LOG.info(
+                            "Sent pre-dispatch notification for %s", spec.command_id
+                        )
                 except Exception:
                     LOG.exception("Delegation discord notification failed")
         # if we skipped creating a pre-report, 'report' stays None and
@@ -845,25 +839,20 @@ class DelegationOrchestrator:
             # short webhook message so Discord reflects the idle state.
             if not sent_pre_report:
                 try:
-                    webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                    if webhook and self._is_delegation_report_changed(
-                        spec.command_id, idle_msg
-                    ):
-                        payload = wh_mod.build_command_payload(
-                            os.uname().nodename,
-                            run.end_ts.isoformat(),
-                            spec.command_id,
-                            idle_msg,
-                            0,
-                            title=(
-                                spec.title
-                                or spec.metadata.get("discord_label")
-                                or "Delegation Report"
-                            ),
+                    if self._is_delegation_report_changed(spec.command_id, idle_msg):
+                        idle_title = (
+                            spec.title
+                            or spec.metadata.get("discord_label")
+                            or "Delegation Report"
                         )
-                        wh_mod.send_webhook(webhook, payload, message_type="command")
+                        if notif is not None:
+                            notif.notify(
+                                idle_title,
+                                idle_msg,
+                                message_type="command",
+                            )
                 except Exception:
-                    LOG.exception("Failed to send idle-state webhook")
+                    LOG.exception("Failed to send idle-state notification")
         elif status == "idle_with_candidate":
             delegate_id = inspect.get("candidate_id")
             delegate_title = inspect.get("candidate_title") or "(no title)"
@@ -890,28 +879,23 @@ class DelegationOrchestrator:
                     # send a short idle notification so Discord reflects the
                     # current idle state.
                     if not sent_pre_report and not idle_webhook_sent:
-                        webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-                        if webhook and self._is_delegation_report_changed(
+                        if self._is_delegation_report_changed(
                             spec.command_id, idle_msg
                         ):
                             try:
-                                payload = wh_mod.build_command_payload(
-                                    os.uname().nodename,
-                                    run.end_ts.isoformat(),
-                                    spec.command_id,
-                                    idle_msg,
-                                    0,
-                                    title=(
-                                        spec.title
-                                        or spec.metadata.get("discord_label")
-                                        or "Delegation Report"
-                                    ),
+                                idle_title = (
+                                    spec.title
+                                    or spec.metadata.get("discord_label")
+                                    or "Delegation Report"
                                 )
-                                wh_mod.send_webhook(
-                                    webhook, payload, message_type="command"
-                                )
+                                if notif is not None:
+                                    notif.notify(
+                                        idle_title,
+                                        idle_msg,
+                                        message_type="command",
+                                    )
                             except Exception:
-                                LOG.exception("Failed to send idle-state webhook")
+                                LOG.exception("Failed to send idle-state notification")
             except Exception:
                 LOG.exception("Failed to handle no-actionable-candidates path")
         else:
@@ -926,45 +910,35 @@ class DelegationOrchestrator:
         # was actually dispatched so the Discord report reflects the
         # resulting state instead of the pre-delegation dry-run.
         try:
-            webhook = os.getenv("AMPA_DISCORD_WEBHOOK")
-            if webhook:
-                # If something was dispatched, re-run the report to capture
-                # the post-dispatch state and post that as an update.
-                dispatched_flag = False
-                if isinstance(result, dict):
-                    dispatched_flag = bool(result.get("dispatched"))
-                if dispatched_flag:
-                    try:
-                        post_report = self.run_delegation_report(spec)
-                        if post_report:
-                            # Update the stored hash so the next cycle
-                            # compares against this post-dispatch state
-                            # rather than the stale pre-dispatch content.
-                            self._is_delegation_report_changed(
-                                spec.command_id, post_report
-                            )
-                            post_message = _build_delegation_discord_message(
-                                post_report
-                            )
-                            payload = wh_mod.build_command_payload(
-                                os.uname().nodename,
-                                run.end_ts.isoformat(),
-                                spec.command_id,
+            # If something was dispatched, re-run the report to capture
+            # the post-dispatch state and post that as an update.
+            dispatched_flag = False
+            if isinstance(result, dict):
+                dispatched_flag = bool(result.get("dispatched"))
+            if dispatched_flag:
+                try:
+                    post_report = self.run_delegation_report(spec)
+                    if post_report:
+                        # Update the stored hash so the next cycle
+                        # compares against this post-dispatch state
+                        # rather than the stale pre-dispatch content.
+                        self._is_delegation_report_changed(spec.command_id, post_report)
+                        post_message = _build_delegation_discord_message(post_report)
+                        post_title = (
+                            spec.title
+                            or spec.metadata.get("discord_label")
+                            or "Delegation Report"
+                        )
+                        if notif is not None:
+                            notif.notify(
+                                post_title,
                                 post_message,
-                                run.exit_code,
-                                title=(
-                                    spec.title
-                                    or spec.metadata.get("discord_label")
-                                    or "Delegation Report"
-                                ),
+                                message_type="command",
                             )
-                            wh_mod.send_webhook(
-                                webhook, payload, message_type="command"
-                            )
-                    except Exception:
-                        LOG.exception("Failed to send post-delegation webhook")
+                except Exception:
+                    LOG.exception("Failed to send post-delegation notification")
         except Exception:
-            LOG.exception("Delegation webhook follow-up failed")
+            LOG.exception("Delegation notification follow-up failed")
 
         # Use the structured result.note when available
         summary_note = None

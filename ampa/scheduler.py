@@ -27,7 +27,6 @@ except Exception:  # pragma: no cover - optional dependency in tests
 
 try:
     from . import daemon
-    from . import webhook as webhook_module
     from . import notifications as notifications_module
     from . import selection
     from . import fallback
@@ -42,7 +41,6 @@ except ImportError:  # pragma: no cover - allow running as script
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     daemon = importlib.import_module("ampa.daemon")
-    webhook_module = importlib.import_module("ampa.webhook")
     notifications_module = importlib.import_module("ampa.notifications")
     selection = importlib.import_module("ampa.selection")
     fallback = importlib.import_module("ampa.fallback")
@@ -573,7 +571,7 @@ class Scheduler:
             command_cwd=self.command_cwd,
             engine=self.engine,
             candidate_selector=self._candidate_selector,
-            webhook_module=webhook_module,
+            notifications_module=notifications_module,
             selection_module=selection,
         )
 
@@ -906,14 +904,14 @@ class Scheduler:
         """Keep the delegation orchestrator in sync with mutable scheduler state.
 
         Callers (including tests) may reassign ``self.run_shell``,
-        ``self.engine``, or patch ``webhook_module`` / ``selection``
+        ``self.engine``, or patch ``notifications_module`` / ``selection``
         after construction.  This method propagates those references to
         the orchestrator so delegation code paths see the current values.
         """
         orch = self._delegation_orchestrator
         orch.run_shell = self.run_shell
         orch.engine = self.engine
-        orch._webhook_module = webhook_module
+        orch._notifications_module = notifications_module
         orch._selection_module = selection
 
     def _recover_stale_delegations(self) -> List[Dict[str, Any]]:

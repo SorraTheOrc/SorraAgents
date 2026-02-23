@@ -578,9 +578,7 @@ class TestDiscordNotification:
     """Verify Discord webhook is sent on recovery."""
 
     def test_discord_sent_on_recovery(self, monkeypatch):
-        """A Discord webhook is sent when items are recovered."""
-        monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "https://discord.example.com/hook")
-
+        """A notification is sent when items are recovered."""
         shell = ShellRecorder()
         stale_item = _make_work_item(
             "WL-DISCORD",
@@ -599,55 +597,25 @@ class TestDiscordNotification:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        sent_payloads = []
+        sent_notifications = []
 
-        def mock_send_webhook(url, payload, **kwargs):
-            sent_payloads.append({"url": url, "payload": payload, "kwargs": kwargs})
+        def mock_notify(title, body="", message_type="other", *, payload=None):
+            sent_notifications.append(
+                {"title": title, "body": body, "message_type": message_type}
+            )
+            return True
 
-        def mock_build_payload(*args, **kwargs):
-            return {"args": args, "kwargs": kwargs}
-
-        with mock.patch("ampa.scheduler.webhook_module") as mock_wh:
-            mock_wh.build_command_payload = mock_build_payload
-            mock_wh.send_webhook = mock_send_webhook
+        with mock.patch("ampa.scheduler.notifications_module") as mock_notif:
+            mock_notif.notify = mock_notify
             recovered = scheduler._recover_stale_delegations()
 
         assert len(recovered) == 1
-        assert len(sent_payloads) == 1
-        assert sent_payloads[0]["url"] == "https://discord.example.com/hook"
-
-    def test_no_discord_when_no_webhook(self, monkeypatch):
-        """No Discord call when AMPA_DISCORD_WEBHOOK is not set."""
-        monkeypatch.delenv("AMPA_DISCORD_WEBHOOK", raising=False)
-
-        shell = ShellRecorder()
-        stale_item = _make_work_item(
-            "WL-NOHOOK",
-            stage="delegated",
-            updated_at=_stale_timestamp(10800),
-        )
-        shell.add_response(
-            "wl in_progress",
-            subprocess.CompletedProcess(
-                args="",
-                returncode=0,
-                stdout=json.dumps([stale_item]),
-                stderr="",
-            ),
-        )
-        scheduler = _make_scheduler(shell=shell)
-
-        with mock.patch("ampa.scheduler.webhook_module") as mock_wh:
-            mock_wh.send_webhook = mock.MagicMock()
-            recovered = scheduler._recover_stale_delegations()
-
-        assert len(recovered) == 1
-        mock_wh.send_webhook.assert_not_called()
+        assert len(sent_notifications) == 1
+        assert sent_notifications[0]["message_type"] == "warning"
+        assert "WL-DISCORD" in sent_notifications[0]["body"]
 
     def test_no_discord_when_nothing_recovered(self, monkeypatch):
-        """No Discord call when no items are recovered."""
-        monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "https://discord.example.com/hook")
-
+        """No notification when no items are recovered."""
         shell = ShellRecorder()
         shell.add_response(
             "wl in_progress",
@@ -660,12 +628,12 @@ class TestDiscordNotification:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        with mock.patch("ampa.scheduler.webhook_module") as mock_wh:
-            mock_wh.send_webhook = mock.MagicMock()
+        with mock.patch("ampa.scheduler.notifications_module") as mock_notif:
+            mock_notif.notify = mock.MagicMock()
             recovered = scheduler._recover_stale_delegations()
 
         assert len(recovered) == 0
-        mock_wh.send_webhook.assert_not_called()
+        mock_notif.notify.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

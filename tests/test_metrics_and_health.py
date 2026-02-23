@@ -12,7 +12,7 @@ from ampa.metrics import (
     ampa_last_heartbeat_timestamp_seconds,
 )
 from ampa import conversation_manager
-import session_block
+from ampa import session_block
 
 
 @pytest.fixture()
@@ -108,9 +108,9 @@ def test_admin_fallback_controls_responder(tmp_path, monkeypatch, metrics_server
     monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "https://example.com/webhook")
 
     monkeypatch.setattr(
-        session_block.webhook_module,
-        "send_webhook",
-        lambda *args, **kwargs: 204,
+        session_block.notifications_module,
+        "notify",
+        lambda *args, **kwargs: True,
     )
 
     session_id = "s-fallback"

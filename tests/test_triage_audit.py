@@ -14,7 +14,7 @@ from ampa.scheduler import (
     SchedulerStore,
 )
 import ampa.daemon as daemon
-from ampa import webhook
+from ampa import notifications
 from ampa.engine.core import EngineConfig
 from ampa.engine.dispatch import DispatchResult
 
@@ -55,8 +55,8 @@ def test_triage_audit_runs_and_cleans_temp(tmp_path, monkeypatch):
     calls = []
     work_id = "TEST-WID-123"
 
-    # dummy send_webhook so scheduler doesn't try real network
-    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+    # dummy notify so scheduler doesn't try real network
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -112,8 +112,8 @@ def test_triage_audit_runs_and_cleans_temp(tmp_path, monkeypatch):
     pre = glob.glob(f"/tmp/wl-audit-comment-{work_id}-*.md")
     assert not pre
 
-    # set a fake webhook so summary extraction path runs (send_webhook is a noop)
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    # set a fake bot token so summary extraction path runs (notify is a noop)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     # run the command (this will invoke our fake_run_shell)
     sched.start_command(spec)
@@ -133,7 +133,7 @@ def test_triage_audit_auto_complete_with_gh(tmp_path, monkeypatch):
     calls = []
     work_id = "TEST-WID-PR-1"
 
-    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -213,7 +213,7 @@ def test_triage_audit_no_candidates_skips_discord(tmp_path, monkeypatch):
     """Verify triage-audit logs and avoids discord when no candidates."""
     calls = []
 
-    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -236,7 +236,7 @@ def test_triage_audit_no_candidates_skips_discord(tmp_path, monkeypatch):
     )
     sched.store.add_command(spec)
 
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     sched.start_command(spec)
 
@@ -248,7 +248,7 @@ def test_triage_audit_includes_blocked_items(tmp_path, monkeypatch):
     calls = []
     work_id = "BLOCKED-1"
 
-    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -315,7 +315,7 @@ def test_triage_audit_includes_blocked_items(tmp_path, monkeypatch):
     )
     sched.store.add_command(spec)
 
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     sched.start_command(spec)
 
@@ -333,7 +333,7 @@ def test_per_status_cooldown_respected(tmp_path, monkeypatch):
     wid_in_review = "WID-REV"
     wid_in_progress = "WID-PROG"
 
-    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     now = dt.datetime.now(dt.timezone.utc)
     # last audit times: both 2 hours ago
@@ -411,7 +411,7 @@ def test_per_status_cooldown_respected(tmp_path, monkeypatch):
         },
     )
 
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     sched.start_command(spec)
 
@@ -426,7 +426,7 @@ def test_triage_audit_audit_only_no_update(tmp_path, monkeypatch):
     calls = []
     work_id = "AUDIT-ONLY-1"
 
-    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -477,7 +477,7 @@ def test_triage_audit_audit_only_no_update(tmp_path, monkeypatch):
     )
     sched.store.add_command(spec)
 
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     sched.start_command(spec)
 
@@ -492,7 +492,7 @@ def test_triage_audit_audit_only_no_templates(tmp_path, monkeypatch):
     work_id = "AUDIT-ONLY-2"
     comment_payload = {"text": ""}
 
-    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -556,11 +556,15 @@ def test_triage_audit_discord_summary_includes_body(tmp_path, monkeypatch):
     work_id = "DISCORD-SUMMARY-1"
     captured = {}
 
-    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
-        captured["payload"] = payload
-        return 200
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        captured["title"] = title
+        captured["body"] = body
+        captured["message_type"] = message_type
+        if payload is not None:
+            captured["payload"] = payload
+        return True
 
-    monkeypatch.setattr(webhook, "send_webhook", fake_send_webhook)
+    monkeypatch.setattr(notifications, "notify", fake_notify)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -611,7 +615,7 @@ def test_triage_audit_discord_summary_includes_body(tmp_path, monkeypatch):
     )
     sched.store.add_command(spec)
 
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     sched.start_command(spec)
 
@@ -626,7 +630,7 @@ def test_triage_audit_delegation_disabled(tmp_path, monkeypatch):
     calls = []
     work_id = "DELEGATE-1"
 
-    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -676,7 +680,7 @@ def test_triage_audit_delegation_disabled(tmp_path, monkeypatch):
     )
     sched.store.add_command(spec)
 
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     sched.start_command(spec)
 
@@ -689,7 +693,7 @@ def test_triage_audit_delegation_skips_when_in_progress(tmp_path, monkeypatch):
     calls = []
     work_id = "DELEGATE-2"
 
-    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -739,7 +743,7 @@ def test_triage_audit_delegation_skips_when_in_progress(tmp_path, monkeypatch):
     )
     sched.store.add_command(spec)
 
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     sched.start_command(spec)
 
@@ -772,7 +776,7 @@ def test_triage_audit_delegation_dispatches_intake_when_idle(tmp_path, monkeypat
         "- [ ] Webhook is sent"
     )
 
-    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -881,7 +885,7 @@ def test_triage_audit_delegation_dispatches_intake_when_idle(tmp_path, monkeypat
     )
     sched.store.add_command(spec)
 
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     sched.start_command(spec)
 
@@ -894,7 +898,7 @@ def test_triage_audit_delegation_dispatches_intake_when_idle(tmp_path, monkeypat
 def test_triage_audit_no_candidates_logs(tmp_path, monkeypatch, caplog):
     calls = []
 
-    monkeypatch.setattr(webhook, "send_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -916,7 +920,7 @@ def test_triage_audit_no_candidates_logs(tmp_path, monkeypatch, caplog):
     )
     sched.store.add_command(spec)
 
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     with caplog.at_level("INFO"):
         sched.start_command(spec)
@@ -1139,10 +1143,12 @@ def test_structured_audit_end_to_end(tmp_path, monkeypatch):
         "trailing agent noise\n"
     )
 
-    def capture_webhook(url, payload, **kwargs):
-        webhook_payloads.append(payload)
+    def capture_notify(title, body="", message_type="other", *, payload=None):
+        if payload is not None:
+            webhook_payloads.append(payload)
+        return True
 
-    monkeypatch.setattr(webhook, "send_webhook", capture_webhook)
+    monkeypatch.setattr(notifications, "notify", capture_notify)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -1206,7 +1212,7 @@ def test_structured_audit_end_to_end(tmp_path, monkeypatch):
     )
     sched.store.add_command(spec)
 
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     sched.start_command(spec)
 

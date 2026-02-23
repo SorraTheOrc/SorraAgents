@@ -21,7 +21,7 @@ from ampa.scheduler import (
     SchedulerStore,
     _content_hash,
 )
-from ampa import webhook as webhook_module
+from ampa import notifications as notifications_module
 from ampa.engine.core import EngineConfig
 from ampa.engine.dispatch import DispatchResult
 
@@ -163,12 +163,14 @@ def test_first_report_always_sent(tmp_path, monkeypatch):
     """AC (a): The very first delegation report should always be sent."""
     webhook_calls = []
 
-    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
-        webhook_calls.append({"url": url, "payload": payload, "type": message_type})
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        webhook_calls.append(
+            {"title": title, "body": body, "message_type": message_type}
+        )
         return 204
 
-    monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setattr(notifications_module, "notify", fake_notify)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     shell = _make_in_progress_shell("Found 1 in_progress:\n- SA-1 Busy item")
     sched = _make_scheduler(shell, tmp_path)
@@ -177,7 +179,7 @@ def test_first_report_always_sent(tmp_path, monkeypatch):
     sched.start_command(spec)
 
     # The pre-dispatch report webhook should have been sent
-    command_calls = [c for c in webhook_calls if c["type"] == "command"]
+    command_calls = [c for c in webhook_calls if c["message_type"] == "command"]
     assert len(command_calls) >= 1, "First report should be sent to Discord"
 
 
@@ -185,12 +187,14 @@ def test_identical_report_suppressed(tmp_path, monkeypatch):
     """AC (b): Identical consecutive reports should be suppressed."""
     webhook_calls = []
 
-    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
-        webhook_calls.append({"url": url, "payload": payload, "type": message_type})
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        webhook_calls.append(
+            {"title": title, "body": body, "message_type": message_type}
+        )
         return 204
 
-    monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setattr(notifications_module, "notify", fake_notify)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     shell = _make_in_progress_shell("Found 1 in_progress:\n- SA-1 Busy item")
     sched = _make_scheduler(shell, tmp_path)
@@ -198,12 +202,12 @@ def test_identical_report_suppressed(tmp_path, monkeypatch):
 
     # First run: should send
     sched.start_command(spec)
-    first_count = len([c for c in webhook_calls if c["type"] == "command"])
+    first_count = len([c for c in webhook_calls if c["message_type"] == "command"])
     assert first_count >= 1
 
     # Second run with identical content: should NOT send additional webhooks
     sched.start_command(spec)
-    second_count = len([c for c in webhook_calls if c["type"] == "command"])
+    second_count = len([c for c in webhook_calls if c["message_type"] == "command"])
     assert second_count == first_count, (
         f"Duplicate report should be suppressed; "
         f"expected {first_count} but got {second_count}"
@@ -214,19 +218,21 @@ def test_changed_report_sent(tmp_path, monkeypatch):
     """AC (c): Report with different content should be sent."""
     webhook_calls = []
 
-    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
-        webhook_calls.append({"url": url, "payload": payload, "type": message_type})
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        webhook_calls.append(
+            {"title": title, "body": body, "message_type": message_type}
+        )
         return 204
 
-    monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setattr(notifications_module, "notify", fake_notify)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     # First run: one in-progress item
     shell1 = _make_in_progress_shell("Found 1 in_progress:\n- SA-1 Busy item")
     sched = _make_scheduler(shell1, tmp_path)
     spec = _delegation_spec()
     sched.start_command(spec)
-    first_count = len([c for c in webhook_calls if c["type"] == "command"])
+    first_count = len([c for c in webhook_calls if c["message_type"] == "command"])
     assert first_count >= 1
 
     # Now change the in-progress items -> different report content
@@ -256,7 +262,7 @@ def test_changed_report_sent(tmp_path, monkeypatch):
     sched.run_shell = shell2
 
     sched.start_command(spec)
-    second_count = len([c for c in webhook_calls if c["type"] == "command"])
+    second_count = len([c for c in webhook_calls if c["message_type"] == "command"])
     assert second_count > first_count, "Changed report should be sent to Discord"
 
 
@@ -269,12 +275,12 @@ def test_idle_no_candidate_dedup(tmp_path, monkeypatch):
     """Idle 'no candidate' messages should be deduped on consecutive runs."""
     webhook_calls = []
 
-    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
-        webhook_calls.append({"type": message_type})
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        webhook_calls.append({"message_type": message_type})
         return 204
 
-    monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setattr(notifications_module, "notify", fake_notify)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
     def shell(cmd, **kwargs):
         s = cmd.strip()
@@ -303,11 +309,11 @@ def test_idle_no_candidate_dedup(tmp_path, monkeypatch):
 
     # First run
     sched.start_command(spec)
-    first_count = len([c for c in webhook_calls if c["type"] == "command"])
+    first_count = len([c for c in webhook_calls if c["message_type"] == "command"])
 
     # Second run with same state
     sched.start_command(spec)
-    second_count = len([c for c in webhook_calls if c["type"] == "command"])
+    second_count = len([c for c in webhook_calls if c["message_type"] == "command"])
 
     assert second_count == first_count, "Duplicate idle message should be suppressed"
 
@@ -321,12 +327,14 @@ def test_dispatch_notification_always_sent(tmp_path, monkeypatch):
     """Dispatch notifications (message_type='dispatch') should not be suppressed."""
     webhook_calls = []
 
-    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
-        webhook_calls.append({"type": message_type, "payload": payload})
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        webhook_calls.append(
+            {"title": title, "body": body, "message_type": message_type}
+        )
         return 204
 
-    monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    monkeypatch.setattr(notifications_module, "notify", fake_notify)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
     monkeypatch.delenv("AMPA_FALLBACK_MODE", raising=False)
 
     def shell(cmd, **kwargs):
@@ -401,10 +409,10 @@ def test_dispatch_notification_always_sent(tmp_path, monkeypatch):
     # Run twice; dispatch notification should appear both times.
     # The engine sends dispatch notifications with message_type="engine".
     sched.start_command(spec)
-    first_dispatch = len([c for c in webhook_calls if c["type"] == "engine"])
+    first_dispatch = len([c for c in webhook_calls if c["message_type"] == "engine"])
 
     sched.start_command(spec)
-    second_dispatch = len([c for c in webhook_calls if c["type"] == "engine"])
+    second_dispatch = len([c for c in webhook_calls if c["message_type"] == "engine"])
 
     assert first_dispatch >= 1, "Dispatch notification should be sent on first run"
     assert second_dispatch >= 2, (

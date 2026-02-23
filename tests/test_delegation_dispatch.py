@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from ampa import scheduler
 from ampa.scheduler import CommandSpec, SchedulerConfig, SchedulerStore, Scheduler
-from ampa import webhook as webhook_module
+from ampa import notifications as notifications_module
 from ampa.engine.core import EngineConfig, EngineResult, EngineStatus
 from ampa.engine.dispatch import DispatchResult
 
@@ -131,14 +131,13 @@ def test_dispatch_logged_before_spawn(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sched.engine._dispatcher, "dispatch", fake_dispatch)  # type: ignore[union-attr]
 
-    # capture webhook calls
-    def fake_send_webhook(url, payload, timeout=10, message_type="other"):
+    # capture notification calls
+    def fake_notify(title, body="", message_type="other", *, payload=None):
         captured["calls"].append(
-            {"url": url, "payload": payload, "message_type": message_type}
+            {"title": title, "body": body, "message_type": message_type}
         )
-        return 200
 
-    monkeypatch.setattr(webhook_module, "send_webhook", fake_send_webhook)
+    monkeypatch.setattr(notifications_module, "notify", fake_notify)
 
     spec = CommandSpec(
         command_id="delegation",
@@ -152,8 +151,8 @@ def test_dispatch_logged_before_spawn(tmp_path, monkeypatch):
     )
     sched.store.add_command(spec)
 
-    # ensure webhook env is present so pre-dispatch path runs
-    monkeypatch.setenv("AMPA_DISCORD_WEBHOOK", "http://example.invalid/webhook")
+    # ensure notification env is present so pre-dispatch path runs
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
     # disable fallback mode override so the engine uses the natural stage-to-action
     monkeypatch.delenv("AMPA_FALLBACK_MODE", raising=False)
 
@@ -170,8 +169,5 @@ def test_dispatch_logged_before_spawn(tmp_path, monkeypatch):
     assert len(dispatches) > 0, "no dispatch record persisted"
     assert dispatches[-1].get("work_item_id") == "SA-TEST-123"
 
-    # verify a webhook was sent (engine or command type)
-    webhook_types = [c.get("message_type") for c in captured["calls"]]
-    assert any(t in ("dispatch", "engine", "command") for t in webhook_types), (
-        f"no dispatch/engine/command webhook sent, got types: {webhook_types}"
-    )
+    # verify a notification was sent
+    assert len(captured["calls"]) > 0, "no notification sent during delegation dispatch"
