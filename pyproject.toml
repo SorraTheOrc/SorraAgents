@@ -10,6 +10,7 @@ dependencies = [
   "prometheus-client",
   "pyyaml>=6.0",
   "jsonschema>=4.0",
+  "discord.py>=2.0",
 ]
 
 [build-system]
