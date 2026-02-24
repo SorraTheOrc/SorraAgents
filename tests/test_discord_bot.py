@@ -15,7 +15,8 @@ import asyncio
 import json
 import os
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -23,7 +24,15 @@ import pytest
 # Import the module under test
 # ---------------------------------------------------------------------------
 
-from ampa.discord_bot import AMPABot, DEFAULT_SOCKET_PATH, MAX_MESSAGE_SIZE, main
+from ampa.discord_bot import (
+    AMPABot,
+    DEFAULT_SOCKET_PATH,
+    MAX_MESSAGE_SIZE,
+    _build_view,
+    _route_interaction,
+    _validate_components,
+    main,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -37,10 +46,13 @@ class FakeChannel:
     def __init__(self, name: str = "test-channel", channel_id: int = 12345):
         self.name = name
         self.id = channel_id
-        self.sent: List[str] = []
+        self.sent: List[Dict[str, Any]] = []
 
-    async def send(self, content: str) -> None:
-        self.sent.append(content)
+    async def send(self, content: str = "", **kwargs: Any) -> None:
+        record: Dict[str, Any] = {"content": content}
+        if "view" in kwargs:
+            record["view"] = kwargs["view"]
+        self.sent.append(record)
 
 
 async def _send_socket_messages(
@@ -108,7 +120,8 @@ class TestAMPABotSocketProtocol:
             )
             assert len(responses) == 1
             assert responses[0]["ok"] is True
-            assert fake_channel.sent == ["Hello from AMPA"]
+            assert len(fake_channel.sent) == 1
+            assert fake_channel.sent[0]["content"] == "Hello from AMPA"
 
         asyncio.run(_test())
 
@@ -123,7 +136,7 @@ class TestAMPABotSocketProtocol:
             assert len(responses) == 1
             assert responses[0]["ok"] is True
             assert len(fake_channel.sent) == 1
-            assert fake_channel.sent[0] == "# Test Title\n\nTest body text"
+            assert fake_channel.sent[0]["content"] == "# Test Title\n\nTest body text"
 
         asyncio.run(_test())
 
@@ -136,7 +149,7 @@ class TestAMPABotSocketProtocol:
                 bot, socket_path, [{"title": "Just a Title"}]
             )
             assert responses[0]["ok"] is True
-            assert fake_channel.sent == ["# Just a Title"]
+            assert fake_channel.sent[0]["content"] == "# Just a Title"
 
         asyncio.run(_test())
 
@@ -149,7 +162,7 @@ class TestAMPABotSocketProtocol:
                 bot, socket_path, [{"body": "Just a body"}]
             )
             assert responses[0]["ok"] is True
-            assert fake_channel.sent == ["Just a body"]
+            assert fake_channel.sent[0]["content"] == "Just a body"
 
         asyncio.run(_test())
 
@@ -203,7 +216,11 @@ class TestAMPABotSocketProtocol:
             responses = await _run_socket_test(bot, socket_path, messages)
             assert len(responses) == 3
             assert all(r["ok"] for r in responses)
-            assert fake_channel.sent == ["Message 1", "Message 2", "Message 3"]
+            assert [m["content"] for m in fake_channel.sent] == [
+                "Message 1",
+                "Message 2",
+                "Message 3",
+            ]
 
         asyncio.run(_test())
 
@@ -220,8 +237,8 @@ class TestAMPABotSocketProtocol:
             )
             assert responses[0]["ok"] is True
             assert len(fake_channel.sent) == 1
-            assert len(fake_channel.sent[0]) == 2000
-            assert fake_channel.sent[0].endswith("...")
+            assert len(fake_channel.sent[0]["content"]) == 2000
+            assert fake_channel.sent[0]["content"].endswith("...")
 
         asyncio.run(_test())
 
@@ -242,7 +259,7 @@ class TestAMPABotSocketProtocol:
         async def _test():
             channel = FakeChannel()
 
-            async def fail_send(content):
+            async def fail_send(content: str = "", **kwargs: Any) -> None:
                 raise RuntimeError("Discord API error")
 
             channel.send = fail_send
@@ -267,7 +284,7 @@ class TestSendToDiscord:
             bot._channel = ch
             result = await bot._send_to_discord("hello")
             assert result is True
-            assert ch.sent == ["hello"]
+            assert ch.sent == [{"content": "hello"}]
 
         asyncio.run(_test())
 
@@ -284,7 +301,7 @@ class TestSendToDiscord:
         async def _test():
             ch = FakeChannel()
 
-            async def raise_err(content):
+            async def raise_err(content: str = "", **kwargs: Any) -> None:
                 raise Exception("boom")
 
             ch.send = raise_err
@@ -462,3 +479,291 @@ class TestAMPABotInit:
         with pytest.raises(SystemExit) as exc_info:
             bot.run()
         assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: _validate_components
+# ---------------------------------------------------------------------------
+
+
+class TestValidateComponents:
+    def test_valid_single_button(self):
+        comps = [{"type": "button", "label": "Blue", "custom_id": "test_blue"}]
+        assert _validate_components(comps) is None
+
+    def test_valid_multiple_buttons(self):
+        comps = [
+            {
+                "type": "button",
+                "label": "Blue",
+                "custom_id": "test_blue",
+                "style": "primary",
+            },
+            {
+                "type": "button",
+                "label": "Red",
+                "custom_id": "test_red",
+                "style": "danger",
+            },
+        ]
+        assert _validate_components(comps) is None
+
+    def test_not_a_list(self):
+        err = _validate_components("not a list")
+        assert err is not None
+        assert "must be a list" in err
+
+    def test_element_not_a_dict(self):
+        err = _validate_components(["not a dict"])
+        assert err is not None
+        assert "must be an object" in err
+
+    def test_missing_required_fields(self):
+        # Missing label and custom_id
+        err = _validate_components([{"type": "button"}])
+        assert err is not None
+        assert "missing required fields" in err
+
+    def test_unsupported_type(self):
+        err = _validate_components(
+            [{"type": "select", "label": "Pick", "custom_id": "test_pick"}]
+        )
+        assert err is not None
+        assert "unsupported type" in err
+
+    def test_empty_list_is_valid(self):
+        assert _validate_components([]) is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: _route_interaction
+# ---------------------------------------------------------------------------
+
+
+class TestRouteInteraction:
+    def test_test_prefix_is_noop(self):
+        """test_* custom_ids are handled as no-ops (no exception, no side effect)."""
+        _route_interaction("test_blue", "user#1234", "2026-01-01T00:00:00Z")
+
+    def test_non_test_prefix_logs(self):
+        """Non-test custom_ids log an info message but don't raise."""
+        _route_interaction("survey_q1", "user#1234", "2026-01-01T00:00:00Z")
+
+
+# ---------------------------------------------------------------------------
+# Tests: _build_view (requires discord.py mock)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildView:
+    def test_build_view_creates_view_with_buttons(self):
+        """_build_view returns a discord.ui.View with the right number of items."""
+        # We need discord.py for this test — skip if not available.
+        try:
+            import discord  # noqa: F401
+        except ImportError:
+            pytest.skip("discord.py not installed")
+
+        # Populate the style map as run() would
+        global _BUTTON_STYLE_MAP
+        from ampa.discord_bot import _BUTTON_STYLE_MAP
+
+        # Temporarily set styles for test
+        original = dict(_BUTTON_STYLE_MAP)
+        try:
+            import ampa.discord_bot as db_mod
+
+            db_mod._BUTTON_STYLE_MAP = {
+                "primary": discord.ButtonStyle.primary,
+                "secondary": discord.ButtonStyle.secondary,
+                "success": discord.ButtonStyle.success,
+                "danger": discord.ButtonStyle.danger,
+            }
+            comps = [
+                {
+                    "type": "button",
+                    "label": "Blue",
+                    "custom_id": "test_blue",
+                    "style": "primary",
+                },
+                {
+                    "type": "button",
+                    "label": "Red",
+                    "custom_id": "test_red",
+                    "style": "danger",
+                },
+            ]
+            view = _build_view(comps)
+            assert view is not None
+            assert len(view.children) == 2
+        finally:
+            db_mod._BUTTON_STYLE_MAP = original
+
+    def test_build_view_default_style(self):
+        """Buttons without explicit style default to secondary."""
+        try:
+            import discord
+        except ImportError:
+            pytest.skip("discord.py not installed")
+
+        import ampa.discord_bot as db_mod
+
+        original = dict(db_mod._BUTTON_STYLE_MAP)
+        try:
+            db_mod._BUTTON_STYLE_MAP = {
+                "primary": discord.ButtonStyle.primary,
+                "secondary": discord.ButtonStyle.secondary,
+                "success": discord.ButtonStyle.success,
+                "danger": discord.ButtonStyle.danger,
+            }
+            comps = [{"type": "button", "label": "OK", "custom_id": "test_ok"}]
+            view = _build_view(comps)
+            assert len(view.children) == 1
+            assert view.children[0].style == discord.ButtonStyle.secondary
+        finally:
+            db_mod._BUTTON_STYLE_MAP = original
+
+
+# ---------------------------------------------------------------------------
+# Tests: Component socket protocol (end-to-end via socket)
+# ---------------------------------------------------------------------------
+
+
+class TestComponentSocketProtocol:
+    @pytest.fixture
+    def socket_path(self, tmp_path):
+        return str(tmp_path / "test_bot.sock")
+
+    @pytest.fixture
+    def bot(self, socket_path):
+        return AMPABot(
+            token="fake-token",
+            channel_id=12345,
+            socket_path=socket_path,
+        )
+
+    @pytest.fixture
+    def fake_channel(self):
+        return FakeChannel()
+
+    def test_message_with_valid_components(self, bot, socket_path, fake_channel):
+        """Message with valid components attaches a view to the send call."""
+        try:
+            import discord  # noqa: F401
+        except ImportError:
+            pytest.skip("discord.py not installed")
+
+        import ampa.discord_bot as db_mod
+
+        original = dict(db_mod._BUTTON_STYLE_MAP)
+        db_mod._BUTTON_STYLE_MAP = {
+            "primary": discord.ButtonStyle.primary,
+            "secondary": discord.ButtonStyle.secondary,
+            "success": discord.ButtonStyle.success,
+            "danger": discord.ButtonStyle.danger,
+        }
+
+        async def _test():
+            bot._channel = fake_channel
+            msg = {
+                "content": "Pick a colour",
+                "components": [
+                    {
+                        "type": "button",
+                        "label": "Blue",
+                        "custom_id": "test_blue",
+                        "style": "primary",
+                    },
+                    {
+                        "type": "button",
+                        "label": "Red",
+                        "custom_id": "test_red",
+                        "style": "danger",
+                    },
+                ],
+            }
+            responses = await _run_socket_test(bot, socket_path, [msg])
+            assert len(responses) == 1
+            assert responses[0]["ok"] is True
+            assert len(fake_channel.sent) == 1
+            assert fake_channel.sent[0]["content"] == "Pick a colour"
+            assert "view" in fake_channel.sent[0]
+            assert fake_channel.sent[0]["view"] is not None
+
+        try:
+            asyncio.run(_test())
+        finally:
+            db_mod._BUTTON_STYLE_MAP = original
+
+    def test_message_with_invalid_components_rejected(
+        self, bot, socket_path, fake_channel
+    ):
+        """Message with invalid components returns an error."""
+
+        async def _test():
+            bot._channel = fake_channel
+            msg = {
+                "content": "Bad components",
+                "components": [{"type": "button"}],  # missing required fields
+            }
+            responses = await _run_socket_test(bot, socket_path, [msg])
+            assert len(responses) == 1
+            assert responses[0]["ok"] is False
+            assert "missing required fields" in responses[0]["error"]
+            assert len(fake_channel.sent) == 0
+
+        asyncio.run(_test())
+
+    def test_message_without_components_sends_plain(
+        self, bot, socket_path, fake_channel
+    ):
+        """Message without components field sends as plain text (no view)."""
+
+        async def _test():
+            bot._channel = fake_channel
+            responses = await _run_socket_test(
+                bot, socket_path, [{"content": "Plain text"}]
+            )
+            assert responses[0]["ok"] is True
+            assert fake_channel.sent[0]["content"] == "Plain text"
+            assert "view" not in fake_channel.sent[0]
+
+        asyncio.run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Tests: _send_to_discord with view parameter
+# ---------------------------------------------------------------------------
+
+
+class TestSendToDiscordWithView:
+    def test_send_with_view(self):
+        """_send_to_discord passes view kwarg to channel.send."""
+
+        async def _test():
+            ch = FakeChannel()
+            bot = AMPABot(token="t", channel_id=1)
+            bot._channel = ch
+            mock_view = MagicMock()
+            result = await bot._send_to_discord("hello", view=mock_view)
+            assert result is True
+            assert len(ch.sent) == 1
+            assert ch.sent[0]["content"] == "hello"
+            assert ch.sent[0]["view"] is mock_view
+
+        asyncio.run(_test())
+
+    def test_send_without_view(self):
+        """_send_to_discord without view does not include view key."""
+
+        async def _test():
+            ch = FakeChannel()
+            bot = AMPABot(token="t", channel_id=1)
+            bot._channel = ch
+            result = await bot._send_to_discord("hello")
+            assert result is True
+            assert len(ch.sent) == 1
+            assert ch.sent[0]["content"] == "hello"
+            assert "view" not in ch.sent[0]
+
+        asyncio.run(_test())

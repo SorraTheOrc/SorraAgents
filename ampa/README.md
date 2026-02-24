@@ -388,3 +388,72 @@ except Exception as exc:
 When implementing new CLI commands, unhandled errors will automatically be
 caught and rendered by the `main()` entry point. For command-internal error
 paths (e.g. inside `_cli_run`), call the helper directly.
+
+
+## Interactive Buttons (MVP)
+
+The Discord bot supports interactive buttons via the component protocol extension.
+Messages sent through the Unix socket protocol may include an optional `components`
+list to attach `discord.ui.Button` elements to the message.
+
+### Component protocol
+
+Each component object must have `type`, `label`, and `custom_id` fields. `style` is
+optional and defaults to `secondary`. Supported styles: `primary`, `secondary`,
+`success`, `danger`.
+
+Example socket message with buttons:
+
+```json
+{
+  "content": "Pick a colour",
+  "components": [
+    {"type": "button", "label": "Blue", "style": "primary", "custom_id": "test_blue"},
+    {"type": "button", "label": "Red",  "style": "danger",  "custom_id": "test_red"}
+  ]
+}
+```
+
+When `components` is absent or empty, messages are sent as plain text (backward-compatible).
+
+### Notification API
+
+The `notify()` function in `ampa.notifications` accepts an optional `components`
+keyword argument:
+
+```python
+from ampa.notifications import notify
+
+notify(
+    title="Blue or Red?",
+    body="Pick a colour by clicking a button below.",
+    message_type="command",
+    components=[
+        {"type": "button", "label": "Blue", "style": "primary", "custom_id": "test_blue"},
+        {"type": "button", "label": "Red", "style": "danger", "custom_id": "test_red"},
+    ],
+)
+```
+
+When `payload` is supplied to `notify()`, the `components` keyword argument is ignored
+— include components directly in the payload dict instead.
+
+### Interaction handling
+
+Clicking a button triggers the `on_interaction` event in `discord_bot.py`. The handler:
+
+1. Filters to component-type (button) interactions only.
+2. Extracts `custom_id`, user identity, and UTC timestamp.
+3. Routes through `_route_interaction()` — no-op for `test_*` prefixes (MVP).
+4. Derives a human-readable label from the `custom_id` (e.g. `test_blue` -> `Blue`).
+5. Sends an in-channel acknowledgement: "You selected Blue, good luck. (clicked by user#1234, 2026-01-01T00:00:00Z)".
+
+### Scheduler test-button command
+
+The scheduler auto-registers a `test-button` command that fires every 15 minutes,
+sending a "Blue or Red?" message with two interactive buttons. This provides ongoing
+MVP validation of the interactive buttons feature. The command can be run manually:
+
+```bash
+python -m ampa.scheduler run-once test-button
+```

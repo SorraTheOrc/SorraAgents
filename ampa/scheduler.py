@@ -621,6 +621,11 @@ class Scheduler:
         # delegation timing.
         self._ensure_watchdog_command()
 
+        # Auto-register the interactive test-button command so a periodic
+        # "Blue or Red?" message with discord.ui.Button components is sent
+        # every 15 minutes (MVP validation for interactive buttons).
+        self._ensure_test_button_command()
+
         # --- Discord bot process supervision ---
         self._bot_process: Optional[subprocess.Popen] = None
         self._bot_consecutive_failures: int = 0
@@ -896,6 +901,7 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     _WATCHDOG_COMMAND_ID = "stale-delegation-watchdog"
+    _TEST_BUTTON_COMMAND_ID = "test-button"
 
     def _ensure_watchdog_command(self) -> None:
         """Register the stale-delegation-watchdog command if absent.
@@ -933,9 +939,80 @@ class Scheduler:
         except Exception:
             LOG.exception("Failed to auto-register watchdog command")
 
-    # ------------------------------------------------------------------
-    # Delegation — delegated to DelegationOrchestrator
-    # ------------------------------------------------------------------
+    def _ensure_test_button_command(self) -> None:
+        """Register the interactive test-button command if absent.
+
+        The test-button command sends a periodic "Blue or Red?" message with
+        interactive ``discord.ui.Button`` components every 15 minutes.  This
+        is the MVP validation for the interactive-buttons feature — clicking
+        a button produces an in-channel acknowledgement with clicker identity
+        and timestamp.
+
+        Only registers when ``AMPA_DISCORD_BOT_TOKEN`` is set — without a bot
+        the buttons cannot be rendered or clicked, so there is no point
+        scheduling the command.
+        """
+        if not os.getenv("AMPA_DISCORD_BOT_TOKEN"):
+            return
+        try:
+            existing = self.store.list_commands()
+            for cmd in existing:
+                if cmd.command_id == self._TEST_BUTTON_COMMAND_ID:
+                    LOG.debug(
+                        "Test-button command already registered: %s",
+                        self._TEST_BUTTON_COMMAND_ID,
+                    )
+                    return
+            test_button_spec = CommandSpec(
+                command_id=self._TEST_BUTTON_COMMAND_ID,
+                command="echo test-button",  # placeholder; actual work is in start_command
+                requires_llm=False,
+                frequency_minutes=15,
+                priority=0,
+                metadata={},
+                title="Interactive Test Button",
+                max_runtime_minutes=1,
+                command_type="test-button",
+            )
+            self.store.add_command(test_button_spec)
+            LOG.info(
+                "Auto-registered test-button command: %s (every %dm)",
+                self._TEST_BUTTON_COMMAND_ID,
+                test_button_spec.frequency_minutes,
+            )
+        except Exception:
+            LOG.exception("Failed to auto-register test-button command")
+
+    def _send_test_button_message(self) -> None:
+        """Send the "Blue or Red?" test message with interactive buttons.
+
+        Called by ``start_command`` when the test-button command type fires.
+        The message includes two buttons (Blue / Red) that trigger the
+        ``on_interaction`` handler in ``discord_bot.py``, which routes
+        through ``_route_interaction()`` (no-op for ``test_*`` prefixes)
+        and sends an acknowledgement with the clicker's identity and
+        timestamp.
+        """
+        components = [
+            {
+                "type": "button",
+                "label": "Blue",
+                "style": "primary",
+                "custom_id": "test_blue",
+            },
+            {
+                "type": "button",
+                "label": "Red",
+                "style": "danger",
+                "custom_id": "test_red",
+            },
+        ]
+        notifications_module.notify(
+            title="Blue or Red?",
+            body="Pick a colour by clicking a button below.",
+            message_type="command",
+            components=components,
+        )
 
     def _sync_orchestrator(self) -> None:
         """Keep the delegation orchestrator in sync with mutable scheduler state.
@@ -1141,6 +1218,12 @@ class Scheduler:
                     )
             except Exception:
                 LOG.exception("Stale delegation watchdog failed")
+            return run
+        if spec.command_type == "test-button":
+            try:
+                self._send_test_button_message()
+            except Exception:
+                LOG.exception("Test-button message failed")
             return run
 
         # always post the generic discord message afterwards

@@ -429,3 +429,144 @@ class TestNotify:
                 await srv.stop()
 
         asyncio.run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Tests: notify with components parameter
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyWithComponents:
+    def test_notify_with_components_sends_components(self, tmp_path, monkeypatch):
+        """Components list is included in the socket message."""
+        sock = str(tmp_path / "test.sock")
+        monkeypatch.setenv("AMPA_BOT_SOCKET_PATH", sock)
+        state_file = str(tmp_path / "state.json")
+        monkeypatch.setenv("AMPA_STATE_FILE", state_file)
+        dl_file = str(tmp_path / "dead.log")
+        monkeypatch.setenv("AMPA_DEADLETTER_FILE", dl_file)
+
+        async def _test():
+            srv = _FakeSocketServer(sock)
+            await srv.start()
+            try:
+                components = [
+                    {
+                        "type": "button",
+                        "label": "Blue",
+                        "custom_id": "test_blue",
+                        "style": "primary",
+                    },
+                    {
+                        "type": "button",
+                        "label": "Red",
+                        "custom_id": "test_red",
+                        "style": "danger",
+                    },
+                ]
+                result = await _run_sync_in_async(
+                    lambda: notify(
+                        "Pick a colour",
+                        "Choose wisely",
+                        "command",
+                        components=components,
+                    )
+                )
+                assert result is True
+                assert len(srv.received) == 1
+                msg = srv.received[0]
+                assert msg["content"] == "# Pick a colour\n\nChoose wisely"
+                assert "components" in msg
+                assert len(msg["components"]) == 2
+                assert msg["components"][0]["label"] == "Blue"
+                assert msg["components"][1]["label"] == "Red"
+            finally:
+                await srv.stop()
+
+        asyncio.run(_test())
+
+    def test_notify_without_components_omits_key(self, tmp_path, monkeypatch):
+        """When no components are provided, the key is absent from the message."""
+        sock = str(tmp_path / "test.sock")
+        monkeypatch.setenv("AMPA_BOT_SOCKET_PATH", sock)
+        state_file = str(tmp_path / "state.json")
+        monkeypatch.setenv("AMPA_STATE_FILE", state_file)
+
+        async def _test():
+            srv = _FakeSocketServer(sock)
+            await srv.start()
+            try:
+                result = await _run_sync_in_async(
+                    notify, "No buttons", "Plain message", "command"
+                )
+                assert result is True
+                assert len(srv.received) == 1
+                msg = srv.received[0]
+                assert "components" not in msg
+            finally:
+                await srv.stop()
+
+        asyncio.run(_test())
+
+    def test_notify_payload_ignores_components_param(self, tmp_path, monkeypatch):
+        """When payload is provided, the components kwarg is ignored."""
+        sock = str(tmp_path / "test.sock")
+        monkeypatch.setenv("AMPA_BOT_SOCKET_PATH", sock)
+        state_file = str(tmp_path / "state.json")
+        monkeypatch.setenv("AMPA_STATE_FILE", state_file)
+
+        async def _test():
+            srv = _FakeSocketServer(sock)
+            await srv.start()
+            try:
+                payload = {"content": "pre-built"}
+                components = [
+                    {"type": "button", "label": "Ignored", "custom_id": "test_ignored"},
+                ]
+                result = await _run_sync_in_async(
+                    lambda: notify(
+                        "ignored",
+                        "ignored",
+                        payload=payload,
+                        components=components,
+                    )
+                )
+                assert result is True
+                msg = srv.received[0]
+                assert msg["content"] == "pre-built"
+                # components kwarg should be ignored when payload is provided
+                assert "components" not in msg
+            finally:
+                await srv.stop()
+
+        asyncio.run(_test())
+
+    def test_notify_payload_with_embedded_components(self, tmp_path, monkeypatch):
+        """Components embedded in a payload dict are preserved."""
+        sock = str(tmp_path / "test.sock")
+        monkeypatch.setenv("AMPA_BOT_SOCKET_PATH", sock)
+        state_file = str(tmp_path / "state.json")
+        monkeypatch.setenv("AMPA_STATE_FILE", state_file)
+
+        async def _test():
+            srv = _FakeSocketServer(sock)
+            await srv.start()
+            try:
+                payload = {
+                    "content": "pre-built with buttons",
+                    "components": [
+                        {"type": "button", "label": "OK", "custom_id": "test_ok"},
+                    ],
+                }
+                result = await _run_sync_in_async(
+                    lambda: notify("ignored", "ignored", payload=payload)
+                )
+                assert result is True
+                msg = srv.received[0]
+                assert msg["content"] == "pre-built with buttons"
+                assert "components" in msg
+                assert msg["components"][0]["label"] == "OK"
+            finally:
+                await srv.stop()
+
+        asyncio.run(_test())
