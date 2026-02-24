@@ -120,6 +120,42 @@ def _from_iso(value: Optional[str]) -> Optional[dt.datetime]:
 
 
 # ---------------------------------------------------------------------------
+# GitHub issue URL helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_github_repo(command_cwd: Optional[str] = None) -> Optional[str]:
+    """Return the ``owner/repo`` slug from the worklog config, or ``None``."""
+    try:
+        cfg_path = os.path.join(command_cwd or ".", ".worklog", "config.yaml")
+        if not os.path.isfile(cfg_path):
+            return None
+        with open(cfg_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("githubRepo:"):
+                    value = line.split(":", 1)[1].strip()
+                    if value and value != "(not set)":
+                        return value
+    except Exception:
+        LOG.debug("Failed to read githubRepo from worklog config")
+    return None
+
+
+def _build_github_issue_url(
+    repo_slug: Optional[str], issue_number: Any
+) -> Optional[str]:
+    """Build ``https://github.com/<owner>/<repo>/issues/<number>``."""
+    if not repo_slug or not issue_number:
+        return None
+    try:
+        num = int(issue_number)
+    except (TypeError, ValueError):
+        return None
+    return f"https://github.com/{repo_slug}/issues/{num}"
+
+
+# ---------------------------------------------------------------------------
 # Discord formatting helpers — canonical implementations live in ampa.delegation.
 # ---------------------------------------------------------------------------
 from .delegation import (  # noqa: E402
@@ -510,15 +546,36 @@ class TriageAuditRunner:
                 except Exception:
                     LOG.exception("Failed to discover PR URL for work item %s", work_id)
 
+                # Build GitHub issue URL from work item metadata
+                github_issue_url: Optional[str] = None
+                try:
+                    wi_data = wi_pre
+                    if isinstance(wi_pre, dict) and "workItem" in wi_pre:
+                        wi_data = wi_pre["workItem"]
+                    if isinstance(wi_data, dict):
+                        issue_num = wi_data.get("githubIssueNumber")
+                        if issue_num:
+                            repo_slug = _get_github_repo(self.command_cwd)
+                            github_issue_url = _build_github_issue_url(
+                                repo_slug, issue_num
+                            )
+                except Exception:
+                    LOG.debug("Failed to build GitHub issue URL for %s", work_id)
+
                 try:
                     heading_title = f"Triage Audit — {title}"
-                    extra = [{"name": "Summary", "value": summary_text}]
+                    extra: List[Dict[str, Any]] = [
+                        {"name": "Work Item", "value": work_id},
+                    ]
+                    if github_issue_url:
+                        extra.append({"name": "GitHub", "value": github_issue_url})
+                    extra.append({"name": "Summary", "value": summary_text})
                     if pr_url:
                         extra.append({"name": "PR", "value": pr_url})
                     payload = notifications_module.build_payload(
                         hostname=os.uname().nodename,
                         timestamp_iso=_utc_now().isoformat(),
-                        work_item_id=None,
+                        work_item_id=work_id,
                         extra_fields=extra,
                         title=heading_title,
                     )

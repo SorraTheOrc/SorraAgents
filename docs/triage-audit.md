@@ -84,13 +84,11 @@ The `_extract_audit_report()` function in `triage_audit.py` extracts content bet
 ## Output locations and formats
 
 - **Worklog comment**: A comment is added with heading `# AMPA Audit Result` containing the extracted structured report (between the delimiter markers). This heading is also used for cooldown detection.
-- **Discord summary**: The `## Summary` section is extracted from the structured report and sent to Discord. If no `## Summary` heading is found, the legacy regex fallback (`_extract_summary()`) is used. The message format:
-
-```
-# /audit <work_id> <work-item-title>
-
-<summary text>
-```
+- **Discord summary**: The `## Summary` section is extracted from the structured report and sent to Discord. If no `## Summary` heading is found, the legacy regex fallback (`_extract_summary()`) is used. The notification includes extra fields:
+  - **Work Item**: The work item ID (always present).
+  - **GitHub**: A link to the corresponding GitHub issue (`https://github.com/<owner>/<repo>/issues/<number>`), included when `githubIssueNumber` is available on the work item and `githubRepo` is configured in `.worklog/config.yaml`.
+  - **Summary**: The extracted summary text.
+  - **PR**: A link to the associated pull request, included when a PR URL is found in the work item description or comments.
 
 ## Configuration and metadata
 

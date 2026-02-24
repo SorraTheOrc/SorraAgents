@@ -520,10 +520,19 @@ def test_triage_audit_audit_only_no_templates(tmp_path, monkeypatch):
 
 
 def test_triage_audit_discord_summary_includes_body(tmp_path, monkeypatch):
-    """Verify Discord summary includes a body line, not just heading."""
+    """Verify Discord summary includes a body line, not just heading.
+
+    Also verifies that the Work Item ID and GitHub issue URL are included
+    as extra fields in the Discord notification content.
+    """
     calls = []
     work_id = "DISCORD-SUMMARY-1"
     captured = {}
+
+    # Create .worklog/config.yaml so _get_github_repo() finds a repo slug
+    wl_dir = tmp_path / ".worklog"
+    wl_dir.mkdir(parents=True, exist_ok=True)
+    (wl_dir / "config.yaml").write_text("githubRepo: TestOwner/TestRepo\n")
 
     def fake_notify(title, body="", message_type="other", *, payload=None):
         captured["title"] = title
@@ -566,8 +575,12 @@ def test_triage_audit_discord_summary_includes_body(tmp_path, monkeypatch):
                 args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
             )
         if cmd.strip().startswith(f"wl show {work_id}"):
+            # Return nested workItem with githubIssueNumber
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({}), stderr=""
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps({"workItem": {"githubIssueNumber": 42}}),
+                stderr="",
             )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
@@ -591,6 +604,9 @@ def test_triage_audit_discord_summary_includes_body(tmp_path, monkeypatch):
     content = captured.get("payload", {}).get("content", "")
     assert "# Triage Audit — Discord summary item" in content
     assert "Summary: A short summary for Discord." in content
+    # New: Work Item ID and GitHub issue URL in extra fields
+    assert f"Work Item: {work_id}" in content
+    assert "GitHub: https://github.com/TestOwner/TestRepo/issues/42" in content
 
 
 def test_triage_audit_no_candidates_logs(tmp_path, monkeypatch, caplog):
@@ -640,6 +656,85 @@ def test_scheduler_run_once_unknown_command(tmp_path, monkeypatch, capsys):
 
     assert exit_code == 2
     assert "Unknown command id" in out
+
+
+# ---------------------------------------------------------------------------
+# _get_github_repo / _build_github_issue_url tests
+# ---------------------------------------------------------------------------
+from ampa.triage_audit import _get_github_repo, _build_github_issue_url
+
+
+def test_get_github_repo_happy_path(tmp_path):
+    """Reads githubRepo from .worklog/config.yaml."""
+    wl_dir = tmp_path / ".worklog"
+    wl_dir.mkdir()
+    (wl_dir / "config.yaml").write_text("githubRepo: MyOrg/MyRepo\n")
+    assert _get_github_repo(str(tmp_path)) == "MyOrg/MyRepo"
+
+
+def test_get_github_repo_missing_file(tmp_path):
+    """Returns None when config.yaml does not exist."""
+    assert _get_github_repo(str(tmp_path)) is None
+
+
+def test_get_github_repo_missing_key(tmp_path):
+    """Returns None when githubRepo key is absent."""
+    wl_dir = tmp_path / ".worklog"
+    wl_dir.mkdir()
+    (wl_dir / "config.yaml").write_text("someOtherKey: value\n")
+    assert _get_github_repo(str(tmp_path)) is None
+
+
+def test_get_github_repo_not_set(tmp_path):
+    """Returns None when githubRepo is '(not set)'."""
+    wl_dir = tmp_path / ".worklog"
+    wl_dir.mkdir()
+    (wl_dir / "config.yaml").write_text("githubRepo: (not set)\n")
+    assert _get_github_repo(str(tmp_path)) is None
+
+
+def test_get_github_repo_none_cwd():
+    """Returns None gracefully when command_cwd is None and ./worklog doesn't exist."""
+    # This should not raise — it should return None
+    result = _get_github_repo(None)
+    # Result depends on whether ./.worklog/config.yaml exists in the cwd
+    assert result is None or isinstance(result, str)
+
+
+def test_build_github_issue_url_happy_path():
+    """Builds correct URL from repo slug and issue number."""
+    assert (
+        _build_github_issue_url("MyOrg/MyRepo", 42)
+        == "https://github.com/MyOrg/MyRepo/issues/42"
+    )
+
+
+def test_build_github_issue_url_string_number():
+    """Accepts issue number as a string."""
+    assert (
+        _build_github_issue_url("MyOrg/MyRepo", "7")
+        == "https://github.com/MyOrg/MyRepo/issues/7"
+    )
+
+
+def test_build_github_issue_url_none_repo():
+    """Returns None when repo_slug is None."""
+    assert _build_github_issue_url(None, 42) is None
+
+
+def test_build_github_issue_url_none_number():
+    """Returns None when issue_number is None."""
+    assert _build_github_issue_url("MyOrg/MyRepo", None) is None
+
+
+def test_build_github_issue_url_invalid_number():
+    """Returns None when issue_number is not a valid integer."""
+    assert _build_github_issue_url("MyOrg/MyRepo", "not-a-number") is None
+
+
+def test_build_github_issue_url_zero():
+    """Returns None when issue_number is 0 (falsy)."""
+    assert _build_github_issue_url("MyOrg/MyRepo", 0) is None
 
 
 # ---------------------------------------------------------------------------
