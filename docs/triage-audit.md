@@ -36,7 +36,6 @@ References:
     - If the report is short enough, embed it directly in the comment.
     - If the report is too large, write it to a temp file and post a comment that references the file path.
     - Temp files used for comments are removed after posting.
-    - If `audit_only` is enabled, delegation is skipped.
 
 6. **Auto-complete check (optional)**
    The scheduler will attempt to move the work item to `completed` and `in_review` when:
@@ -45,7 +44,6 @@ References:
    - The update command includes `--needs-producer-review true` to flag the item for producer review.
 
     If a GitHub PR URL is found, the scheduler can verify merge status with `gh pr view`.
-    - Skipped when `audit_only` is enabled.
 
 ## Cooldown logic
 
@@ -105,7 +103,6 @@ Per-command metadata (from the scheduler command spec):
 - `audit_cooldown_hours_in_review` (optional): Override cooldown hours for items with `in_review` status. Falls back to `audit_cooldown_hours` if not set.
 - `truncate_chars` (default: 65536): Max chars to inline in Worklog comments before writing to a temp file.
 - `verify_pr_with_gh` (default: true): Overrides `AMPA_VERIFY_PR_WITH_GH` when present.
-- `audit_only` (default: false): When true, do not update work item stage/status and skip delegation.
 
 ## Notes
 

@@ -120,22 +120,12 @@ def _from_iso(value: Optional[str]) -> Optional[dt.datetime]:
 
 
 # ---------------------------------------------------------------------------
-# Delegation helpers — canonical implementations live in ampa.delegation.
+# Discord formatting helpers — canonical implementations live in ampa.delegation.
 # ---------------------------------------------------------------------------
 from .delegation import (  # noqa: E402
     _summarize_for_discord,
     _trim_text,
-    _build_delegation_report,
-    DelegationOrchestrator,
 )
-
-
-def _bool_meta(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 class TriageAuditRunner:
@@ -144,12 +134,10 @@ class TriageAuditRunner:
         run_shell: "Callable[..., subprocess.CompletedProcess]",
         command_cwd: str,
         store: Any,
-        engine: Optional[Any] = None,
     ) -> None:
         self.run_shell = run_shell
         self.command_cwd = command_cwd
         self.store = store
-        self.engine = engine
 
     def run(self, spec: Any, run: Any, output: Optional[str]) -> bool:
         # This method is intentionally a close copy of the original
@@ -163,8 +151,6 @@ class TriageAuditRunner:
             truncate_chars = int(spec.metadata.get("truncate_chars", 65536))
         except Exception:
             truncate_chars = 65536
-
-        audit_only = _bool_meta(spec.metadata.get("audit_only"))
 
         try:
             _audit_timeout = int(
@@ -400,8 +386,6 @@ class TriageAuditRunner:
             title = selected.get("title") or selected.get("name") or "(no title)"
             LOG.info("Selected triage candidate %s — %s", work_id, title)
 
-            delegation_result: Optional[Dict[str, Any]] = None
-
             audit_cmd = f'opencode run "/audit {work_id}"'
             LOG.info("Running audit command: %s", audit_cmd)
             proc_audit = _call(audit_cmd)
@@ -419,35 +403,6 @@ class TriageAuditRunner:
                 len(proc_audit.stdout or ""),
                 len(proc_audit.stderr or ""),
             )
-
-            try:
-                old_notifier = None
-                try:
-                    if (
-                        hasattr(self, "engine")
-                        and getattr(self.engine, "_notifier", None) is not None
-                    ):
-                        old_notifier = self.engine._notifier
-                        from ampa.engine.core import NullNotificationSender
-
-                        self.engine._notifier = NullNotificationSender()
-                except Exception:
-                    old_notifier = None
-
-                delegation_result = self._run_delegation_from_runner(
-                    audit_only=audit_only, spec=spec
-                )
-            except Exception:
-                LOG.exception("Delegation run failed during triage audit")
-                delegation_result = None
-            finally:
-                try:
-                    if old_notifier is not None and hasattr(self, "engine"):
-                        self.engine._notifier = old_notifier
-                except Exception:
-                    LOG.exception(
-                        "Failed to restore engine notifier after triage delegation"
-                    )
 
             def _extract_summary(text: str) -> str:
                 if not text:
@@ -484,17 +439,6 @@ class TriageAuditRunner:
                     summary_text = _extract_summary(audit_out or "")
                 if not summary_text:
                     summary_text = f"{work_id} — {title} | exit={exit_code}"
-                if delegation_result:
-                    try:
-                        dn = (
-                            delegation_result.get("note")
-                            if isinstance(delegation_result, dict)
-                            else str(delegation_result)
-                        )
-                    except Exception:
-                        dn = None
-                    if dn:
-                        summary_text = f"{summary_text}\n{dn}"
                 try:
                     summary_text = _summarize_for_discord(summary_text, max_chars=1000)
                 except Exception:
@@ -569,28 +513,6 @@ class TriageAuditRunner:
                 try:
                     heading_title = f"Triage Audit — {title}"
                     extra = [{"name": "Summary", "value": summary_text}]
-                    include_preview = False
-                    try:
-                        include_preview = bool(
-                            (spec.metadata or {}).get("include_delegation_preview")
-                        )
-                    except Exception:
-                        include_preview = False
-                    if include_preview:
-                        try:
-                            delegation_preview = (
-                                self._run_delegation_report_for_preview(spec)
-                            )
-                        except Exception:
-                            delegation_preview = None
-                        extra.append(
-                            {
-                                "name": "Delegation",
-                                "value": (delegation_preview or "(none)"),
-                            }
-                        )
-                    else:
-                        extra.append({"name": "Delegation", "value": "(skipped)"})
                     if pr_url:
                         extra.append({"name": "PR", "value": pr_url})
                     payload = notifications_module.build_payload(
@@ -801,17 +723,6 @@ class TriageAuditRunner:
             except Exception:
                 LOG.exception("Failed to persist last_audit_at_by_item for %s", work_id)
 
-            if audit_only:
-                return True
-
-            try:
-                delegation_result = self._run_delegation_from_runner(
-                    audit_only=False, spec=spec
-                )
-                LOG.info("Triage-initiated delegation result: %s", delegation_result)
-            except Exception:
-                LOG.exception("Failed to run delegation from triage")
-
             try:
                 proc_show = _call(f"wl show {work_id} --json")
                 if proc_show.returncode == 0 and proc_show.stdout:
@@ -964,57 +875,3 @@ class TriageAuditRunner:
             LOG.exception("Error during triage audit processing")
             return False
         return True
-
-    # helper to delegate to DelegationOrchestrator when available
-    def _run_delegation_from_runner(
-        self, *, audit_only: bool, spec: Any
-    ) -> Optional[Dict[str, Any]]:
-        """Delegate idle-delegation logic to ``DelegationOrchestrator``.
-
-        Falls back to a minimal engine-only path when the orchestrator cannot
-        be constructed (e.g. missing dependencies in test environments).
-        """
-        if audit_only:
-            return {
-                "note": "Delegation: skipped (audit_only)",
-                "dispatched": False,
-                "rejected": [],
-                "idle_notification_sent": False,
-            }
-        try:
-            if self.engine is None:
-                return None
-            orchestrator = DelegationOrchestrator(
-                store=self.store,
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-                engine=self.engine,
-                candidate_selector=None,
-                notifications_module=notifications_module,
-                selection_module=None,
-            )
-            return orchestrator.run_idle_delegation(audit_only=audit_only, spec=spec)
-        except Exception:
-            LOG.exception("_run_delegation_from_runner failed")
-            return None
-
-    def _run_delegation_report_for_preview(self, spec: Any) -> Optional[str]:
-        """Build a delegation report for embedding in triage Discord messages.
-
-        Delegates to ``DelegationOrchestrator.run_delegation_report()`` which
-        contains the canonical report-building logic.
-        """
-        try:
-            orchestrator = DelegationOrchestrator(
-                store=self.store,
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-                engine=self.engine,
-                candidate_selector=None,
-                notifications_module=notifications_module,
-                selection_module=None,
-            )
-            return orchestrator.run_delegation_report(spec)
-        except Exception:
-            LOG.exception("Failed to build delegation preview")
-            return None
