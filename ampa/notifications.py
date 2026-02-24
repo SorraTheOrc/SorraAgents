@@ -67,10 +67,22 @@ def _state_file_path() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _default_deadletter_path() -> str:
+    """Return the default dead-letter file path.
+
+    Uses ``<cwd>/.worklog/ampa/deadletter.log`` so the file is project-local,
+    discoverable alongside other AMPA state files, and writable by non-root
+    users.  The daemon is always spawned with ``cwd = projectRoot`` (see
+    ampa.mjs) so ``os.getcwd()`` gives the correct project root.
+    """
+    return os.path.join(os.getcwd(), ".worklog", "ampa", "deadletter.log")
+
+
 def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
     """Persist a failed notification so it is not silently lost.
 
-    Writes to ``AMPA_DEADLETTER_FILE`` (default ``/var/log/ampa_deadletter.log``).
+    Writes to ``AMPA_DEADLETTER_FILE`` (default
+    ``<projectRoot>/.worklog/ampa/deadletter.log``).
     """
     try:
         try:
@@ -87,7 +99,7 @@ def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
             "reason": reason,
             "payload": payload,
         }
-        dl_file = os.getenv("AMPA_DEADLETTER_FILE", "/var/log/ampa_deadletter.log")
+        dl_file = os.getenv("AMPA_DEADLETTER_FILE") or _default_deadletter_path()
         try:
             parent = os.path.dirname(dl_file)
             if parent and not os.path.isdir(parent):

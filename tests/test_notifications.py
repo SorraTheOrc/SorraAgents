@@ -19,6 +19,7 @@ import pytest
 
 from ampa.notifications import (
     DEFAULT_SOCKET_PATH,
+    _default_deadletter_path,
     _read_state,
     _send_via_socket,
     _state_file_path,
@@ -196,6 +197,33 @@ class TestDeadLetter:
         monkeypatch.setenv("AMPA_DEADLETTER_FILE", dl_file)
         dead_letter({"content": "test"})
         assert os.path.exists(dl_file)
+
+    def test_default_path_is_project_local(self, monkeypatch):
+        """Default dead-letter path should be under .worklog/ampa/."""
+        monkeypatch.delenv("AMPA_DEADLETTER_FILE", raising=False)
+        path = _default_deadletter_path()
+        assert path.endswith(os.path.join(".worklog", "ampa", "deadletter.log"))
+
+    def test_writes_to_default_path_without_env_var(self, tmp_path, monkeypatch):
+        """Dead-letter writes succeed on a fresh install with no env var."""
+        monkeypatch.delenv("AMPA_DEADLETTER_FILE", raising=False)
+        # Point cwd at tmp_path so the default path is writable.
+        monkeypatch.chdir(tmp_path)
+        dead_letter({"content": "default-path-test"}, reason="test")
+        expected = tmp_path / ".worklog" / "ampa" / "deadletter.log"
+        assert expected.exists()
+        record = json.loads(expected.read_text().strip())
+        assert record["reason"] == "test"
+        assert record["payload"]["content"] == "default-path-test"
+
+    def test_env_var_override_still_works(self, tmp_path, monkeypatch):
+        """AMPA_DEADLETTER_FILE env var overrides the default path."""
+        custom_file = str(tmp_path / "custom_dead.log")
+        monkeypatch.setenv("AMPA_DEADLETTER_FILE", custom_file)
+        dead_letter({"content": "override"}, reason="custom")
+        assert os.path.exists(custom_file)
+        record = json.loads(open(custom_file).readline())
+        assert record["payload"]["content"] == "override"
 
 
 # ---------------------------------------------------------------------------
