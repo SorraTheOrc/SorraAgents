@@ -344,6 +344,17 @@ class Engine:
                 timestamp=ts,
             )
 
+        if self._config.fallback_mode == "discuss-options":
+            LOG.info(
+                "Fallback mode is 'discuss-options' (not yet implemented); "
+                "falling back to hold — skipping delegation"
+            )
+            return EngineResult(
+                status=EngineStatus.SKIPPED,
+                reason="Fallback mode is 'discuss-options' (deferred to hold)",
+                timestamp=ts,
+            )
+
         # --- Candidate selection ---
         if work_item_id is None:
             candidate_result = self._selector.select()

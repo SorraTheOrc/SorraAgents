@@ -35,12 +35,12 @@ from .notifications import (
     _read_state,
     _write_state,
 )
-from .metrics import (
+from .server import (
     ampa_heartbeat_failure_total,
     ampa_heartbeat_sent_total,
     ampa_last_heartbeat_timestamp_seconds,
 )
-from .metrics import start_metrics_server
+from .server import start_metrics_server
 
 
 def _project_ampa_dir() -> str:
