@@ -52,11 +52,28 @@ def normalize_mode(value: Optional[str]) -> str:
 
 
 def config_path(tool_output_dir: Optional[str] = None) -> str:
+    """Return the path to the fallback config file.
+
+    Resolution order:
+    1. ``AMPA_FALLBACK_CONFIG_FILE`` env var (explicit override, always wins).
+    2. ``.worklog/ampa/fallback_config.json`` (new default location).
+    3. ``<tool_output_dir>/ampa_fallback_config.json`` (legacy fallback — used
+       only when the new-location file does not exist but the legacy one does).
+    """
     override = os.getenv("AMPA_FALLBACK_CONFIG_FILE")
     if override:
         return override
+    # New default: .worklog/ampa/fallback_config.json (project-local)
+    new_default = os.path.join(".worklog", "ampa", "fallback_config.json")
+    if os.path.exists(new_default):
+        return new_default
+    # Legacy fallback: check old location
     base = tool_output_dir or _tool_output_dir()
-    return os.path.join(base, "ampa_fallback_config.json")
+    legacy = os.path.join(base, "ampa_fallback_config.json")
+    if os.path.exists(legacy):
+        return legacy
+    # Neither exists — return new default so new configs are created there
+    return new_default
 
 
 def load_config(path: Optional[str] = None) -> Dict[str, Any]:

@@ -314,8 +314,8 @@ Configuration
 
 - `AMPA_TOOL_OUTPUT_DIR` — directory where pending prompt and session files are written (defaults to temp dir)
 - `AMPA_RESUME_TIMEOUT_SECONDS` — resume timeout in seconds (default 86400 — 24h)
-- `AMPA_FALLBACK_CONFIG_FILE` — path to JSON config for fallback behaviour (defaults to `$AMPA_TOOL_OUTPUT_DIR/ampa_fallback_config.json`)
-- `AMPA_FALLBACK_MODE` — overrides all config values with a single fallback mode (`hold`, `auto-accept`, `auto-decline`)
+- `AMPA_FALLBACK_CONFIG_FILE` — path to JSON config for fallback behaviour (defaults to `.worklog/ampa/fallback_config.json`; falls back to legacy `$AMPA_TOOL_OUTPUT_DIR/ampa_fallback_config.json` if it exists)
+- `AMPA_FALLBACK_MODE` — overrides all config values with a single fallback mode (`hold`, `auto-accept`, `auto-decline`, `accept-recommendation`, `discuss-options`)
 
 Fallback config schema
 ----------------------
@@ -325,7 +325,7 @@ supports per-project overrides and a safe default for public projects (sessions
 without a project id). If no config file exists and no env override is set, the
 delegation scheduler keeps legacy behavior (auto-accept) until a config is saved.
 
-Example:
+Example (simple — one mode per project):
 
 ```json
 {
@@ -338,26 +338,52 @@ Example:
 }
 ```
 
+Example (per-decision overrides):
+
+```json
+{
+  "default": "hold",
+  "public_default": "hold",
+  "projects": {
+    "internal-proj": {
+      "mode": "auto-accept",
+      "overrides": {
+        "run-tests": "auto-accept",
+        "open-pr": "discuss-options",
+        "deploy": "hold"
+      }
+    }
+  }
+}
+```
+
+When a project entry is a string, it sets the mode for all decisions. When it is
+an object, `mode` sets the project default and `overrides` maps decision
+categories (freeform strings) to per-decision modes. Decision categories are not
+validated — any string is accepted.
+
 - `default`: fallback mode for non-public projects without an explicit override.
 - `public_default`: fallback mode when `project_id` is missing (safe default for public).
-- `projects`: map of `project_id` to fallback mode overrides.
+- `projects`: map of `project_id` to a mode string **or** an object `{"mode": "<mode>", "overrides": {"<decision>": "<mode>"}}`.
 
-Valid modes: `hold`, `auto-accept`, `auto-decline`.
+Valid modes: `hold`, `auto-accept`, `auto-decline`, `accept-recommendation`, `discuss-options`.
 
-Mode behavior (current)
------------------------
+Config file location
+--------------------
+
+The default config location is `.worklog/ampa/fallback_config.json`. For backward
+compatibility, if a config file exists at the legacy location
+(`$AMPA_TOOL_OUTPUT_DIR/ampa_fallback_config.json`) but not at the new location,
+it will be used. The `AMPA_FALLBACK_CONFIG_FILE` env var overrides both defaults.
+
+Mode behavior
+-------------
 
 - `hold`: always hold for human input.
 - `auto-accept`: automatically respond with `accept` when a response is required.
 - `auto-decline`: automatically respond with `decline` when a response is required.
-
-Mode behavior (planned direction)
----------------------------------
-
-- `accept-recommendation`: automatically accept the agent's recommended option when it provides one.
-- `discuss-options`: hold a short conversation with the agent to decide, which may still resolve to hold for human input.
-
-Longer term we expect per-decision overrides (for example: always approve running tests, require discussion for opening PRs), but the current config applies a single mode to all decisions for a project.
+- `accept-recommendation`: inspect the payload for a `recommendation` field. If present, auto-apply the recommended action (`accept` or `decline`). If absent, fall back to `hold`.
+- `discuss-options`: intended for multi-turn conversation with the agent (not yet implemented). Currently falls back to `hold` with a log message.
 
 Error Reporting
 ---------------

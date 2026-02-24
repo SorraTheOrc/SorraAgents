@@ -8,6 +8,7 @@ same port. Tests may start the server via `start_metrics_server`.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -26,6 +27,8 @@ from .conversation_manager import (
     SDKError,
     TimedOutError,
 )
+
+_LOG = logging.getLogger("ampa.metrics")
 
 # Registry-local metrics so they do not clash with external collectors during
 # tests or when the package is imported multiple times.
@@ -137,11 +140,44 @@ def _wsgi_app(environ, start_response):
                 is_public = False
             else:
                 is_public = "project_id" not in payload
-            mode = fallback.resolve_mode(project_id, is_public=is_public)
+            # Support per-decision overrides: callers may include a
+            # ``decision`` field (freeform string) in the payload.
+            decision = payload.get("decision") if isinstance(payload, dict) else None
+            mode = fallback.resolve_mode(
+                project_id, is_public=is_public, decision=decision
+            )
             if mode == "auto-accept" and "action" not in payload:
                 payload["action"] = "accept"
             elif mode == "auto-decline" and "action" not in payload:
                 payload["action"] = "decline"
+            elif mode == "accept-recommendation" and "action" not in payload:
+                # Auto-accept the agent's recommendation when present;
+                # otherwise fall back to hold (no action injected).
+                recommendation = payload.get("recommendation")
+                if isinstance(recommendation, dict) and recommendation.get("action"):
+                    rec_action = str(recommendation["action"]).strip().lower()
+                    if rec_action in ("accept", "decline"):
+                        payload["action"] = rec_action
+                    else:
+                        # Unrecognised recommendation action — treat as hold
+                        _LOG.info(
+                            "accept-recommendation: unrecognised recommendation "
+                            "action %r, falling back to hold",
+                            rec_action,
+                        )
+                else:
+                    _LOG.info(
+                        "accept-recommendation: no recommendation in payload, "
+                        "falling back to hold"
+                    )
+            elif mode == "discuss-options" and "action" not in payload:
+                # Placeholder: discuss-options falls back to hold with logging.
+                # Future: integrate with conversation_manager for multi-turn
+                # discussion flows.
+                _LOG.info(
+                    "discuss-options mode requested but not yet implemented; "
+                    "falling back to hold"
+                )
         try:
             if not isinstance(payload, dict):
                 return _json_response(
