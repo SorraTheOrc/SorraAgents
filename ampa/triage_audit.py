@@ -120,22 +120,48 @@ def _from_iso(value: Optional[str]) -> Optional[dt.datetime]:
 
 
 # ---------------------------------------------------------------------------
-# Delegation helpers — canonical implementations live in ampa.delegation.
+# GitHub issue URL helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_github_repo(command_cwd: Optional[str] = None) -> Optional[str]:
+    """Return the ``owner/repo`` slug from the worklog config, or ``None``."""
+    try:
+        cfg_path = os.path.join(command_cwd or ".", ".worklog", "config.yaml")
+        if not os.path.isfile(cfg_path):
+            return None
+        with open(cfg_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("githubRepo:"):
+                    value = line.split(":", 1)[1].strip()
+                    if value and value != "(not set)":
+                        return value
+    except Exception:
+        LOG.debug("Failed to read githubRepo from worklog config")
+    return None
+
+
+def _build_github_issue_url(
+    repo_slug: Optional[str], issue_number: Any
+) -> Optional[str]:
+    """Build ``https://github.com/<owner>/<repo>/issues/<number>``."""
+    if not repo_slug or not issue_number:
+        return None
+    try:
+        num = int(issue_number)
+    except (TypeError, ValueError):
+        return None
+    return f"https://github.com/{repo_slug}/issues/{num}"
+
+
+# ---------------------------------------------------------------------------
+# Discord formatting helpers — canonical implementations live in ampa.delegation.
 # ---------------------------------------------------------------------------
 from .delegation import (  # noqa: E402
     _summarize_for_discord,
     _trim_text,
-    _build_delegation_report,
-    DelegationOrchestrator,
 )
-
-
-def _bool_meta(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 class TriageAuditRunner:
@@ -144,12 +170,10 @@ class TriageAuditRunner:
         run_shell: "Callable[..., subprocess.CompletedProcess]",
         command_cwd: str,
         store: Any,
-        engine: Optional[Any] = None,
     ) -> None:
         self.run_shell = run_shell
         self.command_cwd = command_cwd
         self.store = store
-        self.engine = engine
 
     def run(self, spec: Any, run: Any, output: Optional[str]) -> bool:
         # This method is intentionally a close copy of the original
@@ -163,8 +187,6 @@ class TriageAuditRunner:
             truncate_chars = int(spec.metadata.get("truncate_chars", 65536))
         except Exception:
             truncate_chars = 65536
-
-        audit_only = _bool_meta(spec.metadata.get("audit_only"))
 
         try:
             _audit_timeout = int(
@@ -212,14 +234,14 @@ class TriageAuditRunner:
         try:
             items: List[Dict[str, Any]] = []
 
-            proc = _call("wl in_progress --json")
+            proc = _call("wl list --stage in_review --json")
             if proc.returncode != 0:
-                LOG.warning("wl in_progress failed: %s", proc.stderr)
+                LOG.warning("wl list --stage in_review failed: %s", proc.stderr)
             else:
                 try:
                     raw = json.loads(proc.stdout or "null")
                 except Exception:
-                    LOG.exception("Failed to parse wl in_progress output")
+                    LOG.exception("Failed to parse wl list --stage in_review output")
                     raw = None
                 if isinstance(raw, list):
                     items.extend(raw)
@@ -234,46 +256,6 @@ class TriageAuditRunner:
                             if isinstance(v, list) and k.lower().endswith("workitems"):
                                 items.extend(v)
                                 break
-
-            include_blocked = False
-            try:
-                meta = spec.metadata or {}
-                include_blocked = bool(meta.get("include_blocked", False)) or (
-                    "truncate_chars" in meta
-                )
-            except Exception:
-                include_blocked = False
-
-            proc_b = None
-            if include_blocked:
-                proc_b = _call("wl list --status blocked --json")
-                if proc_b.returncode != 0:
-                    LOG.debug(
-                        "wl list --status blocked failed: %s; trying 'wl blocked --json'",
-                        proc_b.stderr,
-                    )
-                    proc_b = _call("wl blocked --json")
-                if proc_b.returncode == 0 and proc_b.stdout:
-                    try:
-                        rawb = json.loads(proc_b.stdout or "null")
-                    except Exception:
-                        LOG.exception("Failed to parse wl blocked output")
-                        rawb = None
-                    if isinstance(rawb, list):
-                        items.extend(rawb)
-                    elif isinstance(rawb, dict):
-                        for key in ("workItems", "work_items", "items", "data"):
-                            val = rawb.get(key)
-                            if isinstance(val, list):
-                                items.extend(val)
-                                break
-                        if not items:
-                            for k, v in rawb.items():
-                                if isinstance(v, list) and k.lower().endswith(
-                                    "workitems"
-                                ):
-                                    items.extend(v)
-                                    break
 
             unique: Dict[str, Dict[str, Any]] = {}
             for it in items:
@@ -329,14 +311,6 @@ class TriageAuditRunner:
                 if status == "in_review":
                     return _int_meta(
                         "audit_cooldown_hours_in_review", default_cooldown_hours
-                    )
-                if status == "in_progress":
-                    return _int_meta(
-                        "audit_cooldown_hours_in_progress", default_cooldown_hours
-                    )
-                if status == "blocked":
-                    return _int_meta(
-                        "audit_cooldown_hours_blocked", default_cooldown_hours
                     )
                 return default_cooldown_hours
 
@@ -448,8 +422,6 @@ class TriageAuditRunner:
             title = selected.get("title") or selected.get("name") or "(no title)"
             LOG.info("Selected triage candidate %s — %s", work_id, title)
 
-            delegation_result: Optional[Dict[str, Any]] = None
-
             audit_cmd = f'opencode run "/audit {work_id}"'
             LOG.info("Running audit command: %s", audit_cmd)
             proc_audit = _call(audit_cmd)
@@ -467,35 +439,6 @@ class TriageAuditRunner:
                 len(proc_audit.stdout or ""),
                 len(proc_audit.stderr or ""),
             )
-
-            try:
-                old_notifier = None
-                try:
-                    if (
-                        hasattr(self, "engine")
-                        and getattr(self.engine, "_notifier", None) is not None
-                    ):
-                        old_notifier = self.engine._notifier
-                        from ampa.engine.core import NullNotificationSender
-
-                        self.engine._notifier = NullNotificationSender()
-                except Exception:
-                    old_notifier = None
-
-                delegation_result = self._run_delegation_from_runner(
-                    audit_only=audit_only, spec=spec
-                )
-            except Exception:
-                LOG.exception("Delegation run failed during triage audit")
-                delegation_result = None
-            finally:
-                try:
-                    if old_notifier is not None and hasattr(self, "engine"):
-                        self.engine._notifier = old_notifier
-                except Exception:
-                    LOG.exception(
-                        "Failed to restore engine notifier after triage delegation"
-                    )
 
             def _extract_summary(text: str) -> str:
                 if not text:
@@ -532,17 +475,6 @@ class TriageAuditRunner:
                     summary_text = _extract_summary(audit_out or "")
                 if not summary_text:
                     summary_text = f"{work_id} — {title} | exit={exit_code}"
-                if delegation_result:
-                    try:
-                        dn = (
-                            delegation_result.get("note")
-                            if isinstance(delegation_result, dict)
-                            else str(delegation_result)
-                        )
-                    except Exception:
-                        dn = None
-                    if dn:
-                        summary_text = f"{summary_text}\n{dn}"
                 try:
                     summary_text = _summarize_for_discord(summary_text, max_chars=1000)
                 except Exception:
@@ -614,37 +546,36 @@ class TriageAuditRunner:
                 except Exception:
                     LOG.exception("Failed to discover PR URL for work item %s", work_id)
 
+                # Build GitHub issue URL from work item metadata
+                github_issue_url: Optional[str] = None
+                try:
+                    wi_data = wi_pre
+                    if isinstance(wi_pre, dict) and "workItem" in wi_pre:
+                        wi_data = wi_pre["workItem"]
+                    if isinstance(wi_data, dict):
+                        issue_num = wi_data.get("githubIssueNumber")
+                        if issue_num:
+                            repo_slug = _get_github_repo(self.command_cwd)
+                            github_issue_url = _build_github_issue_url(
+                                repo_slug, issue_num
+                            )
+                except Exception:
+                    LOG.debug("Failed to build GitHub issue URL for %s", work_id)
+
                 try:
                     heading_title = f"Triage Audit — {title}"
-                    extra = [{"name": "Summary", "value": summary_text}]
-                    include_preview = False
-                    try:
-                        include_preview = bool(
-                            (spec.metadata or {}).get("include_delegation_preview")
-                        )
-                    except Exception:
-                        include_preview = False
-                    if include_preview:
-                        try:
-                            delegation_preview = (
-                                self._run_delegation_report_for_preview(spec)
-                            )
-                        except Exception:
-                            delegation_preview = None
-                        extra.append(
-                            {
-                                "name": "Delegation",
-                                "value": (delegation_preview or "(none)"),
-                            }
-                        )
-                    else:
-                        extra.append({"name": "Delegation", "value": "(skipped)"})
+                    extra: List[Dict[str, Any]] = [
+                        {"name": "Work Item", "value": work_id},
+                    ]
+                    if github_issue_url:
+                        extra.append({"name": "GitHub", "value": github_issue_url})
+                    extra.append({"name": "Summary", "value": summary_text})
                     if pr_url:
                         extra.append({"name": "PR", "value": pr_url})
                     payload = notifications_module.build_payload(
                         hostname=os.uname().nodename,
                         timestamp_iso=_utc_now().isoformat(),
-                        work_item_id=None,
+                        work_item_id=work_id,
                         extra_fields=extra,
                         title=heading_title,
                     )
@@ -849,17 +780,6 @@ class TriageAuditRunner:
             except Exception:
                 LOG.exception("Failed to persist last_audit_at_by_item for %s", work_id)
 
-            if audit_only:
-                return True
-
-            try:
-                delegation_result = self._run_delegation_from_runner(
-                    audit_only=False, spec=spec
-                )
-                LOG.info("Triage-initiated delegation result: %s", delegation_result)
-            except Exception:
-                LOG.exception("Failed to run delegation from triage")
-
             try:
                 proc_show = _call(f"wl show {work_id} --json")
                 if proc_show.returncode == 0 and proc_show.stdout:
@@ -969,7 +889,7 @@ class TriageAuditRunner:
 
                 if merged_pr and (not children_open or ready_token):
                     try:
-                        upd_cmd = f"wl update {work_id} --status completed --stage in_review --json"
+                        upd_cmd = f"wl update {work_id} --status completed --stage in_review --needs-producer-review true --json"
                         _call(upd_cmd)
                         try:
                             if True:
@@ -1012,57 +932,3 @@ class TriageAuditRunner:
             LOG.exception("Error during triage audit processing")
             return False
         return True
-
-    # helper to delegate to DelegationOrchestrator when available
-    def _run_delegation_from_runner(
-        self, *, audit_only: bool, spec: Any
-    ) -> Optional[Dict[str, Any]]:
-        """Delegate idle-delegation logic to ``DelegationOrchestrator``.
-
-        Falls back to a minimal engine-only path when the orchestrator cannot
-        be constructed (e.g. missing dependencies in test environments).
-        """
-        if audit_only:
-            return {
-                "note": "Delegation: skipped (audit_only)",
-                "dispatched": False,
-                "rejected": [],
-                "idle_notification_sent": False,
-            }
-        try:
-            if self.engine is None:
-                return None
-            orchestrator = DelegationOrchestrator(
-                store=self.store,
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-                engine=self.engine,
-                candidate_selector=None,
-                notifications_module=notifications_module,
-                selection_module=None,
-            )
-            return orchestrator.run_idle_delegation(audit_only=audit_only, spec=spec)
-        except Exception:
-            LOG.exception("_run_delegation_from_runner failed")
-            return None
-
-    def _run_delegation_report_for_preview(self, spec: Any) -> Optional[str]:
-        """Build a delegation report for embedding in triage Discord messages.
-
-        Delegates to ``DelegationOrchestrator.run_delegation_report()`` which
-        contains the canonical report-building logic.
-        """
-        try:
-            orchestrator = DelegationOrchestrator(
-                store=self.store,
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-                engine=self.engine,
-                candidate_selector=None,
-                notifications_module=notifications_module,
-                selection_module=None,
-            )
-            return orchestrator.run_delegation_report(spec)
-        except Exception:
-            LOG.exception("Failed to build delegation preview")
-            return None

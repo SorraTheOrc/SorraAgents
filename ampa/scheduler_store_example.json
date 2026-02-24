@@ -75,12 +75,8 @@
       "metadata": {
         "discord_label": "wl triage audit",
         "audit_cooldown_hours": 6,
-        "audit_cooldown_hours_in_progress": 6,
         "audit_cooldown_hours_in_review": 1,
-        "audit_cooldown_hours_blocked": 6,
-        "truncate_chars": 65536,
-        "include_blocked": true,
-        "audit_only": false
+        "truncate_chars": 65536
       },
       "priority": 0,
       "requires_llm": false,

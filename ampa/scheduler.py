@@ -1198,7 +1198,6 @@ class Scheduler:
                     run_shell=self.run_shell,
                     command_cwd=self.command_cwd,
                     store=self.store,
-                    engine=getattr(self, "engine", None),
                 )
                 try:
                     runner.run(spec, run, output)
