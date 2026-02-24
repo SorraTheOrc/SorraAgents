@@ -7,7 +7,13 @@ import os
 import tempfile
 from typing import Any, Dict, Optional
 
-VALID_MODES = {"hold", "auto-accept", "auto-decline"}
+VALID_MODES = {
+    "hold",
+    "auto-accept",
+    "auto-decline",
+    "accept-recommendation",
+    "discuss-options",
+}
 
 
 def _tool_output_dir() -> str:
@@ -31,6 +37,13 @@ def normalize_mode(value: Optional[str]) -> str:
         "hold": "hold",
         "pause": "hold",
         "queue": "hold",
+        # new modes
+        "accept_recommendation": "accept-recommendation",
+        "accept-recommendation": "accept-recommendation",
+        "recommend": "accept-recommendation",
+        "discuss_options": "discuss-options",
+        "discuss-options": "discuss-options",
+        "discuss": "discuss-options",
     }
     mode = aliases.get(raw, "hold")
     if mode not in VALID_MODES:
@@ -60,11 +73,26 @@ def load_config(path: Optional[str] = None) -> Dict[str, Any]:
         projects = {}
     default_mode = normalize_mode(data.get("default"))
     public_default = normalize_mode(data.get("public_default"))
-    normalized_projects: Dict[str, str] = {}
+    # Normalize projects. Support legacy mapping project->mode (string) and
+    # enhanced mapping project-> { mode: <mode>, overrides: {<decision>: <mode>}}
+    normalized_projects: Dict[str, Any] = {}
     for key, value in projects.items():
         if not key:
             continue
-        normalized_projects[str(key)] = normalize_mode(value)
+        project_key = str(key)
+        if isinstance(value, dict):
+            mode = normalize_mode(value.get("mode") or value.get("default"))
+            overrides = {}
+            raw_overrides = value.get("overrides")
+            if isinstance(raw_overrides, dict):
+                for dkey, dval in raw_overrides.items():
+                    if not dkey:
+                        continue
+                    overrides[str(dkey)] = normalize_mode(dval)
+            normalized_projects[project_key] = {"mode": mode, "overrides": overrides}
+        else:
+            # legacy string-style project entry
+            normalized_projects[project_key] = normalize_mode(value)
     return {
         "default": default_mode,
         "projects": normalized_projects,
@@ -86,7 +114,24 @@ def save_config(config: Dict[str, Any], path: Optional[str] = None) -> Dict[str,
         for key, value in projects.items():
             if not key:
                 continue
-            normalized["projects"][str(key)] = normalize_mode(value)
+            pk = str(key)
+            # Allow callers to pass either a string mode or a dict with mode/overrides
+            if isinstance(value, dict):
+                mode = normalize_mode(value.get("mode") or value.get("default"))
+                overrides = {}
+                raw_overrides = value.get("overrides")
+                if isinstance(raw_overrides, dict):
+                    for dkey, dval in raw_overrides.items():
+                        if not dkey:
+                            continue
+                        overrides[str(dkey)] = normalize_mode(dval)
+                # If there are overrides, write a dict; otherwise write a simple mode
+                if overrides:
+                    normalized["projects"][pk] = {"mode": mode, "overrides": overrides}
+                else:
+                    normalized["projects"][pk] = mode
+            else:
+                normalized["projects"][pk] = normalize_mode(value)
     try:
         parent = os.path.dirname(path)
         if parent:
@@ -105,6 +150,7 @@ def resolve_mode(
     env_override: bool = True,
     is_public: Optional[bool] = None,
     require_config: bool = False,
+    decision: Optional[str] = None,
 ) -> str:
     if env_override:
         env_mode = os.getenv("AMPA_FALLBACK_MODE")
@@ -118,7 +164,19 @@ def resolve_mode(
     if project_id:
         project_key = str(project_id)
         if project_key in projects:
-            return normalize_mode(projects.get(project_key))
+            proj_entry = projects.get(project_key)
+            # If project entry is a mapping with overrides, check decision overrides first
+            if isinstance(proj_entry, dict):
+                overrides = proj_entry.get("overrides") or {}
+                if decision and isinstance(overrides, dict) and decision in overrides:
+                    return normalize_mode(overrides.get(decision))
+                # fall back to the project's mode
+                return normalize_mode(proj_entry.get("mode"))
+            # legacy string entry
+            if decision:
+                # cannot have per-decision config in legacy entry, fall through
+                return normalize_mode(proj_entry)
+            return normalize_mode(proj_entry)
     if is_public is None:
         is_public = project_id is None
     if is_public:
