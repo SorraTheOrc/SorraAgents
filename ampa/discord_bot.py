@@ -30,19 +30,130 @@ A JSON response is written back per message::
     {"ok": false, "error": "..."} # failure
 
 The connection is closed by the client when done.
+
+Component protocol extension
+-----------------------------
+Messages may include an optional ``components`` list to attach interactive
+UI elements (buttons) to the Discord message.  Each component object must
+have ``type``, ``label``, and ``custom_id`` fields.  ``style`` is optional
+and defaults to ``secondary``.  Example::
+
+    {
+      "content": "Pick a colour",
+      "components": [
+        {"type": "button", "label": "Blue", "style": "primary", "custom_id": "test_blue"},
+        {"type": "button", "label": "Red",  "style": "danger",  "custom_id": "test_red"}
+      ]
+    }
+
+When ``components`` is absent or empty, messages are sent as plain text
+(backward-compatible).
 """
 
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import os
 import signal
 import sys
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 LOG = logging.getLogger("ampa.discord_bot")
+
+# Style name -> discord.ButtonStyle mapping (resolved at runtime when discord
+# is imported).  Unknown styles fall back to ``secondary``.
+_BUTTON_STYLE_MAP: Dict[str, Any] = {}  # populated in run()
+
+# Required fields for a valid component object.
+_COMPONENT_REQUIRED_FIELDS = {"type", "label", "custom_id"}
+
+
+# ---------------------------------------------------------------------------
+# Component helpers
+# ---------------------------------------------------------------------------
+
+
+def _validate_components(components: Any) -> Optional[str]:
+    """Return an error string if *components* is malformed, else ``None``."""
+    if not isinstance(components, list):
+        return "components must be a list"
+    for idx, comp in enumerate(components):
+        if not isinstance(comp, dict):
+            return f"components[{idx}] must be an object"
+        missing = _COMPONENT_REQUIRED_FIELDS - set(comp.keys())
+        if missing:
+            return f"components[{idx}] missing required fields: {sorted(missing)}"
+        if comp.get("type") != "button":
+            return f"components[{idx}] unsupported type: {comp.get('type')}"
+    return None
+
+
+def _build_view(components: List[Dict[str, Any]]) -> Any:
+    """Construct a ``discord.ui.View`` from a list of component dicts.
+
+    Each component must have ``type``, ``label``, ``custom_id``, and
+    optionally ``style`` (defaults to ``secondary``).  Unknown style
+    values fall back to ``secondary`` with a warning.
+
+    The returned ``View`` has ``timeout=None`` so buttons remain
+    clickable until the bot restarts.
+    """
+    import discord  # type: ignore
+
+    view = discord.ui.View(timeout=None)
+    for comp in components:
+        style_name = comp.get("style", "secondary")
+        style = _BUTTON_STYLE_MAP.get(style_name)
+        if style is None:
+            LOG.warning(
+                "Unknown button style %r for custom_id=%s; defaulting to secondary",
+                style_name,
+                comp.get("custom_id"),
+            )
+            style = discord.ButtonStyle.secondary
+        button = discord.ui.Button(
+            label=comp["label"],
+            style=style,
+            custom_id=comp["custom_id"],
+        )
+        view.add_item(button)
+    return view
+
+
+def _route_interaction(custom_id: str, user: str, timestamp: str) -> None:
+    """Dispatch a button interaction through conversation_manager plumbing.
+
+    For the MVP, interactions with ``test_*`` custom_id prefixes are treated
+    as no-ops (acknowledge only, no session started or resumed).  Future
+    interactive workflows with non-test prefixes will route through
+    ``conversation_manager.resume_session()`` here.
+
+    This function is called *before* the interaction acknowledgement is sent,
+    so it must return quickly (well under the 3-second Discord timeout).
+    """
+    if custom_id.startswith("test_"):
+        LOG.debug(
+            "No-op route for test interaction: custom_id=%s user=%s ts=%s",
+            custom_id,
+            user,
+            timestamp,
+        )
+        return
+
+    # Future: route non-test interactions to conversation_manager.
+    # Example:
+    #   from . import conversation_manager
+    #   conversation_manager.resume_session(session_id, response, metadata)
+    LOG.info(
+        "Non-test interaction received (future routing): custom_id=%s user=%s ts=%s",
+        custom_id,
+        user,
+        timestamp,
+    )
+
 
 # Default socket path
 DEFAULT_SOCKET_PATH = "/tmp/ampa_bot.sock"
@@ -87,6 +198,15 @@ class AMPABot:
         client = discord.Client(intents=intents)
         self._client = client
 
+        # Populate the button style mapping now that discord is imported.
+        global _BUTTON_STYLE_MAP
+        _BUTTON_STYLE_MAP = {
+            "primary": discord.ButtonStyle.primary,
+            "secondary": discord.ButtonStyle.secondary,
+            "success": discord.ButtonStyle.success,
+            "danger": discord.ButtonStyle.danger,
+        }
+
         @client.event
         async def on_ready() -> None:
             LOG.info(
@@ -110,6 +230,52 @@ class AMPABot:
 
             # Start the Unix socket server now that we have a valid channel.
             await self._start_socket_server()
+
+        @client.event
+        async def on_interaction(interaction: discord.Interaction) -> None:
+            """Handle button click interactions.
+
+            Acknowledges the click with the clicker's identity and timestamp.
+            Routes through _route_interaction() for conversation_manager
+            plumbing (no-op for MVP test messages).
+            """
+            # Only handle component (button) interactions.
+            if interaction.type != discord.InteractionType.component:
+                LOG.debug(
+                    "Ignoring non-component interaction type=%s", interaction.type
+                )
+                return
+
+            custom_id = (
+                interaction.data.get("custom_id", "") if interaction.data else ""
+            )
+            user = interaction.user
+            user_str = f"{user.name}#{user.discriminator}" if user else "unknown"
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+            # Route through conversation_manager plumbing (no-op for test_*).
+            _route_interaction(custom_id, user_str, now_iso)
+
+            # Derive a human-readable label from the custom_id.
+            # Convention: custom_id is "prefix_label", e.g. "test_blue" -> "Blue".
+            label = (
+                custom_id.rsplit("_", 1)[-1].capitalize() if custom_id else "Unknown"
+            )
+
+            ack_message = (
+                f"You selected {label}, good luck. (clicked by {user_str}, {now_iso})"
+            )
+            try:
+                await interaction.response.send_message(ack_message)
+                LOG.info(
+                    "Acknowledged button click: custom_id=%s user=%s",
+                    custom_id,
+                    user_str,
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to acknowledge interaction custom_id=%s", custom_id
+                )
 
         @client.event
         async def on_disconnect() -> None:
@@ -211,12 +377,24 @@ class AMPABot:
                     await writer.drain()
                     continue
 
+                # Parse optional components for interactive buttons.
+                components = data.get("components")
+                view = None
+                if components:
+                    validation_error = _validate_components(components)
+                    if validation_error:
+                        response = {"ok": False, "error": validation_error}
+                        writer.write(json.dumps(response).encode() + b"\n")
+                        await writer.drain()
+                        continue
+                    view = _build_view(components)
+
                 # Discord messages are limited to 2000 characters.
                 if len(content) > 2000:
                     content = content[:1997] + "..."
 
-                ok = await self._send_to_discord(content)
-                response = {"ok": ok}
+                ok = await self._send_to_discord(content, view=view)
+                response: Dict[str, Any] = {"ok": ok}
                 if not ok:
                     response["error"] = "failed to send to Discord"
                 writer.write(json.dumps(response).encode() + b"\n")
@@ -232,17 +410,31 @@ class AMPABot:
             except Exception:
                 pass
 
-    async def _send_to_discord(self, content: str) -> bool:
-        """Send a text message to the configured Discord channel."""
+    async def _send_to_discord(
+        self, content: str, *, view: Optional[Any] = None
+    ) -> bool:
+        """Send a text message to the configured Discord channel.
+
+        Parameters
+        ----------
+        content:
+            The text content of the message.
+        view:
+            Optional ``discord.ui.View`` to attach interactive components.
+        """
         if self._channel is None:
             LOG.error("Cannot send message: channel not resolved")
             return False
         try:
-            await self._channel.send(content)
+            kwargs: Dict[str, Any] = {"content": content}
+            if view is not None:
+                kwargs["view"] = view
+            await self._channel.send(**kwargs)
             LOG.debug(
-                "Sent message to #%s (%d chars)",
+                "Sent message to #%s (%d chars, components=%s)",
                 getattr(self._channel, "name", "?"),
                 len(content),
+                view is not None,
             )
             return True
         except Exception:

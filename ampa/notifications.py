@@ -190,6 +190,7 @@ def notify(
     message_type: str = "other",
     *,
     payload: Optional[Dict[str, Any]] = None,
+    components: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
     """Send a notification to Discord via the bot's Unix socket.
 
@@ -208,6 +209,11 @@ def notify(
         Optional pre-built payload dict.  If provided, this is sent directly
         to the bot socket (must contain ``content`` or ``title``/``body``).
         When *payload* is supplied, *title* and *body* are ignored.
+    components:
+        Optional list of component dicts to attach interactive UI elements
+        (buttons) to the Discord message.  Each dict should have ``type``,
+        ``label``, ``custom_id``, and optionally ``style``.  Ignored when
+        *payload* is supplied (include ``components`` in the payload instead).
 
     Returns
     -------
@@ -231,6 +237,9 @@ def notify(
         else:
             LOG.warning("notify() called with empty title and body – skipping")
             return False
+        # Attach components when building from title/body (not from payload).
+        if components:
+            msg["components"] = components
     msg["message_type"] = message_type
 
     # Try to send via Unix socket.
