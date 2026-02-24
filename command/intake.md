@@ -40,11 +40,7 @@ The command implements the procedural workflow below. Each numbered step is part
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
 - The goal is not to capture an exhaustive spec, but to gather sufficient detail to create a clear Worklog work item that will be used to either seed a PRD, update an existing one, or if the work is small and well-defined, be implemented directly from the Worklog work item.
 
-- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
-
-## Note
-
-- This Hard requirements section is populated with the mandatory progression rule above; review the rest of the hard requirements for task-specific constraints.
+- Do not include procedural next steps (e.g., "Proceed to planning", "Break into sub-tasks") in the intake brief or work item description. Workflow progression is handled by the workflow system via stage transitions and delegation dispatch, not by the work item content.
 
 ## Process (must follow)
 
@@ -104,11 +100,11 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
 
 - The five Intake review types are:
   1. Completeness
-     - Ensure Problem, Success criteria, Constraints, and Suggested next step are present and actionable. Add missing bullets or concise placeholders when obvious.
+     - Ensure Problem, Success criteria, and Constraints are present and actionable. Add missing bullets or concise placeholders when obvious.
   2. Capture fidelity
      - Verify the user's answers are accurately and neutrally represented. Shorten or rephrase only for clarity; do not change meaning.
   3. Related-work & traceability
-  - Confirm related docs/work items are correctly referenced and that the recommended next step references the correct path/work item ids.
+   - Confirm related docs/work items are correctly referenced.
   4. Risks & assumptions
      - Add missing risks and mitigations, failure modes, and assumptions in short bullets.
      - Ensure that a risk addressing scope screep is present. The mitigaation is to record opportunities for additional features/refactorings as work items linked to the main item, rather than expanding the scope of the current item.
