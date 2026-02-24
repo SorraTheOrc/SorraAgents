@@ -212,14 +212,14 @@ class TriageAuditRunner:
         try:
             items: List[Dict[str, Any]] = []
 
-            proc = _call("wl in_progress --json")
+            proc = _call("wl list --stage in_review --json")
             if proc.returncode != 0:
-                LOG.warning("wl in_progress failed: %s", proc.stderr)
+                LOG.warning("wl list --stage in_review failed: %s", proc.stderr)
             else:
                 try:
                     raw = json.loads(proc.stdout or "null")
                 except Exception:
-                    LOG.exception("Failed to parse wl in_progress output")
+                    LOG.exception("Failed to parse wl list --stage in_review output")
                     raw = None
                 if isinstance(raw, list):
                     items.extend(raw)
@@ -234,46 +234,6 @@ class TriageAuditRunner:
                             if isinstance(v, list) and k.lower().endswith("workitems"):
                                 items.extend(v)
                                 break
-
-            include_blocked = False
-            try:
-                meta = spec.metadata or {}
-                include_blocked = bool(meta.get("include_blocked", False)) or (
-                    "truncate_chars" in meta
-                )
-            except Exception:
-                include_blocked = False
-
-            proc_b = None
-            if include_blocked:
-                proc_b = _call("wl list --status blocked --json")
-                if proc_b.returncode != 0:
-                    LOG.debug(
-                        "wl list --status blocked failed: %s; trying 'wl blocked --json'",
-                        proc_b.stderr,
-                    )
-                    proc_b = _call("wl blocked --json")
-                if proc_b.returncode == 0 and proc_b.stdout:
-                    try:
-                        rawb = json.loads(proc_b.stdout or "null")
-                    except Exception:
-                        LOG.exception("Failed to parse wl blocked output")
-                        rawb = None
-                    if isinstance(rawb, list):
-                        items.extend(rawb)
-                    elif isinstance(rawb, dict):
-                        for key in ("workItems", "work_items", "items", "data"):
-                            val = rawb.get(key)
-                            if isinstance(val, list):
-                                items.extend(val)
-                                break
-                        if not items:
-                            for k, v in rawb.items():
-                                if isinstance(v, list) and k.lower().endswith(
-                                    "workitems"
-                                ):
-                                    items.extend(v)
-                                    break
 
             unique: Dict[str, Dict[str, Any]] = {}
             for it in items:
@@ -329,14 +289,6 @@ class TriageAuditRunner:
                 if status == "in_review":
                     return _int_meta(
                         "audit_cooldown_hours_in_review", default_cooldown_hours
-                    )
-                if status == "in_progress":
-                    return _int_meta(
-                        "audit_cooldown_hours_in_progress", default_cooldown_hours
-                    )
-                if status == "blocked":
-                    return _int_meta(
-                        "audit_cooldown_hours_blocked", default_cooldown_hours
                     )
                 return default_cooldown_hours
 
@@ -969,7 +921,7 @@ class TriageAuditRunner:
 
                 if merged_pr and (not children_open or ready_token):
                     try:
-                        upd_cmd = f"wl update {work_id} --status completed --stage in_review --json"
+                        upd_cmd = f"wl update {work_id} --status completed --stage in_review --needs-producer-review true --json"
                         _call(upd_cmd)
                         try:
                             if True:

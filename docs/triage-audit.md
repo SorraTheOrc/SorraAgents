@@ -10,7 +10,7 @@ References:
 ## End-to-end flow
 
 1. **Select a candidate work item**
-   - Run `wl in_progress --json` and normalize the response shape.
+   - Run `wl list --stage in_review --json` and normalize the response shape.
    - Build a candidate list sorted by least-recently-updated (oldest first).
    - Filter out items that have a recent audit comment (cooldown window).
 
@@ -42,13 +42,14 @@ References:
    The scheduler will attempt to move the work item to `completed` and `in_review` when:
    - The audit output indicates a merged PR (PR URL or "PR merged" token), and
    - There are no open child work items, or the audit explicitly says it is ready to close.
+   - The update command includes `--needs-producer-review true` to flag the item for producer review.
 
     If a GitHub PR URL is found, the scheduler can verify merge status with `gh pr view`.
     - Skipped when `audit_only` is enabled.
 
 ## Cooldown logic
 
-To avoid repeatedly auditing the same item, triage-audit inspects prior Worklog comments on each item. Any comment containing `# AMPA Audit Result` is treated as a prior audit. If the most recent audit is within the cooldown window, the item is skipped.
+To avoid repeatedly auditing the same item, triage-audit inspects prior Worklog comments on each item. Any comment containing `# AMPA Audit Result` is treated as a prior audit. If the most recent audit is within the cooldown window, the item is skipped. A per-status cooldown override `audit_cooldown_hours_in_review` can be set to use a different cooldown for `in_review` items (defaults to the general `audit_cooldown_hours`).
 
 ## Structured audit output
 
@@ -101,6 +102,7 @@ Environment variables:
 
 Per-command metadata (from the scheduler command spec):
 - `audit_cooldown_hours` (default: 6): Minimum hours between audits for the same work item.
+- `audit_cooldown_hours_in_review` (optional): Override cooldown hours for items with `in_review` status. Falls back to `audit_cooldown_hours` if not set.
 - `truncate_chars` (default: 65536): Max chars to inline in Worklog comments before writing to a temp file.
 - `verify_pr_with_gh` (default: true): Overrides `AMPA_VERIFY_PR_WITH_GH` when present.
 - `audit_only` (default: false): When true, do not update work item stage/status and skip delegation.

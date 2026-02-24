@@ -60,8 +60,8 @@ def test_triage_audit_runs_and_cleans_temp(tmp_path, monkeypatch):
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        # wl in_progress
-        if cmd.strip() == "wl in_progress --json":
+        # wl list --stage in_review
+        if cmd.strip() == "wl list --stage in_review --json":
             out = json.dumps(
                 {
                     "workItems": [
@@ -137,7 +137,7 @@ def test_triage_audit_auto_complete_with_gh(tmp_path, monkeypatch):
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        if cmd.strip() == "wl in_progress --json":
+        if cmd.strip() == "wl list --stage in_review --json":
             out = json.dumps(
                 {
                     "workItems": [
@@ -207,6 +207,11 @@ def test_triage_audit_auto_complete_with_gh(tmp_path, monkeypatch):
     assert any(c.startswith("gh pr view") for c in calls)
     # ensure wl update was invoked to set completed
     assert any(c.startswith(f"wl update {work_id}") for c in calls)
+    # ensure --needs-producer-review true is included in the update command
+    update_cmds = [c for c in calls if c.startswith(f"wl update {work_id}")]
+    assert any("--needs-producer-review true" in c for c in update_cmds), (
+        f"Expected --needs-producer-review true in update command, got: {update_cmds}"
+    )
 
 
 def test_triage_audit_no_candidates_skips_discord(tmp_path, monkeypatch):
@@ -217,7 +222,7 @@ def test_triage_audit_no_candidates_skips_discord(tmp_path, monkeypatch):
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        if cmd.strip() == "wl in_progress --json":
+        if cmd.strip() == "wl list --stage in_review --json":
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=json.dumps({"workItems": []}), stderr=""
             )
@@ -240,65 +245,26 @@ def test_triage_audit_no_candidates_skips_discord(tmp_path, monkeypatch):
 
     sched.start_command(spec)
 
-    assert calls == ["wl in_progress --json"]
+    assert calls == ["wl list --stage in_review --json"]
 
 
-def test_triage_audit_includes_blocked_items(tmp_path, monkeypatch):
-    """Verify blocked items are included when in_progress is empty."""
+def test_triage_audit_excludes_in_progress_items(tmp_path, monkeypatch):
+    """Verify in_progress items are NOT selected as candidates.
+
+    The triage-audit now only queries ``wl list --stage in_review``, so items
+    with ``in_progress`` status should never appear in the candidate list.
+    This is a negative test replacing the old ``test_triage_audit_includes_blocked_items``.
+    """
     calls = []
-    work_id = "BLOCKED-1"
 
     monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        if cmd.strip() == "wl in_progress --json":
+        if cmd.strip() == "wl list --stage in_review --json":
+            # Return empty — no in_review items exist
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=json.dumps({"workItems": []}), stderr=""
-            )
-        if cmd.strip() == "wl list --status blocked --json":
-            out = json.dumps(
-                {
-                    "workItems": [
-                        {
-                            "id": work_id,
-                            "title": "Blocked item",
-                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                            "status": "blocked",
-                        }
-                    ]
-                }
-            )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        # allow fallback 'wl blocked --json'
-        if cmd.strip() == "wl blocked --json":
-            out = json.dumps(
-                [
-                    {
-                        "id": work_id,
-                        "title": "Blocked item",
-                        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        "status": "blocked",
-                    }
-                ]
-            )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment list {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
-            )
-        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
-            out = "Summary:\nBlocked item audit\n"
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment add {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
             )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
@@ -319,43 +285,46 @@ def test_triage_audit_includes_blocked_items(tmp_path, monkeypatch):
 
     sched.start_command(spec)
 
-    # ensure blocked listing was attempted and audit ran for blocked item
-    assert any(
-        "wl list --status blocked --json" in c or c.strip() == "wl blocked --json"
-        for c in calls
-    )
-    assert any(f"/audit {work_id}" in c for c in calls)
+    # No blocked or in_progress queries should be made — only in_review
+    assert not any("wl in_progress" in c for c in calls)
+    assert not any("wl list --status blocked" in c for c in calls)
+    assert not any("wl blocked" in c for c in calls)
+    # Only the in_review query should have been made, and since it returned
+    # empty, no audit should have run
+    assert calls == ["wl list --stage in_review --json"]
 
 
 def test_per_status_cooldown_respected(tmp_path, monkeypatch):
-    """Verify per-status cooldowns: in_review cooldown smaller than in_progress."""
+    """Verify per-status cooldowns: in_review cooldown allows re-audit when elapsed."""
     calls = []
-    wid_in_review = "WID-REV"
-    wid_in_progress = "WID-PROG"
+    wid_fresh = "WID-FRESH"
+    wid_recent = "WID-RECENT"
 
     monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     now = dt.datetime.now(dt.timezone.utc)
-    # last audit times: both 2 hours ago
-    last_audit_iso = (now - dt.timedelta(hours=2)).isoformat()
+    # last audit for wid_fresh: 3 hours ago (past the 1-hour in_review cooldown)
+    # last audit for wid_recent: 30 minutes ago (within the 1-hour in_review cooldown)
+    last_audit_fresh = (now - dt.timedelta(hours=3)).isoformat()
+    last_audit_recent = (now - dt.timedelta(minutes=30)).isoformat()
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        if cmd.strip() == "wl in_progress --json":
+        if cmd.strip() == "wl list --stage in_review --json":
             out = json.dumps(
                 {
                     "workItems": [
                         {
-                            "id": wid_in_review,
-                            "title": "Review item",
-                            "updated_at": (now - dt.timedelta(hours=3)).isoformat(),
+                            "id": wid_fresh,
+                            "title": "Fresh review item",
+                            "updated_at": (now - dt.timedelta(hours=4)).isoformat(),
                             "status": "in_review",
                         },
                         {
-                            "id": wid_in_progress,
-                            "title": "Prog item",
-                            "updated_at": (now - dt.timedelta(hours=4)).isoformat(),
-                            "status": "in_progress",
+                            "id": wid_recent,
+                            "title": "Recent review item",
+                            "updated_at": (now - dt.timedelta(hours=2)).isoformat(),
+                            "status": "in_review",
                         },
                     ]
                 }
@@ -367,13 +336,16 @@ def test_per_status_cooldown_respected(tmp_path, monkeypatch):
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
             )
-        if cmd.strip().startswith(f'opencode run "/audit {wid_in_review}"'):
+        if cmd.strip().startswith(f'opencode run "/audit {wid_fresh}"'):
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="Summary:\nreview allowed", stderr=""
+                args=cmd,
+                returncode=0,
+                stdout="Summary:\nfresh review allowed",
+                stderr="",
             )
-        if cmd.strip().startswith(f'opencode run "/audit {wid_in_progress}"'):
+        if cmd.strip().startswith(f'opencode run "/audit {wid_recent}"'):
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="Summary:\nprog audited", stderr=""
+                args=cmd, returncode=0, stdout="Summary:\nrecent audited", stderr=""
             )
         if cmd.strip().startswith("wl comment add"):
             return subprocess.CompletedProcess(
@@ -383,7 +355,7 @@ def test_per_status_cooldown_respected(tmp_path, monkeypatch):
 
     sched = make_scheduler(fake_run_shell, tmp_path)
 
-    # metadata sets in_review cooldown to 1 hour, in_progress to 6 hours
+    # metadata sets in_review cooldown to 1 hour, default to 6 hours
     spec = CommandSpec(
         command_id="wl-triage-audit",
         command="true",
@@ -393,20 +365,19 @@ def test_per_status_cooldown_respected(tmp_path, monkeypatch):
         metadata={
             "truncate_chars": 65536,
             "audit_cooldown_hours": 6,
-            "audit_cooldown_hours_in_progress": 6,
             "audit_cooldown_hours_in_review": 1,
         },
         command_type="triage-audit",
     )
     sched.store.add_command(spec)
 
-    # persist last_audit timestamps for both items as 2 hours ago
+    # persist last_audit timestamps: wid_fresh 3h ago, wid_recent 30min ago
     sched.store.update_state(
         spec.command_id,
         {
             "last_audit_at_by_item": {
-                wid_in_review: last_audit_iso,
-                wid_in_progress: last_audit_iso,
+                wid_fresh: last_audit_fresh,
+                wid_recent: last_audit_recent,
             }
         },
     )
@@ -415,10 +386,10 @@ def test_per_status_cooldown_respected(tmp_path, monkeypatch):
 
     sched.start_command(spec)
 
-    # Since in_review cooldown is 1h and last_audit was 2h ago, the in_review item should be audited.
-    # The in_progress item should be skipped because its cooldown is 6h and last_audit is 2h ago.
-    assert any(f"/audit {wid_in_review}" in c for c in calls)
-    assert not any(f"/audit {wid_in_progress}" in c for c in calls)
+    # wid_fresh: last audit 3h ago, in_review cooldown 1h → should be audited
+    assert any(f"/audit {wid_fresh}" in c for c in calls)
+    # wid_recent: last audit 30min ago, in_review cooldown 1h → should be skipped
+    assert not any(f"/audit {wid_recent}" in c for c in calls)
 
 
 def test_triage_audit_audit_only_no_update(tmp_path, monkeypatch):
@@ -430,7 +401,7 @@ def test_triage_audit_audit_only_no_update(tmp_path, monkeypatch):
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        if cmd.strip() == "wl in_progress --json":
+        if cmd.strip() == "wl list --stage in_review --json":
             out = json.dumps(
                 {
                     "workItems": [
@@ -496,7 +467,7 @@ def test_triage_audit_audit_only_no_templates(tmp_path, monkeypatch):
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        if cmd.strip() == "wl in_progress --json":
+        if cmd.strip() == "wl list --stage in_review --json":
             out = json.dumps(
                 {
                     "workItems": [
@@ -568,7 +539,7 @@ def test_triage_audit_discord_summary_includes_body(tmp_path, monkeypatch):
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        if cmd.strip() == "wl in_progress --json":
+        if cmd.strip() == "wl list --stage in_review --json":
             out = json.dumps(
                 {
                     "workItems": [
@@ -634,7 +605,7 @@ def test_triage_audit_delegation_disabled(tmp_path, monkeypatch):
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        if cmd.strip() == "wl in_progress --json":
+        if cmd.strip() == "wl list --stage in_review --json":
             out = json.dumps(
                 {
                     "workItems": [
@@ -697,7 +668,7 @@ def test_triage_audit_delegation_skips_when_in_progress(tmp_path, monkeypatch):
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        if cmd.strip() == "wl in_progress --json":
+        if cmd.strip() == "wl list --stage in_review --json":
             out = json.dumps(
                 {
                     "workItems": [
@@ -780,24 +751,25 @@ def test_triage_audit_delegation_dispatches_intake_when_idle(tmp_path, monkeypat
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
+        if cmd.strip() == "wl list --stage in_review --json":
+            out = json.dumps(
+                {
+                    "workItems": [
+                        {
+                            "id": work_id,
+                            "title": "Audit item",
+                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        }
+                    ]
+                }
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
         if cmd.strip() == "wl in_progress --json":
             in_progress_calls["count"] += 1
-            if in_progress_calls["count"] == 1:
-                out = json.dumps(
-                    {
-                        "workItems": [
-                            {
-                                "id": work_id,
-                                "title": "Audit item",
-                                "updated_at": dt.datetime.now(
-                                    dt.timezone.utc
-                                ).isoformat(),
-                            }
-                        ]
-                    }
-                )
-            else:
-                out = json.dumps({"workItems": []})
+            # Delegation idle-check: return empty to indicate system is idle
+            out = json.dumps({"workItems": []})
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=out, stderr=""
             )
@@ -902,7 +874,7 @@ def test_triage_audit_no_candidates_logs(tmp_path, monkeypatch, caplog):
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        if cmd.strip() == "wl in_progress --json":
+        if cmd.strip() == "wl list --stage in_review --json":
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=json.dumps({"workItems": []}), stderr=""
             )
@@ -925,7 +897,7 @@ def test_triage_audit_no_candidates_logs(tmp_path, monkeypatch, caplog):
     with caplog.at_level("INFO"):
         sched.start_command(spec)
 
-    assert calls == ["wl in_progress --json"]
+    assert calls == ["wl list --stage in_review --json"]
     assert any("no candidates" in message.lower() for message in caplog.messages)
 
 
@@ -1152,7 +1124,7 @@ def test_structured_audit_end_to_end(tmp_path, monkeypatch):
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
-        if cmd.strip() == "wl in_progress --json":
+        if cmd.strip() == "wl list --stage in_review --json":
             out = json.dumps(
                 {
                     "workItems": [
