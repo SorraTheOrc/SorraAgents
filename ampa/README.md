@@ -151,7 +151,7 @@ Quick manual test
 2. Run the metrics server in Python REPL or a tiny script:
 
 ```python
-from ampa.metrics import start_metrics_server
+from ampa.server import start_metrics_server
 start_metrics_server(port=8000)
 ```
 
@@ -162,7 +162,7 @@ start_metrics_server(port=8000)
 Integration test example (pytest)
 
 The repository includes integration tests that start the server on an ephemeral
-port. Run them with `pytest -q` and confirm the new `tests/test_metrics_and_health.py`
+port. Run them with `pytest -q` and confirm `tests/test_metrics_and_health.py`
 passes.
 
 GitHub sync

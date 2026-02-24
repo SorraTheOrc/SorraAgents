@@ -1,8 +1,9 @@
-"""Prometheus metrics and a combined /metrics + /health server for AMPA.
+"""AMPA HTTP server — combined /metrics, /health, /respond, /admin, /session.
 
-This module exposes three metrics required by the observability work-item and
-provides a small WSGI server that serves both `/metrics` and `/health` on the
-same port. Tests may start the server via `start_metrics_server`.
+This module provides the WSGI application and threaded server that exposes
+Prometheus metrics, health checks, the responder endpoint, admin fallback
+controls, and session state lookups. Tests may start the server via
+``start_metrics_server``.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from .conversation_manager import (
     TimedOutError,
 )
 
-_LOG = logging.getLogger("ampa.metrics")
+_LOG = logging.getLogger("ampa.server")
 
 # Registry-local metrics so they do not clash with external collectors during
 # tests or when the package is imported multiple times.

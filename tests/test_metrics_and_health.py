@@ -6,8 +6,8 @@ import urllib.request
 
 import pytest
 
-from ampa.metrics import start_metrics_server, ampa_heartbeat_sent_total
-from ampa.metrics import (
+from ampa.server import start_metrics_server, ampa_heartbeat_sent_total
+from ampa.server import (
     ampa_heartbeat_failure_total,
     ampa_last_heartbeat_timestamp_seconds,
 )

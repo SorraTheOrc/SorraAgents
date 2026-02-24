@@ -461,7 +461,7 @@ class TestEngineFallbackNewModes:
 
 
 class TestRespondAcceptRecommendation:
-    """Test the metrics.py /respond endpoint with accept-recommendation mode."""
+    """Test the server.py /respond endpoint with accept-recommendation mode."""
 
     def test_auto_accepts_recommendation_when_present(
         self, tmp_path, monkeypatch, _metrics_fixture
@@ -547,7 +547,7 @@ class TestRespondAcceptRecommendation:
 
 
 class TestRespondDiscussOptions:
-    """Test the metrics.py /respond endpoint with discuss-options mode."""
+    """Test the server.py /respond endpoint with discuss-options mode."""
 
     def test_discuss_options_falls_back_to_hold(
         self, tmp_path, monkeypatch, _metrics_fixture
@@ -699,8 +699,8 @@ def _post_json(url, payload):
 
 @pytest.fixture()
 def _metrics_fixture(monkeypatch):
-    """Start a metrics server; yield a factory that returns (base_url, server)."""
-    from ampa.metrics import start_metrics_server
+    """Start the AMPA server; yield a factory that returns (base_url, server)."""
+    from ampa.server import start_metrics_server
 
     servers = []
 
