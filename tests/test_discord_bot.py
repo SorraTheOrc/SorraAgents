@@ -593,7 +593,12 @@ class TestBuildView:
                     "style": "danger",
                 },
             ]
-            view = _build_view(comps)
+
+            # discord.ui.View requires a running asyncio event loop
+            async def _run():
+                return _build_view(comps)
+
+            view = asyncio.run(_run())
             assert view is not None
             assert len(view.children) == 2
         finally:
@@ -617,7 +622,12 @@ class TestBuildView:
                 "danger": discord.ButtonStyle.danger,
             }
             comps = [{"type": "button", "label": "OK", "custom_id": "test_ok"}]
-            view = _build_view(comps)
+
+            # discord.ui.View requires a running asyncio event loop
+            async def _run():
+                return _build_view(comps)
+
+            view = asyncio.run(_run())
             assert len(view.children) == 1
             assert view.children[0].style == discord.ButtonStyle.secondary
         finally:
