@@ -1190,8 +1190,11 @@ class Scheduler:
         self._record_run(spec, run, exit_code, output)
         # After recording run, perform any command-specific post actions
         if spec.command_id == "wl-triage-audit" or spec.command_type == "triage-audit":
-            # delegate triage-audit processing to extracted module
+            # Route triage-audit through the audit poller for candidate
+            # detection and cooldown filtering, then delegate audit execution
+            # to TriageAuditRunner via the handoff handler protocol.
             try:
+                from .audit_poller import PollerOutcome, poll_and_handoff
                 from .triage_audit import TriageAuditRunner
 
                 runner = TriageAuditRunner(
@@ -1199,12 +1202,33 @@ class Scheduler:
                     command_cwd=self.command_cwd,
                     store=self.store,
                 )
-                try:
-                    runner.run(spec, run, output)
-                except Exception:
-                    LOG.exception("TriageAuditRunner.run() failed")
+
+                def _audit_handler(work_item: dict) -> bool:
+                    """Adapter: delegates the pre-selected candidate to
+                    TriageAuditRunner for audit execution."""
+                    return runner.run(spec, run, output, work_item=work_item)
+
+                result = poll_and_handoff(
+                    run_shell=self.run_shell,
+                    cwd=self.command_cwd,
+                    store=self.store,
+                    spec=spec,
+                    handler=_audit_handler,
+                )
+
+                if result.outcome == PollerOutcome.query_failed:
+                    LOG.warning(
+                        "Audit poller query failed: %s", result.error or "(no detail)"
+                    )
+                elif result.outcome == PollerOutcome.no_candidates:
+                    LOG.info("Audit poller: no eligible candidates this cycle")
+                else:
+                    LOG.info(
+                        "Audit poller handed off candidate %s",
+                        result.selected_item_id,
+                    )
             except Exception:
-                LOG.exception("Failed to import/execute TriageAuditRunner")
+                LOG.exception("Failed to run audit poller / TriageAuditRunner")
             # triage-audit posts its own discord summary; avoid generic post
             return run
         if spec.command_type == "stale-delegation-watchdog":

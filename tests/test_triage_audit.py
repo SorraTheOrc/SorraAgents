@@ -293,7 +293,12 @@ def test_triage_audit_excludes_in_progress_items(tmp_path, monkeypatch):
 
 
 def test_per_status_cooldown_respected(tmp_path, monkeypatch):
-    """Verify per-status cooldowns: in_review cooldown allows re-audit when elapsed."""
+    """Verify store-based cooldown: items past cooldown are audited, items within cooldown are skipped.
+
+    The audit poller uses a single ``audit_cooldown_hours`` value (no
+    per-status overrides).  Items whose ``last_audit_at`` is older than
+    this threshold are eligible; items within the threshold are skipped.
+    """
     calls = []
     wid_fresh = "WID-FRESH"
     wid_recent = "WID-RECENT"
@@ -301,10 +306,10 @@ def test_per_status_cooldown_respected(tmp_path, monkeypatch):
     monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
     now = dt.datetime.now(dt.timezone.utc)
-    # last audit for wid_fresh: 3 hours ago (past the 1-hour in_review cooldown)
-    # last audit for wid_recent: 30 minutes ago (within the 1-hour in_review cooldown)
-    last_audit_fresh = (now - dt.timedelta(hours=3)).isoformat()
-    last_audit_recent = (now - dt.timedelta(minutes=30)).isoformat()
+    # last audit for wid_fresh: 7 hours ago (past the 6-hour cooldown)
+    # last audit for wid_recent: 3 hours ago (within the 6-hour cooldown)
+    last_audit_fresh = (now - dt.timedelta(hours=7)).isoformat()
+    last_audit_recent = (now - dt.timedelta(hours=3)).isoformat()
 
     def fake_run_shell(cmd, **kwargs):
         calls.append(cmd)
@@ -353,7 +358,7 @@ def test_per_status_cooldown_respected(tmp_path, monkeypatch):
 
     sched = make_scheduler(fake_run_shell, tmp_path)
 
-    # metadata sets in_review cooldown to 1 hour, default to 6 hours
+    # metadata sets cooldown to 6 hours (the poller uses a single cooldown)
     spec = CommandSpec(
         command_id="wl-triage-audit",
         command="true",
@@ -363,13 +368,12 @@ def test_per_status_cooldown_respected(tmp_path, monkeypatch):
         metadata={
             "truncate_chars": 65536,
             "audit_cooldown_hours": 6,
-            "audit_cooldown_hours_in_review": 1,
         },
         command_type="triage-audit",
     )
     sched.store.add_command(spec)
 
-    # persist last_audit timestamps: wid_fresh 3h ago, wid_recent 30min ago
+    # persist last_audit timestamps: wid_fresh 7h ago, wid_recent 3h ago
     sched.store.update_state(
         spec.command_id,
         {
@@ -384,9 +388,9 @@ def test_per_status_cooldown_respected(tmp_path, monkeypatch):
 
     sched.start_command(spec)
 
-    # wid_fresh: last audit 3h ago, in_review cooldown 1h → should be audited
+    # wid_fresh: last audit 7h ago, cooldown 6h → should be audited
     assert any(f"/audit {wid_fresh}" in c for c in calls)
-    # wid_recent: last audit 30min ago, in_review cooldown 1h → should be skipped
+    # wid_recent: last audit 3h ago, cooldown 6h → should be skipped
     assert not any(f"/audit {wid_recent}" in c for c in calls)
 
 
@@ -640,7 +644,12 @@ def test_triage_audit_no_candidates_logs(tmp_path, monkeypatch, caplog):
         sched.start_command(spec)
 
     assert calls == ["wl list --stage in_review --json"]
-    assert any("no candidates" in message.lower() for message in caplog.messages)
+    # The audit poller logs "no items in_review" and the scheduler logs
+    # "no eligible candidates" — check for either message indicating no work.
+    assert any(
+        "no items" in message.lower() or "no eligible candidates" in message.lower()
+        for message in caplog.messages
+    )
 
 
 def test_scheduler_run_once_unknown_command(tmp_path, monkeypatch, capsys):
