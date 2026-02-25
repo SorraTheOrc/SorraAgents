@@ -10,7 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import subprocess
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ampa.audit_poller import (
     AuditHandoffHandler,
@@ -19,6 +19,7 @@ from ampa.audit_poller import (
     _filter_by_cooldown,
     _query_candidates,
     _select_candidate,
+    poll_and_handoff,
 )
 
 
@@ -477,3 +478,190 @@ class TestSelectCandidate:
         result = _select_candidate(candidates)
         assert result is not None
         assert result["id"] in ("WL-1", "WL-2")
+
+
+# ---------------------------------------------------------------------------
+# poll_and_handoff
+# ---------------------------------------------------------------------------
+
+
+class _MockStore:
+    """Minimal mock for SchedulerStore."""
+
+    def __init__(self, state: Optional[Dict[str, Any]] = None):
+        self._states: Dict[str, Dict[str, Any]] = {}
+        if state is not None:
+            self._states["test-cmd"] = state
+
+    def get_state(self, command_id: str) -> Dict[str, Any]:
+        return dict(self._states.get(command_id, {}))
+
+    def update_state(self, command_id: str, state: Dict[str, Any]) -> None:
+        self._states[command_id] = dict(state)
+
+
+class _MockSpec:
+    """Minimal mock for CommandSpec."""
+
+    def __init__(
+        self,
+        command_id: str = "test-cmd",
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        self.command_id = command_id
+        self.metadata = metadata or {}
+
+
+class TestPollAndHandoff:
+    def test_full_flow_hands_off_candidate(self) -> None:
+        items = [
+            {"id": "WL-1", "title": "Item 1", "updatedAt": "2026-02-25T08:00:00Z"},
+        ]
+        handed: list[Dict[str, Any]] = []
+
+        def run_shell(cmd, **kw):
+            return _make_proc(stdout=json.dumps(items))
+
+        def handler(work_item):
+            handed.append(work_item)
+            return True
+
+        store = _MockStore()
+        spec = _MockSpec(metadata={"audit_cooldown_hours": 6})
+
+        result = poll_and_handoff(run_shell, "/tmp", store, spec, handler, now=_NOW)
+
+        assert result.outcome is PollerOutcome.handed_off
+        assert result.selected_item_id == "WL-1"
+        assert len(handed) == 1
+        assert handed[0]["id"] == "WL-1"
+
+    def test_persists_timestamp_before_handoff(self) -> None:
+        items = [{"id": "WL-5", "title": "X"}]
+        persist_order: list[str] = []
+
+        def run_shell(cmd, **kw):
+            return _make_proc(stdout=json.dumps(items))
+
+        class TrackingStore:
+            def __init__(self):
+                self.states: Dict[str, Any] = {}
+
+            def get_state(self, cid):
+                return dict(self.states.get(cid, {}))
+
+            def update_state(self, cid, state):
+                persist_order.append("store_updated")
+                self.states[cid] = dict(state)
+
+        def handler(work_item):
+            persist_order.append("handler_called")
+            return True
+
+        store = TrackingStore()
+        spec = _MockSpec()
+
+        result = poll_and_handoff(run_shell, "/tmp", store, spec, handler, now=_NOW)
+
+        assert result.outcome is PollerOutcome.handed_off
+        assert persist_order == ["store_updated", "handler_called"]
+        # Verify timestamp was actually written
+        state = store.states.get("test-cmd", {})
+        assert "WL-5" in state.get("last_audit_at_by_item", {})
+
+    def test_no_candidates_returns_no_candidates(self) -> None:
+        def run_shell(cmd, **kw):
+            return _make_proc(stdout="[]")
+
+        result = poll_and_handoff(
+            run_shell, "/tmp", _MockStore(), _MockSpec(), lambda w: True, now=_NOW
+        )
+        assert result.outcome is PollerOutcome.no_candidates
+        assert result.selected_item_id is None
+
+    def test_all_within_cooldown_returns_no_candidates(self) -> None:
+        items = [{"id": "WL-1", "title": "A"}]
+        one_hour_ago = (_NOW - dt.timedelta(hours=1)).isoformat()
+        store = _MockStore({"last_audit_at_by_item": {"WL-1": one_hour_ago}})
+
+        def run_shell(cmd, **kw):
+            return _make_proc(stdout=json.dumps(items))
+
+        result = poll_and_handoff(
+            run_shell,
+            "/tmp",
+            store,
+            _MockSpec(metadata={"audit_cooldown_hours": 6}),
+            lambda w: True,
+            now=_NOW,
+        )
+        assert result.outcome is PollerOutcome.no_candidates
+
+    def test_query_failure_returns_no_candidates(self) -> None:
+        """When wl list exits non-zero, _query_candidates returns [], which is
+        reported as no_candidates (not query_failed, since the function itself
+        doesn't distinguish)."""
+
+        def run_shell(cmd, **kw):
+            return _make_proc(returncode=1, stderr="fail")
+
+        result = poll_and_handoff(
+            run_shell, "/tmp", _MockStore(), _MockSpec(), lambda w: True, now=_NOW
+        )
+        # _query_candidates returns [] on non-zero exit, which maps to no_candidates
+        assert result.outcome is PollerOutcome.no_candidates
+
+    def test_handler_exception_still_returns_handed_off(self) -> None:
+        items = [{"id": "WL-99", "title": "Explode"}]
+
+        def run_shell(cmd, **kw):
+            return _make_proc(stdout=json.dumps(items))
+
+        def handler(work_item):
+            raise RuntimeError("handler boom")
+
+        result = poll_and_handoff(
+            run_shell, "/tmp", _MockStore(), _MockSpec(), handler, now=_NOW
+        )
+        assert result.outcome is PollerOutcome.handed_off
+        assert result.selected_item_id == "WL-99"
+
+    def test_selects_oldest_candidate(self) -> None:
+        items = [
+            {"id": "WL-new", "title": "New", "updatedAt": "2026-02-25T12:00:00Z"},
+            {"id": "WL-old", "title": "Old", "updatedAt": "2026-02-25T06:00:00Z"},
+        ]
+        handed: list[Dict[str, Any]] = []
+
+        def run_shell(cmd, **kw):
+            return _make_proc(stdout=json.dumps(items))
+
+        result = poll_and_handoff(
+            run_shell,
+            "/tmp",
+            _MockStore(),
+            _MockSpec(),
+            lambda w: handed.append(w) or True,
+            now=_NOW,
+        )
+        assert result.selected_item_id == "WL-old"
+
+    def test_default_cooldown_when_metadata_missing(self) -> None:
+        """When spec has no metadata, uses default cooldown of 6 hours."""
+        items = [{"id": "WL-1", "title": "A"}]
+        # Audited 3 hours ago - should be within default 6h cooldown
+        three_hours_ago = (_NOW - dt.timedelta(hours=3)).isoformat()
+        store = _MockStore({"last_audit_at_by_item": {"WL-1": three_hours_ago}})
+
+        def run_shell(cmd, **kw):
+            return _make_proc(stdout=json.dumps(items))
+
+        result = poll_and_handoff(
+            run_shell,
+            "/tmp",
+            store,
+            _MockSpec(metadata={}),
+            lambda w: True,
+            now=_NOW,
+        )
+        assert result.outcome is PollerOutcome.no_candidates

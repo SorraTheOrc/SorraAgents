@@ -315,3 +315,126 @@ def _select_candidate(
     )
 
     return sorted_candidates[0]
+
+
+# ---------------------------------------------------------------------------
+# Top-level orchestrator
+# ---------------------------------------------------------------------------
+
+
+def poll_and_handoff(
+    run_shell: Callable[..., subprocess.CompletedProcess],
+    cwd: str,
+    store: Any,
+    spec: Any,
+    handler: AuditHandoffHandler,
+    now: Optional[dt.datetime] = None,
+) -> PollerResult:
+    """Execute one polling cycle: query, filter, select, persist, handoff.
+
+    1. Query ``wl list --stage in_review --json`` for candidate items.
+    2. Filter candidates by store-based cooldown.
+    3. Select the oldest eligible candidate.
+    4. Persist ``last_audit_at`` to the store **before** calling the handler.
+    5. Hand off the selected candidate to *handler*.
+
+    This function never raises.  All errors are caught, logged, and returned
+    as a :class:`PollerResult` with the appropriate outcome.
+
+    Args:
+        run_shell: Callable that executes a shell command.
+        cwd: Working directory for shell commands.
+        store: A ``SchedulerStore`` instance with ``get_state()`` and
+            ``update_state()`` methods.
+        spec: A ``CommandSpec`` instance.  ``spec.command_id`` identifies the
+            state key; ``spec.metadata.get("audit_cooldown_hours", 6)``
+            provides the cooldown interval.
+        handler: An :class:`AuditHandoffHandler` that receives the selected
+            work item dict.
+        now: Override for the current UTC time (for testing).
+
+    Returns:
+        A :class:`PollerResult` describing the outcome.
+    """
+    if now is None:
+        now = dt.datetime.now(dt.timezone.utc)
+
+    # 1. Query candidates
+    candidates = _query_candidates(run_shell, cwd)
+    if candidates is None:
+        # _query_candidates returns [] on failure, but guard defensively
+        return PollerResult(
+            outcome=PollerOutcome.query_failed,
+            error="query returned None",
+        )
+
+    if not candidates:
+        LOG.info("Audit poller: no items in_review")
+        return PollerResult(outcome=PollerOutcome.no_candidates)
+
+    # 2. Read cooldown config
+    try:
+        meta = spec.metadata or {}
+    except Exception:
+        meta = {}
+    try:
+        cooldown_hours = int(meta.get("audit_cooldown_hours", 6))
+    except Exception:
+        cooldown_hours = 6
+
+    # 3. Read persisted state
+    try:
+        state = store.get_state(spec.command_id)
+        if not isinstance(state, dict):
+            state = dict(state or {})
+    except Exception:
+        LOG.exception("Failed to read scheduler store state")
+        state = {}
+
+    last_audit_by_item = state.get("last_audit_at_by_item", {})
+    if not isinstance(last_audit_by_item, dict):
+        last_audit_by_item = {}
+
+    # 4. Filter by cooldown
+    eligible = _filter_by_cooldown(candidates, last_audit_by_item, cooldown_hours, now)
+    if not eligible:
+        LOG.info("Audit poller: no candidates after cooldown filter")
+        return PollerResult(outcome=PollerOutcome.no_candidates)
+
+    # 5. Select oldest candidate
+    selected = _select_candidate(eligible)
+    if selected is None:
+        LOG.info("Audit poller: select_candidate returned None")
+        return PollerResult(outcome=PollerOutcome.no_candidates)
+
+    work_id = str(selected.get("id", ""))
+    if not work_id:
+        LOG.warning("Audit poller: selected candidate has no id")
+        return PollerResult(outcome=PollerOutcome.no_candidates)
+
+    title = selected.get("title") or selected.get("name") or "(no title)"
+    LOG.info("Audit poller: selected candidate %s — %s", work_id, title)
+
+    # 6. Persist timestamp BEFORE handoff
+    try:
+        state.setdefault("last_audit_at_by_item", {})
+        state["last_audit_at_by_item"][work_id] = now.isoformat()
+        store.update_state(spec.command_id, state)
+    except Exception:
+        LOG.exception(
+            "Failed to persist last_audit_at for %s; proceeding with handoff",
+            work_id,
+        )
+
+    # 7. Hand off to handler
+    try:
+        handler(selected)
+    except Exception:
+        LOG.exception(
+            "Audit handler raised for %s; timestamp already persisted", work_id
+        )
+
+    return PollerResult(
+        outcome=PollerOutcome.handed_off,
+        selected_item_id=work_id,
+    )
