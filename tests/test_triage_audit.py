@@ -668,6 +668,141 @@ def test_scheduler_run_once_unknown_command(tmp_path, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# Audit poller routing integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_triage_audit_runner_requires_work_item():
+    """TriageAuditRunner.run() raises TypeError when called without work_item."""
+    from ampa.triage_audit import TriageAuditRunner
+
+    runner = TriageAuditRunner(
+        run_shell=lambda *a, **kw: subprocess.CompletedProcess("", 0),
+        command_cwd="/tmp",
+        store=DummyStore(),
+    )
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={},
+        command_type="triage-audit",
+    )
+    import pytest
+
+    with pytest.raises(TypeError, match="requires a pre-selected work_item"):
+        runner.run(spec, None, None)
+
+
+def test_scheduler_handles_query_failure_gracefully(tmp_path, monkeypatch, caplog):
+    """When wl list fails, the scheduler logs the failure and returns without crashing."""
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
+
+    def fake_run_shell(cmd, **kwargs):
+        if cmd.strip() == "wl list --stage in_review --json":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1, stdout="", stderr="connection refused"
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"audit_cooldown_hours": 6},
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
+
+    with caplog.at_level("INFO"):
+        result = sched.start_command(spec)
+
+    # Should not crash; scheduler returns the run result
+    assert result is not None
+    # The poller logs a warning about the failed query
+    assert any(
+        "no items" in msg.lower()
+        or "no eligible candidates" in msg.lower()
+        or "query failed" in msg.lower()
+        for msg in caplog.messages
+    )
+
+
+def test_scheduler_poller_handler_end_to_end(tmp_path, monkeypatch):
+    """End-to-end: scheduler routes through poller, which selects a candidate and
+    hands it off to TriageAuditRunner for audit execution."""
+    calls = []
+    work_id = "END2END-ITEM"
+
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
+
+    def fake_run_shell(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd.strip() == "wl list --stage in_review --json":
+            out = json.dumps(
+                {
+                    "workItems": [
+                        {
+                            "id": work_id,
+                            "title": "E2E test item",
+                            "updated_at": (
+                                dt.datetime.now(dt.timezone.utc)
+                                - dt.timedelta(hours=10)
+                            ).isoformat(),
+                        }
+                    ]
+                }
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=out, stderr=""
+            )
+        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout="Summary:\nAudit passed, all criteria met.",
+                stderr="",
+            )
+        if cmd.strip().startswith("wl comment add"):
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps({"success": True}),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    sched = make_scheduler(fake_run_shell, tmp_path)
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"audit_cooldown_hours": 6, "truncate_chars": 65536},
+        command_type="triage-audit",
+    )
+    sched.store.add_command(spec)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
+
+    sched.start_command(spec)
+
+    # Verify the poller queried candidates
+    assert any("wl list --stage in_review --json" in c for c in calls)
+    # Verify the handler executed the audit command
+    assert any(f"/audit {work_id}" in c for c in calls)
+    # Verify the poller persisted the cooldown timestamp in the store
+    state = sched.store.get_state(spec.command_id)
+    assert work_id in state.get("last_audit_at_by_item", {})
+
+
+# ---------------------------------------------------------------------------
 # _get_github_repo / _build_github_issue_url tests
 # ---------------------------------------------------------------------------
 from ampa.triage_audit import _get_github_repo, _build_github_issue_url
