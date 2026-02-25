@@ -12,8 +12,13 @@ Work item: SA-0MLYEOG9V107HE1D
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Protocol, runtime_checkable
+import json
+import logging
+import subprocess
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
+
+LOG = logging.getLogger("ampa.audit_poller")
 
 
 # ---------------------------------------------------------------------------
@@ -102,3 +107,90 @@ class AuditHandoffHandler(Protocol):
             callers may use it for logging or metrics.
         """
         ...  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
+# Candidate query & normalization
+# ---------------------------------------------------------------------------
+
+
+def _query_candidates(
+    run_shell: Callable[..., subprocess.CompletedProcess],
+    cwd: str,
+    timeout: int = 60,
+) -> List[Dict[str, Any]]:
+    """Query ``wl list --stage in_review --json`` and return normalised items.
+
+    Handles multiple JSON response shapes:
+
+    - A bare list of work item dicts.
+    - A dict wrapping the list under ``workItems``, ``work_items``,
+      ``items``, ``data``, or any key ending with ``workitems``
+      (case-insensitive).
+
+    Deduplicates items by ID (``id``, ``work_item_id``, or ``work_item``
+    key).  Items without a recognisable ID are silently dropped.
+
+    This function never raises.  On any failure (non-zero exit code,
+    invalid JSON, unexpected structure) it logs the error and returns an
+    empty list.
+
+    Args:
+        run_shell: Callable that executes a shell command and returns a
+            ``subprocess.CompletedProcess`` instance.
+        cwd: Working directory for the shell command.
+        timeout: Maximum seconds for the shell command.
+
+    Returns:
+        A list of unique work item dicts, each guaranteed to have an
+        ``"id"`` key.
+    """
+    try:
+        proc = run_shell(
+            "wl list --stage in_review --json",
+            cwd=cwd,
+            timeout=timeout,
+        )
+    except Exception:
+        LOG.exception("wl list --stage in_review command failed to execute")
+        return []
+
+    if proc.returncode != 0:
+        LOG.warning(
+            "wl list --stage in_review exited with code %s: %s",
+            proc.returncode,
+            proc.stderr,
+        )
+        return []
+
+    try:
+        raw = json.loads(proc.stdout or "null")
+    except Exception:
+        LOG.exception("Failed to parse wl list --stage in_review output as JSON")
+        return []
+
+    items: List[Dict[str, Any]] = []
+
+    if isinstance(raw, list):
+        items.extend(raw)
+    elif isinstance(raw, dict):
+        for key in ("workItems", "work_items", "items", "data"):
+            val = raw.get(key)
+            if isinstance(val, list):
+                items.extend(val)
+                break
+        if not items:
+            for k, v in raw.items():
+                if isinstance(v, list) and k.lower().endswith("workitems"):
+                    items.extend(v)
+                    break
+
+    # Deduplicate by ID
+    unique: Dict[str, Dict[str, Any]] = {}
+    for it in items:
+        wid = it.get("id") or it.get("work_item_id") or it.get("work_item")
+        if not wid:
+            continue
+        unique[str(wid)] = {**it, "id": wid}
+
+    return list(unique.values())
