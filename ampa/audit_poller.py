@@ -11,6 +11,7 @@ Work item: SA-0MLYEOG9V107HE1D
 
 from __future__ import annotations
 
+import datetime as dt
 import enum
 import json
 import logging
@@ -194,3 +195,123 @@ def _query_candidates(
         unique[str(wid)] = {**it, "id": wid}
 
     return list(unique.values())
+
+
+# ---------------------------------------------------------------------------
+# Datetime helpers
+# ---------------------------------------------------------------------------
+
+
+def _from_iso(value: Optional[str]) -> Optional[dt.datetime]:
+    """Parse an ISO-8601 timestamp string, returning ``None`` on failure."""
+    if not value:
+        return None
+    try:
+        v = value
+        if isinstance(v, str) and v.endswith("Z"):
+            v = v[:-1] + "+00:00"
+        return dt.datetime.fromisoformat(v)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Cooldown filtering
+# ---------------------------------------------------------------------------
+
+
+def _filter_by_cooldown(
+    candidates: List[Dict[str, Any]],
+    last_audit_by_item: Dict[str, str],
+    cooldown_hours: int,
+    now: dt.datetime,
+) -> List[Dict[str, Any]]:
+    """Filter candidates by store-based cooldown.
+
+    For each candidate, look up ``last_audit_at_by_item[item_id]`` from the
+    scheduler store state.  If ``(now - last_audit_at) < cooldown_hours`` the
+    candidate is skipped.  Items exactly at the cooldown boundary **are**
+    eligible (exclusive comparison).  Items with no store entry are always
+    eligible.
+
+    Args:
+        candidates: Work item dicts as returned by :func:`_query_candidates`.
+        last_audit_by_item: Mapping of work item ID to ISO-8601 timestamp
+            string, as persisted in the scheduler store under the key
+            ``last_audit_at_by_item``.
+        cooldown_hours: Minimum hours between audits for the same item.
+        now: Current UTC datetime used for comparison.
+
+    Returns:
+        A list of candidates that have passed the cooldown check.
+    """
+    cooldown_delta = dt.timedelta(hours=cooldown_hours)
+    eligible: List[Dict[str, Any]] = []
+
+    for item in candidates:
+        wid = str(item.get("id", ""))
+        if not wid:
+            continue
+
+        last_audit_iso = last_audit_by_item.get(wid)
+        if last_audit_iso:
+            last_audit = _from_iso(last_audit_iso)
+            if last_audit is not None and (now - last_audit) < cooldown_delta:
+                continue
+
+        eligible.append(item)
+
+    return eligible
+
+
+# ---------------------------------------------------------------------------
+# Candidate selection & sorting
+# ---------------------------------------------------------------------------
+
+
+def _item_updated_ts(item: Dict[str, Any]) -> Optional[dt.datetime]:
+    """Extract and parse the ``updated_at`` timestamp from a work item dict.
+
+    Tries multiple key variants used by different ``wl`` output formats.
+    Returns ``None`` if no valid timestamp is found.
+    """
+    for key in (
+        "updatedAt",
+        "updated_at",
+        "last_updated_at",
+        "updated_ts",
+        "updated",
+        "last_update_ts",
+    ):
+        val = item.get(key)
+        if val:
+            parsed = _from_iso(val)
+            if parsed is not None:
+                return parsed
+            try:
+                return dt.datetime.fromisoformat(val)
+            except Exception:
+                continue
+    return None
+
+
+def _select_candidate(
+    candidates: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Sort candidates by ``updated_at`` ascending and return the oldest.
+
+    Items with no ``updated_at`` timestamp are sorted first (most likely to
+    be the oldest).  Returns ``None`` when the candidate list is empty.
+    """
+    if not candidates:
+        return None
+
+    sorted_candidates = sorted(
+        candidates,
+        key=lambda it: (
+            _item_updated_ts(it) is not None,
+            _item_updated_ts(it) or dt.datetime.fromtimestamp(0, dt.timezone.utc),
+        ),
+    )
+
+    return sorted_candidates[0]

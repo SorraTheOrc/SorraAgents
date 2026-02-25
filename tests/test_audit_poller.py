@@ -1,10 +1,13 @@
-"""Unit tests for the audit poller protocol, result types, and query logic.
+"""Unit tests for the audit poller protocol, result types, query, cooldown,
+and selection logic.
 
-Work items: SA-0MM2FCXG11VU3CV3, SA-0MM2FD8O70OBNOI6
+Work items: SA-0MM2FCXG11VU3CV3, SA-0MM2FD8O70OBNOI6, SA-0MM2FDM751UO1844,
+            SA-0MM2FDVGU1XMNPIB
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import subprocess
 from typing import Any, Dict
@@ -13,7 +16,9 @@ from ampa.audit_poller import (
     AuditHandoffHandler,
     PollerOutcome,
     PollerResult,
+    _filter_by_cooldown,
     _query_candidates,
+    _select_candidate,
 )
 
 
@@ -321,3 +326,154 @@ class TestQueryCandidates:
         assert len(received_kwargs) == 1
         assert received_kwargs[0]["cwd"] == "/my/project"
         assert received_kwargs[0]["timeout"] == 42
+
+
+# ---------------------------------------------------------------------------
+# _filter_by_cooldown
+# ---------------------------------------------------------------------------
+
+_NOW = dt.datetime(2026, 2, 25, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+
+class TestFilterByCooldown:
+    def test_all_eligible_no_store_entries(self) -> None:
+        candidates = [
+            {"id": "WL-1", "title": "A"},
+            {"id": "WL-2", "title": "B"},
+        ]
+        result = _filter_by_cooldown(candidates, {}, cooldown_hours=6, now=_NOW)
+        assert len(result) == 2
+
+    def test_all_within_cooldown(self) -> None:
+        # All items audited 1 hour ago, cooldown is 6 hours
+        one_hour_ago = (_NOW - dt.timedelta(hours=1)).isoformat()
+        store = {"WL-1": one_hour_ago, "WL-2": one_hour_ago}
+        candidates = [{"id": "WL-1"}, {"id": "WL-2"}]
+        result = _filter_by_cooldown(candidates, store, cooldown_hours=6, now=_NOW)
+        assert result == []
+
+    def test_none_within_cooldown(self) -> None:
+        # All items audited 10 hours ago, cooldown is 6 hours
+        ten_hours_ago = (_NOW - dt.timedelta(hours=10)).isoformat()
+        store = {"WL-1": ten_hours_ago, "WL-2": ten_hours_ago}
+        candidates = [{"id": "WL-1"}, {"id": "WL-2"}]
+        result = _filter_by_cooldown(candidates, store, cooldown_hours=6, now=_NOW)
+        assert len(result) == 2
+
+    def test_mixed_cooldown(self) -> None:
+        # WL-1 audited 1 hour ago (within cooldown), WL-2 10 hours ago (eligible)
+        store = {
+            "WL-1": (_NOW - dt.timedelta(hours=1)).isoformat(),
+            "WL-2": (_NOW - dt.timedelta(hours=10)).isoformat(),
+        }
+        candidates = [{"id": "WL-1"}, {"id": "WL-2"}]
+        result = _filter_by_cooldown(candidates, store, cooldown_hours=6, now=_NOW)
+        assert len(result) == 1
+        assert result[0]["id"] == "WL-2"
+
+    def test_exact_boundary_is_eligible(self) -> None:
+        # Exactly 6 hours ago with 6-hour cooldown -> eligible
+        exactly_at = (_NOW - dt.timedelta(hours=6)).isoformat()
+        store = {"WL-1": exactly_at}
+        candidates = [{"id": "WL-1"}]
+        result = _filter_by_cooldown(candidates, store, cooldown_hours=6, now=_NOW)
+        assert len(result) == 1
+
+    def test_just_under_boundary_is_filtered(self) -> None:
+        # 5h59m ago with 6-hour cooldown -> still in cooldown
+        just_under = (_NOW - dt.timedelta(hours=5, minutes=59)).isoformat()
+        store = {"WL-1": just_under}
+        candidates = [{"id": "WL-1"}]
+        result = _filter_by_cooldown(candidates, store, cooldown_hours=6, now=_NOW)
+        assert result == []
+
+    def test_missing_store_entry_is_eligible(self) -> None:
+        # WL-1 in store and within cooldown, WL-2 has no entry
+        store = {"WL-1": (_NOW - dt.timedelta(hours=1)).isoformat()}
+        candidates = [{"id": "WL-1"}, {"id": "WL-2"}]
+        result = _filter_by_cooldown(candidates, store, cooldown_hours=6, now=_NOW)
+        assert len(result) == 1
+        assert result[0]["id"] == "WL-2"
+
+    def test_invalid_iso_in_store_is_eligible(self) -> None:
+        store = {"WL-1": "not-a-date"}
+        candidates = [{"id": "WL-1"}]
+        result = _filter_by_cooldown(candidates, store, cooldown_hours=6, now=_NOW)
+        assert len(result) == 1
+
+    def test_z_suffix_timestamps(self) -> None:
+        # Z-suffix ISO format (common in JSON)
+        two_hours_ago = (_NOW - dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        store = {"WL-1": two_hours_ago}
+        candidates = [{"id": "WL-1"}]
+        result = _filter_by_cooldown(candidates, store, cooldown_hours=6, now=_NOW)
+        assert result == []  # 2 hours < 6 hours -> filtered
+
+    def test_empty_candidates(self) -> None:
+        result = _filter_by_cooldown([], {}, cooldown_hours=6, now=_NOW)
+        assert result == []
+
+    def test_items_without_id_are_dropped(self) -> None:
+        candidates = [{"title": "No ID"}]
+        result = _filter_by_cooldown(candidates, {}, cooldown_hours=6, now=_NOW)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _select_candidate
+# ---------------------------------------------------------------------------
+
+
+class TestSelectCandidate:
+    def test_empty_list_returns_none(self) -> None:
+        assert _select_candidate([]) is None
+
+    def test_single_candidate(self) -> None:
+        candidates = [{"id": "WL-1", "updatedAt": "2026-02-25T10:00:00Z"}]
+        result = _select_candidate(candidates)
+        assert result is not None
+        assert result["id"] == "WL-1"
+
+    def test_oldest_first(self) -> None:
+        candidates = [
+            {"id": "WL-new", "updatedAt": "2026-02-25T12:00:00Z"},
+            {"id": "WL-old", "updatedAt": "2026-02-25T08:00:00Z"},
+            {"id": "WL-mid", "updatedAt": "2026-02-25T10:00:00Z"},
+        ]
+        result = _select_candidate(candidates)
+        assert result is not None
+        assert result["id"] == "WL-old"
+
+    def test_no_timestamp_sorted_first(self) -> None:
+        candidates = [
+            {"id": "WL-ts", "updatedAt": "2026-02-25T10:00:00Z"},
+            {"id": "WL-no-ts"},
+        ]
+        result = _select_candidate(candidates)
+        assert result is not None
+        assert result["id"] == "WL-no-ts"
+
+    def test_updated_at_key_variant(self) -> None:
+        candidates = [
+            {"id": "WL-1", "updated_at": "2026-02-25T12:00:00Z"},
+            {"id": "WL-2", "updated_at": "2026-02-25T08:00:00Z"},
+        ]
+        result = _select_candidate(candidates)
+        assert result is not None
+        assert result["id"] == "WL-2"
+
+    def test_identical_timestamps_selects_one(self) -> None:
+        ts = "2026-02-25T10:00:00Z"
+        candidates = [
+            {"id": "WL-a", "updatedAt": ts},
+            {"id": "WL-b", "updatedAt": ts},
+        ]
+        result = _select_candidate(candidates)
+        assert result is not None
+        assert result["id"] in ("WL-a", "WL-b")
+
+    def test_all_missing_timestamps(self) -> None:
+        candidates = [{"id": "WL-1"}, {"id": "WL-2"}]
+        result = _select_candidate(candidates)
+        assert result is not None
+        assert result["id"] in ("WL-1", "WL-2")
