@@ -4,7 +4,8 @@ import datetime as dt
 from unittest.mock import MagicMock, patch
 
 from ampa import scheduler
-from ampa.scheduler import CommandSpec, SchedulerConfig, SchedulerStore, Scheduler
+from ampa.scheduler_types import CommandSpec, SchedulerConfig
+from ampa.scheduler import SchedulerStore, Scheduler
 from ampa import notifications as notifications_module
 from ampa.engine.core import EngineConfig, EngineResult, EngineStatus
 from ampa.engine.dispatch import DispatchResult

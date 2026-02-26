@@ -8,12 +8,14 @@ import sys
 import threading
 from unittest import mock
 
-from ampa.scheduler import (
+from ampa.scheduler_types import (
     CommandRunResult,
     CommandSpec,
     RunResult,
-    Scheduler,
     SchedulerConfig,
+)
+from ampa.scheduler import (
+    Scheduler,
     SchedulerStore,
 )
 from ampa.scheduler_cli import (

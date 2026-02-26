@@ -13,14 +13,16 @@ import datetime as dt
 import json
 import subprocess
 
-from ampa.scheduler import (
+from ampa.scheduler_types import (
     CommandRunResult,
     CommandSpec,
-    Scheduler,
     SchedulerConfig,
-    SchedulerStore,
-    _content_hash,
 )
+from ampa.scheduler import (
+    Scheduler,
+    SchedulerStore,
+)
+from ampa.delegation import _content_hash
 from ampa import notifications as notifications_module
 from ampa.engine.core import EngineConfig
 from ampa.engine.dispatch import DispatchResult

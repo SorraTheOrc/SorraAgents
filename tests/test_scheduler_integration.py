@@ -12,11 +12,13 @@ from unittest import mock
 
 import pytest
 
-from ampa.scheduler import (
+from ampa.scheduler_types import (
     CommandSpec,
     RunResult,
-    Scheduler,
     SchedulerConfig,
+)
+from ampa.scheduler import (
+    Scheduler,
     SchedulerStore,
 )
 

@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import pytest
 
 import ampa.scheduler as sched_mod
-from ampa.scheduler import Scheduler, SchedulerStore, SchedulerConfig
+from ampa.scheduler_types import SchedulerConfig
+from ampa.scheduler import Scheduler, SchedulerStore
 
 
 def test_post_startup_message_uses_wl_status(tmp_path, monkeypatch):

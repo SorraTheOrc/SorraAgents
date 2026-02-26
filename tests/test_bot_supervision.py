@@ -16,9 +16,9 @@ from unittest import mock
 
 import pytest
 
+from ampa.scheduler_types import SchedulerConfig
 from ampa.scheduler import (
     Scheduler,
-    SchedulerConfig,
     SchedulerStore,
 )
 

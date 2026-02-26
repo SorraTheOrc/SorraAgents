@@ -26,15 +26,17 @@ from unittest import mock
 
 import pytest
 
-from ampa.scheduler import (
+from ampa.scheduler_types import (
     CommandRunResult,
     CommandSpec,
     RunResult,
+    _utc_now,
+    _to_iso,
+)
+from ampa.scheduler import (
     Scheduler,
     SchedulerConfig,
     SchedulerStore,
-    _utc_now,
-    _to_iso,
 )
 
 
