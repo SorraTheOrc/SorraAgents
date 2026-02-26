@@ -1,7 +1,8 @@
-"""Tests for ampa.engine.dispatch — Dispatcher protocol, OpenCodeRunDispatcher, DryRunDispatcher."""
+"""Tests for ampa.engine.dispatch — Dispatcher protocol, OpenCodeRunDispatcher, ContainerDispatcher, DryRunDispatcher."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ampa.engine.dispatch import (
+    ContainerDispatcher,
     DispatchRecord,
     DispatchResult,
     Dispatcher,
@@ -501,3 +503,339 @@ class TestRealisticCommands:
             d.calls[2].command
             == 'opencode run "work on WL-3 using the implement skill"'
         )
+
+
+# ---------------------------------------------------------------------------
+# ContainerDispatcher tests
+# ---------------------------------------------------------------------------
+
+# Patch base path for all pool helpers so tests never touch real pool state.
+_POOL_MOD = "ampa.engine.dispatch"
+
+
+class TestContainerDispatcherProtocol:
+    """Verify ContainerDispatcher satisfies the Dispatcher protocol."""
+
+    def test_is_dispatcher(self):
+        d = ContainerDispatcher(project_root="/tmp/proj")
+        assert isinstance(d, Dispatcher)
+
+
+class TestContainerDispatcherSuccess:
+    """Tests for the successful container dispatch path."""
+
+    @patch(f"{_POOL_MOD}.subprocess.Popen")
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-0")
+    def test_successful_dispatch(self, mock_claim, mock_popen):
+        """dispatch() acquires container, spawns distrobox, returns success."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 7777
+        mock_popen.return_value = mock_proc
+
+        d = ContainerDispatcher(
+            project_root="/tmp/proj",
+            branch="feature/test",
+            clock=_fixed_clock,
+        )
+        result = d.dispatch(
+            command='opencode run "/intake WL-1"',
+            work_item_id="WL-1",
+        )
+
+        assert result.success is True
+        assert result.pid == 7777
+        assert result.container_id == "ampa-pool-0"
+        assert result.error is None
+        assert result.timestamp == FIXED_TIME
+        assert "distrobox enter ampa-pool-0" in result.command
+        assert 'opencode run "/intake WL-1"' in result.command
+
+    @patch(f"{_POOL_MOD}.subprocess.Popen")
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-2")
+    def test_popen_called_with_distrobox_command(self, mock_claim, mock_popen):
+        """Popen is called with the distrobox-wrapped command."""
+        mock_popen.return_value = MagicMock(pid=1)
+
+        d = ContainerDispatcher(
+            project_root="/my/project",
+            branch="main",
+            clock=_fixed_clock,
+        )
+        d.dispatch(command='opencode run "/plan WL-2"', work_item_id="WL-2")
+
+        args, kwargs = mock_popen.call_args
+        assert args[0] == 'distrobox enter ampa-pool-2 -- opencode run "/plan WL-2"'
+        assert kwargs["shell"] is True
+        assert kwargs["start_new_session"] is True
+        assert kwargs["stdout"] == subprocess.DEVNULL
+        assert kwargs["stderr"] == subprocess.DEVNULL
+        assert kwargs["stdin"] == subprocess.DEVNULL
+        assert kwargs["cwd"] == "/my/project"
+
+    @patch(f"{_POOL_MOD}.subprocess.Popen")
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-1")
+    def test_container_env_vars_set(self, mock_claim, mock_popen):
+        """Container env vars are injected into the subprocess environment."""
+        mock_popen.return_value = MagicMock(pid=1)
+
+        d = ContainerDispatcher(
+            project_root="/proj",
+            branch="feat/x",
+            env={"EXISTING": "value"},
+            clock=_fixed_clock,
+        )
+        d.dispatch(command="cmd", work_item_id="WL-3")
+
+        _, kwargs = mock_popen.call_args
+        env = kwargs["env"]
+        assert env["AMPA_CONTAINER_NAME"] == "ampa-pool-1"
+        assert env["AMPA_WORK_ITEM_ID"] == "WL-3"
+        assert env["AMPA_BRANCH"] == "feat/x"
+        assert env["AMPA_PROJECT_ROOT"] == "/proj"
+        # Also preserves the caller-supplied env
+        assert env["EXISTING"] == "value"
+
+    @patch(f"{_POOL_MOD}.subprocess.Popen")
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-0")
+    def test_claim_called_with_work_item_and_branch(self, mock_claim, mock_popen):
+        """_claim_pool_container is called with the correct arguments."""
+        mock_popen.return_value = MagicMock(pid=1)
+
+        d = ContainerDispatcher(
+            project_root="/p",
+            branch="wl-123-fix",
+            clock=_fixed_clock,
+        )
+        d.dispatch(command="cmd", work_item_id="WL-123")
+
+        mock_claim.assert_called_once_with("WL-123", "wl-123-fix")
+
+
+class TestContainerDispatcherPoolEmpty:
+    """Tests for the pool-empty failure path."""
+
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value=None)
+    def test_no_containers_available(self, mock_claim):
+        """dispatch() returns failed result when pool is empty."""
+        d = ContainerDispatcher(
+            project_root="/proj",
+            clock=_fixed_clock,
+        )
+        result = d.dispatch(command="cmd", work_item_id="WL-EMPTY")
+
+        assert result.success is False
+        assert result.pid is None
+        assert result.container_id is None
+        assert "No pool containers available" in result.error
+        assert result.work_item_id == "WL-EMPTY"
+        assert result.timestamp == FIXED_TIME
+
+    @patch(f"{_POOL_MOD}.subprocess.Popen")
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value=None)
+    def test_popen_not_called_when_pool_empty(self, mock_claim, mock_popen):
+        """Popen is never called when no container is available."""
+        d = ContainerDispatcher(clock=_fixed_clock)
+        d.dispatch(command="cmd", work_item_id="WL-EMPTY")
+
+        mock_popen.assert_not_called()
+
+
+class TestContainerDispatcherSpawnFailure:
+    """Tests for spawn failure with pool release."""
+
+    @patch(f"{_POOL_MOD}._release_pool_container")
+    @patch(f"{_POOL_MOD}.subprocess.Popen")
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-0")
+    def test_file_not_found_releases_container(
+        self, mock_claim, mock_popen, mock_release
+    ):
+        """FileNotFoundError releases the container and returns failure."""
+        mock_popen.side_effect = FileNotFoundError("distrobox: not found")
+
+        d = ContainerDispatcher(
+            project_root="/proj",
+            clock=_fixed_clock,
+        )
+        result = d.dispatch(command="cmd", work_item_id="WL-FAIL1")
+
+        assert result.success is False
+        assert "FileNotFoundError" in result.error
+        assert result.container_id == "ampa-pool-0"
+        mock_release.assert_called_once_with("ampa-pool-0")
+
+    @patch(f"{_POOL_MOD}._release_pool_container")
+    @patch(f"{_POOL_MOD}.subprocess.Popen")
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-1")
+    def test_permission_error_releases_container(
+        self, mock_claim, mock_popen, mock_release
+    ):
+        """PermissionError releases the container and returns failure."""
+        mock_popen.side_effect = PermissionError("denied")
+
+        d = ContainerDispatcher(clock=_fixed_clock)
+        result = d.dispatch(command="cmd", work_item_id="WL-FAIL2")
+
+        assert result.success is False
+        assert "PermissionError" in result.error
+        assert result.container_id == "ampa-pool-1"
+        mock_release.assert_called_once_with("ampa-pool-1")
+
+    @patch(f"{_POOL_MOD}._release_pool_container")
+    @patch(f"{_POOL_MOD}.subprocess.Popen")
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-2")
+    def test_os_error_releases_container(self, mock_claim, mock_popen, mock_release):
+        """OSError releases the container and returns failure."""
+        mock_popen.side_effect = OSError("Too many open files")
+
+        d = ContainerDispatcher(clock=_fixed_clock)
+        result = d.dispatch(command="cmd", work_item_id="WL-FAIL3")
+
+        assert result.success is False
+        assert "OSError" in result.error
+        assert result.container_id == "ampa-pool-2"
+        mock_release.assert_called_once_with("ampa-pool-2")
+
+    @patch(f"{_POOL_MOD}._release_pool_container")
+    @patch(f"{_POOL_MOD}.subprocess.Popen")
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-0")
+    def test_failure_preserves_command_and_id(
+        self, mock_claim, mock_popen, mock_release
+    ):
+        """Failed result preserves the distrobox command and work item ID."""
+        mock_popen.side_effect = OSError("bad")
+
+        d = ContainerDispatcher(clock=_fixed_clock)
+        result = d.dispatch(command="opencode run x", work_item_id="WL-META")
+
+        assert "distrobox enter ampa-pool-0 -- opencode run x" in result.command
+        assert result.work_item_id == "WL-META"
+        assert result.timestamp == FIXED_TIME
+
+
+class TestContainerDispatcherTimeout:
+    """Tests for AMPA_CONTAINER_DISPATCH_TIMEOUT configuration."""
+
+    def test_default_timeout(self):
+        """Default timeout is 30 seconds."""
+        d = ContainerDispatcher(clock=_fixed_clock)
+        assert d._timeout == 30
+
+    def test_constructor_timeout(self):
+        """Constructor timeout overrides default."""
+        d = ContainerDispatcher(timeout=60, clock=_fixed_clock)
+        assert d._timeout == 60
+
+    @patch.dict("os.environ", {"AMPA_CONTAINER_DISPATCH_TIMEOUT": "120"})
+    def test_env_var_timeout(self):
+        """AMPA_CONTAINER_DISPATCH_TIMEOUT env var overrides constructor."""
+        d = ContainerDispatcher(timeout=60, clock=_fixed_clock)
+        assert d._timeout == 120
+
+    @patch.dict("os.environ", {"AMPA_CONTAINER_DISPATCH_TIMEOUT": "not-a-number"})
+    def test_invalid_env_var_falls_back(self):
+        """Invalid env var falls back to constructor / default."""
+        d = ContainerDispatcher(timeout=45, clock=_fixed_clock)
+        assert d._timeout == 45
+
+
+# ---------------------------------------------------------------------------
+# Pool helper unit tests (module-level functions)
+# ---------------------------------------------------------------------------
+
+
+class TestPoolHelpers:
+    """Tests for the pool state read/write/claim/release helpers."""
+
+    def test_read_pool_state_missing_file(self, tmp_path):
+        """Returns empty dict when pool-state.json doesn't exist."""
+        from ampa.engine.dispatch import _read_pool_state
+
+        with patch(
+            f"{_POOL_MOD}._pool_state_path", return_value=tmp_path / "nope.json"
+        ):
+            assert _read_pool_state() == {}
+
+    def test_read_pool_state_valid(self, tmp_path):
+        """Returns parsed JSON when file exists."""
+        from ampa.engine.dispatch import _read_pool_state
+
+        state_file = tmp_path / "pool-state.json"
+        state_file.write_text(json.dumps({"ampa-pool-0": {"workItemId": "WL-1"}}))
+
+        with patch(f"{_POOL_MOD}._pool_state_path", return_value=state_file):
+            state = _read_pool_state()
+            assert state["ampa-pool-0"]["workItemId"] == "WL-1"
+
+    def test_read_pool_state_invalid_json(self, tmp_path):
+        """Returns empty dict on invalid JSON."""
+        from ampa.engine.dispatch import _read_pool_state
+
+        state_file = tmp_path / "pool-state.json"
+        state_file.write_text("{bad json")
+
+        with patch(f"{_POOL_MOD}._pool_state_path", return_value=state_file):
+            assert _read_pool_state() == {}
+
+    def test_save_pool_state(self, tmp_path):
+        """Writes pool state to disk."""
+        from ampa.engine.dispatch import _save_pool_state
+
+        state_file = tmp_path / "subdir" / "pool-state.json"
+
+        with patch(f"{_POOL_MOD}._pool_state_path", return_value=state_file):
+            _save_pool_state({"ampa-pool-0": {"workItemId": "WL-X"}})
+
+        assert state_file.exists()
+        loaded = json.loads(state_file.read_text())
+        assert loaded["ampa-pool-0"]["workItemId"] == "WL-X"
+
+    @patch(
+        f"{_POOL_MOD}._existing_pool_containers",
+        return_value={"ampa-pool-0", "ampa-pool-1"},
+    )
+    @patch(
+        f"{_POOL_MOD}._read_pool_state",
+        return_value={"ampa-pool-0": {"workItemId": "WL-BUSY"}},
+    )
+    def test_list_available_pool(self, mock_state, mock_existing):
+        """Returns containers that exist but are not claimed."""
+        from ampa.engine.dispatch import _list_available_pool
+
+        available = _list_available_pool()
+        assert "ampa-pool-1" in available
+        assert "ampa-pool-0" not in available
+
+    @patch(f"{_POOL_MOD}._save_pool_state")
+    @patch(f"{_POOL_MOD}._read_pool_state", return_value={})
+    @patch(f"{_POOL_MOD}._list_available_pool", return_value=["ampa-pool-0"])
+    def test_claim_pool_container_success(self, mock_avail, mock_read, mock_save):
+        """Claims the first available container and writes state."""
+        from ampa.engine.dispatch import _claim_pool_container
+
+        name = _claim_pool_container("WL-42", "feat/x")
+        assert name == "ampa-pool-0"
+        mock_save.assert_called_once()
+        saved_state = mock_save.call_args[0][0]
+        assert saved_state["ampa-pool-0"]["workItemId"] == "WL-42"
+        assert saved_state["ampa-pool-0"]["branch"] == "feat/x"
+
+    @patch(f"{_POOL_MOD}._list_available_pool", return_value=[])
+    def test_claim_pool_container_empty(self, mock_avail):
+        """Returns None when no containers are available."""
+        from ampa.engine.dispatch import _claim_pool_container
+
+        assert _claim_pool_container("WL-99", "main") is None
+
+    @patch(f"{_POOL_MOD}._save_pool_state")
+    @patch(
+        f"{_POOL_MOD}._read_pool_state",
+        return_value={"ampa-pool-0": {"workItemId": "WL-1"}},
+    )
+    def test_release_pool_container(self, mock_read, mock_save):
+        """Removes the container claim from pool state."""
+        from ampa.engine.dispatch import _release_pool_container
+
+        _release_pool_container("ampa-pool-0")
+        mock_save.assert_called_once()
+        saved_state = mock_save.call_args[0][0]
+        assert "ampa-pool-0" not in saved_state
