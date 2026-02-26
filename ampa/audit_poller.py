@@ -149,6 +149,10 @@ def _query_candidates(
     try:
         proc = run_shell(
             "wl list --stage in_review --json",
+            shell=True,
+            check=False,
+            capture_output=True,
+            text=True,
             cwd=cwd,
             timeout=timeout,
         )

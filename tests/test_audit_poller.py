@@ -328,6 +328,22 @@ class TestQueryCandidates:
         assert received_kwargs[0]["cwd"] == "/my/project"
         assert received_kwargs[0]["timeout"] == 42
 
+    def test_passes_shell_true(self) -> None:
+        """Verify shell=True is passed so the command string is interpreted
+        by the shell rather than treated as a literal executable path."""
+        received_kwargs: list[dict] = []
+
+        def run_shell(cmd, **kw):
+            received_kwargs.append(kw)
+            return _make_proc(stdout="[]")
+
+        _query_candidates(run_shell, "/tmp")
+        assert len(received_kwargs) == 1
+        assert received_kwargs[0].get("shell") is True, (
+            "_query_candidates must pass shell=True to run_shell; "
+            "without it subprocess.run treats the string as a filename"
+        )
+
 
 # ---------------------------------------------------------------------------
 # _filter_by_cooldown
