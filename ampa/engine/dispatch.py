@@ -46,6 +46,8 @@ class DispatchResult:
         command: The shell command that was (or would have been) executed.
         work_item_id: The work item ID being dispatched.
         timestamp: When the dispatch occurred (UTC).
+        container_id: Optional container identifier when the session was
+            dispatched inside a container (e.g. Podman/Distrobox).
     """
 
     success: bool
@@ -54,15 +56,17 @@ class DispatchResult:
     timestamp: datetime
     pid: int | None = None
     error: str | None = None
+    container_id: str | None = None
 
     @property
     def summary(self) -> str:
         """One-line human-readable summary."""
         if self.success:
-            return (
-                f"Dispatched {self.work_item_id} (pid={self.pid}) "
-                f"at {self.timestamp.isoformat()}"
-            )
+            parts = [f"Dispatched {self.work_item_id} (pid={self.pid}"]
+            if self.container_id is not None:
+                parts.append(f", container={self.container_id}")
+            parts.append(f") at {self.timestamp.isoformat()}")
+            return "".join(parts)
         return (
             f"Dispatch failed for {self.work_item_id}: {self.error} "
             f"at {self.timestamp.isoformat()}"

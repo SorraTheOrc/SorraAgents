@@ -96,6 +96,73 @@ class TestDispatchResult:
         with pytest.raises(AttributeError):
             r.success = False  # type: ignore[misc]
 
+    def test_container_id_default_none(self):
+        """container_id defaults to None when not provided."""
+        r = DispatchResult(
+            success=True,
+            command="cmd",
+            work_item_id="WL-CID-1",
+            timestamp=FIXED_TIME,
+            pid=100,
+        )
+        assert r.container_id is None
+
+    def test_container_id_set(self):
+        """container_id is stored when explicitly provided."""
+        r = DispatchResult(
+            success=True,
+            command="cmd",
+            work_item_id="WL-CID-2",
+            timestamp=FIXED_TIME,
+            pid=200,
+            container_id="abc123def456",
+        )
+        assert r.container_id == "abc123def456"
+
+    def test_summary_with_container_id(self):
+        """summary includes container_id when present."""
+        r = DispatchResult(
+            success=True,
+            command="cmd",
+            work_item_id="WL-CID-3",
+            timestamp=FIXED_TIME,
+            pid=300,
+            container_id="ctr-xyz",
+        )
+        s = r.summary
+        assert "WL-CID-3" in s
+        assert "pid=300" in s
+        assert "container=ctr-xyz" in s
+        assert "Dispatched" in s
+
+    def test_summary_without_container_id(self):
+        """summary omits container when container_id is None."""
+        r = DispatchResult(
+            success=True,
+            command="cmd",
+            work_item_id="WL-CID-4",
+            timestamp=FIXED_TIME,
+            pid=400,
+        )
+        s = r.summary
+        assert "container" not in s
+        assert "pid=400" in s
+
+    def test_summary_failure_ignores_container_id(self):
+        """Failed dispatch summary does not mention container_id."""
+        r = DispatchResult(
+            success=False,
+            command="cmd",
+            work_item_id="WL-CID-5",
+            timestamp=FIXED_TIME,
+            error="boom",
+            container_id="should-not-appear",
+        )
+        s = r.summary
+        assert "boom" in s
+        assert "failed" in s
+        assert "should-not-appear" not in s
+
 
 # ---------------------------------------------------------------------------
 # Protocol conformance
