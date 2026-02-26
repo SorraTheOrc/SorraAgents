@@ -596,6 +596,65 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _cli_config(args: argparse.Namespace) -> int:
+    """Persist operator configuration into the scheduler store.
+
+    Usage: `wl ampa config [--auto-assign-enabled yes|no]`
+
+    If `--auto-assign-enabled` is provided, write the value into the
+    delegation command's metadata as `auto_assign_enabled`. If the
+    delegation command is missing, register a minimal delegation command
+    and set the metadata.
+    If no flag is provided, print the current effective value.
+    """
+    store = _store_from_env()
+    spec = store.get_command("delegation")
+    if spec is None:
+        # Create a minimal delegation command spec so the operator toggle
+        # has a canonical home in the scheduler store.
+        spec = CommandSpec(
+            command_id="delegation",
+            command="",
+            requires_llm=False,
+            frequency_minutes=1,
+            priority=0,
+            metadata={},
+            title="Delegation Report",
+            command_type="delegation",
+        )
+        store.add_command(spec)
+
+    meta = spec.metadata if isinstance(spec.metadata, dict) else {}
+    val = getattr(args, "auto_assign_enabled", None)
+    if val is None:
+        # Show current value
+        current = meta.get("auto_assign_enabled")
+        if current is None:
+            # Fall back to legacy audit_only for operators who haven't set the new flag
+            current = meta.get("audit_only")
+        print(f"auto_assign_enabled: {current}")
+        return 0
+
+    # Normalize input
+    normalized = str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+    meta["auto_assign_enabled"] = normalized
+    # Persist change
+    spec = CommandSpec(
+        command_id=spec.command_id,
+        command=spec.command,
+        requires_llm=spec.requires_llm,
+        frequency_minutes=spec.frequency_minutes,
+        priority=spec.priority,
+        metadata=meta,
+        title=spec.title,
+        max_runtime_minutes=spec.max_runtime_minutes,
+        command_type=spec.command_type,
+    )
+    store.update_command(spec)
+    print(f"Set auto_assign_enabled={normalized} on command 'delegation'")
+    return 0
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
@@ -614,6 +673,7 @@ def main() -> None:
         "update": _cli_update,
         "remove": _cli_remove,
         "delegation": _cli_dry_run,
+        "config": _cli_config,
         "run-once": lambda a: _cli_run(a),
         "run": _cli_run,
     }

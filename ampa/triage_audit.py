@@ -175,14 +175,47 @@ class TriageAuditRunner:
         self.command_cwd = command_cwd
         self.store = store
 
-    def run(self, spec: Any, run: Any, output: Optional[str]) -> bool:
-        # This method is intentionally a close copy of the original
-        # Scheduler._run_triage_audit implementation. It was preserved to
-        # keep behavioural parity during refactor.
-        try:
-            default_cooldown_hours = int(spec.metadata.get("audit_cooldown_hours", 6))
-        except Exception:
-            default_cooldown_hours = 6
+    def run(
+        self,
+        spec: Any,
+        run: Any,
+        output: Optional[str],
+        *,
+        work_item: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Execute audit processing for a single work item.
+
+        When *work_item* is provided (the expected path when invoked via
+        :func:`audit_poller.poll_and_handoff`), detection and cooldown
+        filtering are skipped — the caller has already selected the
+        candidate and persisted the ``last_audit_at`` timestamp.
+
+        When *work_item* is ``None`` (legacy path), this method raises
+        ``TypeError`` to signal that the old call convention is no longer
+        supported.  Callers must use the audit poller to select candidates.
+
+        Args:
+            spec: A ``CommandSpec`` instance.
+            run: The ``CommandRun`` / ``CommandRunResult`` from the
+                scheduler.
+            output: Raw stdout from the scheduler command (may be
+                ``None``).
+            work_item: A dict representing the pre-selected work item
+                (as returned by ``wl list --json``).  Must contain at
+                least ``"id"`` and ``"title"`` keys.
+
+        Returns:
+            ``True`` if audit processing completed, ``False`` on error.
+
+        Raises:
+            TypeError: If *work_item* is ``None``.
+        """
+        if work_item is None:
+            raise TypeError(
+                "TriageAuditRunner.run() requires a pre-selected work_item dict. "
+                "Use audit_poller.poll_and_handoff() for candidate detection."
+            )
+
         try:
             truncate_chars = int(spec.metadata.get("truncate_chars", 65536))
         except Exception:
@@ -232,195 +265,15 @@ class TriageAuditRunner:
             return proc
 
         try:
-            items: List[Dict[str, Any]] = []
-
-            proc = _call("wl list --stage in_review --json")
-            if proc.returncode != 0:
-                LOG.warning("wl list --stage in_review failed: %s", proc.stderr)
-            else:
-                try:
-                    raw = json.loads(proc.stdout or "null")
-                except Exception:
-                    LOG.exception("Failed to parse wl list --stage in_review output")
-                    raw = None
-                if isinstance(raw, list):
-                    items.extend(raw)
-                elif isinstance(raw, dict):
-                    for key in ("workItems", "work_items", "items", "data"):
-                        val = raw.get(key)
-                        if isinstance(val, list):
-                            items.extend(val)
-                            break
-                    if not items:
-                        for k, v in raw.items():
-                            if isinstance(v, list) and k.lower().endswith("workitems"):
-                                items.extend(v)
-                                break
-
-            unique: Dict[str, Dict[str, Any]] = {}
-            for it in items:
-                wid = it.get("id") or it.get("work_item_id") or it.get("work_item")
-                if not wid:
-                    continue
-                unique[str(wid)] = {**it, "id": wid}
-            items = list(unique.values())
-
-            if not items:
-                LOG.info("Triage audit found no candidates")
-                return False
-
-            def _item_updated_ts(it: Dict[str, Any]) -> Optional[dt.datetime]:
-                for k in (
-                    "updated_at",
-                    "last_updated_at",
-                    "updated_ts",
-                    "updated",
-                    "last_update_ts",
-                ):
-                    v = it.get(k)
-                    if v:
-                        try:
-                            return _from_iso(v)
-                        except Exception:
-                            try:
-                                return dt.datetime.fromisoformat(v)
-                            except Exception:
-                                continue
-                return None
-
             now = _utc_now()
 
-            def _get_cooldown_hours_for_item(it: Dict[str, Any]) -> int:
-                try:
-                    meta = spec.metadata or {}
-                except Exception:
-                    meta = {}
-
-                def _int_meta(key: str, fallback: int) -> int:
-                    try:
-                        val = meta.get(key, None)
-                        if val is None:
-                            return int(fallback)
-                        return int(val)
-                    except Exception:
-                        return int(fallback)
-
-                status = (
-                    it.get("status") or it.get("state") or it.get("stage") or ""
-                ).lower()
-                if status == "in_review":
-                    return _int_meta(
-                        "audit_cooldown_hours_in_review", default_cooldown_hours
-                    )
-                return default_cooldown_hours
-
-            candidates: List[tuple] = []
-            persisted_state = self.store.get_state(spec.command_id)
-            persisted_by_item = (
-                persisted_state.get("last_audit_at_by_item", {})
-                if isinstance(persisted_state, dict)
-                else {}
-            )
-
-            for it in items:
-                wid = it.get("id") or it.get("work_item_id") or it.get("work_item")
-                if not wid:
-                    continue
-
-                last_audit: Optional[dt.datetime] = None
-                try:
-                    proc_c = _call(f"wl comment list {wid} --json")
-                    if proc_c.returncode == 0 and proc_c.stdout:
-                        try:
-                            raw_comments = json.loads(proc_c.stdout)
-                        except Exception:
-                            raw_comments = []
-                        comments = []
-                        if isinstance(raw_comments, list):
-                            comments = raw_comments
-                        elif isinstance(raw_comments, dict):
-                            for key in ("comments", "items", "data"):
-                                val = raw_comments.get(key)
-                                if isinstance(val, list):
-                                    comments = val
-                                    break
-                        for c in comments:
-                            body = (
-                                c.get("comment") or c.get("body") or c.get("text") or ""
-                            )
-                            if not body:
-                                continue
-                            if "# AMPA Audit Result" not in body:
-                                continue
-                            cand_ts = None
-                            for key in (
-                                "createdAt",
-                                "created_at",
-                                "created_ts",
-                                "created",
-                                "ts",
-                                "timestamp",
-                            ):
-                                v = c.get(key)
-                                if v is None:
-                                    for k2, v2 in c.items():
-                                        if k2.lower() == key.lower():
-                                            v = v2
-                                            break
-                                if v:
-                                    try:
-                                        cand_ts = _from_iso(v)
-                                    except Exception:
-                                        try:
-                                            cand_ts = dt.datetime.fromisoformat(v)
-                                        except Exception:
-                                            cand_ts = None
-                                    if cand_ts is not None:
-                                        break
-                            if cand_ts is None:
-                                continue
-                            if last_audit is None or cand_ts > last_audit:
-                                last_audit = cand_ts
-                except Exception:
-                    LOG.exception("Failed to list comments for %s", wid)
-
-                try:
-                    pst = persisted_by_item.get(wid)
-                    pdt = _from_iso(pst) if pst else None
-                    if pdt is not None and (last_audit is None or pdt > last_audit):
-                        last_audit = pdt
-                except Exception:
-                    LOG.debug("Failed to parse persisted last_audit for %s", wid)
-
-                try:
-                    cooldown_hours_for_item = _get_cooldown_hours_for_item(it)
-                except Exception:
-                    cooldown_hours_for_item = default_cooldown_hours
-                cooldown_delta = dt.timedelta(hours=cooldown_hours_for_item)
-
-                if last_audit is not None and (now - last_audit) < cooldown_delta:
-                    continue
-
-                updated = _item_updated_ts(it)
-                candidates.append((updated, {**it, "id": wid}))
-
-            if not candidates:
-                LOG.info("Triage audit found no candidates after cooldown filter")
-                return False
-
-            candidates.sort(
-                key=lambda t: (
-                    t[0] is not None,
-                    t[0] or dt.datetime.fromtimestamp(0, dt.timezone.utc),
-                )
-            )
-            selected = candidates[0][1]
-            work_id = str(selected.get("id") or "")
+            # Extract work item identity from the pre-selected candidate
+            work_id = str(work_item.get("id") or "")
             if not work_id:
-                LOG.warning("Triage audit candidate missing id")
+                LOG.warning("Triage audit: work_item dict missing id")
                 return False
-            title = selected.get("title") or selected.get("name") or "(no title)"
-            LOG.info("Selected triage candidate %s — %s", work_id, title)
+            title = work_item.get("title") or work_item.get("name") or "(no title)"
+            LOG.info("Running audit for pre-selected candidate %s — %s", work_id, title)
 
             audit_cmd = f'opencode run "/audit {work_id}"'
             LOG.info("Running audit command: %s", audit_cmd)
@@ -770,15 +623,11 @@ class TriageAuditRunner:
                             "Failed to verify posted WL comment for %s", work_id
                         )
 
-            try:
-                state = self.store.get_state(spec.command_id)
-                if not isinstance(state, dict):
-                    state = dict(state or {})
-                state.setdefault("last_audit_at_by_item", {})
-                state["last_audit_at_by_item"][work_id] = _to_iso(now)
-                self.store.update_state(spec.command_id, state)
-            except Exception:
-                LOG.exception("Failed to persist last_audit_at_by_item for %s", work_id)
+            # NOTE: last_audit_at_by_item persistence is now handled by the
+            # audit poller (audit_poller.poll_and_handoff) *before* this
+            # handler is called.  The store write has been intentionally
+            # removed from here to avoid double-writes and to keep the
+            # poller as the single source of truth for cooldown timestamps.
 
             try:
                 proc_show = _call(f"wl show {work_id} --json")

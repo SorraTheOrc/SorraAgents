@@ -766,15 +766,33 @@ class DelegationOrchestrator:
 
         notif = self._notifications_module
 
-        LOG.info(
-            "Handling delegation command: %s (audit_only=%s)",
-            spec.command_id,
-            _bool_meta(spec.metadata.get("audit_only")),
-        )
+        # Determine effective audit-only behaviour.  If an operator has set
+        # an explicit `auto_assign_enabled` flag in the delegation command
+        # metadata, treat that as authoritative (present -> controls live
+        # promotions).  Otherwise fall back to the legacy `audit_only`
+        # metadata for backwards compatibility.
+        meta = spec.metadata if isinstance(spec.metadata, dict) else {}
+        if "auto_assign_enabled" in meta:
+            # auto_assign_enabled == True -> live promotions allowed
+            audit_only_effective = not _bool_meta(meta.get("auto_assign_enabled"))
+            LOG.info(
+                "Handling delegation command: %s (auto_assign_enabled=%s -> audit_only=%s)",
+                spec.command_id,
+                _bool_meta(meta.get("auto_assign_enabled")),
+                audit_only_effective,
+            )
+        else:
+            audit_only_effective = _bool_meta(meta.get("audit_only"))
+            LOG.info(
+                "Handling delegation command: %s (audit_only=%s)",
+                spec.command_id,
+                _bool_meta(meta.get("audit_only")),
+            )
         # Inspect current state first. If there is a candidate that will be
         # dispatched we want to avoid sending the pre-dispatch report to
         # Discord (otherwise operators see two nearly-identical messages).
-        audit_only = _bool_meta(spec.metadata.get("audit_only"))
+        # Use the computed effective audit-only value for gating
+        audit_only = audit_only_effective
         inspect = self._inspect_idle_delegation()
         status = inspect.get("status")
 
