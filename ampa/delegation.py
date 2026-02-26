@@ -24,6 +24,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .engine.candidates import CandidateSelector
 from .engine.core import Engine, EngineResult, EngineStatus
+from .scheduler_types import (
+    _utc_now,
+    _from_iso,
+    _bool_meta,
+    CommandRunResult,
+    RunResult,
+)
 
 LOG = logging.getLogger("ampa.delegation")
 
@@ -31,22 +38,6 @@ LOG = logging.getLogger("ampa.delegation")
 # ---------------------------------------------------------------------------
 # Utility / formatting helpers
 # ---------------------------------------------------------------------------
-
-
-def _utc_now() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
-
-
-def _from_iso(value: Optional[str]) -> Optional[dt.datetime]:
-    if not value:
-        return None
-    try:
-        v = value
-        if isinstance(v, str) and v.endswith("Z"):
-            v = v[:-1] + "+00:00"
-        return dt.datetime.fromisoformat(v)
-    except Exception:
-        return None
 
 
 def _trim_text(value: Optional[str]) -> str:
@@ -760,10 +751,6 @@ class DelegationOrchestrator:
         RunResult
             An updated RunResult with delegation metadata attached.
         """
-        # Avoid importing at module level to prevent circular imports.
-        # These are only needed when execute() is called.
-        from .scheduler import _bool_meta, CommandRunResult, RunResult
-
         notif = self._notifications_module
 
         # Determine effective audit-only behaviour.  If an operator has set

@@ -2,7 +2,8 @@ import json
 import json
 import subprocess
 
-from ampa.scheduler import Scheduler, SchedulerConfig, SchedulerStore, CommandSpec
+from ampa.scheduler_types import CommandSpec, SchedulerConfig
+from ampa.scheduler import Scheduler, SchedulerStore
 from ampa import notifications
 
 

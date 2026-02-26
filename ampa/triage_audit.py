@@ -22,6 +22,7 @@ try:
     from . import notifications as notifications_module
 except Exception:  # pragma: no cover - defensive
     import ampa.notifications as notifications_module
+from .scheduler_types import _utc_now, _to_iso, _from_iso
 
 LOG = logging.getLogger("ampa.triage_audit")
 
@@ -95,28 +96,6 @@ def _extract_summary_from_report(report: str) -> str:
     else:
         section = report[start:]
     return section.strip()
-
-
-def _utc_now() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
-
-
-def _to_iso(value: Optional[dt.datetime]) -> Optional[str]:
-    if value is None:
-        return None
-    return value.isoformat()
-
-
-def _from_iso(value: Optional[str]) -> Optional[dt.datetime]:
-    if not value:
-        return None
-    try:
-        v = value
-        if isinstance(v, str) and v.endswith("Z"):
-            v = v[:-1] + "+00:00"
-        return dt.datetime.fromisoformat(v)
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------

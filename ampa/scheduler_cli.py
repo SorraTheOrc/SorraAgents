@@ -19,16 +19,18 @@ import re
 from typing import Any, Dict, List, Optional
 
 from . import daemon, notifications as notifications_module, selection
-from .scheduler import (
+from .scheduler_types import (
     CommandSpec,
-    SchedulerStore,
     SchedulerConfig,
-    load_scheduler,
     RunResult,
     CommandRunResult,
     _utc_now,
     _from_iso,
     _to_iso,
+)
+from .scheduler import (
+    SchedulerStore,
+    load_scheduler,
     build_error_report,
     render_error_report,
     render_error_report_json,

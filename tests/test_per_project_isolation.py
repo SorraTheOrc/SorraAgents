@@ -20,7 +20,8 @@ from unittest import mock
 import pytest
 
 from ampa.daemon import _project_ampa_dir, load_env
-from ampa.scheduler import SchedulerConfig, SchedulerStore
+from ampa.scheduler_types import SchedulerConfig
+from ampa.scheduler import SchedulerStore
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +351,7 @@ class TestSchedulerStoreIsolation:
         monkeypatch.chdir(project_a)
         config_a = SchedulerConfig.from_env()
         store_a = SchedulerStore(config_a.store_path)
-        from ampa.scheduler import CommandSpec
+        from ampa.scheduler_types import CommandSpec
 
         store_a.add_command(
             CommandSpec(
@@ -546,7 +547,7 @@ class TestCrossProjectContamination:
         store_b_before = json.loads(Path(path_b).read_text())
 
         # Mutate store A
-        from ampa.scheduler import CommandSpec
+        from ampa.scheduler_types import CommandSpec
 
         store_a.add_command(
             CommandSpec(

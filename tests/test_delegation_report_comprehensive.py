@@ -28,11 +28,13 @@ from ampa.delegation import (
     _format_in_progress_items,
     DelegationOrchestrator,
 )
-from ampa.scheduler import (
+from ampa.scheduler_types import (
     CommandRunResult,
     CommandSpec,
-    Scheduler,
     SchedulerConfig,
+)
+from ampa.scheduler import (
+    Scheduler,
     SchedulerStore,
 )
 from ampa import notifications as notifications_module

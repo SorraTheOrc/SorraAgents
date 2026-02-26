@@ -2,11 +2,13 @@ import datetime as dt
 import json
 import subprocess
 
-from ampa.scheduler import (
+from ampa.scheduler_types import (
     CommandRunResult,
     CommandSpec,
-    Scheduler,
     SchedulerConfig,
+)
+from ampa.scheduler import (
+    Scheduler,
     SchedulerStore,
 )
 from ampa.engine.core import EngineConfig

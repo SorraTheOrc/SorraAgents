@@ -1,11 +1,13 @@
 import datetime as dt
 import json
 
-from ampa.scheduler import (
+from ampa.scheduler_types import (
     CommandSpec,
     RunResult,
-    Scheduler,
     SchedulerConfig,
+)
+from ampa.scheduler import (
+    Scheduler,
     SchedulerStore,
 )
 

@@ -7,10 +7,9 @@ import re
 from types import SimpleNamespace
 
 from ampa import scheduler
+from ampa.scheduler_types import CommandSpec, SchedulerConfig
 from ampa.scheduler import (
     Scheduler,
-    CommandSpec,
-    SchedulerConfig,
     SchedulerStore,
 )
 import ampa.daemon as daemon
