@@ -119,7 +119,7 @@ def _query_candidates(
     run_shell: Callable[..., subprocess.CompletedProcess],
     cwd: str,
     timeout: int = 60,
-) -> List[Dict[str, Any]]:
+) -> Optional[List[Dict[str, Any]]]:
     """Query ``wl list --stage in_review --json`` and return normalised items.
 
     Handles multiple JSON response shapes:
@@ -132,9 +132,10 @@ def _query_candidates(
     Deduplicates items by ID (``id``, ``work_item_id``, or ``work_item``
     key).  Items without a recognisable ID are silently dropped.
 
-    This function never raises.  On any failure (non-zero exit code,
-    invalid JSON, unexpected structure) it logs the error and returns an
-    empty list.
+    This function never raises.  On query failure (non-zero exit code,
+    invalid JSON, execution error) it logs the error and returns ``None``
+    to signal a query failure (as opposed to an empty list, which means
+    the query succeeded but found no ``in_review`` items).
 
     Args:
         run_shell: Callable that executes a shell command and returns a
@@ -143,8 +144,8 @@ def _query_candidates(
         timeout: Maximum seconds for the shell command.
 
     Returns:
-        A list of unique work item dicts, each guaranteed to have an
-        ``"id"`` key.
+        A list of unique work item dicts (each guaranteed to have an
+        ``"id"`` key) on success, or ``None`` on query failure.
     """
     try:
         proc = run_shell(
@@ -158,7 +159,7 @@ def _query_candidates(
         )
     except Exception:
         LOG.exception("wl list --stage in_review command failed to execute")
-        return []
+        return None
 
     if proc.returncode != 0:
         LOG.warning(
@@ -166,13 +167,13 @@ def _query_candidates(
             proc.returncode,
             proc.stderr,
         )
-        return []
+        return None
 
     try:
         raw = json.loads(proc.stdout or "null")
     except Exception:
         LOG.exception("Failed to parse wl list --stage in_review output as JSON")
-        return []
+        return None
 
     items: List[Dict[str, Any]] = []
 
@@ -366,10 +367,12 @@ def poll_and_handoff(
     # 1. Query candidates
     candidates = _query_candidates(run_shell, cwd)
     if candidates is None:
-        # _query_candidates returns [] on failure, but guard defensively
+        # _query_candidates returns None on query failure (non-zero exit,
+        # invalid JSON, execution error) to distinguish from an empty list
+        # (query succeeded, no in_review items).
         return PollerResult(
             outcome=PollerOutcome.query_failed,
-            error="query returned None",
+            error="wl list query failed (see logs for details)",
         )
 
     if not candidates:

@@ -281,19 +281,19 @@ class TestQueryCandidates:
         assert len(result) == 1
         assert result[0]["id"] == "WL-1"
 
-    def test_non_zero_exit_code_returns_empty(self) -> None:
+    def test_non_zero_exit_code_returns_none(self) -> None:
         def run_shell(cmd, **kw):
             return _make_proc(returncode=1, stderr="error")
 
         result = _query_candidates(run_shell, "/tmp")
-        assert result == []
+        assert result is None
 
-    def test_invalid_json_returns_empty(self) -> None:
+    def test_invalid_json_returns_none(self) -> None:
         def run_shell(cmd, **kw):
             return _make_proc(stdout="not json at all")
 
         result = _query_candidates(run_shell, "/tmp")
-        assert result == []
+        assert result is None
 
     def test_null_json_returns_empty(self) -> None:
         def run_shell(cmd, **kw):
@@ -309,12 +309,12 @@ class TestQueryCandidates:
         result = _query_candidates(run_shell, "/tmp")
         assert result == []
 
-    def test_run_shell_exception_returns_empty(self) -> None:
+    def test_run_shell_exception_returns_none(self) -> None:
         def run_shell(cmd, **kw):
             raise OSError("connection refused")
 
         result = _query_candidates(run_shell, "/tmp")
-        assert result == []
+        assert result is None
 
     def test_passes_cwd_and_timeout(self) -> None:
         received_kwargs: list[dict] = []
@@ -590,7 +590,12 @@ class TestPollAndHandoff:
             return _make_proc(stdout="[]")
 
         result = poll_and_handoff(
-            run_shell, "/tmp", _MockStore(), _MockSpec(), lambda w: True, now=_NOW
+            run_shell,
+            "/tmp",
+            _MockStore(),
+            _MockSpec(),
+            lambda work_item: True,
+            now=_NOW,
         )
         assert result.outcome is PollerOutcome.no_candidates
         assert result.selected_item_id is None
@@ -608,24 +613,28 @@ class TestPollAndHandoff:
             "/tmp",
             store,
             _MockSpec(metadata={"audit_cooldown_hours": 6}),
-            lambda w: True,
+            lambda work_item: True,
             now=_NOW,
         )
         assert result.outcome is PollerOutcome.no_candidates
 
-    def test_query_failure_returns_no_candidates(self) -> None:
-        """When wl list exits non-zero, _query_candidates returns [], which is
-        reported as no_candidates (not query_failed, since the function itself
-        doesn't distinguish)."""
+    def test_query_failure_returns_query_failed(self) -> None:
+        """When wl list exits non-zero, _query_candidates returns None, which
+        is reported as query_failed."""
 
         def run_shell(cmd, **kw):
             return _make_proc(returncode=1, stderr="fail")
 
         result = poll_and_handoff(
-            run_shell, "/tmp", _MockStore(), _MockSpec(), lambda w: True, now=_NOW
+            run_shell,
+            "/tmp",
+            _MockStore(),
+            _MockSpec(),
+            lambda work_item: True,
+            now=_NOW,
         )
-        # _query_candidates returns [] on non-zero exit, which maps to no_candidates
-        assert result.outcome is PollerOutcome.no_candidates
+        assert result.outcome is PollerOutcome.query_failed
+        assert result.error is not None
 
     def test_handler_exception_still_returns_handed_off(self) -> None:
         items = [{"id": "WL-99", "title": "Explode"}]
@@ -657,7 +666,7 @@ class TestPollAndHandoff:
             "/tmp",
             _MockStore(),
             _MockSpec(),
-            lambda w: handed.append(w) or True,
+            lambda work_item: handed.append(work_item) or True,
             now=_NOW,
         )
         assert result.selected_item_id == "WL-old"
@@ -677,7 +686,7 @@ class TestPollAndHandoff:
             "/tmp",
             store,
             _MockSpec(metadata={}),
-            lambda w: True,
+            lambda work_item: True,
             now=_NOW,
         )
         assert result.outcome is PollerOutcome.no_candidates
