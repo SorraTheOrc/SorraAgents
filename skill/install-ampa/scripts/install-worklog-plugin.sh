@@ -109,13 +109,9 @@ parse_args() {
           exit 2
         fi
         ;;
-      --webhook|-w)
-        log_error "Warning: --webhook is deprecated. Use --bot-token and --channel-id instead."
-        shift
-        if [ "$#" -gt 0 ]; then
-          shift  # consume the value but ignore it
-        fi
-        ;;
+      # --webhook removed: webhooks were migrated to the Discord bot/notifications
+      # model. Operators should provide --bot-token and --channel-id or set
+      # per-project .env values. Passing --webhook is no longer supported.
       --yes|-y)
         AUTO_YES=1
         shift
@@ -454,6 +450,11 @@ detect_existing_channel_id() {
     awk -F= '/AMPA_DISCORD_CHANNEL_ID/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "ampa/.env" | tr -d '"' | tr -d "'"
   fi
 }
+
+# Note: webhook-specific helpers were removed. The installer enforces the
+# bot-token/channel model; operators should use --bot-token and --channel-id
+# or set per-project .env values. This avoids reintroducing legacy webhook
+# behaviour which the runtime has migrated away from.
 
 # Prompt user whether to change bot config during upgrade
 prompt_bot_config_change() {

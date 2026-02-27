@@ -431,7 +431,7 @@ function readLogTail(lpath, maxBytes = 64 * 1024) {
 function extractErrorLines(text) {
   if (!text) return [];
   const lines = text.split(/\r?\n/);
-  const re = /(ERROR|Traceback|Exception|AMPA_DISCORD_WEBHOOK)/i;
+  const re = /(ERROR|Traceback|Exception|AMPA_DISCORD_BOT_TOKEN|AMPA_DISCORD_CHANNEL_ID)/i;
   const out = [];
   for (const l of lines) {
     if (re.test(l)) out.push(l);

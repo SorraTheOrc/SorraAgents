@@ -92,6 +92,16 @@ tmux set -g window-active-style bg=colour234
 # Default pane border colors
 tmux set -g pane-border-style fg=colour238
 tmux set -g pane-active-border-style fg=colour45
+# Ensure tmux copies to the system clipboard when using copy-mode/yank.
+# Make this conditional: older tmux versions do not support `set-clipboard` and
+# will error. Detect support before setting so the script remains compatible.
+if tmux show-options -g | grep -q '^set-clipboard'; then
+  tmux set -g set-clipboard on
+else
+  # Fallback: enable mouse-based copy selection which works with terminal
+  # integrations and avoids failures on older tmux releases.
+  tmux set -g mouse on || true
+fi
 
 set_window_colors() {
   local target="$1"

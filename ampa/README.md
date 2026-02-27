@@ -93,6 +93,30 @@ Add the runtime dependencies and install them in your environment:
  pip install -r ampa/requirements.txt
 ```
 
+Developer-only container (for contributors)
+
+The repository includes a developer Containerfile at `ampa/Containerfile` and
+supporting files (`ampa/.containerignore`, `ampa/.env.sample`). These are
+intended for development workflows (creating distrobox/podman dev images,
+CI, and contributor convenience) and are not part of the operator-facing
+documentation. Operator guidance for running AMPA is provided above and
+focuses on the Python CLI (`python -m ampa.daemon` / `python -m ampa.scheduler`).
+
+If you're contributing and need a dev container, inspect `ampa/Containerfile`
+and the related files. Do not rely on container build/run instructions for
+operator deployments; those were intentionally removed from user-facing docs.
+
+Suggested next steps for contributors:
+
+- Build a dev image locally via Podman or Docker using `ampa/Containerfile`.
+- Use a distrobox or other dev container to reproduce CI environments.
+- The Containerfile targets a minimal Debian slim base — adjust packages
+  as needed for your distro or contributor workflow.
+
+Note: CI and local development may use the Containerfile to run integration
+tests; operator installations should continue to prefer the Python package
+and the `wl ampa` commands described above.
+
 Run as a daemon
 
 The daemon defaults to sending a single heartbeat and exiting. To run the
