@@ -807,8 +807,19 @@ class Scheduler:
                 LOG.exception("Test-button message failed")
             return run
 
-        # always post the generic discord message afterwards
-        self._post_discord(spec, run, output)
+        # always post the generic discord notification afterwards
+        if spec.command_type != "heartbeat":
+            try:
+                short_output = _summarize_for_discord(output, max_chars=1000)
+            except Exception:
+                LOG.exception("Failed to summarize output for discord post")
+                short_output = output
+            title = spec.title or spec.metadata.get("discord_label") or spec.command_id
+            notifications_module.notify(
+                title=title,
+                body=short_output or "",
+                message_type="command",
+            )
         return run
 
     def run_once(self) -> Optional[RunResult]:
@@ -948,25 +959,6 @@ class Scheduler:
                     selected_spec = None
             now = now + dt.timedelta(seconds=tick_seconds)
         return {"observed": observed}
-
-    def _post_discord(
-        self, spec: CommandSpec, run: RunResult, output: Optional[str]
-    ) -> None:
-        if spec.command_type == "heartbeat":
-            return
-        # ensure Discord-safe summary for output
-        try:
-            short_output = _summarize_for_discord(output, max_chars=1000)
-        except Exception:
-            LOG.exception("Failed to summarize output for discord post")
-            short_output = output
-
-        title = spec.title or spec.metadata.get("discord_label") or spec.command_id
-        notifications_module.notify(
-            title=title,
-            body=short_output or "",
-            message_type="command",
-        )
 
     def _run_idle_delegation(
         self, *, audit_only: bool, spec: Optional[CommandSpec] = None
