@@ -397,6 +397,7 @@ class DelegationOrchestrator:
             }
             if result.dispatch_result:
                 delegate_info["pid"] = result.dispatch_result.pid
+                delegate_info["container_id"] = result.dispatch_result.container_id
             return {
                 "note": f"Delegation: dispatched {action} {wid}",
                 "dispatched": True,

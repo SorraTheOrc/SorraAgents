@@ -230,6 +230,59 @@ class TestEngineResultConversion:
         assert result["delegate_info"]["action"] == "plan"
         assert result["delegate_info"]["id"] == "WL-99"
 
+    def test_success_propagates_container_id_none(self):
+        """When dispatch has no container_id, delegate_info carries None."""
+        engine = mock.MagicMock(spec=Engine)
+        engine.process_delegation.return_value = _make_engine_result(
+            status=EngineStatus.SUCCESS,
+            action="intake",
+            work_item_id="WL-CID-NONE",
+        )
+        scheduler = _make_scheduler(engine=engine)
+        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+
+        assert result["dispatched"] is True
+        assert result["delegate_info"]["container_id"] is None
+
+    def test_success_propagates_container_id_present(self):
+        """When dispatch has a container_id, delegate_info carries it."""
+        dr = DispatchResult(
+            success=True,
+            command='opencode run "/intake WL-CID-SET"',
+            work_item_id="WL-CID-SET",
+            timestamp=dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc),
+            pid=54321,
+            container_id="podman-abc123",
+        )
+        selected = WorkItemCandidate(
+            id="WL-CID-SET",
+            title="Container Test Item",
+            stage="idea",
+            status="open",
+        )
+        candidate_result = CandidateResult(
+            selected=selected,
+            candidates=(selected,),
+        )
+        er = EngineResult(
+            status=EngineStatus.SUCCESS,
+            reason="",
+            work_item_id="WL-CID-SET",
+            command_name="delegate",
+            action="intake",
+            dispatch_result=dr,
+            candidate_result=candidate_result,
+            timestamp=dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc),
+        )
+        engine = mock.MagicMock(spec=Engine)
+        engine.process_delegation.return_value = er
+        scheduler = _make_scheduler(engine=engine)
+        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+
+        assert result["dispatched"] is True
+        assert result["delegate_info"]["container_id"] == "podman-abc123"
+        assert result["delegate_info"]["pid"] == 54321
+
     def test_no_candidates_result(self):
         """NO_CANDIDATES maps to dispatched=False, idle_notification_sent=True."""
         engine = mock.MagicMock(spec=Engine)
