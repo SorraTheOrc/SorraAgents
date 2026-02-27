@@ -1,6 +1,6 @@
 # Ampa Plugin Installer Test Suite
 
-This directory contains comprehensive tests for the refactored ampa plugin installer script (`plugins/install-worklog-plugin.sh`).
+This directory contains comprehensive tests for the refactored ampa plugin installer script (`skill/install-ampa/scripts/install-worklog-plugin.sh`).
 
 ## Test Files
 
@@ -265,6 +265,6 @@ The manual test suite runs in approximately 5-10 seconds depending on system per
 
 ## See Also
 
-- `plugins/install-worklog-plugin.sh` - The refactored installer script
+- `skill/install-ampa/scripts/install-worklog-plugin.sh` - The canonical installer script
 - `skill/install-ampa/resources/ampa.mjs` - Canonical AMPA plugin source
 - `ampa/README.md` - AMPA daemon documentation
