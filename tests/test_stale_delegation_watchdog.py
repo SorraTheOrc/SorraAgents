@@ -33,11 +33,9 @@ from ampa.scheduler_types import (
     _utc_now,
     _to_iso,
 )
-from ampa.scheduler import (
-    Scheduler,
-    SchedulerConfig,
-    SchedulerStore,
-)
+from ampa.scheduler import Scheduler
+from ampa.scheduler_types import SchedulerConfig
+from ampa.scheduler_store import SchedulerStore
 
 
 # ---------------------------------------------------------------------------

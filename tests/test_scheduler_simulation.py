@@ -6,10 +6,8 @@ from ampa.scheduler_types import (
     RunResult,
     SchedulerConfig,
 )
-from ampa.scheduler import (
-    Scheduler,
-    SchedulerStore,
-)
+from ampa.scheduler import Scheduler
+from ampa.scheduler_store import SchedulerStore
 
 
 def _deviation_ratio(observed_seconds, expected_seconds):

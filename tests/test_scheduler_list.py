@@ -1,7 +1,7 @@
 import datetime as dt
 
 from ampa.scheduler_types import CommandSpec
-from ampa.scheduler import SchedulerStore
+from ampa.scheduler_store import SchedulerStore
 from ampa.scheduler_cli import _build_command_listing
 
 

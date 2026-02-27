@@ -2,33 +2,20 @@
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
-import hashlib
 import json
 import logging
 import os
 import signal
 import subprocess
 import sys
-import tempfile
-import re
-import uuid
-import getpass
-import shutil
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-
-try:
-    import requests  # type: ignore
-except Exception:  # pragma: no cover - optional dependency in tests
-    requests = None
 
 try:
     from . import daemon
     from . import notifications as notifications_module
     from . import selection
-    from . import fallback
     from .error_report import (
         build_error_report,
         render_error_report,
@@ -42,35 +29,20 @@ except ImportError:  # pragma: no cover - allow running as script
     daemon = importlib.import_module("ampa.daemon")
     notifications_module = importlib.import_module("ampa.notifications")
     selection = importlib.import_module("ampa.selection")
-    fallback = importlib.import_module("ampa.fallback")
     _er = importlib.import_module("ampa.error_report")
     build_error_report = _er.build_error_report
     render_error_report = _er.render_error_report
     render_error_report_json = _er.render_error_report_json
 
-# Engine imports — the engine package is part of the ampa package and must
-# always be available.
-from .engine.core import Engine, EngineConfig, EngineResult, EngineStatus
-from .engine.descriptor import load_descriptor
+# Engine imports — only types referenced directly by the Scheduler class.
+from .engine.core import Engine, EngineResult
 from .engine.candidates import CandidateSelector
-
-from .engine.dispatch import OpenCodeRunDispatcher
-from .engine.invariants import InvariantEvaluator
-from .engine.adapters import (
-    ShellCandidateFetcher,
-    ShellInProgressQuerier,
-    ShellWorkItemFetcher,
-    ShellWorkItemUpdater,
-    ShellCommentWriter,
-    StoreDispatchRecorder,
-    DiscordNotificationSender,
-)
 
 # ---------------------------------------------------------------------------
 # Shared data classes and utilities — canonical definitions live in
-# ampa.scheduler_types.  Re-exported here for backward compatibility.
+# ampa.scheduler_types.
 # ---------------------------------------------------------------------------
-from .scheduler_types import (  # noqa: F401
+from .scheduler_types import (
     CommandSpec,
     SchedulerConfig,
     RunResult,
@@ -79,54 +51,28 @@ from .scheduler_types import (  # noqa: F401
     _to_iso,
     _from_iso,
     _seconds_between,
-    _bool_meta,
 )
 
 LOG = logging.getLogger("ampa.scheduler")
 
-# ---------------------------------------------------------------------------
-# Persistence — canonical definition lives in ampa.scheduler_store.
-# Re-exported here for backward compatibility.
-# ---------------------------------------------------------------------------
-from .scheduler_store import SchedulerStore  # noqa: E402, F401
+from .scheduler_store import SchedulerStore  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# Executor functions — canonical definitions live in ampa.scheduler_executor.
-# Re-exported here for backward compatibility.
-# ---------------------------------------------------------------------------
-from .scheduler_executor import (  # noqa: E402, F401
+from .scheduler_executor import (  # noqa: E402
     default_llm_probe,
     default_executor,
     score_command,
 )
 
-# ---------------------------------------------------------------------------
-# Bot supervisor — canonical definition lives in ampa.bot_supervisor.
-# Re-exported here for backward compatibility.
-# ---------------------------------------------------------------------------
-from .bot_supervisor import BotSupervisor  # noqa: E402, F401
+from .bot_supervisor import BotSupervisor  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# Engine factory — canonical definition lives in ampa.engine_factory.
-# Re-exported here for backward compatibility.
-# ---------------------------------------------------------------------------
-from .engine_factory import build_engine  # noqa: E402, F401
+from .engine_factory import build_engine  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Delegation helpers — canonical implementations live in ampa.delegation.
-# Re-exported here for backward compatibility with existing callers/tests.
 # ---------------------------------------------------------------------------
-from .delegation import (  # noqa: E402, F401
+from .delegation import (  # noqa: E402
     _summarize_for_discord,
-    _trim_text,
-    _content_hash,
-    _format_in_progress_items,
-    _format_candidate_line,
-    _build_dry_run_report,
-    _build_dry_run_discord_message,
-    _build_delegation_report,
-    _build_delegation_discord_message,
     DelegationOrchestrator,
 )
 
@@ -916,32 +862,3 @@ def load_scheduler(command_cwd: Optional[str] = None) -> Scheduler:
     config = SchedulerConfig.from_env()
     store = SchedulerStore(config.store_path)
     return Scheduler(store, config, command_cwd=command_cwd)
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point has been extracted to ampa/scheduler_cli.py.
-# Re-export key CLI symbols so existing callers (tests, scripts) continue to
-# work without import changes while they migrate.
-# ---------------------------------------------------------------------------
-from .scheduler_cli import (  # noqa: F401  -- re-exports for backward compat
-    main,
-    _build_parser,
-    _cli_list,
-    _cli_add,
-    _cli_update,
-    _cli_remove,
-    _cli_dry_run,
-    _cli_run,
-    _cli_run_once,
-    _parse_metadata,
-    _store_from_env,
-    _command_description,
-    _build_command_listing,
-    _truncate_text,
-    _format_command_table,
-    _format_run_result_json,
-    _format_run_result_human,
-    _format_command_detail,
-    _format_command_details_table,
-    _get_instance_name,
-)
