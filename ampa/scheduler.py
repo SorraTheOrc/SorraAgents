@@ -106,6 +106,12 @@ from .scheduler_executor import (  # noqa: E402, F401
 # ---------------------------------------------------------------------------
 from .bot_supervisor import BotSupervisor  # noqa: E402, F401
 
+# ---------------------------------------------------------------------------
+# Engine factory — canonical definition lives in ampa.engine_factory.
+# Re-exported here for backward compatibility.
+# ---------------------------------------------------------------------------
+from .engine_factory import build_engine  # noqa: E402, F401
+
 
 # ---------------------------------------------------------------------------
 # Delegation helpers — canonical implementations live in ampa.delegation.
@@ -201,8 +207,7 @@ class Scheduler:
 
         # --- Engine initialization ---
         # If an engine is explicitly provided, use it.  Otherwise, build one
-        # from the workflow descriptor.  The engine is a hard dependency — if
-        # it cannot be constructed the scheduler will raise.
+        # from the workflow descriptor via the engine factory.
         self._candidate_selector: Optional[CandidateSelector] = None
         self.engine: Optional[Engine] = engine
         if self.engine is None:
@@ -320,96 +325,18 @@ class Scheduler:
     def _build_engine(self) -> Optional[Engine]:
         """Construct an Engine from the workflow descriptor.
 
-        Also stores the ``CandidateSelector`` on ``self._candidate_selector``
-        so that ``_inspect_idle_delegation`` can perform lightweight pre-flight
-        checks without invoking the full engine pipeline.
+        Delegates to ``build_engine()`` factory and stores the
+        ``CandidateSelector`` on ``self._candidate_selector``.
 
-        Returns ``None`` when the descriptor cannot be loaded (e.g. the YAML
-        file is missing or malformed).
+        Returns ``None`` when the descriptor cannot be loaded.
         """
-        try:
-            descriptor_path = os.getenv(
-                "AMPA_WORKFLOW_DESCRIPTOR",
-                os.path.join(
-                    os.path.dirname(os.path.dirname(__file__)),
-                    "docs",
-                    "workflow",
-                    "workflow.yaml",
-                ),
-            )
-
-            descriptor = load_descriptor(descriptor_path)
-
-            # Shell-based adapters for wl CLI calls
-            fetcher = ShellWorkItemFetcher(
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-            )
-            candidate_fetcher = ShellCandidateFetcher(
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-            )
-            in_progress_querier = ShellInProgressQuerier(
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-            )
-            selector = CandidateSelector(
-                descriptor=descriptor,
-                fetcher=candidate_fetcher,
-                in_progress_querier=in_progress_querier,
-            )
-            evaluator = InvariantEvaluator(
-                invariants=descriptor.invariants,
-                querier=in_progress_querier,
-            )
-            dispatcher = OpenCodeRunDispatcher(cwd=self.command_cwd)
-
-            # Protocol adapters for external dependencies
-            updater = ShellWorkItemUpdater(
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-            )
-            comment_writer = ShellCommentWriter(
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-            )
-            recorder = StoreDispatchRecorder(store=self.store)
-            notifier = DiscordNotificationSender()
-
-            # Resolve fallback mode at engine init time so it is consistent
-            # for the lifetime of this scheduler instance.
-            try:
-                fb_mode = fallback.resolve_mode(None, require_config=True)
-            except Exception:
-                fb_mode = None
-
-            engine_config = EngineConfig(
-                descriptor_path=descriptor_path,
-                fallback_mode=fb_mode,
-            )
-
-            engine = Engine(
-                descriptor=descriptor,
-                dispatcher=dispatcher,
-                candidate_selector=selector,
-                invariant_evaluator=evaluator,
-                work_item_fetcher=fetcher,
-                updater=updater,
-                comment_writer=comment_writer,
-                dispatch_recorder=recorder,
-                notifier=notifier,
-                config=engine_config,
-            )
-            LOG.info(
-                "Engine initialized with descriptor=%s fallback_mode=%s",
-                descriptor_path,
-                fb_mode,
-            )
-            self._candidate_selector = selector
-            return engine
-        except Exception:
-            LOG.exception("Failed to initialize engine")
-            return None
+        engine, selector = build_engine(
+            run_shell=self.run_shell,
+            command_cwd=self.command_cwd,
+            store=self.store,
+        )
+        self._candidate_selector = selector
+        return engine
 
     def _clear_stale_running_states(self) -> None:
         """Clear `running` flags for commands whose last_start_ts is older
