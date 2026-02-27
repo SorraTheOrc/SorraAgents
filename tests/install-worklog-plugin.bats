@@ -58,18 +58,22 @@ teardown() {
   [[ "$output" == *"Unknown option"* ]]
 }
 
-@test "webhook option with value" {
-  run ./install-test.sh --webhook "https://example.com/webhook" --no-restart --yes plugins-test-plugin.mjs
+@test "bot-token and channel-id option with value" {
+  TEST_BOT_TOKEN="bot_test_token"
+  TEST_CHANNEL_ID="1234567890"
+  run ./install-test.sh --bot-token "$TEST_BOT_TOKEN" --channel-id "$TEST_CHANNEL_ID" --no-restart --yes plugins-test-plugin.mjs
   [ "$status" -eq 0 ] || [ "$status" -eq 1 ]  # Might fail if source doesn't exist, that's ok
 }
 
-@test "webhook short option -w works" {
-  run ./install-test.sh -w "https://example.com/webhook" --no-restart --yes plugins-test-plugin.mjs
+@test "bot-token and channel-id long options work" {
+  TEST_BOT_TOKEN="bot_test_token"
+  TEST_CHANNEL_ID="1234567890"
+  run ./install-test.sh --bot-token "$TEST_BOT_TOKEN" --channel-id "$TEST_CHANNEL_ID" --no-restart --yes plugins-test-plugin.mjs
   [ "$status" -eq 0 ] || [ "$status" -eq 1 ]
 }
 
-@test "webhook without value fails" {
-  run ./install-test.sh --webhook
+@test "bot-token without value fails" {
+  run ./install-test.sh --bot-token
   [ "$status" -eq 2 ]
   [[ "$output" == *"requires a value"* ]]
 }
@@ -204,9 +208,13 @@ teardown() {
 
 @test "env sample file detection" {
   mkdir -p ampa
-  echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
-  
-  run ./install-test.sh --webhook "https://example.com/webhook" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
+  echo 'AMPA_DISCORD_BOT_TOKEN=""' > ampa/.env.sample
+  echo 'AMPA_DISCORD_CHANNEL_ID=""' >> ampa/.env.sample
+
+  TEST_BOT_TOKEN="bot_test_token"
+  TEST_CHANNEL_ID="1234567890"
+
+  run ./install-test.sh --bot-token "$TEST_BOT_TOKEN" --channel-id "$TEST_CHANNEL_ID" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Verify .env was created
@@ -215,9 +223,13 @@ teardown() {
 
 @test "env sample with legacy .env.samplw filename" {
   mkdir -p ampa
-  echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.samplw
-  
-  run ./install-test.sh --webhook "https://example.com/webhook" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
+  echo 'AMPA_DISCORD_BOT_TOKEN=""' > ampa/.env.samplw
+  echo 'AMPA_DISCORD_CHANNEL_ID=""' >> ampa/.env.samplw
+
+  TEST_BOT_TOKEN="bot_test_token"
+  TEST_CHANNEL_ID="1234567890"
+
+  run ./install-test.sh --bot-token "$TEST_BOT_TOKEN" --channel-id "$TEST_CHANNEL_ID" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   [ -f ".worklog/plugins/ampa_py/ampa/.env" ]
@@ -225,14 +237,17 @@ teardown() {
 
 @test "webhook written to env file" {
   mkdir -p ampa
-  echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
-  
-  TEST_WEBHOOK="https://discord.com/api/webhooks/test123"
-  run ./install-test.sh --webhook "$TEST_WEBHOOK" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
+  echo 'AMPA_DISCORD_BOT_TOKEN=""' > ampa/.env.sample
+  echo 'AMPA_DISCORD_CHANNEL_ID=""' >> ampa/.env.sample
+
+  TEST_BOT_TOKEN="bot_test_token"
+  TEST_CHANNEL_ID="1234567890"
+  run ./install-test.sh --bot-token "$TEST_BOT_TOKEN" --channel-id "$TEST_CHANNEL_ID" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
-  
-  # Verify webhook is in the env file
-  grep -q "AMPA_DISCORD_WEBHOOK=$TEST_WEBHOOK" .worklog/plugins/ampa_py/ampa/.env
+
+  # Verify bot token and channel id are in the env file
+  grep -q "AMPA_DISCORD_BOT_TOKEN=$TEST_BOT_TOKEN" .worklog/plugins/ampa_py/ampa/.env
+  grep -q "AMPA_DISCORD_CHANNEL_ID=$TEST_CHANNEL_ID" .worklog/plugins/ampa_py/ampa/.env
 }
 
 @test "existing env file preservation during upgrade" {
@@ -240,18 +255,19 @@ teardown() {
   mkdir -p .worklog/plugins/ampa_py/ampa
   
   # Create existing env with data
-  echo 'AMPA_DISCORD_WEBHOOK="https://existing.webhook"' > .worklog/plugins/ampa_py/ampa/.env
+  echo 'AMPA_DISCORD_BOT_TOKEN="existing_bot_token"' > .worklog/plugins/ampa_py/ampa/.env
+  echo 'AMPA_DISCORD_CHANNEL_ID="existing_channel_id"' >> .worklog/plugins/ampa_py/ampa/.env
   echo "test_data=preserved" >> .worklog/plugins/ampa_py/ampa/.env
   
   # Create package files (no requirements.txt — skip venv)
   cp -r ampa .worklog/plugins/ampa_py/
   
-  # Perform "upgrade" without changing webhook
+  # Perform "upgrade" without changing bot token/channel
   run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
-  # Old env should be preserved since no webhook was provided
-  grep -q "https://existing.webhook" .worklog/plugins/ampa_py/ampa/.env || \
+  # Old env should be preserved since no new bot token/channel was provided
+  grep -q "existing_bot_token" .worklog/plugins/ampa_py/ampa/.env || \
   grep -q "test_data=preserved" .worklog/plugins/ampa_py/ampa/.env
 }
 
@@ -337,44 +353,49 @@ teardown() {
 
 @test "fresh install flow complete" {
   mkdir -p ampa
-  echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
+  echo 'AMPA_DISCORD_BOT_TOKEN=""' > ampa/.env.sample
+  echo 'AMPA_DISCORD_CHANNEL_ID=""' >> ampa/.env.sample
   
-  TEST_WEBHOOK="https://discord.com/api/webhooks/test"
+  TEST_BOT_TOKEN="bot_test_token"
+  TEST_CHANNEL_ID="1234567890"
   
-  run ./install-test.sh --webhook "$TEST_WEBHOOK" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --bot-token "$TEST_BOT_TOKEN" --channel-id "$TEST_CHANNEL_ID" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Verify all components installed
   [ -f ".worklog/plugins/plugins-test-plugin.mjs" ]
   [ -d ".worklog/plugins/ampa_py/ampa" ]
   [ -f ".worklog/plugins/ampa_py/ampa/.env" ]
-  grep -q "AMPA_DISCORD_WEBHOOK=$TEST_WEBHOOK" .worklog/plugins/ampa_py/ampa/.env
+  grep -q "AMPA_DISCORD_BOT_TOKEN=$TEST_BOT_TOKEN" .worklog/plugins/ampa_py/ampa/.env
+  grep -q "AMPA_DISCORD_CHANNEL_ID=$TEST_CHANNEL_ID" .worklog/plugins/ampa_py/ampa/.env
 }
 
 @test "upgrade flow preserves custom env" {
-  # First install with webhook
+  # First install with bot token/channel
   mkdir -p ampa
-  echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
+  echo 'AMPA_DISCORD_BOT_TOKEN=""' > ampa/.env.sample
+  echo 'AMPA_DISCORD_CHANNEL_ID=""' >> ampa/.env.sample
   
-  run ./install-test.sh --webhook "https://old.webhook" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --bot-token "existing_bot_token" --channel-id "existing_channel_id" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Verify first install
   [ -f ".worklog/plugins/ampa_py/ampa/.env" ]
-  grep -q "https://old.webhook" .worklog/plugins/ampa_py/ampa/.env
+  grep -q "existing_bot_token" .worklog/plugins/ampa_py/ampa/.env
   
-  # Second install (upgrade) without changing webhook
+  # Second install (upgrade) without changing bot token/channel
   run ./install-test.sh --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
-  # Verify env is preserved (old webhook still there)
-  grep -q "https://old.webhook" .worklog/plugins/ampa_py/ampa/.env || true
+  # Verify env is preserved (old bot token still there)
+  grep -q "existing_bot_token" .worklog/plugins/ampa_py/ampa/.env || true
 }
 
 @test "help text contains all options" {
   run ./install-test.sh --help
   [ "$status" -eq 0 ]
-  [[ "$output" == *"--webhook"* ]]
+  [[ "$output" == *"--bot-token"* ]]
+  [[ "$output" == *"--channel-id"* ]]
   [[ "$output" == *"--yes"* ]]
   [[ "$output" == *"--restart"* ]]
   [[ "$output" == *"--no-restart"* ]]
@@ -415,11 +436,15 @@ teardown() {
   rm -rf "$parent_dir/resources"
 }
 
-@test "original behavior: webhook option with global default" {
+@test "original behavior: bot-token/channel-id option with global default" {
   mkdir -p ampa
-  echo 'AMPA_DISCORD_WEBHOOK=""' > ampa/.env.sample
-  
-  run ./install-test.sh --webhook "https://example.webhook" --no-restart --yes plugins-test-plugin.mjs
+  echo 'AMPA_DISCORD_BOT_TOKEN=""' > ampa/.env.sample
+  echo 'AMPA_DISCORD_CHANNEL_ID=""' >> ampa/.env.sample
+
+  TEST_BOT_TOKEN="bot_test_token"
+  TEST_CHANNEL_ID="1234567890"
+
+  run ./install-test.sh --bot-token "$TEST_BOT_TOKEN" --channel-id "$TEST_CHANNEL_ID" --no-restart --yes plugins-test-plugin.mjs
   [ "$status" -eq 0 ]
 }
 
@@ -490,7 +515,7 @@ teardown() {
 }
 
 @test "decision log contains installation details" {
-  run ./install-test.sh --webhook "https://test.webhook" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
+  run ./install-test.sh --bot-token "log_bot_token" --channel-id "log_channel" --no-restart --yes plugins-test-plugin.mjs .worklog/plugins
   [ "$status" -eq 0 ]
   
   # Check if decision log exists and has content
