@@ -100,6 +100,12 @@ from .scheduler_executor import (  # noqa: E402, F401
     score_command,
 )
 
+# ---------------------------------------------------------------------------
+# Bot supervisor — canonical definition lives in ampa.bot_supervisor.
+# Re-exported here for backward compatibility.
+# ---------------------------------------------------------------------------
+from .bot_supervisor import BotSupervisor  # noqa: E402, F401
+
 
 # ---------------------------------------------------------------------------
 # Delegation helpers — canonical implementations live in ampa.delegation.
@@ -266,137 +272,50 @@ class Scheduler:
         self._ensure_test_button_command()
 
         # --- Discord bot process supervision ---
-        self._bot_process: Optional[subprocess.Popen] = None
-        self._bot_consecutive_failures: int = 0
-        self._BOT_MAX_CONSECUTIVE_FAILURES: int = 3
-
-    # ------------------------------------------------------------------
-    # Discord bot process supervision
-    # ------------------------------------------------------------------
-
-    def _ensure_bot_running(self) -> None:
-        """Ensure the Discord bot process is alive, starting it if needed.
-
-        Called at scheduler startup and at the top of each cycle.  If
-        ``AMPA_DISCORD_BOT_TOKEN`` is not set, this is a no-op — notifications
-        are silently disabled.
-
-        If the bot fails to start on 3 consecutive attempts the supervisor logs
-        an error and stops retrying until the scheduler is restarted (to avoid
-        spamming logs and wasting resources).
-        """
-        token = os.getenv("AMPA_DISCORD_BOT_TOKEN")
-        if not token:
-            return
-
-        # Already exceeded consecutive failure limit — don't keep retrying.
-        if self._bot_consecutive_failures >= self._BOT_MAX_CONSECUTIVE_FAILURES:
-            return
-
-        # Check if existing process is still alive.
-        if self._bot_process is not None:
-            rc = self._bot_process.poll()
-            if rc is None:
-                # Process is alive — nothing to do.
-                return
-            # Process has exited.
-            LOG.warning(
-                "Discord bot process (pid=%d) exited with code %s – restarting",
-                self._bot_process.pid,
-                rc,
-            )
-            self._bot_process = None
-
-        # Attempt to start the bot.
-        try:
-            self._bot_process = subprocess.Popen(
-                [sys.executable, "-m", "ampa.discord_bot"],
-                start_new_session=True,
-            )
-            LOG.info(
-                "Started Discord bot process (pid=%d)",
-                self._bot_process.pid,
-            )
-            self._bot_consecutive_failures = 0
-        except Exception:
-            self._bot_consecutive_failures += 1
-            LOG.exception(
-                "Failed to start Discord bot process (attempt %d/%d)",
-                self._bot_consecutive_failures,
-                self._BOT_MAX_CONSECUTIVE_FAILURES,
-            )
-            if self._bot_consecutive_failures >= self._BOT_MAX_CONSECUTIVE_FAILURES:
-                LOG.error(
-                    "Discord bot failed to start %d consecutive times – "
-                    "giving up until scheduler restart",
-                    self._BOT_MAX_CONSECUTIVE_FAILURES,
-                )
-
-    def _wait_for_bot_socket(self, timeout: float = 15.0) -> None:
-        """Block until the bot's Unix socket appears or *timeout* expires.
-
-        Called once at startup between ``_ensure_bot_running()`` and
-        ``_post_startup_message()`` so the startup notification is not
-        dead-lettered due to a race condition.
-
-        A stale socket file from a previous bot process is deleted first so
-        we only return once the **new** bot has created its socket and is
-        actually listening.
-        """
-        if self._bot_process is None:
-            # Bot not started (token not set or exceeded failure limit).
-            return
-        socket_path = os.getenv("AMPA_BOT_SOCKET_PATH", "/tmp/ampa_bot.sock")
-
-        # Remove stale socket from a previous run so we wait for the new one.
-        if os.path.exists(socket_path):
-            try:
-                os.unlink(socket_path)
-                LOG.info("Removed stale bot socket %s before waiting", socket_path)
-            except OSError:
-                LOG.warning("Could not remove stale socket %s", socket_path)
-
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if os.path.exists(socket_path):
-                LOG.info("Bot socket ready at %s", socket_path)
-                return
-            time.sleep(0.5)
-        LOG.warning(
-            "Bot socket not found at %s after %.0fs – "
-            "startup message may be dead-lettered",
-            socket_path,
-            timeout,
+        self._bot_supervisor = BotSupervisor(
+            run_shell=self.run_shell,
+            command_cwd=self.command_cwd,
+            notifications_module=notifications_module,
         )
 
+    # ------------------------------------------------------------------
+    # Discord bot process supervision — delegated to BotSupervisor.
+    # Properties proxy internal state for backward compatibility with
+    # tests that read/write _bot_process and _bot_consecutive_failures.
+    # ------------------------------------------------------------------
+
+    @property
+    def _bot_process(self):
+        return self._bot_supervisor._bot_process
+
+    @_bot_process.setter
+    def _bot_process(self, value):
+        self._bot_supervisor._bot_process = value
+
+    @property
+    def _bot_consecutive_failures(self):
+        return self._bot_supervisor._bot_consecutive_failures
+
+    @_bot_consecutive_failures.setter
+    def _bot_consecutive_failures(self, value):
+        self._bot_supervisor._bot_consecutive_failures = value
+
+    @property
+    def _BOT_MAX_CONSECUTIVE_FAILURES(self):
+        return self._bot_supervisor._BOT_MAX_CONSECUTIVE_FAILURES
+
+    @_BOT_MAX_CONSECUTIVE_FAILURES.setter
+    def _BOT_MAX_CONSECUTIVE_FAILURES(self, value):
+        self._bot_supervisor._BOT_MAX_CONSECUTIVE_FAILURES = value
+
+    def _ensure_bot_running(self) -> None:
+        self._bot_supervisor.ensure_running()
+
+    def _wait_for_bot_socket(self, timeout: float = 15.0) -> None:
+        self._bot_supervisor.wait_for_socket(timeout)
+
     def _shutdown_bot(self) -> None:
-        """Send SIGTERM to the bot process and wait briefly for it to exit."""
-        if self._bot_process is None:
-            return
-        rc = self._bot_process.poll()
-        if rc is not None:
-            # Already exited.
-            self._bot_process = None
-            return
-        pid = self._bot_process.pid
-        LOG.info("Sending SIGTERM to Discord bot process (pid=%d)", pid)
-        try:
-            self._bot_process.terminate()
-            try:
-                self._bot_process.wait(timeout=5)
-                LOG.info("Discord bot process (pid=%d) exited cleanly", pid)
-            except subprocess.TimeoutExpired:
-                LOG.warning(
-                    "Discord bot process (pid=%d) did not exit after SIGTERM; "
-                    "sending SIGKILL",
-                    pid,
-                )
-                self._bot_process.kill()
-                self._bot_process.wait(timeout=2)
-        except Exception:
-            LOG.exception("Error shutting down Discord bot process (pid=%d)", pid)
-        finally:
-            self._bot_process = None
+        self._bot_supervisor.shutdown()
 
     def _build_engine(self) -> Optional[Engine]:
         """Construct an Engine from the workflow descriptor.
@@ -1071,53 +990,7 @@ class Scheduler:
         return self._delegation_orchestrator.run_delegation_report(spec)
 
     def _post_startup_message(self) -> None:
-        # Only attempt startup notification if Discord bot is configured.
-        if not os.getenv("AMPA_DISCORD_BOT_TOKEN"):
-            return
-        # Capture the human-facing output of `wl status` for the startup message
-        try:
-            proc = self.run_shell(
-                "wl status",
-                shell=True,
-                check=False,
-                capture_output=True,
-                text=True,
-                cwd=self.command_cwd,
-            )
-            # Some test doubles may return CompletedProcess with stdout only when
-            # the command used '--json'. Ensure we try the JSON variant when the
-            # plain invocation produced no useful output so tests that stub
-            # `run_shell` for `wl status` still exercise the intended path.
-            if getattr(proc, "stdout", None) == "":
-                json_proc = self.run_shell(
-                    "wl status --json",
-                    shell=True,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    cwd=self.command_cwd,
-                )
-                if getattr(json_proc, "stdout", None):
-                    proc = json_proc
-            status_out = ""
-            if getattr(proc, "stdout", None):
-                status_out += proc.stdout
-            if getattr(proc, "stderr", None):
-                # prefer stderr only if stdout is empty to keep message concise
-                if not status_out:
-                    status_out += proc.stderr
-            if not status_out:
-                status_out = "(wl status produced no output)"
-        except Exception:
-            LOG.exception("Failed to run 'wl status' for startup message")
-            status_out = "(wl status unavailable)"
-
-        notifications_module.notify(
-            title="Scheduler Started",
-            body=status_out,
-            message_type="startup",
-        )
-        LOG.info("Startup notification dispatched")
+        self._bot_supervisor.post_startup_message()
 
 
 def load_scheduler(command_cwd: Optional[str] = None) -> Scheduler:
