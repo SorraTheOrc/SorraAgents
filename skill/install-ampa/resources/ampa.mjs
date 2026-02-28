@@ -305,28 +305,52 @@ function resolveDaemonStore(projectRoot, name = 'default') {
     if (fs.existsSync(projectStore)) {
       storePath = projectStore;
     } else {
-      // Backward compat: look inside the Python package directory
+      // Backward compat: look inside the Python package directory. Prefer the
+      // per-project package first, then any PYTHONPATH entries, then the
+      // global plugins dir. If a package provides a scheduler_store.json use
+      // that; otherwise continue searching. If no package store is found,
+      // default to the per-project path.
       const candidates = [];
-      if (env.PYTHONPATH) {
-        for (const entry of env.PYTHONPATH.split(path.delimiter)) {
-          if (entry) candidates.push(entry);
-        }
-      }
+      // per-project package candidate first
       candidates.push(path.join(projectRoot, '.worklog', 'plugins', 'ampa_py'));
+      // Do not consult the daemon's PYTHONPATH here — the test harness and
+      // developer environments may set PYTHONPATH to include local copies of
+      // the package, which would break test isolation. Only consider the
+      // per-project package and the daemon's XDG_CONFIG_HOME-based global
+      // plugins path.
+      // Determine the global plugins dir based on the daemon's environment
+      // (env) when possible. Tests spawn the daemon with XDG_CONFIG_HOME set
+      // in its environment; prefer that so resolution matches what the daemon
+      // will see. Fall back to the current process's globalPluginsDir()
+      // only if the daemon didn't set XDG_CONFIG_HOME.
       try {
-        candidates.push(path.join(globalPluginsDir(), 'ampa_py'));
+        // Only consult the daemon's XDG_CONFIG_HOME (from the daemon process
+        // environment). Do NOT consult this process's XDG_CONFIG_HOME — that
+        // risks picking up the developer's installed plugin and breaking test
+        // isolation.
+        if (env.XDG_CONFIG_HOME) {
+          const gbase = path.join(env.XDG_CONFIG_HOME, 'opencode', '.worklog', 'plugins');
+          candidates.push(path.join(gbase, 'ampa_py'));
+        }
       } catch (e) {}
-      let foundPkg = false;
+
+      const perProjectPkg = path.join(projectRoot, '.worklog', 'plugins', 'ampa_py');
       for (const candidate of candidates) {
         const ampaPath = path.join(candidate, 'ampa');
-        if (fs.existsSync(path.join(ampaPath, 'scheduler.py'))) {
-          const pkgStore = path.join(ampaPath, 'scheduler_store.json');
-          if (fs.existsSync(pkgStore)) {
-            storePath = pkgStore;
-            foundPkg = true;
-          }
+        if (!fs.existsSync(path.join(ampaPath, 'scheduler.py'))) continue;
+        const pkgStore = path.join(ampaPath, 'scheduler_store.json');
+        if (fs.existsSync(pkgStore)) {
+          storePath = pkgStore;
           break;
         }
+        // If the per-project package exists but has no store file, prefer the
+        // per-project scheduler_store.json path rather than falling back to
+        // a global package store. This keeps per-project isolation intact.
+        if (candidate === perProjectPkg) {
+          storePath = projectStore;
+          break;
+        }
+        // otherwise continue searching other candidates
       }
       // Default to per-project path even if file doesn't exist yet
       if (!storePath) {
@@ -1707,6 +1731,10 @@ async function finishWork(force = false, workItemIdArg) {
   const insideContainer = !!process.env.AMPA_CONTAINER_NAME;
 
   let cName, workItemId, branch, projectRoot;
+  // commitHash: set when we push from inside the container
+  let commitHash = null;
+  // commitHashHost: set when we push via host-enter path
+  let commitHashHost = null;
 
   if (insideContainer) {
     // Inside-container path: read env vars set by start-work
@@ -1809,35 +1837,57 @@ async function finishWork(force = false, workItemIdArg) {
       runSync('wl', ['sync']);
 
       const hashResult = runSync('git', ['rev-parse', '--short', 'HEAD']);
-      const commitHash = hashResult.stdout || 'unknown';
+      commitHash = hashResult.stdout || 'unknown';
+    }
 
-      // 4. Update work item
+    // 4. Update work item (always update, even when --force is used). When
+    // forced, there is no commit hash — note that in the comment.
+    try {
       console.log(`Updating work item ${workItemId}...`);
       spawnSync('wl', ['update', workItemId, '--stage', 'in_review', '--status', 'completed', '--json'], {
         stdio: 'pipe',
         encoding: 'utf8',
       });
-      spawnSync('wl', ['comment', 'add', workItemId, '--comment', `Work completed in dev container ${cName}. Branch: ${pushBranch}. Latest commit: ${commitHash}`, '--author', 'ampa', '--json'], {
+      const commentMsg = commitHash
+        ? `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. Latest commit: ${commitHash}`
+        : `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. No commit pushed (finished with --force or no new commits).`;
+      spawnSync('wl', ['comment', 'add', workItemId, '--comment', commentMsg, '--author', 'ampa', '--json'], {
         stdio: 'pipe',
         encoding: 'utf8',
       });
+    } catch (e) {
+      // Non-fatal — continue to cleanup even if wl update/comment fail
     }
 
-    // 5. Release pool claim and mark for cleanup
+    // 5. Release pool claim and attempt to destroy the container. If the
+    // container cannot remove itself, mark it for host-side cleanup.
     if (projectRoot) {
       try {
         releasePoolContainer(projectRoot, cName);
       } catch (e) {
         // Non-fatal — pool state file may not be accessible from inside container
       }
+      // Try to remove the container directly (may fail inside some container
+      // environments). If direct removal fails, fall back to marking it for
+      // host-side cleanup.
       try {
-        markForCleanup(projectRoot, cName);
-        console.log(`Container "${cName}" marked for cleanup — it will be destroyed automatically on the next host-side pool operation.`);
+        const rmRes = runSync('distrobox', ['rm', '--force', cName]);
+        if (rmRes.status === 0) {
+          console.log(`Container "${cName}" destroyed.`);
+        } else {
+          // Couldn't remove from inside — mark for cleanup
+          markForCleanup(projectRoot, cName);
+          console.log(`Container "${cName}" marked for cleanup — it will be destroyed automatically on the next host-side pool operation.`);
+        }
       } catch (e) {
-        // Fallback to manual instructions if marker write fails
-        console.log(`Container "${cName}" marked for cleanup.`);
-        console.log('Run the following from the host to destroy the container:');
-        console.log(`  distrobox rm --force ${cName}`);
+        try {
+          markForCleanup(projectRoot, cName);
+          console.log(`Container "${cName}" marked for cleanup — it will be destroyed automatically on the next host-side pool operation.`);
+        } catch (ee) {
+          console.log(`Container "${cName}" marked for cleanup.`);
+          console.log('Run the following from the host to destroy the container:');
+          console.log(`  distrobox rm --force ${cName}`);
+        }
       }
     } else {
       console.log(`Container "${cName}" marked for cleanup.`);
@@ -1892,21 +1942,30 @@ async function finishWork(force = false, workItemIdArg) {
 
     // Extract commit hash from output
     const hashMatch = (commitResult.stdout || '').match(/AMPA_COMMIT_HASH=(\S+)/);
-    const commitHash = hashMatch ? hashMatch[1] : 'unknown';
+    commitHashHost = hashMatch ? hashMatch[1] : 'unknown';
 
-    // Update work item from the host
-    console.log(`Updating work item ${workItemId}...`);
-    spawnSync('wl', ['update', workItemId, '--stage', 'in_review', '--status', 'completed', '--json'], {
-      stdio: 'pipe',
-      encoding: 'utf8',
-    });
-    spawnSync('wl', ['comment', 'add', workItemId, '--comment', `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. Latest commit: ${commitHash}`, '--author', 'ampa', '--json'], {
-      stdio: 'pipe',
-      encoding: 'utf8',
-    });
-  } else {
-    console.log('Warning: Skipping commit/push (--force). Uncommitted changes will be lost.');
-  }
+    }
+
+    // Update work item from the host (always update, even when --force).
+    try {
+      console.log(`Updating work item ${workItemId}...`);
+      spawnSync('wl', ['update', workItemId, '--stage', 'in_review', '--status', 'completed', '--json'], {
+        stdio: 'pipe',
+        encoding: 'utf8',
+      });
+      const commentMsgHost = commitHashHost || (commitHash || null)
+        ? `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. Latest commit: ${commitHashHost || commitHash}`
+        : `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. No commit pushed (finished with --force or no new commits).`;
+      spawnSync('wl', ['comment', 'add', workItemId, '--comment', commentMsgHost, '--author', 'ampa', '--json'], {
+        stdio: 'pipe',
+        encoding: 'utf8',
+      });
+    } catch (e) {
+      // Non-fatal
+    }
+    if (force) {
+      console.log('Warning: Skipping commit/push (--force). Uncommitted changes will be lost.');
+    }
 
   // Release pool claim
   try {

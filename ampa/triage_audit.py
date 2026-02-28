@@ -404,6 +404,7 @@ class TriageAuditRunner:
                     extra.append({"name": "Summary", "value": summary_text})
                     if pr_url:
                         extra.append({"name": "PR", "value": pr_url})
+                    # Build payload compatible with notifications.notify()
                     payload = notifications_module.build_payload(
                         hostname=os.uname().nodename,
                         timestamp_iso=_utc_now().isoformat(),
@@ -411,10 +412,16 @@ class TriageAuditRunner:
                         extra_fields=extra,
                         title=heading_title,
                     )
+                    # The notify() API expects either (title, body) or a
+                    # pre-built payload dict passed as the ``payload`` kwarg.
+                    # Previously code called notify(title, message_type=..., payload=payload)
+                    # which some notify implementations interpret differently.
+                    # Use the explicit payload kwarg to ensure the payload is
+                    # delivered as intended.
                     notifications_module.notify(
-                        heading_title,
-                        message_type="command",
+                        title=heading_title,
                         payload=payload,
+                        message_type="command",
                     )
                 except Exception:
                     LOG.exception("Failed to send discord summary")
