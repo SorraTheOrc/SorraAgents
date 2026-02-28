@@ -6,12 +6,9 @@ import subprocess
 import re
 from types import SimpleNamespace
 
-from ampa import scheduler
 from ampa.scheduler_types import CommandSpec, SchedulerConfig
-from ampa.scheduler import (
-    Scheduler,
-    SchedulerStore,
-)
+from ampa.scheduler import Scheduler
+from ampa.scheduler_store import SchedulerStore
 import ampa.daemon as daemon
 from ampa import notifications
 

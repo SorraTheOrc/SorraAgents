@@ -21,7 +21,7 @@ import pytest
 
 from ampa.daemon import _project_ampa_dir, load_env
 from ampa.scheduler_types import SchedulerConfig
-from ampa.scheduler import SchedulerStore
+from ampa.scheduler_store import SchedulerStore
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,8 @@ import json
 import subprocess
 
 from ampa.scheduler_types import CommandSpec, SchedulerConfig
-from ampa.scheduler import Scheduler, SchedulerStore
+from ampa.scheduler import Scheduler
+from ampa.scheduler_store import SchedulerStore
 from ampa import notifications
 
 
@@ -78,7 +79,7 @@ def test_dry_run_report_and_discord_message(tmp_path, monkeypatch):
         command_type="delegation",
     )
 
-    report = sched._run_delegation_report(spec)
+    report = sched._delegation_orchestrator.run_delegation_report(spec)
     assert report is not None
     assert "Example item - SA-123" in report
     # when in-progress items exist, report should be concise and not include the
@@ -87,7 +88,7 @@ def test_dry_run_report_and_discord_message(tmp_path, monkeypatch):
     assert "AMPA Delegation" not in report
     assert "Next work - SA-999" not in report
 
-    message = sched._run_delegation_report(spec)
+    message = sched._delegation_orchestrator.run_delegation_report(spec)
     assert message is not None
     payload = notifications.build_command_payload(
         "host",

@@ -18,10 +18,8 @@ from ampa.scheduler_types import (
     CommandSpec,
     SchedulerConfig,
 )
-from ampa.scheduler import (
-    Scheduler,
-    SchedulerStore,
-)
+from ampa.scheduler import Scheduler
+from ampa.scheduler_store import SchedulerStore
 from ampa.delegation import _content_hash
 from ampa import notifications as notifications_module
 from ampa.engine.core import EngineConfig
@@ -97,34 +95,55 @@ def test_content_hash_handles_none():
 
 
 # ---------------------------------------------------------------------------
-# Unit test for _is_delegation_report_changed
+# Unit test for _is_delegation_report_changed (via orchestrator)
 # ---------------------------------------------------------------------------
 
 
 def test_is_delegation_report_changed_first_call(tmp_path):
     """First call should always return True (no previous hash)."""
     sched = _make_scheduler(lambda *a, **kw: None, tmp_path)
-    assert sched._is_delegation_report_changed("delegation", "some report") is True
+    assert (
+        sched._delegation_orchestrator._is_delegation_report_changed(
+            "delegation", "some report"
+        )
+        is True
+    )
 
 
 def test_is_delegation_report_changed_same_content(tmp_path):
     """Same content on second call should return False."""
     sched = _make_scheduler(lambda *a, **kw: None, tmp_path)
-    sched._is_delegation_report_changed("delegation", "same report")
-    assert sched._is_delegation_report_changed("delegation", "same report") is False
+    sched._delegation_orchestrator._is_delegation_report_changed(
+        "delegation", "same report"
+    )
+    assert (
+        sched._delegation_orchestrator._is_delegation_report_changed(
+            "delegation", "same report"
+        )
+        is False
+    )
 
 
 def test_is_delegation_report_changed_different_content(tmp_path):
     """Different content on second call should return True."""
     sched = _make_scheduler(lambda *a, **kw: None, tmp_path)
-    sched._is_delegation_report_changed("delegation", "report A")
-    assert sched._is_delegation_report_changed("delegation", "report B") is True
+    sched._delegation_orchestrator._is_delegation_report_changed(
+        "delegation", "report A"
+    )
+    assert (
+        sched._delegation_orchestrator._is_delegation_report_changed(
+            "delegation", "report B"
+        )
+        is True
+    )
 
 
 def test_hash_persisted_in_state(tmp_path):
     """Verify the hash is stored in the scheduler state dict."""
     sched = _make_scheduler(lambda *a, **kw: None, tmp_path)
-    sched._is_delegation_report_changed("delegation", "test content")
+    sched._delegation_orchestrator._is_delegation_report_changed(
+        "delegation", "test content"
+    )
     state = sched.store.get_state("delegation")
     assert "last_delegation_report_hash" in state
     assert state["last_delegation_report_hash"] == _content_hash("test content")

@@ -2,33 +2,20 @@
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
-import hashlib
 import json
 import logging
 import os
 import signal
 import subprocess
 import sys
-import tempfile
-import re
-import uuid
-import getpass
-import shutil
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-
-try:
-    import requests  # type: ignore
-except Exception:  # pragma: no cover - optional dependency in tests
-    requests = None
 
 try:
     from . import daemon
     from . import notifications as notifications_module
     from . import selection
-    from . import fallback
     from .error_report import (
         build_error_report,
         render_error_report,
@@ -42,35 +29,20 @@ except ImportError:  # pragma: no cover - allow running as script
     daemon = importlib.import_module("ampa.daemon")
     notifications_module = importlib.import_module("ampa.notifications")
     selection = importlib.import_module("ampa.selection")
-    fallback = importlib.import_module("ampa.fallback")
     _er = importlib.import_module("ampa.error_report")
     build_error_report = _er.build_error_report
     render_error_report = _er.render_error_report
     render_error_report_json = _er.render_error_report_json
 
-# Engine imports — the engine package is part of the ampa package and must
-# always be available.
-from .engine.core import Engine, EngineConfig, EngineResult, EngineStatus
-from .engine.descriptor import load_descriptor
+# Engine imports — only types referenced directly by the Scheduler class.
+from .engine.core import Engine, EngineResult
 from .engine.candidates import CandidateSelector
-
-from .engine.dispatch import OpenCodeRunDispatcher
-from .engine.invariants import InvariantEvaluator
-from .engine.adapters import (
-    ShellCandidateFetcher,
-    ShellInProgressQuerier,
-    ShellWorkItemFetcher,
-    ShellWorkItemUpdater,
-    ShellCommentWriter,
-    StoreDispatchRecorder,
-    DiscordNotificationSender,
-)
 
 # ---------------------------------------------------------------------------
 # Shared data classes and utilities — canonical definitions live in
-# ampa.scheduler_types.  Re-exported here for backward compatibility.
+# ampa.scheduler_types.
 # ---------------------------------------------------------------------------
-from .scheduler_types import (  # noqa: F401
+from .scheduler_types import (
     CommandSpec,
     SchedulerConfig,
     RunResult,
@@ -79,271 +51,35 @@ from .scheduler_types import (  # noqa: F401
     _to_iso,
     _from_iso,
     _seconds_between,
-    _bool_meta,
 )
 
 LOG = logging.getLogger("ampa.scheduler")
 
+from .scheduler_store import SchedulerStore  # noqa: E402
 
-class SchedulerStore:
-    def __init__(self, path: str) -> None:
-        self.path = path
-        self.data = self._load()
+from .scheduler_executor import (  # noqa: E402
+    default_llm_probe,
+    default_executor,
+    score_command,
+)
 
-    def _load(self) -> Dict[str, Any]:
-        try:
-            with open(self.path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-                if not isinstance(data, dict):
-                    raise ValueError("store root must be object")
-                data.setdefault("commands", {})
-                data.setdefault("state", {})
-                data.setdefault("last_global_start_ts", None)
-                # append-only dispatch records for delegation actions
-                data.setdefault("dispatches", [])
-                return data
-        except FileNotFoundError:
-            raise FileNotFoundError(
-                f"Scheduler store not found at {self.path}. "
-                "The local scheduler_store.json must exist at "
-                "<projectRoot>/.worklog/ampa/scheduler_store.json before "
-                "starting the scheduler. Copy scheduler_store_example.json "
-                "to this location and configure your commands."
-            ) from None
-        except Exception:
-            LOG.exception("Failed to read scheduler store at %s", self.path)
-            raise
+from .bot_supervisor import BotSupervisor  # noqa: E402
 
-    def save(self) -> None:
-        dir_name = os.path.dirname(self.path)
-        if dir_name:
-            os.makedirs(dir_name, exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as fh:
-            json.dump(self.data, fh, indent=2, sort_keys=True)
-
-    def append_dispatch(self, record: Dict[str, Any], retain_last: int = 100) -> str:
-        """Append an append-only dispatch record and persist the store.
-
-        Returns the generated dispatch id.
-        """
-        try:
-            dispatch_id = record.get("id") or uuid.uuid4().hex
-            record = dict(record)
-            record["id"] = str(dispatch_id)
-            record.setdefault("ts", _utc_now().isoformat())
-            record.setdefault("session", uuid.uuid4().hex)
-            # Best-effort runner identity
-            try:
-                record.setdefault("runner", getpass.getuser())
-            except Exception:
-                record.setdefault("runner", os.getenv("USER") or "(unknown)")
-            self.data.setdefault("dispatches", []).append(record)
-            # retention: keep only the most recent `retain_last` entries
-            try:
-                if isinstance(self.data.get("dispatches"), list):
-                    self.data["dispatches"] = self.data["dispatches"][
-                        -int(retain_last) :
-                    ]
-            except Exception:
-                pass
-            self.save()
-            return str(dispatch_id)
-        except Exception:
-            LOG.exception("Failed to append dispatch record")
-            # Fallback: return a best-effort id
-            return str(uuid.uuid4().hex)
-
-    def list_commands(self) -> List[CommandSpec]:
-        return [
-            CommandSpec.from_dict(value)
-            for value in self.data.get("commands", {}).values()
-        ]
-
-    def add_command(self, spec: CommandSpec) -> None:
-        self.data.setdefault("commands", {})[spec.command_id] = spec.to_dict()
-        self.data.setdefault("state", {}).setdefault(spec.command_id, {})
-        self.save()
-
-    def remove_command(self, command_id: str) -> None:
-        self.data.get("commands", {}).pop(command_id, None)
-        self.data.get("state", {}).pop(command_id, None)
-        self.save()
-
-    def update_command(self, spec: CommandSpec) -> None:
-        if spec.command_id not in self.data.get("commands", {}):
-            raise KeyError(f"Unknown command id {spec.command_id}")
-        self.data["commands"][spec.command_id] = spec.to_dict()
-        self.save()
-
-    def get_command(self, command_id: str) -> Optional[CommandSpec]:
-        payload = self.data.get("commands", {}).get(command_id)
-        if not payload:
-            return None
-        return CommandSpec.from_dict(payload)
-
-    def get_state(self, command_id: str) -> Dict[str, Any]:
-        return dict(self.data.get("state", {}).get(command_id, {}))
-
-    def update_state(self, command_id: str, state: Dict[str, Any]) -> None:
-        self.data.setdefault("state", {})[command_id] = state
-        self.save()
-
-    def update_global_start(self, when: dt.datetime) -> None:
-        self.data["last_global_start_ts"] = _to_iso(when)
-        self.save()
-
-    def last_global_start(self) -> Optional[dt.datetime]:
-        return _from_iso(self.data.get("last_global_start_ts"))
-
-
-def default_llm_probe(url: str) -> bool:
-    if requests is None:
-        LOG.debug("requests missing; assuming LLM unavailable")
-        return False
-    try:
-        resp = requests.get(url, timeout=2)
-        return resp.status_code < 500
-    except Exception:
-        return False
+from .engine_factory import build_engine  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Delegation helpers — canonical implementations live in ampa.delegation.
-# Re-exported here for backward compatibility with existing callers/tests.
 # ---------------------------------------------------------------------------
-from .delegation import (  # noqa: E402, F401
-    _summarize_for_discord,
-    _trim_text,
-    _content_hash,
-    _format_in_progress_items,
-    _format_candidate_line,
-    _build_dry_run_report,
-    _build_dry_run_discord_message,
-    _build_delegation_report,
-    _build_delegation_discord_message,
-    DelegationOrchestrator,
+from .delegation import DelegationOrchestrator  # noqa: E402
+
+from .scheduler_helpers import (  # noqa: E402
+    clear_stale_running_states as _clear_stale_running_states,
+    ensure_watchdog_command as _ensure_watchdog_command,
+    ensure_test_button_command as _ensure_test_button_command,
+    send_test_button_message as _send_test_button_message,
+    log_health as _log_health,
 )
-
-
-def default_executor(spec: CommandSpec, command_cwd: Optional[str] = None) -> RunResult:
-    if spec.command_type == "heartbeat":
-        start = _utc_now()
-        try:
-            config = daemon.get_env_config()
-            status = daemon.run_once(config)
-        except SystemExit as exc:
-            status = getattr(exc, "code", 1) or 1
-        end = _utc_now()
-        return CommandRunResult(
-            start_ts=start,
-            end_ts=end,
-            exit_code=int(status),
-            output="heartbeat",
-        )
-    start = _utc_now()
-    # Determine an execution timeout in seconds.
-    # Priority (highest -> lowest):
-    # 1. CommandSpec.max_runtime_minutes (per-command override)
-    # 2. Delegation-specific env AMPA_DELEGATION_OPENCODE_TIMEOUT (used for opencode spawn)
-    # 3. Global AMPA_CMD_TIMEOUT_SECONDS default
-    timeout = None
-    try:
-        default_cmd_timeout = int(os.getenv("AMPA_CMD_TIMEOUT_SECONDS", "3600"))
-    except Exception:
-        default_cmd_timeout = 3600
-    if spec.max_runtime_minutes is not None:
-        timeout = max(1, int(spec.max_runtime_minutes * 60))
-    else:
-        # Enforce a default timeout for delegation flows and for commands that
-        # spawn `opencode run` to avoid leaving the scheduler marked running
-        # indefinitely when a child process hangs. Non-opencode commands keep
-        # the previous behaviour unless explicitly configured.
-        try:
-            delegate_env = os.getenv("AMPA_DELEGATION_OPENCODE_TIMEOUT")
-            delegate_timeout = (
-                int(delegate_env) if delegate_env else default_cmd_timeout
-            )
-        except Exception:
-            delegate_timeout = default_cmd_timeout
-        if spec.command_type == "delegation" or "opencode run" in (spec.command or ""):
-            timeout = max(1, int(delegate_timeout))
-
-    LOG.info("Starting command %s (timeout=%s)", spec.command_id, timeout)
-    try:
-        result = subprocess.run(  # nosec - shell execution is explicit configuration
-            spec.command,
-            shell=True,
-            check=False,
-            timeout=timeout,
-            text=True,
-            capture_output=True,
-            cwd=command_cwd,
-        )
-        end = _utc_now()
-    except subprocess.TimeoutExpired as e:
-        # Normalize timeouts to exit code 124 and notify operators via
-        # Discord when configured. Return a CompletedProcess-like object so
-        # the rest of the function can treat the result uniformly.
-        end = _utc_now()
-        out = getattr(e, "output", None) or ""
-        err = getattr(e, "stderr", None) or ""
-        LOG.warning(
-            "Command %s timed out after %s seconds",
-            spec.command_id,
-            timeout,
-        )
-        try:
-            msg = (
-                f"Command {spec.command_id} timed out after {timeout}s: {spec.command}"
-            )
-            notifications_module.notify(
-                title=(spec.title or spec.command)[:128],
-                body=msg,
-                message_type="error",
-            )
-        except Exception:
-            LOG.exception("Failed to send timeout notification")
-        result = subprocess.CompletedProcess(
-            args=spec.command,
-            returncode=124,
-            stdout=out,
-            stderr=err,
-        )
-
-    LOG.info(
-        "Finished command %s exit=%s duration=%.2fs",
-        spec.command_id,
-        result.returncode,
-        (end - start).total_seconds(),
-    )
-    output = ""
-    if getattr(result, "stdout", None):
-        output += result.stdout
-    if getattr(result, "stderr", None):
-        output += result.stderr
-    return CommandRunResult(
-        start_ts=start,
-        end_ts=end,
-        exit_code=result.returncode,
-        output=output.strip(),
-    )
-
-
-def score_command(
-    spec: CommandSpec,
-    now: dt.datetime,
-    last_run: Optional[dt.datetime],
-    priority_weight: float,
-) -> Tuple[float, float]:
-    desired_interval = max(1.0, spec.frequency_minutes * 60.0)
-    if last_run is None:
-        time_since_last = now.timestamp()
-    else:
-        time_since_last = (now - last_run).total_seconds()
-    lateness = time_since_last - desired_interval
-    normalized_lateness = max(lateness / desired_interval, 0.0)
-    priority_factor = 1.0 + max(priority_weight, 0.0) * spec.priority
-    return normalized_lateness * priority_factor, normalized_lateness
 
 
 class Scheduler:
@@ -421,13 +157,25 @@ class Scheduler:
         self.run_shell = _run_shell_with_timeout
 
         # --- Engine initialization ---
-        # If an engine is explicitly provided, use it.  Otherwise, build one
-        # from the workflow descriptor.  The engine is a hard dependency — if
-        # it cannot be constructed the scheduler will raise.
+        # If an engine is explicitly provided, use it. Otherwise, build one
+        # from the workflow descriptor via the engine factory. Use the
+        # centralized factory here (build_engine) so the Scheduler does not
+        # contain adapter construction logic.
         self._candidate_selector: Optional[CandidateSelector] = None
-        self.engine: Optional[Engine] = engine
-        if self.engine is None:
-            self.engine = self._build_engine()
+        if engine is not None:
+            # Engine explicitly injected by caller (tests/overrides)
+            self.engine: Optional[Engine] = engine
+        else:
+            # Build engine and candidate selector via the factory and assign
+            # both to Scheduler state so downstream components (delegation
+            # orchestrator, tests) can access the selector instance.
+            eng, selector = build_engine(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+                store=self.store,
+            )
+            self.engine = eng
+            self._candidate_selector = selector
 
         # Delegation orchestrator — all delegation-specific orchestration is
         # handled by DelegationOrchestrator (ampa.delegation).
@@ -478,406 +226,25 @@ class Scheduler:
         # Clear any stale 'running' flags left from previous crashes or
         # interrupted runs so commands don't remain permanently blocked.
         try:
-            self._clear_stale_running_states()
+            _clear_stale_running_states(self.store)
         except Exception:
             LOG.exception("Failed to clear stale running states")
 
         # Auto-register the stale delegation watchdog as a scheduled command
         # so it runs on its own cadence (every 30 minutes) independently of
         # delegation timing.
-        self._ensure_watchdog_command()
+        _ensure_watchdog_command(self.store)
 
         # Auto-register the interactive test-button command so a periodic
         # "Blue or Red?" message with discord.ui.Button components is sent
         # every 15 minutes (MVP validation for interactive buttons).
-        self._ensure_test_button_command()
+        _ensure_test_button_command(self.store)
 
         # --- Discord bot process supervision ---
-        self._bot_process: Optional[subprocess.Popen] = None
-        self._bot_consecutive_failures: int = 0
-        self._BOT_MAX_CONSECUTIVE_FAILURES: int = 3
-
-    # ------------------------------------------------------------------
-    # Discord bot process supervision
-    # ------------------------------------------------------------------
-
-    def _ensure_bot_running(self) -> None:
-        """Ensure the Discord bot process is alive, starting it if needed.
-
-        Called at scheduler startup and at the top of each cycle.  If
-        ``AMPA_DISCORD_BOT_TOKEN`` is not set, this is a no-op — notifications
-        are silently disabled.
-
-        If the bot fails to start on 3 consecutive attempts the supervisor logs
-        an error and stops retrying until the scheduler is restarted (to avoid
-        spamming logs and wasting resources).
-        """
-        token = os.getenv("AMPA_DISCORD_BOT_TOKEN")
-        if not token:
-            return
-
-        # Already exceeded consecutive failure limit — don't keep retrying.
-        if self._bot_consecutive_failures >= self._BOT_MAX_CONSECUTIVE_FAILURES:
-            return
-
-        # Check if existing process is still alive.
-        if self._bot_process is not None:
-            rc = self._bot_process.poll()
-            if rc is None:
-                # Process is alive — nothing to do.
-                return
-            # Process has exited.
-            LOG.warning(
-                "Discord bot process (pid=%d) exited with code %s – restarting",
-                self._bot_process.pid,
-                rc,
-            )
-            self._bot_process = None
-
-        # Attempt to start the bot.
-        try:
-            self._bot_process = subprocess.Popen(
-                [sys.executable, "-m", "ampa.discord_bot"],
-                start_new_session=True,
-            )
-            LOG.info(
-                "Started Discord bot process (pid=%d)",
-                self._bot_process.pid,
-            )
-            self._bot_consecutive_failures = 0
-        except Exception:
-            self._bot_consecutive_failures += 1
-            LOG.exception(
-                "Failed to start Discord bot process (attempt %d/%d)",
-                self._bot_consecutive_failures,
-                self._BOT_MAX_CONSECUTIVE_FAILURES,
-            )
-            if self._bot_consecutive_failures >= self._BOT_MAX_CONSECUTIVE_FAILURES:
-                LOG.error(
-                    "Discord bot failed to start %d consecutive times – "
-                    "giving up until scheduler restart",
-                    self._BOT_MAX_CONSECUTIVE_FAILURES,
-                )
-
-    def _wait_for_bot_socket(self, timeout: float = 15.0) -> None:
-        """Block until the bot's Unix socket appears or *timeout* expires.
-
-        Called once at startup between ``_ensure_bot_running()`` and
-        ``_post_startup_message()`` so the startup notification is not
-        dead-lettered due to a race condition.
-
-        A stale socket file from a previous bot process is deleted first so
-        we only return once the **new** bot has created its socket and is
-        actually listening.
-        """
-        if self._bot_process is None:
-            # Bot not started (token not set or exceeded failure limit).
-            return
-        socket_path = os.getenv("AMPA_BOT_SOCKET_PATH", "/tmp/ampa_bot.sock")
-
-        # Remove stale socket from a previous run so we wait for the new one.
-        if os.path.exists(socket_path):
-            try:
-                os.unlink(socket_path)
-                LOG.info("Removed stale bot socket %s before waiting", socket_path)
-            except OSError:
-                LOG.warning("Could not remove stale socket %s", socket_path)
-
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if os.path.exists(socket_path):
-                LOG.info("Bot socket ready at %s", socket_path)
-                return
-            time.sleep(0.5)
-        LOG.warning(
-            "Bot socket not found at %s after %.0fs – "
-            "startup message may be dead-lettered",
-            socket_path,
-            timeout,
-        )
-
-    def _shutdown_bot(self) -> None:
-        """Send SIGTERM to the bot process and wait briefly for it to exit."""
-        if self._bot_process is None:
-            return
-        rc = self._bot_process.poll()
-        if rc is not None:
-            # Already exited.
-            self._bot_process = None
-            return
-        pid = self._bot_process.pid
-        LOG.info("Sending SIGTERM to Discord bot process (pid=%d)", pid)
-        try:
-            self._bot_process.terminate()
-            try:
-                self._bot_process.wait(timeout=5)
-                LOG.info("Discord bot process (pid=%d) exited cleanly", pid)
-            except subprocess.TimeoutExpired:
-                LOG.warning(
-                    "Discord bot process (pid=%d) did not exit after SIGTERM; "
-                    "sending SIGKILL",
-                    pid,
-                )
-                self._bot_process.kill()
-                self._bot_process.wait(timeout=2)
-        except Exception:
-            LOG.exception("Error shutting down Discord bot process (pid=%d)", pid)
-        finally:
-            self._bot_process = None
-
-    def _build_engine(self) -> Optional[Engine]:
-        """Construct an Engine from the workflow descriptor.
-
-        Also stores the ``CandidateSelector`` on ``self._candidate_selector``
-        so that ``_inspect_idle_delegation`` can perform lightweight pre-flight
-        checks without invoking the full engine pipeline.
-
-        Returns ``None`` when the descriptor cannot be loaded (e.g. the YAML
-        file is missing or malformed).
-        """
-        try:
-            descriptor_path = os.getenv(
-                "AMPA_WORKFLOW_DESCRIPTOR",
-                os.path.join(
-                    os.path.dirname(os.path.dirname(__file__)),
-                    "docs",
-                    "workflow",
-                    "workflow.yaml",
-                ),
-            )
-
-            descriptor = load_descriptor(descriptor_path)
-
-            # Shell-based adapters for wl CLI calls
-            fetcher = ShellWorkItemFetcher(
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-            )
-            candidate_fetcher = ShellCandidateFetcher(
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-            )
-            in_progress_querier = ShellInProgressQuerier(
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-            )
-            selector = CandidateSelector(
-                descriptor=descriptor,
-                fetcher=candidate_fetcher,
-                in_progress_querier=in_progress_querier,
-            )
-            evaluator = InvariantEvaluator(
-                invariants=descriptor.invariants,
-                querier=in_progress_querier,
-            )
-            dispatcher = OpenCodeRunDispatcher(cwd=self.command_cwd)
-
-            # Protocol adapters for external dependencies
-            updater = ShellWorkItemUpdater(
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-            )
-            comment_writer = ShellCommentWriter(
-                run_shell=self.run_shell,
-                command_cwd=self.command_cwd,
-            )
-            recorder = StoreDispatchRecorder(store=self.store)
-            notifier = DiscordNotificationSender()
-
-            # Resolve fallback mode at engine init time so it is consistent
-            # for the lifetime of this scheduler instance.
-            try:
-                fb_mode = fallback.resolve_mode(None, require_config=True)
-            except Exception:
-                fb_mode = None
-
-            engine_config = EngineConfig(
-                descriptor_path=descriptor_path,
-                fallback_mode=fb_mode,
-            )
-
-            engine = Engine(
-                descriptor=descriptor,
-                dispatcher=dispatcher,
-                candidate_selector=selector,
-                invariant_evaluator=evaluator,
-                work_item_fetcher=fetcher,
-                updater=updater,
-                comment_writer=comment_writer,
-                dispatch_recorder=recorder,
-                notifier=notifier,
-                config=engine_config,
-            )
-            LOG.info(
-                "Engine initialized with descriptor=%s fallback_mode=%s",
-                descriptor_path,
-                fb_mode,
-            )
-            self._candidate_selector = selector
-            return engine
-        except Exception:
-            LOG.exception("Failed to initialize engine")
-            return None
-
-    def _clear_stale_running_states(self) -> None:
-        """Clear `running` flags for commands whose last_start_ts is older
-        than AMPA_STALE_RUNNING_THRESHOLD_SECONDS (default 3600s).
-
-        This prevents commands from remaining marked as running due to a
-        previous crash or unhandled exception which would otherwise block
-        future scheduling.
-        """
-        try:
-            thresh_raw = os.getenv("AMPA_STALE_RUNNING_THRESHOLD_SECONDS", "3600")
-            try:
-                threshold = int(thresh_raw)
-            except Exception:
-                threshold = 3600
-            now = _utc_now()
-            for cmd in self.store.list_commands():
-                try:
-                    st = self.store.get_state(cmd.command_id) or {}
-                    if st.get("running") is not True:
-                        continue
-                    last_start_iso = st.get("last_start_ts")
-                    last_start = _from_iso(last_start_iso) if last_start_iso else None
-                    age = (
-                        None
-                        if last_start is None
-                        else int((now - last_start).total_seconds())
-                    )
-                    if age is None or age > threshold:
-                        st["running"] = False
-                        self.store.update_state(cmd.command_id, st)
-                        LOG.info(
-                            "Cleared stale running flag for %s (age_s=%s)",
-                            cmd.command_id,
-                            age,
-                        )
-                except Exception:
-                    LOG.exception(
-                        "Failed to evaluate/clear running state for %s",
-                        getattr(cmd, "command_id", "?"),
-                    )
-        except Exception:
-            LOG.exception("Unexpected error while clearing stale running states")
-
-    # ------------------------------------------------------------------
-    # Auto-registration of built-in commands
-    # ------------------------------------------------------------------
-
-    _WATCHDOG_COMMAND_ID = "stale-delegation-watchdog"
-    _TEST_BUTTON_COMMAND_ID = "test-button"
-
-    def _ensure_watchdog_command(self) -> None:
-        """Register the stale-delegation-watchdog command if absent.
-
-        The watchdog runs on its own cadence (default 30 minutes) so that
-        stuck delegated items are detected even when the delegation command
-        itself is not being selected by the scheduler.
-        """
-        try:
-            existing = self.store.list_commands()
-            for cmd in existing:
-                if cmd.command_id == self._WATCHDOG_COMMAND_ID:
-                    LOG.debug(
-                        "Watchdog command already registered: %s",
-                        self._WATCHDOG_COMMAND_ID,
-                    )
-                    return
-            watchdog_spec = CommandSpec(
-                command_id=self._WATCHDOG_COMMAND_ID,
-                command="echo watchdog",  # placeholder; actual work is in start_command
-                requires_llm=False,
-                frequency_minutes=30,
-                priority=0,
-                metadata={},
-                title="Stale Delegation Watchdog",
-                max_runtime_minutes=5,
-                command_type="stale-delegation-watchdog",
-            )
-            self.store.add_command(watchdog_spec)
-            LOG.info(
-                "Auto-registered watchdog command: %s (every %dm)",
-                self._WATCHDOG_COMMAND_ID,
-                watchdog_spec.frequency_minutes,
-            )
-        except Exception:
-            LOG.exception("Failed to auto-register watchdog command")
-
-    def _ensure_test_button_command(self) -> None:
-        """Register the interactive test-button command if absent.
-
-        The test-button command sends a periodic "Blue or Red?" message with
-        interactive ``discord.ui.Button`` components every 15 minutes.  This
-        is the MVP validation for the interactive-buttons feature — clicking
-        a button produces an in-channel acknowledgement with clicker identity
-        and timestamp.
-
-        Only registers when ``AMPA_DISCORD_BOT_TOKEN`` is set — without a bot
-        the buttons cannot be rendered or clicked, so there is no point
-        scheduling the command.
-        """
-        if not os.getenv("AMPA_DISCORD_BOT_TOKEN"):
-            return
-        try:
-            existing = self.store.list_commands()
-            for cmd in existing:
-                if cmd.command_id == self._TEST_BUTTON_COMMAND_ID:
-                    LOG.debug(
-                        "Test-button command already registered: %s",
-                        self._TEST_BUTTON_COMMAND_ID,
-                    )
-                    return
-            test_button_spec = CommandSpec(
-                command_id=self._TEST_BUTTON_COMMAND_ID,
-                command="echo test-button",  # placeholder; actual work is in start_command
-                requires_llm=False,
-                frequency_minutes=15,
-                priority=0,
-                metadata={},
-                title="Interactive Test Button",
-                max_runtime_minutes=1,
-                command_type="test-button",
-            )
-            self.store.add_command(test_button_spec)
-            LOG.info(
-                "Auto-registered test-button command: %s (every %dm)",
-                self._TEST_BUTTON_COMMAND_ID,
-                test_button_spec.frequency_minutes,
-            )
-        except Exception:
-            LOG.exception("Failed to auto-register test-button command")
-
-    def _send_test_button_message(self) -> None:
-        """Send the "Blue or Red?" test message with interactive buttons.
-
-        Called by ``start_command`` when the test-button command type fires.
-        The message includes two buttons (Blue / Red) that trigger the
-        ``on_interaction`` handler in ``discord_bot.py``, which routes
-        through ``_route_interaction()`` (no-op for ``test_*`` prefixes)
-        and sends an acknowledgement with the clicker's identity and
-        timestamp.
-        """
-        components = [
-            {
-                "type": "button",
-                "label": "Blue",
-                "style": "primary",
-                "custom_id": "test_blue",
-            },
-            {
-                "type": "button",
-                "label": "Red",
-                "style": "danger",
-                "custom_id": "test_red",
-            },
-        ]
-        notifications_module.notify(
-            title="Blue or Red?",
-            body="Pick a colour by clicking a button below.",
-            message_type="command",
-            components=components,
+        self._bot_supervisor = BotSupervisor(
+            run_shell=self.run_shell,
+            command_cwd=self.command_cwd,
+            notifications_module=notifications_module,
         )
 
     def _sync_orchestrator(self) -> None:
@@ -891,19 +258,12 @@ class Scheduler:
         orch = self._delegation_orchestrator
         orch.run_shell = self.run_shell
         orch.engine = self.engine
+        # Ensure the orchestrator sees the current candidate selector
+        # when tests or callers mutate ``self._candidate_selector`` after
+        # Scheduler construction.
+        orch._candidate_selector = self._candidate_selector
         orch._notifications_module = notifications_module
         orch._selection_module = selection
-
-    def _recover_stale_delegations(self) -> List[Dict[str, Any]]:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        self._sync_orchestrator()
-        return self._delegation_orchestrator.recover_stale_delegations()
-
-    def _is_delegation_report_changed(self, command_id: str, report_text: str) -> bool:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        return self._delegation_orchestrator._is_delegation_report_changed(
-            command_id, report_text
-        )
 
     def _global_rate_limited(self, now: dt.datetime) -> bool:
         last_start = self.store.last_global_start()
@@ -987,11 +347,6 @@ class Scheduler:
         )
         state["run_history"] = history[-self.config.max_run_history :]
         self.store.update_state(spec.command_id, state)
-
-    def _inspect_idle_delegation(self) -> Dict[str, Any]:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        self._sync_orchestrator()
-        return self._delegation_orchestrator._inspect_idle_delegation()
 
     def start_command(
         self, spec: CommandSpec, now: Optional[dt.datetime] = None
@@ -1099,7 +454,9 @@ class Scheduler:
             return run
         if spec.command_type == "stale-delegation-watchdog":
             try:
-                stale_recovered = self._recover_stale_delegations()
+                stale_recovered = (
+                    self._delegation_orchestrator.recover_stale_delegations()
+                )
                 if stale_recovered:
                     LOG.info(
                         "Stale delegation watchdog recovered %d item(s)",
@@ -1110,13 +467,26 @@ class Scheduler:
             return run
         if spec.command_type == "test-button":
             try:
-                self._send_test_button_message()
+                _send_test_button_message(notifications_module)
             except Exception:
                 LOG.exception("Test-button message failed")
             return run
 
-        # always post the generic discord message afterwards
-        self._post_discord(spec, run, output)
+        # always post the generic discord notification afterwards
+        if spec.command_type != "heartbeat":
+            try:
+                from .delegation import _summarize_for_discord
+
+                short_output = _summarize_for_discord(output, max_chars=1000)
+            except Exception:
+                LOG.exception("Failed to summarize output for discord post")
+                short_output = output
+            title = spec.title or spec.metadata.get("discord_label") or spec.command_id
+            notifications_module.notify(
+                title=title,
+                body=short_output or "",
+                message_type="command",
+            )
         return run
 
     def run_once(self) -> Optional[RunResult]:
@@ -1131,8 +501,8 @@ class Scheduler:
 
         # Start the Discord bot process (no-op if token not configured).
         # Must happen before the startup message so the socket is ready.
-        self._ensure_bot_running()
-        self._wait_for_bot_socket()
+        self._bot_supervisor.ensure_running()
+        self._bot_supervisor.wait_for_socket()
 
         self._post_startup_message()
 
@@ -1140,7 +510,7 @@ class Scheduler:
         # scheduler exits (SIGTERM / SIGINT / normal exit).
         def _shutdown_handler(signum, frame):
             LOG.info("Received signal %s – shutting down bot", signum)
-            self._shutdown_bot()
+            self._bot_supervisor.shutdown()
             # Re-raise to let the default handler terminate the scheduler.
             signal.signal(signum, signal.SIG_DFL)
             os.kill(os.getpid(), signum)
@@ -1158,7 +528,7 @@ class Scheduler:
         try:
             while True:
                 # Ensure bot is alive at the top of each cycle.
-                self._ensure_bot_running()
+                self._bot_supervisor.ensure_running()
                 try:
                     self.run_once()
                 except Exception:
@@ -1172,50 +542,13 @@ class Scheduler:
                 _health_accum += self.config.poll_interval_seconds
                 if _health_accum >= _health_interval:
                     try:
-                        self._log_health()
+                        _log_health(self.store)
                     except Exception:
                         LOG.exception("Failed to emit periodic health report")
                     _health_accum = 0
         finally:
             # Best-effort cleanup on exit.
-            self._shutdown_bot()
-
-    def _log_health(self) -> None:
-        """Emit a periodic health report about scheduled commands.
-
-        Reports last run timestamp, exit code and running state for each
-        discovered command so operators can quickly see recent activity.
-        """
-        try:
-            cmds = self.store.list_commands()
-        except Exception:
-            LOG.exception("Failed to read commands for health report")
-            return
-        lines: List[str] = []
-        now = _utc_now()
-        for cmd in cmds:
-            try:
-                state = self.store.get_state(cmd.command_id) or {}
-                last_run_iso = state.get("last_run_ts")
-                last_run_dt = _from_iso(last_run_iso) if last_run_iso else None
-                age = (
-                    int((now - last_run_dt).total_seconds())
-                    if last_run_dt is not None
-                    else None
-                )
-                running = bool(state.get("running"))
-                last_exit = state.get("last_exit_code")
-                lines.append(
-                    f"{cmd.command_id} title={cmd.title!r} last_run={last_run_iso or 'never'} age_s={age if age is not None else 'NA'} exit={last_exit} running={running}"
-                )
-            except Exception:
-                LOG.exception(
-                    "Failed to build health line for %s",
-                    getattr(cmd, "command_id", "?"),
-                )
-        LOG.info(
-            "Scheduler health report: %d commands\n%s", len(lines), "\n".join(lines)
-        )
+            self._bot_supervisor.shutdown()
 
     def simulate(
         self,
@@ -1257,126 +590,11 @@ class Scheduler:
             now = now + dt.timedelta(seconds=tick_seconds)
         return {"observed": observed}
 
-    def _post_discord(
-        self, spec: CommandSpec, run: RunResult, output: Optional[str]
-    ) -> None:
-        if spec.command_type == "heartbeat":
-            return
-        # ensure Discord-safe summary for output
-        try:
-            short_output = _summarize_for_discord(output, max_chars=1000)
-        except Exception:
-            LOG.exception("Failed to summarize output for discord post")
-            short_output = output
-
-        title = spec.title or spec.metadata.get("discord_label") or spec.command_id
-        notifications_module.notify(
-            title=title,
-            body=short_output or "",
-            message_type="command",
-        )
-
-    def _run_idle_delegation(
-        self, *, audit_only: bool, spec: Optional[CommandSpec] = None
-    ) -> Dict[str, Any]:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        self._sync_orchestrator()
-        return self._delegation_orchestrator.run_idle_delegation(
-            audit_only=audit_only, spec=spec
-        )
-
-    @staticmethod
-    def _engine_rejections(result: EngineResult) -> List[Dict[str, str]]:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        return DelegationOrchestrator._engine_rejections(result)
-
-    def _run_delegation_report(
-        self, spec: Optional[CommandSpec] = None
-    ) -> Optional[str]:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        self._sync_orchestrator()
-        return self._delegation_orchestrator.run_delegation_report(spec)
-
     def _post_startup_message(self) -> None:
-        # Only attempt startup notification if Discord bot is configured.
-        if not os.getenv("AMPA_DISCORD_BOT_TOKEN"):
-            return
-        # Capture the human-facing output of `wl status` for the startup message
-        try:
-            proc = self.run_shell(
-                "wl status",
-                shell=True,
-                check=False,
-                capture_output=True,
-                text=True,
-                cwd=self.command_cwd,
-            )
-            # Some test doubles may return CompletedProcess with stdout only when
-            # the command used '--json'. Ensure we try the JSON variant when the
-            # plain invocation produced no useful output so tests that stub
-            # `run_shell` for `wl status` still exercise the intended path.
-            if getattr(proc, "stdout", None) == "":
-                json_proc = self.run_shell(
-                    "wl status --json",
-                    shell=True,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    cwd=self.command_cwd,
-                )
-                if getattr(json_proc, "stdout", None):
-                    proc = json_proc
-            status_out = ""
-            if getattr(proc, "stdout", None):
-                status_out += proc.stdout
-            if getattr(proc, "stderr", None):
-                # prefer stderr only if stdout is empty to keep message concise
-                if not status_out:
-                    status_out += proc.stderr
-            if not status_out:
-                status_out = "(wl status produced no output)"
-        except Exception:
-            LOG.exception("Failed to run 'wl status' for startup message")
-            status_out = "(wl status unavailable)"
-
-        notifications_module.notify(
-            title="Scheduler Started",
-            body=status_out,
-            message_type="startup",
-        )
-        LOG.info("Startup notification dispatched")
+        self._bot_supervisor.post_startup_message()
 
 
 def load_scheduler(command_cwd: Optional[str] = None) -> Scheduler:
     config = SchedulerConfig.from_env()
     store = SchedulerStore(config.store_path)
     return Scheduler(store, config, command_cwd=command_cwd)
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point has been extracted to ampa/scheduler_cli.py.
-# Re-export key CLI symbols so existing callers (tests, scripts) continue to
-# work without import changes while they migrate.
-# ---------------------------------------------------------------------------
-from .scheduler_cli import (  # noqa: F401  -- re-exports for backward compat
-    main,
-    _build_parser,
-    _cli_list,
-    _cli_add,
-    _cli_update,
-    _cli_remove,
-    _cli_dry_run,
-    _cli_run,
-    _cli_run_once,
-    _parse_metadata,
-    _store_from_env,
-    _command_description,
-    _build_command_listing,
-    _truncate_text,
-    _format_command_table,
-    _format_run_result_json,
-    _format_run_result_human,
-    _format_command_detail,
-    _format_command_details_table,
-    _get_instance_name,
-)
