@@ -222,7 +222,7 @@ def _cli_dry_run(args: argparse.Namespace) -> int:
     )
     if args.discord and not os.getenv("AMPA_DISCORD_BOT_TOKEN"):
         LOG.warning("AMPA_DISCORD_BOT_TOKEN not set; discord flag will be ignored")
-    report = scheduler._run_delegation_report(spec)
+    report = scheduler._delegation_orchestrator.run_delegation_report(spec)
     if report:
         print(report)
         if args.discord:

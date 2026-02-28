@@ -194,7 +194,7 @@ class TestStaleDelegationDetection:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 1
         assert recovered[0]["work_item_id"] == "WL-1"
@@ -222,7 +222,7 @@ class TestStaleDelegationDetection:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 0
 
@@ -246,7 +246,7 @@ class TestStaleDelegationDetection:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 0
 
@@ -273,7 +273,7 @@ class TestStaleDelegationDetection:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 3
         ids = {r["work_item_id"] for r in recovered}
@@ -293,7 +293,7 @@ class TestStaleDelegationDetection:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert recovered == []
 
@@ -311,7 +311,7 @@ class TestStaleDelegationDetection:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert recovered == []
 
@@ -335,7 +335,7 @@ class TestStaleDelegationDetection:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         # At exact boundary, age_s == threshold, condition is > so not recovered
         assert len(recovered) == 0
@@ -359,7 +359,7 @@ class TestStaleDelegationDetection:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 1
         assert recovered[0]["work_item_id"] == "WL-PAST"
@@ -392,7 +392,7 @@ class TestRecoveryActions:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        scheduler._recover_stale_delegations()
+        scheduler._delegation_orchestrator.recover_stale_delegations()
 
         # Find the wl update call
         update_calls = [
@@ -426,7 +426,7 @@ class TestRecoveryActions:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        scheduler._recover_stale_delegations()
+        scheduler._delegation_orchestrator.recover_stale_delegations()
 
         comment_calls = [
             c
@@ -468,7 +468,7 @@ class TestRecoveryActions:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 0
 
@@ -500,10 +500,12 @@ class TestRecoveryActions:
 
         shell.__call__ = failing_shell
         scheduler = _make_scheduler(shell=shell)
-        # Re-assign the patched shell
+        # Re-assign the patched shell to both the scheduler and the
+        # delegation orchestrator so recover_stale_delegations sees it.
         scheduler.run_shell = failing_shell
+        scheduler._delegation_orchestrator.run_shell = failing_shell
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 1
         assert recovered[0]["work_item_id"] == "WL-CFAIL"
@@ -539,7 +541,7 @@ class TestThresholdConfiguration:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 1
 
@@ -564,7 +566,7 @@ class TestThresholdConfiguration:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 0  # 3600 < 7200 default
 
@@ -605,9 +607,11 @@ class TestDiscordNotification:
             )
             return True
 
-        with mock.patch("ampa.scheduler.notifications_module") as mock_notif:
+        with mock.patch.object(
+            scheduler._delegation_orchestrator, "_notifications_module"
+        ) as mock_notif:
             mock_notif.notify = mock_notify
-            recovered = scheduler._recover_stale_delegations()
+            recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 1
         assert len(sent_notifications) == 1
@@ -628,9 +632,11 @@ class TestDiscordNotification:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        with mock.patch("ampa.scheduler.notifications_module") as mock_notif:
+        with mock.patch.object(
+            scheduler._delegation_orchestrator, "_notifications_module"
+        ) as mock_notif:
             mock_notif.notify = mock.MagicMock()
-            recovered = scheduler._recover_stale_delegations()
+            recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 0
         mock_notif.notify.assert_not_called()
@@ -658,7 +664,7 @@ class TestErrorHandling:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert recovered == []
 
@@ -676,7 +682,7 @@ class TestErrorHandling:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert recovered == []
 
@@ -688,8 +694,9 @@ class TestErrorHandling:
 
         scheduler = _make_scheduler()
         scheduler.run_shell = exploding_shell
+        scheduler._delegation_orchestrator.run_shell = exploding_shell
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert recovered == []
 
@@ -712,7 +719,7 @@ class TestErrorHandling:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert recovered == []
 
@@ -735,7 +742,7 @@ class TestErrorHandling:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert recovered == []
 
@@ -758,7 +765,7 @@ class TestErrorHandling:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 1
         assert recovered[0]["work_item_id"] == "WL-NESTED"
@@ -782,7 +789,7 @@ class TestErrorHandling:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         assert len(recovered) == 1
         assert recovered[0]["work_item_id"] == "WL-SNAKE"
@@ -832,15 +839,15 @@ class TestScheduledCommandIntegration:
         )
 
         with mock.patch.object(
-            scheduler,
-            "_recover_stale_delegations",
-            wraps=scheduler._recover_stale_delegations,
+            scheduler._delegation_orchestrator,
+            "recover_stale_delegations",
+            wraps=scheduler._delegation_orchestrator.recover_stale_delegations,
         ) as mock_recover:
             scheduler.start_command(spec)
             mock_recover.assert_called_once()
 
     def test_watchdog_not_called_for_delegation_commands(self):
-        """_recover_stale_delegations is NOT called for delegation command type."""
+        """recover_stale_delegations is NOT called for delegation command type."""
         store = DummyStore()
         spec = _make_spec(command_type="delegation")
         store.add_command(spec)
@@ -869,12 +876,14 @@ class TestScheduledCommandIntegration:
             run_shell=shell,
         )
 
-        with mock.patch.object(scheduler, "_recover_stale_delegations") as mock_recover:
+        with mock.patch.object(
+            scheduler._delegation_orchestrator, "recover_stale_delegations"
+        ) as mock_recover:
             scheduler.start_command(spec)
             mock_recover.assert_not_called()
 
     def test_watchdog_not_called_for_shell_commands(self):
-        """_recover_stale_delegations is NOT called for shell/heartbeat commands."""
+        """recover_stale_delegations is NOT called for shell/heartbeat commands."""
         store = DummyStore()
         spec = _make_spec(
             command_id="heartbeat-1", command_type="shell", command="echo hi"
@@ -894,7 +903,9 @@ class TestScheduledCommandIntegration:
             run_shell=ShellRecorder(),
         )
 
-        with mock.patch.object(scheduler, "_recover_stale_delegations") as mock_recover:
+        with mock.patch.object(
+            scheduler._delegation_orchestrator, "recover_stale_delegations"
+        ) as mock_recover:
             scheduler.start_command(spec)
             mock_recover.assert_not_called()
 
@@ -922,8 +933,8 @@ class TestScheduledCommandIntegration:
         )
 
         with mock.patch.object(
-            scheduler,
-            "_recover_stale_delegations",
+            scheduler._delegation_orchestrator,
+            "recover_stale_delegations",
             side_effect=RuntimeError("watchdog exploded"),
         ):
             result = scheduler.start_command(spec)
@@ -1089,7 +1100,7 @@ class TestMixedScenarios:
         )
         scheduler = _make_scheduler(shell=shell)
 
-        recovered = scheduler._recover_stale_delegations()
+        recovered = scheduler._delegation_orchestrator.recover_stale_delegations()
 
         ids = {r["work_item_id"] for r in recovered}
         assert ids == {"WL-STALE-1", "WL-STALE-2"}

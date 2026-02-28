@@ -19,6 +19,7 @@ from ampa.scheduler_types import (
 )
 from ampa.scheduler import Scheduler
 from ampa.scheduler_store import SchedulerStore
+from ampa.delegation import DelegationOrchestrator
 
 from ampa.engine.core import (
     Engine,
@@ -31,6 +32,7 @@ from ampa.engine.candidates import (
     CandidateRejection,
     WorkItemCandidate,
 )
+from ampa.engine_factory import build_engine as build_engine_factory
 from ampa.engine.dispatch import DispatchResult
 
 
@@ -102,7 +104,7 @@ def _make_scheduler(
     config = _make_config()
 
     # Suppress auto-construction of engine so we can inject our own
-    with mock.patch.object(Scheduler, "_build_engine", return_value=None):
+    with mock.patch("ampa.scheduler.build_engine", return_value=(None, None)):
         scheduler = Scheduler(
             store=store,
             config=config,
@@ -110,8 +112,9 @@ def _make_scheduler(
             run_shell=run_shell or _noop_run_shell,
         )
 
-    # Inject engine after construction
+    # Inject engine after construction and sync to orchestrator
     scheduler.engine = engine
+    scheduler._delegation_orchestrator.engine = engine
     return scheduler
 
 
@@ -161,12 +164,12 @@ def _make_engine_result(
 
 
 # ---------------------------------------------------------------------------
-# Tests: _run_idle_delegation routes to engine
+# Tests: run_idle_delegation routes to engine
 # ---------------------------------------------------------------------------
 
 
 class TestEngineRouting:
-    """Tests that _run_idle_delegation routes to the engine."""
+    """Tests that run_idle_delegation routes to the engine."""
 
     def test_routes_to_engine_when_available(self):
         """When engine is set, delegation uses engine."""
@@ -176,7 +179,9 @@ class TestEngineRouting:
         )
 
         scheduler = _make_scheduler(engine=engine)
-        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=False, spec=_make_spec()
+        )
 
         engine.process_delegation.assert_called_once()
         assert result["dispatched"] is True
@@ -186,18 +191,22 @@ class TestEngineRouting:
         assert result["delegate_info"]["pid"] == 12345
 
     def test_engine_none_raises_assertion(self):
-        """When engine is None, _run_idle_delegation raises AssertionError."""
+        """When engine is None, run_idle_delegation raises AssertionError."""
         scheduler = _make_scheduler(engine=None)
 
         with pytest.raises(AssertionError):
-            scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+            scheduler._delegation_orchestrator.run_idle_delegation(
+                audit_only=False, spec=_make_spec()
+            )
 
     def test_audit_only_skips_engine(self):
         """audit_only=True returns early without calling the engine."""
         engine = mock.MagicMock(spec=Engine)
         scheduler = _make_scheduler(engine=engine)
 
-        result = scheduler._run_idle_delegation(audit_only=True, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=True, spec=_make_spec()
+        )
 
         engine.process_delegation.assert_not_called()
         assert result["dispatched"] is False
@@ -221,7 +230,9 @@ class TestEngineResultConversion:
             work_item_id="WL-99",
         )
         scheduler = _make_scheduler(engine=engine)
-        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=False, spec=_make_spec()
+        )
 
         assert result["dispatched"] is True
         assert result["note"] == "Delegation: dispatched plan WL-99"
@@ -237,7 +248,9 @@ class TestEngineResultConversion:
             work_item_id="WL-CID-NONE",
         )
         scheduler = _make_scheduler(engine=engine)
-        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=False, spec=_make_spec()
+        )
 
         assert result["dispatched"] is True
         assert result["delegate_info"]["container_id"] is None
@@ -275,7 +288,9 @@ class TestEngineResultConversion:
         engine = mock.MagicMock(spec=Engine)
         engine.process_delegation.return_value = er
         scheduler = _make_scheduler(engine=engine)
-        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=False, spec=_make_spec()
+        )
 
         assert result["dispatched"] is True
         assert result["delegate_info"]["container_id"] == "podman-abc123"
@@ -290,7 +305,9 @@ class TestEngineResultConversion:
             with_candidate=False,
         )
         scheduler = _make_scheduler(engine=engine)
-        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=False, spec=_make_spec()
+        )
 
         assert result["dispatched"] is False
         assert result["idle_notification_sent"] is True
@@ -305,7 +322,9 @@ class TestEngineResultConversion:
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
         scheduler = _make_scheduler(engine=engine)
-        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=False, spec=_make_spec()
+        )
 
         assert result["dispatched"] is False
         assert "hold" in result["note"]
@@ -336,7 +355,9 @@ class TestEngineResultConversion:
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
         scheduler = _make_scheduler(engine=engine)
-        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=False, spec=_make_spec()
+        )
 
         assert result["dispatched"] is False
         assert "blocked" in result["note"]
@@ -354,7 +375,9 @@ class TestEngineResultConversion:
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
         scheduler = _make_scheduler(engine=engine)
-        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=False, spec=_make_spec()
+        )
 
         assert result["dispatched"] is False
         assert "blocked" in result["note"]
@@ -372,7 +395,9 @@ class TestEngineResultConversion:
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
         scheduler = _make_scheduler(engine=engine)
-        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=False, spec=_make_spec()
+        )
 
         assert result["dispatched"] is False
         assert "failed" in result["note"]
@@ -387,7 +412,9 @@ class TestEngineResultConversion:
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
         scheduler = _make_scheduler(engine=engine)
-        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=False, spec=_make_spec()
+        )
 
         assert result["dispatched"] is False
         assert "engine error" in result["note"]
@@ -398,7 +425,9 @@ class TestEngineResultConversion:
         engine = mock.MagicMock(spec=Engine)
         engine.process_delegation.side_effect = RuntimeError("boom")
         scheduler = _make_scheduler(engine=engine)
-        result = scheduler._run_idle_delegation(audit_only=False, spec=_make_spec())
+        result = scheduler._delegation_orchestrator.run_idle_delegation(
+            audit_only=False, spec=_make_spec()
+        )
 
         assert result["dispatched"] is False
         assert "engine error" in result["note"]
@@ -411,7 +440,7 @@ class TestEngineResultConversion:
 
 
 class TestEngineRejections:
-    """Tests the _engine_rejections static method."""
+    """Tests the DelegationOrchestrator._engine_rejections static method."""
 
     def test_no_candidate_result(self):
         """Returns empty list when candidate_result is None."""
@@ -420,7 +449,7 @@ class TestEngineRejections:
             reason="test",
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
-        assert Scheduler._engine_rejections(result) == []
+        assert DelegationOrchestrator._engine_rejections(result) == []
 
     def test_no_rejections(self):
         """Returns empty list when there are no rejections."""
@@ -431,7 +460,7 @@ class TestEngineRejections:
             candidate_result=cr,
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
-        assert Scheduler._engine_rejections(result) == []
+        assert DelegationOrchestrator._engine_rejections(result) == []
 
     def test_with_rejections(self):
         """Returns formatted rejection dicts."""
@@ -451,7 +480,7 @@ class TestEngineRejections:
             candidate_result=cr,
             timestamp=dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
         )
-        rejected = Scheduler._engine_rejections(result)
+        rejected = DelegationOrchestrator._engine_rejections(result)
         assert len(rejected) == 2
         assert rejected[0] == {
             "id": "WL-1",
@@ -466,26 +495,30 @@ class TestEngineRejections:
 
 
 # ---------------------------------------------------------------------------
-# Tests: _build_engine
+# Tests: build_engine factory
 # ---------------------------------------------------------------------------
 
 
 class TestBuildEngine:
-    """Tests the _build_engine method."""
+    """Tests the build_engine factory function."""
 
     def test_build_engine_returns_none_when_descriptor_missing(self):
-        """When the descriptor file doesn't exist, _build_engine returns None."""
+        """When the descriptor file doesn't exist, build_engine returns (None, None)."""
         scheduler = _make_scheduler(engine=None)
 
         with mock.patch.dict(
             "os.environ", {"AMPA_WORKFLOW_DESCRIPTOR": "/nonexistent/path.yaml"}
         ):
-            result = scheduler._build_engine()
+            result, _selector = build_engine_factory(
+                run_shell=scheduler.run_shell,
+                command_cwd=scheduler.command_cwd,
+                store=scheduler.store,
+            )
 
         assert result is None
 
     def test_build_engine_returns_engine_with_valid_descriptor(self):
-        """When a valid descriptor exists, _build_engine returns an Engine."""
+        """When a valid descriptor exists, build_engine returns an Engine."""
         import os
 
         descriptor_path = os.path.join(
@@ -502,7 +535,11 @@ class TestBuildEngine:
         with mock.patch.dict(
             "os.environ", {"AMPA_WORKFLOW_DESCRIPTOR": descriptor_path}
         ):
-            result = scheduler._build_engine()
+            result, _selector = build_engine_factory(
+                run_shell=scheduler.run_shell,
+                command_cwd=scheduler.command_cwd,
+                store=scheduler.store,
+            )
 
         assert result is not None
         assert isinstance(result, Engine)
@@ -520,7 +557,7 @@ class TestSchedulerEngineInit:
         """Passing engine= to Scheduler sets self.engine."""
         engine = mock.MagicMock(spec=Engine)
 
-        with mock.patch.object(Scheduler, "_build_engine", return_value=None):
+        with mock.patch("ampa.scheduler.build_engine", return_value=(None, None)):
             scheduler = Scheduler(
                 store=DummyStore(),
                 config=_make_config(),

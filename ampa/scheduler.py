@@ -71,9 +71,14 @@ from .engine_factory import build_engine  # noqa: E402
 # ---------------------------------------------------------------------------
 # Delegation helpers — canonical implementations live in ampa.delegation.
 # ---------------------------------------------------------------------------
-from .delegation import (  # noqa: E402
-    _summarize_for_discord,
-    DelegationOrchestrator,
+from .delegation import DelegationOrchestrator  # noqa: E402
+
+from .scheduler_helpers import (  # noqa: E402
+    clear_stale_running_states as _clear_stale_running_states,
+    ensure_watchdog_command as _ensure_watchdog_command,
+    ensure_test_button_command as _ensure_test_button_command,
+    send_test_button_message as _send_test_button_message,
+    log_health as _log_health,
 )
 
 
@@ -152,12 +157,25 @@ class Scheduler:
         self.run_shell = _run_shell_with_timeout
 
         # --- Engine initialization ---
-        # If an engine is explicitly provided, use it.  Otherwise, build one
-        # from the workflow descriptor via the engine factory.
+        # If an engine is explicitly provided, use it. Otherwise, build one
+        # from the workflow descriptor via the engine factory. Use the
+        # centralized factory here (build_engine) so the Scheduler does not
+        # contain adapter construction logic.
         self._candidate_selector: Optional[CandidateSelector] = None
-        self.engine: Optional[Engine] = engine
-        if self.engine is None:
-            self.engine = self._build_engine()
+        if engine is not None:
+            # Engine explicitly injected by caller (tests/overrides)
+            self.engine: Optional[Engine] = engine
+        else:
+            # Build engine and candidate selector via the factory and assign
+            # both to Scheduler state so downstream components (delegation
+            # orchestrator, tests) can access the selector instance.
+            eng, selector = build_engine(
+                run_shell=self.run_shell,
+                command_cwd=self.command_cwd,
+                store=self.store,
+            )
+            self.engine = eng
+            self._candidate_selector = selector
 
         # Delegation orchestrator — all delegation-specific orchestration is
         # handled by DelegationOrchestrator (ampa.delegation).
@@ -208,241 +226,25 @@ class Scheduler:
         # Clear any stale 'running' flags left from previous crashes or
         # interrupted runs so commands don't remain permanently blocked.
         try:
-            self._clear_stale_running_states()
+            _clear_stale_running_states(self.store)
         except Exception:
             LOG.exception("Failed to clear stale running states")
 
         # Auto-register the stale delegation watchdog as a scheduled command
         # so it runs on its own cadence (every 30 minutes) independently of
         # delegation timing.
-        self._ensure_watchdog_command()
+        _ensure_watchdog_command(self.store)
 
         # Auto-register the interactive test-button command so a periodic
         # "Blue or Red?" message with discord.ui.Button components is sent
         # every 15 minutes (MVP validation for interactive buttons).
-        self._ensure_test_button_command()
+        _ensure_test_button_command(self.store)
 
         # --- Discord bot process supervision ---
         self._bot_supervisor = BotSupervisor(
             run_shell=self.run_shell,
             command_cwd=self.command_cwd,
             notifications_module=notifications_module,
-        )
-
-    # ------------------------------------------------------------------
-    # Discord bot process supervision — delegated to BotSupervisor.
-    # Properties proxy internal state for backward compatibility with
-    # tests that read/write _bot_process and _bot_consecutive_failures.
-    # ------------------------------------------------------------------
-
-    @property
-    def _bot_process(self):
-        return self._bot_supervisor._bot_process
-
-    @_bot_process.setter
-    def _bot_process(self, value):
-        self._bot_supervisor._bot_process = value
-
-    @property
-    def _bot_consecutive_failures(self):
-        return self._bot_supervisor._bot_consecutive_failures
-
-    @_bot_consecutive_failures.setter
-    def _bot_consecutive_failures(self, value):
-        self._bot_supervisor._bot_consecutive_failures = value
-
-    @property
-    def _BOT_MAX_CONSECUTIVE_FAILURES(self):
-        return self._bot_supervisor._BOT_MAX_CONSECUTIVE_FAILURES
-
-    @_BOT_MAX_CONSECUTIVE_FAILURES.setter
-    def _BOT_MAX_CONSECUTIVE_FAILURES(self, value):
-        self._bot_supervisor._BOT_MAX_CONSECUTIVE_FAILURES = value
-
-    def _ensure_bot_running(self) -> None:
-        self._bot_supervisor.ensure_running()
-
-    def _wait_for_bot_socket(self, timeout: float = 15.0) -> None:
-        self._bot_supervisor.wait_for_socket(timeout)
-
-    def _shutdown_bot(self) -> None:
-        self._bot_supervisor.shutdown()
-
-    def _build_engine(self) -> Optional[Engine]:
-        """Construct an Engine from the workflow descriptor.
-
-        Delegates to ``build_engine()`` factory and stores the
-        ``CandidateSelector`` on ``self._candidate_selector``.
-
-        Returns ``None`` when the descriptor cannot be loaded.
-        """
-        engine, selector = build_engine(
-            run_shell=self.run_shell,
-            command_cwd=self.command_cwd,
-            store=self.store,
-        )
-        self._candidate_selector = selector
-        return engine
-
-    def _clear_stale_running_states(self) -> None:
-        """Clear `running` flags for commands whose last_start_ts is older
-        than AMPA_STALE_RUNNING_THRESHOLD_SECONDS (default 3600s).
-
-        This prevents commands from remaining marked as running due to a
-        previous crash or unhandled exception which would otherwise block
-        future scheduling.
-        """
-        try:
-            thresh_raw = os.getenv("AMPA_STALE_RUNNING_THRESHOLD_SECONDS", "3600")
-            try:
-                threshold = int(thresh_raw)
-            except Exception:
-                threshold = 3600
-            now = _utc_now()
-            for cmd in self.store.list_commands():
-                try:
-                    st = self.store.get_state(cmd.command_id) or {}
-                    if st.get("running") is not True:
-                        continue
-                    last_start_iso = st.get("last_start_ts")
-                    last_start = _from_iso(last_start_iso) if last_start_iso else None
-                    age = (
-                        None
-                        if last_start is None
-                        else int((now - last_start).total_seconds())
-                    )
-                    if age is None or age > threshold:
-                        st["running"] = False
-                        self.store.update_state(cmd.command_id, st)
-                        LOG.info(
-                            "Cleared stale running flag for %s (age_s=%s)",
-                            cmd.command_id,
-                            age,
-                        )
-                except Exception:
-                    LOG.exception(
-                        "Failed to evaluate/clear running state for %s",
-                        getattr(cmd, "command_id", "?"),
-                    )
-        except Exception:
-            LOG.exception("Unexpected error while clearing stale running states")
-
-    # ------------------------------------------------------------------
-    # Auto-registration of built-in commands
-    # ------------------------------------------------------------------
-
-    _WATCHDOG_COMMAND_ID = "stale-delegation-watchdog"
-    _TEST_BUTTON_COMMAND_ID = "test-button"
-
-    def _ensure_watchdog_command(self) -> None:
-        """Register the stale-delegation-watchdog command if absent.
-
-        The watchdog runs on its own cadence (default 30 minutes) so that
-        stuck delegated items are detected even when the delegation command
-        itself is not being selected by the scheduler.
-        """
-        try:
-            existing = self.store.list_commands()
-            for cmd in existing:
-                if cmd.command_id == self._WATCHDOG_COMMAND_ID:
-                    LOG.debug(
-                        "Watchdog command already registered: %s",
-                        self._WATCHDOG_COMMAND_ID,
-                    )
-                    return
-            watchdog_spec = CommandSpec(
-                command_id=self._WATCHDOG_COMMAND_ID,
-                command="echo watchdog",  # placeholder; actual work is in start_command
-                requires_llm=False,
-                frequency_minutes=30,
-                priority=0,
-                metadata={},
-                title="Stale Delegation Watchdog",
-                max_runtime_minutes=5,
-                command_type="stale-delegation-watchdog",
-            )
-            self.store.add_command(watchdog_spec)
-            LOG.info(
-                "Auto-registered watchdog command: %s (every %dm)",
-                self._WATCHDOG_COMMAND_ID,
-                watchdog_spec.frequency_minutes,
-            )
-        except Exception:
-            LOG.exception("Failed to auto-register watchdog command")
-
-    def _ensure_test_button_command(self) -> None:
-        """Register the interactive test-button command if absent.
-
-        The test-button command sends a periodic "Blue or Red?" message with
-        interactive ``discord.ui.Button`` components every 15 minutes.  This
-        is the MVP validation for the interactive-buttons feature — clicking
-        a button produces an in-channel acknowledgement with clicker identity
-        and timestamp.
-
-        Only registers when ``AMPA_DISCORD_BOT_TOKEN`` is set — without a bot
-        the buttons cannot be rendered or clicked, so there is no point
-        scheduling the command.
-        """
-        if not os.getenv("AMPA_DISCORD_BOT_TOKEN"):
-            return
-        try:
-            existing = self.store.list_commands()
-            for cmd in existing:
-                if cmd.command_id == self._TEST_BUTTON_COMMAND_ID:
-                    LOG.debug(
-                        "Test-button command already registered: %s",
-                        self._TEST_BUTTON_COMMAND_ID,
-                    )
-                    return
-            test_button_spec = CommandSpec(
-                command_id=self._TEST_BUTTON_COMMAND_ID,
-                command="echo test-button",  # placeholder; actual work is in start_command
-                requires_llm=False,
-                frequency_minutes=15,
-                priority=0,
-                metadata={},
-                title="Interactive Test Button",
-                max_runtime_minutes=1,
-                command_type="test-button",
-            )
-            self.store.add_command(test_button_spec)
-            LOG.info(
-                "Auto-registered test-button command: %s (every %dm)",
-                self._TEST_BUTTON_COMMAND_ID,
-                test_button_spec.frequency_minutes,
-            )
-        except Exception:
-            LOG.exception("Failed to auto-register test-button command")
-
-    def _send_test_button_message(self) -> None:
-        """Send the "Blue or Red?" test message with interactive buttons.
-
-        Called by ``start_command`` when the test-button command type fires.
-        The message includes two buttons (Blue / Red) that trigger the
-        ``on_interaction`` handler in ``discord_bot.py``, which routes
-        through ``_route_interaction()`` (no-op for ``test_*`` prefixes)
-        and sends an acknowledgement with the clicker's identity and
-        timestamp.
-        """
-        components = [
-            {
-                "type": "button",
-                "label": "Blue",
-                "style": "primary",
-                "custom_id": "test_blue",
-            },
-            {
-                "type": "button",
-                "label": "Red",
-                "style": "danger",
-                "custom_id": "test_red",
-            },
-        ]
-        notifications_module.notify(
-            title="Blue or Red?",
-            body="Pick a colour by clicking a button below.",
-            message_type="command",
-            components=components,
         )
 
     def _sync_orchestrator(self) -> None:
@@ -456,19 +258,12 @@ class Scheduler:
         orch = self._delegation_orchestrator
         orch.run_shell = self.run_shell
         orch.engine = self.engine
+        # Ensure the orchestrator sees the current candidate selector
+        # when tests or callers mutate ``self._candidate_selector`` after
+        # Scheduler construction.
+        orch._candidate_selector = self._candidate_selector
         orch._notifications_module = notifications_module
         orch._selection_module = selection
-
-    def _recover_stale_delegations(self) -> List[Dict[str, Any]]:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        self._sync_orchestrator()
-        return self._delegation_orchestrator.recover_stale_delegations()
-
-    def _is_delegation_report_changed(self, command_id: str, report_text: str) -> bool:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        return self._delegation_orchestrator._is_delegation_report_changed(
-            command_id, report_text
-        )
 
     def _global_rate_limited(self, now: dt.datetime) -> bool:
         last_start = self.store.last_global_start()
@@ -552,11 +347,6 @@ class Scheduler:
         )
         state["run_history"] = history[-self.config.max_run_history :]
         self.store.update_state(spec.command_id, state)
-
-    def _inspect_idle_delegation(self) -> Dict[str, Any]:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        self._sync_orchestrator()
-        return self._delegation_orchestrator._inspect_idle_delegation()
 
     def start_command(
         self, spec: CommandSpec, now: Optional[dt.datetime] = None
@@ -664,7 +454,9 @@ class Scheduler:
             return run
         if spec.command_type == "stale-delegation-watchdog":
             try:
-                stale_recovered = self._recover_stale_delegations()
+                stale_recovered = (
+                    self._delegation_orchestrator.recover_stale_delegations()
+                )
                 if stale_recovered:
                     LOG.info(
                         "Stale delegation watchdog recovered %d item(s)",
@@ -675,7 +467,7 @@ class Scheduler:
             return run
         if spec.command_type == "test-button":
             try:
-                self._send_test_button_message()
+                _send_test_button_message(notifications_module)
             except Exception:
                 LOG.exception("Test-button message failed")
             return run
@@ -683,6 +475,8 @@ class Scheduler:
         # always post the generic discord notification afterwards
         if spec.command_type != "heartbeat":
             try:
+                from .delegation import _summarize_for_discord
+
                 short_output = _summarize_for_discord(output, max_chars=1000)
             except Exception:
                 LOG.exception("Failed to summarize output for discord post")
@@ -707,8 +501,8 @@ class Scheduler:
 
         # Start the Discord bot process (no-op if token not configured).
         # Must happen before the startup message so the socket is ready.
-        self._ensure_bot_running()
-        self._wait_for_bot_socket()
+        self._bot_supervisor.ensure_running()
+        self._bot_supervisor.wait_for_socket()
 
         self._post_startup_message()
 
@@ -716,7 +510,7 @@ class Scheduler:
         # scheduler exits (SIGTERM / SIGINT / normal exit).
         def _shutdown_handler(signum, frame):
             LOG.info("Received signal %s – shutting down bot", signum)
-            self._shutdown_bot()
+            self._bot_supervisor.shutdown()
             # Re-raise to let the default handler terminate the scheduler.
             signal.signal(signum, signal.SIG_DFL)
             os.kill(os.getpid(), signum)
@@ -734,7 +528,7 @@ class Scheduler:
         try:
             while True:
                 # Ensure bot is alive at the top of each cycle.
-                self._ensure_bot_running()
+                self._bot_supervisor.ensure_running()
                 try:
                     self.run_once()
                 except Exception:
@@ -748,50 +542,13 @@ class Scheduler:
                 _health_accum += self.config.poll_interval_seconds
                 if _health_accum >= _health_interval:
                     try:
-                        self._log_health()
+                        _log_health(self.store)
                     except Exception:
                         LOG.exception("Failed to emit periodic health report")
                     _health_accum = 0
         finally:
             # Best-effort cleanup on exit.
-            self._shutdown_bot()
-
-    def _log_health(self) -> None:
-        """Emit a periodic health report about scheduled commands.
-
-        Reports last run timestamp, exit code and running state for each
-        discovered command so operators can quickly see recent activity.
-        """
-        try:
-            cmds = self.store.list_commands()
-        except Exception:
-            LOG.exception("Failed to read commands for health report")
-            return
-        lines: List[str] = []
-        now = _utc_now()
-        for cmd in cmds:
-            try:
-                state = self.store.get_state(cmd.command_id) or {}
-                last_run_iso = state.get("last_run_ts")
-                last_run_dt = _from_iso(last_run_iso) if last_run_iso else None
-                age = (
-                    int((now - last_run_dt).total_seconds())
-                    if last_run_dt is not None
-                    else None
-                )
-                running = bool(state.get("running"))
-                last_exit = state.get("last_exit_code")
-                lines.append(
-                    f"{cmd.command_id} title={cmd.title!r} last_run={last_run_iso or 'never'} age_s={age if age is not None else 'NA'} exit={last_exit} running={running}"
-                )
-            except Exception:
-                LOG.exception(
-                    "Failed to build health line for %s",
-                    getattr(cmd, "command_id", "?"),
-                )
-        LOG.info(
-            "Scheduler health report: %d commands\n%s", len(lines), "\n".join(lines)
-        )
+            self._bot_supervisor.shutdown()
 
     def simulate(
         self,
@@ -832,27 +589,6 @@ class Scheduler:
                     selected_spec = None
             now = now + dt.timedelta(seconds=tick_seconds)
         return {"observed": observed}
-
-    def _run_idle_delegation(
-        self, *, audit_only: bool, spec: Optional[CommandSpec] = None
-    ) -> Dict[str, Any]:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        self._sync_orchestrator()
-        return self._delegation_orchestrator.run_idle_delegation(
-            audit_only=audit_only, spec=spec
-        )
-
-    @staticmethod
-    def _engine_rejections(result: EngineResult) -> List[Dict[str, str]]:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        return DelegationOrchestrator._engine_rejections(result)
-
-    def _run_delegation_report(
-        self, spec: Optional[CommandSpec] = None
-    ) -> Optional[str]:
-        """Thin wrapper — delegates to ``DelegationOrchestrator``."""
-        self._sync_orchestrator()
-        return self._delegation_orchestrator.run_delegation_report(spec)
 
     def _post_startup_message(self) -> None:
         self._bot_supervisor.post_startup_message()
