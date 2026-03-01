@@ -550,6 +550,87 @@ class TestRouteInteraction:
         _route_interaction("survey_q1", "user#1234", "2026-01-01T00:00:00Z")
 
 
+class TestProcessInteractionAck:
+    """Tests for the interaction acknowledgement path (process_interaction).
+
+    These tests avoid requiring discord.py by constructing a minimal fake
+    Interaction-like object.  The acknowledgement path should call
+    ``interaction.response.send_message(...)`` with the expected formatted
+    string.
+    """
+
+    def test_process_interaction_sends_ack_for_known_custom_id(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        try:
+            import discord  # noqa: F401
+
+            interaction_type = discord.InteractionType.component
+        except Exception:
+            interaction_type = "component"
+
+        resp = SimpleNamespace(send_message=AsyncMock())
+        response_wrapper = SimpleNamespace(send_message=resp.send_message)
+
+        user = SimpleNamespace(name="alice", discriminator="1234")
+        interaction = SimpleNamespace(
+            type=interaction_type,
+            data={"custom_id": "test_blue"},
+            user=user,
+            response=response_wrapper,
+        )
+
+        # Call the coroutine and assert send_message was awaited with expected
+        # acknowledgement containing the human-readable label and user id.
+        import asyncio
+
+        from ampa.discord_bot import process_interaction
+
+        asyncio.run(process_interaction(interaction))
+        resp.send_message.assert_awaited()
+        sent_msg = resp.send_message.call_args[0][0]
+        assert "You selected Blue, good luck." in sent_msg
+        assert "alice#1234" in sent_msg
+
+    def test_process_interaction_handles_unparseable_custom_id(self, caplog):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        try:
+            import discord  # noqa: F401
+
+            interaction_type = discord.InteractionType.component
+        except Exception:
+            interaction_type = "component"
+
+        resp = SimpleNamespace(send_message=AsyncMock())
+        response_wrapper = SimpleNamespace(send_message=resp.send_message)
+
+        user = SimpleNamespace(name="bob", discriminator="4321")
+        # custom_id without underscore should trigger a warning but still be
+        # acknowledged using the fallback label.
+        interaction = SimpleNamespace(
+            type=interaction_type,
+            data={"custom_id": "mysteryid"},
+            user=user,
+            response=response_wrapper,
+        )
+
+        import asyncio
+        from ampa.discord_bot import process_interaction
+
+        caplog.clear()
+        asyncio.run(process_interaction(interaction))
+        resp.send_message.assert_awaited()
+        sent_msg = resp.send_message.call_args[0][0]
+        assert "You selected Mysteryid, good luck." in sent_msg
+        # A warning should have been emitted for the unparsable custom_id
+        assert any(
+            "Could not derive label from custom_id" in r.message for r in caplog.records
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tests: _build_view (requires discord.py mock)
 # ---------------------------------------------------------------------------

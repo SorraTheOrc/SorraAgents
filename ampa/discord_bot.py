@@ -155,6 +155,67 @@ def _route_interaction(custom_id: str, user: str, timestamp: str) -> None:
     )
 
 
+async def process_interaction(interaction: object) -> None:
+    """Process a discord.Interaction: route and acknowledge.
+
+    Separated from the client event so tests can call it directly without
+    wrapping in the discord.py event system.
+    """
+    try:
+        import discord  # type: ignore
+    except Exception:
+        # If discord isn't available, we can't inspect types — attempt best-effort
+        # access to expected attributes and fail gracefully in tests.
+        discord = None  # type: ignore
+
+    # Only handle component (button) interactions.
+    if discord is not None:
+        if getattr(interaction, "type", None) != discord.InteractionType.component:
+            LOG.debug(
+                "Ignoring non-component interaction type=%s",
+                getattr(interaction, "type", None),
+            )
+            return
+
+    custom_id = (
+        interaction.data.get("custom_id", "")
+        if getattr(interaction, "data", None)
+        else ""
+    )
+    user = getattr(interaction, "user", None)
+    user_str = (
+        f"{getattr(user, 'name', 'unknown')}#{getattr(user, 'discriminator', '')}"
+        if user
+        else "unknown"
+    )
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    # Route through conversation_manager plumbing (no-op for test_*).
+    _route_interaction(custom_id, user_str, now_iso)
+
+    # Derive a human-readable label from the custom_id.
+    # Convention: custom_id is "prefix_label", e.g. "test_blue" -> "Blue".
+    label = custom_id.rsplit("_", 1)[-1].capitalize() if custom_id else "Unknown"
+
+    # Warn if we couldn't parse a conventional prefix_label format but a
+    # non-empty custom_id was provided.  This helps surface telemetry when
+    # producers send unexpected custom_id values.
+    if custom_id and "_" not in custom_id:
+        LOG.warning(
+            "Could not derive label from custom_id=%r; using %r",
+            custom_id,
+            label,
+        )
+
+    ack_message = f"You selected {label}, good luck. (clicked by {user_str}, {now_iso})"
+    try:
+        # interaction.response.send_message is an async callable on real Interaction
+        await interaction.response.send_message(ack_message)  # type: ignore
+        LOG.info("Acknowledged button click: custom_id=%s user=%s", custom_id, user_str)
+    except Exception:
+        LOG.exception("Failed to acknowledge interaction custom_id=%s", custom_id)
+
+
 # Default socket path
 DEFAULT_SOCKET_PATH = "/tmp/ampa_bot.sock"
 
@@ -239,43 +300,8 @@ class AMPABot:
             Routes through _route_interaction() for conversation_manager
             plumbing (no-op for MVP test messages).
             """
-            # Only handle component (button) interactions.
-            if interaction.type != discord.InteractionType.component:
-                LOG.debug(
-                    "Ignoring non-component interaction type=%s", interaction.type
-                )
-                return
-
-            custom_id = (
-                interaction.data.get("custom_id", "") if interaction.data else ""
-            )
-            user = interaction.user
-            user_str = f"{user.name}#{user.discriminator}" if user else "unknown"
-            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-            # Route through conversation_manager plumbing (no-op for test_*).
-            _route_interaction(custom_id, user_str, now_iso)
-
-            # Derive a human-readable label from the custom_id.
-            # Convention: custom_id is "prefix_label", e.g. "test_blue" -> "Blue".
-            label = (
-                custom_id.rsplit("_", 1)[-1].capitalize() if custom_id else "Unknown"
-            )
-
-            ack_message = (
-                f"You selected {label}, good luck. (clicked by {user_str}, {now_iso})"
-            )
-            try:
-                await interaction.response.send_message(ack_message)
-                LOG.info(
-                    "Acknowledged button click: custom_id=%s user=%s",
-                    custom_id,
-                    user_str,
-                )
-            except Exception:
-                LOG.exception(
-                    "Failed to acknowledge interaction custom_id=%s", custom_id
-                )
+            # Delegate to top-level processor to make the logic testable.
+            await process_interaction(interaction)
 
         @client.event
         async def on_disconnect() -> None:
