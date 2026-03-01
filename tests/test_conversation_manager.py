@@ -73,7 +73,6 @@ def test_resume_no_prompt(tmp_path, monkeypatch):
 def test_resume_with_sdk_client(tmp_path, monkeypatch):
     tool_dir = str(tmp_path)
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", tool_dir)
-    monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
 
     class DummySDK:
         def __init__(self):
@@ -153,7 +152,6 @@ def test_resume_timeout(tmp_path, monkeypatch):
 def test_responder_payload_resume(tmp_path, monkeypatch):
     tool_dir = str(tmp_path)
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", tool_dir)
-    monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
 
     session_id = "s-responder"
     prompt = "Approve deploy?"
@@ -178,7 +176,6 @@ def test_responder_payload_resume(tmp_path, monkeypatch):
 def test_responder_payload_action_accept(tmp_path, monkeypatch):
     tool_dir = str(tmp_path)
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", tool_dir)
-    monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
 
     session_id = "s-responder-action"
     prompt = "Approve deploy?"

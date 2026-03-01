@@ -470,7 +470,6 @@ class TestRespondAcceptRecommendation:
         from ampa import conversation_manager
 
         monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
-        monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
         _setup_fallback_config(
             tmp_path,
             monkeypatch,
@@ -497,7 +496,6 @@ class TestRespondAcceptRecommendation:
         from ampa import conversation_manager
 
         monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
-        monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
         _setup_fallback_config(
             tmp_path,
             monkeypatch,
@@ -528,7 +526,6 @@ class TestRespondAcceptRecommendation:
         from ampa import conversation_manager
 
         monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
-        monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
         _setup_fallback_config(
             tmp_path,
             monkeypatch,
@@ -559,7 +556,6 @@ class TestRespondDiscussOptions:
         from ampa import conversation_manager
 
         monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
-        monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
         _setup_fallback_config(
             tmp_path,
             monkeypatch,
@@ -590,7 +586,6 @@ class TestRespondPerDecisionOverride:
         from ampa import conversation_manager
 
         monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
-        monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
         _setup_fallback_config(
             tmp_path,
             monkeypatch,
@@ -625,7 +620,6 @@ class TestRespondPerDecisionOverride:
         from ampa import conversation_manager
 
         monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
-        monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
         _setup_fallback_config(
             tmp_path,
             monkeypatch,

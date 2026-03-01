@@ -358,13 +358,11 @@ class TestSendViaSocket:
 
     def test_socket_not_found(self, tmp_path, monkeypatch):
         sock = str(tmp_path / "nonexistent.sock")
-        monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
         result = _send_via_socket(sock, {"content": "hello"})
         assert result is False
 
     def test_bot_returns_error(self, tmp_path, monkeypatch):
         sock = str(tmp_path / "test.sock")
-        monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
 
         async def _test():
             srv = _FakeSocketServer(sock, ok=False, error="channel not found")
@@ -464,7 +462,6 @@ class TestNotify:
     def test_notify_dead_letters_on_socket_failure(self, tmp_path, monkeypatch):
         sock = str(tmp_path / "nonexistent.sock")
         monkeypatch.setenv("AMPA_BOT_SOCKET_PATH", sock)
-        monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
         state_file = str(tmp_path / "state.json")
         monkeypatch.setenv("AMPA_STATE_FILE", state_file)
         dl_file = str(tmp_path / "dead.log")
