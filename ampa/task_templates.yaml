@@ -1,0 +1,123 @@
+# Default child-task templates for brief_intake.py
+#
+# Each template defines a standard work-item category that the APMA creates
+# when decomposing a project brief into an epic with child tasks.
+#
+# Fields:
+#   title_prefix:  Prepended to the brief title to form the child title.
+#   issue_type:    wl issue type (task, feature, etc.).
+#   priority:      Default priority (critical, high, medium, low).
+#   suggested_assignee: Default agent-group suggestion.
+#   description_template: Python format string; receives {brief_title} and {brief_summary}.
+#   acceptance_criteria_template: Python format string; produces the AC section.
+
+templates:
+  - category: discovery
+    title_prefix: "Discovery & Analysis:"
+    issue_type: task
+    priority: high
+    suggested_assignee: analysis-agent
+    description_template: |
+      Perform discovery and analysis for: {brief_title}
+
+      Goals:
+      - Identify unknowns, risks, and dependencies.
+      - Review existing codebase, documentation, and related work items.
+      - Produce a findings summary with recommendations.
+
+      Context from brief:
+      {brief_summary}
+    acceptance_criteria_template: |
+      ## Acceptance Criteria
+      1. A findings document is produced listing unknowns, risks, and dependencies.
+      2. Related existing work items and code areas are identified and referenced.
+      3. Recommendations for design and implementation approach are provided.
+      4. Findings are recorded as a comment on the parent epic.
+
+  - category: design
+    title_prefix: "Design Spec:"
+    issue_type: task
+    priority: high
+    suggested_assignee: design-agent
+    description_template: |
+      Produce a design specification for: {brief_title}
+
+      Goals:
+      - Define the architecture, interfaces, and data models.
+      - Specify component interactions and integration points.
+      - Identify design trade-offs and document decisions.
+
+      Context from brief:
+      {brief_summary}
+    acceptance_criteria_template: |
+      ## Acceptance Criteria
+      1. A design document is produced covering architecture, interfaces, and data models.
+      2. Component interactions and integration points are specified.
+      3. Design trade-offs are documented with rationale for chosen approach.
+      4. The design is reviewed and approved (or feedback addressed) before implementation begins.
+
+  - category: implementation
+    title_prefix: "Implementation:"
+    issue_type: feature
+    priority: high
+    suggested_assignee: dev-agent
+    description_template: |
+      Implement the core functionality for: {brief_title}
+
+      Goals:
+      - Write production code meeting the design specification.
+      - Follow project conventions and coding standards.
+      - Ensure code is well-documented and maintainable.
+
+      Context from brief:
+      {brief_summary}
+    acceptance_criteria_template: |
+      ## Acceptance Criteria
+      1. Production code is implemented following the design specification.
+      2. Code follows project conventions (style, naming, module structure).
+      3. All functions and classes have docstrings and inline comments where needed.
+      4. No repository-breaking changes are introduced; the build passes.
+
+  - category: testing
+    title_prefix: "Testing:"
+    issue_type: task
+    priority: high
+    suggested_assignee: test-agent
+    description_template: |
+      Create and execute tests for: {brief_title}
+
+      Goals:
+      - Write unit tests covering core logic and edge cases.
+      - Write integration tests for component interactions.
+      - Ensure test coverage meets project standards.
+
+      Context from brief:
+      {brief_summary}
+    acceptance_criteria_template: |
+      ## Acceptance Criteria
+      1. Unit tests cover all core functions and edge cases.
+      2. Integration tests validate component interactions.
+      3. All tests pass in the CI pipeline.
+      4. Test coverage for new code meets or exceeds project standards.
+
+  - category: documentation
+    title_prefix: "Documentation:"
+    issue_type: task
+    priority: medium
+    suggested_assignee: docs-agent
+    description_template: |
+      Write documentation for: {brief_title}
+
+      Goals:
+      - Author user-facing documentation (usage, configuration, examples).
+      - Update existing docs to reflect changes.
+      - Provide operator runbook entries if applicable.
+
+      Context from brief:
+      {brief_summary}
+    acceptance_criteria_template: |
+      ## Acceptance Criteria
+      1. User-facing documentation is complete (usage, configuration, examples).
+      2. Existing documentation is updated to reflect any changes.
+      3. Operator runbook entries are provided where applicable.
+      4. Documentation is linked from the parent epic for traceability.
