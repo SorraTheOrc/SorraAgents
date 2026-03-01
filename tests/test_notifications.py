@@ -225,6 +225,97 @@ class TestDeadLetter:
         record = json.loads(open(custom_file).readline())
         assert record["payload"]["content"] == "override"
 
+    def test_posts_to_webhook_and_does_not_write_file(self, tmp_path, monkeypatch):
+        """When AMPA_DEADLETTER_WEBHOOK is set and POST succeeds, no file write."""
+        dl_file = str(tmp_path / "dead.log")
+        monkeypatch.setenv("AMPA_DEADLETTER_FILE", dl_file)
+        monkeypatch.setenv("AMPA_DEADLETTER_WEBHOOK", "http://example.invalid/hook")
+
+        # Capture posted payload
+        posted = {}
+
+        import requests
+
+        class _Resp:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+        class _Session:
+            def __init__(self):
+                pass
+
+            def post(self, url, json=None, timeout=None):
+                posted["url"] = url
+                posted["json"] = json
+                posted["timeout"] = timeout
+                return _Resp()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(requests, "Session", _Session)
+
+        dead_letter({"content": "from-webhook"}, reason="socket down")
+
+        # POST attempted
+        assert posted.get("url") == "http://example.invalid/hook"
+        assert posted.get("json") is not None
+        assert posted["json"]["reason"] == "socket down"
+        assert posted["json"]["payload"]["content"] == "from-webhook"
+
+        # File should not be written when webhook accepted the record
+        assert not os.path.exists(dl_file)
+
+    def test_webhook_post_failure_falls_back_to_file(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """When webhook POST fails, dead_letter falls back to file and logs error."""
+        dl_file = str(tmp_path / "dead.log")
+        monkeypatch.setenv("AMPA_DEADLETTER_FILE", dl_file)
+        monkeypatch.setenv("AMPA_DEADLETTER_WEBHOOK", "http://example.invalid/hook")
+
+        import requests
+
+        class _Resp:
+            status_code = 500
+
+            def raise_for_status(self):
+                raise requests.HTTPError("server error")
+
+        class _Session:
+            def __init__(self):
+                pass
+
+            def post(self, url, json=None, timeout=None):
+                return _Resp()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(requests, "Session", _Session)
+
+        caplog.clear()
+        dead_letter({"content": "fallback"}, reason="socket down")
+
+        # File should be written after POST failure
+        assert os.path.exists(dl_file)
+        record = json.loads(open(dl_file).readline())
+        assert record["reason"] == "socket down"
+        assert record["payload"]["content"] == "fallback"
+
+        # Ensure error was logged about webhook failure
+        found = False
+        for rec in caplog.records:
+            if (
+                "dead_letter: webhook POST returned non-2xx status" in rec.getMessage()
+                or "dead_letter: webhook POST failed" in rec.getMessage()
+            ):
+                found = True
+                break
+        assert found
+
 
 # ---------------------------------------------------------------------------
 # Tests: _truncate_output

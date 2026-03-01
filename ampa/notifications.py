@@ -99,6 +99,41 @@ def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
             "reason": reason,
             "payload": payload,
         }
+
+        # If a webhook is configured, try to POST the dead-letter record.
+        webhook = os.getenv("AMPA_DEADLETTER_WEBHOOK")
+        if webhook:
+            try:
+                # Import requests lazily so the package remains optional.
+                import requests  # type: ignore
+
+                session = requests.Session()
+                session.trust_env = False
+                try:
+                    resp = session.post(webhook, json=record, timeout=5)
+                    # Raise for status to treat non-2xx as failures.
+                    try:
+                        resp.raise_for_status()
+                        LOG.info("dead_letter: posted failure to webhook %s", webhook)
+                        return
+                    except Exception:
+                        LOG.exception(
+                            "dead_letter: webhook POST returned non-2xx status (%s)",
+                            getattr(resp, "status_code", None),
+                        )
+                finally:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+            except ImportError:
+                LOG.debug(
+                    "dead_letter: requests library not available, falling back to file"
+                )
+            except Exception:
+                LOG.exception("dead_letter: webhook POST failed, falling back to file")
+
+        # Fallback: append to the dead-letter file.
         dl_file = os.getenv("AMPA_DEADLETTER_FILE") or _default_deadletter_path()
         try:
             parent = os.path.dirname(dl_file)

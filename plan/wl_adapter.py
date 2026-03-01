@@ -35,11 +35,13 @@ class WLAdapter:
             return []
 
     def dep_add(self, blocked: str, blocker: str) -> bool:
-        out = self._run(["dep", "add", blocked, blocker])
+        # request machine-readable output from wl to make callers able to
+        # parse/inspect responses if needed
+        out = self._run(["dep", "add", blocked, blocker, "--json"])
         return out is not None
 
     def dep_rm(self, blocked: str, blocker: str) -> bool:
-        out = self._run(["dep", "rm", blocked, blocker])
+        out = self._run(["dep", "rm", blocked, blocker, "--json"])
         return out is not None
 
     def dep_list(self, id: str) -> List[Dict[str, Any]]:
@@ -153,7 +155,7 @@ class WLAdapter:
                     return True
             return False
 
-        for c in comments:
+        for c in comments or []:
             if _matches(c):
                 # still present
                 return False
