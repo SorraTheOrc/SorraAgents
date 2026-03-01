@@ -1019,35 +1019,57 @@ stop_daemon() {
   fi
 }
 
-# Start the daemon
-start_daemon() {
-  log_info "Attempting to restart daemon..."
-  log_decision "Attempting restart: TARGET=$TARGET_DIR"
-
-  if ! wl ampa start --name default > /tmp/ampa_install_start.log 2>&1; then
-    log_error "Warning: failed to start daemon; see /tmp/ampa_install_start.log"
-    log_decision "RESTART=failed"
-    return 1
-  fi
-
-  # Verify daemon started by checking PID file
+# Verify the daemon started successfully by checking PID file and process liveness
+verify_daemon_started() {
   if [ -f "$PID_FILE" ]; then
     local newpid
     newpid=$(sed -n '1p' "$PID_FILE" 2>/dev/null || true)
     if [ -n "$newpid" ] && kill -0 "$newpid" 2>/dev/null; then
-      log_info "Started pid=$newpid"
-      log_decision "RESTART=ok PID=$newpid"
+      log_info "Daemon running pid=$newpid"
+      log_decision "VERIFY_DAEMON=ok PID=$newpid"
       return 0
     else
-      log_info "Start command executed; no running pid detected. See /tmp/ampa_install_start.log"
-      log_decision "RESTART=unknown"
+      log_error "PID file exists but no running process detected. See /tmp/ampa_install_start.log"
+      log_decision "VERIFY_DAEMON=pid-not-running"
       return 1
     fi
   else
-    log_info "Start command executed; no pid file created. See /tmp/ampa_install_start.log"
-    log_decision "RESTART=no-pid-file"
+    log_error "No PID file created after start. See /tmp/ampa_install_start.log"
+    log_decision "VERIFY_DAEMON=no-pid-file"
     return 1
   fi
+}
+
+# Start the daemon
+start_daemon() {
+  log_info "Attempting to start daemon..."
+  log_decision "Attempting start: TARGET=$TARGET_DIR"
+
+  if ! wl ampa start --name default > /tmp/ampa_install_start.log 2>&1; then
+    log_error "Failed to start daemon; see /tmp/ampa_install_start.log"
+    log_decision "START=failed"
+    return 1
+  fi
+
+  verify_daemon_started
+}
+
+# Restart the daemon by stopping then starting it
+restart_daemon() {
+  log_info "Restarting daemon..."
+  log_decision "RESTART=begin TARGET=$TARGET_DIR"
+
+  stop_daemon
+
+  start_daemon
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    log_decision "RESTART=ok"
+  else
+    log_error "Daemon restart failed: start did not succeed after stop."
+    log_decision "RESTART=failed"
+  fi
+  return "$rc"
 }
 
 # ============================================================================
@@ -1121,12 +1143,13 @@ main() {
     fi
   fi
 
-  # Detect and possibly restart daemon
+  # Detect running daemon and decide on restart after install
   local do_restart=0
   local running_pid
   running_pid=$(detect_running_daemon) || true
   if [ -n "$running_pid" ] && prompt_restart_daemon "$running_pid"; then
     do_restart=1
+    # Stop daemon before install; restart_daemon() will be called after install
     stop_daemon
   fi
 
@@ -1184,17 +1207,23 @@ main() {
      fi
    fi
 
-   # Start daemon after install/upgrade completes, but only if a Python ampa
-   # package was installed into the plugin directory. If no python bundle is
-   # present there's nothing sensible to start and calling `wl ampa start`
-   # will fail with "No command resolved".
+   # Start or restart daemon after install/upgrade completes, but only if a
+   # Python ampa package was installed into the plugin directory. If no python
+   # bundle is present there's nothing sensible to start and calling
+   # `wl ampa start` will fail with "No command resolved".
    # Respect --no-restart flag.
    if [ "$FORCE_NO_RESTART" -eq 0 ] && [ -f "$TARGET_DIR/$(basename "$SRC")" ]; then
      if [ -d "$TARGET_DIR/ampa_py/ampa" ]; then
-       log_info "Starting daemon after installation..."
-       start_daemon
+       if [ "$do_restart" -eq 1 ]; then
+         log_info "Restarting daemon after upgrade..."
+         # stop_daemon was already called before install; just start
+         start_daemon
+       else
+         log_info "Starting daemon after installation..."
+         start_daemon
+       fi
      else
-       log_info "No Python ampa package installed at $TARGET_DIR/ampa_py/ampa; skipping daemon restart."
+       log_info "No Python ampa package installed at $TARGET_DIR/ampa_py/ampa; skipping daemon start."
      fi
    fi
 
