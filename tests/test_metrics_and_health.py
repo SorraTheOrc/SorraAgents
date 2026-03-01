@@ -71,6 +71,7 @@ def test_health_misconfigured(tmp_path, monkeypatch, metrics_server):
 
 def test_responder_endpoint_resumes_session(tmp_path, monkeypatch, metrics_server):
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
     session_id = "s-respond"
     conversation_manager.start_conversation(session_id, "Approve?")
 
@@ -91,6 +92,7 @@ def test_responder_endpoint_resumes_session(tmp_path, monkeypatch, metrics_serve
 
 def test_session_state_endpoint_returns_state(tmp_path, monkeypatch, metrics_server):
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
     session_id = "s-session"
     conversation_manager.start_conversation(session_id, "Confirm?")
 
@@ -157,6 +159,7 @@ def test_responder_public_default_applies_when_project_missing(
     tmp_path, monkeypatch, metrics_server
 ):
     monkeypatch.setenv("AMPA_TOOL_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("AMPA_MAX_RETRIES", "1")
     monkeypatch.setenv("AMPA_ADMIN_TOKEN", "secret-token")
 
     base, server = metrics_server()
