@@ -8,7 +8,7 @@ References:
 - `ampa/scheduler.py` (routing)
 - `tests/test_audit_poller.py` (poller unit tests)
 - `tests/test_triage_audit.py` (integration and behavior tests)
-- `command/audit.md` (the `/audit` command itself)
+ - `skill/audit/SKILL.md` (the `/audit` command itself)
 
 ## Architecture
 
@@ -115,6 +115,9 @@ The `_extract_audit_report()` function in `triage_audit.py` extracts content bet
 Environment variables:
 - `AMPA_DISCORD_BOT_TOKEN`: If set, Discord summary messages are sent via the bot.
 - `AMPA_VERIFY_PR_WITH_GH`: If set to `1|true|yes`, verifies PR merge status with `gh` when a PR URL appears in output. If unset, defaults to enabled.
+
+Migration note:
+- Older documentation sometimes references `AMPA_DISCORD_WEBHOOK` (an incoming webhook URL). The project migrated to a bot/token model; the code and tests expect `AMPA_DISCORD_BOT_TOKEN` (and an optional `AMPA_DISCORD_CHANNEL_ID` or configured socket/channel). If you operate a deployment that still uses an incoming webhook you should either set up a bot token or extend the `notifications` module to accept `AMPA_DISCORD_WEBHOOK` as a fallback.
 
 Per-command metadata (from the scheduler command spec):
 - `audit_cooldown_hours` (default: 6): Minimum hours between audits for the same work item. A single value applies to all items regardless of status.
