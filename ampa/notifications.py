@@ -23,6 +23,7 @@ import logging
 import os
 import socket
 import tempfile
+import time
 from typing import Any, Dict, List, Optional
 
 LOG = logging.getLogger("ampa.notifications")
@@ -32,6 +33,10 @@ DEFAULT_SOCKET_PATH = "/tmp/ampa_bot.sock"
 
 # Socket connect + send timeout in seconds.
 SOCKET_TIMEOUT = 10
+
+# Retry / backoff defaults — overridable via environment variables.
+DEFAULT_MAX_RETRIES = 10
+DEFAULT_BACKOFF_BASE_SECONDS = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -303,58 +308,143 @@ def notify(
     return True
 
 
+def _retry_config() -> tuple:
+    """Return ``(max_retries, backoff_base)`` from env vars or defaults.
+
+    Environment variables:
+    - ``AMPA_MAX_RETRIES`` — maximum number of send attempts (default 10,
+      minimum 1).
+    - ``AMPA_BACKOFF_BASE_SECONDS`` — base delay in seconds for exponential
+      backoff (default 2.0, must be > 0).
+    """
+    try:
+        max_retries = int(os.getenv("AMPA_MAX_RETRIES", str(DEFAULT_MAX_RETRIES)))
+        if max_retries < 1:
+            max_retries = 1
+    except (TypeError, ValueError):
+        max_retries = DEFAULT_MAX_RETRIES
+
+    try:
+        backoff_base = float(
+            os.getenv("AMPA_BACKOFF_BASE_SECONDS", str(DEFAULT_BACKOFF_BASE_SECONDS))
+        )
+        if backoff_base <= 0:
+            backoff_base = DEFAULT_BACKOFF_BASE_SECONDS
+    except (TypeError, ValueError):
+        backoff_base = DEFAULT_BACKOFF_BASE_SECONDS
+
+    return max_retries, backoff_base
+
+
 def _send_via_socket(socket_path: str, msg: Dict[str, Any]) -> bool:
-    """Send a single JSON message to the bot via Unix socket.
+    """Send a single JSON message to the bot via Unix socket with retries.
+
+    Retries with exponential backoff on connection/send failures up to
+    ``AMPA_MAX_RETRIES`` attempts.  Each failed attempt is logged with its
+    attempt number and the error encountered.  A final failure after all
+    retries are exhausted is logged at ERROR level.
 
     Returns ``True`` if the bot acknowledged the message, ``False`` otherwise.
     """
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(SOCKET_TIMEOUT)
-        sock.connect(socket_path)
+    max_retries, backoff_base = _retry_config()
 
-        line = json.dumps(msg) + "\n"
-        sock.sendall(line.encode("utf-8"))
+    last_error: str = ""
+    for attempt in range(1, max_retries + 1):
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(SOCKET_TIMEOUT)
+            sock.connect(socket_path)
 
-        # Read the response line.
-        data = b""
-        while b"\n" not in data:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            data += chunk
+            line = json.dumps(msg) + "\n"
+            sock.sendall(line.encode("utf-8"))
 
-        if not data:
-            LOG.warning("Bot socket returned empty response")
-            return False
+            # Read the response line.
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
 
-        resp = json.loads(data.strip())
-        if resp.get("ok"):
-            LOG.debug("Notification sent successfully via bot socket")
-            return True
-        else:
-            LOG.warning("Bot socket returned error: %s", resp.get("error", "unknown"))
-            return False
+            if not data:
+                last_error = "empty response from bot socket"
+                LOG.warning(
+                    "Send attempt %d/%d failed: %s",
+                    attempt,
+                    max_retries,
+                    last_error,
+                )
+                if attempt < max_retries:
+                    backoff = backoff_base * (2 ** (attempt - 1))
+                    time.sleep(backoff)
+                continue
 
-    except FileNotFoundError:
-        LOG.warning("Bot socket not found at %s – bot may not be running", socket_path)
-        return False
-    except ConnectionRefusedError:
-        LOG.warning(
-            "Bot socket connection refused at %s – bot may not be running",
-            socket_path,
-        )
-        return False
-    except OSError as exc:
-        LOG.warning("Bot socket error: %s", exc)
-        return False
-    except Exception:
-        LOG.exception("Unexpected error sending notification via bot socket")
-        return False
-    finally:
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
+            resp = json.loads(data.strip())
+            if resp.get("ok"):
+                LOG.debug("Notification sent successfully via bot socket")
+                return True
+            else:
+                last_error = "bot returned error: %s" % resp.get("error", "unknown")
+                LOG.warning(
+                    "Send attempt %d/%d failed: %s",
+                    attempt,
+                    max_retries,
+                    last_error,
+                )
+                if attempt < max_retries:
+                    backoff = backoff_base * (2 ** (attempt - 1))
+                    time.sleep(backoff)
+                continue
+
+        except FileNotFoundError:
+            last_error = "socket not found at %s" % socket_path
+            LOG.warning(
+                "Send attempt %d/%d failed: %s",
+                attempt,
+                max_retries,
+                last_error,
+            )
+        except ConnectionRefusedError:
+            last_error = "connection refused at %s" % socket_path
+            LOG.warning(
+                "Send attempt %d/%d failed: %s",
+                attempt,
+                max_retries,
+                last_error,
+            )
+        except OSError as exc:
+            last_error = "socket error: %s" % exc
+            LOG.warning(
+                "Send attempt %d/%d failed: %s",
+                attempt,
+                max_retries,
+                last_error,
+            )
+        except Exception as exc:
+            last_error = "unexpected error: %s" % exc
+            LOG.warning(
+                "Send attempt %d/%d failed: %s",
+                attempt,
+                max_retries,
+                last_error,
+            )
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+        # Sleep before next retry (but not after the last attempt).
+        if attempt < max_retries:
+            backoff = backoff_base * (2 ** (attempt - 1))
+            time.sleep(backoff)
+
+    # All retries exhausted.
+    LOG.error(
+        "All %d send attempts failed. Last error: %s",
+        max_retries,
+        last_error,
+    )
+    return False
