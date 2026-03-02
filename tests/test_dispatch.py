@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
+import threading
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -16,6 +19,7 @@ from ampa.engine.dispatch import (
     Dispatcher,
     DryRunDispatcher,
     OpenCodeRunDispatcher,
+    _enforce_timeout,
 )
 
 # ---------------------------------------------------------------------------
@@ -736,6 +740,116 @@ class TestContainerDispatcherTimeout:
         """Invalid env var falls back to constructor / default."""
         d = ContainerDispatcher(timeout=45, clock=_fixed_clock)
         assert d._timeout == 45
+
+    @patch(f"{_POOL_MOD}.subprocess.Popen")
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-0")
+    @patch(f"{_POOL_MOD}.threading.Timer")
+    def test_dispatch_starts_timer(self, mock_timer_cls, mock_claim, mock_popen):
+        """dispatch() starts a daemon Timer with the configured timeout."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 9999
+        mock_popen.return_value = mock_proc
+        mock_timer = MagicMock()
+        mock_timer_cls.return_value = mock_timer
+
+        d = ContainerDispatcher(
+            project_root="/proj",
+            timeout=42,
+            clock=_fixed_clock,
+        )
+        result = d.dispatch(command="cmd", work_item_id="WL-TMR")
+
+        assert result.success is True
+        mock_timer_cls.assert_called_once()
+        timer_args = mock_timer_cls.call_args
+        assert timer_args[1]["args"] == (mock_proc, 42) or timer_args[0][2] == (
+            mock_proc,
+            42,
+        )
+        assert mock_timer.daemon is True
+        mock_timer.start.assert_called_once()
+
+
+class TestEnforceTimeout:
+    """Tests for _enforce_timeout helper function."""
+
+    def test_already_exited_does_nothing(self):
+        """If process already exited, _enforce_timeout is a no-op."""
+        proc = MagicMock()
+        proc.poll.return_value = 0  # Already exited.
+
+        with patch(f"{_POOL_MOD}.os.killpg") as mock_killpg:
+            _enforce_timeout(proc, 30)
+
+        mock_killpg.assert_not_called()
+
+    @patch(f"{_POOL_MOD}.os.killpg")
+    def test_sends_sigterm_to_process_group(self, mock_killpg):
+        """Sends SIGTERM to the process group when process is still running."""
+        proc = MagicMock()
+        proc.pid = 12345
+        proc.poll.return_value = None  # Still running.
+        proc.wait.return_value = 0  # Exits after SIGTERM.
+
+        _enforce_timeout(proc, 30)
+
+        mock_killpg.assert_called_once_with(12345, signal.SIGTERM)
+
+    @patch(f"{_POOL_MOD}.os.killpg")
+    def test_escalates_to_sigkill_on_timeout(self, mock_killpg):
+        """Sends SIGKILL if process doesn't exit after SIGTERM + grace period."""
+        proc = MagicMock()
+        proc.pid = 12345
+        proc.poll.return_value = None  # Still running.
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="cmd", timeout=5)
+
+        _enforce_timeout(proc, 30)
+
+        assert mock_killpg.call_count == 2
+        mock_killpg.assert_any_call(12345, signal.SIGTERM)
+        mock_killpg.assert_any_call(12345, signal.SIGKILL)
+
+    @patch(f"{_POOL_MOD}.os.killpg")
+    def test_handles_process_already_gone_on_sigterm(self, mock_killpg):
+        """ProcessLookupError on SIGTERM is handled gracefully."""
+        proc = MagicMock()
+        proc.pid = 12345
+        proc.poll.return_value = None
+        mock_killpg.side_effect = ProcessLookupError
+
+        # Should not raise.
+        _enforce_timeout(proc, 30)
+
+        mock_killpg.assert_called_once_with(12345, signal.SIGTERM)
+
+    @patch(f"{_POOL_MOD}.os.killpg")
+    def test_handles_process_already_gone_on_sigkill(self, mock_killpg):
+        """ProcessLookupError on SIGKILL (after SIGTERM) is handled gracefully."""
+        proc = MagicMock()
+        proc.pid = 12345
+        proc.poll.return_value = None
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="cmd", timeout=5)
+
+        # First call (SIGTERM) succeeds, second call (SIGKILL) raises.
+        mock_killpg.side_effect = [None, ProcessLookupError]
+
+        # Should not raise.
+        _enforce_timeout(proc, 30)
+
+        assert mock_killpg.call_count == 2
+
+    @patch(f"{_POOL_MOD}.os.killpg")
+    def test_handles_permission_error_on_sigterm(self, mock_killpg):
+        """PermissionError on SIGTERM is handled gracefully."""
+        proc = MagicMock()
+        proc.pid = 12345
+        proc.poll.return_value = None
+        mock_killpg.side_effect = PermissionError
+
+        # Should not raise.
+        _enforce_timeout(proc, 30)
+
+        mock_killpg.assert_called_once_with(12345, signal.SIGTERM)
 
 
 # ---------------------------------------------------------------------------
