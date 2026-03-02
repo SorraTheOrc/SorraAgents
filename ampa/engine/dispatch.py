@@ -24,8 +24,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -226,6 +228,54 @@ class OpenCodeRunDispatcher:
 
 # Default timeout (seconds) for the distrobox-enter subprocess.
 _DEFAULT_CONTAINER_DISPATCH_TIMEOUT = 30
+
+# Grace period (seconds) between SIGTERM and SIGKILL during timeout enforcement.
+_TIMEOUT_GRACE_PERIOD = 5
+
+
+def _enforce_timeout(proc: subprocess.Popen, timeout: int) -> None:
+    """Kill *proc* after *timeout* seconds if it is still running.
+
+    Runs as a daemon-thread callback so ``dispatch()`` can return immediately
+    (fire-and-forget contract).  Because the child is started with
+    ``start_new_session=True`` we use ``os.killpg`` to terminate the entire
+    process group, ensuring any children spawned inside the distrobox
+    container are also cleaned up.
+
+    Escalation sequence (mirrors ``BotSupervisor.shutdown``):
+      1. ``SIGTERM`` the process group.
+      2. Wait up to ``_TIMEOUT_GRACE_PERIOD`` seconds for graceful exit.
+      3. ``SIGKILL`` the process group if still alive.
+    """
+    exit_code = proc.poll()
+    if exit_code is not None:
+        # Already exited — nothing to do.
+        return
+
+    pgid = proc.pid  # process group id == pid when start_new_session=True
+    LOG.warning(
+        "Container dispatch timeout (%ds) reached for pid %d — sending SIGTERM",
+        timeout,
+        proc.pid,
+    )
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return  # Already gone or we lack permission — nothing more to do.
+
+    try:
+        proc.wait(timeout=_TIMEOUT_GRACE_PERIOD)
+    except subprocess.TimeoutExpired:
+        LOG.warning(
+            "Container dispatch pid %d did not exit after SIGTERM + %ds grace — sending SIGKILL",
+            proc.pid,
+            _TIMEOUT_GRACE_PERIOD,
+        )
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass  # Already gone.
 
 
 def _global_ampa_dir() -> Path:
@@ -481,11 +531,22 @@ class ContainerDispatcher:
                 container_id=container_name,
             )
 
+        # 4. Schedule timeout enforcement -----------------------------------
+        if self._timeout and self._timeout > 0:
+            timer = threading.Timer(
+                self._timeout,
+                _enforce_timeout,
+                args=(proc, self._timeout),
+            )
+            timer.daemon = True  # Don't prevent engine shutdown.
+            timer.start()
+
         LOG.info(
-            "Container dispatch successful: %s -> container=%s pid=%d",
+            "Container dispatch successful: %s -> container=%s pid=%d timeout=%ds",
             work_item_id,
             container_name,
             proc.pid,
+            self._timeout,
         )
         return DispatchResult(
             success=True,
