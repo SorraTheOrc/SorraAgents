@@ -507,3 +507,11 @@ MVP validation of the interactive buttons feature. The command can be run manual
 ```bash
 python -m ampa.scheduler run-once test-button
 ```
+
+Project References
+------------------
+
+- PRD: `docs/prd/PRD_Automated_PM_Agent_-_end-to-end_project_overseer_(SA-0ML5E2A2V1YILTVR).md`
+- Parent epic: SA-0ML5E2A2V1YILTVR (Automated PM Agent — end-to-end project overseer)
+- Parent work item: SA-0ML7NOSHP0MJC6HS (AMPA Daemon: Discord heartbeat & notifier)
+- Documentation work item: SA-0ML7OB1H71YWK6OG (Documentation & Operator Runbook)
