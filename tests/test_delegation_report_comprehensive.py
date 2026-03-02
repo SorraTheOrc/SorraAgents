@@ -533,10 +533,10 @@ class TestIntegrationIdleNoCandidates:
 
     def test_all_rejected_discord_notification(self, tmp_path, monkeypatch):
         """Discord notification sent with idle content when all candidates rejected."""
-        webhook_calls = []
+        notify_calls = []
 
         def fake_notify(title, body="", message_type="other", *, payload=None):
-            webhook_calls.append({"title": title, "body": body, "type": message_type})
+            notify_calls.append({"title": title, "body": body, "type": message_type})
             return True
 
         fake_mod = types.SimpleNamespace(notify=fake_notify)
@@ -585,7 +585,7 @@ class TestIntegrationIdleNoCandidates:
         sched = _make_scheduler(fake_run_shell, tmp_path)
         sched.start_command(_delegation_spec())
 
-        command_calls = [c for c in webhook_calls if c["type"] == "command"]
+        command_calls = [c for c in notify_calls if c["type"] == "command"]
         assert len(command_calls) >= 1, "Should send at least one notification"
         # The notification body should reflect idle state, not busy
         for call in command_calls:
@@ -594,10 +594,10 @@ class TestIntegrationIdleNoCandidates:
     def test_no_items_message_not_busy_in_report(self, tmp_path, monkeypatch):
         """The pre-dispatch report uses idle format when wl in_progress says
         'No in-progress work items found'."""
-        webhook_calls = []
+        notify_calls = []
 
         def fake_notify(title, body="", message_type="other", *, payload=None):
-            webhook_calls.append({"title": title, "body": body, "type": message_type})
+            notify_calls.append({"title": title, "body": body, "type": message_type})
             return True
 
         fake_mod = types.SimpleNamespace(notify=fake_notify)
@@ -646,7 +646,7 @@ class TestIntegrationIdleNoCandidates:
         sched = _make_scheduler(fake_run_shell, tmp_path)
         sched.start_command(_delegation_spec())
 
-        command_calls = [c for c in webhook_calls if c["type"] == "command"]
+        command_calls = [c for c in notify_calls if c["type"] == "command"]
         assert len(command_calls) >= 1
         body = command_calls[0]["body"]
         assert "Agents are currently busy" not in body
@@ -808,10 +808,10 @@ class TestIntegrationInvariantFailure:
 
     def test_invariant_failure_discord_has_detail(self, tmp_path, monkeypatch):
         """Discord notification includes detail, not 'busy', when invariant fails."""
-        webhook_calls = []
+        notify_calls = []
 
         def fake_notify(title, body="", message_type="other", *, payload=None):
-            webhook_calls.append({"title": title, "body": body, "type": message_type})
+            notify_calls.append({"title": title, "body": body, "type": message_type})
             return True
 
         fake_mod = types.SimpleNamespace(notify=fake_notify)
@@ -877,7 +877,7 @@ class TestIntegrationInvariantFailure:
         sched.start_command(_delegation_spec())
 
         # At least one command-type notification should have been sent
-        command_calls = [c for c in webhook_calls if c["type"] == "command"]
+        command_calls = [c for c in notify_calls if c["type"] == "command"]
         assert len(command_calls) >= 1, "At least one Discord notification expected"
         # No notification should say "Agents are currently busy" when agents are idle
         for call in command_calls:

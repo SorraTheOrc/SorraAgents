@@ -2,8 +2,7 @@
 
 This module implements a Discord bot that listens on a Unix domain socket for
 incoming notification requests and sends them as messages to a configured
-Discord channel.  It replaces the webhook-based notification system with a
-persistent bot connection.
+Discord channel.
 
 Usage::
 
@@ -17,8 +16,8 @@ Environment variables:
 
 The bot accepts newline-delimited JSON messages on the Unix socket.  Each
 message must be a JSON object; it is sent to the configured Discord channel as
-a plain-text message using the ``content`` field (matching the existing webhook
-payload format ``{"content": "..."}``) .
+a plain-text message using the ``content`` field
+(payload format ``{"content": "..."}``) .
 
 Protocol
 --------
@@ -380,7 +379,7 @@ class AMPABot:
                     await writer.drain()
                     continue
 
-                # Extract the message content.  Accept either the webhook-style
+                # Extract the message content.  Accept either the
                 # ``{"content": "..."}`` format or a ``{"body": "...", "title":
                 # "..."}`` format from the notification API.
                 content = data.get("content")

@@ -92,7 +92,7 @@ def _run_sync_in_async(sync_fn, *args, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Tests: payload builders (identical to webhook.py behavior)
+# Tests: payload builders
 # ---------------------------------------------------------------------------
 
 
@@ -225,7 +225,9 @@ class TestDeadLetter:
         record = json.loads(open(custom_file).readline())
         assert record["payload"]["content"] == "override"
 
-    def test_posts_to_webhook_and_does_not_write_file(self, tmp_path, monkeypatch):
+    def test_posts_to_deadletter_webhook_and_does_not_write_file(
+        self, tmp_path, monkeypatch
+    ):
         """When AMPA_DEADLETTER_WEBHOOK is set and POST succeeds, no file write."""
         dl_file = str(tmp_path / "dead.log")
         monkeypatch.setenv("AMPA_DEADLETTER_FILE", dl_file)
@@ -257,21 +259,21 @@ class TestDeadLetter:
 
         monkeypatch.setattr(requests, "Session", _Session)
 
-        dead_letter({"content": "from-webhook"}, reason="socket down")
+        dead_letter({"content": "dead-letter-test"}, reason="socket down")
 
         # POST attempted
         assert posted.get("url") == "http://example.invalid/hook"
         assert posted.get("json") is not None
         assert posted["json"]["reason"] == "socket down"
-        assert posted["json"]["payload"]["content"] == "from-webhook"
+        assert posted["json"]["payload"]["content"] == "dead-letter-test"
 
-        # File should not be written when webhook accepted the record
+        # File should not be written when dead-letter webhook accepted the record
         assert not os.path.exists(dl_file)
 
-    def test_webhook_post_failure_falls_back_to_file(
+    def test_deadletter_webhook_post_failure_falls_back_to_file(
         self, tmp_path, monkeypatch, caplog
     ):
-        """When webhook POST fails, dead_letter falls back to file and logs error."""
+        """When dead-letter webhook POST fails, dead_letter falls back to file and logs error."""
         dl_file = str(tmp_path / "dead.log")
         monkeypatch.setenv("AMPA_DEADLETTER_FILE", dl_file)
         monkeypatch.setenv("AMPA_DEADLETTER_WEBHOOK", "http://example.invalid/hook")
@@ -305,12 +307,13 @@ class TestDeadLetter:
         assert record["reason"] == "socket down"
         assert record["payload"]["content"] == "fallback"
 
-        # Ensure error was logged about webhook failure
+        # Ensure error was logged about dead-letter webhook failure
         found = False
         for rec in caplog.records:
             if (
-                "dead_letter: webhook POST returned non-2xx status" in rec.getMessage()
-                or "dead_letter: webhook POST failed" in rec.getMessage()
+                "dead_letter: dead-letter webhook POST returned non-2xx status"
+                in rec.getMessage()
+                or "dead_letter: dead-letter webhook POST failed" in rec.getMessage()
             ):
                 found = True
                 break

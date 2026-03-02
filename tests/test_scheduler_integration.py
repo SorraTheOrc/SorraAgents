@@ -743,7 +743,7 @@ class TestShellAdapters:
         recorder = StoreDispatchRecorder(store=failing_store)
         assert recorder.record_dispatch({}) is None
 
-    def test_discord_notification_sender_no_webhook(self):
+    def test_discord_notification_sender_no_bot_token(self):
         from ampa.engine.adapters import DiscordNotificationSender
 
         with mock.patch("ampa.notifications.notify", return_value=True):

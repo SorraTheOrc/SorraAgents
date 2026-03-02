@@ -61,7 +61,7 @@ def _delegation_spec():
     )
 
 
-def test_idle_delegation_posts_single_detailed_webhook(tmp_path, monkeypatch):
+def test_idle_delegation_posts_single_detailed_notification(tmp_path, monkeypatch):
     calls = []
 
     def fake_notify(title, body="", message_type="other", *, payload=None):
@@ -109,7 +109,7 @@ def test_idle_delegation_posts_single_detailed_webhook(tmp_path, monkeypatch):
 
     result_run = sched.start_command(spec)
 
-    # Ensure a detailed idle webhook is sent. When all candidates are
+    # Ensure a detailed idle notification is sent. When all candidates are
     # rejected the pre-dispatch report path runs and sends a report
     # that includes the considered candidates.
     assert len(calls) >= 1, "Expected at least one notification to be sent"

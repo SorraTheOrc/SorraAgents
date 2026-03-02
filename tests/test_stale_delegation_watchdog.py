@@ -577,7 +577,7 @@ class TestThresholdConfiguration:
 
 
 class TestDiscordNotification:
-    """Verify Discord webhook is sent on recovery."""
+    """Verify Discord notification is sent on recovery."""
 
     def test_discord_sent_on_recovery(self, monkeypatch):
         """A notification is sent when items are recovered."""

@@ -43,13 +43,13 @@ def make_scheduler(run_shell_callable, tmp_path):
 
 
 def test_dispatch_logged_before_spawn(tmp_path, monkeypatch):
-    """Verify a dispatch record is persisted and a dispatch webhook is sent
+    """Verify a dispatch record is persisted and a dispatch notification is sent
     when the engine successfully dispatches work.
 
     The engine records the dispatch after spawning the subprocess (via
     ``StoreDispatchRecorder``). This test patches the engine's dispatcher to
     avoid real subprocess spawning and verifies that the full delegation
-    flow (inspect → engine dispatch → record → webhook) works end-to-end.
+    flow (inspect → engine dispatch → record → notification) works end-to-end.
     """
     calls = []
     captured = {"calls": []}
