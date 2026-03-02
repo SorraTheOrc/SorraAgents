@@ -235,7 +235,7 @@ teardown() {
   [ -f ".worklog/plugins/ampa_py/ampa/.env" ]
 }
 
-@test "webhook written to env file" {
+@test "bot token and channel id written to env file" {
   mkdir -p ampa
   echo 'AMPA_DISCORD_BOT_TOKEN=""' > ampa/.env.sample
   echo 'AMPA_DISCORD_CHANNEL_ID=""' >> ampa/.env.sample

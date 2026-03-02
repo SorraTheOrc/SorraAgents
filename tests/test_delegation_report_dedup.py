@@ -182,10 +182,10 @@ def _make_in_progress_shell(in_progress_text):
 
 def test_first_report_always_sent(tmp_path, monkeypatch):
     """AC (a): The very first delegation report should always be sent."""
-    webhook_calls = []
+    notify_calls = []
 
     def fake_notify(title, body="", message_type="other", *, payload=None):
-        webhook_calls.append(
+        notify_calls.append(
             {"title": title, "body": body, "message_type": message_type}
         )
         return 204
@@ -199,17 +199,17 @@ def test_first_report_always_sent(tmp_path, monkeypatch):
 
     sched.start_command(spec)
 
-    # The pre-dispatch report webhook should have been sent
-    command_calls = [c for c in webhook_calls if c["message_type"] == "command"]
+    # The pre-dispatch report notification should have been sent
+    command_calls = [c for c in notify_calls if c["message_type"] == "command"]
     assert len(command_calls) >= 1, "First report should be sent to Discord"
 
 
 def test_identical_report_suppressed(tmp_path, monkeypatch):
     """AC (b): Identical consecutive reports should be suppressed."""
-    webhook_calls = []
+    notify_calls = []
 
     def fake_notify(title, body="", message_type="other", *, payload=None):
-        webhook_calls.append(
+        notify_calls.append(
             {"title": title, "body": body, "message_type": message_type}
         )
         return 204
@@ -223,12 +223,12 @@ def test_identical_report_suppressed(tmp_path, monkeypatch):
 
     # First run: should send
     sched.start_command(spec)
-    first_count = len([c for c in webhook_calls if c["message_type"] == "command"])
+    first_count = len([c for c in notify_calls if c["message_type"] == "command"])
     assert first_count >= 1
 
-    # Second run with identical content: should NOT send additional webhooks
+    # Second run with identical content: should NOT send additional notifications
     sched.start_command(spec)
-    second_count = len([c for c in webhook_calls if c["message_type"] == "command"])
+    second_count = len([c for c in notify_calls if c["message_type"] == "command"])
     assert second_count == first_count, (
         f"Duplicate report should be suppressed; "
         f"expected {first_count} but got {second_count}"
@@ -237,10 +237,10 @@ def test_identical_report_suppressed(tmp_path, monkeypatch):
 
 def test_changed_report_sent(tmp_path, monkeypatch):
     """AC (c): Report with different content should be sent."""
-    webhook_calls = []
+    notify_calls = []
 
     def fake_notify(title, body="", message_type="other", *, payload=None):
-        webhook_calls.append(
+        notify_calls.append(
             {"title": title, "body": body, "message_type": message_type}
         )
         return 204
@@ -253,7 +253,7 @@ def test_changed_report_sent(tmp_path, monkeypatch):
     sched = _make_scheduler(shell1, tmp_path)
     spec = _delegation_spec()
     sched.start_command(spec)
-    first_count = len([c for c in webhook_calls if c["message_type"] == "command"])
+    first_count = len([c for c in notify_calls if c["message_type"] == "command"])
     assert first_count >= 1
 
     # Now change the in-progress items -> different report content
@@ -283,7 +283,7 @@ def test_changed_report_sent(tmp_path, monkeypatch):
     sched.run_shell = shell2
 
     sched.start_command(spec)
-    second_count = len([c for c in webhook_calls if c["message_type"] == "command"])
+    second_count = len([c for c in notify_calls if c["message_type"] == "command"])
     assert second_count > first_count, "Changed report should be sent to Discord"
 
 
@@ -294,10 +294,10 @@ def test_changed_report_sent(tmp_path, monkeypatch):
 
 def test_idle_no_candidate_dedup(tmp_path, monkeypatch):
     """Idle 'no candidate' messages should be deduped on consecutive runs."""
-    webhook_calls = []
+    notify_calls = []
 
     def fake_notify(title, body="", message_type="other", *, payload=None):
-        webhook_calls.append({"message_type": message_type})
+        notify_calls.append({"message_type": message_type})
         return 204
 
     monkeypatch.setattr(notifications_module, "notify", fake_notify)
@@ -330,11 +330,11 @@ def test_idle_no_candidate_dedup(tmp_path, monkeypatch):
 
     # First run
     sched.start_command(spec)
-    first_count = len([c for c in webhook_calls if c["message_type"] == "command"])
+    first_count = len([c for c in notify_calls if c["message_type"] == "command"])
 
     # Second run with same state
     sched.start_command(spec)
-    second_count = len([c for c in webhook_calls if c["message_type"] == "command"])
+    second_count = len([c for c in notify_calls if c["message_type"] == "command"])
 
     assert second_count == first_count, "Duplicate idle message should be suppressed"
 
@@ -346,10 +346,10 @@ def test_idle_no_candidate_dedup(tmp_path, monkeypatch):
 
 def test_dispatch_notification_always_sent(tmp_path, monkeypatch):
     """Dispatch notifications (message_type='dispatch') should not be suppressed."""
-    webhook_calls = []
+    notify_calls = []
 
     def fake_notify(title, body="", message_type="other", *, payload=None):
-        webhook_calls.append(
+        notify_calls.append(
             {"title": title, "body": body, "message_type": message_type}
         )
         return 204
@@ -430,10 +430,10 @@ def test_dispatch_notification_always_sent(tmp_path, monkeypatch):
     # Run twice; dispatch notification should appear both times.
     # The engine sends dispatch notifications with message_type="engine".
     sched.start_command(spec)
-    first_dispatch = len([c for c in webhook_calls if c["message_type"] == "engine"])
+    first_dispatch = len([c for c in notify_calls if c["message_type"] == "engine"])
 
     sched.start_command(spec)
-    second_dispatch = len([c for c in webhook_calls if c["message_type"] == "engine"])
+    second_dispatch = len([c for c in notify_calls if c["message_type"] == "engine"])
 
     assert first_dispatch >= 1, "Dispatch notification should be sent on first run"
     assert second_dispatch >= 2, (

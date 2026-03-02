@@ -1,8 +1,8 @@
 """Public notification API for AMPA.
 
 This module provides a single entry point — :func:`notify` — that all AMPA
-modules should call instead of ``webhook_module.send_webhook()``.  Internally
-it routes messages to the Discord bot via a Unix domain socket.
+modules should call to send Discord messages.  Internally it routes messages
+to the Discord bot via a Unix domain socket.
 
 If the socket is unreachable the message is dead-lettered to a local file so
 nothing is silently lost.
@@ -10,9 +10,9 @@ nothing is silently lost.
 State tracking
 --------------
 Each successful send records ``last_message_ts`` and ``last_message_type`` in a
-state file (same path as the legacy webhook state).  The daemon's heartbeat
-suppression logic reads this state to avoid sending redundant heartbeats when
-a non-heartbeat message was already sent recently.
+state file.  The daemon's heartbeat suppression logic reads this state to avoid
+sending redundant heartbeats when a non-heartbeat message was already sent
+recently.
 """
 
 from __future__ import annotations
@@ -40,8 +40,8 @@ DEFAULT_BACKOFF_BASE_SECONDS = 2.0
 
 
 # ---------------------------------------------------------------------------
-# State helpers (ported from webhook.py so the state-file contract is
-# preserved across the migration).
+# State helpers — the state-file contract is preserved for backward
+# compatibility.
 # ---------------------------------------------------------------------------
 
 
@@ -68,7 +68,7 @@ def _state_file_path() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Dead-letter (ported from webhook.py)
+# Dead-letter
 # ---------------------------------------------------------------------------
 
 
@@ -105,7 +105,7 @@ def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
             "payload": payload,
         }
 
-        # If a webhook is configured, try to POST the dead-letter record.
+        # If a dead-letter webhook is configured, try to POST the record there.
         webhook = os.getenv("AMPA_DEADLETTER_WEBHOOK")
         if webhook:
             try:
@@ -119,11 +119,14 @@ def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
                     # Raise for status to treat non-2xx as failures.
                     try:
                         resp.raise_for_status()
-                        LOG.info("dead_letter: posted failure to webhook %s", webhook)
+                        LOG.info(
+                            "dead_letter: posted failure to dead-letter webhook %s",
+                            webhook,
+                        )
                         return
                     except Exception:
                         LOG.exception(
-                            "dead_letter: webhook POST returned non-2xx status (%s)",
+                            "dead_letter: dead-letter webhook POST returned non-2xx status (%s)",
                             getattr(resp, "status_code", None),
                         )
                 finally:
@@ -136,7 +139,9 @@ def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
                     "dead_letter: requests library not available, falling back to file"
                 )
             except Exception:
-                LOG.exception("dead_letter: webhook POST failed, falling back to file")
+                LOG.exception(
+                    "dead_letter: dead-letter webhook POST failed, falling back to file"
+                )
 
         # Fallback: append to the dead-letter file.
         dl_file = os.getenv("AMPA_DEADLETTER_FILE") or _default_deadletter_path()
@@ -157,9 +162,8 @@ def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Payload builders (ported from webhook.py for backward compatibility during
-# migration — callers can continue to use these to build the message content
-# and then pass the result to notify()).
+# Payload builders — callers can use these to build the message content
+# and then pass the result to notify().
 # ---------------------------------------------------------------------------
 
 
@@ -176,10 +180,10 @@ def build_payload(
     extra_fields: Optional[List[Dict[str, Any]]] = None,
     title: str = "AMPA Heartbeat",
 ) -> Dict[str, Any]:
-    """Build a simple markdown payload (same output as ``webhook.build_payload``).
+    """Build a simple markdown payload (same output as the legacy ``build_payload``).
 
-    Returns ``{"content": "<markdown>"}`` — compatible with both the legacy
-    webhook format and the new bot socket protocol.
+    Returns ``{"content": "<markdown>"}`` — compatible with the bot socket
+    protocol.
     """
     heading = f"# {title}"
     body: List[str] = []
@@ -204,7 +208,7 @@ def build_command_payload(
     exit_code: Optional[int],
     title: str = "AMPA Heartbeat",
 ) -> Dict[str, Any]:
-    """Build a command-oriented payload (same as ``webhook.build_command_payload``).
+    """Build a command-oriented payload (same as the legacy ``build_command_payload``).
 
     Returns ``{"content": "<markdown>"}``.
     """

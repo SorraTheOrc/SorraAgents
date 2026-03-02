@@ -1042,11 +1042,11 @@ def test_structured_audit_end_to_end(tmp_path, monkeypatch):
     Verifies:
     1. The posted WL comment contains the structured report (not raw output).
     2. The posted WL comment does NOT contain the old "Audit output:" label.
-    3. The Discord webhook payload includes the summary extracted from ## Summary.
+    3. The Discord notification payload includes the summary extracted from ## Summary.
     4. Preamble/trailing noise from the raw output is excluded from the comment.
     """
     calls = []
-    webhook_payloads = []
+    notify_payloads = []
     posted_comments = []
     work_id = "TEST-E2E-STRUCT-001"
 
@@ -1078,7 +1078,7 @@ def test_structured_audit_end_to_end(tmp_path, monkeypatch):
 
     def capture_notify(title, body="", message_type="other", *, payload=None):
         if payload is not None:
-            webhook_payloads.append(payload)
+            notify_payloads.append(payload)
         return True
 
     monkeypatch.setattr(notifications, "notify", capture_notify)
@@ -1171,8 +1171,8 @@ def test_structured_audit_end_to_end(tmp_path, monkeypatch):
     assert "--- AUDIT REPORT START ---" not in comment_content
     assert "--- AUDIT REPORT END ---" not in comment_content
 
-    # --- Verify Discord webhook ---
-    assert webhook_payloads, "Expected at least one webhook payload"
-    # The webhook should include the Summary section text
-    payload_str = json.dumps(webhook_payloads[0])
+    # --- Verify Discord notification ---
+    assert notify_payloads, "Expected at least one notification payload"
+    # The notification should include the Summary section text
+    payload_str = json.dumps(notify_payloads[0])
     assert "All 3 acceptance criteria are met" in payload_str
