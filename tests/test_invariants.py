@@ -589,3 +589,231 @@ class TestRealWorkflowInvariants:
         )
         result = evaluator.evaluate(["requires_approvals"], wi)
         assert result.passed is False
+
+
+# ---------------------------------------------------------------------------
+# Test: Audit-specific invariants (F2)
+# ---------------------------------------------------------------------------
+
+
+class TestAuditInvariants:
+    """Verify audit-specific invariants from workflow.yaml evaluate correctly.
+
+    Invariants tested:
+    - requires_audit_result: regex(comments, "(?i)AMPA Audit Result")
+    - audit_recommends_closure: regex(comments, "(?i)(can this item be closed?\\s*yes|...)")
+    - audit_does_not_recommend_closure: regex(comments, "(?i)can this item be closed?\\s*no")
+    """
+
+    @pytest.fixture
+    def evaluator(self) -> InvariantEvaluator:
+        from ampa.engine.descriptor import load_descriptor
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parent.parent
+        desc = load_descriptor(
+            repo / "docs" / "workflow" / "workflow.yaml",
+            schema_path=repo / "docs" / "workflow" / "workflow-schema.json",
+        )
+        return InvariantEvaluator(desc.invariants, querier=MockQuerier(0))
+
+    # -- requires_audit_result -------------------------------------------------
+
+    def test_requires_audit_result_passes(self, evaluator: InvariantEvaluator) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "AMPA Audit Result: All criteria met."}],
+        )
+        result = evaluator.evaluate(["requires_audit_result"], wi)
+        assert result.passed is True
+
+    def test_requires_audit_result_case_insensitive(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "ampa audit result: pass"}],
+        )
+        result = evaluator.evaluate(["requires_audit_result"], wi)
+        assert result.passed is True
+
+    def test_requires_audit_result_no_comments(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(comments=[])
+        result = evaluator.evaluate(["requires_audit_result"], wi)
+        assert result.passed is False
+
+    def test_requires_audit_result_partial_match_fails(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        """'AMPA Audit' without 'Result' should not match."""
+        wi = _make_work_item(
+            comments=[{"comment": "AMPA Audit completed for this item."}],
+        )
+        result = evaluator.evaluate(["requires_audit_result"], wi)
+        assert result.passed is False
+
+    def test_requires_audit_result_in_multiple_comments(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        """Audit result present in second comment should still match."""
+        wi = _make_work_item(
+            comments=[
+                {"comment": "Agent started work."},
+                {"comment": "AMPA Audit Result: 5/5 criteria met."},
+            ],
+        )
+        result = evaluator.evaluate(["requires_audit_result"], wi)
+        assert result.passed is True
+
+    def test_requires_audit_result_mixed_case(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "Ampa AUDIT result: pass"}],
+        )
+        result = evaluator.evaluate(["requires_audit_result"], wi)
+        assert result.passed is True
+
+    # -- audit_recommends_closure ----------------------------------------------
+
+    def test_recommends_closure_explicit_yes(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "Can this item be closed? Yes"}],
+        )
+        result = evaluator.evaluate(["audit_recommends_closure"], wi)
+        assert result.passed is True
+
+    def test_recommends_closure_all_criteria_met(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "All acceptance criteria are met."}],
+        )
+        result = evaluator.evaluate(["audit_recommends_closure"], wi)
+        assert result.passed is True
+
+    def test_recommends_closure_all_criteria_satisfied(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "All acceptance criteria have been satisfied."}],
+        )
+        result = evaluator.evaluate(["audit_recommends_closure"], wi)
+        assert result.passed is True
+
+    def test_recommends_closure_case_insensitive(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "CAN THIS ITEM BE CLOSED? YES"}],
+        )
+        result = evaluator.evaluate(["audit_recommends_closure"], wi)
+        assert result.passed is True
+
+    def test_recommends_closure_whitespace_variations(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "Can this item be closed?   yes"}],
+        )
+        result = evaluator.evaluate(["audit_recommends_closure"], wi)
+        assert result.passed is True
+
+    def test_recommends_closure_no_match(self, evaluator: InvariantEvaluator) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "Audit found some issues."}],
+        )
+        result = evaluator.evaluate(["audit_recommends_closure"], wi)
+        assert result.passed is False
+
+    def test_recommends_closure_no_comments(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(comments=[])
+        result = evaluator.evaluate(["audit_recommends_closure"], wi)
+        assert result.passed is False
+
+    # -- audit_does_not_recommend_closure --------------------------------------
+
+    def test_does_not_recommend_closure_explicit_no(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "Can this item be closed? No"}],
+        )
+        result = evaluator.evaluate(["audit_does_not_recommend_closure"], wi)
+        assert result.passed is True
+
+    def test_does_not_recommend_closure_case_insensitive(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "can this item be closed? no"}],
+        )
+        result = evaluator.evaluate(["audit_does_not_recommend_closure"], wi)
+        assert result.passed is True
+
+    def test_does_not_recommend_closure_whitespace(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(
+            comments=[{"comment": "Can this item be closed?    no"}],
+        )
+        result = evaluator.evaluate(["audit_does_not_recommend_closure"], wi)
+        assert result.passed is True
+
+    def test_does_not_recommend_closure_no_match(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        """When audit says 'yes', does_not_recommend should not match."""
+        wi = _make_work_item(
+            comments=[{"comment": "Can this item be closed? Yes"}],
+        )
+        result = evaluator.evaluate(["audit_does_not_recommend_closure"], wi)
+        assert result.passed is False
+
+    def test_does_not_recommend_no_comments(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        wi = _make_work_item(comments=[])
+        result = evaluator.evaluate(["audit_does_not_recommend_closure"], wi)
+        assert result.passed is False
+
+    # -- Edge cases ------------------------------------------------------------
+
+    def test_audit_result_returns_false_not_error_on_no_comments(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        """Invariant evaluation should return False (not raise) with no comments."""
+        wi = _make_work_item(comments=[])
+        result = evaluator.evaluate(
+            ["requires_audit_result", "audit_recommends_closure"],
+            wi,
+            fail_fast=False,
+        )
+        assert result.passed is False
+        # Both should be clean failures, not exceptions
+        assert all(isinstance(r, SingleInvariantResult) for r in result.results)
+
+    def test_multiple_audit_comments_latest_still_searchable(
+        self, evaluator: InvariantEvaluator
+    ) -> None:
+        """All comments are concatenated, so any match wins.
+
+        Note: the invariant does not enforce 'latest wins' -- it checks
+        the concatenated text of all comments.  This test documents that
+        behavior.
+        """
+        wi = _make_work_item(
+            comments=[
+                {"comment": "Can this item be closed? No"},
+                {"comment": "Revised: Can this item be closed? Yes"},
+            ],
+        )
+        # Both yes and no patterns exist -- both invariants will match
+        result_yes = evaluator.evaluate(["audit_recommends_closure"], wi)
+        result_no = evaluator.evaluate(["audit_does_not_recommend_closure"], wi)
+        assert result_yes.passed is True
+        assert result_no.passed is True
