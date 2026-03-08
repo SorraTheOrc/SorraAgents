@@ -108,40 +108,64 @@ def dead_letter(payload: Dict[str, Any], reason: Optional[str] = None) -> None:
         # If a dead-letter webhook is configured, try to POST the record there.
         webhook = os.getenv("AMPA_DEADLETTER_WEBHOOK")
         if webhook:
+            # Import requests lazily so the package remains optional.
+            session = None
             try:
-                # Import requests lazily so the package remains optional.
                 import requests  # type: ignore
 
                 session = requests.Session()
                 session.trust_env = False
+
+                # Use a small, bounded retry/backoff when posting dead letters so
+                # transient network issues have a chance to recover without
+                # blocking the caller for too long. Reuse the general retry
+                # configuration but keep attempts conservative (cap at 3).
                 try:
-                    resp = session.post(webhook, json=record, timeout=5)
-                    # Raise for status to treat non-2xx as failures.
+                    max_retries, backoff_base = _retry_config()
+                    web_retries = min(max_retries, 3)
+                except Exception:
+                    web_retries, backoff_base = 3, 2.0
+
+                for attempt in range(1, web_retries + 1):
                     try:
+                        resp = session.post(webhook, json=record, timeout=5)
                         resp.raise_for_status()
                         LOG.info(
-                            "dead_letter: posted failure to dead-letter webhook %s",
+                            "dead_letter: posted failure to dead-letter webhook %s (attempt %d/%d)",
                             webhook,
+                            attempt,
+                            web_retries,
                         )
                         return
                     except Exception:
                         LOG.exception(
-                            "dead_letter: dead-letter webhook POST returned non-2xx status (%s)",
-                            getattr(resp, "status_code", None),
+                            "dead_letter: dead-letter webhook POST failed (attempt %d/%d), webhook=%s",
+                            attempt,
+                            web_retries,
+                            webhook,
                         )
-                finally:
-                    try:
-                        session.close()
-                    except Exception:
-                        pass
+                        if attempt < web_retries:
+                            try:
+                                backoff = backoff_base * (2 ** (attempt - 1))
+                                time.sleep(backoff)
+                            except Exception:
+                                pass
+                # If we get here, all webhook attempts failed — fall through to
+                # the file fallback below.
             except ImportError:
                 LOG.debug(
                     "dead_letter: requests library not available, falling back to file"
                 )
             except Exception:
                 LOG.exception(
-                    "dead_letter: dead-letter webhook POST failed, falling back to file"
+                    "dead_letter: unexpected error while attempting dead-letter webhook, falling back to file"
                 )
+            finally:
+                try:
+                    if session is not None:
+                        session.close()
+                except Exception:
+                    pass
 
         # Fallback: append to the dead-letter file.
         dl_file = os.getenv("AMPA_DEADLETTER_FILE") or _default_deadletter_path()
