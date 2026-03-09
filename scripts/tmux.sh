@@ -56,8 +56,8 @@ fi
 
 # Creates a tmux session with three panes per window:
 # - Left pane: full height, 50% width
-# - Right top: 50% of right column height
-# - Right bottom: 50% of right column height
+# - Right top: ~66% of right column height
+# - Right bottom: ~33% of right column height
 
 SESSION="Dev"
 DEFAULT_WINDOW="Agents"
@@ -126,7 +126,7 @@ create_three_pane_layout() {
   # Create the splits; we'll explicitly send a `cd` to each pane so they end
   # up in the desired working directory regardless of tmux version.
   right_pane="$(tmux split-window -h -p 50 -P -F '#{pane_id}' -t "$target_window")"
-  bottom_right_pane="$(tmux split-window -v -p 50 -P -F '#{pane_id}' -t "$right_pane")"
+  bottom_right_pane="$(tmux split-window -v -p 33 -P -F '#{pane_id}' -t "$right_pane")"
 
   if [[ -n "$pane_dir" ]]; then
     # Wait for each pane to be ready (has a pane_pid) before sending keys.

@@ -863,6 +863,35 @@ setup_python_package() {
   return 0
 }
 
+# Ensure project scheduler store exists at <project>/.worklog/ampa/scheduler_store.json
+ensure_project_scheduler_store() {
+  local project_ampa_dir=".worklog/ampa"
+  local project_store="$project_ampa_dir/scheduler_store.json"
+  local plugin_store="$TARGET_DIR/ampa_py/ampa/scheduler_store.json"
+  local plugin_store_example="$TARGET_DIR/ampa_py/ampa/scheduler_store_example.json"
+
+  mkdir -p "$project_ampa_dir"
+
+  if [ -f "$project_store" ]; then
+    return 0
+  fi
+
+  if [ -f "$plugin_store" ]; then
+    cp -p "$plugin_store" "$project_store" 2>/dev/null || cp "$plugin_store" "$project_store"
+    log_info "Initialized $project_store from plugin scheduler_store.json"
+    return 0
+  fi
+
+  if [ -f "$plugin_store_example" ]; then
+    cp -p "$plugin_store_example" "$project_store" 2>/dev/null || cp "$plugin_store_example" "$project_store"
+    log_info "Initialized $project_store from scheduler_store_example.json"
+    return 0
+  fi
+
+  printf '{"commands": {}, "state": {}, "last_global_start_ts": null}\n' > "$project_store"
+  log_info "Initialized empty $project_store"
+}
+
 # ============================================================================
 # DAEMON RESTART HANDLING
 # ============================================================================
@@ -1191,6 +1220,9 @@ main() {
      log_error "Install cannot proceed without AMPA; aborting."
      exit 2
    fi
+
+   # Ensure scheduler store exists in the project runtime location.
+   ensure_project_scheduler_store
 
    # Handle .env file configuration
    if [ "$SKIP_BOT_CONFIG_UPDATE" -eq 1 ] || [ "$preserve_existing_env" -eq 1 ]; then
