@@ -27,8 +27,8 @@ setup() {
   # Change to test directory
   cd "$TEST_DIR"
   
-  # Copy the installer script to test directory
-  cp /home/rogardle/.config/opencode/skill/install-ampa/scripts/install-worklog-plugin.sh ./install-test.sh
+  # Copy the installer script to test directory (use current user's repo path)
+  cp /home/rgardler/.config/opencode/skill/install-ampa/scripts/install-worklog-plugin.sh ./install-test.sh
   
   # Make it executable
   chmod +x ./install-test.sh
