@@ -212,7 +212,65 @@ def detect_and_surface_blocking_prompt(
     metadata["pending_prompt_file"] = path
     metadata["tool_output_dir"] = out_dir
 
-    # set session state and emit event
+    # Attempt to resolve a per-project fallback mode. If the resolved mode
+    # indicates an automatic decision (auto-accept / auto-decline) apply it
+    # immediately by resuming the session. Otherwise persist state, emit the
+    # waiting event and notify humans.
+    try:
+        # Import locally to avoid any potential import cycles (conversation
+        # manager imports this module). Fallback module is safe to import at
+        # top-level but keep import here for locality and test isolation.
+        try:
+            from . import fallback as fallback_mod
+        except Exception:
+            import fallback as fallback_mod
+
+        mode = fallback_mod.resolve_mode(work_item_id, tool_output_dir=out_dir)
+    except Exception:
+        LOG.exception("Failed to resolve fallback mode for session=%s", session_id)
+        mode = "hold"
+
+    # If configured for automatic handling (via env), attempt to apply the
+    # decision now. Default is to NOT auto-apply so human notification still
+    # occurs unless AMPA_AUTO_APPLY_FALLBACK is set to a truthy value.
+    auto_apply = str(os.getenv("AMPA_AUTO_APPLY_FALLBACK", "")).strip().lower()
+    auto_apply = auto_apply in ("1", "true", "yes")
+
+    # If configured for automatic handling, attempt to apply the decision now
+    if auto_apply and mode in ("auto-accept", "auto-decline"):
+        # write waiting state so resume_session can validate state
+        set_session_state(session_id, "waiting_for_input")
+        response = "accept" if mode == "auto-accept" else "decline"
+        try:
+            # conversation_manager imports session_block; import lazily to
+            # avoid circular import at module import time.
+            try:
+                from . import conversation_manager as conv
+            except Exception:
+                import conversation_manager as conv
+
+            result = conv.resume_session(
+                session_id, response, metadata={"tool_output_dir": out_dir}
+            )
+            LOG.info(
+                "Auto-applied fallback mode=%s for session=%s response=%s",
+                mode,
+                session_id,
+                response,
+            )
+            metadata["fallback_mode"] = mode
+            metadata["fallback_applied"] = True
+            metadata["fallback_response"] = response
+            metadata["resume_result"] = result
+            return metadata
+        except Exception:
+            LOG.exception(
+                "Auto-fallback %s failed for session=%s; falling back to hold",
+                mode,
+                session_id,
+            )
+
+    # Otherwise persist waiting state and notify humans
     set_session_state(session_id, "waiting_for_input")
     emit_internal_event("waiting_for_input", metadata)
     _send_waiting_for_input_notification(metadata)
