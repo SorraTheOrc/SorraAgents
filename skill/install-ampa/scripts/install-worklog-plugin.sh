@@ -66,7 +66,26 @@ acquire_lock() {
     log_error "Another ampa install appears to be running (lock $LOCK_DIR). Try again later."
     exit 1
   fi
+  # Ensure lock is cleaned up on normal exit and common signals.
   trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
+}
+
+# Explicit release function for tests and explicit cleanup paths
+release_lock() {
+  if [ -d "$LOCK_DIR" ]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
+  # Remove traps installed by acquire_lock so callers can control lifecycle
+  trap - EXIT INT TERM || true
+}
+
+# Wrapper to ensure a unique install environment: acquires the lock and
+# records that the caller holds it. Callers may still rely on the EXIT trap
+# established by acquire_lock; release_lock() is provided if explicit
+# release is desired.
+ensure_unique_install() {
+  acquire_lock
+  LOCK_HELD=1
 }
 
 # ============================================================================
