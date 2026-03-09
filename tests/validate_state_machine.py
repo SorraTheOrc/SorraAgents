@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Semantic validation of a workflow descriptor beyond JSON Schema.
 
