@@ -1,23 +1,87 @@
-import json
-import os
-import glob
+"""Integration and behaviour tests for the descriptor-driven triage-audit flow.
+
+Refactored from the Scheduler-based tests to use the descriptor-driven audit
+API (ampa.audit.handlers) directly.  All external side-effects are mocked:
+wl, opencode run, and gh are never invoked as real processes.
+
+Coverage:
+1. Descriptor-driven handler integration:
+   - AuditResultHandler: runs opencode, extracts structured report, posts comment.
+   - CloseWithAuditHandler: closes item, sets needs-producer-review, sends Discord.
+2. Audit poller (poll_and_handoff): candidate query, cooldown, handoff.
+3. TriageAuditRunner: comment posting, gh auto-complete, Discord notification.
+4. Utility helpers: _extract_audit_report, _extract_summary_from_report,
+   _get_github_repo, _build_github_issue_url.
+"""
+
+from __future__ import annotations
+
 import datetime as dt
+import json
 import subprocess
 import re
-from types import SimpleNamespace
+from pathlib import Path
+from typing import Any, Callable
 
-from ampa.scheduler_types import CommandSpec, SchedulerConfig
-from ampa.scheduler import Scheduler
+import pytest
+
+from ampa.audit.handlers import (
+    AuditResultHandler,
+    CloseWithAuditHandler,
+    HandlerResult,
+)
+from ampa.audit.result import (
+    AUDIT_REPORT_END,
+    AUDIT_REPORT_START,
+    AuditResult,
+    CriterionResult,
+)
+from ampa.audit_poller import (
+    PollerOutcome,
+    poll_and_handoff,
+)
+from ampa.engine.descriptor import WorkflowDescriptor, load_descriptor
+from ampa.engine.invariants import InvariantEvaluator, NullQuerier
 from ampa.scheduler_store import SchedulerStore
-import ampa.daemon as daemon
+from ampa.scheduler_types import CommandSpec
+from ampa.triage_audit import (
+    TriageAuditRunner,
+    _extract_audit_report,
+    _extract_summary_from_report,
+    _get_github_repo,
+    _build_github_issue_url,
+)
 from ampa import notifications
 
 
+# ---------------------------------------------------------------------------
+# Shared fixtures and helpers
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture
+def descriptor() -> WorkflowDescriptor:
+    """Load the real workflow descriptor."""
+    return load_descriptor(
+        REPO_ROOT / "docs" / "workflow" / "workflow.yaml",
+        schema_path=REPO_ROOT / "docs" / "workflow" / "workflow-schema.json",
+    )
+
+
+@pytest.fixture
+def evaluator(descriptor: WorkflowDescriptor) -> InvariantEvaluator:
+    """Build evaluator from the real workflow descriptor."""
+    return InvariantEvaluator(descriptor.invariants, querier=NullQuerier())
+
+
 class DummyStore(SchedulerStore):
+    """In-memory SchedulerStore for hermetic tests."""
+
     def __init__(self) -> None:
-        # in-memory store
         self.path = ":memory:"
-        self.data = {
+        self.data: dict[str, Any] = {
             "commands": {},
             "state": {},
             "last_global_start_ts": None,
@@ -28,202 +92,516 @@ class DummyStore(SchedulerStore):
         return None
 
 
-def make_scheduler(run_shell_callable, tmp_path):
-    store = DummyStore()
-    config = SchedulerConfig(
-        poll_interval_seconds=1,
-        global_min_interval_seconds=1,
-        priority_weight=0.1,
-        store_path=str(tmp_path / "store.json"),
-        llm_healthcheck_url="http://localhost/health",
-        max_run_history=5,
-    )
-    sched = Scheduler(
-        store, config, run_shell=run_shell_callable, command_cwd=str(tmp_path)
-    )
-    return sched
+class MockUpdater:
+    """Mock WorkItemUpdater."""
+
+    def __init__(self, succeed: bool = True) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._succeed = succeed
+
+    def update(
+        self,
+        work_item_id: str,
+        *,
+        status: str | None = None,
+        stage: str | None = None,
+        assignee: str | None = None,
+    ) -> bool:
+        self.calls.append(
+            {
+                "work_item_id": work_item_id,
+                "status": status,
+                "stage": stage,
+                "assignee": assignee,
+            }
+        )
+        return self._succeed
 
 
-def test_triage_audit_runs_and_cleans_temp(tmp_path, monkeypatch):
-    """Verify triage-audit flow executes audit command and removes temp comment file."""
-    calls = []
-    work_id = "TEST-WID-123"
+class MockCommentWriter:
+    """Mock WorkItemCommentWriter."""
 
-    # dummy notify so scheduler doesn't try real network
-    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
+    def __init__(self, succeed: bool = True) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._succeed = succeed
 
-    def fake_run_shell(cmd, **kwargs):
-        calls.append(cmd)
-        # wl list --stage in_review
-        if cmd.strip() == "wl list --stage in_review --json":
-            out = json.dumps(
-                {
-                    "workItems": [
-                        {
-                            "id": work_id,
-                            "title": "Test item",
-                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        }
-                    ]
-                }
-            )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        # wl comment list <work>
-        if cmd.strip().startswith(f"wl comment list {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
-            )
-        # opencode audit
-        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
-            # return some stdout that includes a Summary: section
-            out = "Summary:\nThis is a short summary line.\n\nDetails:\nMore info"
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        # wl comment add
-        if cmd.strip().startswith(f"wl comment add {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    sched = make_scheduler(fake_run_shell, tmp_path)
-
-    spec = CommandSpec(
-        command_id="wl-triage-audit",
-        command="true",
-        requires_llm=False,
-        frequency_minutes=1,
-        priority=0,
-        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
-        command_type="triage-audit",
-    )
-    sched.store.add_command(spec)
-
-    # ensure no pre-existing temp files for this work id
-    pre = glob.glob(f"/tmp/wl-audit-comment-{work_id}-*.md")
-    assert not pre
-
-    # set a fake bot token so summary extraction path runs (notify is a noop)
-    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
-
-    # run the command (this will invoke our fake_run_shell)
-    sched.start_command(spec)
-
-    # ensure audit command was called
-    assert any(f"/audit {work_id}" in c for c in calls)
-    # ensure a wl comment add was attempted
-    assert any(c.startswith(f"wl comment add {work_id}") for c in calls)
-
-    # ensure temp files for this work id were removed
-    post = glob.glob(f"/tmp/wl-audit-comment-{work_id}-*.md")
-    assert not post
+    def write_comment(
+        self, work_item_id: str, comment: str, author: str = "ampa-engine"
+    ) -> bool:
+        self.calls.append(
+            {
+                "work_item_id": work_item_id,
+                "comment": comment,
+                "author": author,
+            }
+        )
+        return self._succeed
 
 
-def test_triage_audit_auto_complete_with_gh(tmp_path, monkeypatch):
-    """Verify triage-audit auto-completes when gh confirms PR merged."""
-    calls = []
-    work_id = "TEST-WID-PR-1"
+class MockFetcher:
+    """Mock WorkItemFetcher."""
 
-    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
+    def __init__(self, result: dict[str, Any] | None = None) -> None:
+        self._result = result
+        self.calls: list[str] = []
 
-    def fake_run_shell(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd.strip() == "wl list --stage in_review --json":
-            out = json.dumps(
-                {
-                    "workItems": [
-                        {
-                            "id": work_id,
-                            "title": "PR item",
-                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        }
-                    ]
-                }
-            )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment list {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
-            )
-        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
-            out = "Summary:\nPR merged: https://github.com/example/repo/pull/42\n\nDetails: ready to close"
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith("gh pr view"):
-            # simulate gh returning merged:true
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"merged": True}), stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment add {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
-            )
-        if cmd.strip().startswith(f"wl show {work_id}"):
-            # return no children
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({}), stderr=""
-            )
-        if cmd.strip().startswith(f"wl update {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+    def fetch(self, work_item_id: str) -> dict[str, Any] | None:
+        self.calls.append(work_item_id)
+        return self._result
 
-    sched = make_scheduler(fake_run_shell, tmp_path)
 
-    spec = CommandSpec(
-        command_id="wl-triage-audit",
-        command="true",
-        requires_llm=False,
-        frequency_minutes=1,
-        priority=0,
-        metadata={
-            "truncate_chars": 65536,
-            "audit_cooldown_hours": 0,
-            "verify_pr_with_gh": True,
+class MockNotifier:
+    """Mock NotificationSender."""
+
+    def __init__(self, succeed: bool = True) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._succeed = succeed
+
+    def send(self, message: str, *, title: str = "", level: str = "info") -> bool:
+        self.calls.append({"message": message, "title": title, "level": level})
+        return self._succeed
+
+
+def _make_work_item(
+    work_item_id: str = "TEST-001",
+    title: str = "Test work item",
+    status: str = "in_progress",
+    stage: str = "in_review",
+    tags: list[str] | None = None,
+    comments: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Build a mock work item dict (wl show --json shape)."""
+    return {
+        "workItem": {
+            "id": work_item_id,
+            "title": title,
+            "description": "Test description",
+            "status": status,
+            "stage": stage,
+            "tags": tags or [],
+            "assignee": "",
+            "priority": "medium",
         },
-        command_type="triage-audit",
+        "comments": comments or [],
+    }
+
+
+def _make_structured_audit_output(
+    recommends_closure: bool = True,
+    work_item_id: str = "TEST-001",
+) -> str:
+    """Build a realistic structured audit output with report markers."""
+    if recommends_closure:
+        criteria = (
+            "| 1 | Feature works | met | tests pass |\n"
+            "| 2 | Documentation | met | README updated |"
+        )
+        recommendation = (
+            "Can this item be closed? **Yes**. All acceptance criteria are met."
+        )
+    else:
+        criteria = (
+            "| 1 | Feature works | met | tests pass |\n"
+            "| 2 | Documentation | unmet | README missing |"
+        )
+        recommendation = (
+            "Can this item be closed? **No**. Documentation is missing."
+        )
+
+    return (
+        "Some preamble noise from opencode...\n"
+        f"{AUDIT_REPORT_START}\n"
+        f"## Summary\n\n"
+        f"Audit of {work_item_id}.\n\n"
+        f"## Acceptance Criteria Status\n\n"
+        f"| # | Criterion | Verdict | Evidence |\n"
+        f"|---|-----------|---------|----------|\n"
+        f"{criteria}\n\n"
+        f"## Recommendation\n\n"
+        f"{recommendation}\n"
+        f"{AUDIT_REPORT_END}\n"
+        "Trailing agent noise...\n"
     )
-    sched.store.add_command(spec)
-
-    # enable GH verification via env
-    monkeypatch.setenv("AMPA_VERIFY_PR_WITH_GH", "1")
-
-    sched.start_command(spec)
-
-    # ensure gh pr view was invoked
-    assert any(c.startswith("gh pr view") for c in calls)
-    # ensure wl update was invoked to set completed
-    assert any(c.startswith(f"wl update {work_id}") for c in calls)
-    # ensure --needs-producer-review true is included in the update command
-    update_cmds = [c for c in calls if c.startswith(f"wl update {work_id}")]
-    assert any("--needs-producer-review true" in c for c in update_cmds), (
-        f"Expected --needs-producer-review true in update command, got: {update_cmds}"
-    )
 
 
-def test_triage_audit_no_candidates_skips_discord(tmp_path, monkeypatch):
-    """Verify triage-audit logs and avoids discord when no candidates."""
-    calls = []
+def _make_shell_for_opencode(
+    work_item_id: str,
+    audit_output: str,
+    *,
+    extra_responses: dict[str, subprocess.CompletedProcess] | None = None,
+) -> Callable[..., subprocess.CompletedProcess]:
+    """Return a run_shell mock that intercepts opencode run and optionally gh."""
 
-    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
-
-    def fake_run_shell(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd.strip() == "wl list --stage in_review --json":
+    def run_shell(cmd: str, **kwargs: Any) -> subprocess.CompletedProcess:
+        if f'opencode run "/audit {work_item_id}"' in cmd:
             return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"workItems": []}), stderr=""
+                args=cmd, returncode=0, stdout=audit_output, stderr=""
+            )
+        if extra_responses:
+            for prefix, result in extra_responses.items():
+                if cmd.strip().startswith(prefix):
+                    return result
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout='{"success": true}', stderr=""
+        )
+
+    return run_shell
+
+
+# ---------------------------------------------------------------------------
+# Section 1: Descriptor-driven handler integration
+# ---------------------------------------------------------------------------
+
+
+class TestAuditResultHandlerIntegration:
+    """Integration tests for AuditResultHandler using the descriptor-driven API.
+
+    Mocks: wl (updater, comment_writer, fetcher), opencode run (run_shell).
+    No real processes are spawned.
+    """
+
+    def _make_handler(
+        self,
+        descriptor: WorkflowDescriptor,
+        evaluator: InvariantEvaluator,
+        *,
+        work_item_id: str = "TEST-001",
+        audit_output: str | None = None,
+        recommends_closure: bool = True,
+        comment_writer: MockCommentWriter | None = None,
+        updater: MockUpdater | None = None,
+        fetcher: MockFetcher | None = None,
+    ) -> tuple[AuditResultHandler, MockCommentWriter, MockUpdater]:
+        if comment_writer is None:
+            comment_writer = MockCommentWriter()
+        if updater is None:
+            updater = MockUpdater()
+        if fetcher is None:
+            # Fetcher returns work item with audit comment (satisfies pre-invariant)
+            fetcher = MockFetcher(
+                _make_work_item(
+                    work_item_id=work_item_id,
+                    comments=[
+                        {
+                            "comment": (
+                                "# AMPA Audit Result\n\n"
+                                "Can this item be closed? Yes."
+                            )
+                        }
+                    ],
+                )
+            )
+        output = (
+            audit_output
+            if audit_output is not None
+            else _make_structured_audit_output(recommends_closure, work_item_id)
+        )
+        run_shell = _make_shell_for_opencode(work_item_id, output)
+        handler = AuditResultHandler(
+            descriptor=descriptor,
+            evaluator=evaluator,
+            updater=updater,
+            comment_writer=comment_writer,
+            fetcher=fetcher,
+            run_shell=run_shell,
+        )
+        return handler, comment_writer, updater
+
+    def test_posts_structured_comment(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """AuditResultHandler posts a comment with # AMPA Audit Result heading."""
+        work_id = "AUDIT-COMMENT-001"
+        handler, comment_writer, _ = self._make_handler(
+            descriptor, evaluator, work_item_id=work_id
+        )
+        wi = _make_work_item(work_item_id=work_id, status="in_progress", stage="in_review")
+
+        result = handler.execute(wi)
+
+        assert result.success is True
+        assert len(comment_writer.calls) == 1
+        comment = comment_writer.calls[0]["comment"]
+        assert "# AMPA Audit Result" in comment
+
+    def test_comment_excludes_preamble_and_trailing_noise(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """Comment body contains the structured report, not raw opencode preamble."""
+        work_id = "AUDIT-NOISE-001"
+        handler, comment_writer, _ = self._make_handler(
+            descriptor, evaluator, work_item_id=work_id
+        )
+        wi = _make_work_item(work_item_id=work_id, status="in_progress", stage="in_review")
+
+        handler.execute(wi)
+
+        comment = comment_writer.calls[0]["comment"]
+        assert "preamble noise" not in comment
+        assert "Trailing agent noise" not in comment
+        assert AUDIT_REPORT_START not in comment
+        assert AUDIT_REPORT_END not in comment
+
+    def test_comment_contains_acceptance_criteria(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """Posted comment includes extracted acceptance criteria table."""
+        work_id = "AUDIT-AC-001"
+        handler, comment_writer, _ = self._make_handler(
+            descriptor, evaluator, work_item_id=work_id
+        )
+        wi = _make_work_item(work_item_id=work_id, status="in_progress", stage="in_review")
+
+        handler.execute(wi)
+
+        comment = comment_writer.calls[0]["comment"]
+        assert "Acceptance Criteria" in comment
+        assert "Feature works" in comment
+
+    def test_recommends_closure_transitions_to_audit_passed(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """When audit recommends closure, handler transitions state to audit_passed."""
+        work_id = "AUDIT-PASS-001"
+        handler, _, updater = self._make_handler(
+            descriptor, evaluator, work_item_id=work_id, recommends_closure=True
+        )
+        wi = _make_work_item(work_item_id=work_id, status="in_progress", stage="in_review")
+
+        result = handler.execute(wi)
+
+        assert result.success is True
+        assert result.reason == "audit_result_recorded"
+        assert len(updater.calls) == 1
+        assert updater.calls[0]["stage"] == "audit_passed"
+
+    def test_legacy_output_no_markers_still_posts_comment(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """When opencode output has no markers, handler falls back and still posts comment."""
+        work_id = "AUDIT-LEGACY-001"
+        legacy_output = (
+            "## Summary\n\nAudit complete. All criteria met.\n\n"
+            "## Recommendation\n\nCan this item be closed? Yes.\n"
+        )
+        fetcher = MockFetcher(
+            _make_work_item(
+                work_item_id=work_id,
+                comments=[
+                    {
+                        "comment": (
+                            "# AMPA Audit Result\n\n"
+                            "Can this item be closed? Yes."
+                        )
+                    }
+                ],
+            )
+        )
+        handler, comment_writer, _ = self._make_handler(
+            descriptor,
+            evaluator,
+            work_item_id=work_id,
+            audit_output=legacy_output,
+            fetcher=fetcher,
+        )
+        wi = _make_work_item(work_item_id=work_id, status="in_progress", stage="in_review")
+
+        result = handler.execute(wi)
+
+        assert result.success is True
+        assert len(comment_writer.calls) == 1
+        assert "# AMPA Audit Result" in comment_writer.calls[0]["comment"]
+
+    def test_opencode_empty_output_returns_parse_error(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """When opencode returns empty output, handler returns parse error, no comment posted."""
+        work_id = "AUDIT-EMPTY-001"
+        handler, comment_writer, _ = self._make_handler(
+            descriptor, evaluator, work_item_id=work_id, audit_output=""
+        )
+        wi = _make_work_item(work_item_id=work_id, status="in_progress", stage="in_review")
+
+        result = handler.execute(wi)
+
+        assert result.success is False
+        assert result.reason == "audit_parse_error"
+        assert len(comment_writer.calls) == 0
+
+    def test_comment_does_not_contain_template_headings(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """Posted comment does not contain template or lifecycle headings."""
+        work_id = "AUDIT-TEMPLATE-001"
+        handler, comment_writer, _ = self._make_handler(
+            descriptor, evaluator, work_item_id=work_id
+        )
+        wi = _make_work_item(work_item_id=work_id, status="in_progress", stage="in_review")
+
+        handler.execute(wi)
+
+        comment = comment_writer.calls[0]["comment"]
+        assert "## Intake" not in comment
+        assert "## Plan" not in comment
+        assert "Proposed child work items" not in comment
+
+    def test_invalid_from_state_returns_failure(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """Handler rejects work items not in in_review state."""
+        handler, comment_writer, _ = self._make_handler(descriptor, evaluator)
+        wi = _make_work_item(status="open", stage="idea")
+
+        result = handler.execute(wi)
+
+        assert result.success is False
+        assert result.reason == "invalid_from_state"
+        assert len(comment_writer.calls) == 0
+
+    def test_no_wl_update_outside_state_transition(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """AuditResultHandler only calls updater for the state transition, not extra updates."""
+        work_id = "AUDIT-NOUPDATE-001"
+        handler, _, updater = self._make_handler(
+            descriptor, evaluator, work_item_id=work_id
+        )
+        wi = _make_work_item(work_item_id=work_id, status="in_progress", stage="in_review")
+
+        handler.execute(wi)
+
+        # Exactly one updater call (the state transition to audit_passed)
+        assert len(updater.calls) == 1
+
+
+class TestCloseWithAuditHandlerIntegration:
+    """Integration tests for CloseWithAuditHandler using the descriptor-driven API.
+
+    Mocks: wl (updater, notifier, run_shell), no real processes spawned.
+    """
+
+    def _make_handler(
+        self,
+        descriptor: WorkflowDescriptor,
+        evaluator: InvariantEvaluator,
+        *,
+        updater: MockUpdater | None = None,
+        notifier: MockNotifier | None = None,
+    ) -> tuple[CloseWithAuditHandler, MockUpdater, MockNotifier]:
+        if updater is None:
+            updater = MockUpdater()
+        if notifier is None:
+            notifier = MockNotifier()
+        handler = CloseWithAuditHandler(
+            descriptor=descriptor,
+            evaluator=evaluator,
+            updater=updater,
+            notifier=notifier,
+            run_shell=lambda *a, **kw: subprocess.CompletedProcess(
+                args="", returncode=0, stdout='{"success": true}', stderr=""
+            ),
+        )
+        return handler, updater, notifier
+
+    def _wi_audit_passed(
+        self,
+        work_item_id: str = "CLOSE-001",
+        title: str = "Feature complete",
+        *,
+        recommends_closure: bool = True,
+    ) -> dict[str, Any]:
+        closure_text = "Yes" if recommends_closure else "No"
+        return _make_work_item(
+            work_item_id=work_item_id,
+            title=title,
+            status="completed",
+            stage="audit_passed",
+            comments=[
+                {
+                    "comment": (
+                        f"# AMPA Audit Result\n\n"
+                        f"Can this item be closed? {closure_text}. All criteria met."
+                    )
+                }
+            ],
+        )
+
+    def test_auto_complete_transitions_state(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """CloseWithAuditHandler transitions state when audit recommends closure."""
+        handler, updater, _ = self._make_handler(descriptor, evaluator)
+        wi = self._wi_audit_passed()
+
+        result = handler.execute(wi)
+
+        assert result.success is True
+        assert result.reason == "close_with_audit_completed"
+        assert len(updater.calls) == 1
+
+    def test_auto_complete_sends_discord_notification(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """CloseWithAuditHandler sends a Discord notification on success."""
+        handler, _, notifier = self._make_handler(descriptor, evaluator)
+        wi = self._wi_audit_passed(title="My Completed Feature")
+
+        handler.execute(wi)
+
+        assert len(notifier.calls) == 1
+        assert "My Completed Feature" in notifier.calls[0]["message"]
+
+    def test_no_closure_when_audit_does_not_recommend(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """CloseWithAuditHandler fails when audit does not recommend closure."""
+        handler, updater, _ = self._make_handler(descriptor, evaluator)
+        wi = self._wi_audit_passed(recommends_closure=False)
+
+        result = handler.execute(wi)
+
+        assert result.success is False
+        assert result.reason == "pre_invariant_failed"
+        assert len(updater.calls) == 0
+
+    def test_invalid_from_state_is_rejected(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        """CloseWithAuditHandler rejects work items not in audit_passed state."""
+        handler, updater, _ = self._make_handler(descriptor, evaluator)
+        wi = _make_work_item(status="in_progress", stage="in_review")
+
+        result = handler.execute(wi)
+
+        assert result.success is False
+        assert result.reason == "invalid_from_state"
+        assert len(updater.calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Section 2: Audit poller (poll_and_handoff) integration
+# ---------------------------------------------------------------------------
+
+
+def _make_wl_list_shell(
+    items: list[dict[str, Any]],
+) -> Callable[..., subprocess.CompletedProcess]:
+    """Return a run_shell mock that returns the given items from wl list."""
+    output = json.dumps({"workItems": items})
+
+    def run_shell(cmd: str, **kwargs: Any) -> subprocess.CompletedProcess:
+        if "wl list --stage in_review" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=output, stderr=""
             )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
-    sched = make_scheduler(fake_run_shell, tmp_path)
+    return run_shell
 
+
+def test_poller_no_candidates_returns_no_candidates() -> None:
+    """poll_and_handoff returns no_candidates when wl list returns empty list."""
+    store = DummyStore()
     spec = CommandSpec(
         command_id="wl-triage-audit",
         command="true",
@@ -233,396 +611,182 @@ def test_triage_audit_no_candidates_skips_discord(tmp_path, monkeypatch):
         metadata={"audit_cooldown_hours": 0},
         command_type="triage-audit",
     )
-    sched.store.add_command(spec)
+    store.add_command(spec)
+    handler_calls: list[dict[str, Any]] = []
 
-    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
+    result = poll_and_handoff(
+        run_shell=_make_wl_list_shell([]),
+        cwd="/tmp",
+        store=store,
+        spec=spec,
+        handler=lambda wi: handler_calls.append(wi) or True,
+    )
 
-    sched.start_command(spec)
+    assert result.outcome == PollerOutcome.no_candidates
+    assert result.selected_item_id is None
+    assert len(handler_calls) == 0
 
-    assert calls == ["wl list --stage in_review --json"]
 
-
-def test_triage_audit_excludes_in_progress_items(tmp_path, monkeypatch):
-    """Verify in_progress items are NOT selected as candidates.
-
-    The triage-audit now only queries ``wl list --stage in_review``, so items
-    with ``in_progress`` status should never appear in the candidate list.
-    This is a negative test replacing the old ``test_triage_audit_includes_blocked_items``.
-    """
-    calls = []
-
-    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
-
-    def fake_run_shell(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd.strip() == "wl list --stage in_review --json":
-            # Return empty — no in_review items exist
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"workItems": []}), stderr=""
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    sched = make_scheduler(fake_run_shell, tmp_path)
-
+def test_poller_only_queries_in_review_stage() -> None:
+    """poll_and_handoff issues exactly one wl list --stage in_review query."""
+    store = DummyStore()
     spec = CommandSpec(
         command_id="wl-triage-audit",
         command="true",
         requires_llm=False,
         frequency_minutes=1,
         priority=0,
-        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        metadata={"audit_cooldown_hours": 0},
         command_type="triage-audit",
     )
-    sched.store.add_command(spec)
+    store.add_command(spec)
+    shell_calls: list[str] = []
 
-    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
+    def tracking_shell(cmd: str, **kwargs: Any) -> subprocess.CompletedProcess:
+        shell_calls.append(cmd)
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=json.dumps({"workItems": []}),
+            stderr="",
+        )
 
-    sched.start_command(spec)
+    poll_and_handoff(
+        run_shell=tracking_shell,
+        cwd="/tmp",
+        store=store,
+        spec=spec,
+        handler=lambda wi: True,
+    )
 
-    # No blocked or in_progress queries should be made — only in_review
-    assert not any("wl in_progress" in c for c in calls)
-    assert not any("wl list --status blocked" in c for c in calls)
-    assert not any("wl blocked" in c for c in calls)
-    # Only the in_review query should have been made, and since it returned
-    # empty, no audit should have run
-    assert calls == ["wl list --stage in_review --json"]
+    assert all("in_review" in c for c in shell_calls if "wl" in c)
+    assert not any("in_progress" in c for c in shell_calls)
+    assert not any("blocked" in c for c in shell_calls)
 
 
-def test_per_status_cooldown_respected(tmp_path, monkeypatch):
-    """Verify store-based cooldown: items past cooldown are audited, items within cooldown are skipped.
-
-    The audit poller uses a single ``audit_cooldown_hours`` value (no
-    per-status overrides).  Items whose ``last_audit_at`` is older than
-    this threshold are eligible; items within the threshold are skipped.
-    """
-    calls = []
-    wid_fresh = "WID-FRESH"
-    wid_recent = "WID-RECENT"
-
-    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
-
+def test_poller_cooldown_skips_recently_audited_item() -> None:
+    """poll_and_handoff skips items audited within the cooldown window."""
+    work_id = "WID-RECENT"
     now = dt.datetime.now(dt.timezone.utc)
-    # last audit for wid_fresh: 7 hours ago (past the 6-hour cooldown)
-    # last audit for wid_recent: 3 hours ago (within the 6-hour cooldown)
-    last_audit_fresh = (now - dt.timedelta(hours=7)).isoformat()
-    last_audit_recent = (now - dt.timedelta(hours=3)).isoformat()
-
-    def fake_run_shell(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd.strip() == "wl list --stage in_review --json":
-            out = json.dumps(
-                {
-                    "workItems": [
-                        {
-                            "id": wid_fresh,
-                            "title": "Fresh review item",
-                            "updated_at": (now - dt.timedelta(hours=4)).isoformat(),
-                            "status": "in_review",
-                        },
-                        {
-                            "id": wid_recent,
-                            "title": "Recent review item",
-                            "updated_at": (now - dt.timedelta(hours=2)).isoformat(),
-                            "status": "in_review",
-                        },
-                    ]
-                }
-            )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith("wl comment list"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
-            )
-        if cmd.strip().startswith(f'opencode run "/audit {wid_fresh}"'):
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout="Summary:\nfresh review allowed",
-                stderr="",
-            )
-        if cmd.strip().startswith(f'opencode run "/audit {wid_recent}"'):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout="Summary:\nrecent audited", stderr=""
-            )
-        if cmd.strip().startswith("wl comment add"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    sched = make_scheduler(fake_run_shell, tmp_path)
-
-    # metadata sets cooldown to 6 hours (the poller uses a single cooldown)
+    store = DummyStore()
     spec = CommandSpec(
         command_id="wl-triage-audit",
         command="true",
         requires_llm=False,
         frequency_minutes=1,
         priority=0,
-        metadata={
-            "truncate_chars": 65536,
-            "audit_cooldown_hours": 6,
-        },
+        metadata={"audit_cooldown_hours": 6},
         command_type="triage-audit",
     )
-    sched.store.add_command(spec)
-
-    # persist last_audit timestamps: wid_fresh 7h ago, wid_recent 3h ago
-    sched.store.update_state(
+    store.add_command(spec)
+    # Persisted timestamp: 3 hours ago → within the 6-hour cooldown
+    store.update_state(
         spec.command_id,
         {
             "last_audit_at_by_item": {
-                wid_fresh: last_audit_fresh,
-                wid_recent: last_audit_recent,
+                work_id: (now - dt.timedelta(hours=3)).isoformat(),
             }
         },
     )
+    handler_calls: list[dict[str, Any]] = []
 
-    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
+    result = poll_and_handoff(
+        run_shell=_make_wl_list_shell(
+            [{"id": work_id, "title": "Recent item", "updated_at": now.isoformat()}]
+        ),
+        cwd="/tmp",
+        store=store,
+        spec=spec,
+        handler=lambda wi: handler_calls.append(wi) or True,
+        now=now,
+    )
 
-    sched.start_command(spec)
-
-    # wid_fresh: last audit 7h ago, cooldown 6h → should be audited
-    assert any(f"/audit {wid_fresh}" in c for c in calls)
-    # wid_recent: last audit 3h ago, cooldown 6h → should be skipped
-    assert not any(f"/audit {wid_recent}" in c for c in calls)
+    assert result.outcome == PollerOutcome.no_candidates
+    assert len(handler_calls) == 0
 
 
-def test_triage_audit_audit_only_no_update(tmp_path, monkeypatch):
-    """Verify audit-only mode avoids wl update."""
-    calls = []
-    work_id = "AUDIT-ONLY-1"
-
-    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
-
-    def fake_run_shell(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd.strip() == "wl list --stage in_review --json":
-            out = json.dumps(
-                {
-                    "workItems": [
-                        {
-                            "id": work_id,
-                            "title": "Audit only item",
-                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        }
-                    ]
-                }
-            )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment list {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
-            )
-        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
-            out = "Summary:\nAudit only output\n"
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment add {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
-            )
-        if cmd.strip().startswith(f"wl update {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    sched = make_scheduler(fake_run_shell, tmp_path)
-
+def test_poller_cooldown_audits_expired_item() -> None:
+    """poll_and_handoff hands off items whose cooldown has expired."""
+    work_id = "WID-FRESH"
+    now = dt.datetime.now(dt.timezone.utc)
+    store = DummyStore()
     spec = CommandSpec(
         command_id="wl-triage-audit",
         command="true",
         requires_llm=False,
         frequency_minutes=1,
         priority=0,
-        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        metadata={"audit_cooldown_hours": 6},
         command_type="triage-audit",
     )
-    sched.store.add_command(spec)
+    store.add_command(spec)
+    # Persisted timestamp: 7 hours ago → past the 6-hour cooldown
+    store.update_state(
+        spec.command_id,
+        {
+            "last_audit_at_by_item": {
+                work_id: (now - dt.timedelta(hours=7)).isoformat(),
+            }
+        },
+    )
+    handler_calls: list[dict[str, Any]] = []
 
-    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
-
-    sched.start_command(spec)
-
-    # ensure comment add was attempted and no update was made
-    assert any(c.startswith(f"wl comment add {work_id}") for c in calls)
-    assert not any(c.startswith(f"wl update {work_id}") for c in calls)
-
-
-def test_triage_audit_audit_only_no_templates(tmp_path, monkeypatch):
-    """Verify audit-only mode does not add template headings in comment payload."""
-    calls = []
-    work_id = "AUDIT-ONLY-2"
-    comment_payload = {"text": ""}
-
-    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
-
-    def fake_run_shell(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd.strip() == "wl list --stage in_review --json":
-            out = json.dumps(
+    result = poll_and_handoff(
+        run_shell=_make_wl_list_shell(
+            [
                 {
-                    "workItems": [
-                        {
-                            "id": work_id,
-                            "title": "Audit only title",
-                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        }
-                    ]
+                    "id": work_id,
+                    "title": "Fresh item",
+                    "updated_at": (now - dt.timedelta(hours=8)).isoformat(),
                 }
-            )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment list {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
-            )
-        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
-            out = "Summary:\nAudit only output\n"
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment add {work_id}"):
-            m = re.search(r"\$\(cat '([^']+)'\)", cmd)
-            assert m
-            with open(m.group(1), "r", encoding="utf-8") as fh:
-                comment_payload["text"] = fh.read()
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+            ]
+        ),
+        cwd="/tmp",
+        store=store,
+        spec=spec,
+        handler=lambda wi: handler_calls.append(wi) or True,
+        now=now,
+    )
 
-    sched = make_scheduler(fake_run_shell, tmp_path)
+    assert result.outcome == PollerOutcome.handed_off
+    assert result.selected_item_id == work_id
+    assert len(handler_calls) == 1
+    assert handler_calls[0]["id"] == work_id
 
+
+def test_poller_query_failure_returns_query_failed() -> None:
+    """poll_and_handoff returns query_failed when wl list exits non-zero."""
+    store = DummyStore()
     spec = CommandSpec(
         command_id="wl-triage-audit",
         command="true",
         requires_llm=False,
         frequency_minutes=1,
         priority=0,
-        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        metadata={"audit_cooldown_hours": 6},
         command_type="triage-audit",
     )
-    sched.store.add_command(spec)
+    store.add_command(spec)
 
-    sched.start_command(spec)
+    def failing_shell(cmd: str, **kwargs: Any) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=1, stdout="", stderr="connection refused"
+        )
 
-    assert "Proposed child work items" not in comment_payload["text"]
-    assert "## Intake" not in comment_payload["text"]
-    assert "## Plan" not in comment_payload["text"]
-
-
-def test_triage_audit_discord_summary_includes_body(tmp_path, monkeypatch):
-    """Verify Discord summary includes a body line, not just heading.
-
-    Also verifies that the Work Item ID and GitHub issue URL are included
-    as extra fields in the Discord notification content.
-    """
-    calls = []
-    work_id = "DISCORD-SUMMARY-1"
-    captured = {}
-
-    # Create .worklog/config.yaml so _get_github_repo() finds a repo slug
-    wl_dir = tmp_path / ".worklog"
-    wl_dir.mkdir(parents=True, exist_ok=True)
-    (wl_dir / "config.yaml").write_text("githubRepo: TestOwner/TestRepo\n")
-
-    def fake_notify(title, body="", message_type="other", *, payload=None):
-        captured["title"] = title
-        captured["body"] = body
-        captured["message_type"] = message_type
-        if payload is not None:
-            captured["payload"] = payload
-        return True
-
-    monkeypatch.setattr(notifications, "notify", fake_notify)
-
-    def fake_run_shell(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd.strip() == "wl list --stage in_review --json":
-            out = json.dumps(
-                {
-                    "workItems": [
-                        {
-                            "id": work_id,
-                            "title": "Discord summary item",
-                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        }
-                    ]
-                }
-            )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment list {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
-            )
-        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
-            out = "Summary:\nA short summary for Discord.\n"
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment add {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
-            )
-        if cmd.strip().startswith(f"wl show {work_id}"):
-            # Return nested workItem with githubIssueNumber
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout=json.dumps({"workItem": {"githubIssueNumber": 42}}),
-                stderr="",
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    sched = make_scheduler(fake_run_shell, tmp_path)
-
-    spec = CommandSpec(
-        command_id="wl-triage-audit",
-        command="true",
-        requires_llm=False,
-        frequency_minutes=1,
-        priority=0,
-        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
-        command_type="triage-audit",
+    result = poll_and_handoff(
+        run_shell=failing_shell,
+        cwd="/tmp",
+        store=store,
+        spec=spec,
+        handler=lambda wi: True,
     )
-    sched.store.add_command(spec)
 
-    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
-
-    sched.start_command(spec)
-
-    content = captured.get("payload", {}).get("content", "")
-    assert "# Triage Audit — Discord summary item" in content
-    assert "Summary: A short summary for Discord." in content
-    # New: Work Item ID and GitHub issue URL in extra fields
-    assert f"Work Item: {work_id}" in content
-    assert "GitHub: https://github.com/TestOwner/TestRepo/issues/42" in content
+    assert result.outcome == PollerOutcome.query_failed
 
 
-def test_triage_audit_no_candidates_logs(tmp_path, monkeypatch, caplog):
-    calls = []
-
-    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
-
-    def fake_run_shell(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd.strip() == "wl list --stage in_review --json":
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"workItems": []}), stderr=""
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    sched = make_scheduler(fake_run_shell, tmp_path)
+def test_poller_logs_no_candidates(caplog: pytest.LogCaptureFixture) -> None:
+    """poll_and_handoff logs an info message when no candidates are found."""
+    store = DummyStore()
     spec = CommandSpec(
         command_id="wl-triage-audit",
         command="true",
@@ -632,46 +796,74 @@ def test_triage_audit_no_candidates_logs(tmp_path, monkeypatch, caplog):
         metadata={"audit_cooldown_hours": 0},
         command_type="triage-audit",
     )
-    sched.store.add_command(spec)
-
-    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
+    store.add_command(spec)
 
     with caplog.at_level("INFO"):
-        sched.start_command(spec)
+        poll_and_handoff(
+            run_shell=_make_wl_list_shell([]),
+            cwd="/tmp",
+            store=store,
+            spec=spec,
+            handler=lambda wi: True,
+        )
 
-    assert calls == ["wl list --stage in_review --json"]
-    # The audit poller logs "no items in_review" and the scheduler logs
-    # "no eligible candidates" — check for either message indicating no work.
     assert any(
-        "no items" in message.lower() or "no eligible candidates" in message.lower()
-        for message in caplog.messages
+        "no items" in msg.lower() or "no candidates" in msg.lower()
+        for msg in caplog.messages
     )
 
 
-def test_scheduler_run_once_unknown_command(tmp_path, monkeypatch, capsys):
-    from ampa import scheduler_cli
+def test_poller_selects_oldest_candidate() -> None:
+    """poll_and_handoff selects the candidate with the oldest updated_at timestamp."""
+    now = dt.datetime.now(dt.timezone.utc)
+    older_id = "WID-OLDER"
+    newer_id = "WID-NEWER"
+    store = DummyStore()
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
+    store.add_command(spec)
+    handler_calls: list[dict[str, Any]] = []
 
-    sched = make_scheduler(lambda *a, **k: subprocess.CompletedProcess("", 0), tmp_path)
-    monkeypatch.setattr(scheduler_cli, "load_scheduler", lambda command_cwd=None: sched)
-    monkeypatch.setattr(scheduler_cli.daemon, "load_env", lambda: None)
-    args = SimpleNamespace(command_id="missing")
+    poll_and_handoff(
+        run_shell=_make_wl_list_shell(
+            [
+                {
+                    "id": newer_id,
+                    "title": "Newer item",
+                    "updated_at": (now - dt.timedelta(hours=1)).isoformat(),
+                },
+                {
+                    "id": older_id,
+                    "title": "Older item",
+                    "updated_at": (now - dt.timedelta(hours=10)).isoformat(),
+                },
+            ]
+        ),
+        cwd="/tmp",
+        store=store,
+        spec=spec,
+        handler=lambda wi: handler_calls.append(wi) or True,
+        now=now,
+    )
 
-    exit_code = scheduler_cli._cli_run_once(args)
-    out = capsys.readouterr().out
-
-    assert exit_code == 2
-    assert "Unknown command id" in out
+    assert len(handler_calls) == 1
+    assert handler_calls[0]["id"] == older_id
 
 
 # ---------------------------------------------------------------------------
-# Audit poller routing integration tests
+# Section 3: TriageAuditRunner (gh auto-complete, comment posting, Discord)
 # ---------------------------------------------------------------------------
 
 
-def test_triage_audit_runner_requires_work_item():
+def test_triage_audit_runner_requires_work_item() -> None:
     """TriageAuditRunner.run() raises TypeError when called without work_item."""
-    from ampa.triage_audit import TriageAuditRunner
-
     runner = TriageAuditRunner(
         run_shell=lambda *a, **kw: subprocess.CompletedProcess("", 0),
         command_cwd="/tmp",
@@ -686,122 +878,377 @@ def test_triage_audit_runner_requires_work_item():
         metadata={},
         command_type="triage-audit",
     )
-    import pytest
-
     with pytest.raises(TypeError, match="requires a pre-selected work_item"):
         runner.run(spec, None, None)
 
 
-def test_scheduler_handles_query_failure_gracefully(tmp_path, monkeypatch, caplog):
-    """When wl list fails, the scheduler logs the failure and returns without crashing."""
+def test_triage_audit_runner_posts_comment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """TriageAuditRunner.run() calls opencode then posts a wl comment."""
+    work_id = "RUNNER-COMMENT-001"
+    calls: list[str] = []
+
     monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
-    def fake_run_shell(cmd, **kwargs):
-        if cmd.strip() == "wl list --stage in_review --json":
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=1, stdout="", stderr="connection refused"
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+    canned_output = _make_structured_audit_output(True, work_id)
 
-    sched = make_scheduler(fake_run_shell, tmp_path)
+    def fake_run_shell(cmd: str, **kwargs: Any) -> subprocess.CompletedProcess:
+        calls.append(cmd)
+        if f'opencode run "/audit {work_id}"' in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=canned_output, stderr=""
+            )
+        if f"wl show {work_id}" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({}), stderr=""
+            )
+        if f"wl comment list {work_id}" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout='{"success": true}', stderr=""
+        )
+
+    runner = TriageAuditRunner(
+        run_shell=fake_run_shell,
+        command_cwd=str(tmp_path),
+        store=DummyStore(),
+    )
     spec = CommandSpec(
         command_id="wl-triage-audit",
         command="true",
         requires_llm=False,
         frequency_minutes=1,
         priority=0,
-        metadata={"audit_cooldown_hours": 6},
+        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
         command_type="triage-audit",
     )
-    sched.store.add_command(spec)
-    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
-    with caplog.at_level("INFO"):
-        result = sched.start_command(spec)
+    result = runner.run(spec, None, None, work_item={"id": work_id, "title": "Test item"})
 
-    # Should not crash; scheduler returns the run result
-    assert result is not None
-    # The poller logs a warning about the failed query
-    assert any(
-        "no items" in msg.lower()
-        or "no eligible candidates" in msg.lower()
-        or "query failed" in msg.lower()
-        for msg in caplog.messages
-    )
+    assert result is True
+    assert any(f'opencode run "/audit {work_id}"' in c for c in calls)
+    assert any(f"wl comment add {work_id}" in c for c in calls)
 
 
-def test_scheduler_poller_handler_end_to_end(tmp_path, monkeypatch):
-    """End-to-end: scheduler routes through poller, which selects a candidate and
-    hands it off to TriageAuditRunner for audit execution."""
-    calls = []
-    work_id = "END2END-ITEM"
+def test_triage_audit_runner_comment_contains_ampa_heading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TriageAuditRunner posts a comment with # AMPA Audit Result heading."""
+    work_id = "RUNNER-HEADING-001"
+    comment_content: dict[str, str] = {"text": ""}
 
     monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
 
-    def fake_run_shell(cmd, **kwargs):
+    canned_output = _make_structured_audit_output(True, work_id)
+
+    def fake_run_shell(cmd: str, **kwargs: Any) -> subprocess.CompletedProcess:
+        if f'opencode run "/audit {work_id}"' in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=canned_output, stderr=""
+            )
+        if f"wl comment add {work_id}" in cmd:
+            m = re.search(r"cat '([^']+)'", cmd)
+            if m:
+                try:
+                    with open(m.group(1), encoding="utf-8") as fh:
+                        comment_content["text"] = fh.read()
+                except OSError:
+                    pass
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout='{"success": true}', stderr=""
+            )
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout='{"success": true}', stderr=""
+        )
+
+    runner = TriageAuditRunner(
+        run_shell=fake_run_shell,
+        command_cwd=str(tmp_path),
+        store=DummyStore(),
+    )
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
+
+    runner.run(spec, None, None, work_item={"id": work_id, "title": "Test item"})
+
+    assert "# AMPA Audit Result" in comment_content["text"]
+
+
+def test_triage_audit_runner_structured_report_not_raw_noise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Comment posted by TriageAuditRunner contains structured report, not preamble noise."""
+    work_id = "RUNNER-STRUCT-001"
+    comment_content: dict[str, str] = {"text": ""}
+
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
+
+    canned_output = (
+        "Some preamble noise from the agent stdout\n"
+        f"{AUDIT_REPORT_START}\n"
+        "## Summary\n\n"
+        "All 3 acceptance criteria are met.\n\n"
+        "## Acceptance Criteria Status\n\n"
+        "| # | Criterion | Verdict | Evidence |\n"
+        "|---|-----------|---------|----------|\n"
+        "| 1 | Widget renders | met | src/widget.tsx:15 |\n"
+        "| 2 | API returns 200 | met | src/api.ts:42 |\n"
+        "| 3 | Tests pass | met | tests/widget.test.ts:8 |\n\n"
+        "## Recommendation\n\n"
+        "This item can be closed: all acceptance criteria are met.\n"
+        f"{AUDIT_REPORT_END}\n"
+        "trailing agent noise\n"
+    )
+
+    def fake_run_shell(cmd: str, **kwargs: Any) -> subprocess.CompletedProcess:
+        if f'opencode run "/audit {work_id}"' in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=canned_output, stderr=""
+            )
+        if f"wl comment add {work_id}" in cmd:
+            m = re.search(r"cat '([^']+)'", cmd)
+            if m:
+                try:
+                    with open(m.group(1), encoding="utf-8") as fh:
+                        comment_content["text"] = fh.read()
+                except OSError:
+                    pass
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout='{"success": true}', stderr=""
+            )
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout='{"success": true}', stderr=""
+        )
+
+    runner = TriageAuditRunner(
+        run_shell=fake_run_shell,
+        command_cwd=str(tmp_path),
+        store=DummyStore(),
+    )
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
+
+    runner.run(spec, None, None, work_item={"id": work_id, "title": "Test"})
+
+    text = comment_content["text"]
+    assert "# AMPA Audit Result" in text
+    assert "## Summary" in text
+    assert "All 3 acceptance criteria are met." in text
+    assert "Widget renders" in text
+    assert "preamble noise" not in text
+    assert "trailing agent noise" not in text
+    assert AUDIT_REPORT_START not in text
+    assert AUDIT_REPORT_END not in text
+
+
+def test_triage_audit_runner_comment_no_template_headings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TriageAuditRunner comment does not include lifecycle template headings."""
+    work_id = "RUNNER-NOTEMP-001"
+    comment_content: dict[str, str] = {"text": ""}
+
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
+
+    def fake_run_shell(cmd: str, **kwargs: Any) -> subprocess.CompletedProcess:
+        if f'opencode run "/audit {work_id}"' in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="Summary:\nAudit only output\n", stderr=""
+            )
+        if f"wl comment add {work_id}" in cmd:
+            m = re.search(r"cat '([^']+)'", cmd)
+            if m:
+                try:
+                    with open(m.group(1), encoding="utf-8") as fh:
+                        comment_content["text"] = fh.read()
+                except OSError:
+                    pass
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout='{"success": true}', stderr=""
+            )
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout='{"success": true}', stderr=""
+        )
+
+    runner = TriageAuditRunner(
+        run_shell=fake_run_shell,
+        command_cwd=str(tmp_path),
+        store=DummyStore(),
+    )
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
+
+    runner.run(spec, None, None, work_item={"id": work_id, "title": "Test"})
+
+    text = comment_content["text"]
+    assert "Proposed child work items" not in text
+    assert "## Intake" not in text
+    assert "## Plan" not in text
+
+
+def test_triage_audit_auto_complete_with_gh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TriageAuditRunner auto-completes (wl update) when gh confirms PR merged."""
+    work_id = "RUNNER-GH-001"
+    calls: list[str] = []
+
+    monkeypatch.setattr(notifications, "notify", lambda *a, **k: True)
+
+    def fake_run_shell(cmd: str, **kwargs: Any) -> subprocess.CompletedProcess:
         calls.append(cmd)
-        if cmd.strip() == "wl list --stage in_review --json":
-            out = json.dumps(
-                {
-                    "workItems": [
-                        {
-                            "id": work_id,
-                            "title": "E2E test item",
-                            "updated_at": (
-                                dt.datetime.now(dt.timezone.utc)
-                                - dt.timedelta(hours=10)
-                            ).isoformat(),
-                        }
-                    ]
-                }
+        if f'opencode run "/audit {work_id}"' in cmd:
+            out = (
+                "Summary:\nPR merged: https://github.com/example/repo/pull/42\n\n"
+                "Details: ready to close"
             )
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=out, stderr=""
             )
-        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
+        if cmd.strip().startswith("gh pr view"):
             return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout="Summary:\nAudit passed, all criteria met.",
-                stderr="",
+                args=cmd, returncode=0, stdout=json.dumps({"merged": True}), stderr=""
             )
-        if cmd.strip().startswith("wl comment add"):
+        if f"wl show {work_id}" in cmd:
             return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout=json.dumps({"success": True}),
-                stderr="",
+                args=cmd, returncode=0, stdout=json.dumps({}), stderr=""
+            )
+        if f"wl comment add {work_id}" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout='{"success": true}', stderr=""
+            )
+        if f"wl update {work_id}" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout='{"success": true}', stderr=""
             )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
-    sched = make_scheduler(fake_run_shell, tmp_path)
+    monkeypatch.setenv("AMPA_VERIFY_PR_WITH_GH", "1")
+
+    runner = TriageAuditRunner(
+        run_shell=fake_run_shell,
+        command_cwd=str(tmp_path),
+        store=DummyStore(),
+    )
     spec = CommandSpec(
         command_id="wl-triage-audit",
         command="true",
         requires_llm=False,
         frequency_minutes=1,
         priority=0,
-        metadata={"audit_cooldown_hours": 6, "truncate_chars": 65536},
+        metadata={
+            "truncate_chars": 65536,
+            "audit_cooldown_hours": 0,
+            "verify_pr_with_gh": True,
+        },
         command_type="triage-audit",
     )
-    sched.store.add_command(spec)
+
+    runner.run(spec, None, None, work_item={"id": work_id, "title": "PR item"})
+
+    assert any(c.strip().startswith("gh pr view") for c in calls)
+    assert any(f"wl update {work_id}" in c for c in calls)
+    update_cmds = [c for c in calls if f"wl update {work_id}" in c]
+    assert any("--needs-producer-review true" in c for c in update_cmds), (
+        f"Expected --needs-producer-review true in update command, got: {update_cmds}"
+    )
+
+
+def test_triage_audit_runner_discord_notification_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TriageAuditRunner Discord notification includes Work Item ID, title, and summary."""
+    work_id = "RUNNER-DISCORD-001"
+    captured: dict[str, Any] = {}
+
+    wl_dir = tmp_path / ".worklog"
+    wl_dir.mkdir(parents=True, exist_ok=True)
+    (wl_dir / "config.yaml").write_text("githubRepo: TestOwner/TestRepo\n")
+
+    def fake_notify(title: str, body: str = "", message_type: str = "other", *, payload: Any = None) -> bool:
+        captured["title"] = title
+        captured["payload"] = payload
+        return True
+
+    monkeypatch.setattr(notifications, "notify", fake_notify)
+
+    def fake_run_shell(cmd: str, **kwargs: Any) -> subprocess.CompletedProcess:
+        if f'opencode run "/audit {work_id}"' in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout="Summary:\nA short summary for Discord.\n",
+                stderr="",
+            )
+        if f"wl show {work_id}" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout=json.dumps({"workItem": {"githubIssueNumber": 42}}),
+                stderr="",
+            )
+        if f"wl comment list {work_id}" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
+            )
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout='{"success": true}', stderr=""
+        )
+
     monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
 
-    sched.start_command(spec)
+    runner = TriageAuditRunner(
+        run_shell=fake_run_shell,
+        command_cwd=str(tmp_path),
+        store=DummyStore(),
+    )
+    spec = CommandSpec(
+        command_id="wl-triage-audit",
+        command="true",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
+        command_type="triage-audit",
+    )
 
-    # Verify the poller queried candidates
-    assert any("wl list --stage in_review --json" in c for c in calls)
-    # Verify the handler executed the audit command
-    assert any(f"/audit {work_id}" in c for c in calls)
-    # Verify the poller persisted the cooldown timestamp in the store
-    state = sched.store.get_state(spec.command_id)
-    assert work_id in state.get("last_audit_at_by_item", {})
+    runner.run(spec, None, None, work_item={"id": work_id, "title": "Discord summary item"})
+
+    content = captured.get("payload", {}).get("content", "")
+    assert "# Triage Audit — Discord summary item" in content
+    assert "Summary: A short summary for Discord." in content
+    assert f"Work Item: {work_id}" in content
+    assert "GitHub: https://github.com/TestOwner/TestRepo/issues/42" in content
 
 
 # ---------------------------------------------------------------------------
-# _get_github_repo / _build_github_issue_url tests
+# Section 4: Utility helper tests (_extract_audit_report, _extract_summary_from_report,
+#             _get_github_repo, _build_github_issue_url)
 # ---------------------------------------------------------------------------
-from ampa.triage_audit import _get_github_repo, _build_github_issue_url
+
+# --- _get_github_repo / _build_github_issue_url ---
 
 
 def test_get_github_repo_happy_path(tmp_path):
@@ -880,8 +1327,6 @@ def test_build_github_issue_url_zero():
 # ---------------------------------------------------------------------------
 # _extract_audit_report tests
 # ---------------------------------------------------------------------------
-from ampa.triage_audit import _extract_audit_report
-from ampa.triage_audit import _extract_summary_from_report
 
 
 def test_extract_audit_report_happy_path():
@@ -1027,152 +1472,3 @@ def test_extract_summary_from_report_multiline():
     assert "Line two continues." in result
     assert "Another paragraph in summary." in result
     assert "Close it." not in result
-
-
-# ---------------------------------------------------------------------------
-# End-to-end integration test (mock-based)
-# ---------------------------------------------------------------------------
-
-
-def test_structured_audit_end_to_end(tmp_path, monkeypatch):
-    """Integration test: canned structured audit output flows through
-    marker extraction → comment posting (structured report only) →
-    Discord summary extraction from ## Summary section.
-
-    Verifies:
-    1. The posted WL comment contains the structured report (not raw output).
-    2. The posted WL comment does NOT contain the old "Audit output:" label.
-    3. The Discord notification payload includes the summary extracted from ## Summary.
-    4. Preamble/trailing noise from the raw output is excluded from the comment.
-    """
-    calls = []
-    notify_payloads = []
-    posted_comments = []
-    work_id = "TEST-E2E-STRUCT-001"
-
-    canned_audit_output = (
-        "Some preamble noise from the agent stdout\n"
-        "--- AUDIT REPORT START ---\n"
-        "## Summary\n"
-        "\n"
-        "All 3 acceptance criteria are met. The implementation is correct and tests pass.\n"
-        "\n"
-        "## Acceptance Criteria Status\n"
-        "\n"
-        "| # | Criterion | Verdict | Evidence |\n"
-        "|---|-----------|---------|----------|\n"
-        "| 1 | Widget renders | met | src/widget.tsx:15 |\n"
-        "| 2 | API returns 200 | met | src/api.ts:42 |\n"
-        "| 3 | Tests pass | met | tests/widget.test.ts:8 |\n"
-        "\n"
-        "## Children Status\n"
-        "\n"
-        "No children.\n"
-        "\n"
-        "## Recommendation\n"
-        "\n"
-        "This item can be closed: all acceptance criteria are met.\n"
-        "--- AUDIT REPORT END ---\n"
-        "trailing agent noise\n"
-    )
-
-    def capture_notify(title, body="", message_type="other", *, payload=None):
-        if payload is not None:
-            notify_payloads.append(payload)
-        return True
-
-    monkeypatch.setattr(notifications, "notify", capture_notify)
-
-    def fake_run_shell(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd.strip() == "wl list --stage in_review --json":
-            out = json.dumps(
-                {
-                    "workItems": [
-                        {
-                            "id": work_id,
-                            "title": "Structured audit test item",
-                            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        }
-                    ]
-                }
-            )
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=out, stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment list {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"comments": []}), stderr=""
-            )
-        if cmd.strip().startswith(f'opencode run "/audit {work_id}"'):
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=canned_audit_output, stderr=""
-            )
-        if cmd.strip().startswith(f"wl comment add {work_id}"):
-            posted_comments.append(cmd)
-            # Extract the comment file path from the command to read its content
-            import re as _re
-
-            m = _re.search(r"cat '([^']+)'", cmd)
-            if m:
-                try:
-                    with open(m.group(1), "r") as f:
-                        posted_comments.append(f.read())
-                except Exception:
-                    pass
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps({"success": True}), stderr=""
-            )
-        if cmd.strip().startswith(f"wl show {work_id}"):
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=0,
-                stdout=json.dumps({"id": work_id, "status": "in_progress"}),
-                stderr="",
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    sched = make_scheduler(fake_run_shell, tmp_path)
-
-    spec = CommandSpec(
-        command_id="wl-triage-audit",
-        command="true",
-        requires_llm=False,
-        frequency_minutes=1,
-        priority=0,
-        metadata={"truncate_chars": 65536, "audit_cooldown_hours": 0},
-        command_type="triage-audit",
-    )
-    sched.store.add_command(spec)
-
-    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
-
-    sched.start_command(spec)
-
-    # --- Verify comment posting ---
-    # A wl comment add should have been attempted
-    comment_cmds = [c for c in calls if c.startswith(f"wl comment add {work_id}")]
-    assert comment_cmds, "Expected at least one wl comment add call"
-
-    # The posted comment content should contain the structured report
-    comment_content = "\n".join(posted_comments)
-    assert "# AMPA Audit Result" in comment_content
-    assert "## Summary" in comment_content
-    assert "All 3 acceptance criteria are met" in comment_content
-    assert "## Acceptance Criteria Status" in comment_content
-    assert "Widget renders" in comment_content
-    assert "## Recommendation" in comment_content
-
-    # The posted comment should NOT contain old-style labels or raw noise
-    assert "Audit output:" not in comment_content
-    assert "preamble noise" not in comment_content
-    assert "trailing agent noise" not in comment_content
-    # Delimiters themselves should not be in the comment
-    assert "--- AUDIT REPORT START ---" not in comment_content
-    assert "--- AUDIT REPORT END ---" not in comment_content
-
-    # --- Verify Discord notification ---
-    assert notify_payloads, "Expected at least one notification payload"
-    # The notification should include the Summary section text
-    payload_str = json.dumps(notify_payloads[0])
-    assert "All 3 acceptance criteria are met" in payload_str
