@@ -1,0 +1,76 @@
+name: pr-monitor
+
+on:
+  schedule:
+    # Run every hour at the top of the hour.
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run mode (no comments or work items created)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  check-prs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Read repository contents and PR metadata.
+      contents: read
+      # Post comments on pull requests.
+      pull-requests: write
+      # Read check runs status.
+      checks: read
+      # Read issues (PR comments use the issues API).
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Authenticate gh CLI
+        run: |
+          # gh CLI is pre-installed on ubuntu-latest GitHub Actions runners.
+          # GITHUB_TOKEN is automatically provided by the Actions runtime.
+          gh auth status || echo "gh auth status returned non-zero; token may not be fully configured"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan open PRs and notify
+        run: |
+          DRY_RUN_FLAG=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+          python scripts/pr_monitor/check_prs.py \
+            --repo "${{ github.repository }}" \
+            --verbose \
+            $DRY_RUN_FLAG \
+            --report /tmp/pr-monitor-report.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-monitor-report
+          path: /tmp/pr-monitor-report.json
+          if-no-files-found: ignore
