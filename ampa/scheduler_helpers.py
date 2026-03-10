@@ -23,7 +23,6 @@ LOG = logging.getLogger("ampa.scheduler")
 
 _WATCHDOG_COMMAND_ID = "stale-delegation-watchdog"
 _TEST_BUTTON_COMMAND_ID = "test-button"
-_AUTO_DELEGATE_COMMAND_ID = "auto-delegate"
 
 
 # ---------------------------------------------------------------------------
@@ -142,49 +141,6 @@ def ensure_test_button_command(store: SchedulerStore) -> None:
         )
     except Exception:
         LOG.exception("Failed to auto-register test-button command")
-
-
-def ensure_auto_delegate_command(store: SchedulerStore) -> None:
-    """Register the auto-delegate command if absent.
-
-    The command is **disabled by default** (``enabled`` metadata flag is
-    ``false``) to allow safe rollout — operators must explicitly enable it
-    in their ``scheduler_store.json``.
-    """
-    try:
-        existing = store.list_commands()
-        for cmd in existing:
-            if cmd.command_id == _AUTO_DELEGATE_COMMAND_ID:
-                LOG.debug(
-                    "Auto-delegate command already registered: %s",
-                    _AUTO_DELEGATE_COMMAND_ID,
-                )
-                return
-        auto_delegate_spec = CommandSpec(
-            command_id=_AUTO_DELEGATE_COMMAND_ID,
-            command="echo auto-delegate",
-            requires_llm=False,
-            frequency_minutes=30,
-            priority=0,
-            metadata={
-                "enabled": False,
-                "eligible_stages": ["plan_complete"],
-                "eligible_priorities": ["high", "critical"],
-                "max_retries": 3,
-                "retry_backoff_base_seconds": 2.0,
-            },
-            title="Auto Delegate",
-            max_runtime_minutes=5,
-            command_type="auto-delegate",
-        )
-        store.add_command(auto_delegate_spec)
-        LOG.info(
-            "Auto-registered auto-delegate command: %s (every %dm, disabled by default)",
-            _AUTO_DELEGATE_COMMAND_ID,
-            auto_delegate_spec.frequency_minutes,
-        )
-    except Exception:
-        LOG.exception("Failed to auto-register auto-delegate command")
 
 
 # ---------------------------------------------------------------------------

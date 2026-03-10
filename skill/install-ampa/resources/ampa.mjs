@@ -203,7 +203,7 @@ async function resolveCommand(cliCmd, projectRoot) {
 async function resolveRunOnceCommand(projectRoot, commandId, extraArgs = []) {
   // Build base args: use 'run' subcommand (enhanced version).
   const subcommand = 'run';
-  const baseArgs = ['-u', '-m', 'ampa.scheduler', subcommand];
+  const baseArgs = ['-u', '-m', 'ampa.scheduler_cli', subcommand];
   if (commandId) baseArgs.push(commandId);
   if (extraArgs.length) baseArgs.push(...extraArgs);
 
@@ -230,7 +230,7 @@ async function resolveRunOnceCommand(projectRoot, commandId, extraArgs = []) {
 }
 
 async function resolveListCommand(projectRoot, useJson) {
-  const args = ['-m', 'ampa.scheduler', 'list'];
+  const args = ['-m', 'ampa.scheduler_cli', 'list'];
   if (useJson) args.push('--json');
 
   // Per-project config: .env is always loaded from <projectRoot>/.worklog/ampa/.env

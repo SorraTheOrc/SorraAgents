@@ -95,23 +95,6 @@
       "priority": 0,
       "requires_llm": false,
       "type": "delegation"
-    },
-    "auto-delegate": {
-      "command": "echo auto-delegate",
-      "frequency_minutes": 30,
-      "id": "auto-delegate",
-      "title": "Auto Delegate",
-      "max_runtime_minutes": 5,
-      "metadata": {
-        "enabled": false,
-        "eligible_stages": ["plan_complete"],
-        "eligible_priorities": ["high", "critical"],
-        "max_retries": 3,
-        "retry_backoff_base_seconds": 2.0
-      },
-      "priority": 0,
-      "requires_llm": false,
-      "type": "auto-delegate"
     }
   },
   "last_global_start_ts": "2026-02-05T07:51:52.053932+00:00",
