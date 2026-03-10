@@ -77,6 +77,7 @@ from .scheduler_helpers import (  # noqa: E402
     clear_stale_running_states as _clear_stale_running_states,
     ensure_watchdog_command as _ensure_watchdog_command,
     ensure_test_button_command as _ensure_test_button_command,
+    ensure_auto_delegate_command as _ensure_auto_delegate_command,
     send_test_button_message as _send_test_button_message,
     log_health as _log_health,
 )
@@ -239,6 +240,9 @@ class Scheduler:
         # "Blue or Red?" message with discord.ui.Button components is sent
         # every 15 minutes (MVP validation for interactive buttons).
         _ensure_test_button_command(self.store)
+
+        # Auto-register the auto-delegate command (disabled by default).
+        _ensure_auto_delegate_command(self.store)
 
         # --- Discord bot process supervision ---
         self._bot_supervisor = BotSupervisor(
@@ -602,6 +606,43 @@ class Scheduler:
                 _send_test_button_message(notifications_module)
             except Exception:
                 LOG.exception("Test-button message failed")
+            return run
+        if spec.command_type == "auto-delegate":
+            try:
+                from .auto_delegate import AutoDelegateRunner
+                from .scheduler_types import _bool_meta
+
+                enabled = _bool_meta(spec.metadata.get("enabled", True))
+                if not enabled:
+                    LOG.info(
+                        "auto-delegate: command %s is disabled; skipping",
+                        spec.command_id,
+                    )
+                else:
+                    runner = AutoDelegateRunner(
+                        run_shell=self.run_shell,
+                        command_cwd=self.command_cwd,
+                        notifier=notifications_module,
+                    )
+                    result_dict = runner.run(spec)
+                    LOG.info("auto-delegate result: %s", result_dict)
+                    action = result_dict.get("action", "")
+                    if action == "delegated":
+                        note = result_dict.get("note", "")
+                        try:
+                            notifications_module.notify(
+                                title=spec.title or "Auto Delegate",
+                                body=note,
+                                message_type="command",
+                            )
+                        except Exception:
+                            LOG.exception(
+                                "auto-delegate: failed to send delegation notification"
+                            )
+                    elif action == "delegate_failed":
+                        pass  # failure notification already sent by the runner
+            except Exception:
+                LOG.exception("auto-delegate command failed")
             return run
 
         # always post the generic discord notification afterwards
