@@ -59,6 +59,11 @@ def _make_scheduler(now: dt.datetime, llm_available: bool) -> Scheduler:
         "auto-delegate",
         {"last_run_ts": now.isoformat()},
     )
+    # Same for the pr-monitor command (auto-registered at init).
+    scheduler.store.update_state(
+        "pr-monitor",
+        {"last_run_ts": now.isoformat()},
+    )
     return scheduler
 
 
