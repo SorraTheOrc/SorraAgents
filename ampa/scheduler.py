@@ -412,22 +412,154 @@ class Scheduler:
         # After recording run, perform any command-specific post actions
         if spec.command_id == "wl-triage-audit" or spec.command_type == "triage-audit":
             # Route triage-audit through the audit poller for candidate
-            # detection and cooldown filtering, then delegate audit execution
-            # to TriageAuditRunner via the handoff handler protocol.
+            # detection and cooldown filtering, then execute descriptor-driven
+            # audit handlers via the handoff handler protocol.
             try:
                 from .audit_poller import PollerOutcome, poll_and_handoff
-                from .triage_audit import TriageAuditRunner
+                from .audit.handlers import (
+                    AuditFailHandler,
+                    AuditResultHandler,
+                    CloseWithAuditHandler,
+                )
+                from .engine.adapters import (
+                    DiscordNotificationSender,
+                    ShellCommentWriter,
+                    ShellWorkItemFetcher,
+                    ShellWorkItemUpdater,
+                )
+                from .engine.descriptor import load_descriptor
+                from .engine.invariants import InvariantEvaluator, NullQuerier
 
-                runner = TriageAuditRunner(
+                descriptor = None
+                if self.engine is not None:
+                    descriptor = getattr(self.engine, "descriptor", None)
+                if descriptor is None:
+                    descriptor_path = os.getenv(
+                        "AMPA_WORKFLOW_DESCRIPTOR",
+                        os.path.join(
+                            os.path.dirname(os.path.dirname(__file__)),
+                            "docs",
+                            "workflow",
+                            "workflow.yaml",
+                        ),
+                    )
+                    descriptor = load_descriptor(descriptor_path)
+
+                evaluator = InvariantEvaluator(
+                    invariants=descriptor.invariants,
+                    querier=NullQuerier(),
+                )
+                updater = ShellWorkItemUpdater(
                     run_shell=self.run_shell,
                     command_cwd=self.command_cwd,
-                    store=self.store,
+                )
+                comment_writer = ShellCommentWriter(
+                    run_shell=self.run_shell,
+                    command_cwd=self.command_cwd,
+                )
+                fetcher = ShellWorkItemFetcher(
+                    run_shell=self.run_shell,
+                    command_cwd=self.command_cwd,
+                )
+                notifier = DiscordNotificationSender()
+
+                audit_result_handler = AuditResultHandler(
+                    descriptor=descriptor,
+                    evaluator=evaluator,
+                    updater=updater,
+                    comment_writer=comment_writer,
+                    fetcher=fetcher,
+                    run_shell=self.run_shell,
+                    command_cwd=self.command_cwd,
+                )
+                audit_fail_handler = AuditFailHandler(
+                    descriptor=descriptor,
+                    evaluator=evaluator,
+                    updater=updater,
+                    run_shell=self.run_shell,
+                    command_cwd=self.command_cwd,
+                )
+                close_with_audit_handler = CloseWithAuditHandler(
+                    descriptor=descriptor,
+                    evaluator=evaluator,
+                    updater=updater,
+                    notifier=notifier,
+                    run_shell=self.run_shell,
+                    command_cwd=self.command_cwd,
                 )
 
                 def _audit_handler(work_item: dict) -> bool:
-                    """Adapter: delegates the pre-selected candidate to
-                    TriageAuditRunner for audit execution."""
-                    return runner.run(spec, run, output, work_item=work_item)
+                    """Execute descriptor-driven audit lifecycle for one item."""
+                    work_item_id = str(work_item.get("id") or "")
+                    if not work_item_id:
+                        LOG.warning("Audit handoff missing work item id")
+                        return False
+
+                    full_item = fetcher.fetch(work_item_id)
+                    if full_item is None:
+                        full_item = {"workItem": work_item, "comments": []}
+
+                    result = audit_result_handler.execute(full_item)
+                    if not result.success:
+                        LOG.warning(
+                            "audit_result failed for %s: %s — %s",
+                            work_item_id,
+                            result.reason,
+                            result.details,
+                        )
+                        try:
+                            notifications_module.notify(
+                                title=f"Audit failed — {work_item.get('title') or work_item_id}",
+                                body=f"{result.reason}: {result.details}",
+                                message_type="error",
+                            )
+                        except Exception:
+                            LOG.exception("Failed to send audit failure notification")
+                        return False
+
+                    try:
+                        notifications_module.notify(
+                            title=f"Audit Result — {work_item.get('title') or work_item_id}",
+                            body=result.details or result.reason,
+                            message_type="command",
+                        )
+                    except Exception:
+                        LOG.exception("Failed to send audit summary notification")
+
+                    refreshed = fetcher.fetch(work_item_id) or full_item
+                    if result.reason == "audit_recommends_no_closure":
+                        fail_result = audit_fail_handler.execute(refreshed)
+                        if not fail_result.success:
+                            LOG.warning(
+                                "audit_fail failed for %s: %s — %s",
+                                work_item_id,
+                                fail_result.reason,
+                                fail_result.details,
+                            )
+                            return False
+                        return True
+
+                    if result.reason == "audit_result_recorded":
+                        refreshed_for_close = fetcher.fetch(work_item_id) or refreshed
+                        close_result = close_with_audit_handler.execute(refreshed)
+                        if (
+                            not close_result.success
+                            and close_result.reason == "invalid_from_state"
+                        ):
+                            close_result = close_with_audit_handler.execute(
+                                refreshed_for_close
+                            )
+                        if not close_result.success:
+                            LOG.warning(
+                                "close_with_audit failed for %s: %s — %s",
+                                work_item_id,
+                                close_result.reason,
+                                close_result.details,
+                            )
+                            return False
+                        return True
+
+                    return True
 
                 result = poll_and_handoff(
                     run_shell=self.run_shell,
@@ -449,7 +581,7 @@ class Scheduler:
                         result.selected_item_id,
                     )
             except Exception:
-                LOG.exception("Failed to run audit poller / TriageAuditRunner")
+                LOG.exception("Failed to run audit poller / descriptor handlers")
             # triage-audit posts its own discord summary; avoid generic post
             return run
         if spec.command_type == "stale-delegation-watchdog":

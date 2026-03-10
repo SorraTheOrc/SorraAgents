@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import subprocess
+import json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence
 
@@ -440,7 +441,19 @@ class AuditResultHandler:
                     details=inv_result.summary(),
                 )
 
-        # Step 6: Apply state transition to audit_passed
+        # Step 6: If audit does not recommend closure, do not transition here.
+        # The caller can route to the audit_fail command while item is still in
+        # review state.
+        if not audit_result.recommends_closure:
+            return HandlerResult(
+                success=True,
+                reason="audit_recommends_no_closure",
+                command="audit_result",
+                work_item_id=work_item_id,
+                details="Audit completed but does not recommend closure",
+            )
+
+        # Step 7: Apply state transition to audit_passed
         to_state = self._descriptor.resolve_state_ref(cmd.to)
         update_ok = self._updater.update(
             work_item_id,
@@ -750,6 +763,17 @@ class CloseWithAuditHandler:
                     details=inv_result.summary(),
                 )
 
+        # Step 2b: Auto-completion checks from acceptance criteria.
+        check_failures = self._run_completion_checks(work_item)
+        if check_failures:
+            return HandlerResult(
+                success=False,
+                reason="completion_checks_failed",
+                command="close_with_audit",
+                work_item_id=work_item_id,
+                details=", ".join(check_failures),
+            )
+
         # Step 3: Apply state transition
         to_state = self._descriptor.resolve_state_ref(cmd.to)
         update_ok = self._updater.update(
@@ -819,3 +843,127 @@ class CloseWithAuditHandler:
             command="close_with_audit",
             work_item_id=work_item_id,
         )
+
+    def _run_completion_checks(self, work_item: Dict[str, Any]) -> list[str]:
+        """Run pre-close checks required by close_with_audit.
+
+        Returns a list of failed check names. Empty list means all checks pass.
+        """
+        failures: list[str] = []
+        work_item_id = _get_work_item_id(work_item)
+
+        # Check 1: PR merged (via gh pr view) when PR URL can be found.
+        pr = self._extract_pr_from_work_item(work_item)
+        if pr is None:
+            failures.append("pr_not_found")
+        else:
+            owner_repo, pr_num = pr
+            if not self._is_pr_merged(owner_repo, pr_num):
+                failures.append("pr_not_merged")
+
+        # Check 2: no open children
+        if not self._has_no_open_children(work_item_id):
+            failures.append("open_children_exist")
+
+        return failures
+
+    def _extract_pr_from_work_item(
+        self, work_item: Dict[str, Any]
+    ) -> tuple[str, str] | None:
+        """Extract owner/repo and PR number from work item comments."""
+        comments = work_item.get("comments")
+        if not isinstance(comments, list):
+            comments = []
+        pattern = re.compile(
+            r"https?://github\.com/(?P<owner_repo>[^/]+/[^/]+)/pull/(?P<number>\d+)",
+            re.I,
+        )
+        for comment in reversed(comments):
+            if not isinstance(comment, dict):
+                continue
+            body = (
+                comment.get("comment") or comment.get("body") or comment.get("text") or ""
+            )
+            if not isinstance(body, str):
+                continue
+            m = pattern.search(body)
+            if m:
+                return m.group("owner_repo"), m.group("number")
+        return None
+
+    def _is_pr_merged(self, owner_repo: str, pr_num: str) -> bool:
+        """Check PR merged status via gh CLI."""
+        cmd = f"gh pr view {pr_num} --repo {owner_repo} --json merged"
+        try:
+            proc = self._run_shell(
+                cmd,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self._cwd,
+                timeout=300,
+            )
+        except Exception:
+            LOG.exception("Failed to execute gh pr view for PR %s", pr_num)
+            return False
+
+        if proc.returncode != 0:
+            LOG.warning(
+                "gh pr view failed for PR %s: rc=%s stderr=%r",
+                pr_num,
+                proc.returncode,
+                (proc.stderr or "")[:512],
+            )
+            return False
+
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except Exception:
+            LOG.exception("Failed to parse gh pr view output for PR %s", pr_num)
+            return False
+        return bool(data.get("merged"))
+
+    def _has_no_open_children(self, work_item_id: str) -> bool:
+        """Return True when all direct children are closed/completed."""
+        cmd = f"wl show {work_item_id} --children --json"
+        try:
+            proc = self._run_shell(
+                cmd,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self._cwd,
+                timeout=300,
+            )
+        except Exception:
+            LOG.exception("Failed to query children for %s", work_item_id)
+            return False
+
+        if proc.returncode != 0:
+            LOG.warning(
+                "wl show --children failed for %s: rc=%s stderr=%r",
+                work_item_id,
+                proc.returncode,
+                (proc.stderr or "")[:512],
+            )
+            return False
+
+        try:
+            payload = json.loads(proc.stdout or "{}")
+        except Exception:
+            LOG.exception("Failed to parse wl show --children output for %s", work_item_id)
+            return False
+
+        children = payload.get("children")
+        if not isinstance(children, list):
+            return True
+        closed_statuses = {"closed", "done", "completed", "resolved"}
+        for child in children:
+            if not isinstance(child, dict):
+                continue
+            status = str(child.get("status") or "").strip().lower()
+            if status and status not in closed_statuses:
+                return False
+        return True

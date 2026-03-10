@@ -210,6 +210,33 @@ def _mock_shell_success(stdout: str = "", returncode: int = 0):
     return run_shell
 
 
+def _mock_shell_close_success():
+    """Mock shell for close_with_audit checks (gh + children)."""
+
+    def run_shell(*args, **kwargs):
+        cmd = args[0] if args else ""
+        cmd_s = str(cmd)
+        if cmd_s.startswith("gh pr view"):
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='{"merged": true}',
+                stderr="",
+            )
+        if "wl show" in cmd_s and "--children --json" in cmd_s:
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout='{"children": []}',
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout='{"success": true}', stderr=""
+        )
+
+    return run_shell
+
+
 def _mock_shell_audit(recommends_closure: bool = True):
     """Create a mock run_shell that returns audit output for opencode run."""
     audit_output = _make_audit_output(recommends_closure)
@@ -631,7 +658,7 @@ class TestCloseWithAuditHandler:
             evaluator=evaluator,
             updater=updater or MockUpdater(),
             notifier=notifier or MockNotifier(),
-            run_shell=run_shell or _mock_shell_success(),
+            run_shell=run_shell or _mock_shell_close_success(),
         )
 
     def test_success_path(
@@ -647,6 +674,7 @@ class TestCloseWithAuditHandler:
             stage="audit_passed",
             title="My Feature",
             comments=[
+                {"comment": "PR: https://github.com/example/repo/pull/42"},
                 {
                     "comment": "Can this item be closed? Yes. All acceptance criteria are met."
                 },
@@ -671,6 +699,7 @@ class TestCloseWithAuditHandler:
             status="completed",
             stage="audit_passed",
             comments=[
+                {"comment": "PR: https://github.com/example/repo/pull/42"},
                 {"comment": "Can this item be closed? Yes."},
             ],
         )
@@ -710,6 +739,21 @@ class TestCloseWithAuditHandler:
         def tracking_shell(*args, **kwargs):
             cmd = args[0] if args else ""
             shell_calls.append(str(cmd))
+            cmd_s = str(cmd)
+            if cmd_s.startswith("gh pr view"):
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='{"merged": true}',
+                    stderr="",
+                )
+            if "wl show" in cmd_s and "--children --json" in cmd_s:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='{"children": []}',
+                    stderr="",
+                )
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout='{"success": true}', stderr=""
             )
@@ -719,6 +763,7 @@ class TestCloseWithAuditHandler:
             status="completed",
             stage="audit_passed",
             comments=[
+                {"comment": "PR: https://github.com/example/repo/pull/42"},
                 {"comment": "Can this item be closed? Yes."},
             ],
         )
@@ -737,6 +782,21 @@ class TestCloseWithAuditHandler:
         def tracking_shell(*args, **kwargs):
             cmd = args[0] if args else ""
             shell_calls.append(str(cmd))
+            cmd_s = str(cmd)
+            if cmd_s.startswith("gh pr view"):
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='{"merged": true}',
+                    stderr="",
+                )
+            if "wl show" in cmd_s and "--children --json" in cmd_s:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='{"children": []}',
+                    stderr="",
+                )
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout='{"success": true}', stderr=""
             )
@@ -746,6 +806,7 @@ class TestCloseWithAuditHandler:
             status="completed",
             stage="audit_passed",
             comments=[
+                {"comment": "PR: https://github.com/example/repo/pull/42"},
                 {"comment": "Can this item be closed? Yes."},
             ],
         )
@@ -765,6 +826,7 @@ class TestCloseWithAuditHandler:
             status="completed",
             stage="audit_passed",
             comments=[
+                {"comment": "PR: https://github.com/example/repo/pull/42"},
                 {"comment": "Can this item be closed? Yes."},
             ],
         )
@@ -783,12 +845,29 @@ class TestCloseWithAuditHandler:
             stage="audit_passed",
             title="Implement feature X",
             comments=[
+                {"comment": "PR: https://github.com/example/repo/pull/42"},
                 {"comment": "Can this item be closed? Yes."},
             ],
         )
         handler.execute(wi)
         assert len(notifier.calls) == 1
         assert "Implement feature X" in notifier.calls[0]["message"]
+
+    def test_completion_checks_fail_when_pr_missing(
+        self, descriptor: WorkflowDescriptor, evaluator: InvariantEvaluator
+    ) -> None:
+        handler = self._make_handler(descriptor, evaluator)
+        wi = _make_work_item(
+            status="completed",
+            stage="audit_passed",
+            comments=[
+                {"comment": "Can this item be closed? Yes."},
+            ],
+        )
+        result = handler.execute(wi)
+        assert result.success is False
+        assert result.reason == "completion_checks_failed"
+        assert "pr_not_found" in result.details
 
 
 # ---------------------------------------------------------------------------
