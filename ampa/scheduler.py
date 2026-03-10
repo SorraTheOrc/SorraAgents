@@ -77,6 +77,7 @@ from .scheduler_helpers import (  # noqa: E402
     clear_stale_running_states as _clear_stale_running_states,
     ensure_watchdog_command as _ensure_watchdog_command,
     ensure_test_button_command as _ensure_test_button_command,
+    ensure_auto_delegate_command as _ensure_auto_delegate_command,
     send_test_button_message as _send_test_button_message,
     log_health as _log_health,
 )
@@ -239,6 +240,11 @@ class Scheduler:
         # "Blue or Red?" message with discord.ui.Button components is sent
         # every 15 minutes (MVP validation for interactive buttons).
         _ensure_test_button_command(self.store)
+
+        # Auto-register the auto-delegate command (disabled by default for
+        # safe rollout).  When enabled it periodically runs ``wl next`` and
+        # delegates plan-complete high/critical items.
+        _ensure_auto_delegate_command(self.store)
 
         # --- Discord bot process supervision ---
         self._bot_supervisor = BotSupervisor(
@@ -602,6 +608,26 @@ class Scheduler:
                 _send_test_button_message(notifications_module)
             except Exception:
                 LOG.exception("Test-button message failed")
+            return run
+        if spec.command_type == "auto-delegate":
+            try:
+                meta = getattr(spec, "metadata", {}) or {}
+                if not meta.get("enabled"):
+                    LOG.debug(
+                        "auto-delegate: command disabled via metadata.enabled"
+                    )
+                    return run
+                from .auto_delegate import AutoDelegateRunner
+
+                runner = AutoDelegateRunner(
+                    run_shell=self.run_shell,
+                    command_cwd=self.command_cwd,
+                    notifier=notifications_module,
+                )
+                result = runner.run(spec)
+                LOG.info("auto-delegate result: %s", result)
+            except Exception:
+                LOG.exception("auto-delegate command failed")
             return run
 
         # always post the generic discord notification afterwards

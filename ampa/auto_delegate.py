@@ -32,7 +32,7 @@ import json
 import logging
 import subprocess
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 LOG = logging.getLogger("ampa.auto_delegate")
 
