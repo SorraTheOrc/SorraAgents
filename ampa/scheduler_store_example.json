@@ -112,6 +112,22 @@
       "priority": 0,
       "requires_llm": false,
       "type": "auto-delegate"
+    },
+    "pr-monitor": {
+      "command": "python -m ampa.pr_monitor",
+      "frequency_minutes": 60,
+      "id": "pr-monitor",
+      "title": "PR Monitor",
+      "max_runtime_minutes": 10,
+      "metadata": {
+        "dedup": true,
+        "max_prs": 50,
+        "discord_label": "pr monitor",
+        "truncate_chars": 65536
+      },
+      "priority": 0,
+      "requires_llm": false,
+      "type": "pr-monitor"
     }
   },
   "last_global_start_ts": "2026-02-05T07:51:52.053932+00:00",
