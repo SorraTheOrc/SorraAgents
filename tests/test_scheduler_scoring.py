@@ -53,6 +53,11 @@ def _make_scheduler(now: dt.datetime, llm_available: bool) -> Scheduler:
         "test-button",
         {"last_run_ts": now.isoformat()},
     )
+    # Same for auto-delegate (auto-registered, disabled by default).
+    scheduler.store.update_state(
+        "auto-delegate",
+        {"last_run_ts": now.isoformat()},
+    )
     return scheduler
 
 
