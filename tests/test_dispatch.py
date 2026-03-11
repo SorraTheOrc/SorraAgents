@@ -1244,43 +1244,39 @@ class TestTeardownOnCompletion:
         mock_teardown.assert_called_once_with("ampa-pool-0")
         mock_release.assert_called_once_with("ampa-pool-0")
 
-    @patch(f"{_POOL_MOD}.ContainerDispatcher._teardown", return_value=True)
-    @patch(f"{_POOL_MOD}.ContainerDispatcher._release")
     @patch(f"{_POOL_MOD}.subprocess.Popen")
     @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-0")
     def test_teardown_thread_started_on_successful_dispatch(
-        self, mock_claim, mock_popen, mock_release, mock_teardown
+        self, mock_claim, mock_popen
     ):
         """dispatch() starts a daemon teardown thread after successful spawn."""
+        teardown_done = threading.Event()
+        release_done = threading.Event()
+
+        def fake_teardown(container_name: str) -> bool:
+            teardown_done.set()
+            return True
+
+        def fake_release(container_name: str) -> None:
+            release_done.set()
+
         mock_proc = MagicMock()
         mock_proc.pid = 1234
         mock_popen.return_value = mock_proc
 
-        started_threads: list[threading.Thread] = []
-        original_thread_start = threading.Thread.start
+        with patch.object(ContainerDispatcher, "_teardown", staticmethod(fake_teardown)):
+            with patch.object(ContainerDispatcher, "_release", staticmethod(fake_release)):
+                d = ContainerDispatcher(
+                    project_root="/proj",
+                    branch="main",
+                    clock=_fixed_clock,
+                )
+                result = d.dispatch(command="cmd", work_item_id="WL-TD")
 
-        def record_start(self_thread, *args, **kwargs):
-            if self_thread.name == "" or "_teardown_on_completion" in str(
-                getattr(self_thread, "_target", "")
-            ):
-                started_threads.append(self_thread)
-            return original_thread_start(self_thread, *args, **kwargs)
-
-        with patch.object(threading.Thread, "start", record_start):
-            d = ContainerDispatcher(
-                project_root="/proj",
-                branch="main",
-                clock=_fixed_clock,
-            )
-            d.dispatch(command="cmd", work_item_id="WL-TD")
-
-        # Give the teardown thread a moment to run
-        import time
-        time.sleep(0.05)
-
-        # Teardown and release should have been called by the background thread
-        mock_teardown.assert_called_once_with("ampa-pool-0")
-        mock_release.assert_called_once_with("ampa-pool-0")
+        assert result.success is True
+        # Wait up to 2 s for the background thread to call teardown + release.
+        assert teardown_done.wait(timeout=2), "teardown was not called by background thread"
+        assert release_done.wait(timeout=2), "release was not called by background thread"
 
 
 # ---------------------------------------------------------------------------

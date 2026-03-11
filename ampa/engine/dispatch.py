@@ -465,6 +465,16 @@ def _mark_for_cleanup(container_name: str) -> None:
 # Default timeout (seconds) for podman stop during container teardown.
 _DEFAULT_CONTAINER_TEARDOWN_TIMEOUT = 60
 
+# Extra seconds added to the subprocess.run() timeout beyond the podman --time
+# value so the podman process itself has time to relay the stop signal and exit.
+_TEARDOWN_STOP_TIMEOUT_BUFFER = 10
+
+# Timeout (seconds) for the podman rm subprocess call.
+_TEARDOWN_RM_TIMEOUT = 30
+
+# Maximum number of stderr characters to include in log messages.
+_MAX_STDERR_LOG_CHARS = 512
+
 
 def _is_not_found_error(stderr: str) -> bool:
     """Return ``True`` if *stderr* indicates the container does not exist.
@@ -525,7 +535,7 @@ def teardown_container(container_id: str, timeout: int | None = None) -> bool:
             ["podman", "stop", "--time", str(timeout), container_id],
             capture_output=True,
             text=True,
-            timeout=timeout + 10,  # allow podman itself a little extra time
+            timeout=timeout + _TEARDOWN_STOP_TIMEOUT_BUFFER,
         )
         if stop_result.returncode != 0:
             stderr = stop_result.stderr or ""
@@ -539,7 +549,7 @@ def teardown_container(container_id: str, timeout: int | None = None) -> bool:
                 "podman stop failed for %s (rc=%d): %s",
                 container_id,
                 stop_result.returncode,
-                stderr[:512],
+                stderr[:_MAX_STDERR_LOG_CHARS],
             )
             _mark_for_cleanup(container_id)
             return False
@@ -562,7 +572,7 @@ def teardown_container(container_id: str, timeout: int | None = None) -> bool:
             ["podman", "rm", container_id],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=_TEARDOWN_RM_TIMEOUT,
         )
         if rm_result.returncode != 0:
             stderr = rm_result.stderr or ""
@@ -576,7 +586,7 @@ def teardown_container(container_id: str, timeout: int | None = None) -> bool:
                 "podman rm failed for %s (rc=%d): %s",
                 container_id,
                 rm_result.returncode,
-                stderr[:512],
+                stderr[:_MAX_STDERR_LOG_CHARS],
             )
             _mark_for_cleanup(container_id)
             return False
