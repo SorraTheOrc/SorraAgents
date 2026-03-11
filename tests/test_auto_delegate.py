@@ -23,7 +23,7 @@ from unittest import mock
 
 import pytest
 
-from ampa.auto_delegate import AutoDelegateRunner, _normalize_candidates
+from ampa.auto_delegate import AutoDelegateRunner, _normalize_candidates, _extract_github_url
 from ampa.scheduler_types import CommandSpec, RunResult, SchedulerConfig
 from ampa.scheduler import Scheduler
 from ampa.scheduler_store import SchedulerStore
@@ -320,6 +320,104 @@ class TestAutoDelegateRunnerDelegated:
         assert result["action"] == "delegated"
         assert result["work_item_id"] == "WI-55"
 
+    def test_success_notification_sent(self):
+        """Notifier is called on successful delegation with work item ID, stage, priority."""
+        notifier = mock.MagicMock()
+        run_shell = _make_shell(
+            {
+                "wl next": {"returncode": 0, "stdout": self._candidate_json()},
+                "wl gh delegate": {"returncode": 0},
+            }
+        )
+        runner = AutoDelegateRunner(
+            run_shell=run_shell,
+            command_cwd="/tmp",
+            notifier=notifier,
+            sleep_fn=lambda _: None,
+        )
+        spec = _make_auto_delegate_spec()
+        result = runner.run(spec)
+
+        assert result["action"] == "delegated"
+        notifier.notify.assert_called_once()
+        call_kwargs = notifier.notify.call_args.kwargs
+        assert call_kwargs.get("message_type") == "completion"
+        body = call_kwargs.get("body", "")
+        assert "WI-42" in body
+        assert "in_review" in body
+        assert "high" in body
+
+    def test_success_notification_includes_github_url(self):
+        """When wl gh delegate outputs a GitHub URL it is included in the notification."""
+        notifier = mock.MagicMock()
+        gh_url = "https://github.com/SorraTheOrc/SorraAgents/issues/123"
+        run_shell = _make_shell(
+            {
+                "wl next": {"returncode": 0, "stdout": self._candidate_json()},
+                "wl gh delegate": {"returncode": 0, "stdout": f"Issue created: {gh_url}"},
+            }
+        )
+        runner = AutoDelegateRunner(
+            run_shell=run_shell,
+            command_cwd="/tmp",
+            notifier=notifier,
+            sleep_fn=lambda _: None,
+        )
+        spec = _make_auto_delegate_spec()
+        result = runner.run(spec)
+
+        assert result["action"] == "delegated"
+        assert result.get("github_url") == gh_url
+        notifier.notify.assert_called_once()
+        body = notifier.notify.call_args.kwargs.get("body", "")
+        assert gh_url in body
+
+    def test_success_notification_without_github_url(self):
+        """When delegate output has no URL, notification still succeeds without URL."""
+        notifier = mock.MagicMock()
+        run_shell = _make_shell(
+            {
+                "wl next": {"returncode": 0, "stdout": self._candidate_json()},
+                "wl gh delegate": {"returncode": 0, "stdout": "Delegated successfully."},
+            }
+        )
+        runner = AutoDelegateRunner(
+            run_shell=run_shell,
+            command_cwd="/tmp",
+            notifier=notifier,
+            sleep_fn=lambda _: None,
+        )
+        spec = _make_auto_delegate_spec()
+        result = runner.run(spec)
+
+        assert result["action"] == "delegated"
+        assert result.get("github_url") is None
+        notifier.notify.assert_called_once()
+        body = notifier.notify.call_args.kwargs.get("body", "")
+        assert "WI-42" in body
+        assert "github.com" not in body
+
+    def test_success_notification_failure_does_not_propagate(self):
+        """An exception in the success notifier must not escape run()."""
+        notifier = mock.MagicMock()
+        notifier.notify.side_effect = RuntimeError("discord down")
+        run_shell = _make_shell(
+            {
+                "wl next": {"returncode": 0, "stdout": self._candidate_json()},
+                "wl gh delegate": {"returncode": 0},
+            }
+        )
+        runner = AutoDelegateRunner(
+            run_shell=run_shell,
+            command_cwd="/tmp",
+            notifier=notifier,
+            sleep_fn=lambda _: None,
+        )
+        spec = _make_auto_delegate_spec()
+        # Must not raise
+        result = runner.run(spec)
+        assert result["action"] == "delegated"
+
 
 class TestAutoDelegateRunnerRetry:
     """Retry and back-off behaviour on wl gh delegate failure."""
@@ -519,3 +617,22 @@ class TestNormalizeCandidates:
     def test_non_dict_non_list_returns_empty(self):
         assert _normalize_candidates("string") == []
         assert _normalize_candidates(42) == []
+
+
+class TestExtractGithubUrl:
+    def test_extracts_url_from_text(self):
+        text = "Issue created: https://github.com/owner/repo/issues/42"
+        assert _extract_github_url(text) == "https://github.com/owner/repo/issues/42"
+
+    def test_returns_none_when_no_url(self):
+        assert _extract_github_url("Delegated successfully.") is None
+
+    def test_returns_none_for_empty_string(self):
+        assert _extract_github_url("") is None
+
+    def test_returns_none_for_none(self):
+        assert _extract_github_url(None) is None
+
+    def test_returns_first_url_when_multiple(self):
+        text = "See https://github.com/a/b/issues/1 and https://github.com/c/d/issues/2"
+        assert _extract_github_url(text) == "https://github.com/a/b/issues/1"

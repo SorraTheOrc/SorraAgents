@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -188,15 +189,18 @@ class AutoDelegateRunner:
                 )
                 self._sleep(delay)
 
-            success, error = self._delegate(work_item_id)
+            success, error, delegate_stdout = self._delegate(work_item_id)
             if success:
                 note = f"auto-delegate: delegated {work_item_id!r} ({title!r})"
                 LOG.info(note)
+                github_url = _extract_github_url(delegate_stdout)
+                self._notify_success(work_item_id, title, github_url, stage, priority)
                 return {
                     "action": "delegated",
                     "work_item_id": work_item_id,
                     "note": note,
                     "retries": attempt,
+                    "github_url": github_url,
                 }
             last_error = error
             LOG.warning(
@@ -267,8 +271,8 @@ class AutoDelegateRunner:
         candidates = _normalize_candidates(payload)
         return candidates[0] if candidates else None
 
-    def _delegate(self, work_item_id: str) -> Tuple[bool, Optional[str]]:
-        """Run ``wl gh delegate <id>`` and return ``(success, error_message)``."""
+    def _delegate(self, work_item_id: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        """Run ``wl gh delegate <id>`` and return ``(success, error_message, stdout)``."""
         try:
             proc = self.run_shell(
                 f"wl gh delegate {work_item_id}",
@@ -279,14 +283,14 @@ class AutoDelegateRunner:
                 cwd=self.command_cwd,
             )
         except Exception as exc:
-            return False, str(exc)
+            return False, str(exc), None
 
         if proc.returncode == 0:
-            return True, None
+            return True, None, (proc.stdout or "").strip()
         stderr = (proc.stderr or "").strip()
         stdout = (proc.stdout or "").strip()
         error = stderr or stdout or f"exit code {proc.returncode}"
-        return False, error
+        return False, error, None
 
     def _notify_failure(
         self,
@@ -322,10 +326,56 @@ class AutoDelegateRunner:
                 work_item_id,
             )
 
+    def _notify_success(
+        self,
+        work_item_id: str,
+        title: str,
+        github_url: Optional[str],
+        stage: str,
+        priority: str,
+    ) -> None:
+        """Post a Discord notification about a successful delegation."""
+        msg_title = f"Auto-delegate succeeded — {title}"
+        lines = [f"Work item **{work_item_id}** delegated to GitHub Copilot."]
+        if github_url:
+            lines.append(f"GitHub issue: {github_url}")
+        lines.append(f"Stage: {stage} | Priority: {priority}")
+        msg_body = "\n".join(lines)
+        try:
+            if self._notifier is not None:
+                self._notifier.notify(
+                    title=msg_title,
+                    body=msg_body,
+                    message_type="completion",
+                )
+            else:
+                from . import notifications as _notifications
+
+                _notifications.notify(
+                    title=msg_title,
+                    body=msg_body,
+                    message_type="completion",
+                )
+        except Exception:
+            LOG.exception(
+                "auto-delegate: failed to send success notification for %s",
+                work_item_id,
+            )
+
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+_GITHUB_URL_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/issues/\d+")
+
+
+def _extract_github_url(text: Optional[str]) -> Optional[str]:
+    """Extract the first GitHub URL from *text*, or ``None`` if not found."""
+    if not text:
+        return None
+    match = _GITHUB_URL_RE.search(text)
+    return match.group(0) if match else None
 
 
 def _extract_id(item: Dict[str, Any]) -> str:
