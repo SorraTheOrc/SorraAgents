@@ -20,6 +20,13 @@ from ampa.engine.dispatch import (
     DryRunDispatcher,
     OpenCodeRunDispatcher,
     _enforce_timeout,
+    _is_not_found_error,
+    _mark_for_cleanup,
+    _pool_cleanup_path,
+    _read_cleanup_list,
+    _save_cleanup_list,
+    _teardown_on_completion,
+    teardown_container,
 )
 
 # ---------------------------------------------------------------------------
@@ -528,9 +535,10 @@ class TestContainerDispatcherProtocol:
 class TestContainerDispatcherSuccess:
     """Tests for the successful container dispatch path."""
 
+    @patch(f"{_POOL_MOD}.ContainerDispatcher._teardown", return_value=True)
     @patch(f"{_POOL_MOD}.subprocess.Popen")
     @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-0")
-    def test_successful_dispatch(self, mock_claim, mock_popen):
+    def test_successful_dispatch(self, mock_claim, mock_popen, mock_teardown):
         """dispatch() acquires container, spawns distrobox, returns success."""
         mock_proc = MagicMock()
         mock_proc.pid = 7777
@@ -554,9 +562,10 @@ class TestContainerDispatcherSuccess:
         assert "distrobox enter ampa-pool-0" in result.command
         assert 'opencode run "/intake WL-1"' in result.command
 
+    @patch(f"{_POOL_MOD}.ContainerDispatcher._teardown", return_value=True)
     @patch(f"{_POOL_MOD}.subprocess.Popen")
     @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-2")
-    def test_popen_called_with_distrobox_command(self, mock_claim, mock_popen):
+    def test_popen_called_with_distrobox_command(self, mock_claim, mock_popen, mock_teardown):
         """Popen is called with the distrobox-wrapped command."""
         mock_popen.return_value = MagicMock(pid=1)
 
@@ -567,7 +576,9 @@ class TestContainerDispatcherSuccess:
         )
         d.dispatch(command='opencode run "/plan WL-2"', work_item_id="WL-2")
 
-        args, kwargs = mock_popen.call_args
+        # call_args_list[0] is the distrobox spawn; subsequent calls are from
+        # the background teardown thread — only check the first Popen call.
+        args, kwargs = mock_popen.call_args_list[0]
         assert args[0] == 'distrobox enter ampa-pool-2 -- opencode run "/plan WL-2"'
         assert kwargs["shell"] is True
         assert kwargs["start_new_session"] is True
@@ -576,9 +587,10 @@ class TestContainerDispatcherSuccess:
         assert kwargs["stdin"] == subprocess.DEVNULL
         assert kwargs["cwd"] == "/my/project"
 
+    @patch(f"{_POOL_MOD}.ContainerDispatcher._teardown", return_value=True)
     @patch(f"{_POOL_MOD}.subprocess.Popen")
     @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-1")
-    def test_container_env_vars_set(self, mock_claim, mock_popen):
+    def test_container_env_vars_set(self, mock_claim, mock_popen, mock_teardown):
         """Container env vars are injected into the subprocess environment."""
         mock_popen.return_value = MagicMock(pid=1)
 
@@ -590,7 +602,8 @@ class TestContainerDispatcherSuccess:
         )
         d.dispatch(command="cmd", work_item_id="WL-3")
 
-        _, kwargs = mock_popen.call_args
+        # First call is the distrobox spawn; use call_args_list[0].
+        _, kwargs = mock_popen.call_args_list[0]
         env = kwargs["env"]
         assert env["AMPA_CONTAINER_NAME"] == "ampa-pool-1"
         assert env["AMPA_WORK_ITEM_ID"] == "WL-3"
@@ -599,9 +612,10 @@ class TestContainerDispatcherSuccess:
         # Also preserves the caller-supplied env
         assert env["EXISTING"] == "value"
 
+    @patch(f"{_POOL_MOD}.ContainerDispatcher._teardown", return_value=True)
     @patch(f"{_POOL_MOD}.subprocess.Popen")
     @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-0")
-    def test_claim_called_with_work_item_and_branch(self, mock_claim, mock_popen):
+    def test_claim_called_with_work_item_and_branch(self, mock_claim, mock_popen, mock_teardown):
         """_claim_pool_container is called with the correct arguments."""
         mock_popen.return_value = MagicMock(pid=1)
 
@@ -741,10 +755,11 @@ class TestContainerDispatcherTimeout:
         d = ContainerDispatcher(timeout=45, clock=_fixed_clock)
         assert d._timeout == 45
 
+    @patch(f"{_POOL_MOD}.ContainerDispatcher._teardown", return_value=True)
     @patch(f"{_POOL_MOD}.subprocess.Popen")
     @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-0")
     @patch(f"{_POOL_MOD}.threading.Timer")
-    def test_dispatch_starts_timer(self, mock_timer_cls, mock_claim, mock_popen):
+    def test_dispatch_starts_timer(self, mock_timer_cls, mock_claim, mock_popen, mock_teardown):
         """dispatch() starts a daemon Timer with the configured timeout."""
         mock_proc = MagicMock()
         mock_proc.pid = 9999
@@ -953,3 +968,352 @@ class TestPoolHelpers:
         mock_save.assert_called_once()
         saved_state = mock_save.call_args[0][0]
         assert "ampa-pool-0" not in saved_state
+
+
+# ---------------------------------------------------------------------------
+# Pool cleanup list helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestPoolCleanupHelpers:
+    """Tests for _read_cleanup_list / _save_cleanup_list / _mark_for_cleanup."""
+
+    def test_read_cleanup_list_missing_file(self, tmp_path):
+        """Returns empty list when pool-cleanup.json doesn't exist."""
+        with patch(f"{_POOL_MOD}._pool_cleanup_path", return_value=tmp_path / "nope.json"):
+            assert _read_cleanup_list() == []
+
+    def test_read_cleanup_list_valid(self, tmp_path):
+        """Returns parsed list when file exists."""
+        cleanup_file = tmp_path / "pool-cleanup.json"
+        cleanup_file.write_text(json.dumps(["ampa-pool-5", "ampa-pool-6"]))
+
+        with patch(f"{_POOL_MOD}._pool_cleanup_path", return_value=cleanup_file):
+            result = _read_cleanup_list()
+            assert result == ["ampa-pool-5", "ampa-pool-6"]
+
+    def test_read_cleanup_list_invalid_json(self, tmp_path):
+        """Returns empty list on invalid JSON."""
+        cleanup_file = tmp_path / "pool-cleanup.json"
+        cleanup_file.write_text("{bad json")
+
+        with patch(f"{_POOL_MOD}._pool_cleanup_path", return_value=cleanup_file):
+            assert _read_cleanup_list() == []
+
+    def test_read_cleanup_list_non_list_json(self, tmp_path):
+        """Returns empty list when JSON is valid but not a list."""
+        cleanup_file = tmp_path / "pool-cleanup.json"
+        cleanup_file.write_text(json.dumps({"not": "a list"}))
+
+        with patch(f"{_POOL_MOD}._pool_cleanup_path", return_value=cleanup_file):
+            assert _read_cleanup_list() == []
+
+    def test_save_cleanup_list(self, tmp_path):
+        """Writes cleanup list to disk, creating parent directories."""
+        cleanup_file = tmp_path / "subdir" / "pool-cleanup.json"
+
+        with patch(f"{_POOL_MOD}._pool_cleanup_path", return_value=cleanup_file):
+            _save_cleanup_list(["ampa-pool-7", "ampa-pool-8"])
+
+        assert cleanup_file.exists()
+        loaded = json.loads(cleanup_file.read_text())
+        assert loaded == ["ampa-pool-7", "ampa-pool-8"]
+
+    def test_mark_for_cleanup_adds_entry(self, tmp_path):
+        """_mark_for_cleanup adds container to the cleanup list."""
+        cleanup_file = tmp_path / "pool-cleanup.json"
+        cleanup_file.write_text(json.dumps([]))
+
+        with patch(f"{_POOL_MOD}._pool_cleanup_path", return_value=cleanup_file):
+            _mark_for_cleanup("ampa-pool-3")
+            result = json.loads(cleanup_file.read_text())
+            assert "ampa-pool-3" in result
+
+    def test_mark_for_cleanup_is_idempotent(self, tmp_path):
+        """_mark_for_cleanup does not duplicate an already-listed container."""
+        cleanup_file = tmp_path / "pool-cleanup.json"
+        cleanup_file.write_text(json.dumps(["ampa-pool-3"]))
+
+        with patch(f"{_POOL_MOD}._pool_cleanup_path", return_value=cleanup_file):
+            _mark_for_cleanup("ampa-pool-3")
+            _mark_for_cleanup("ampa-pool-3")
+            result = json.loads(cleanup_file.read_text())
+            assert result.count("ampa-pool-3") == 1
+
+    def test_mark_for_cleanup_appends_to_existing(self, tmp_path):
+        """_mark_for_cleanup keeps existing entries when adding a new one."""
+        cleanup_file = tmp_path / "pool-cleanup.json"
+        cleanup_file.write_text(json.dumps(["ampa-pool-0"]))
+
+        with patch(f"{_POOL_MOD}._pool_cleanup_path", return_value=cleanup_file):
+            _mark_for_cleanup("ampa-pool-1")
+            result = json.loads(cleanup_file.read_text())
+            assert "ampa-pool-0" in result
+            assert "ampa-pool-1" in result
+
+
+# ---------------------------------------------------------------------------
+# _is_not_found_error tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsNotFoundError:
+    """Tests for the _is_not_found_error helper."""
+
+    def test_no_container_with_name(self):
+        assert _is_not_found_error("Error: no container with name or id 'ampa-pool-0'") is True
+
+    def test_no_such_container(self):
+        assert _is_not_found_error("Error: no such container: ampa-pool-0") is True
+
+    def test_container_not_found(self):
+        assert _is_not_found_error("container not found") is True
+
+    def test_does_not_exist(self):
+        assert _is_not_found_error("does not exist") is True
+
+    def test_case_insensitive(self):
+        assert _is_not_found_error("NO SUCH CONTAINER: ampa-pool-0") is True
+
+    def test_unrelated_error(self):
+        assert _is_not_found_error("permission denied") is False
+
+    def test_empty_string(self):
+        assert _is_not_found_error("") is False
+
+
+# ---------------------------------------------------------------------------
+# teardown_container tests
+# ---------------------------------------------------------------------------
+
+
+class TestTeardownContainer:
+    """Tests for teardown_container()."""
+
+    @patch(f"{_POOL_MOD}.subprocess.run")
+    def test_success_stop_and_rm(self, mock_run):
+        """teardown_container returns True when both stop and rm succeed."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        result = teardown_container("ampa-pool-0", timeout=60)
+
+        assert result is True
+        assert mock_run.call_count == 2
+        stop_call = mock_run.call_args_list[0]
+        rm_call = mock_run.call_args_list[1]
+        assert stop_call[0][0] == ["podman", "stop", "--time", "60", "ampa-pool-0"]
+        assert rm_call[0][0] == ["podman", "rm", "ampa-pool-0"]
+
+    @patch(f"{_POOL_MOD}.subprocess.run")
+    def test_already_removed_at_stop(self, mock_run):
+        """Returns True (idempotent) when stop says container not found."""
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stderr="Error: no container with name or id 'ampa-pool-0'",
+        )
+
+        result = teardown_container("ampa-pool-0", timeout=60)
+
+        assert result is True
+        # rm should NOT be called since stop already said container is gone
+        assert mock_run.call_count == 1
+
+    @patch(f"{_POOL_MOD}.subprocess.run")
+    def test_already_removed_at_rm(self, mock_run):
+        """Returns True (idempotent) when rm says container not found."""
+        # stop succeeds, rm says already removed
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stderr=""),
+            MagicMock(returncode=1, stderr="no such container: ampa-pool-0"),
+        ]
+
+        result = teardown_container("ampa-pool-0", timeout=60)
+
+        assert result is True
+        assert mock_run.call_count == 2
+
+    @patch(f"{_POOL_MOD}._mark_for_cleanup")
+    @patch(f"{_POOL_MOD}.subprocess.run")
+    def test_stop_nonzero_exit_marks_cleanup(self, mock_run, mock_mark):
+        """Returns False and marks container for cleanup on non-zero stop exit."""
+        mock_run.return_value = MagicMock(returncode=1, stderr="some other error")
+
+        result = teardown_container("ampa-pool-0", timeout=60)
+
+        assert result is False
+        mock_mark.assert_called_once_with("ampa-pool-0")
+
+    @patch(f"{_POOL_MOD}._mark_for_cleanup")
+    @patch(f"{_POOL_MOD}.subprocess.run")
+    def test_rm_nonzero_exit_marks_cleanup(self, mock_run, mock_mark):
+        """Returns False and marks container for cleanup on non-zero rm exit."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stderr=""),
+            MagicMock(returncode=1, stderr="some rm error"),
+        ]
+
+        result = teardown_container("ampa-pool-0", timeout=60)
+
+        assert result is False
+        mock_mark.assert_called_once_with("ampa-pool-0")
+
+    @patch(f"{_POOL_MOD}._mark_for_cleanup")
+    @patch(f"{_POOL_MOD}.subprocess.run", side_effect=subprocess.TimeoutExpired("podman", 60))
+    def test_stop_timeout_marks_cleanup(self, mock_run, mock_mark):
+        """Returns False and marks for cleanup when podman stop times out."""
+        result = teardown_container("ampa-pool-0", timeout=60)
+
+        assert result is False
+        mock_mark.assert_called_once_with("ampa-pool-0")
+
+    @patch(f"{_POOL_MOD}._mark_for_cleanup")
+    @patch(f"{_POOL_MOD}.subprocess.run", side_effect=FileNotFoundError("podman not found"))
+    def test_podman_not_found_marks_cleanup(self, mock_run, mock_mark):
+        """Returns False and marks for cleanup when podman binary is missing."""
+        result = teardown_container("ampa-pool-0", timeout=60)
+
+        assert result is False
+        mock_mark.assert_called_once_with("ampa-pool-0")
+
+    @patch(f"{_POOL_MOD}.subprocess.run")
+    @patch.dict("os.environ", {"AMPA_CONTAINER_TEARDOWN_TIMEOUT": "120"})
+    def test_env_var_timeout(self, mock_run):
+        """AMPA_CONTAINER_TEARDOWN_TIMEOUT env var sets the stop timeout."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        teardown_container("ampa-pool-0")  # no explicit timeout
+
+        stop_call = mock_run.call_args_list[0]
+        assert "--time" in stop_call[0][0]
+        idx = stop_call[0][0].index("--time")
+        assert stop_call[0][0][idx + 1] == "120"
+
+    @patch(f"{_POOL_MOD}.subprocess.run")
+    @patch.dict("os.environ", {"AMPA_CONTAINER_TEARDOWN_TIMEOUT": "bad-value"})
+    def test_invalid_env_var_falls_back_to_default(self, mock_run):
+        """Invalid AMPA_CONTAINER_TEARDOWN_TIMEOUT falls back to 60 seconds."""
+        mock_run.return_value = MagicMock(returncode=0, stderr="")
+
+        teardown_container("ampa-pool-0")
+
+        stop_call = mock_run.call_args_list[0]
+        idx = stop_call[0][0].index("--time")
+        assert stop_call[0][0][idx + 1] == "60"
+
+
+# ---------------------------------------------------------------------------
+# _teardown_on_completion tests
+# ---------------------------------------------------------------------------
+
+
+class TestTeardownOnCompletion:
+    """Tests for _teardown_on_completion thread function."""
+
+    def test_waits_then_tears_down_and_releases(self):
+        """Calls teardown then release after proc.wait() returns."""
+        mock_proc = MagicMock()
+        mock_teardown = MagicMock(return_value=True)
+        mock_release = MagicMock()
+
+        _teardown_on_completion(mock_proc, "ampa-pool-0", mock_teardown, mock_release)
+
+        mock_proc.wait.assert_called_once()
+        mock_teardown.assert_called_once_with("ampa-pool-0")
+        mock_release.assert_called_once_with("ampa-pool-0")
+
+    def test_release_called_even_when_teardown_fails(self):
+        """Pool claim is released even if teardown returns False."""
+        mock_proc = MagicMock()
+        mock_teardown = MagicMock(return_value=False)
+        mock_release = MagicMock()
+
+        _teardown_on_completion(mock_proc, "ampa-pool-0", mock_teardown, mock_release)
+
+        mock_teardown.assert_called_once_with("ampa-pool-0")
+        mock_release.assert_called_once_with("ampa-pool-0")
+
+    def test_release_called_even_when_wait_raises(self):
+        """Pool claim is released even if proc.wait() raises unexpectedly."""
+        mock_proc = MagicMock()
+        mock_proc.wait.side_effect = OSError("wait failed")
+        mock_teardown = MagicMock(return_value=True)
+        mock_release = MagicMock()
+
+        _teardown_on_completion(mock_proc, "ampa-pool-0", mock_teardown, mock_release)
+
+        mock_teardown.assert_called_once_with("ampa-pool-0")
+        mock_release.assert_called_once_with("ampa-pool-0")
+
+    @patch(f"{_POOL_MOD}.subprocess.Popen")
+    @patch(f"{_POOL_MOD}._claim_pool_container", return_value="ampa-pool-0")
+    def test_teardown_thread_started_on_successful_dispatch(
+        self, mock_claim, mock_popen
+    ):
+        """dispatch() starts a daemon teardown thread after successful spawn."""
+        teardown_done = threading.Event()
+        release_done = threading.Event()
+
+        def fake_teardown(container_name: str) -> bool:
+            teardown_done.set()
+            return True
+
+        def fake_release(container_name: str) -> None:
+            release_done.set()
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 1234
+        mock_popen.return_value = mock_proc
+
+        with patch.object(ContainerDispatcher, "_teardown", staticmethod(fake_teardown)):
+            with patch.object(ContainerDispatcher, "_release", staticmethod(fake_release)):
+                d = ContainerDispatcher(
+                    project_root="/proj",
+                    branch="main",
+                    clock=_fixed_clock,
+                )
+                result = d.dispatch(command="cmd", work_item_id="WL-TD")
+
+        assert result.success is True
+        # Wait up to 2 s for the background thread to call teardown + release.
+        assert teardown_done.wait(timeout=2), "teardown was not called by background thread"
+        assert release_done.wait(timeout=2), "release was not called by background thread"
+
+
+# ---------------------------------------------------------------------------
+# _list_available_pool excludes cleanup-listed containers
+# ---------------------------------------------------------------------------
+
+
+class TestListAvailablePoolWithCleanup:
+    """_list_available_pool should exclude containers pending watchdog cleanup."""
+
+    @patch(
+        f"{_POOL_MOD}._read_cleanup_list",
+        return_value=["ampa-pool-1"],
+    )
+    @patch(
+        f"{_POOL_MOD}._existing_pool_containers",
+        return_value={"ampa-pool-0", "ampa-pool-1"},
+    )
+    @patch(f"{_POOL_MOD}._read_pool_state", return_value={})
+    def test_cleanup_listed_container_excluded(self, mock_state, mock_existing, mock_cleanup):
+        """Containers in pool-cleanup.json are excluded from the available list."""
+        from ampa.engine.dispatch import _list_available_pool
+
+        available = _list_available_pool()
+        assert "ampa-pool-0" in available
+        assert "ampa-pool-1" not in available
+
+    @patch(f"{_POOL_MOD}._read_cleanup_list", return_value=[])
+    @patch(
+        f"{_POOL_MOD}._existing_pool_containers",
+        return_value={"ampa-pool-0", "ampa-pool-1"},
+    )
+    @patch(f"{_POOL_MOD}._read_pool_state", return_value={})
+    def test_empty_cleanup_list_does_not_exclude(self, mock_state, mock_existing, mock_cleanup):
+        """Empty cleanup list does not exclude any containers."""
+        from ampa.engine.dispatch import _list_available_pool
+
+        available = _list_available_pool()
+        assert "ampa-pool-0" in available
+        assert "ampa-pool-1" in available
