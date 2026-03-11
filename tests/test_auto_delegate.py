@@ -320,6 +320,32 @@ class TestAutoDelegateRunnerDelegated:
         assert result["action"] == "delegated"
         assert result["work_item_id"] == "WI-55"
 
+    def test_success_notification_includes_github_url(self):
+        url = "https://github.com/org/repo/issues/123"
+        stdout = f"Created issue at {url}\n"
+        run_shell = _make_shell(
+            {
+                "wl next": {"returncode": 0, "stdout": self._candidate_json(stage="in_review", priority="high", wid="WI-99")},
+                "wl gh delegate": {"returncode": 0, "stdout": stdout},
+            }
+        )
+        notifier = mock.MagicMock()
+        runner = AutoDelegateRunner(
+            run_shell=run_shell,
+            command_cwd="/tmp",
+            sleep_fn=lambda _: None,
+            notifier=notifier,
+        )
+        spec = _make_auto_delegate_spec()
+        result = runner.run(spec)
+
+        assert result["action"] == "delegated"
+        notifier.notify.assert_called_once()
+        _, kwargs = notifier.notify.call_args
+        assert kwargs["message_type"] == "completion"
+        assert "Auto-delegate succeeded" in kwargs["title"]
+        assert url in kwargs["body"]
+
 
 class TestAutoDelegateRunnerRetry:
     """Retry and back-off behaviour on wl gh delegate failure."""
