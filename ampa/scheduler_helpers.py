@@ -24,6 +24,7 @@ LOG = logging.getLogger("ampa.scheduler")
 _WATCHDOG_COMMAND_ID = "stale-delegation-watchdog"
 _TEST_BUTTON_COMMAND_ID = "test-button"
 _AUTO_DELEGATE_COMMAND_ID = "auto-delegate"
+_PR_MONITOR_COMMAND_ID = "pr-monitor"
 
 
 # ---------------------------------------------------------------------------
@@ -180,9 +181,40 @@ def ensure_auto_delegate_command(store: SchedulerStore) -> None:
         LOG.exception("Failed to auto-register auto-delegate command")
 
 
-# ---------------------------------------------------------------------------
-# Runtime helpers (called from Scheduler.start_command / run_forever)
-# ---------------------------------------------------------------------------
+def ensure_pr_monitor_command(store: SchedulerStore) -> None:
+    """Register the PR monitor command if absent.
+
+    Runs hourly (``frequency_minutes=60``) and scans open pull requests for
+    CI status.  Requires ``gh`` CLI availability at runtime.
+    """
+    try:
+        existing = store.list_commands()
+        for cmd in existing:
+            if cmd.command_id == _PR_MONITOR_COMMAND_ID:
+                LOG.debug(
+                    "PR monitor command already registered: %s",
+                    _PR_MONITOR_COMMAND_ID,
+                )
+                return
+        pr_monitor_spec = CommandSpec(
+            command_id=_PR_MONITOR_COMMAND_ID,
+            command="echo pr-monitor",
+            requires_llm=False,
+            frequency_minutes=60,
+            priority=0,
+            metadata={"dedup": True, "max_prs": 50},
+            title="PR Monitor",
+            max_runtime_minutes=10,
+            command_type="pr-monitor",
+        )
+        store.add_command(pr_monitor_spec)
+        LOG.info(
+            "Auto-registered PR monitor command: %s (every %dm)",
+            _PR_MONITOR_COMMAND_ID,
+            pr_monitor_spec.frequency_minutes,
+        )
+    except Exception:
+        LOG.exception("Failed to auto-register PR monitor command")
 
 
 def send_test_button_message(notifier: Any) -> None:

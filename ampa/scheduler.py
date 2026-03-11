@@ -78,6 +78,7 @@ from .scheduler_helpers import (  # noqa: E402
     ensure_watchdog_command as _ensure_watchdog_command,
     ensure_test_button_command as _ensure_test_button_command,
     ensure_auto_delegate_command as _ensure_auto_delegate_command,
+    ensure_pr_monitor_command as _ensure_pr_monitor_command,
     send_test_button_message as _send_test_button_message,
     log_health as _log_health,
 )
@@ -245,6 +246,11 @@ class Scheduler:
         # safe rollout).  When enabled it periodically runs ``wl next`` and
         # delegates plan-complete high/critical items.
         _ensure_auto_delegate_command(self.store)
+
+        # Auto-register the PR monitor command — scans open PRs hourly,
+        # posts "ready for review" when CI passes, and creates critical
+        # work items when CI fails.
+        _ensure_pr_monitor_command(self.store)
 
         # --- Discord bot process supervision ---
         self._bot_supervisor = BotSupervisor(
@@ -628,6 +634,20 @@ class Scheduler:
                 LOG.info("auto-delegate result: %s", result)
             except Exception:
                 LOG.exception("auto-delegate command failed")
+            return run
+        if spec.command_type == "pr-monitor":
+            try:
+                from .pr_monitor import PRMonitorRunner
+
+                runner = PRMonitorRunner(
+                    run_shell=self.run_shell,
+                    command_cwd=self.command_cwd,
+                    notifier=notifications_module,
+                )
+                result = runner.run(spec)
+                LOG.info("pr-monitor result: %s", result)
+            except Exception:
+                LOG.exception("pr-monitor command failed")
             return run
 
         # always post the generic discord notification afterwards
