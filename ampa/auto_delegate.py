@@ -379,6 +379,8 @@ class AutoDelegateRunner:
                     message_type="completion",
                 )
         except Exception:
+            # Keep behavior consistent with failure notification: log and
+            # continue without raising so runner.run() remains resilient.
             LOG.exception(
                 "auto-delegate: failed to send success notification for %s",
                 work_item_id,
