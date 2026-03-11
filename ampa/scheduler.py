@@ -72,6 +72,7 @@ from .engine_factory import build_engine  # noqa: E402
 # Delegation helpers — canonical implementations live in ampa.delegation.
 # ---------------------------------------------------------------------------
 from .delegation import DelegationOrchestrator  # noqa: E402
+import hashlib
 
 from .scheduler_helpers import (  # noqa: E402
     clear_stale_running_states as _clear_stale_running_states,
@@ -660,11 +661,32 @@ class Scheduler:
                 LOG.exception("Failed to summarize output for discord post")
                 short_output = output
             title = spec.title or spec.metadata.get("discord_label") or spec.command_id
-            notifications_module.notify(
-                title=title,
-                body=short_output or "",
-                message_type="command",
-            )
+            try:
+                # Deduplicate generic scheduled command notifications by
+                # storing a content hash in the scheduler state per-command.
+                # Only send when the summarized output differs from the
+                # last posted content. This mirrors delegation report
+                # deduplication behaviour but is generic for scheduled
+                # commands like `wl-in_progress`.
+                new_hash = hashlib.sha256((short_output or "").encode("utf-8")).hexdigest()
+                state = self.store.get_state(spec.command_id)
+                old_hash = state.get("last_output_hash")
+                if old_hash == new_hash:
+                    LOG.info(
+                        "Output for %s unchanged (hash=%s); skipping Discord notification",
+                        spec.command_id,
+                        new_hash[:12],
+                    )
+                else:
+                    state["last_output_hash"] = new_hash
+                    self.store.update_state(spec.command_id, state)
+                    notifications_module.notify(
+                        title=title,
+                        body=short_output or "",
+                        message_type="command",
+                    )
+            except Exception:
+                LOG.exception("Failed to send generic command notification")
         return run
 
     def run_once(self) -> Optional[RunResult]:
