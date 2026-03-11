@@ -747,3 +747,162 @@ def test_scheduler_config_from_env_ignores_env_var(monkeypatch, tmp_path):
     config = SchedulerConfig.from_env()
     expected = str(tmp_path / ".worklog" / "ampa" / "scheduler_store.json")
     assert config.store_path == expected
+
+# ---------------------------------------------------------------------------
+# _try_daemon_run tests
+# ---------------------------------------------------------------------------
+
+from ampa.scheduler_cli import _try_daemon_run, _daemon_port
+
+
+def test_daemon_port_default(monkeypatch):
+    """_daemon_port returns 8000 by default."""
+    monkeypatch.delenv("AMPA_METRICS_PORT", raising=False)
+    assert _daemon_port() == 8000
+
+
+def test_daemon_port_from_env(monkeypatch):
+    """_daemon_port reads AMPA_METRICS_PORT from environment."""
+    monkeypatch.setenv("AMPA_METRICS_PORT", "9090")
+    assert _daemon_port() == 9090
+
+
+def test_try_daemon_run_no_daemon(monkeypatch):
+    """_try_daemon_run returns None when daemon is not reachable."""
+    # Point at a port where nothing is listening.
+    monkeypatch.setenv("AMPA_METRICS_PORT", "19999")
+    result = _try_daemon_run("any-cmd")
+    assert result is None
+
+
+def test_try_daemon_run_zero_port(monkeypatch):
+    """_try_daemon_run returns None when port is 0 (disabled)."""
+    monkeypatch.setenv("AMPA_METRICS_PORT", "0")
+    result = _try_daemon_run("any-cmd")
+    assert result is None
+
+
+def test_cli_run_delegates_to_daemon(monkeypatch):
+    """_cli_run uses daemon result when _try_daemon_run succeeds."""
+    import datetime as dt
+
+    daemon_response = {
+        "id": "my-cmd",
+        "name": "My Command",
+        "status": "success",
+        "started_at": "2026-01-01T12:00:00+00:00",
+        "finished_at": "2026-01-01T12:00:03+00:00",
+        "duration_seconds": 3.0,
+        "exit_code": 0,
+        "output": "hello from daemon",
+        "instance": "daemon-host",
+    }
+
+    args = _make_args(command_id="my-cmd")
+    with mock.patch("ampa.scheduler_cli._try_daemon_run", return_value=daemon_response):
+        exit_code, output = _capture_cli_run(args)
+
+    assert exit_code == 0
+    # Human-readable output should mention the command
+    assert "my-cmd" in output
+
+
+def test_cli_run_daemon_json_output(monkeypatch):
+    """When --json is set and daemon handles the run, CLI prints daemon JSON."""
+    daemon_response = {
+        "id": "my-cmd",
+        "name": "My Command",
+        "status": "success",
+        "started_at": "2026-01-01T12:00:00+00:00",
+        "finished_at": "2026-01-01T12:00:03+00:00",
+        "duration_seconds": 3.0,
+        "exit_code": 0,
+        "output": "daemon output",
+        "instance": "daemon-host",
+    }
+
+    args = _make_args(command_id="my-cmd", json=True)
+    with mock.patch("ampa.scheduler_cli._try_daemon_run", return_value=daemon_response):
+        exit_code, output = _capture_cli_run(args)
+
+    assert exit_code == 0
+    data = json.loads(output)
+    assert data["id"] == "my-cmd"
+    assert data["output"] == "daemon output"
+
+
+def test_cli_run_falls_back_when_daemon_unavailable():
+    """_cli_run falls back to local execution when daemon returns None."""
+    spec = _make_spec("fallback-cmd")
+    run_result = _make_run_result(exit_code=0, output="local run")
+    store = DummyStore()
+    store.add_command(spec)
+    config = SchedulerConfig(
+        poll_interval_seconds=5,
+        global_min_interval_seconds=60,
+        priority_weight=0.1,
+        store_path=":memory:",
+        llm_healthcheck_url="http://localhost/health",
+        max_run_history=5,
+    )
+    scheduler = Scheduler(store, config, executor=lambda _: run_result)
+
+    args = _make_args(command_id="fallback-cmd")
+    with (
+        mock.patch("ampa.scheduler_cli._try_daemon_run", return_value=None),
+        mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler),
+    ):
+        exit_code, output = _capture_cli_run(args)
+
+    assert exit_code == 0
+    assert "fallback-cmd" in output
+
+
+def test_cli_run_daemon_error_response(monkeypatch):
+    """_cli_run handles an error dict from the daemon gracefully."""
+    daemon_response = {"error": "Unknown command id: no-cmd"}
+
+    args = _make_args(command_id="no-cmd")
+    with mock.patch("ampa.scheduler_cli._try_daemon_run", return_value=daemon_response):
+        exit_code, output = _capture_cli_run(args)
+
+    assert exit_code == 2
+    assert "Unknown command id" in output
+
+
+def test_cli_run_watch_skips_daemon():
+    """Watch mode bypasses daemon detection and runs locally."""
+    spec = _make_spec("watch-daemon-cmd")
+    run_result = _make_run_result(exit_code=0, output="watch output")
+    store = DummyStore()
+    store.add_command(spec)
+    config = SchedulerConfig(
+        poll_interval_seconds=5,
+        global_min_interval_seconds=60,
+        priority_weight=0.1,
+        store_path=":memory:",
+        llm_healthcheck_url="http://localhost/health",
+        max_run_history=5,
+    )
+    scheduler = Scheduler(store, config, executor=lambda _: run_result)
+
+    # Interrupt via time.sleep (same pattern as test_cli_run_watch_mocked).
+    sleep_count = 0
+
+    def interruptible_sleep(_seconds):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count >= 1:
+            raise KeyboardInterrupt()
+
+    # _try_daemon_run should NOT be called in watch mode
+    try_daemon_mock = mock.MagicMock(return_value={"id": "x", "exit_code": 0})
+    args = _make_args(command_id="watch-daemon-cmd", watch=1)
+    with (
+        mock.patch("ampa.scheduler_cli._try_daemon_run", try_daemon_mock),
+        mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler),
+        mock.patch("ampa.scheduler_cli.time.sleep", side_effect=interruptible_sleep),
+    ):
+        _capture_cli_run(args)
+
+    try_daemon_mock.assert_not_called()

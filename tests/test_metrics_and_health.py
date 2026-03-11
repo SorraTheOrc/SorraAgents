@@ -215,3 +215,202 @@ def test_admin_fallback_requires_token(tmp_path, monkeypatch, metrics_server):
         raised = True
         assert exc.code == 401
     assert raised
+
+
+# ---------------------------------------------------------------------------
+# /run endpoint tests
+# ---------------------------------------------------------------------------
+
+
+def _make_dummy_scheduler(command_id="test-cmd", command="echo hi", exit_code=0):
+    """Build a minimal in-memory scheduler stub for /run endpoint tests."""
+    from ampa.scheduler_types import CommandSpec, CommandRunResult, SchedulerConfig
+    from ampa.scheduler import Scheduler
+    from ampa.scheduler_store import SchedulerStore
+    import datetime as dt
+
+    class _DummyStore(SchedulerStore):
+        def __init__(self):
+            self.path = ":memory:"
+            self.data = {"commands": {}, "state": {}, "last_global_start_ts": None}
+
+        def save(self):
+            pass
+
+    spec = CommandSpec(
+        command_id=command_id,
+        command=command,
+        requires_llm=False,
+        frequency_minutes=10,
+        priority=0,
+        metadata={},
+        title="Test Command",
+        command_type="shell",
+    )
+    store = _DummyStore()
+    store.add_command(spec)
+    start = dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt.timezone.utc)
+    end = dt.datetime(2026, 1, 1, 12, 0, 3, tzinfo=dt.timezone.utc)
+    run_result = CommandRunResult(
+        start_ts=start, end_ts=end, exit_code=exit_code, output="hello"
+    )
+    config = SchedulerConfig(
+        poll_interval_seconds=5,
+        global_min_interval_seconds=60,
+        priority_weight=0.1,
+        store_path=":memory:",
+        llm_healthcheck_url="http://localhost/health",
+        max_run_history=5,
+    )
+    return Scheduler(store, config, executor=lambda _: run_result)
+
+
+def test_run_endpoint_no_scheduler(metrics_server):
+    """/run returns 503 when no scheduler is registered."""
+    import ampa.server as srv
+
+    orig = srv._scheduler
+    srv._scheduler = None
+    try:
+        base, server = metrics_server()
+        req = urllib.request.Request(
+            f"{base}/run",
+            data=json.dumps({"command_id": "x"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req)
+            raised = False
+        except urllib.error.HTTPError as exc:
+            raised = True
+            assert exc.code == 503
+        assert raised
+    finally:
+        srv._scheduler = orig
+
+
+def test_run_endpoint_unknown_command(metrics_server):
+    """/run returns 404 for an unknown command id."""
+    import ampa.server as srv
+
+    sched = _make_dummy_scheduler(command_id="known-cmd")
+    orig = srv._scheduler
+    srv._scheduler = sched
+    try:
+        base, server = metrics_server()
+        req = urllib.request.Request(
+            f"{base}/run",
+            data=json.dumps({"command_id": "no-such-cmd"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req)
+            raised = False
+        except urllib.error.HTTPError as exc:
+            raised = True
+            assert exc.code == 404
+        assert raised
+    finally:
+        srv._scheduler = orig
+
+
+def test_run_endpoint_success(metrics_server):
+    """/run executes the command and returns JSON result."""
+    import ampa.server as srv
+
+    sched = _make_dummy_scheduler(command_id="my-cmd", exit_code=0)
+    orig = srv._scheduler
+    srv._scheduler = sched
+    try:
+        base, server = metrics_server()
+        req = urllib.request.Request(
+            f"{base}/run",
+            data=json.dumps({"command_id": "my-cmd"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read().decode())
+        assert body["id"] == "my-cmd"
+        assert body["status"] == "success"
+        assert body["exit_code"] == 0
+        assert body["output"] == "hello"
+        assert "started_at" in body
+        assert "finished_at" in body
+        assert "duration_seconds" in body
+        assert "instance" in body
+    finally:
+        srv._scheduler = orig
+
+
+def test_run_endpoint_failure_result(metrics_server):
+    """/run returns 'failed' status when command exits non-zero."""
+    import ampa.server as srv
+
+    sched = _make_dummy_scheduler(command_id="fail-cmd", exit_code=42)
+    orig = srv._scheduler
+    srv._scheduler = sched
+    try:
+        base, server = metrics_server()
+        req = urllib.request.Request(
+            f"{base}/run",
+            data=json.dumps({"command_id": "fail-cmd"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read().decode())
+        assert body["status"] == "failed"
+        assert body["exit_code"] == 42
+    finally:
+        srv._scheduler = orig
+
+
+def test_run_endpoint_method_not_allowed(metrics_server):
+    """/run returns 405 for non-POST requests."""
+    import ampa.server as srv
+
+    sched = _make_dummy_scheduler()
+    orig = srv._scheduler
+    srv._scheduler = sched
+    try:
+        base, server = metrics_server()
+        try:
+            urllib.request.urlopen(f"{base}/run")
+            raised = False
+        except urllib.error.HTTPError as exc:
+            raised = True
+            assert exc.code == 405
+        assert raised
+    finally:
+        srv._scheduler = orig
+
+
+def test_run_endpoint_missing_command_id(metrics_server):
+    """/run returns 400 when command_id is absent from payload."""
+    import ampa.server as srv
+
+    sched = _make_dummy_scheduler()
+    orig = srv._scheduler
+    srv._scheduler = sched
+    try:
+        base, server = metrics_server()
+        req = urllib.request.Request(
+            f"{base}/run",
+            data=json.dumps({"other_key": "value"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req)
+            raised = False
+        except urllib.error.HTTPError as exc:
+            raised = True
+            assert exc.code == 400
+        assert raised
+    finally:
+        srv._scheduler = orig

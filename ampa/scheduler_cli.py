@@ -16,6 +16,8 @@ import tempfile
 import time
 import datetime as dt
 import re
+import urllib.request
+import urllib.error
 from typing import Any, Dict, List, Optional
 
 from . import daemon, notifications as notifications_module, selection
@@ -37,6 +39,61 @@ from .scheduler import (
 )
 
 LOG = logging.getLogger("ampa.scheduler.cli")
+
+# ---------------------------------------------------------------------------
+# Daemon detection and delegation helpers
+# ---------------------------------------------------------------------------
+
+def _daemon_port() -> int:
+    """Return the HTTP port of the running daemon (from AMPA_METRICS_PORT)."""
+    try:
+        return int(os.getenv("AMPA_METRICS_PORT", "8000"))
+    except Exception:
+        return 8000
+
+
+def _try_daemon_run(command_id: str) -> Optional[Dict[str, Any]]:
+    """Try to execute a command via the running daemon's /run endpoint.
+
+    If the daemon is available and has a scheduler registered it will execute
+    the command and return the result as a dict (same schema as
+    ``_format_run_result_json``).  Returns ``None`` if the daemon is not
+    reachable, has no scheduler running, or the command is unknown.
+    """
+    port = _daemon_port()
+    if port <= 0:
+        return None
+    url = f"http://127.0.0.1:{port}/run"
+    data = json.dumps({"command_id": command_id}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        # Allow up to AMPA_CMD_TIMEOUT_SECONDS for the command to complete.
+        try:
+            timeout = int(os.getenv("AMPA_CMD_TIMEOUT_SECONDS", "3600"))
+        except Exception:
+            timeout = 3600
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            result = json.loads(body)
+            if isinstance(result, dict):
+                return result
+            return None
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 503):
+            # 404 = unknown command id, 503 = no scheduler running — let caller
+            # fall back to local execution.
+            LOG.debug(
+                "Daemon /run returned %s for command %s; falling back to local",
+                exc.code,
+                command_id,
+            )
+        else:
+            LOG.debug("Daemon /run HTTP error %s; falling back to local", exc.code)
+        return None
+    except Exception:
+        LOG.debug("Daemon not reachable; falling back to local execution")
+        return None
 
 
 def _parse_metadata(value: Optional[str]) -> Dict[str, Any]:
@@ -458,6 +515,49 @@ def _cli_run(args: argparse.Namespace) -> int:
             print(_format_command_details_table(details, fmt))
         return 0
 
+    # When watch mode is NOT active, try to delegate to the running daemon so
+    # that the run appears in its logs and scheduler state.  Watch mode always
+    # runs locally to allow real-time looping without HTTP round-trips.
+    if watch_interval is None:
+        daemon_result = _try_daemon_run(command_id)
+        if daemon_result is not None:
+            # Daemon executed the command; display the result locally.
+            if "error" in daemon_result:
+                if use_json:
+                    print(json.dumps(daemon_result, indent=2))
+                else:
+                    print(daemon_result["error"])
+                return 2
+            if use_json:
+                print(json.dumps(daemon_result, indent=2, sort_keys=True))
+            else:
+                # Reconstruct displayable objects from the daemon response.
+                start_ts = _from_iso(daemon_result.get("started_at"))
+                end_ts = _from_iso(daemon_result.get("finished_at"))
+                if start_ts is None:
+                    start_ts = _utc_now()
+                if end_ts is None:
+                    end_ts = start_ts
+                run = CommandRunResult(
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    exit_code=int(daemon_result.get("exit_code", 0)),
+                    output=daemon_result.get("output"),
+                )
+                spec = CommandSpec(
+                    command_id=daemon_result.get("id", command_id),
+                    command="",
+                    requires_llm=False,
+                    frequency_minutes=0,
+                    priority=0,
+                    metadata={},
+                    title=daemon_result.get("name", command_id),
+                    command_type="shell",
+                )
+                daemon_instance = daemon_result.get("instance") or instance
+                print(_format_run_result_human(spec, run, fmt, daemon_instance))
+            return int(daemon_result.get("exit_code", 0))
+
     scheduler = load_scheduler(command_cwd=os.getcwd())
     spec = scheduler.store.get_command(command_id)
     if spec is None:
@@ -573,7 +673,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_cmd = sub.add_parser(
         "run",
-        help="Run a scheduler command immediately by id, or list available commands",
+        help=(
+            "Run a scheduler command immediately by id, or list available commands. "
+            "When a running daemon is detected (via AMPA_METRICS_PORT, default 8000) "
+            "the command is forwarded to it so the run appears in the daemon log and "
+            "scheduler store. Falls back to local execution if no daemon is available."
+        ),
     )
     run_cmd.add_argument(
         "command_id",
@@ -601,7 +706,10 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="?",
         const=5,
         default=None,
-        help="Rerun the command every N seconds (default: 5)",
+        help=(
+            "Rerun the command locally every N seconds (default: 5). "
+            "Watch mode always runs locally rather than through the daemon."
+        ),
     )
 
     return parser
