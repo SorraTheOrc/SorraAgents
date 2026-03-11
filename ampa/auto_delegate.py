@@ -45,7 +45,7 @@ _DEFAULT_ELIGIBLE_STAGES: List[str] = ["in_review"]
 _DEFAULT_ELIGIBLE_PRIORITIES: List[str] = ["high", "critical"]
 _DEFAULT_MAX_RETRIES: int = 3
 _DEFAULT_BACKOFF_BASE: float = 2.0
-_GITHUB_URL_RE = re.compile(r"https?://github\.com/[^\s]+")
+_GITHUB_URL_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/(?:issues|pull)/\d+")
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +198,7 @@ class AutoDelegateRunner:
             if success:
                 note = f"auto-delegate: delegated {work_item_id!r} ({title!r})"
                 LOG.info(note)
-                github_url = _find_github_url(stdout) or _find_github_url(stderr)
+                github_url = _extract_github_url(stdout) or _extract_github_url(stderr)
                 self._notify_success(
                     work_item_id=work_item_id,
                     title=title,
@@ -211,6 +211,7 @@ class AutoDelegateRunner:
                     "work_item_id": work_item_id,
                     "note": note,
                     "retries": attempt,
+                    "github_url": github_url,
                 }
             last_error = error
             LOG.warning(
@@ -388,6 +389,13 @@ class AutoDelegateRunner:
 # Utilities
 # ---------------------------------------------------------------------------
 
+def _extract_github_url(text: Optional[str]) -> Optional[str]:
+    """Extract the first GitHub URL from *text*, or ``None`` if not found."""
+    if not text:
+        return None
+    match = _GITHUB_URL_RE.search(text)
+    return match.group(0) if match else None
+
 
 def _extract_id(item: Any) -> str:
     if not isinstance(item, dict):
@@ -455,10 +463,3 @@ def _normalize_candidates(payload: Any) -> List[Dict[str, Any]]:
     if "id" in payload:
         return [payload]
     return []
-
-
-def _find_github_url(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
-    match = _GITHUB_URL_RE.search(text)
-    return match.group(0) if match else None

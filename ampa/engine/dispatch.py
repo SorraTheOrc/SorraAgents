@@ -17,6 +17,19 @@ Usage::
         work_item_id="WL-123",
     )
     assert result.success
+
+Container teardown
+------------------
+When a ``ContainerDispatcher`` session completes (success or failure), the
+container is automatically stopped and removed via :func:`teardown_container`.
+The pool claim is then released so the slot becomes available for replenishment.
+
+- Default teardown timeout: 60 s (override via ``AMPA_CONTAINER_TEARDOWN_TIMEOUT``).
+- Teardown is idempotent: if the container is already gone the function returns
+  successfully without raising.
+- On timeout, the error is logged and the container is added to
+  ``pool-cleanup.json`` so the host-side watchdog can destroy it on the next
+  pool operation.
 """
 
 from __future__ import annotations
@@ -26,12 +39,11 @@ import logging
 import os
 import signal
 import subprocess
-import sys
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 LOG = logging.getLogger("ampa.engine.dispatch")
 
@@ -349,16 +361,18 @@ def _existing_pool_containers() -> set[str]:
 
 
 def _list_available_pool() -> list[str]:
-    """List pool containers that exist in Podman and are NOT claimed.
+    """List pool containers that exist in Podman and are NOT claimed or in cleanup.
 
-    Mirrors the JS ``listAvailablePool`` function.
+    Mirrors the JS ``listAvailablePool`` function, extended to also exclude
+    containers that are pending watchdog cleanup (pool-cleanup.json).
     """
     state = _read_pool_state()
     existing = _existing_pool_containers()
+    cleanup = set(_read_cleanup_list())
     available: list[str] = []
     for i in range(_POOL_MAX_INDEX):
         name = f"{_POOL_PREFIX}{i}"
-        if name in existing and name not in state:
+        if name in existing and name not in state and name not in cleanup:
             available.append(name)
     return available
 
@@ -391,6 +405,241 @@ def _release_pool_container(container_name: str) -> None:
     state = _read_pool_state()
     state.pop(container_name, None)
     _save_pool_state(state)
+
+
+# ---------------------------------------------------------------------------
+# Pool cleanup list (pool-cleanup.json)
+# ---------------------------------------------------------------------------
+
+
+def _pool_cleanup_path() -> Path:
+    """Return the path to the pool cleanup file.
+
+    Mirrors the JS ``poolCleanupPath()`` in ampa.mjs.
+    """
+    return _global_ampa_dir() / "pool-cleanup.json"
+
+
+def _read_cleanup_list() -> list[str]:
+    """Read the list of containers marked for watchdog cleanup.
+
+    Returns an empty list when the file doesn't exist or is invalid.
+    """
+    p = _pool_cleanup_path()
+    try:
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [str(item) for item in data]
+    except (json.JSONDecodeError, OSError):
+        pass
+    return []
+
+
+def _save_cleanup_list(containers: list[str]) -> None:
+    """Persist the cleanup list to disk."""
+    p = _pool_cleanup_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(containers, indent=2), encoding="utf-8")
+
+
+def _mark_for_cleanup(container_name: str) -> None:
+    """Add *container_name* to ``pool-cleanup.json`` for watchdog cleanup.
+
+    Idempotent: if the container is already in the list it is not duplicated.
+    """
+    existing = _read_cleanup_list()
+    if container_name not in existing:
+        existing.append(container_name)
+        _save_cleanup_list(existing)
+    LOG.warning(
+        "Container %s marked for watchdog cleanup in pool-cleanup.json",
+        container_name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Container teardown
+# ---------------------------------------------------------------------------
+
+# Default timeout (seconds) for podman stop during container teardown.
+_DEFAULT_CONTAINER_TEARDOWN_TIMEOUT = 60
+
+# Extra seconds added to the subprocess.run() timeout beyond the podman --time
+# value so the podman process itself has time to relay the stop signal and exit.
+_TEARDOWN_STOP_TIMEOUT_BUFFER = 10
+
+# Timeout (seconds) for the podman rm subprocess call.
+_TEARDOWN_RM_TIMEOUT = 30
+
+# Maximum number of stderr characters to include in log messages.
+_MAX_STDERR_LOG_CHARS = 512
+
+
+def _is_not_found_error(stderr: str) -> bool:
+    """Return ``True`` if *stderr* indicates the container does not exist.
+
+    Used to implement idempotent teardown: if a container has already been
+    removed, ``podman stop`` / ``podman rm`` emit a "not found"-style message
+    and we treat that as a successful no-op rather than an error.
+    """
+    lower = stderr.lower()
+    return any(
+        phrase in lower
+        for phrase in (
+            "no container with name or id",
+            "no such container",
+            "container not found",
+            "does not exist",
+        )
+    )
+
+
+def teardown_container(container_id: str, timeout: int | None = None) -> bool:
+    """Stop and remove *container_id* via ``podman stop`` + ``podman rm``.
+
+    Both operations are idempotent: if the container has already been removed
+    the function returns ``True`` without raising.
+
+    If ``podman stop`` times out or fails unexpectedly, the error is logged and
+    the container is added to ``pool-cleanup.json`` so the host-side watchdog
+    can destroy it on the next pool operation.  The function returns ``False``
+    in that case.
+
+    Args:
+        container_id: Name or ID of the container to tear down.
+        timeout: Maximum seconds to wait for ``podman stop`` to complete.
+            Defaults to the ``AMPA_CONTAINER_TEARDOWN_TIMEOUT`` environment
+            variable, or 60 seconds when the variable is not set / invalid.
+
+    Returns:
+        ``True`` when the container was successfully stopped and removed (or
+        was already absent), ``False`` when teardown failed (error logged;
+        container marked for watchdog cleanup).
+    """
+    if timeout is None:
+        env_val = os.environ.get("AMPA_CONTAINER_TEARDOWN_TIMEOUT")
+        if env_val is not None:
+            try:
+                timeout = int(env_val)
+            except ValueError:
+                timeout = _DEFAULT_CONTAINER_TEARDOWN_TIMEOUT
+        else:
+            timeout = _DEFAULT_CONTAINER_TEARDOWN_TIMEOUT
+
+    LOG.info("Tearing down container %s (timeout=%ds)", container_id, timeout)
+
+    # -- Stop ---------------------------------------------------------------
+    try:
+        stop_result = subprocess.run(  # noqa: S603, S607
+            ["podman", "stop", "--time", str(timeout), container_id],
+            capture_output=True,
+            text=True,
+            timeout=timeout + _TEARDOWN_STOP_TIMEOUT_BUFFER,
+        )
+        if stop_result.returncode != 0:
+            stderr = stop_result.stderr or ""
+            if _is_not_found_error(stderr):
+                LOG.info(
+                    "Container %s already removed (stop phase) — treating as success",
+                    container_id,
+                )
+                return True
+            LOG.error(
+                "podman stop failed for %s (rc=%d): %s",
+                container_id,
+                stop_result.returncode,
+                stderr[:_MAX_STDERR_LOG_CHARS],
+            )
+            _mark_for_cleanup(container_id)
+            return False
+    except subprocess.TimeoutExpired:
+        LOG.error(
+            "podman stop timed out for %s after %ds — marking for watchdog cleanup",
+            container_id,
+            timeout,
+        )
+        _mark_for_cleanup(container_id)
+        return False
+    except (FileNotFoundError, OSError) as exc:
+        LOG.error("podman stop failed for %s: %s", container_id, exc)
+        _mark_for_cleanup(container_id)
+        return False
+
+    # -- Remove -------------------------------------------------------------
+    try:
+        rm_result = subprocess.run(  # noqa: S603, S607
+            ["podman", "rm", container_id],
+            capture_output=True,
+            text=True,
+            timeout=_TEARDOWN_RM_TIMEOUT,
+        )
+        if rm_result.returncode != 0:
+            stderr = rm_result.stderr or ""
+            if _is_not_found_error(stderr):
+                LOG.info(
+                    "Container %s already removed (rm phase) — treating as success",
+                    container_id,
+                )
+                return True
+            LOG.error(
+                "podman rm failed for %s (rc=%d): %s",
+                container_id,
+                rm_result.returncode,
+                stderr[:_MAX_STDERR_LOG_CHARS],
+            )
+            _mark_for_cleanup(container_id)
+            return False
+    except subprocess.TimeoutExpired:
+        LOG.error(
+            "podman rm timed out for %s — marking for watchdog cleanup",
+            container_id,
+        )
+        _mark_for_cleanup(container_id)
+        return False
+    except (FileNotFoundError, OSError) as exc:
+        LOG.error("podman rm failed for %s: %s", container_id, exc)
+        _mark_for_cleanup(container_id)
+        return False
+
+    LOG.info("Container %s successfully torn down", container_id)
+    return True
+
+
+def _teardown_on_completion(
+    proc: subprocess.Popen,  # type: ignore[type-arg]
+    container_name: str,
+    teardown_fn: Callable[[str], bool],
+    release_fn: Callable[[str], None],
+) -> None:
+    """Wait for *proc* to exit then tear down *container_name*.
+
+    Designed to run as a daemon thread started immediately after a successful
+    :meth:`ContainerDispatcher.dispatch`.  Ensures the container is stopped,
+    removed, and the pool claim released regardless of whether the agent exits
+    successfully or with an error.
+
+    Args:
+        proc: The ``Popen`` object for the running agent session.
+        container_name: Pool container to tear down when the session ends.
+        teardown_fn: Callable implementing the teardown (default:
+            :func:`teardown_container`).  Accepts ``container_name`` and
+            returns a bool.  Provided as a parameter so tests can patch it.
+        release_fn: Callable that releases the pool claim (default:
+            :func:`_release_pool_container`).  Accepts ``container_name``.
+    """
+    try:
+        proc.wait()
+    except Exception:
+        LOG.exception(
+            "Unexpected error waiting for container process (pid=%d, container=%s)",
+            proc.pid,
+            container_name,
+        )
+    # Tear down the container regardless of the exit code or any wait error.
+    teardown_fn(container_name)
+    # Release the pool claim so the slot becomes available for replenishment.
+    release_fn(container_name)
 
 
 class ContainerDispatcher:
@@ -453,6 +702,11 @@ class ContainerDispatcher:
     @staticmethod
     def _release(container_name: str) -> None:
         _release_pool_container(container_name)
+
+    @staticmethod
+    def _teardown(container_name: str) -> bool:
+        """Tear down *container_name* (thin wrapper for patching in tests)."""
+        return teardown_container(container_name)
 
     # -- Dispatch -----------------------------------------------------------
 
@@ -540,6 +794,16 @@ class ContainerDispatcher:
             )
             timer.daemon = True  # Don't prevent engine shutdown.
             timer.start()
+
+        # 5. Schedule teardown on completion --------------------------------
+        # When the agent session finishes (success or failure), a daemon
+        # thread stops and removes the container then releases the pool claim.
+        teardown_thread = threading.Thread(
+            target=_teardown_on_completion,
+            args=(proc, container_name, self._teardown, self._release),
+            daemon=True,
+        )
+        teardown_thread.start()
 
         LOG.info(
             "Container dispatch successful: %s -> container=%s pid=%d timeout=%ds",
