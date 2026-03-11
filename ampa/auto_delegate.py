@@ -2,7 +2,7 @@
 
 Periodically runs ``wl next --json`` and automatically delegates the
 recommended work item to the GitHub Copilot coding agent when the item is in
-``plan_complete`` stage and has ``high`` or ``critical`` priority.
+``in_review`` stage and has ``high`` or ``critical`` priority.
 
 Retry / back-off behaviour
 --------------------------
@@ -19,7 +19,7 @@ All behaviour can be driven from the ``CommandSpec.metadata`` dict:
   exponential back-off.  Actual delay for attempt *n* (0-indexed) is
   ``base * 2^n`` seconds.
 * ``eligible_stages`` (list[str]) — stages that qualify for delegation
-  (default ``["plan_complete"]``).
+  (default ``["in_review"]``).
 * ``eligible_priorities`` (list[str]) — priorities that qualify
   (default ``["high", "critical"]``).
 
@@ -40,7 +40,7 @@ LOG = logging.getLogger("ampa.auto_delegate")
 # Defaults
 # ---------------------------------------------------------------------------
 
-_DEFAULT_ELIGIBLE_STAGES: List[str] = ["plan_complete"]
+_DEFAULT_ELIGIBLE_STAGES: List[str] = ["in_review"]
 _DEFAULT_ELIGIBLE_PRIORITIES: List[str] = ["high", "critical"]
 _DEFAULT_MAX_RETRIES: int = 3
 _DEFAULT_BACKOFF_BASE: float = 2.0
