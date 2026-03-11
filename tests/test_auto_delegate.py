@@ -229,7 +229,7 @@ class TestAutoDelegateRunnerSkipped:
 
     def test_wrong_priority_skipped(self):
         run_shell = _make_shell(
-            {"wl next": {"returncode": 0, "stdout": self._candidate_json("plan_complete", "low")}}
+            {"wl next": {"returncode": 0, "stdout": self._candidate_json("in_review", "low")}}
         )
         runner = AutoDelegateRunner(run_shell=run_shell, command_cwd="/tmp", sleep_fn=lambda _: None)
         spec = _make_auto_delegate_spec()
@@ -247,7 +247,7 @@ class TestAutoDelegateRunnerSkipped:
 
     def test_custom_eligible_priorities_respected(self):
         run_shell = _make_shell(
-            {"wl next": {"returncode": 0, "stdout": self._candidate_json("plan_complete", "critical")}}
+            {"wl next": {"returncode": 0, "stdout": self._candidate_json("in_review", "critical")}}
         )
         runner = AutoDelegateRunner(run_shell=run_shell, command_cwd="/tmp", sleep_fn=lambda _: None)
         spec = _make_auto_delegate_spec(eligible_priorities=["high"])
@@ -258,7 +258,7 @@ class TestAutoDelegateRunnerSkipped:
 class TestAutoDelegateRunnerDelegated:
     """Happy path: candidate meets criteria and delegation succeeds."""
 
-    def _candidate_json(self, stage: str = "plan_complete", priority: str = "high", wid: str = "WI-42") -> str:
+    def _candidate_json(self, stage: str = "in_review", priority: str = "high", wid: str = "WI-42") -> str:
         return json.dumps({"id": wid, "stage": stage, "priority": priority, "title": "Do the thing"})
 
     def test_delegates_when_criteria_match(self):
@@ -276,7 +276,7 @@ class TestAutoDelegateRunnerDelegated:
         assert result["retries"] == 0
 
     def test_delegates_with_critical_priority(self):
-        candidate = json.dumps({"id": "WI-99", "stage": "plan_complete", "priority": "critical", "title": "Critical"})
+        candidate = json.dumps({"id": "WI-99", "stage": "in_review", "priority": "critical", "title": "Critical"})
         run_shell = _make_shell(
             {
                 "wl next": {"returncode": 0, "stdout": candidate},
@@ -291,7 +291,7 @@ class TestAutoDelegateRunnerDelegated:
 
     def test_candidate_in_list_payload(self):
         payload = json.dumps([
-            {"id": "WI-1", "stage": "plan_complete", "priority": "high", "title": "First"}
+            {"id": "WI-1", "stage": "in_review", "priority": "high", "title": "First"}
         ])
         run_shell = _make_shell(
             {
@@ -306,7 +306,7 @@ class TestAutoDelegateRunnerDelegated:
 
     def test_candidate_in_items_key(self):
         payload = json.dumps({"items": [
-            {"id": "WI-55", "stage": "plan_complete", "priority": "high", "title": "From items"}
+            {"id": "WI-55", "stage": "in_review", "priority": "high", "title": "From items"}
         ]})
         run_shell = _make_shell(
             {
@@ -325,7 +325,7 @@ class TestAutoDelegateRunnerRetry:
     """Retry and back-off behaviour on wl gh delegate failure."""
 
     def _candidate_json(self, wid: str = "WI-7") -> str:
-        return json.dumps({"id": wid, "stage": "plan_complete", "priority": "high", "title": "Retry me"})
+        return json.dumps({"id": wid, "stage": "in_review", "priority": "high", "title": "Retry me"})
 
     def test_retries_on_failure_and_succeeds(self):
         call_count = {"n": 0}
@@ -422,7 +422,7 @@ class TestSchedulerAutoDelegate:
     def test_scheduler_runs_auto_delegate(self):
         """When enabled and candidate qualifies, scheduler delegates."""
         candidate_json = json.dumps(
-            {"id": "WI-10", "stage": "plan_complete", "priority": "high", "title": "Test"}
+            {"id": "WI-10", "stage": "in_review", "priority": "high", "title": "Test"}
         )
 
         calls = {"delegate": 0}
@@ -495,7 +495,7 @@ class TestSchedulerAutoDelegate:
 
 class TestNormalizeCandidates:
     def test_list_payload(self):
-        items = [{"id": "1", "stage": "plan_complete"}]
+        items = [{"id": "1", "stage": "in_review"}]
         assert _normalize_candidates(items) == items
 
     def test_dict_with_items_key(self):
@@ -507,7 +507,7 @@ class TestNormalizeCandidates:
         assert _normalize_candidates(payload) == [{"id": "3"}]
 
     def test_dict_with_id_key_treated_as_single_item(self):
-        payload = {"id": "4", "stage": "plan_complete"}
+        payload = {"id": "4", "stage": "in_review"}
         assert _normalize_candidates(payload) == [payload]
 
     def test_empty_dict(self):
