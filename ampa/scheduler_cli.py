@@ -227,12 +227,21 @@ def _cli_dry_run(args: argparse.Namespace) -> int:
         print(report)
         if args.discord:
             try:
-                message = _build_delegation_discord_message(report)
-                notifications_module.notify(
-                    "Delegation Report",
-                    message,
-                    message_type="command",
-                )
+                # Only send a Discord notification when the report content has
+                # changed since the last time we posted. Use the orchestrator's
+                # dedup helper which persists a content hash in the scheduler
+                # state to suppress duplicate posts.
+                if scheduler._delegation_orchestrator._is_delegation_report_changed(
+                    spec.command_id, report
+                ):
+                    message = _build_delegation_discord_message(report)
+                    notifications_module.notify(
+                        "Delegation Report",
+                        message,
+                        message_type="command",
+                    )
+                else:
+                    LOG.info("Delegation report unchanged; skipping discord notification")
             except Exception:
                 LOG.exception("Failed to send delegation discord notification")
     return 0
