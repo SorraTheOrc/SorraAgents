@@ -353,7 +353,10 @@ class TestAutoDelegateRunnerDelegated:
         gh_url = "https://github.com/SorraTheOrc/SorraAgents/issues/123"
         run_shell = _make_shell(
             {
-                "wl next": {"returncode": 0, "stdout": self._candidate_json()},
+                "wl next": {
+                    "returncode": 0,
+                    "stdout": self._candidate_json(stage="in_review", priority="high", wid="WI-99"),
+                },
                 "wl gh delegate": {"returncode": 0, "stdout": f"Issue created: {gh_url}"},
             }
         )
@@ -369,8 +372,14 @@ class TestAutoDelegateRunnerDelegated:
         assert result["action"] == "delegated"
         assert result.get("github_url") == gh_url
         notifier.notify.assert_called_once()
-        body = notifier.notify.call_args.kwargs.get("body", "")
+        call_kwargs = notifier.notify.call_args.kwargs
+        assert call_kwargs.get("message_type") == "completion"
+        assert "Auto-delegate succeeded" in call_kwargs.get("title", "")
+        body = call_kwargs.get("body", "")
         assert gh_url in body
+        assert "WI-99" in body
+        assert "in_review" in body
+        assert "high" in body
 
     def test_success_notification_without_github_url(self):
         """When delegate output has no URL, notification still succeeds without URL."""
@@ -395,7 +404,7 @@ class TestAutoDelegateRunnerDelegated:
         notifier.notify.assert_called_once()
         body = notifier.notify.call_args.kwargs.get("body", "")
         assert "WI-42" in body
-        assert "github.com" not in body
+        assert "Destination: (GitHub URL pending)" in body
 
     def test_success_notification_failure_does_not_propagate(self):
         """An exception in the success notifier must not escape run()."""
@@ -414,7 +423,6 @@ class TestAutoDelegateRunnerDelegated:
             sleep_fn=lambda _: None,
         )
         spec = _make_auto_delegate_spec()
-        # Must not raise
         result = runner.run(spec)
         assert result["action"] == "delegated"
 

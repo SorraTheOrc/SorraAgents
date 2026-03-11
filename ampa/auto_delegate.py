@@ -45,6 +45,7 @@ _DEFAULT_ELIGIBLE_STAGES: List[str] = ["in_review"]
 _DEFAULT_ELIGIBLE_PRIORITIES: List[str] = ["high", "critical"]
 _DEFAULT_MAX_RETRIES: int = 3
 _DEFAULT_BACKOFF_BASE: float = 2.0
+_GITHUB_URL_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/(?:issues|pull)/\d+")
 
 
 # ---------------------------------------------------------------------------
@@ -147,10 +148,14 @@ class AutoDelegateRunner:
                 "note": "wl next query failed",
             }
 
-        work_item_id = _extract_id(candidate)
-        stage = _extract_stage(candidate)
-        priority = _extract_priority(candidate)
-        title = candidate.get("title") or str(work_item_id)
+        if isinstance(candidate, dict):
+            candidate_dict: Dict[str, Any] = candidate
+        else:
+            candidate_dict = {}
+        work_item_id = _extract_id(candidate_dict)
+        stage = _extract_stage(candidate_dict)
+        priority = _extract_priority(candidate_dict)
+        title = candidate_dict.get("title") or str(work_item_id)
 
         LOG.info(
             "auto-delegate: candidate id=%s stage=%r priority=%r title=%r",
@@ -189,12 +194,18 @@ class AutoDelegateRunner:
                 )
                 self._sleep(delay)
 
-            success, error, delegate_stdout = self._delegate(work_item_id)
+            success, error, stdout, stderr = self._delegate(work_item_id)
             if success:
                 note = f"auto-delegate: delegated {work_item_id!r} ({title!r})"
                 LOG.info(note)
-                github_url = _extract_github_url(delegate_stdout)
-                self._notify_success(work_item_id, title, github_url, stage, priority)
+                github_url = _extract_github_url(stdout) or _extract_github_url(stderr)
+                self._notify_success(
+                    work_item_id=work_item_id,
+                    title=title,
+                    stage=stage,
+                    priority=priority,
+                    destination_url=github_url,
+                )
                 return {
                     "action": "delegated",
                     "work_item_id": work_item_id,
@@ -271,8 +282,10 @@ class AutoDelegateRunner:
         candidates = _normalize_candidates(payload)
         return candidates[0] if candidates else None
 
-    def _delegate(self, work_item_id: str) -> Tuple[bool, Optional[str], Optional[str]]:
-        """Run ``wl gh delegate <id>`` and return ``(success, error_message, stdout)``."""
+    def _delegate(
+        self, work_item_id: str
+    ) -> Tuple[bool, Optional[str], str, str]:
+        """Run ``wl gh delegate <id>`` and return ``(success, error_message, stdout, stderr)``."""
         try:
             proc = self.run_shell(
                 f"wl gh delegate {work_item_id}",
@@ -283,14 +296,16 @@ class AutoDelegateRunner:
                 cwd=self.command_cwd,
             )
         except Exception as exc:
-            return False, str(exc), None
+            return False, str(exc), "", ""
 
         if proc.returncode == 0:
-            return True, None, (proc.stdout or "").strip()
+            stdout = (proc.stdout or "").strip()
+            stderr = (proc.stderr or "").strip()
+            return True, None, stdout, stderr
         stderr = (proc.stderr or "").strip()
         stdout = (proc.stdout or "").strip()
         error = stderr or stdout or f"exit code {proc.returncode}"
-        return False, error, None
+        return False, error, stdout, stderr
 
     def _notify_failure(
         self,
@@ -330,17 +345,24 @@ class AutoDelegateRunner:
         self,
         work_item_id: str,
         title: str,
-        github_url: Optional[str],
         stage: str,
         priority: str,
+        destination_url: Optional[str],
     ) -> None:
         """Post a Discord notification about a successful delegation."""
+        stage_label = stage or "(unknown)"
+        priority_label = priority or "(unknown)"
+        destination_label = destination_url or "(GitHub URL pending)"
         msg_title = f"Auto-delegate succeeded — {title}"
-        lines = [f"Work item **{work_item_id}** delegated to GitHub Copilot."]
-        if github_url:
-            lines.append(f"GitHub issue: {github_url}")
-        lines.append(f"Stage: {stage} | Priority: {priority}")
-        msg_body = "\n".join(lines)
+        msg_body = "\n".join(
+            [
+                f"Work item **{work_item_id}** delegated successfully.",
+                f"Stage: {stage_label}",
+                f"Priority: {priority_label}",
+                "Action: wl gh delegate",
+                f"Destination: {destination_label}",
+            ]
+        )
         try:
             if self._notifier is not None:
                 self._notifier.notify(
@@ -367,9 +389,6 @@ class AutoDelegateRunner:
 # Utilities
 # ---------------------------------------------------------------------------
 
-_GITHUB_URL_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/issues/\d+")
-
-
 def _extract_github_url(text: Optional[str]) -> Optional[str]:
     """Extract the first GitHub URL from *text*, or ``None`` if not found."""
     if not text:
@@ -378,7 +397,9 @@ def _extract_github_url(text: Optional[str]) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def _extract_id(item: Dict[str, Any]) -> str:
+def _extract_id(item: Any) -> str:
+    if not isinstance(item, dict):
+        return "(unknown)"
     for key in ("id", "work_item_id", "workItemId"):
         val = item.get(key)
         if val is not None:
@@ -386,7 +407,9 @@ def _extract_id(item: Dict[str, Any]) -> str:
     return "(unknown)"
 
 
-def _extract_stage(item: Dict[str, Any]) -> str:
+def _extract_stage(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
     for key in ("stage", "currentStage", "current_stage"):
         val = item.get(key)
         if val is not None:
@@ -394,7 +417,9 @@ def _extract_stage(item: Dict[str, Any]) -> str:
     return ""
 
 
-def _extract_priority(item: Dict[str, Any]) -> str:
+def _extract_priority(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
     val = item.get("priority")
     if val is not None:
         return str(val).lower()
