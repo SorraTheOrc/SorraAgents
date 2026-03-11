@@ -211,8 +211,8 @@ class PRMonitorRunner:
         )
         LOG.info(note)
 
-        # Send summary notification
-        self._notify_summary(ready_prs, failing_prs, skipped_prs, len(prs))
+        # Send summary notification (include PR metadata so we can format links)
+        self._notify_summary(ready_prs, failing_prs, skipped_prs, len(prs), prs)
 
         return {
             "action": "completed",
@@ -298,8 +298,7 @@ class PRMonitorRunner:
         """
         try:
             cmd = (
-                f"{gh_cmd} pr checks {pr_number} "
-                f"--json name,state,conclusion --required"
+                f"{gh_cmd} pr checks {pr_number} --json name,bucket"
             )
             proc = self.run_shell(
                 cmd,
@@ -315,18 +314,28 @@ class PRMonitorRunner:
             )
             return None
 
-        # gh pr checks returns exit code 1 when checks are failing, so we
-        # must parse stdout regardless of returncode.
+        # gh pr checks returns exit code 1 when checks are failing, so parse
+        # stdout regardless of returncode.
         stdout = (proc.stdout or "").strip()
-        if not stdout:
-            # No checks configured — treat as all passing
-            if proc.returncode == 0:
-                return (True, [], [])
-            return None
+        stderr = (proc.stderr or "").strip()
 
+        # If no stdout but successful return code, treat as no checks configured
+        if not stdout and proc.returncode == 0:
+            return (True, [], [])
+
+        # Try to parse JSON; if that fails, see if gh printed a human message
+        # like "no checks reported on the '<branch>' branch" and treat that
+        # as no checks configured.
         try:
             checks = json.loads(stdout)
         except Exception:
+            combined = (stdout + "\n" + stderr).lower()
+            if "no checks reported" in combined or "no checks found" in combined:
+                LOG.info(
+                    "pr-monitor: no checks configured for PR #%d (gh message)",
+                    pr_number,
+                )
+                return (True, [], [])
             LOG.warning(
                 "pr-monitor: invalid JSON from gh pr checks for PR #%d: %r",
                 pr_number,
@@ -341,40 +350,42 @@ class PRMonitorRunner:
         pending: List[str] = []
 
         for check in checks:
-            state = str(check.get("state", "")).upper()
-            conclusion = str(check.get("conclusion", "")).upper()
             name = check.get("name", "(unknown)")
 
-            if state == "COMPLETED" or state == "SUCCESS":
-                if conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED", ""):
-                    # If state is SUCCESS with no conclusion, it's passing
-                    if state == "SUCCESS":
-                        continue
-                    # COMPLETED with a passing conclusion
-                    if conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED"):
-                        continue
-                    # COMPLETED with empty conclusion — ambiguous, treat as pass
-                    if not conclusion or conclusion == "NONE":
-                        continue
-                # COMPLETED but with failure/error conclusion
-                if conclusion in ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"):
-                    failing.append(name)
-                    continue
-                # Unknown conclusion for COMPLETED — treat as pass
-                continue
-            elif state in ("PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"):
-                pending.append(name)
-            elif state in ("FAILURE", "ERROR"):
-                failing.append(name)
-            else:
-                # Unknown state — log and skip
-                LOG.debug(
-                    "pr-monitor: unknown check state=%r conclusion=%r for %s on PR #%d",
-                    state,
-                    conclusion,
+            # Use the documented `bucket` field exclusively. If `bucket` is
+            # missing that indicates we cannot reliably interpret the check
+            # status in this environment — treat as a retrieval failure so
+            # the caller can decide (we return None).  This removes legacy
+            # fallbacks that attempted to interpret older `state` fields.
+            bucket = check.get("bucket")
+            if bucket is None:
+                LOG.warning(
+                    "pr-monitor: check object missing 'bucket' for %s on PR #%d",
                     name,
                     pr_number,
                 )
+                return None
+
+            bucket = str(bucket).lower()
+
+            # bucket values documented: pass, fail, pending, skipping and cancel
+            if bucket in ("pass", "skipping"):
+                # pass / skipping -> treat as passing
+                continue
+            if bucket == "pending":
+                pending.append(name)
+                continue
+            if bucket in ("fail", "cancel"):
+                failing.append(name)
+                continue
+
+            # Unknown bucket value — log and skip
+            LOG.debug(
+                "pr-monitor: unknown check bucket=%r for %s on PR #%d",
+                bucket,
+                name,
+                pr_number,
+            )
 
         all_passing = len(failing) == 0 and len(pending) == 0
         return (all_passing, failing, pending)
@@ -623,24 +634,51 @@ class PRMonitorRunner:
         failing_prs: List[int],
         skipped_prs: List[int],
         total: int,
+        prs: List[Dict[str, Any]],
     ) -> None:
         """Send a Discord summary notification for the entire run."""
         if not self._notifier:
             return
         try:
+            # Build a mapping from PR number to title/url for link formatting
+            pr_map: Dict[int, Dict[str, str]] = {}
+            for p in prs:
+                num = p.get("number")
+                try:
+                    num = int(num)
+                except Exception:
+                    continue
+                pr_map[num] = {"title": p.get("title", f"PR #{num}"), "url": p.get("url", "")}
+
             lines = [f"Checked **{total}** open PR(s)."]
             if ready_prs:
-                lines.append(
-                    f"Ready for review: {', '.join(f'#{n}' for n in ready_prs)}"
-                )
+                ready_links = []
+                for n in ready_prs:
+                    meta = pr_map.get(n)
+                    if meta and meta.get("url"):
+                        ready_links.append(f"[{meta.get('title')}]({meta.get('url')})")
+                    else:
+                        ready_links.append(f"#{n}")
+                lines.append(f"Ready for review: {', '.join(ready_links)}")
             if failing_prs:
-                lines.append(
-                    f"CI failing: {', '.join(f'#{n}' for n in failing_prs)}"
-                )
+                fail_links = []
+                for n in failing_prs:
+                    meta = pr_map.get(n)
+                    if meta and meta.get("url"):
+                        fail_links.append(f"[{meta.get('title')}]({meta.get('url')})")
+                    else:
+                        fail_links.append(f"#{n}")
+                lines.append(f"CI failing: {', '.join(fail_links)}")
             if skipped_prs:
+                skip_links = []
+                for n in skipped_prs:
+                    meta = pr_map.get(n)
+                    if meta and meta.get("url"):
+                        skip_links.append(f"[{meta.get('title')}]({meta.get('url')})")
+                    else:
+                        skip_links.append(f"#{n}")
                 lines.append(
-                    f"Skipped (already notified or pending): "
-                    f"{', '.join(f'#{n}' for n in skipped_prs)}"
+                    f"Skipped (already notified or pending): {', '.join(skip_links)}"
                 )
             self._notifier.notify(
                 title="PR Monitor Summary",
