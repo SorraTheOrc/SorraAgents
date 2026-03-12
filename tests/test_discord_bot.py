@@ -30,6 +30,7 @@ from ampa.discord_bot import (
     MAX_MESSAGE_SIZE,
     _build_view,
     _route_interaction,
+    _route_pr_review_interaction,
     _validate_components,
     main,
 )
@@ -858,3 +859,135 @@ class TestSendToDiscordWithView:
             assert "view" not in ch.sent[0]
 
         asyncio.run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Tests: _route_pr_review_interaction
+# ---------------------------------------------------------------------------
+
+
+class TestRoutePrReviewInteraction:
+    """Tests for the PR review approve/reject routing function."""
+
+    def test_approve_calls_responder_with_accept(self):
+        """pr_review_approve_42 routes to responder with action=accept."""
+        with patch("ampa.responder.resume_from_payload") as mock_resume:
+            mock_resume.return_value = {}
+            _route_pr_review_interaction(
+                "pr_review_approve_42", "alice#1234", "2026-01-01T00:00:00Z"
+            )
+            mock_resume.assert_called_once()
+            payload = mock_resume.call_args[0][0]
+            assert payload["session_id"] == "pr-review-42"
+            assert payload["action"] == "accept"
+            assert payload["metadata"]["pr_number"] == 42
+            assert payload["metadata"]["approved_by"] == "alice#1234"
+            assert payload["metadata"]["timestamp"] == "2026-01-01T00:00:00Z"
+            assert payload["metadata"]["source"] == "discord_button"
+
+    def test_reject_calls_responder_with_decline(self):
+        """pr_review_reject_99 routes to responder with action=decline."""
+        with patch("ampa.responder.resume_from_payload") as mock_resume:
+            mock_resume.return_value = {}
+            _route_pr_review_interaction(
+                "pr_review_reject_99", "bob#5678", "2026-02-15T12:00:00Z"
+            )
+            mock_resume.assert_called_once()
+            payload = mock_resume.call_args[0][0]
+            assert payload["session_id"] == "pr-review-99"
+            assert payload["action"] == "decline"
+            assert payload["metadata"]["pr_number"] == 99
+            assert payload["metadata"]["approved_by"] == "bob#5678"
+
+    def test_invalid_pr_number_logs_error_and_returns(self, caplog):
+        """Non-numeric PR suffix logs an error and does not call responder."""
+        import logging
+
+        with caplog.at_level(logging.ERROR):
+            _route_pr_review_interaction(
+                "pr_review_approve_notanumber", "alice#1234", "2026-01-01T00:00:00Z"
+            )
+        assert any("Invalid PR number" in r.message for r in caplog.records)
+
+    def test_empty_pr_number_logs_error(self, caplog):
+        """Empty PR number suffix logs an error."""
+        import logging
+
+        with caplog.at_level(logging.ERROR):
+            _route_pr_review_interaction(
+                "pr_review_approve_", "alice#1234", "2026-01-01T00:00:00Z"
+            )
+        assert any("Invalid PR number" in r.message for r in caplog.records)
+
+    def test_responder_exception_is_caught(self, caplog):
+        """If responder.resume_from_payload raises, exception is logged, not propagated."""
+        import logging
+
+        with patch("ampa.responder.resume_from_payload") as mock_resume:
+            mock_resume.side_effect = RuntimeError("session not found")
+            with caplog.at_level(logging.ERROR):
+                # Should NOT raise
+                _route_pr_review_interaction(
+                    "pr_review_approve_10", "alice#1234", "2026-01-01T00:00:00Z"
+                )
+        assert any(
+            "PR review routing failed" in r.message for r in caplog.records
+        )
+
+    def test_responder_import_failure_is_caught(self, caplog):
+        """If responder cannot be imported, error is logged and function returns."""
+        import logging
+
+        with caplog.at_level(logging.ERROR):
+            with patch.dict("sys.modules", {"ampa.responder": None}):
+                # Patch the import inside the function to raise ImportError
+                original_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+                def failing_import(name, *args, **kwargs):
+                    if name == "ampa.responder" or (args and "responder" in str(args)):
+                        raise ImportError("no responder")
+                    return original_import(name, *args, **kwargs)
+
+                with patch("builtins.__import__", side_effect=failing_import):
+                    _route_pr_review_interaction(
+                        "pr_review_approve_5", "alice#1234", "2026-01-01T00:00:00Z"
+                    )
+        assert any(
+            "Cannot import responder" in r.message for r in caplog.records
+        )
+
+
+class TestRouteInteractionPRReviewDelegation:
+    """Tests that _route_interaction correctly delegates to _route_pr_review_interaction."""
+
+    def test_approve_prefix_delegates(self):
+        """_route_interaction with pr_review_approve_* delegates to PR review routing."""
+        with patch("ampa.discord_bot._route_pr_review_interaction") as mock_fn:
+            _route_interaction(
+                "pr_review_approve_42", "alice#1234", "2026-01-01T00:00:00Z"
+            )
+            mock_fn.assert_called_once_with(
+                "pr_review_approve_42", "alice#1234", "2026-01-01T00:00:00Z"
+            )
+
+    def test_reject_prefix_delegates(self):
+        """_route_interaction with pr_review_reject_* delegates to PR review routing."""
+        with patch("ampa.discord_bot._route_pr_review_interaction") as mock_fn:
+            _route_interaction(
+                "pr_review_reject_7", "bob#5678", "2026-02-15T12:00:00Z"
+            )
+            mock_fn.assert_called_once_with(
+                "pr_review_reject_7", "bob#5678", "2026-02-15T12:00:00Z"
+            )
+
+    def test_test_prefix_does_not_delegate(self):
+        """test_* prefix should NOT delegate to PR review routing."""
+        with patch("ampa.discord_bot._route_pr_review_interaction") as mock_fn:
+            _route_interaction("test_blue", "user#1234", "2026-01-01T00:00:00Z")
+            mock_fn.assert_not_called()
+
+    def test_unknown_prefix_does_not_delegate(self):
+        """Unknown prefix should NOT delegate to PR review routing."""
+        with patch("ampa.discord_bot._route_pr_review_interaction") as mock_fn:
+            _route_interaction("survey_q1", "user#1234", "2026-01-01T00:00:00Z")
+            mock_fn.assert_not_called()
