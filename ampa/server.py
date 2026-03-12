@@ -28,8 +28,24 @@ from .conversation_manager import (
     SDKError,
     TimedOutError,
 )
+from .scheduler_types import CommandRunResult, _to_iso
 
 _LOG = logging.getLogger("ampa.server")
+
+# Module-level reference to the running scheduler, registered by the daemon.
+# When set, the /run endpoint delegates command execution to this scheduler
+# so that manual runs appear in the daemon log and scheduler store.
+_scheduler = None
+
+
+def register_scheduler(sched) -> None:
+    """Register the running scheduler instance for /run endpoint delegation.
+
+    Called by the daemon after the scheduler is loaded so that HTTP-triggered
+    runs go through the same scheduler that processes scheduled runs.
+    """
+    global _scheduler
+    _scheduler = sched
 
 # Registry-local metrics so they do not clash with external collectors during
 # tests or when the package is imported multiple times.
@@ -205,6 +221,56 @@ def _wsgi_app(environ, start_response):
                 start_response, "500 Internal Server Error", {"error": str(exc)}
             )
 
+    if path == "/run":
+        if method != "POST":
+            return _json_response(
+                start_response, "405 Method Not Allowed", {"error": "POST required"}
+            )
+        payload = _read_json_body(environ)
+        if payload is None or "command_id" not in payload:
+            return _json_response(
+                start_response, "400 Bad Request", {"error": "command_id required"}
+            )
+        if _scheduler is None:
+            return _json_response(
+                start_response,
+                "503 Service Unavailable",
+                {"error": "scheduler not running"},
+            )
+        command_id = str(payload["command_id"])
+        spec = _scheduler.store.get_command(command_id)
+        if spec is None:
+            return _json_response(
+                start_response,
+                "404 Not Found",
+                {"error": f"Unknown command id: {command_id}"},
+            )
+        try:
+            import socket as _socket
+
+            instance = _socket.gethostname()
+            run = _scheduler.start_command(spec)
+            output = run.output if isinstance(run, CommandRunResult) else None
+            result = {
+                "id": spec.command_id,
+                "name": spec.title or spec.command_id,
+                "status": "success" if run.exit_code == 0 else "failed",
+                "started_at": _to_iso(run.start_ts),
+                "finished_at": _to_iso(run.end_ts),
+                "duration_seconds": round(run.duration_seconds, 3),
+                "exit_code": run.exit_code,
+                "output": output,
+                "instance": instance,
+            }
+            return _json_response(start_response, "200 OK", result)
+        except Exception as exc:
+            _LOG.exception("Error executing command %s via /run", command_id)
+            return _json_response(
+                start_response,
+                "500 Internal Server Error",
+                {"error": str(exc)},
+            )
+
     if path == "/admin/fallback":
         token = os.getenv("AMPA_ADMIN_TOKEN")
         if token:
@@ -305,5 +371,6 @@ __all__ = [
     "ampa_heartbeat_sent_total",
     "ampa_heartbeat_failure_total",
     "ampa_last_heartbeat_timestamp_seconds",
+    "register_scheduler",
     "start_metrics_server",
 ]

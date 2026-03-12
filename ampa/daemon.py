@@ -40,7 +40,7 @@ from .server import (
     ampa_heartbeat_sent_total,
     ampa_last_heartbeat_timestamp_seconds,
 )
-from .server import start_metrics_server
+from .server import start_metrics_server, register_scheduler
 
 
 def _project_ampa_dir() -> str:
@@ -254,6 +254,7 @@ def main() -> None:
 
             LOG.info("Starting scheduler under daemon runtime")
             sched = scheduler.load_scheduler(command_cwd=os.getcwd())
+            register_scheduler(sched)
             sched.run_forever()
             return
         except SystemExit:
