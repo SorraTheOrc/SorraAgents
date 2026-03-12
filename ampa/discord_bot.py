@@ -14,10 +14,17 @@ Environment variables:
 - ``AMPA_DISCORD_CHANNEL_ID`` – Target channel ID as an integer (required)
 - ``AMPA_BOT_SOCKET_PATH``    – Unix socket path (default: ``/tmp/ampa_bot.sock``)
 
-The bot accepts newline-delimited JSON messages on the Unix socket.  Each
-message must be a JSON object; it is sent to the configured Discord channel as
-a plain-text message using the ``content`` field
-(payload format ``{"content": "..."}``) .
+    The bot accepts newline-delimited JSON messages on the Unix socket.  Each
+    message must be a JSON object; it is sent to the configured Discord channel.
+    Backwards-compatible plain-text messages use the ``content`` field
+    (payload format ``{"content": "..."}``).
+    
+    The bot also supports richer payloads via optional ``embeds`` (list of
+    embed objects) and ``components`` (interactive buttons).  When ``embeds`` is
+    present the message will be sent with embeds where the bot can construct
+    ``discord.Embed`` objects.  For compatibility the server will accept embed
+    dicts and attempt to build proper Embed objects when ``discord`` is
+    available.
 
 Protocol
 --------
@@ -90,6 +97,19 @@ def _validate_components(components: Any) -> Optional[str]:
     return None
 
 
+def _validate_embeds(embeds: Any) -> Optional[str]:
+    """Validate the embed payload format. Returns error string or None."""
+    if not isinstance(embeds, list):
+        return "embeds must be a list"
+    for idx, e in enumerate(embeds):
+        if not isinstance(e, dict):
+            return f"embeds[{idx}] must be an object"
+        # permit minimal embed dicts; keys like title/description/url/color/fields
+        if "fields" in e and not isinstance(e["fields"], list):
+            return f"embeds[{idx}].fields must be a list"
+    return None
+
+
 def _build_view(components: List[Dict[str, Any]]) -> Any:
     """Construct a ``discord.ui.View`` from a list of component dicts.
 
@@ -120,6 +140,49 @@ def _build_view(components: List[Dict[str, Any]]) -> Any:
         )
         view.add_item(button)
     return view
+
+
+def _build_embeds(embeds: List[Dict[str, Any]]) -> List[Any]:
+    """Convert embed dicts into discord.Embed objects when possible.
+
+    If discord is not available, return the original dicts as a fallback so
+    tests and non-discord runs can still pass the payload through.
+    """
+    try:
+        import discord  # type: ignore
+    except Exception:
+        return embeds
+
+    out: List[Any] = []
+    for e in embeds:
+        title = e.get("title")
+        description = e.get("description")
+        url = e.get("url")
+        color = e.get("color")
+        try:
+            embed_obj = discord.Embed(title=title, description=description, url=url)
+            if color is not None:
+                try:
+                    embed_obj.colour = discord.Colour(int(color))
+                except Exception:
+                    # accept hex ints like 0x123456 or decimal ints
+                    try:
+                        embed_obj.colour = discord.Colour(int(color))
+                    except Exception:
+                        pass
+            # fields
+            fields = e.get("fields") or []
+            for f in fields:
+                fname = f.get("name")
+                fval = f.get("value")
+                finline = bool(f.get("inline", False))
+                if fname is not None and fval is not None:
+                    embed_obj.add_field(name=fname, value=fval, inline=finline)
+            out.append(embed_obj)
+        except Exception:
+            # On any failure, fall back to the raw dict for compatibility
+            out.append(e)
+    return out
 
 
 def _route_interaction(custom_id: str, user: str, timestamp: str) -> None:
@@ -393,16 +456,21 @@ class AMPABot:
                     elif body:
                         content = body
 
-                if not content:
+                # Check whether we have embeds — embeds-only messages are valid
+                # even when content is empty.
+                raw_embeds = data.get("embeds")
+                has_embeds = isinstance(raw_embeds, list) and len(raw_embeds) > 0
+
+                if not content and not has_embeds:
                     response = {
                         "ok": False,
-                        "error": "empty message: no 'content' or 'body' field",
+                        "error": "empty message: no 'content', 'body', or 'embeds' field",
                     }
                     writer.write(json.dumps(response).encode() + b"\n")
                     await writer.drain()
                     continue
 
-                # Parse optional components for interactive buttons.
+                # Parse optional components for interactive buttons and embeds.
                 components = data.get("components")
                 view = None
                 if components:
@@ -414,11 +482,21 @@ class AMPABot:
                         continue
                     view = _build_view(components)
 
+                embeds_out = None
+                if has_embeds:
+                    validation_error = _validate_embeds(raw_embeds)
+                    if validation_error:
+                        response = {"ok": False, "error": validation_error}
+                        writer.write(json.dumps(response).encode() + b"\n")
+                        await writer.drain()
+                        continue
+                    embeds_out = _build_embeds(raw_embeds)
+
                 # Discord messages are limited to 2000 characters.
-                if len(content) > 2000:
+                if content and len(content) > 2000:
                     content = content[:1997] + "..."
 
-                ok = await self._send_to_discord(content, view=view)
+                ok = await self._send_to_discord(content, view=view, embeds=embeds_out)
                 response: Dict[str, Any] = {"ok": ok}
                 if not ok:
                     response["error"] = "failed to send to Discord"
@@ -436,7 +514,7 @@ class AMPABot:
                 pass
 
     async def _send_to_discord(
-        self, content: str, *, view: Optional[Any] = None
+        self, content: str, *, view: Optional[Any] = None, embeds: Optional[List[Any]] = None
     ) -> bool:
         """Send a text message to the configured Discord channel.
 
@@ -451,14 +529,19 @@ class AMPABot:
             LOG.error("Cannot send message: channel not resolved")
             return False
         try:
-            kwargs: Dict[str, Any] = {"content": content}
+            kwargs: Dict[str, Any] = {}
+            if content:
+                kwargs["content"] = content
             if view is not None:
                 kwargs["view"] = view
+            if embeds is not None:
+                kwargs["embeds"] = embeds
             await self._channel.send(**kwargs)
             LOG.debug(
-                "Sent message to #%s (%d chars, components=%s)",
+                "Sent message to #%s (%d chars, embeds=%s, components=%s)",
                 getattr(self._channel, "name", "?"),
-                len(content),
+                len(content) if content else 0,
+                embeds is not None,
                 view is not None,
             )
             return True

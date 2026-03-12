@@ -449,14 +449,23 @@ class PRMonitorRunner:
         )
         self._post_wl_comment(pr_number, pr_title, wl_comment)
 
-        # Send Discord notification
+        # Send Discord notification using an embed payload when possible.
         try:
             if self._notifier is not None:
-                self._notifier.notify(
-                    title=f"PR #{pr_number} ready for review",
-                    body=f"**{pr_title}**\nAll required checks are passing.\n{pr_url}",
-                    message_type="command",
-                )
+                # Build a minimal content fallback plus an embed for rich display.
+                payload = {
+                    "content": f"PR #{pr_number} ready for review: {pr_title} {pr_url}",
+                    "embeds": [
+                        {
+                            "title": f"PR #{pr_number} ready for review",
+                            "description": f"**{pr_title}**\nAll required checks are passing.",
+                            "url": pr_url,
+                            # Soft green
+                            "color": 0x2ecc71,
+                        }
+                    ],
+                }
+                self._notifier.notify(payload=payload, message_type="command")
         except Exception:
             LOG.exception(
                 "pr-monitor: failed to send ready notification for PR #%d",
@@ -508,15 +517,28 @@ class PRMonitorRunner:
         # Send Discord notification
         try:
             if self._notifier is not None:
-                self._notifier.notify(
-                    title=f"CI failing on PR #{pr_number}",
-                    body=(
-                        f"**{pr_title}**\n"
-                        f"Failing checks: {checks_str}\n"
-                        f"{pr_url}"
-                    ),
-                    message_type="error",
-                )
+                # Build an embed containing the failing checks for richer display.
+                fields = []
+                if failing_checks:
+                    # Put up to 10 failing checks into a single field; others are joined.
+                    fields.append({
+                        "name": "Failing checks",
+                        "value": "\n".join(failing_checks[:10]),
+                        "inline": False,
+                    })
+
+                payload = {
+                    "content": f"CI failing on PR #{pr_number}: {pr_title} {pr_url}",
+                    "embeds": [
+                        {
+                            "title": f"CI failing on PR #{pr_number}",
+                            "description": f"**{pr_title}**\n{pr_url}",
+                            "color": 0xe74c3c,
+                            "fields": fields,
+                        }
+                    ],
+                }
+                self._notifier.notify(payload=payload, message_type="error")
         except Exception:
             LOG.exception(
                 "pr-monitor: failed to send failure notification for PR #%d",
@@ -680,11 +702,19 @@ class PRMonitorRunner:
                 lines.append(
                     f"Skipped (already notified or pending): {', '.join(skip_links)}"
                 )
-            self._notifier.notify(
-                title="PR Monitor Summary",
-                body="\n".join(lines),
-                message_type="command",
-            )
+            # Build an embed summary so the message appears nicely in Discord.
+            summary_description = "\n".join(lines)
+            payload = {
+                "content": f"PR Monitor Summary — checked {total} PR(s)",
+                "embeds": [
+                    {
+                        "title": "PR Monitor Summary",
+                        "description": summary_description,
+                        "color": 0x3498db,
+                    }
+                ],
+            }
+            self._notifier.notify(payload=payload, message_type="command")
         except Exception:
             LOG.exception("pr-monitor: failed to send summary notification")
 
