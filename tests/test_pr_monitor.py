@@ -1216,3 +1216,283 @@ class TestParseMarkerJson:
         body = "Some prefix\n<!-- marker -->\ntext {\"a\": 1} more"
         result = PRMonitorRunner._parse_marker_json(body, "<!-- marker -->")
         assert result == {"a": 1}
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _dispatch_review (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchReview:
+    """Verify _dispatch_review() dispatch logic."""
+
+    _DISPATCH_MARKER_PREFIX = "<!-- ampa-pr-audit-dispatch:"
+
+    def _make_runner(
+        self, run_shell=None, wl_shell=None, dispatcher=None
+    ):
+        return PRMonitorRunner(
+            run_shell=run_shell
+            or (lambda *a, **k: subprocess.CompletedProcess([], 0, "", "")),
+            command_cwd="/tmp",
+            dispatcher=dispatcher,
+            wl_shell=wl_shell,
+        )
+
+    def _make_dispatch_result(self, success=True, error=None, container_id="c1"):
+        """Build a minimal DispatchResult-like object."""
+        return type(
+            "FakeResult",
+            (),
+            {
+                "success": success,
+                "pid": 12345 if success else None,
+                "error": error,
+                "container_id": container_id,
+                "timestamp": dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+            },
+        )()
+
+    # -- no dispatcher configured -------------------------------------------
+
+    def test_skips_when_no_dispatcher(self):
+        """auto_review enabled but no dispatcher — silent skip."""
+        runner = self._make_runner(dispatcher=None)
+        pr = {"headRefName": "feature/SA-TEST123456-foo", "number": 10}
+        # Should not raise
+        runner._dispatch_review("gh", pr, 10, "Some PR")
+
+    # -- no work item ID extracted ------------------------------------------
+
+    def test_skips_when_no_work_item_id(self):
+        """Branch name doesn't contain a recognisable work-item ID."""
+        fake_dispatcher = mock.MagicMock()
+        runner = self._make_runner(dispatcher=fake_dispatcher)
+        pr = {"headRefName": "random-branch", "number": 11}
+        runner._dispatch_review("gh", pr, 11, "No ID PR")
+        fake_dispatcher.dispatch.assert_not_called()
+
+    # -- already dispatched -------------------------------------------------
+
+    def test_skips_when_already_dispatched(self):
+        """Dispatch marker already exists for this PR number."""
+        dispatch_comment = json.dumps({
+            "dispatch_state": {
+                "pr_number": 12,
+                "dispatched_at": "2026-01-01T00:00:00+00:00",
+                "container_id": "c1",
+                "work_item_id": "SA-TEST123456",
+            }
+        })
+        marker = f"{self._DISPATCH_MARKER_PREFIX}12 -->"
+        wl_output = json.dumps({
+            "comments": [
+                {"comment": f"{marker}\n{dispatch_comment}"}
+            ]
+        })
+
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 0, wl_output, "")
+
+        fake_dispatcher = mock.MagicMock()
+        runner = self._make_runner(wl_shell=wl_shell, dispatcher=fake_dispatcher)
+        pr = {"headRefName": "feature/SA-TEST123456-foo", "number": 12}
+        runner._dispatch_review("gh", pr, 12, "Already Dispatched")
+        fake_dispatcher.dispatch.assert_not_called()
+
+    # -- successful dispatch ------------------------------------------------
+
+    def test_successful_dispatch(self):
+        """Dispatch succeeds — marker is posted."""
+        result = self._make_dispatch_result(success=True, container_id="pool-1")
+        fake_dispatcher = mock.MagicMock()
+        fake_dispatcher.dispatch.return_value = result
+
+        wl_calls = []
+
+        def wl_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            wl_calls.append(cmd_str)
+            # Return empty comments for _get_audit_dispatch_state
+            if "wl show" in cmd_str:
+                return subprocess.CompletedProcess(
+                    [], 0, json.dumps({"comments": []}), ""
+                )
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = self._make_runner(wl_shell=wl_shell, dispatcher=fake_dispatcher)
+        pr = {"headRefName": "feature/SA-TEST123456-desc", "number": 13}
+        runner._dispatch_review("gh", pr, 13, "Good PR")
+
+        # Dispatcher was called
+        fake_dispatcher.dispatch.assert_called_once()
+        call_kwargs = fake_dispatcher.dispatch.call_args
+        assert "SA-TEST123456" in call_kwargs.kwargs.get(
+            "work_item_id", call_kwargs[1].get("work_item_id", "")
+        ) or "SA-TEST123456" in str(call_kwargs)
+
+        # A marker comment was posted
+        marker_posts = [c for c in wl_calls if "comment" in c and "add" in c]
+        assert len(marker_posts) >= 1
+
+    # -- dispatch failure ---------------------------------------------------
+
+    def test_dispatch_failure_logged(self):
+        """Dispatch returns failure — failure is posted as comment."""
+        result = self._make_dispatch_result(
+            success=False, error="No pool containers available"
+        )
+        fake_dispatcher = mock.MagicMock()
+        fake_dispatcher.dispatch.return_value = result
+
+        wl_calls = []
+
+        def wl_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            wl_calls.append(cmd_str)
+            if "wl show" in cmd_str:
+                return subprocess.CompletedProcess(
+                    [], 0, json.dumps({"comments": []}), ""
+                )
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = self._make_runner(wl_shell=wl_shell, dispatcher=fake_dispatcher)
+        pr = {"headRefName": "feature/SA-TEST123456-desc", "number": 14}
+        runner._dispatch_review("gh", pr, 14, "Failing PR")
+
+        # Dispatcher was called
+        fake_dispatcher.dispatch.assert_called_once()
+
+        # A failure comment was posted (not a marker)
+        fail_comments = [
+            c for c in wl_calls if "comment" in c and "failed" in c.lower()
+        ]
+        assert len(fail_comments) >= 1
+
+    # -- dispatch exception does not propagate --------------------------------
+
+    def test_dispatch_exception_does_not_propagate(self):
+        """If the dispatcher raises, _dispatch_review catches it."""
+        fake_dispatcher = mock.MagicMock()
+        fake_dispatcher.dispatch.side_effect = RuntimeError("boom")
+
+        def wl_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "wl show" in cmd_str:
+                return subprocess.CompletedProcess(
+                    [], 0, json.dumps({"comments": []}), ""
+                )
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = self._make_runner(wl_shell=wl_shell, dispatcher=fake_dispatcher)
+        pr = {"headRefName": "feature/SA-TEST123456-desc", "number": 15}
+        # Should not raise
+        runner._dispatch_review("gh", pr, 15, "Exploding PR")
+
+
+# ---------------------------------------------------------------------------
+# Integration test: auto_review flag in run()
+# ---------------------------------------------------------------------------
+
+
+class TestAutoReviewIntegration:
+    """Verify that run() dispatches reviews when auto_review is True."""
+
+    def _make_spec(self, auto_review=False, dedup=False):
+        return type(
+            "FakeSpec",
+            (),
+            {"metadata": {"auto_review": auto_review, "dedup": dedup}},
+        )()
+
+    def _one_pr_json(self):
+        return json.dumps([
+            {
+                "number": 99,
+                "title": "Test PR",
+                "url": "https://github.com/test/repo/pull/99",
+                "headRefName": "feature/SA-INTEGTEST01-test",
+            }
+        ])
+
+    def _all_pass_checks(self):
+        return json.dumps([
+            {"name": "ci", "bucket": "pass", "state": "SUCCESS", "conclusion": ""}
+        ])
+
+    def test_auto_review_dispatches_on_ready_pr(self):
+        """With auto_review=True, a passing PR triggers dispatch."""
+        fake_result = type(
+            "R",
+            (),
+            {
+                "success": True,
+                "pid": 999,
+                "error": None,
+                "container_id": "c-test",
+                "timestamp": dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+            },
+        )()
+        fake_dispatcher = mock.MagicMock()
+        fake_dispatcher.dispatch.return_value = fake_result
+
+        pr_json = self._one_pr_json()
+        checks_json = self._all_pass_checks()
+
+        def run_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "pr list" in cmd_str:
+                return subprocess.CompletedProcess([], 0, pr_json, "")
+            if "pr checks" in cmd_str:
+                return subprocess.CompletedProcess([], 0, checks_json, "")
+            if "which" in cmd_str or "command -v" in cmd_str:
+                return subprocess.CompletedProcess([], 0, "/usr/bin/gh", "")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        def wl_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "wl show" in cmd_str:
+                return subprocess.CompletedProcess(
+                    [], 0, json.dumps({"comments": []}), ""
+                )
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = PRMonitorRunner(
+            run_shell=run_shell,
+            command_cwd="/tmp",
+            dispatcher=fake_dispatcher,
+            wl_shell=wl_shell,
+        )
+        spec = self._make_spec(auto_review=True)
+        result = runner.run(spec)
+
+        assert 99 in result["ready_prs"]
+        fake_dispatcher.dispatch.assert_called_once()
+
+    def test_auto_review_false_does_not_dispatch(self):
+        """With auto_review=False (default), no dispatch occurs."""
+        fake_dispatcher = mock.MagicMock()
+
+        pr_json = self._one_pr_json()
+        checks_json = self._all_pass_checks()
+
+        def run_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "pr list" in cmd_str:
+                return subprocess.CompletedProcess([], 0, pr_json, "")
+            if "pr checks" in cmd_str:
+                return subprocess.CompletedProcess([], 0, checks_json, "")
+            if "which" in cmd_str or "command -v" in cmd_str:
+                return subprocess.CompletedProcess([], 0, "/usr/bin/gh", "")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = PRMonitorRunner(
+            run_shell=run_shell,
+            command_cwd="/tmp",
+            dispatcher=fake_dispatcher,
+        )
+        spec = self._make_spec(auto_review=False)
+        result = runner.run(spec)
+
+        assert 99 in result["ready_prs"]
+        fake_dispatcher.dispatch.assert_not_called()

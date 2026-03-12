@@ -640,10 +640,26 @@ class Scheduler:
             try:
                 from .pr_monitor import PRMonitorRunner
 
+                # Lazily create a dispatcher only when auto_review is enabled.
+                dispatcher = None
+                meta = getattr(spec, "metadata", {}) or {}
+                if meta.get("auto_review"):
+                    try:
+                        from .engine.dispatch import ContainerDispatcher
+
+                        dispatcher = ContainerDispatcher(
+                            project_root=self.command_cwd,
+                        )
+                    except Exception:
+                        LOG.exception(
+                            "pr-monitor: failed to create ContainerDispatcher"
+                        )
+
                 runner = PRMonitorRunner(
                     run_shell=self.run_shell,
                     command_cwd=self.command_cwd,
                     notifier=notifications_module,
+                    dispatcher=dispatcher,
                 )
                 result = runner.run(spec)
                 LOG.info("pr-monitor result: %s", result)

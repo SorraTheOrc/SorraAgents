@@ -79,6 +79,9 @@ class PRMonitorRunner:
     wl_shell:
         Optional separate callable for ``wl`` commands.  Defaults to
         *run_shell*.
+    dispatcher:
+        Optional :class:`~ampa.engine.dispatch.Dispatcher` used to
+        spawn LLM audit sessions when ``auto_review`` is enabled.
     """
 
     def __init__(
@@ -87,11 +90,13 @@ class PRMonitorRunner:
         command_cwd: str,
         notifier: Optional[Any] = None,
         wl_shell: Optional[Callable[..., subprocess.CompletedProcess]] = None,
+        dispatcher: Optional[Any] = None,
     ) -> None:
         self.run_shell = run_shell
         self.command_cwd = command_cwd
         self._notifier = notifier
         self._wl_shell = wl_shell or run_shell
+        self._dispatcher = dispatcher
 
     # ------------------------------------------------------------------
     # Public API
@@ -121,6 +126,7 @@ class PRMonitorRunner:
         metadata: Dict[str, Any] = getattr(spec, "metadata", {}) or {}
         gh_cmd = str(metadata.get("gh_command", _DEFAULT_GH_COMMAND))
         dedup = _coerce_bool(metadata.get("dedup", True))
+        auto_review = _coerce_bool(metadata.get("auto_review", False))
         try:
             max_prs = int(metadata.get("max_prs", _DEFAULT_MAX_PRS))
         except (TypeError, ValueError):
@@ -212,6 +218,10 @@ class PRMonitorRunner:
                     gh_cmd, pr_number, pr_title, pr_url
                 )
                 ready_prs.append(pr_number)
+
+                # Dispatch LLM audit when auto_review is enabled
+                if auto_review:
+                    self._dispatch_review(gh_cmd, pr, pr_number, pr_title)
             elif failing_checks:
                 self._handle_failing_pr(
                     gh_cmd, pr_number, pr_title, pr_url, failing_checks
@@ -485,6 +495,126 @@ class PRMonitorRunner:
                 "pr-monitor: failed to send ready notification for PR #%d",
                 pr_number,
             )
+
+    # ------------------------------------------------------------------
+    # Auto-review dispatch
+    # ------------------------------------------------------------------
+
+    def _dispatch_review(
+        self,
+        gh_cmd: str,
+        pr: Dict[str, Any],
+        pr_number: int,
+        pr_title: str,
+    ) -> None:
+        """Dispatch an LLM audit session for a CI-passing PR.
+
+        Skips silently when:
+        - No dispatcher is configured.
+        - No work-item ID can be extracted from the PR.
+        - A dispatch marker already exists for this PR number.
+
+        Failures are logged and recorded as work-item comments but never
+        propagate — the rest of the pr-monitor run continues unaffected.
+        """
+        if self._dispatcher is None:
+            LOG.debug(
+                "pr-monitor: auto_review enabled but no dispatcher configured — "
+                "skipping PR #%d",
+                pr_number,
+            )
+            return
+
+        # Extract work-item ID
+        work_item_id = self._extract_work_item_id(pr, gh_cmd)
+        if not work_item_id:
+            LOG.debug(
+                "pr-monitor: no work-item ID found for PR #%d — "
+                "skipping auto-review",
+                pr_number,
+            )
+            return
+
+        # Check for existing dispatch
+        existing = self._get_audit_dispatch_state(work_item_id, pr_number)
+        if existing is not None:
+            LOG.info(
+                "pr-monitor: audit already dispatched for PR #%d "
+                "(work item %s) — skipping",
+                pr_number,
+                work_item_id,
+            )
+            return
+
+        # Compose review prompt
+        prompt = (
+            f"/implement {work_item_id} "
+            f"Review PR #{pr_number} ({pr_title}) against the acceptance "
+            f"criteria of work item {work_item_id}. "
+            f"Post your audit results as a structured comment on the work "
+            f"item using the marker format: "
+            f"{_AUDIT_RESULT_MARKER}"
+        )
+        command = f'opencode run "{prompt}"'
+
+        # Dispatch
+        try:
+            result = self._dispatcher.dispatch(
+                command=command, work_item_id=work_item_id
+            )
+        except Exception:
+            LOG.exception(
+                "pr-monitor: dispatch failed for PR #%d (work item %s)",
+                pr_number,
+                work_item_id,
+            )
+            return
+
+        if result.success:
+            LOG.info(
+                "pr-monitor: dispatched audit for PR #%d → work item %s "
+                "(pid=%s, container=%s)",
+                pr_number,
+                work_item_id,
+                result.pid,
+                result.container_id,
+            )
+            self._post_audit_dispatch_marker(
+                work_item_id,
+                pr_number,
+                dispatched_at=result.timestamp.isoformat(),
+                container_id=result.container_id or "",
+            )
+        else:
+            LOG.warning(
+                "pr-monitor: audit dispatch failed for PR #%d "
+                "(work item %s): %s",
+                pr_number,
+                work_item_id,
+                result.error,
+            )
+            # Record the failure as a comment so operators can see it
+            try:
+                fail_comment = (
+                    f"Auto-review dispatch failed for PR #{pr_number}: "
+                    f"{result.error}"
+                )
+                self._wl_shell(
+                    f"wl comment add {work_item_id} "
+                    f'--comment "{fail_comment}" '
+                    f'--author "pr-monitor"',
+                    shell=True,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    cwd=self.command_cwd,
+                )
+            except Exception:
+                LOG.debug(
+                    "pr-monitor: failed to post dispatch failure comment "
+                    "for work item %s",
+                    work_item_id,
+                )
 
     def _handle_failing_pr(
         self,
