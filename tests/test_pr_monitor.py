@@ -240,8 +240,8 @@ class TestPRMonitorReady:
         )
         checks = _checks_json(
             [
-                {"name": "ci", "state": "COMPLETED", "conclusion": "SUCCESS"},
-                {"name": "lint", "state": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "ci", "bucket": "pass"},
+                {"name": "lint", "bucket": "pass"},
             ]
         )
         calls: Dict[str, List[str]] = {"gh_comments": [], "wl": []}
@@ -322,8 +322,8 @@ class TestPRMonitorFailing:
         )
         checks = _checks_json(
             [
-                {"name": "ci-build", "state": "COMPLETED", "conclusion": "FAILURE"},
-                {"name": "lint", "state": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "ci-build", "bucket": "fail"},
+                {"name": "lint", "bucket": "pass"},
             ]
         )
         calls: Dict[str, List] = {"wl_create": [], "gh_comments": []}
@@ -371,9 +371,9 @@ class TestPRMonitorFailing:
         )
         checks = _checks_json(
             [
-                {"name": "build", "state": "COMPLETED", "conclusion": "FAILURE"},
-                {"name": "test", "state": "COMPLETED", "conclusion": "ERROR"},
-                {"name": "lint", "state": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "build", "bucket": "fail"},
+                {"name": "test", "bucket": "fail"},
+                {"name": "lint", "bucket": "pass"},
             ]
         )
 
@@ -405,7 +405,7 @@ class TestPRMonitorDedup:
             [{"number": 33, "title": "Already notified", "url": "https://github.com/repo/pull/33", "headRefName": "dedup"}]
         )
         checks = _checks_json(
-            [{"name": "ci", "state": "COMPLETED", "conclusion": "SUCCESS"}]
+            [{"name": "ci", "bucket": "pass"}]
         )
 
         def run_shell(cmd, **kwargs):
@@ -447,7 +447,7 @@ class TestPRMonitorDedup:
             [{"number": 33, "title": "Re-notify", "url": "https://github.com/repo/pull/33", "headRefName": "nodedup"}]
         )
         checks = _checks_json(
-            [{"name": "ci", "state": "COMPLETED", "conclusion": "SUCCESS"}]
+            [{"name": "ci", "bucket": "pass"}]
         )
         gh_comment_calls: List[str] = []
 
@@ -484,8 +484,8 @@ class TestPRMonitorPending:
         )
         checks = _checks_json(
             [
-                {"name": "ci", "state": "IN_PROGRESS", "conclusion": ""},
-                {"name": "lint", "state": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "ci", "bucket": "pending"},
+                {"name": "lint", "bucket": "pass"},
             ]
         )
 
@@ -536,7 +536,7 @@ class TestPRMonitorMultiplePRs:
                         [],
                         0,
                         _checks_json(
-                            [{"name": "ci", "state": "COMPLETED", "conclusion": "SUCCESS"}]
+                            [{"name": "ci", "bucket": "pass"}]
                         ),
                         "",
                     )
@@ -545,7 +545,7 @@ class TestPRMonitorMultiplePRs:
                         [],
                         1,
                         _checks_json(
-                            [{"name": "ci", "state": "COMPLETED", "conclusion": "FAILURE"}]
+                            [{"name": "ci", "bucket": "fail"}]
                         ),
                         "",
                     )
@@ -554,7 +554,7 @@ class TestPRMonitorMultiplePRs:
                         [],
                         0,
                         _checks_json(
-                            [{"name": "ci", "state": "IN_PROGRESS", "conclusion": ""}]
+                            [{"name": "ci", "bucket": "pending"}]
                         ),
                         "",
                     )
@@ -611,7 +611,7 @@ class TestPRMonitorErrorResilience:
             [{"number": 99, "title": "Comment fail", "url": "https://github.com/repo/pull/99", "headRefName": "cf"}]
         )
         checks = _checks_json(
-            [{"name": "ci", "state": "COMPLETED", "conclusion": "SUCCESS"}]
+            [{"name": "ci", "bucket": "pass"}]
         )
 
         def run_shell(cmd, **kwargs):
@@ -642,7 +642,7 @@ class TestPRMonitorErrorResilience:
             [{"number": 11, "title": "Notify fail", "url": "https://github.com/repo/pull/11", "headRefName": "nf"}]
         )
         checks = _checks_json(
-            [{"name": "ci", "state": "COMPLETED", "conclusion": "SUCCESS"}]
+            [{"name": "ci", "bucket": "pass"}]
         )
 
         def run_shell(cmd, **kwargs):
@@ -684,7 +684,7 @@ class TestSchedulerPRMonitor:
             [{"number": 5, "title": "Test", "url": "https://github.com/repo/pull/5", "headRefName": "test"}]
         )
         checks = _checks_json(
-            [{"name": "ci", "state": "COMPLETED", "conclusion": "SUCCESS"}]
+            [{"name": "ci", "bucket": "pass"}]
         )
 
         def run_shell(cmd, **kwargs):
@@ -796,37 +796,37 @@ class TestCheckStateParsing:
         return runner.run(spec)
 
     def test_success_state(self):
-        checks = _checks_json([{"name": "ci", "state": "SUCCESS", "conclusion": ""}])
+        checks = _checks_json([{"name": "ci", "bucket": "pass"}])
         result = self._run_with_checks(checks)
         assert 1 in result["ready_prs"]
 
     def test_neutral_conclusion(self):
         checks = _checks_json(
-            [{"name": "ci", "state": "COMPLETED", "conclusion": "NEUTRAL"}]
+            [{"name": "ci", "bucket": "pass"}]
         )
         result = self._run_with_checks(checks)
         assert 1 in result["ready_prs"]
 
     def test_skipped_conclusion(self):
         checks = _checks_json(
-            [{"name": "ci", "state": "COMPLETED", "conclusion": "SKIPPED"}]
+            [{"name": "ci", "bucket": "pass"}]
         )
         result = self._run_with_checks(checks)
         assert 1 in result["ready_prs"]
 
     def test_timed_out_conclusion(self):
         checks = _checks_json(
-            [{"name": "ci", "state": "COMPLETED", "conclusion": "TIMED_OUT"}]
+            [{"name": "ci", "bucket": "fail"}]
         )
         result = self._run_with_checks(checks)
         assert 1 in result["failing_prs"]
 
     def test_error_state(self):
-        checks = _checks_json([{"name": "ci", "state": "ERROR", "conclusion": ""}])
+        checks = _checks_json([{"name": "ci", "bucket": "fail"}])
         result = self._run_with_checks(checks)
         assert 1 in result["failing_prs"]
 
     def test_queued_state(self):
-        checks = _checks_json([{"name": "ci", "state": "QUEUED", "conclusion": ""}])
+        checks = _checks_json([{"name": "ci", "bucket": "pending"}])
         result = self._run_with_checks(checks)
         assert 1 in result["skipped_prs"]
