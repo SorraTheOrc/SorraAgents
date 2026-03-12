@@ -1746,3 +1746,411 @@ class TestCheckAndPresentAuditResults:
         pr = {"headRefName": "feature/SA-TEST123456-foo", "number": 24}
         # Should not raise
         runner._check_and_present_audit_results("gh", pr, 24, "PR", "")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Merge, reject, cleanup, and review decision tests
+# ---------------------------------------------------------------------------
+
+
+class TestMergePr:
+    """Tests for PRMonitorRunner._merge_pr()."""
+
+    def _make_runner(self, run_shell=None):
+        return PRMonitorRunner(
+            run_shell=run_shell or _make_shell({}),
+            command_cwd="/test",
+        )
+
+    def test_successful_merge(self):
+        """gh pr merge succeeds → returns (True, ...)."""
+        shell = _make_shell({"pr merge": {"returncode": 0, "stdout": "merged"}})
+        runner = self._make_runner(run_shell=shell)
+        ok, note = runner._merge_pr("gh", 42)
+        assert ok is True
+        assert "42" in note
+
+    def test_merge_failure_nonzero_exit(self):
+        """gh pr merge fails → returns (False, ...) with stderr info."""
+        shell = _make_shell({
+            "pr merge": {"returncode": 1, "stderr": "merge conflict"}
+        })
+        runner = self._make_runner(run_shell=shell)
+        ok, note = runner._merge_pr("gh", 42)
+        assert ok is False
+        assert "merge conflict" in note
+
+    def test_merge_exception(self):
+        """Exception during merge → returns (False, ...) without propagating."""
+        shell = _make_shell({"pr merge": OSError("boom")})
+        runner = self._make_runner(run_shell=shell)
+        ok, note = runner._merge_pr("gh", 42)
+        assert ok is False
+        assert "boom" in note
+
+    def test_merge_passes_correct_args(self):
+        """Verify the correct command is passed to run_shell."""
+        calls = []
+
+        def recording_shell(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        runner = self._make_runner(run_shell=recording_shell)
+        runner._merge_pr("gh", 99)
+        assert len(calls) == 1
+        assert calls[0][0] == ["gh", "pr", "merge", "99", "--merge"]
+        assert calls[0][1]["cwd"] == "/test"
+
+
+class TestCloseWorkItem:
+    """Tests for PRMonitorRunner._close_work_item()."""
+
+    def _make_runner(self, wl_shell=None):
+        return PRMonitorRunner(
+            run_shell=_make_shell({}),
+            command_cwd="/test",
+            wl_shell=wl_shell or _make_shell({}),
+        )
+
+    def test_successful_close(self):
+        shell = _make_shell({"wl close": {"returncode": 0}})
+        runner = self._make_runner(wl_shell=shell)
+        assert runner._close_work_item("SA-123", "done") is True
+
+    def test_close_failure(self):
+        shell = _make_shell({"wl close": {"returncode": 1, "stderr": "not found"}})
+        runner = self._make_runner(wl_shell=shell)
+        assert runner._close_work_item("SA-123", "done") is False
+
+    def test_close_exception(self):
+        shell = _make_shell({"wl close": RuntimeError("crash")})
+        runner = self._make_runner(wl_shell=shell)
+        assert runner._close_work_item("SA-123", "done") is False
+
+    def test_close_passes_correct_args(self):
+        calls = []
+
+        def recording_shell(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        runner = self._make_runner(wl_shell=recording_shell)
+        runner._close_work_item("SA-XYZ", "merged by bob")
+        assert len(calls) == 1
+        assert calls[0] == [
+            "wl", "close", "SA-XYZ",
+            "--reason", "merged by bob",
+            "--json",
+        ]
+
+
+class TestCleanupBranch:
+    """Tests for PRMonitorRunner._cleanup_branch()."""
+
+    def _make_runner(self, run_shell=None):
+        return PRMonitorRunner(
+            run_shell=run_shell or _make_shell({}),
+            command_cwd="/test",
+        )
+
+    def test_successful_cleanup(self):
+        shell = _make_shell({"git push": {"returncode": 0}})
+        runner = self._make_runner(run_shell=shell)
+        assert runner._cleanup_branch("gh", "feature/foo") is True
+
+    def test_cleanup_failure(self):
+        shell = _make_shell({
+            "git push": {"returncode": 1, "stderr": "remote ref does not exist"}
+        })
+        runner = self._make_runner(run_shell=shell)
+        assert runner._cleanup_branch("gh", "feature/foo") is False
+
+    def test_cleanup_exception(self):
+        shell = _make_shell({"git push": OSError("network")})
+        runner = self._make_runner(run_shell=shell)
+        assert runner._cleanup_branch("gh", "feature/foo") is False
+
+    def test_cleanup_passes_correct_args(self):
+        calls = []
+
+        def recording_shell(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        runner = self._make_runner(run_shell=recording_shell)
+        runner._cleanup_branch("gh", "feature/my-branch")
+        assert len(calls) == 1
+        assert calls[0] == ["git", "push", "origin", "--delete", "feature/my-branch"]
+
+
+class TestGetPrBranch:
+    """Tests for PRMonitorRunner._get_pr_branch()."""
+
+    def _make_runner(self, run_shell=None):
+        return PRMonitorRunner(
+            run_shell=run_shell or _make_shell({}),
+            command_cwd="/test",
+        )
+
+    def test_returns_branch_name(self):
+        shell = _make_shell({
+            "pr view": {"returncode": 0, "stdout": "feature/SA-123-foo\n"}
+        })
+        runner = self._make_runner(run_shell=shell)
+        assert runner._get_pr_branch("gh", 42) == "feature/SA-123-foo"
+
+    def test_returns_none_on_failure(self):
+        shell = _make_shell({"pr view": {"returncode": 1}})
+        runner = self._make_runner(run_shell=shell)
+        assert runner._get_pr_branch("gh", 42) is None
+
+    def test_returns_none_on_empty_output(self):
+        shell = _make_shell({"pr view": {"returncode": 0, "stdout": ""}})
+        runner = self._make_runner(run_shell=shell)
+        assert runner._get_pr_branch("gh", 42) is None
+
+    def test_returns_none_on_exception(self):
+        shell = _make_shell({"pr view": OSError("nope")})
+        runner = self._make_runner(run_shell=shell)
+        assert runner._get_pr_branch("gh", 42) is None
+
+
+class TestAddWlComment:
+    """Tests for PRMonitorRunner._add_wl_comment()."""
+
+    def _make_runner(self, wl_shell=None):
+        return PRMonitorRunner(
+            run_shell=_make_shell({}),
+            command_cwd="/test",
+            wl_shell=wl_shell or _make_shell({}),
+        )
+
+    def test_successful_comment(self):
+        shell = _make_shell({"wl comment": {"returncode": 0}})
+        runner = self._make_runner(wl_shell=shell)
+        assert runner._add_wl_comment("SA-123", "all good") is True
+
+    def test_comment_failure(self):
+        shell = _make_shell({"wl comment": {"returncode": 1}})
+        runner = self._make_runner(wl_shell=shell)
+        assert runner._add_wl_comment("SA-123", "all good") is False
+
+    def test_comment_exception(self):
+        shell = _make_shell({"wl comment": RuntimeError("crash")})
+        runner = self._make_runner(wl_shell=shell)
+        assert runner._add_wl_comment("SA-123", "all good") is False
+
+
+class TestNotifyReviewOutcome:
+    """Tests for PRMonitorRunner._notify_review_outcome()."""
+
+    def _make_runner(self, notifier=None):
+        return PRMonitorRunner(
+            run_shell=_make_shell({}),
+            command_cwd="/test",
+            notifier=notifier,
+        )
+
+    def test_sends_notification(self):
+        notifier = mock.MagicMock()
+        runner = self._make_runner(notifier=notifier)
+        runner._notify_review_outcome(42, "PR Merged", "All done", color=0x2ECC71)
+        notifier.notify.assert_called_once()
+        payload = notifier.notify.call_args[1]["payload"]
+        assert payload["embeds"][0]["title"] == "PR Merged"
+        assert payload["embeds"][0]["description"] == "All done"
+        assert payload["embeds"][0]["color"] == 0x2ECC71
+
+    def test_no_notifier_is_noop(self):
+        runner = self._make_runner(notifier=None)
+        # Should not raise
+        runner._notify_review_outcome(42, "PR Merged", "All done")
+
+    def test_notifier_exception_does_not_propagate(self):
+        notifier = mock.MagicMock()
+        notifier.notify.side_effect = RuntimeError("discord down")
+        runner = self._make_runner(notifier=notifier)
+        # Should not raise
+        runner._notify_review_outcome(42, "PR Merged", "All done")
+
+
+class TestHandleReviewDecisionApprove:
+    """Tests for handle_review_decision() with action=accept."""
+
+    def _make_runner(self, run_shell=None, wl_shell=None, notifier=None):
+        return PRMonitorRunner(
+            run_shell=run_shell or _make_shell({}),
+            command_cwd="/test",
+            wl_shell=wl_shell or _make_shell({}),
+            notifier=notifier,
+        )
+
+    def test_approve_merges_and_returns_merged(self):
+        """Successful approval merges PR and returns action=merged."""
+        shell = _make_shell({
+            "pr merge": {"returncode": 0},
+            "pr view": {"returncode": 0, "stdout": "feature/my-branch\n"},
+            "git push": {"returncode": 0},
+        })
+        wl_shell = _make_shell({
+            "wl close": {"returncode": 0},
+            "wl comment": {"returncode": 0},
+        })
+        notifier = mock.MagicMock()
+        runner = self._make_runner(
+            run_shell=shell, wl_shell=wl_shell, notifier=notifier
+        )
+        result = runner.handle_review_decision(
+            action="accept",
+            pr_number=42,
+            work_item_id="SA-123",
+            approved_by="alice",
+        )
+        assert result["action"] == "merged"
+        assert "42" in result["note"]
+        assert "alice" in result["note"]
+        # Notification sent
+        notifier.notify.assert_called()
+        payload = notifier.notify.call_args[1]["payload"]
+        assert "Merged" in payload["embeds"][0]["title"]
+
+    def test_approve_without_work_item_skips_close(self):
+        """When no work_item_id, skip wl close but still merge."""
+        wl_calls = []
+
+        def tracking_wl(cmd, **kwargs):
+            wl_calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        shell = _make_shell({
+            "pr merge": {"returncode": 0},
+            "pr view": {"returncode": 0, "stdout": "feature/br\n"},
+            "git push": {"returncode": 0},
+        })
+        runner = self._make_runner(run_shell=shell, wl_shell=tracking_wl)
+        result = runner.handle_review_decision(
+            action="accept", pr_number=42, work_item_id=None, approved_by="bob"
+        )
+        assert result["action"] == "merged"
+        # No wl close or wl comment calls
+        for call in wl_calls:
+            cmd_str = " ".join(str(c) for c in call)
+            assert "wl close" not in cmd_str
+
+    def test_approve_merge_failure_returns_error(self):
+        """If merge fails, return action=error and notify."""
+        shell = _make_shell({
+            "pr merge": {"returncode": 1, "stderr": "conflict"}
+        })
+        notifier = mock.MagicMock()
+        runner = self._make_runner(run_shell=shell, notifier=notifier)
+        result = runner.handle_review_decision(
+            action="accept", pr_number=42, approved_by="alice"
+        )
+        assert result["action"] == "error"
+        assert "conflict" in result["note"]
+        # Error notification sent
+        notifier.notify.assert_called()
+        payload = notifier.notify.call_args[1]["payload"]
+        assert "Failed" in payload["embeds"][0]["title"]
+
+    def test_approve_branch_not_found_skips_cleanup(self):
+        """If _get_pr_branch returns None, skip branch cleanup."""
+        shell = _make_shell({
+            "pr merge": {"returncode": 0},
+            "pr view": {"returncode": 1},  # branch lookup fails
+        })
+        runner = self._make_runner(run_shell=shell)
+        result = runner.handle_review_decision(
+            action="accept", pr_number=42, approved_by="alice"
+        )
+        assert result["action"] == "merged"
+
+    def test_approve_action_variants(self):
+        """accept, approve, ACCEPT all treated as approve."""
+        shell = _make_shell({
+            "pr merge": {"returncode": 0},
+            "pr view": {"returncode": 1},
+        })
+        runner = self._make_runner(run_shell=shell)
+        for action_str in ("accept", "approve", "ACCEPT", " Accept "):
+            result = runner.handle_review_decision(
+                action=action_str, pr_number=1, approved_by="x"
+            )
+            assert result["action"] == "merged", f"Failed for action={action_str!r}"
+
+
+class TestHandleReviewDecisionReject:
+    """Tests for handle_review_decision() with action=decline."""
+
+    def _make_runner(self, run_shell=None, wl_shell=None, notifier=None):
+        return PRMonitorRunner(
+            run_shell=run_shell or _make_shell({}),
+            command_cwd="/test",
+            wl_shell=wl_shell or _make_shell({}),
+            notifier=notifier,
+        )
+
+    def test_reject_posts_comment_and_returns_rejected(self):
+        """Decline posts a GH comment and returns action=rejected."""
+        gh_calls = []
+
+        def tracking_shell(cmd, **kwargs):
+            gh_calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        notifier = mock.MagicMock()
+        runner = self._make_runner(run_shell=tracking_shell, notifier=notifier)
+        result = runner.handle_review_decision(
+            action="decline",
+            pr_number=42,
+            work_item_id="SA-123",
+            approved_by="bob",
+        )
+        assert result["action"] == "rejected"
+        assert "42" in result["note"]
+        assert "bob" in result["note"]
+        # GH comment posted
+        assert any(
+            "pr" in str(c) and "comment" in str(c) for c in gh_calls
+        )
+        # Discord notification sent
+        notifier.notify.assert_called()
+
+    def test_reject_without_work_item_id(self):
+        """Reject works without a work_item_id."""
+        runner = self._make_runner()
+        result = runner.handle_review_decision(
+            action="decline", pr_number=42, approved_by="bob"
+        )
+        assert result["action"] == "rejected"
+
+    def test_reject_records_wl_comment(self):
+        """Reject records a comment on the work item."""
+        wl_calls = []
+
+        def tracking_wl(cmd, **kwargs):
+            wl_calls.append(
+                cmd if isinstance(cmd, str)
+                else " ".join(str(c) for c in cmd)
+            )
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        runner = self._make_runner(wl_shell=tracking_wl)
+        runner.handle_review_decision(
+            action="decline",
+            pr_number=42,
+            work_item_id="SA-456",
+            approved_by="carol",
+        )
+        assert any("wl comment add SA-456" in c for c in wl_calls)
+
+    def test_decline_action_variants(self):
+        """decline, reject, DECLINE all treated as reject."""
+        runner = self._make_runner()
+        for action_str in ("decline", "reject", "DECLINE", " Decline "):
+            result = runner.handle_review_decision(
+                action=action_str, pr_number=1, approved_by="x"
+            )
+            assert result["action"] == "rejected", f"Failed for action={action_str!r}"

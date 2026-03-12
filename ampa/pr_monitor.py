@@ -1197,6 +1197,331 @@ class PRMonitorRunner:
                         return None
         return None
 
+    # ------------------------------------------------------------------
+    # Phase 4 — Merge / reject / cleanup on operator decision
+    # ------------------------------------------------------------------
+
+    def handle_review_decision(
+        self,
+        action: str,
+        pr_number: int,
+        work_item_id: Optional[str] = None,
+        approved_by: str = "unknown",
+        gh_cmd: str = _DEFAULT_GH_COMMAND,
+    ) -> Dict[str, Any]:
+        """Process an operator's approve or reject decision for a PR review.
+
+        This is the main entry point called after the Discord interaction is
+        routed through the conversation manager.  It orchestrates merge (or
+        rejection), work-item closure, branch cleanup, and notifications.
+
+        Parameters
+        ----------
+        action
+            ``"accept"`` to merge, anything else to reject.
+        pr_number
+            The GitHub PR number.
+        work_item_id
+            Optional work-item ID associated with the PR.  If *None*, the
+            method will attempt to extract it from the PR.
+        approved_by
+            Human-readable identifier of the operator (e.g. Discord username).
+        gh_cmd
+            The ``gh`` CLI executable name / path.
+
+        Returns
+        -------
+        dict
+            ``action`` key is ``"merged"``, ``"rejected"``, or ``"error"``
+            with a ``note`` describing the outcome.
+        """
+        is_approve = str(action).strip().lower() in ("accept", "approve")
+        LOG.info(
+            "pr-monitor: handling review decision action=%s pr_number=%d "
+            "work_item_id=%s approved_by=%s",
+            action,
+            pr_number,
+            work_item_id,
+            approved_by,
+        )
+
+        if is_approve:
+            return self._handle_approve(
+                gh_cmd, pr_number, work_item_id, approved_by
+            )
+        return self._handle_reject(
+            gh_cmd, pr_number, work_item_id, approved_by
+        )
+
+    def _handle_approve(
+        self,
+        gh_cmd: str,
+        pr_number: int,
+        work_item_id: Optional[str],
+        approved_by: str,
+    ) -> Dict[str, Any]:
+        """Execute merge, work-item closure, branch cleanup, and notifications."""
+        # 1. Merge the PR
+        merge_ok, merge_note = self._merge_pr(gh_cmd, pr_number)
+        if not merge_ok:
+            self._notify_review_outcome(
+                pr_number,
+                "Merge Failed",
+                merge_note,
+                color=0xE74C3C,
+            )
+            return {"action": "error", "note": merge_note}
+
+        # 2. Close the associated work item (best-effort)
+        if work_item_id:
+            reason = (
+                f"PR #{pr_number} merged via auto-review approval "
+                f"by {approved_by}"
+            )
+            self._close_work_item(work_item_id, reason)
+
+        # 3. Delete the remote branch (best-effort)
+        branch = self._get_pr_branch(gh_cmd, pr_number)
+        if branch:
+            self._cleanup_branch(gh_cmd, branch)
+
+        # 4. Record a Worklog comment (best-effort)
+        if work_item_id:
+            comment = (
+                f"PR #{pr_number} merged and branch cleaned up. "
+                f"Approved by {approved_by} via Discord."
+            )
+            self._add_wl_comment(work_item_id, comment)
+
+        # 5. Send confirmation notification to Discord
+        self._notify_review_outcome(
+            pr_number,
+            "PR Merged",
+            f"PR #{pr_number} has been merged and cleaned up.\n"
+            f"Approved by **{approved_by}**.",
+            color=0x2ECC71,
+        )
+
+        return {
+            "action": "merged",
+            "note": f"PR #{pr_number} merged by {approved_by}",
+        }
+
+    def _handle_reject(
+        self,
+        gh_cmd: str,
+        pr_number: int,
+        work_item_id: Optional[str],
+        approved_by: str,
+    ) -> Dict[str, Any]:
+        """Post rejection comment on PR and record in Worklog."""
+        # 1. Post a rejection comment on the PR
+        body = (
+            f"This PR was **declined** during auto-review by **{approved_by}**.\n\n"
+            "The automated audit was reviewed and the operator chose not to "
+            "merge at this time.  Please address any concerns and re-request "
+            "review when ready."
+        )
+        self._post_gh_comment(gh_cmd, pr_number, body)
+
+        # 2. Record rejection in Worklog (best-effort)
+        if work_item_id:
+            comment = (
+                f"PR #{pr_number} review rejected by {approved_by} "
+                "via Discord.  PR comment posted."
+            )
+            self._add_wl_comment(work_item_id, comment)
+
+        # 3. Notify Discord
+        self._notify_review_outcome(
+            pr_number,
+            "PR Review Rejected",
+            f"PR #{pr_number} was declined by **{approved_by}**.\n"
+            "A comment has been posted on the PR.",
+            color=0xE74C3C,
+        )
+
+        return {
+            "action": "rejected",
+            "note": f"PR #{pr_number} rejected by {approved_by}",
+        }
+
+    def _merge_pr(
+        self, gh_cmd: str, pr_number: int
+    ) -> Tuple[bool, str]:
+        """Merge a PR via ``gh pr merge``.
+
+        Returns ``(success, note)`` where *note* describes the outcome.
+        """
+        try:
+            proc = self.run_shell(
+                [gh_cmd, "pr", "merge", str(pr_number), "--merge"],
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                stderr = (proc.stderr or "").strip()[:512]
+                note = (
+                    f"pr-monitor: gh pr merge failed for PR #{pr_number}: "
+                    f"rc={proc.returncode} stderr={stderr!r}"
+                )
+                LOG.error(note)
+                return False, note
+            LOG.info("pr-monitor: merged PR #%d", pr_number)
+            return True, f"PR #{pr_number} merged successfully"
+        except Exception as exc:
+            note = f"pr-monitor: exception merging PR #{pr_number}: {exc}"
+            LOG.exception(note)
+            return False, note
+
+    def _reject_pr(
+        self, gh_cmd: str, pr_number: int, reason: str
+    ) -> bool:
+        """Post a rejection comment on a PR.  Returns True on success."""
+        return self._post_gh_comment(gh_cmd, pr_number, reason)
+
+    def _close_work_item(self, work_item_id: str, reason: str) -> bool:
+        """Close a Worklog work item.  Best-effort — failures are logged."""
+        try:
+            proc = self._wl_shell(
+                [
+                    "wl", "close", work_item_id,
+                    "--reason", reason,
+                    "--json",
+                ],
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                LOG.warning(
+                    "pr-monitor: wl close failed for %s: rc=%s stderr=%r",
+                    work_item_id,
+                    proc.returncode,
+                    (proc.stderr or "")[:512],
+                )
+                return False
+            LOG.info("pr-monitor: closed work item %s", work_item_id)
+            return True
+        except Exception:
+            LOG.exception(
+                "pr-monitor: exception closing work item %s", work_item_id
+            )
+            return False
+
+    def _cleanup_branch(self, gh_cmd: str, branch: str) -> bool:
+        """Delete a remote branch.  Best-effort — failures are logged."""
+        try:
+            proc = self.run_shell(
+                ["git", "push", "origin", "--delete", branch],
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                LOG.warning(
+                    "pr-monitor: branch cleanup failed for %s: rc=%s stderr=%r",
+                    branch,
+                    proc.returncode,
+                    (proc.stderr or "")[:512],
+                )
+                return False
+            LOG.info("pr-monitor: deleted remote branch %s", branch)
+            return True
+        except Exception:
+            LOG.exception(
+                "pr-monitor: exception deleting branch %s", branch
+            )
+            return False
+
+    def _get_pr_branch(
+        self, gh_cmd: str, pr_number: int
+    ) -> Optional[str]:
+        """Retrieve the head branch name for a PR.  Returns None on failure."""
+        try:
+            proc = self.run_shell(
+                f"{gh_cmd} pr view {pr_number} --json headRefName -q .headRefName",
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode == 0 and (proc.stdout or "").strip():
+                return proc.stdout.strip()
+            return None
+        except Exception:
+            LOG.exception(
+                "pr-monitor: failed to get branch for PR #%d", pr_number
+            )
+            return None
+
+    def _add_wl_comment(self, work_item_id: str, comment: str) -> bool:
+        """Add a comment to a Worklog work item.  Best-effort."""
+        try:
+            proc = self._wl_shell(
+                [
+                    "wl", "comment", "add", work_item_id,
+                    "--comment", comment,
+                    "--author", "ampa-pr-monitor",
+                    "--json",
+                ],
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                LOG.warning(
+                    "pr-monitor: wl comment add failed for %s: rc=%s",
+                    work_item_id,
+                    proc.returncode,
+                )
+                return False
+            return True
+        except Exception:
+            LOG.exception(
+                "pr-monitor: exception adding WL comment to %s", work_item_id
+            )
+            return False
+
+    def _notify_review_outcome(
+        self,
+        pr_number: int,
+        title: str,
+        description: str,
+        color: int = 0x3498DB,
+    ) -> None:
+        """Send a Discord notification about a review outcome."""
+        if not self._notifier:
+            return
+        try:
+            payload = {
+                "content": f"{title} — PR #{pr_number}",
+                "embeds": [
+                    {
+                        "title": title,
+                        "description": description,
+                        "color": color,
+                    }
+                ],
+            }
+            self._notifier.notify(payload=payload, message_type="command")
+        except Exception:
+            LOG.exception(
+                "pr-monitor: failed to send review outcome notification "
+                "for PR #%d",
+                pr_number,
+            )
+
     def _notify_summary(
         self,
         ready_prs: List[int],
