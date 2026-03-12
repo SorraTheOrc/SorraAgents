@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -43,6 +44,19 @@ _DEFAULT_MAX_PRS: int = 50
 _DEFAULT_GH_COMMAND: str = "gh"
 _READY_COMMENT_MARKER: str = "<!-- ampa-pr-monitor:ready -->"
 _FAILURE_COMMENT_MARKER: str = "<!-- ampa-pr-monitor:failure -->"
+_AUDIT_RESULT_MARKER: str = "<!-- ampa-pr-audit-result -->"
+_AUDIT_DISPATCH_MARKER_PREFIX: str = "<!-- ampa-pr-audit-dispatch:"
+
+# Pattern to extract work-item IDs from branch names.
+# Matches: feature/<ID>-*, bug/<ID>-*, wl-<ID>-*, or bare <PREFIX>-<HASH>
+_WORK_ITEM_ID_BRANCH_RE = re.compile(
+    r"(?:feature/|bug/|wl-)?((?:[A-Z]{2,}-)?[A-Za-z0-9]{10,})"
+)
+# Pattern to extract work-item IDs from PR body markers.
+_WORK_ITEM_ID_BODY_RE = re.compile(
+    r"(?:work[- ]?item|closes|fixes|resolves)[:\s]+([A-Z]{2,}-[A-Za-z0-9]*[0-9][A-Za-z0-9]*)",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +663,242 @@ class PRMonitorRunner:
         except Exception:
             LOG.exception("pr-monitor: exception creating critical work item")
             return None
+
+    # ------------------------------------------------------------------
+    # Work-item ID extraction
+    # ------------------------------------------------------------------
+
+    def _extract_work_item_id(
+        self, pr: Dict[str, Any], gh_cmd: str
+    ) -> Optional[str]:
+        """Extract a work-item ID from a PR.
+
+        Checks, in order:
+        1. The branch name (``headRefName``) for patterns like
+           ``feature/<ID>-*``, ``bug/<ID>-*``, ``wl-<ID>-*``.
+        2. The PR body for markers like ``work-item: <ID>``,
+           ``closes <ID>``, ``fixes <ID>``.
+
+        Returns the work-item ID string or ``None`` if not found.
+        """
+        # 1. Try branch name
+        branch = pr.get("headRefName", "")
+        if branch:
+            m = _WORK_ITEM_ID_BRANCH_RE.search(branch)
+            if m:
+                candidate = m.group(1)
+                # Validate it looks like a work-item ID (has a prefix separator)
+                if "-" in candidate:
+                    return candidate
+
+        # 2. Try PR body
+        pr_number = pr.get("number")
+        if pr_number is not None:
+            try:
+                cmd = f"{gh_cmd} pr view {pr_number} --json body"
+                proc = self.run_shell(
+                    cmd,
+                    shell=True,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    cwd=self.command_cwd,
+                )
+                if proc.returncode == 0 and (proc.stdout or "").strip():
+                    data = json.loads(proc.stdout.strip())
+                    body = data.get("body", "")
+                    m = _WORK_ITEM_ID_BODY_RE.search(body)
+                    if m:
+                        return m.group(1)
+            except Exception:
+                LOG.debug(
+                    "pr-monitor: exception extracting work item from PR #%s body",
+                    pr_number,
+                )
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Audit dispatch state tracking
+    # ------------------------------------------------------------------
+
+    def _get_audit_dispatch_state(
+        self, work_item_id: str, pr_number: int
+    ) -> Optional[Dict[str, Any]]:
+        """Query a work item's comments for a dispatch marker for *pr_number*.
+
+        Returns the parsed dispatch state dict or ``None`` if not found.
+        """
+        marker = f"{_AUDIT_DISPATCH_MARKER_PREFIX}{pr_number} -->"
+        try:
+            proc = self._wl_shell(
+                f"wl show {work_item_id} --json",
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                return None
+            stdout = (proc.stdout or "").strip()
+            if not stdout:
+                return None
+            data = json.loads(stdout)
+            comments = data.get("comments", [])
+            if not comments and "workItem" in data:
+                comments = data.get("comments", [])
+            for comment in comments:
+                body = comment.get("comment", "")
+                if marker in body:
+                    return self._parse_marker_json(body, marker)
+        except Exception:
+            LOG.debug(
+                "pr-monitor: exception reading dispatch state for %s PR #%d",
+                work_item_id,
+                pr_number,
+            )
+        return None
+
+    def _get_audit_result(
+        self,
+        work_item_id: str,
+        pr_number: int,
+        after_iso: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Query a work item's comments for an audit result for *pr_number*.
+
+        If *after_iso* is provided, only results whose ``audited_at``
+        timestamp is after that ISO-8601 string are considered.
+
+        Returns the parsed audit result dict or ``None``.
+        """
+        try:
+            proc = self._wl_shell(
+                f"wl show {work_item_id} --json",
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                return None
+            stdout = (proc.stdout or "").strip()
+            if not stdout:
+                return None
+            data = json.loads(stdout)
+            comments = data.get("comments", [])
+            for comment in comments:
+                body = comment.get("comment", "")
+                if _AUDIT_RESULT_MARKER not in body:
+                    continue
+                result = self._parse_marker_json(body, _AUDIT_RESULT_MARKER)
+                if result is None:
+                    continue
+                audit = result.get("audit_result", result)
+                # Check PR number match if present
+                if audit.get("pr_number") is not None and audit.get("pr_number") != pr_number:
+                    continue
+                # Check freshness
+                if after_iso and audit.get("audited_at"):
+                    if audit["audited_at"] <= after_iso:
+                        LOG.debug(
+                            "pr-monitor: stale audit result for %s PR #%d "
+                            "(audited_at=%s <= %s)",
+                            work_item_id,
+                            pr_number,
+                            audit["audited_at"],
+                            after_iso,
+                        )
+                        continue
+                return audit
+        except Exception:
+            LOG.debug(
+                "pr-monitor: exception reading audit result for %s PR #%d",
+                work_item_id,
+                pr_number,
+            )
+        return None
+
+    def _post_audit_dispatch_marker(
+        self,
+        work_item_id: str,
+        pr_number: int,
+        dispatched_at: str,
+        container_id: Optional[str] = None,
+    ) -> bool:
+        """Post a dispatch state marker comment to a work item.
+
+        Returns True on success.
+        """
+        marker = f"{_AUDIT_DISPATCH_MARKER_PREFIX}{pr_number} -->"
+        payload = json.dumps({
+            "dispatch_state": {
+                "pr_number": pr_number,
+                "dispatched_at": dispatched_at,
+                "container_id": container_id,
+                "work_item_id": work_item_id,
+            }
+        })
+        comment_body = f"{marker}\n{payload}"
+        try:
+            proc = self._wl_shell(
+                [
+                    "wl", "comment", "add", work_item_id,
+                    "--comment", comment_body,
+                    "--author", "ampa-pr-monitor",
+                    "--json",
+                ],
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                LOG.warning(
+                    "pr-monitor: failed to post dispatch marker for %s PR #%d: %s",
+                    work_item_id,
+                    pr_number,
+                    (proc.stderr or "")[:256],
+                )
+                return False
+            return True
+        except Exception:
+            LOG.exception(
+                "pr-monitor: exception posting dispatch marker for %s PR #%d",
+                work_item_id,
+                pr_number,
+            )
+            return False
+
+    @staticmethod
+    def _parse_marker_json(
+        body: str, marker: str
+    ) -> Optional[Dict[str, Any]]:
+        """Extract the JSON object following *marker* in a comment body."""
+        idx = body.find(marker)
+        if idx < 0:
+            return None
+        rest = body[idx + len(marker) :].strip()
+        # Try to find a JSON object in the remaining text
+        brace = rest.find("{")
+        if brace < 0:
+            return None
+        # Find the matching closing brace
+        depth = 0
+        for i, ch in enumerate(rest[brace:]):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(rest[brace : brace + i + 1])
+                    except json.JSONDecodeError:
+                        return None
+        return None
 
     def _notify_summary(
         self,

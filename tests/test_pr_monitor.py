@@ -830,3 +830,389 @@ class TestCheckStateParsing:
         checks = _checks_json([{"name": "ci", "bucket": "pending"}])
         result = self._run_with_checks(checks)
         assert 1 in result["skipped_prs"]
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for work-item ID extraction
+# ---------------------------------------------------------------------------
+
+
+class TestExtractWorkItemId:
+    """Verify _extract_work_item_id() handles branch names and PR bodies."""
+
+    def _make_runner(self, run_shell=None):
+        return PRMonitorRunner(
+            run_shell=run_shell
+            or (lambda *a, **k: subprocess.CompletedProcess([], 0, "", "")),
+            command_cwd="/tmp",
+        )
+
+    def test_feature_branch(self):
+        runner = self._make_runner()
+        pr = {"headRefName": "feature/SA-0MMN9YNS41N1B77L-llm-pr-review", "number": 1}
+        result = runner._extract_work_item_id(pr, "gh")
+        assert result == "SA-0MMN9YNS41N1B77L"
+
+    def test_bug_branch(self):
+        runner = self._make_runner()
+        pr = {"headRefName": "bug/WL-ABC123DEF0-fix-crash", "number": 2}
+        result = runner._extract_work_item_id(pr, "gh")
+        assert result == "WL-ABC123DEF0"
+
+    def test_wl_branch(self):
+        runner = self._make_runner()
+        pr = {"headRefName": "wl-SA-0MMABCDEF12345-short", "number": 3}
+        result = runner._extract_work_item_id(pr, "gh")
+        assert result == "SA-0MMABCDEF12345"
+
+    def test_no_branch_falls_back_to_body(self):
+        body_json = json.dumps({"body": "Fixes work-item: SA-TESTID1234"})
+
+        def run_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "gh pr view" in cmd_str:
+                return subprocess.CompletedProcess([], 0, body_json, "")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = self._make_runner(run_shell)
+        pr = {"headRefName": "some-random-branch", "number": 5}
+        result = runner._extract_work_item_id(pr, "gh")
+        assert result == "SA-TESTID1234"
+
+    def test_body_closes_pattern(self):
+        body_json = json.dumps({"body": "This PR closes WL-0ABCDEFGHIJ"})
+
+        def run_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "gh pr view" in cmd_str:
+                return subprocess.CompletedProcess([], 0, body_json, "")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = self._make_runner(run_shell)
+        pr = {"headRefName": "no-match-here", "number": 6}
+        result = runner._extract_work_item_id(pr, "gh")
+        assert result == "WL-0ABCDEFGHIJ"
+
+    def test_no_work_item_found(self):
+        body_json = json.dumps({"body": "Just a regular PR"})
+
+        def run_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "gh pr view" in cmd_str:
+                return subprocess.CompletedProcess([], 0, body_json, "")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = self._make_runner(run_shell)
+        pr = {"headRefName": "main", "number": 7}
+        result = runner._extract_work_item_id(pr, "gh")
+        assert result is None
+
+    def test_missing_branch_name(self):
+        runner = self._make_runner()
+        pr = {"number": 8}
+        result = runner._extract_work_item_id(pr, "gh")
+        assert result is None
+
+    def test_gh_view_failure(self):
+        def run_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "gh pr view" in cmd_str:
+                return subprocess.CompletedProcess([], 1, "", "error")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = self._make_runner(run_shell)
+        pr = {"headRefName": "no-match", "number": 9}
+        result = runner._extract_work_item_id(pr, "gh")
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for audit dispatch state tracking
+# ---------------------------------------------------------------------------
+
+
+class TestAuditDispatchState:
+    """Verify _get_audit_dispatch_state() and _post_audit_dispatch_marker()."""
+
+    def _make_runner(self, wl_shell=None):
+        default_shell = lambda *a, **k: subprocess.CompletedProcess([], 0, "", "")
+        return PRMonitorRunner(
+            run_shell=default_shell,
+            command_cwd="/tmp",
+            wl_shell=wl_shell or default_shell,
+        )
+
+    def test_no_dispatch_state(self):
+        wl_data = json.dumps({
+            "workItem": {"id": "SA-TEST1"},
+            "comments": [],
+        })
+
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 0, wl_data, "")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._get_audit_dispatch_state("SA-TEST1", 42)
+        assert result is None
+
+    def test_dispatch_state_found(self):
+        marker = "<!-- ampa-pr-audit-dispatch:42 -->"
+        payload = json.dumps({
+            "dispatch_state": {
+                "pr_number": 42,
+                "dispatched_at": "2026-03-12T10:00:00Z",
+                "container_id": "pool-1",
+                "work_item_id": "SA-TEST1",
+            }
+        })
+        wl_data = json.dumps({
+            "workItem": {"id": "SA-TEST1"},
+            "comments": [
+                {"comment": f"{marker}\n{payload}", "author": "ampa-pr-monitor"},
+            ],
+        })
+
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 0, wl_data, "")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._get_audit_dispatch_state("SA-TEST1", 42)
+        assert result is not None
+        assert result["dispatch_state"]["pr_number"] == 42
+        assert result["dispatch_state"]["container_id"] == "pool-1"
+
+    def test_dispatch_state_wrong_pr(self):
+        """Dispatch marker for a different PR number is not matched."""
+        marker = "<!-- ampa-pr-audit-dispatch:99 -->"
+        payload = json.dumps({
+            "dispatch_state": {"pr_number": 99, "dispatched_at": "2026-03-12T10:00:00Z"}
+        })
+        wl_data = json.dumps({
+            "workItem": {"id": "SA-TEST1"},
+            "comments": [
+                {"comment": f"{marker}\n{payload}", "author": "ampa-pr-monitor"},
+            ],
+        })
+
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 0, wl_data, "")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._get_audit_dispatch_state("SA-TEST1", 42)
+        assert result is None
+
+    def test_wl_show_failure(self):
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 1, "", "error")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._get_audit_dispatch_state("SA-TEST1", 42)
+        assert result is None
+
+    def test_post_dispatch_marker_success(self):
+        calls = []
+
+        def wl_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            calls.append(cmd_str)
+            return subprocess.CompletedProcess([], 0, "{}", "")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._post_audit_dispatch_marker(
+            "SA-TEST1", 42, "2026-03-12T10:00:00Z", "pool-1"
+        )
+        assert result is True
+        assert len(calls) == 1
+        assert "wl comment add SA-TEST1" in calls[0]
+
+    def test_post_dispatch_marker_failure(self):
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 1, "", "error")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._post_audit_dispatch_marker(
+            "SA-TEST1", 42, "2026-03-12T10:00:00Z"
+        )
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for audit result query
+# ---------------------------------------------------------------------------
+
+
+class TestAuditResult:
+    """Verify _get_audit_result() and _parse_marker_json()."""
+
+    def _make_runner(self, wl_shell=None):
+        default_shell = lambda *a, **k: subprocess.CompletedProcess([], 0, "", "")
+        return PRMonitorRunner(
+            run_shell=default_shell,
+            command_cwd="/tmp",
+            wl_shell=wl_shell or default_shell,
+        )
+
+    def test_no_audit_result(self):
+        wl_data = json.dumps({
+            "workItem": {"id": "SA-TEST1"},
+            "comments": [],
+        })
+
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 0, wl_data, "")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._get_audit_result("SA-TEST1", 42)
+        assert result is None
+
+    def test_audit_result_found(self):
+        marker = "<!-- ampa-pr-audit-result -->"
+        payload = json.dumps({
+            "audit_result": {
+                "overall": "pass",
+                "criteria": [{"name": "Tests pass", "pass": True, "notes": "All green"}],
+                "summary": "All criteria met",
+                "concerns": [],
+                "audited_at": "2026-03-12T12:00:00Z",
+                "pr_number": 42,
+                "pr_sha": "abc123",
+            }
+        })
+        wl_data = json.dumps({
+            "workItem": {"id": "SA-TEST1"},
+            "comments": [
+                {"comment": f"{marker}\n{payload}", "author": "audit-agent"},
+            ],
+        })
+
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 0, wl_data, "")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._get_audit_result("SA-TEST1", 42)
+        assert result is not None
+        assert result["overall"] == "pass"
+        assert result["pr_number"] == 42
+
+    def test_audit_result_wrong_pr(self):
+        marker = "<!-- ampa-pr-audit-result -->"
+        payload = json.dumps({
+            "audit_result": {
+                "overall": "pass",
+                "audited_at": "2026-03-12T12:00:00Z",
+                "pr_number": 99,
+            }
+        })
+        wl_data = json.dumps({
+            "workItem": {"id": "SA-TEST1"},
+            "comments": [
+                {"comment": f"{marker}\n{payload}", "author": "audit-agent"},
+            ],
+        })
+
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 0, wl_data, "")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._get_audit_result("SA-TEST1", 42)
+        assert result is None
+
+    def test_audit_result_stale(self):
+        """Audit result older than after_iso is rejected."""
+        marker = "<!-- ampa-pr-audit-result -->"
+        payload = json.dumps({
+            "audit_result": {
+                "overall": "pass",
+                "audited_at": "2026-03-12T10:00:00Z",
+                "pr_number": 42,
+            }
+        })
+        wl_data = json.dumps({
+            "workItem": {"id": "SA-TEST1"},
+            "comments": [
+                {"comment": f"{marker}\n{payload}", "author": "audit-agent"},
+            ],
+        })
+
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 0, wl_data, "")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._get_audit_result(
+            "SA-TEST1", 42, after_iso="2026-03-12T11:00:00Z"
+        )
+        assert result is None
+
+    def test_audit_result_fresh(self):
+        """Audit result newer than after_iso is accepted."""
+        marker = "<!-- ampa-pr-audit-result -->"
+        payload = json.dumps({
+            "audit_result": {
+                "overall": "pass",
+                "audited_at": "2026-03-12T14:00:00Z",
+                "pr_number": 42,
+            }
+        })
+        wl_data = json.dumps({
+            "workItem": {"id": "SA-TEST1"},
+            "comments": [
+                {"comment": f"{marker}\n{payload}", "author": "audit-agent"},
+            ],
+        })
+
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 0, wl_data, "")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._get_audit_result(
+            "SA-TEST1", 42, after_iso="2026-03-12T11:00:00Z"
+        )
+        assert result is not None
+        assert result["overall"] == "pass"
+
+    def test_wl_show_failure(self):
+        def wl_shell(cmd, **kwargs):
+            return subprocess.CompletedProcess([], 1, "", "error")
+
+        runner = self._make_runner(wl_shell)
+        result = runner._get_audit_result("SA-TEST1", 42)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _parse_marker_json
+# ---------------------------------------------------------------------------
+
+
+class TestParseMarkerJson:
+    """Verify the static _parse_marker_json helper."""
+
+    def test_valid_json(self):
+        body = '<!-- marker -->\n{"key": "value"}'
+        result = PRMonitorRunner._parse_marker_json(body, "<!-- marker -->")
+        assert result == {"key": "value"}
+
+    def test_nested_json(self):
+        body = '<!-- marker -->\n{"outer": {"inner": 42}}'
+        result = PRMonitorRunner._parse_marker_json(body, "<!-- marker -->")
+        assert result == {"outer": {"inner": 42}}
+
+    def test_no_marker(self):
+        body = "no marker here"
+        result = PRMonitorRunner._parse_marker_json(body, "<!-- marker -->")
+        assert result is None
+
+    def test_no_json_after_marker(self):
+        body = "<!-- marker -->\nno json here"
+        result = PRMonitorRunner._parse_marker_json(body, "<!-- marker -->")
+        assert result is None
+
+    def test_invalid_json(self):
+        body = "<!-- marker -->\n{invalid json}"
+        result = PRMonitorRunner._parse_marker_json(body, "<!-- marker -->")
+        assert result is None
+
+    def test_marker_with_extra_text(self):
+        body = "Some prefix\n<!-- marker -->\ntext {\"a\": 1} more"
+        result = PRMonitorRunner._parse_marker_json(body, "<!-- marker -->")
+        assert result == {"a": 1}
