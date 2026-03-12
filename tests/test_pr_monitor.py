@@ -1496,3 +1496,253 @@ class TestAutoReviewIntegration:
 
         assert 99 in result["ready_prs"]
         fake_dispatcher.dispatch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _present_audit_results (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestPresentAuditResults:
+    """Verify _present_audit_results builds Discord payloads correctly."""
+
+    def _make_runner(self, notifier=None):
+        return PRMonitorRunner(
+            run_shell=lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""),
+            command_cwd="/tmp",
+            notifier=notifier,
+        )
+
+    def _make_audit(self, overall="pass", summary="Looks good.", concerns=None,
+                    criteria=None):
+        return {
+            "overall": overall,
+            "summary": summary,
+            "concerns": concerns or [],
+            "criteria": criteria or [],
+        }
+
+    def test_no_notifier_is_noop(self):
+        runner = self._make_runner(notifier=None)
+        audit = self._make_audit()
+        # Should not raise
+        runner._present_audit_results(42, "Test PR", "http://pr/42", "SA-X1", audit)
+
+    def test_pass_embed_sent(self):
+        notifier = mock.MagicMock()
+        runner = self._make_runner(notifier=notifier)
+        audit = self._make_audit(
+            overall="pass",
+            summary="All criteria met.",
+            criteria=[
+                {"name": "Tests pass", "pass": True, "notes": "100% coverage"},
+                {"name": "Docs updated", "pass": True, "notes": ""},
+            ],
+        )
+        runner._present_audit_results(42, "Good PR", "http://pr/42", "SA-X1", audit)
+
+        notifier.notify.assert_called_once()
+        call_kwargs = notifier.notify.call_args[1]
+        payload = call_kwargs["payload"]
+
+        # Check embed
+        assert len(payload["embeds"]) == 1
+        embed = payload["embeds"][0]
+        assert "PASS" in embed["title"]
+        assert embed["color"] == 0x2ECC71  # green
+
+        # Check buttons
+        assert len(payload["components"]) == 2
+        approve_btn = payload["components"][0]
+        reject_btn = payload["components"][1]
+        assert approve_btn["custom_id"] == "pr_review_approve_42"
+        assert reject_btn["custom_id"] == "pr_review_reject_42"
+
+    def test_fail_embed_colour(self):
+        notifier = mock.MagicMock()
+        runner = self._make_runner(notifier=notifier)
+        audit = self._make_audit(overall="fail", summary="Failed.")
+        runner._present_audit_results(10, "Bad PR", "http://pr/10", "SA-X2", audit)
+
+        payload = notifier.notify.call_args[1]["payload"]
+        assert payload["embeds"][0]["color"] == 0xE74C3C  # red
+
+    def test_partial_embed_colour(self):
+        notifier = mock.MagicMock()
+        runner = self._make_runner(notifier=notifier)
+        audit = self._make_audit(overall="partial", summary="Some issues.")
+        runner._present_audit_results(11, "OK PR", "http://pr/11", "SA-X3", audit)
+
+        payload = notifier.notify.call_args[1]["payload"]
+        assert payload["embeds"][0]["color"] == 0xF39C12  # yellow
+
+    def test_concerns_included(self):
+        notifier = mock.MagicMock()
+        runner = self._make_runner(notifier=notifier)
+        audit = self._make_audit(
+            concerns=["Missing error handling", "No migration script"]
+        )
+        runner._present_audit_results(13, "PR", "http://pr/13", "SA-X4", audit)
+
+        payload = notifier.notify.call_args[1]["payload"]
+        embed = payload["embeds"][0]
+        concern_fields = [f for f in embed["fields"] if f["name"] == "Concerns"]
+        assert len(concern_fields) == 1
+        assert "Missing error handling" in concern_fields[0]["value"]
+
+    def test_notifier_exception_does_not_propagate(self):
+        notifier = mock.MagicMock()
+        notifier.notify.side_effect = RuntimeError("Discord down")
+        runner = self._make_runner(notifier=notifier)
+        audit = self._make_audit()
+        # Should not raise
+        runner._present_audit_results(14, "PR", "http://pr/14", "SA-X5", audit)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _check_and_present_audit_results (Phase 2 orchestration)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckAndPresentAuditResults:
+    """Verify _check_and_present_audit_results orchestration logic."""
+
+    _DISPATCH_MARKER_PREFIX = "<!-- ampa-pr-audit-dispatch:"
+    _RESULT_MARKER = "<!-- ampa-pr-audit-result -->"
+
+    def _make_runner(self, wl_shell=None, notifier=None, dispatcher=None):
+        return PRMonitorRunner(
+            run_shell=lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""),
+            command_cwd="/tmp",
+            notifier=notifier,
+            dispatcher=dispatcher,
+            wl_shell=wl_shell,
+        )
+
+    def test_no_work_item_is_noop(self):
+        """If no work item ID extracted, do nothing."""
+        runner = self._make_runner()
+        pr = {"headRefName": "random-branch", "number": 20}
+        # Should not raise
+        runner._check_and_present_audit_results("gh", pr, 20, "PR", "")
+
+    def test_no_dispatch_triggers_dispatch(self):
+        """If no dispatch marker, trigger a new dispatch."""
+        fake_result = type(
+            "R", (), {
+                "success": True, "pid": 1, "error": None,
+                "container_id": "c1",
+                "timestamp": dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+            }
+        )()
+        fake_dispatcher = mock.MagicMock()
+        fake_dispatcher.dispatch.return_value = fake_result
+
+        def wl_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "wl show" in cmd_str:
+                return subprocess.CompletedProcess(
+                    [], 0, json.dumps({"comments": []}), ""
+                )
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = self._make_runner(
+            wl_shell=wl_shell, dispatcher=fake_dispatcher
+        )
+        pr = {"headRefName": "feature/SA-TEST123456-foo", "number": 21}
+        runner._check_and_present_audit_results("gh", pr, 21, "PR", "")
+
+        # Should have triggered dispatch
+        fake_dispatcher.dispatch.assert_called_once()
+
+    def test_dispatch_exists_no_result_is_noop(self):
+        """Dispatch marker exists but no result yet — silent skip."""
+        dispatch_comment = json.dumps({
+            "dispatch_state": {
+                "pr_number": 22,
+                "dispatched_at": "2026-01-01T00:00:00+00:00",
+                "container_id": "c1",
+                "work_item_id": "SA-TEST123456",
+            }
+        })
+        marker = f"{self._DISPATCH_MARKER_PREFIX}22 -->"
+
+        def wl_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "wl show" in cmd_str:
+                return subprocess.CompletedProcess(
+                    [], 0,
+                    json.dumps({
+                        "comments": [{"comment": f"{marker}\n{dispatch_comment}"}]
+                    }),
+                    "",
+                )
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        notifier = mock.MagicMock()
+        runner = self._make_runner(wl_shell=wl_shell, notifier=notifier)
+        pr = {"headRefName": "feature/SA-TEST123456-foo", "number": 22}
+        runner._check_and_present_audit_results("gh", pr, 22, "PR", "")
+
+        notifier.notify.assert_not_called()
+
+    def test_result_found_presents_to_discord(self):
+        """Audit result exists — Discord embed with buttons is sent."""
+        dispatch_comment = json.dumps({
+            "dispatch_state": {
+                "pr_number": 23,
+                "dispatched_at": "2026-01-01T00:00:00+00:00",
+                "container_id": "c1",
+                "work_item_id": "SA-TEST123456",
+            }
+        })
+        dispatch_marker = f"{self._DISPATCH_MARKER_PREFIX}23 -->"
+
+        result_payload = json.dumps({
+            "audit_result": {
+                "overall": "pass",
+                "summary": "Everything checks out.",
+                "concerns": [],
+                "criteria": [{"name": "Tests", "pass": True, "notes": "OK"}],
+                "pr_number": 23,
+                "audited_at": "2026-01-02T00:00:00+00:00",
+            }
+        })
+        result_marker = self._RESULT_MARKER
+
+        def wl_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "wl show" in cmd_str:
+                return subprocess.CompletedProcess(
+                    [], 0,
+                    json.dumps({
+                        "comments": [
+                            {"comment": f"{dispatch_marker}\n{dispatch_comment}"},
+                            {"comment": f"{result_marker}\n{result_payload}"},
+                        ]
+                    }),
+                    "",
+                )
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        notifier = mock.MagicMock()
+        runner = self._make_runner(wl_shell=wl_shell, notifier=notifier)
+        pr = {"headRefName": "feature/SA-TEST123456-foo", "number": 23}
+        runner._check_and_present_audit_results(
+            "gh", pr, 23, "Audited PR", "http://pr/23"
+        )
+
+        notifier.notify.assert_called_once()
+        payload = notifier.notify.call_args[1]["payload"]
+        assert "PASS" in payload["embeds"][0]["title"]
+        assert payload["components"][0]["custom_id"] == "pr_review_approve_23"
+
+    def test_exception_does_not_propagate(self):
+        """Internal errors are caught — run continues."""
+        def wl_shell(cmd, **kwargs):
+            raise RuntimeError("wl crashed")
+
+        runner = self._make_runner(wl_shell=wl_shell)
+        pr = {"headRefName": "feature/SA-TEST123456-foo", "number": 24}
+        # Should not raise
+        runner._check_and_present_audit_results("gh", pr, 24, "PR", "")

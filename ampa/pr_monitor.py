@@ -212,6 +212,14 @@ class PRMonitorRunner:
                         pr_number,
                     )
                     skipped_prs.append(pr_number)
+
+                    # Even though we skip the ready comment, check for
+                    # pending audit results when auto_review is enabled.
+                    if auto_review:
+                        self._check_and_present_audit_results(
+                            gh_cmd, pr, pr_number, pr_title,
+                            pr.get("url", ""),
+                        )
                     continue
 
                 self._handle_ready_pr(
@@ -615,6 +623,165 @@ class PRMonitorRunner:
                     "for work item %s",
                     work_item_id,
                 )
+
+    # ------------------------------------------------------------------
+    # Audit result collection and Discord presentation
+    # ------------------------------------------------------------------
+
+    def _check_and_present_audit_results(
+        self,
+        gh_cmd: str,
+        pr: Dict[str, Any],
+        pr_number: int,
+        pr_title: str,
+        pr_url: str,
+    ) -> None:
+        """Check for completed audit results and present them in Discord.
+
+        Called on subsequent runs for PRs that are already marked ready
+        and have a dispatch in progress.  If the audit agent has posted
+        results, a Discord embed with Approve/Reject buttons is sent.
+
+        If no dispatch marker or no results yet, this is a no-op.
+        """
+        try:
+            work_item_id = self._extract_work_item_id(pr, gh_cmd)
+            if not work_item_id:
+                return
+
+            # Check if a dispatch was made
+            dispatch_state = self._get_audit_dispatch_state(
+                work_item_id, pr_number
+            )
+            if dispatch_state is None:
+                # No dispatch recorded — nothing to check.
+                # (This can happen if auto_review was just enabled and the
+                # PR was already marked ready before dispatch existed.)
+                # Trigger a dispatch instead.
+                self._dispatch_review(gh_cmd, pr, pr_number, pr_title)
+                return
+
+            # Check for audit results
+            audit = self._get_audit_result(work_item_id, pr_number)
+            if audit is None:
+                LOG.debug(
+                    "pr-monitor: no audit result yet for PR #%d "
+                    "(work item %s) — audit may still be running",
+                    pr_number,
+                    work_item_id,
+                )
+                return
+
+            # Present the results in Discord
+            self._present_audit_results(
+                pr_number, pr_title, pr_url, work_item_id, audit
+            )
+        except Exception:
+            LOG.exception(
+                "pr-monitor: error checking audit results for PR #%d",
+                pr_number,
+            )
+
+    def _present_audit_results(
+        self,
+        pr_number: int,
+        pr_title: str,
+        pr_url: str,
+        work_item_id: str,
+        audit: Dict[str, Any],
+    ) -> None:
+        """Build and send a Discord embed with audit results and action buttons.
+
+        The embed includes:
+        - Overall verdict (pass/fail/partial)
+        - Per-criterion results
+        - Concerns
+        - Approve Merge / Reject buttons
+
+        Button custom_ids follow the convention:
+        ``pr_review_approve_{pr_number}`` and ``pr_review_reject_{pr_number}``.
+        """
+        if self._notifier is None:
+            LOG.debug(
+                "pr-monitor: no notifier — cannot present audit results "
+                "for PR #%d",
+                pr_number,
+            )
+            return
+
+        overall = audit.get("overall", "unknown")
+        summary = audit.get("summary", "No summary available.")
+        concerns = audit.get("concerns", [])
+        criteria = audit.get("criteria", [])
+
+        # Colour: green=pass, red=fail, yellow=partial
+        colour_map = {"pass": 0x2ECC71, "fail": 0xE74C3C, "partial": 0xF39C12}
+        colour = colour_map.get(overall, 0x95A5A6)
+
+        # Build criteria fields
+        fields = []
+        for c in criteria[:10]:  # Cap at 10 to avoid embed limits
+            name = c.get("name", "Criterion")
+            passed = c.get("pass", False)
+            notes = c.get("notes", "")
+            icon = "PASS" if passed else "FAIL"
+            value = f"[{icon}] {notes}" if notes else f"[{icon}]"
+            fields.append({"name": name, "value": value, "inline": False})
+
+        if concerns:
+            concern_text = "\n".join(f"- {c}" for c in concerns[:5])
+            fields.append({
+                "name": "Concerns",
+                "value": concern_text,
+                "inline": False,
+            })
+
+        embed = {
+            "title": f"Audit: PR #{pr_number} — {overall.upper()}",
+            "description": f"**{pr_title}**\n\n{summary}",
+            "url": pr_url,
+            "color": colour,
+            "fields": fields,
+            "footer": {"text": f"Work item: {work_item_id}"},
+        }
+
+        components = [
+            {
+                "type": "button",
+                "label": "Approve Merge",
+                "style": "success",
+                "custom_id": f"pr_review_approve_{pr_number}",
+            },
+            {
+                "type": "button",
+                "label": "Reject",
+                "style": "danger",
+                "custom_id": f"pr_review_reject_{pr_number}",
+            },
+        ]
+
+        payload = {
+            "content": (
+                f"Audit complete for PR #{pr_number}: "
+                f"{pr_title} — {overall.upper()}"
+            ),
+            "embeds": [embed],
+            "components": components,
+        }
+
+        try:
+            self._notifier.notify(payload=payload, message_type="command")
+            LOG.info(
+                "pr-monitor: presented audit results for PR #%d "
+                "(verdict: %s)",
+                pr_number,
+                overall,
+            )
+        except Exception:
+            LOG.exception(
+                "pr-monitor: failed to send audit results for PR #%d",
+                pr_number,
+            )
 
     def _handle_failing_pr(
         self,
