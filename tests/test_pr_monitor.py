@@ -443,7 +443,8 @@ class TestPRMonitorDedup:
         result = runner.run(spec)
 
         assert result["action"] == "completed"
-        assert 33 in result["skipped_prs"]
+        assert 33 in result["ready_existing_prs"]
+        assert 33 not in result["skipped_prs"]
         assert 33 not in result["ready_prs"]
 
     def test_does_not_skip_when_dedup_disabled(self):
@@ -577,6 +578,53 @@ class TestPRMonitorMultiplePRs:
         assert 1 in result["ready_prs"]
         assert 2 in result["failing_prs"]
         assert 3 in result["skipped_prs"]
+
+    def test_dedup_existing_ready_not_counted_as_skipped(self):
+        pr_list = _pr_list_json(
+            [
+                {
+                    "number": 66,
+                    "title": "Already ready",
+                    "url": "https://github.com/repo/pull/66",
+                    "headRefName": "wl-SA-66",
+                }
+            ]
+        )
+        checks = _checks_json(
+            [{"name": "ci", "bucket": "pass"}]
+        )
+
+        def run_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "gh --version" in cmd_str:
+                return subprocess.CompletedProcess([], 0, "gh version 2.x", "")
+            if "gh pr list" in cmd_str:
+                return subprocess.CompletedProcess([], 0, pr_list, "")
+            if "gh pr checks" in cmd_str:
+                return subprocess.CompletedProcess([], 0, checks, "")
+            if "gh pr view" in cmd_str:
+                return subprocess.CompletedProcess(
+                    [],
+                    0,
+                    json.dumps(
+                        {
+                            "comments": [
+                                {"body": "<!-- ampa-pr-monitor:ready --> ready"}
+                            ]
+                        }
+                    ),
+                    "",
+                )
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = PRMonitorRunner(run_shell=run_shell, command_cwd="/tmp")
+        result = runner.run(_make_pr_monitor_spec(dedup=True, auto_review=False))
+
+        assert result["open_prs"] == 1
+        assert result["ready_prs"] == []
+        assert result["ready_existing_prs"] == [66]
+        assert result["skipped_prs"] == []
+        assert result["skipped_dedup_prs"] == 1
 
 
 # ---------------------------------------------------------------------------

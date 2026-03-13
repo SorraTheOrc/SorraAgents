@@ -186,6 +186,7 @@ def test_format_human_normal_with_pr_monitor_metrics():
             "pr_monitor": {
                 "open_prs": 5,
                 "ready_prs": [11, 12],
+                "ready_existing_prs": [16],
                 "failing_prs": [13],
                 "skipped_prs": [14, 15],
                 "llm_reviews_dispatched": 2,
@@ -198,6 +199,7 @@ def test_format_human_normal_with_pr_monitor_metrics():
     text = _format_run_result_human(spec, run, "normal", "host")
     assert "Open PRs:  5" in text
     assert "Ready:     2" in text
+    assert "Ready Existing: 1" in text
     assert "Failing:   1" in text
     assert "Skipped:   2" in text
     assert "LLM Reviews: dispatched=2, presented=1" in text

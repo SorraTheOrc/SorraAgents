@@ -671,6 +671,9 @@ class Scheduler:
                 if isinstance(run, CommandRunResult):
                     open_prs = int(result.get("open_prs", result.get("prs_checked", 0)))
                     ready_count = len(result.get("ready_prs", []) or [])
+                    ready_existing_count = len(
+                        result.get("ready_existing_prs", []) or []
+                    )
                     failing_count = len(result.get("failing_prs", []) or [])
                     skipped_count = len(result.get("skipped_prs", []) or [])
                     pending_count = int(result.get("skipped_pending_prs", 0) or 0)
@@ -688,6 +691,7 @@ class Scheduler:
                     summary_lines = [
                         f"open_prs={open_prs}",
                         f"ready_for_review={ready_count}",
+                        f"ready_existing={ready_existing_count}",
                         f"failing={failing_count}",
                         f"skipped={skipped_count}",
                         f"pending_checks={pending_count}",

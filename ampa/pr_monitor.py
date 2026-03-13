@@ -118,7 +118,8 @@ class PRMonitorRunner:
             * ``action`` — ``"completed"``, ``"no_prs"``, ``"gh_unavailable"``,
               ``"list_failed"``
             * ``prs_checked`` — number of PRs evaluated
-            * ``ready_prs`` — list of PR numbers marked ready
+            * ``ready_prs`` — list of PR numbers newly marked ready
+            * ``ready_existing_prs`` — list of PR numbers already marked ready
             * ``failing_prs`` — list of PR numbers with failing CI
             * ``skipped_prs`` — list of PR numbers skipped (already notified)
             * ``note`` — human-readable summary
@@ -149,6 +150,7 @@ class PRMonitorRunner:
                 "prs_checked": 0,
                 "open_prs": 0,
                 "ready_prs": [],
+                "ready_existing_prs": [],
                 "failing_prs": [],
                 "skipped_prs": [],
                 "skipped_pending_prs": 0,
@@ -170,6 +172,7 @@ class PRMonitorRunner:
                 "prs_checked": 0,
                 "open_prs": 0,
                 "ready_prs": [],
+                "ready_existing_prs": [],
                 "failing_prs": [],
                 "skipped_prs": [],
                 "skipped_pending_prs": 0,
@@ -188,6 +191,7 @@ class PRMonitorRunner:
                 "prs_checked": 0,
                 "open_prs": 0,
                 "ready_prs": [],
+                "ready_existing_prs": [],
                 "failing_prs": [],
                 "skipped_prs": [],
                 "skipped_pending_prs": 0,
@@ -201,6 +205,7 @@ class PRMonitorRunner:
 
         # 3. Evaluate each PR
         ready_prs: List[int] = []
+        ready_existing_prs: List[int] = []
         failing_prs: List[int] = []
         skipped_prs: List[int] = []
         skipped_pending_prs = 0
@@ -245,7 +250,7 @@ class PRMonitorRunner:
                         "pr-monitor: PR #%d already marked ready — skipping",
                         pr_number,
                     )
-                    skipped_prs.append(pr_number)
+                    ready_existing_prs.append(pr_number)
                     skipped_dedup_prs += 1
 
                     # Even though we skip the ready comment, check for
@@ -276,7 +281,8 @@ class PRMonitorRunner:
 
         note = (
             f"pr-monitor: checked {len(prs)} PR(s) — "
-            f"{len(ready_prs)} ready, {len(failing_prs)} failing, "
+            f"{len(ready_prs)} ready, {len(ready_existing_prs)} ready_existing, "
+            f"{len(failing_prs)} failing, "
             f"{len(skipped_prs)} skipped; "
             f"{self._metrics.get('llm_reviews_dispatched', 0)} LLM dispatched; "
             f"{self._metrics.get('llm_reviews_presented', 0)} LLM presented; "
@@ -289,6 +295,7 @@ class PRMonitorRunner:
             "prs_checked": len(prs),
             "open_prs": len(prs),
             "ready_prs": ready_prs,
+            "ready_existing_prs": ready_existing_prs,
             "failing_prs": failing_prs,
             "skipped_prs": skipped_prs,
             "skipped_pending_prs": skipped_pending_prs,
