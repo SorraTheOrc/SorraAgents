@@ -68,14 +68,18 @@ def _make_pr_monitor_spec(
     dedup: bool = True,
     max_prs: int = 50,
     gh_command: str = "gh",
+    auto_review: Optional[bool] = None,
 ) -> CommandSpec:
+    metadata = {"dedup": dedup, "max_prs": max_prs, "gh_command": gh_command}
+    if auto_review is not None:
+        metadata["auto_review"] = auto_review
     return CommandSpec(
         command_id=command_id,
         command="echo pr-monitor",
         requires_llm=False,
         frequency_minutes=60,
         priority=0,
-        metadata={"dedup": dedup, "max_prs": max_prs, "gh_command": gh_command},
+        metadata=metadata,
         title="PR Monitor",
         max_runtime_minutes=10,
         command_type="pr-monitor",
@@ -718,6 +722,53 @@ class TestSchedulerPRMonitor:
             run = sched.start_command(_make_pr_monitor_spec())
 
         assert run is not None
+
+    def test_scheduler_auto_review_missing_defaults_enabled(self):
+        """Missing auto_review metadata should still inject dispatcher."""
+        sched = _make_scheduler()
+        with mock.patch("ampa.scheduler.notifications_module"), \
+            mock.patch("ampa.engine.dispatch.ContainerDispatcher") as dispatcher_cls, \
+            mock.patch("ampa.pr_monitor.PRMonitorRunner") as runner_cls:
+            runner = runner_cls.return_value
+            runner.run.return_value = {"action": "completed"}
+            run = sched.start_command(_make_pr_monitor_spec())
+
+        assert run is not None
+        dispatcher_cls.assert_called_once()
+        kwargs = runner_cls.call_args.kwargs
+        assert kwargs["dispatcher"] is dispatcher_cls.return_value
+
+    def test_scheduler_auto_review_false_skips_dispatcher(self):
+        """Explicit auto_review=False should disable dispatcher injection."""
+        sched = _make_scheduler()
+        with mock.patch("ampa.scheduler.notifications_module"), \
+            mock.patch("ampa.engine.dispatch.ContainerDispatcher") as dispatcher_cls, \
+            mock.patch("ampa.pr_monitor.PRMonitorRunner") as runner_cls:
+            runner = runner_cls.return_value
+            runner.run.return_value = {"action": "completed"}
+            run = sched.start_command(_make_pr_monitor_spec(auto_review=False))
+
+        assert run is not None
+        dispatcher_cls.assert_not_called()
+        kwargs = runner_cls.call_args.kwargs
+        assert kwargs["dispatcher"] is None
+
+    def test_scheduler_dispatcher_failure_does_not_stop_pr_monitor(self):
+        """ContainerDispatcher errors should not abort pr-monitor execution."""
+        sched = _make_scheduler()
+        with mock.patch("ampa.scheduler.notifications_module"), \
+            mock.patch(
+                "ampa.engine.dispatch.ContainerDispatcher",
+                side_effect=RuntimeError("boom"),
+            ), \
+            mock.patch("ampa.pr_monitor.PRMonitorRunner") as runner_cls:
+            runner = runner_cls.return_value
+            runner.run.return_value = {"action": "completed"}
+            run = sched.start_command(_make_pr_monitor_spec())
+
+        assert run is not None
+        kwargs = runner_cls.call_args.kwargs
+        assert kwargs["dispatcher"] is None
 
     def test_pr_monitor_auto_registered(self):
         """Scheduler init auto-registers the pr-monitor command."""

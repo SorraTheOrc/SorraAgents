@@ -640,10 +640,12 @@ class Scheduler:
             try:
                 from .pr_monitor import PRMonitorRunner
 
-                # Lazily create a dispatcher only when auto_review is enabled.
+                # Lazily create a dispatcher when auto_review is enabled.
+                # Opt-out semantics: missing key defaults to True.
                 dispatcher = None
                 meta = getattr(spec, "metadata", {}) or {}
-                if meta.get("auto_review"):
+                auto_review = bool(meta.get("auto_review", True))
+                if auto_review:
                     try:
                         from .engine.dispatch import ContainerDispatcher
 
