@@ -1,0 +1,372 @@
+{
+  "success": true,
+  "workItem": {
+    "id": "SA-0MMN9YNS41N1B77L",
+    "title": "Add LLM-driven PR review action to pr-monitor for CI-passing PRs",
+    "description": "# LLM-driven PR Review Action for pr-monitor\n\n**Headline:** Automate PR review for CI-passing PRs by dispatching an LLM audit agent in a container, presenting results in Discord with one-click merge approval.\n\n## Problem Statement\n\nWhen all CI checks pass on a PR, the pr-monitor currently posts notifications but takes no further action. The operator must manually review the PR against its work item's acceptance criteria and merge it. This creates a bottleneck and delays merges, particularly when multiple PRs are ready concurrently.\n\n## Users\n\n- **Operators** managing the AMPA project lifecycle. They want to receive an automated audit summary in Discord so they can approve or reject merges without manually reviewing every change against the work item.\n\n**User story:** As an operator, when a PR passes all CI checks, I want the pr-monitor to dispatch an LLM agent to audit the PR against its work item's acceptance criteria and present the results in Discord with Approve/Reject buttons, so I can merge with a single click or ignore it if I disagree.\n\n## Success Criteria\n\n1. When `auto_review` is enabled and a PR passes CI, the pr-monitor dispatches an LLM audit via `ContainerDispatcher` on the first eligible run, tracks the dispatch via the work item state, and does not re-dispatch on subsequent runs.\n2. On subsequent runs, when an audit result is found in the work item (dated after the PR's last modification), the pr-monitor sends a Discord embed with audit summary, PR details, and Approve Merge / Reject buttons.\n3. Clicking Approve Merge routes through `_route_interaction()` to `conversation_manager.resume_session()`, which triggers merge (via `gh pr merge`), work item close, and branch deletion -- all executed directly in the daemon process.\n4. Clicking Reject records the decline, posts a PR comment, and closes the session without merging.\n5. If no approval or rejection occurs, the pr-monitor re-sends the full audit embed with buttons on each subsequent run until the operator acts or the PR is otherwise closed.\n6. When `auto_review` is not set or is false, behaviour is unchanged (backwards compatible, opt-in).\n7. Audit dispatch failures are logged and recorded as work item comments but do not block the rest of the pr-monitor run.\n8. If no work item ID can be extracted from a PR, the auto-review is skipped for that PR and a debug-level log is emitted (no error).\n\n## Constraints\n\n- **Container dependency:** The audit runs inside a distrobox container via `ContainerDispatcher`. Container pool availability limits concurrency; dispatch must handle \"no container available\" gracefully.\n- **Asynchronous multi-run model:** The audit is dispatched on one pr-monitor run and results are collected on a subsequent run. The pr-monitor does not wait synchronously for audit completion.\n- **Audit storage dependency:** Audit results will be stored as structured data within the work item itself (likely via a forthcoming extension to `wl update` or similar Worklog command). This feature is blocked on that capability being available.\n- **Work item identification:** The pr-monitor must reliably extract the work item ID from the PR (branch name `wl-<id>-*`, PR body marker, or linked GitHub issue). If no work item can be identified, the auto-review should be skipped for that PR.\n- **Merge executes in daemon:** The merge-and-cleanup step (Phase 4) runs directly in the daemon process via shell commands, not inside a container.\n- **No approval timeout:** Approval buttons remain active indefinitely. The pr-monitor re-notifies every run until the operator acts.\n- **Opt-in via metadata:** The `auto_review` metadata flag (default `false`) gates the entire feature, preserving backward compatibility.\n\n## Blocking Dependency\n\nThis feature requires a child work item defining the minimum viable Worklog audit storage capability needed by the pr-monitor. This capability will likely be an extension to `wl update` (or a similar existing Worklog command) rather than a new `wl audit` command. The child item should specify: how the audit agent writes results into the work item, how the pr-monitor queries for audit results and their timestamps, and the minimum data schema (pass/fail per criterion, summary, concerns).\n\n## Existing State\n\n- `PRMonitorRunner` in `ampa/pr_monitor.py` handles CI-passing PRs by posting a GitHub comment (with `_READY_COMMENT_MARKER` dedup), a Worklog comment, and a Discord notification. No automated review or merge.\n- `ContainerDispatcher` in `ampa/engine/dispatch.py` provides container pool dispatch (claim, spawn, timeout, teardown). Fully implemented.\n- `discord_bot.py` handles button interactions via `process_interaction()` -> `_route_interaction()`. Non-test interactions currently hit a `# Future:` placeholder that logs but does nothing.\n- `conversation_manager.py` provides `start_conversation()` (records pending prompt, sets `waiting_for_input`) and `resume_session()` (validates state, emits event, transitions to `running`). Fully implemented.\n- `responder.py` provides `resume_from_payload()` mapping `accept`/`decline` actions to `conversation_manager.resume_session()`. Fully implemented.\n- `scheduler_helpers.py` registers `pr-monitor` with `metadata={\"dedup\": True, \"max_prs\": 50}`. No `auto_review` field yet.\n\n## Desired Change\n\n### Phase 1: Audit dispatch\n- Add `_dispatch_review()` to `PRMonitorRunner` that extracts the work item ID, composes a review prompt, and dispatches it via `ContainerDispatcher`.\n- The audit agent uses the forthcoming Worklog audit capability to write structured audit results into the work item.\n- Track dispatch state via the work item (not via PR comment markers). On subsequent runs, check the work item for audit state to avoid re-dispatching.\n\n### Phase 2: Audit result collection and presentation\n- On subsequent pr-monitor runs, check the work item for audit results dated after the PR's last modification time.\n- When results are found, compose a Discord embed with audit summary, PR metadata, and Approve Merge / Reject buttons.\n- Use `conversation_manager.start_conversation()` to record the pending approval as `waiting_for_input`.\n- Re-send the full embed on every subsequent run until the operator acts.\n\n### Phase 3: Interaction routing\n- Extend `_route_interaction()` in `discord_bot.py` to handle `pr_review_approve_*` and `pr_review_reject_*` custom_ids.\n- On approve: call `responder.resume_from_payload()` with `action=accept`, triggering merge-and-cleanup.\n- On reject: call with `action=decline`, posting a PR comment and closing the session.\n\n### Phase 4: Merge and cleanup (on approval)\n- Execute directly in the daemon process: `gh pr merge`, `wl close`, branch deletion.\n- Post confirmation to Discord and Worklog.\n\n### Configuration\n- Add `auto_review: false` to the pr-monitor metadata defaults in `scheduler_helpers.py`.\n- Supported metadata keys: `auto_review` (bool), `auto_review_prompt_template` (optional string), `auto_review_container_timeout` (optional int).\n\n### Files likely to change\n- `ampa/pr_monitor.py` -- `_dispatch_review()`, `_handle_ready_pr()` update, work-item-ID extraction, audit-result presentation\n- `ampa/scheduler_helpers.py` -- metadata defaults\n- `ampa/scheduler.py` -- inject `ContainerDispatcher` into `PRMonitorRunner`\n- `ampa/discord_bot.py` -- extend `_route_interaction()`\n- `tests/test_pr_monitor.py`, `tests/test_discord_bot.py`, `tests/test_scheduler_run.py` -- new tests\n\n## Risks & Assumptions\n\n### Risks\n- **Scope creep:** The four-phase design touches multiple subsystems (pr-monitor, Discord bot, conversation manager, scheduler). Mitigation: record additional feature ideas and refactorings as separate work items linked to this one rather than expanding scope.\n- **Container pool exhaustion:** If multiple PRs pass CI simultaneously, audit dispatches may fail due to limited pool size (3 containers). Mitigation: dispatch failure is already handled gracefully (log + comment, no block); consider a queue-based retry in a follow-up item.\n- **Discord notification flooding:** Re-sending the full audit embed every pr-monitor run (default 60 min) could create noise if the operator is away. Mitigation: acceptable for now; a lighter reminder mode can be a follow-up item.\n- **Audit quality variance:** LLM audit results may vary in quality or miss subtle issues. Mitigation: the human-in-the-loop approval gate ensures no merge without operator review.\n- **Stale audit results:** If a PR receives new commits after the audit was dispatched but before approval, the audit results become stale. Mitigation: the pr-monitor checks that audit results are dated after the PR's last modification time; new commits invalidate old audits and trigger a new dispatch.\n\n### Assumptions\n- The Worklog audit storage capability (likely via `wl update` extension) will provide a way to write structured audit data into the work item and query it with timestamps.\n- The `ContainerDispatcher` API will not change significantly before this feature is implemented.\n- The `conversation_manager` and `responder` APIs are stable and sufficient for the approval flow without modification.\n- The `_route_interaction()` placeholder in `discord_bot.py` can be extended without breaking existing test-button functionality.\n- The operator has `gh` CLI configured with sufficient permissions to merge PRs and delete branches.\n\n## Related Work\n\n- SA-0MM3CMZZD1K61ETX -- \"ContainerDispatcher implementation\" (completed). Provides the container dispatch infrastructure.\n- SA-0MM3CP6TH0AZQMUK -- \"Container lifecycle tracking in delegation\" (open). Related container state tracking.\n- SA-0MMLS6O0Y1DFCZWH -- \"Container-id tracking in engine dispatch records\" (open). Related dispatch record improvements.\n- SA-0MM01V1HM0JA8XVL -- \"Enable Discord bot interactive buttons (MVP)\" (completed). Provides the button infrastructure.\n- SA-0MM03XFHP05MRGCB -- \"Button Interaction Handler\" (completed). Provides interaction routing scaffolding.\n- SA-0MLHF6M5H02GTAT6 -- \"Implement agent conversation manager\" (completed). Provides `start_conversation` / `resume_session`.\n- SA-0MMLSW5RH1E16WAF -- \"Route ampa run through running daemon\" (completed). Discovered-from parent.\n- SA-0MLYZUKT30VDY7KF -- \"Use containers in the delegate flow\" (open). Parent epic for container delegation.\n\n## Related work (automated report)\n\nThis section was generated automatically by the `find_related` skill and may be updated on subsequent runs. Manual edits to this section may be overwritten.\n\n### Additional related work items\n\n- **SA-0MM03XTIO01J1MLN** — \"Conversation Manager No-Op Wiring\" (completed). Wired button interactions through conversation_manager/responder as a no-op pass-through for the MVP. This is the exact integration point that Phase 3 of this feature will extend: `_route_interaction()` currently dispatches test-button clicks as no-ops and has a placeholder for non-test custom_ids that will need to handle `pr_review_approve_*` / `pr_review_reject_*`.\n\n- **SA-0MM03WPV801P8Q8Z** — \"Socket Protocol Component Extension\" (completed). Extended the Unix socket JSON protocol between `notifications.py` and `discord_bot.py` with an optional `components` field for attaching button metadata. Phase 2 will use this protocol to send Discord embeds with Approve/Reject buttons from the pr-monitor.\n\n- **SA-0MM03X33703438S8** — \"Bot Button Construction and Sending\" (completed). Implemented `discord.ui.View` / `discord.ui.Button` construction from the `components` field. This is the rendering layer that Phase 2's audit-result embeds will rely on to present Approve Merge / Reject buttons.\n\n- **SA-0MLGZN32D031X3W6** — \"Responder REST endpoint\" (completed). Implemented the POST `/respond` endpoint that maps accept/decline payloads to `conversation_manager.resume_session()`. Phase 3's approve/reject flow routes through `responder.resume_from_payload()`, which was delivered by this item.\n\n- **SA-0MLJW08I01VIZ6JB** — \"Add recommendation-aware fallback modes\" (completed). Extended the responder/engine layer with `accept-recommendation` and `discuss-options` fallback modes and per-decision overrides. Relevant because the PR review approval flow introduces a new action type through the same responder pathway; understanding the existing mode/action vocabulary avoids conflicts.\n\n- **SA-0MLWQI6DC09TF7IY** — \"Audit integration & lifecycle updates\" (completed). Refactored triage audit into descriptor-driven command handlers for audit invocation, result parsing, and lifecycle transitions. The audit storage and result-query patterns established here inform how the pr-monitor will write and retrieve structured audit results from work items.\n\n- **SA-0MLYEOG9V107HE1D** — \"Audit detection & polling flow\" (completed). Extracted audit candidate detection, cooldown filtering, and one-at-a-time selection into a polling module. The asynchronous dispatch-then-poll pattern used here is architecturally analogous to how the pr-monitor will dispatch an audit on one run and collect results on a subsequent run.\n\n- **SA-0MLX8G4EK12N0B5S** — \"Dispatch interface and opencode run backend\" (completed). Defined the abstract `Dispatcher` protocol and implemented `OpenCodeRunDispatcher`, `ContainerDispatcher`, and `DryRunDispatcher` in `ampa/engine/dispatch.py`. This is the dispatch infrastructure that Phase 1's `_dispatch_review()` will call via `ContainerDispatcher`.\n\n- **SA-0MM3CPC3Y1E3XIYP** — \"Container teardown on completion\" (completed). Implemented `teardown_container()` and integrated it with the delegation completion flow. Relevant because audit containers dispatched by the pr-monitor will be torn down through this same mechanism after the audit agent completes.\n\n- **SA-0MLG0HXF9163MK1N** — \"Enable interactive opencode sessions for intake prompts\" (completed). Established the pattern for detecting blocked sessions, surfacing `waiting_for_input` state to Discord, and resuming via responder. The PR review approval flow follows the same human-in-the-loop pattern: dispatch work, wait for input, resume on operator action.\n\n### Related repository files\n\n- `ampa/pr_monitor.py` — Contains `PRMonitorRunner` and `_handle_ready_pr()` which will be extended with `_dispatch_review()` and audit-result presentation logic.\n- `ampa/discord_bot.py:188` — `_route_interaction()` function that currently handles test-button clicks; will be extended to route `pr_review_approve_*` and `pr_review_reject_*` custom_ids.\n- `ampa/conversation_manager.py` — Provides `start_conversation()` and `resume_session()` used by the approval flow.\n- `ampa/responder.py:15` — `resume_from_payload()` that maps accept/decline actions to `conversation_manager.resume_session()`.\n- `ampa/engine/dispatch.py:645` — `ContainerDispatcher` class used to dispatch the audit agent in a pool container.\n- `ampa/scheduler_helpers.py` — Registers pr-monitor command with metadata; will need `auto_review` default added.\n- `ampa/design/conversation_manager.md` — Design doc for the conversation manager pattern used by the approval flow.\n- `tests/test_pr_monitor.py` — Existing pr-monitor test suite to be extended with auto-review tests.\n- `tests/test_discord_bot.py` — Existing Discord bot tests covering `_route_interaction()`.\n- `tests/test_dispatch.py` — Comprehensive tests for all dispatcher implementations including `ContainerDispatcher`.",
+    "status": "in-progress",
+    "priority": "high",
+    "sortIndex": 500,
+    "parentId": null,
+    "createdAt": "2026-03-12T09:37:57.221Z",
+    "updatedAt": "2026-03-13T14:28:16.019Z",
+    "tags": [],
+    "assignee": "opencode",
+    "stage": "in_review",
+    "issueType": "epic",
+    "createdBy": "",
+    "deletedBy": "",
+    "deleteReason": "",
+    "risk": "",
+    "effort": "",
+    "githubIssueNumber": 564,
+    "githubIssueId": "I_kwDOQ9Hlbs7yahc9",
+    "githubIssueUpdatedAt": "2026-03-13T14:12:43Z",
+    "needsProducerReview": false
+  },
+  "comments": [
+    {
+      "id": "SA-C0MMOZRUVM0VMX794",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #579: No pool containers available",
+      "createdAt": "2026-03-13T14:28:16.019Z",
+      "references": []
+    },
+    {
+      "id": "SA-C0MMOYI0120N7915K",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "ampa-pr-monitor",
+      "comment": "<!-- ampa-pr-audit-dispatch:566 -->\n{\"dispatch_state\": {\"pr_number\": 566, \"dispatched_at\": \"2026-03-13T13:52:36.062823+00:00\", \"container_id\": \"ampa-pool-2\", \"work_item_id\": \"SA-0MMN9YNS41N1B77L\"}}",
+      "createdAt": "2026-03-13T13:52:36.519Z",
+      "references": [],
+      "githubCommentId": 4055402270,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:43Z"
+    },
+    {
+      "id": "SA-C0MMOYHXCC1CA8P1N",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "ampa-pr-monitor",
+      "comment": "<!-- ampa-pr-audit-dispatch:577 -->\n{\"dispatch_state\": {\"pr_number\": 577, \"dispatched_at\": \"2026-03-13T13:52:32.537128+00:00\", \"container_id\": \"ampa-pool-1\", \"work_item_id\": \"SA-0MMN9YNS41N1B77L\"}}",
+      "createdAt": "2026-03-13T13:52:33.036Z",
+      "references": [],
+      "githubCommentId": 4055401906,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:42Z"
+    },
+    {
+      "id": "SA-C0MMOYHURO054P8XK",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "ampa-pr-monitor",
+      "comment": "<!-- ampa-pr-audit-dispatch:578 -->\n{\"dispatch_state\": {\"pr_number\": 578, \"dispatched_at\": \"2026-03-13T13:52:29.206262+00:00\", \"container_id\": \"ampa-pool-0\", \"work_item_id\": \"SA-0MMN9YNS41N1B77L\"}}",
+      "createdAt": "2026-03-13T13:52:29.700Z",
+      "references": [],
+      "githubCommentId": 4055401731,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:40Z"
+    },
+    {
+      "id": "SA-C0MMOSC2ZA1B1TKNV",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "ampa-pr-monitor",
+      "comment": "<!-- ampa-pr-audit-dispatch:566 -->\n{\"dispatch_state\": {\"pr_number\": 566, \"dispatched_at\": \"2026-03-13T11:00:02.223403+00:00\", \"container_id\": \"ampa-pool-2\", \"work_item_id\": \"SA-0MMN9YNS41N1B77L\"}}",
+      "createdAt": "2026-03-13T11:00:02.710Z",
+      "references": []
+    },
+    {
+      "id": "SA-C0MMOSC0N915L13AJ",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "ampa-pr-monitor",
+      "comment": "<!-- ampa-pr-audit-dispatch:577 -->\n{\"dispatch_state\": {\"pr_number\": 577, \"dispatched_at\": \"2026-03-13T10:59:59.256496+00:00\", \"container_id\": \"ampa-pool-1\", \"work_item_id\": \"SA-0MMN9YNS41N1B77L\"}}",
+      "createdAt": "2026-03-13T10:59:59.685Z",
+      "references": []
+    },
+    {
+      "id": "SA-C0MMOSBYEN0TDLFBR",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "ampa-pr-monitor",
+      "comment": "<!-- ampa-pr-audit-dispatch:578 -->\n{\"dispatch_state\": {\"pr_number\": 578, \"dispatched_at\": \"2026-03-13T10:59:56.347051+00:00\", \"container_id\": \"ampa-pool-0\", \"work_item_id\": \"SA-0MMN9YNS41N1B77L\"}}",
+      "createdAt": "2026-03-13T10:59:56.783Z",
+      "references": []
+    },
+    {
+      "id": "SA-C0MMORYYEI0CD2SAG",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T10:49:50.251Z",
+      "references": [],
+      "githubCommentId": 4055401552,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:39Z"
+    },
+    {
+      "id": "SA-C0MMORYW7E17ZHAY8",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #577: No pool containers available",
+      "createdAt": "2026-03-13T10:49:47.402Z",
+      "references": [],
+      "githubCommentId": 4055401195,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:37Z"
+    },
+    {
+      "id": "SA-C0MMORYTV61XRHLLA",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #578: No pool containers available",
+      "createdAt": "2026-03-13T10:49:44.370Z",
+      "references": [],
+      "githubCommentId": 4055400771,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:35Z"
+    },
+    {
+      "id": "SA-C0MMORRQ8W1KGW100",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T10:44:13.088Z",
+      "references": [],
+      "githubCommentId": 4055400316,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:33Z"
+    },
+    {
+      "id": "SA-C0MMORRNVO1UBM18F",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #577: No pool containers available",
+      "createdAt": "2026-03-13T10:44:10.020Z",
+      "references": [],
+      "githubCommentId": 4055399912,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:31Z"
+    },
+    {
+      "id": "SA-C0MMORRLIV0G4GIQE",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #578: No pool containers available",
+      "createdAt": "2026-03-13T10:44:06.967Z",
+      "references": [],
+      "githubCommentId": 4055399596,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:29Z"
+    },
+    {
+      "id": "SA-C0MMOR6N380RWSABY",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T10:27:49.220Z",
+      "references": [],
+      "githubCommentId": 4055399299,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:27Z"
+    },
+    {
+      "id": "SA-C0MMOR6KMU1VWLD33",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #577: No pool containers available",
+      "createdAt": "2026-03-13T10:27:46.039Z",
+      "references": [],
+      "githubCommentId": 4055398984,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:25Z"
+    },
+    {
+      "id": "SA-C0MMON8REX1XI6A2Y",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:37:29.673Z",
+      "references": [],
+      "githubCommentId": 4055398584,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:23Z"
+    },
+    {
+      "id": "SA-C0MMON8O5M1TS8VSA",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #577: No pool containers available",
+      "createdAt": "2026-03-13T08:37:25.450Z",
+      "references": [],
+      "githubCommentId": 4055398294,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:22Z"
+    },
+    {
+      "id": "SA-C0MMON3J5W0XBNXUS",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:33:25.701Z",
+      "references": [],
+      "githubCommentId": 4055398123,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:20Z"
+    },
+    {
+      "id": "SA-C0MMON3FXM1RYBY32",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #577: No pool containers available",
+      "createdAt": "2026-03-13T08:33:21.515Z",
+      "references": [],
+      "githubCommentId": 4055397879,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:19Z"
+    },
+    {
+      "id": "SA-C0MMON2W3X0WHF0RY",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:32:55.821Z",
+      "references": [],
+      "githubCommentId": 4055397717,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:18Z"
+    },
+    {
+      "id": "SA-C0MMON2SLY0PQ8F2K",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #577: No pool containers available",
+      "createdAt": "2026-03-13T08:32:51.287Z",
+      "references": [],
+      "githubCommentId": 4055397439,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:16Z"
+    },
+    {
+      "id": "SA-C0MMON1V9309P0W14",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:32:08.056Z",
+      "references": [],
+      "githubCommentId": 4055397121,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:15Z"
+    },
+    {
+      "id": "SA-C0MMON1RUB1SGK4LX",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #577: No pool containers available",
+      "createdAt": "2026-03-13T08:32:03.636Z",
+      "references": [],
+      "githubCommentId": 4055396912,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:14Z"
+    },
+    {
+      "id": "SA-C0MMOMYRMS0MYUC5G",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:29:43.396Z",
+      "references": [],
+      "githubCommentId": 4055396656,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:12Z"
+    },
+    {
+      "id": "SA-C0MMOMPP9H0A915KK",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:22:40.421Z",
+      "references": [],
+      "githubCommentId": 4055396372,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:11Z"
+    },
+    {
+      "id": "SA-C0MMOMO8MP0OPQZ5D",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:21:32.210Z",
+      "references": [],
+      "githubCommentId": 4055396066,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:10Z"
+    },
+    {
+      "id": "SA-C0MMOMKRL10IW17KY",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:18:50.149Z",
+      "references": [],
+      "githubCommentId": 4055395724,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:08Z"
+    },
+    {
+      "id": "SA-C0MMOMEZKV1ICKNKR",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:14:20.576Z",
+      "references": [],
+      "githubCommentId": 4055395487,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:07Z"
+    },
+    {
+      "id": "SA-C0MMOMCF7T07HG8EL",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:12:20.873Z",
+      "references": [],
+      "githubCommentId": 4055395286,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:05Z"
+    },
+    {
+      "id": "SA-C0MMOMB3RI1RKHAWM",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:11:19.375Z",
+      "references": [],
+      "githubCommentId": 4055395032,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:04Z"
+    },
+    {
+      "id": "SA-C0MMOMA22E0HXWIPF",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:10:30.519Z",
+      "references": [],
+      "githubCommentId": 4055394800,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:03Z"
+    },
+    {
+      "id": "SA-C0MMOLXEH10NENGSQ",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "pr-monitor",
+      "comment": "Auto-review dispatch failed for PR #566: No pool containers available",
+      "createdAt": "2026-03-13T08:00:40.069Z",
+      "references": [],
+      "githubCommentId": 4055394545,
+      "githubCommentUpdatedAt": "2026-03-13T14:12:02Z"
+    },
+    {
+      "id": "SA-C0MMO1MS481KPF3AI",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "opencode",
+      "comment": "All 5 child work items implemented and in review. PR #566 (https://github.com/SorraTheOrc/SorraAgents/pull/566) created with all changes. Branch: feature/SA-0MMN9YNS41N1B77L-llm-pr-review. Commits: b9a76c3, 2352038, 0268034, b1274ee, c257b54. Full test suite: 1221 passed, 0 regressions.",
+      "createdAt": "2026-03-12T22:32:32.217Z",
+      "references": [],
+      "githubCommentId": 4051494178,
+      "githubCommentUpdatedAt": "2026-03-13T01:07:20Z"
+    },
+    {
+      "id": "SA-C0MMNE10LM06Y0ISO",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "Map",
+      "comment": "Intake complete. Priority remains high. No formal wl dep edges added -- the main blocking dependency is a child work item (to be created during planning) for the minimum viable Worklog audit storage capability. SA-0MM3CP6TH0AZQMUK (container lifecycle tracking) and SA-0MMLS6O0Y1DFCZWH (container-id tracking) are related but not blocking this feature.",
+      "createdAt": "2026-03-12T11:31:45.611Z",
+      "references": [],
+      "githubCommentId": 4049772194,
+      "githubCommentUpdatedAt": "2026-03-12T20:23:02Z"
+    }
+    ,
+    {
+      "id": "SA-C0MMAUDIT578",
+      "workItemId": "SA-0MMN9YNS41N1B77L",
+      "author": "audit-agent",
+      "comment": "<!-- ampa-pr-audit-result -->\n{\n  \"audit_result\": {\n    \"overall\": \"partial\",\n    \"criteria\": [\n      {\"name\": \"Discord summary links use PR-number links\", \"pass\": true, \"notes\": \"PR Monitor now formats ready/failing/skipped lists as [#n](url) in the Discord embed (see ampa/pr_monitor.py changes).\"},\n      {\"name\": \"Scheduler and CLI expose PR number lists\", \"pass\": true, \"notes\": \"scheduler and scheduler_cli now include ready_pr_numbers/failing_pr_numbers/skipped_pr_numbers and human-readable lists.\"},\n      {\"name\": \"Dispatch LLM audits for CI-passing PRs\", \"pass\": false, \"notes\": \"No changes to dispatch logic in this PR; LLM dispatch remains covered by other child items.\"},\n      {\"name\": \"Present audit results in Discord with action buttons\", \"pass\": false, \"notes\": \"No changes to audit presentation or operator action routing in this PR.\"},\n      {\"name\": \"End-to-end operator flow (Approve/Reject merge)\", \"pass\": false, \"notes\": \"Not implemented here; this PR is a targeted enhancement to summaries.\"}\n    ],\n    \"summary\": \"PR #578 updates run and Discord summaries to include PR-number links and exposes PR-number lists in scheduler metadata and CLI output. Changes are limited to summary formatting and tests; they do not modify LLM dispatch, audit presentation, or merge workflows.\",\n    \"concerns\": [\"Unrelated acceptance criteria for LLM dispatch and review actions remain unmet by this PR; merge is safe but does not complete the epic.\"],\n    \"audited_at\": \"2026-03-13T14:40:00Z\",\n    \"pr_number\": 578,\n    \"pr_sha\": null\n  }\n}",
+      "createdAt": "2026-03-13T14:40:00.000Z",
+      "references": [],
+      "githubCommentId": null,
+      "githubCommentUpdatedAt": null
+    }
+  ]
+}
