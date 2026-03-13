@@ -260,6 +260,7 @@ def _wsgi_app(environ, start_response):
                 "duration_seconds": round(run.duration_seconds, 3),
                 "exit_code": run.exit_code,
                 "output": output,
+                "metadata": getattr(run, "metadata", None),
                 "instance": instance,
             }
             return _json_response(start_response, "200 OK", result)

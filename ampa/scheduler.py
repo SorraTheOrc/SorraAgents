@@ -665,6 +665,49 @@ class Scheduler:
                 )
                 result = runner.run(spec)
                 LOG.info("pr-monitor result: %s", result)
+
+                # Attach a concise execution summary so `wl ampa run pr-monitor`
+                # surfaces meaningful metrics in normal output mode.
+                if isinstance(run, CommandRunResult):
+                    open_prs = int(result.get("open_prs", result.get("prs_checked", 0)))
+                    ready_count = len(result.get("ready_prs", []) or [])
+                    failing_count = len(result.get("failing_prs", []) or [])
+                    skipped_count = len(result.get("skipped_prs", []) or [])
+                    pending_count = int(result.get("skipped_pending_prs", 0) or 0)
+                    dedup_count = int(result.get("skipped_dedup_prs", 0) or 0)
+                    checks_unavailable = int(
+                        result.get("checks_unavailable_prs", 0) or 0
+                    )
+                    llm_dispatched = int(result.get("llm_reviews_dispatched", 0) or 0)
+                    llm_presented = int(result.get("llm_reviews_presented", 0) or 0)
+                    notifications = int(result.get("notifications_sent", 0) or 0)
+                    auto_review_enabled = bool(
+                        result.get("auto_review_enabled", False)
+                    )
+
+                    summary_lines = [
+                        f"open_prs={open_prs}",
+                        f"ready_for_review={ready_count}",
+                        f"failing={failing_count}",
+                        f"skipped={skipped_count}",
+                        f"pending_checks={pending_count}",
+                        f"dedup_skips={dedup_count}",
+                        f"checks_unavailable={checks_unavailable}",
+                        f"llm_reviews_dispatched={llm_dispatched}",
+                        f"llm_reviews_presented={llm_presented}",
+                        f"notifications_sent={notifications}",
+                        f"auto_review_enabled={str(auto_review_enabled).lower()}",
+                    ]
+                    if result.get("note"):
+                        summary_lines.append(str(result["note"]))
+
+                    run = CommandRunResult(
+                        start_ts=run.start_ts,
+                        end_ts=run.end_ts,
+                        exit_code=run.exit_code,
+                        output="\n".join(summary_lines),
+                        metadata={"pr_monitor": result},
+                    )
             except Exception:
                 LOG.exception("pr-monitor command failed")
             return run

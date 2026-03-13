@@ -122,7 +122,15 @@ class PRMonitorRunner:
             * ``failing_prs`` — list of PR numbers with failing CI
             * ``skipped_prs`` — list of PR numbers skipped (already notified)
             * ``note`` — human-readable summary
+            * ``open_prs`` — number of open PRs found
+            * ``skipped_pending_prs`` — number skipped due to pending checks
+            * ``skipped_dedup_prs`` — number skipped due to dedup marker
+            * ``checks_unavailable_prs`` — number skipped due to check query errors
+            * ``llm_reviews_dispatched`` — number of LLM audits dispatched
+            * ``llm_reviews_presented`` — number of audit results presented in Discord
+            * ``notifications_sent`` — number of Discord notifications sent
         """
+        self._metrics_reset()
         metadata: Dict[str, Any] = getattr(spec, "metadata", {}) or {}
         gh_cmd = str(metadata.get("gh_command", _DEFAULT_GH_COMMAND))
         dedup = _coerce_bool(metadata.get("dedup", True))
@@ -139,9 +147,16 @@ class PRMonitorRunner:
             return {
                 "action": "gh_unavailable",
                 "prs_checked": 0,
+                "open_prs": 0,
                 "ready_prs": [],
                 "failing_prs": [],
                 "skipped_prs": [],
+                "skipped_pending_prs": 0,
+                "skipped_dedup_prs": 0,
+                "checks_unavailable_prs": 0,
+                "llm_reviews_dispatched": 0,
+                "llm_reviews_presented": 0,
+                "notifications_sent": 0,
                 "note": note,
             }
 
@@ -153,9 +168,16 @@ class PRMonitorRunner:
             return {
                 "action": "list_failed",
                 "prs_checked": 0,
+                "open_prs": 0,
                 "ready_prs": [],
                 "failing_prs": [],
                 "skipped_prs": [],
+                "skipped_pending_prs": 0,
+                "skipped_dedup_prs": 0,
+                "checks_unavailable_prs": 0,
+                "llm_reviews_dispatched": 0,
+                "llm_reviews_presented": 0,
+                "notifications_sent": 0,
                 "note": note,
             }
         if not prs:
@@ -164,9 +186,16 @@ class PRMonitorRunner:
             return {
                 "action": "no_prs",
                 "prs_checked": 0,
+                "open_prs": 0,
                 "ready_prs": [],
                 "failing_prs": [],
                 "skipped_prs": [],
+                "skipped_pending_prs": 0,
+                "skipped_dedup_prs": 0,
+                "checks_unavailable_prs": 0,
+                "llm_reviews_dispatched": 0,
+                "llm_reviews_presented": 0,
+                "notifications_sent": 0,
                 "note": note,
             }
 
@@ -174,6 +203,9 @@ class PRMonitorRunner:
         ready_prs: List[int] = []
         failing_prs: List[int] = []
         skipped_prs: List[int] = []
+        skipped_pending_prs = 0
+        skipped_dedup_prs = 0
+        checks_unavailable_prs = 0
 
         for pr in prs:
             pr_number = pr.get("number")
@@ -189,6 +221,7 @@ class PRMonitorRunner:
                     "pr-monitor: could not retrieve check status for PR #%d",
                     pr_number,
                 )
+                checks_unavailable_prs += 1
                 continue
 
             all_passing, failing_checks, pending_checks = check_status
@@ -200,6 +233,7 @@ class PRMonitorRunner:
                     pr_number,
                 )
                 skipped_prs.append(pr_number)
+                skipped_pending_prs += 1
                 continue
 
             if all_passing:
@@ -212,6 +246,7 @@ class PRMonitorRunner:
                         pr_number,
                     )
                     skipped_prs.append(pr_number)
+                    skipped_dedup_prs += 1
 
                     # Even though we skip the ready comment, check for
                     # pending audit results when auto_review is enabled.
@@ -236,28 +271,67 @@ class PRMonitorRunner:
                 )
                 failing_prs.append(pr_number)
 
+        # Send summary notification (include PR metadata so we can format links)
+        self._notify_summary(ready_prs, failing_prs, skipped_prs, len(prs), prs)
+
         note = (
             f"pr-monitor: checked {len(prs)} PR(s) — "
             f"{len(ready_prs)} ready, {len(failing_prs)} failing, "
-            f"{len(skipped_prs)} skipped"
+            f"{len(skipped_prs)} skipped; "
+            f"{self._metrics.get('llm_reviews_dispatched', 0)} LLM dispatched; "
+            f"{self._metrics.get('llm_reviews_presented', 0)} LLM presented; "
+            f"{self._metrics.get('notifications_sent', 0)} notifications"
         )
         LOG.info(note)
-
-        # Send summary notification (include PR metadata so we can format links)
-        self._notify_summary(ready_prs, failing_prs, skipped_prs, len(prs), prs)
 
         return {
             "action": "completed",
             "prs_checked": len(prs),
+            "open_prs": len(prs),
             "ready_prs": ready_prs,
             "failing_prs": failing_prs,
             "skipped_prs": skipped_prs,
+            "skipped_pending_prs": skipped_pending_prs,
+            "skipped_dedup_prs": skipped_dedup_prs,
+            "checks_unavailable_prs": checks_unavailable_prs,
+            "llm_reviews_dispatched": int(
+                self._metrics.get("llm_reviews_dispatched", 0)
+            ),
+            "llm_reviews_presented": int(
+                self._metrics.get("llm_reviews_presented", 0)
+            ),
+            "notifications_sent": int(self._metrics.get("notifications_sent", 0)),
+            "auto_review_enabled": auto_review,
+            "dedup_enabled": dedup,
             "note": note,
         }
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _metrics_reset(self) -> None:
+        self._metrics = {
+            "llm_reviews_dispatched": 0,
+            "llm_reviews_presented": 0,
+            "notifications_sent": 0,
+        }
+
+    def _metric_inc(self, key: str, value: int = 1) -> None:
+        metrics = getattr(self, "_metrics", None)
+        if not isinstance(metrics, dict):
+            self._metrics_reset()
+            metrics = self._metrics
+        metrics[key] = int(metrics.get(key, 0)) + int(value)
+
+    def _send_notification(self, payload: Dict[str, Any], message_type: str) -> bool:
+        if self._notifier is None:
+            return False
+        # notifications.notify() requires a positional title argument even when
+        # sending a pre-built payload.
+        self._notifier.notify(title="", payload=payload, message_type=message_type)
+        self._metric_inc("notifications_sent")
+        return True
 
     def _gh_available(self, gh_cmd: str) -> bool:
         """Return True if the gh CLI is available."""
@@ -497,7 +571,7 @@ class PRMonitorRunner:
                         }
                     ],
                 }
-                self._notifier.notify(payload=payload, message_type="command")
+                self._send_notification(payload=payload, message_type="command")
         except Exception:
             LOG.exception(
                 "pr-monitor: failed to send ready notification for PR #%d",
@@ -593,6 +667,7 @@ class PRMonitorRunner:
                 dispatched_at=result.timestamp.isoformat(),
                 container_id=result.container_id or "",
             )
+            self._metric_inc("llm_reviews_dispatched")
         else:
             LOG.warning(
                 "pr-monitor: audit dispatch failed for PR #%d "
@@ -770,7 +845,9 @@ class PRMonitorRunner:
         }
 
         try:
-            self._notifier.notify(payload=payload, message_type="command")
+            sent = self._send_notification(payload=payload, message_type="command")
+            if sent:
+                self._metric_inc("llm_reviews_presented")
             LOG.info(
                 "pr-monitor: presented audit results for PR #%d "
                 "(verdict: %s)",
@@ -849,7 +926,7 @@ class PRMonitorRunner:
                         }
                     ],
                 }
-                self._notifier.notify(payload=payload, message_type="error")
+                self._send_notification(payload=payload, message_type="error")
         except Exception:
             LOG.exception(
                 "pr-monitor: failed to send failure notification for PR #%d",
@@ -1514,7 +1591,7 @@ class PRMonitorRunner:
                     }
                 ],
             }
-            self._notifier.notify(payload=payload, message_type="command")
+            self._send_notification(payload=payload, message_type="command")
         except Exception:
             LOG.exception(
                 "pr-monitor: failed to send review outcome notification "
@@ -1586,7 +1663,7 @@ class PRMonitorRunner:
                     }
                 ],
             }
-            self._notifier.notify(payload=payload, message_type="command")
+            self._send_notification(payload=payload, message_type="command")
         except Exception:
             LOG.exception("pr-monitor: failed to send summary notification")
 

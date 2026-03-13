@@ -116,6 +116,33 @@ def test_format_run_result_json_no_output():
     assert result["exit_code"] == 0
 
 
+def test_format_run_result_json_includes_pr_monitor_metadata():
+    spec = _make_spec("pr-monitor", command_type="pr-monitor", title="PR Monitor")
+    run = _make_run_result(exit_code=0, output="summary")
+    run = CommandRunResult(
+        start_ts=run.start_ts,
+        end_ts=run.end_ts,
+        exit_code=run.exit_code,
+        output=run.output,
+        metadata={
+            "pr_monitor": {
+                "open_prs": 3,
+                "ready_prs": [1, 2],
+                "failing_prs": [3],
+                "skipped_prs": [],
+                "llm_reviews_dispatched": 2,
+                "llm_reviews_presented": 1,
+                "notifications_sent": 4,
+                "auto_review_enabled": True,
+            }
+        },
+    )
+    result = json.loads(_format_run_result_json(spec, run, "host"))
+    assert "pr_monitor" in result
+    assert result["pr_monitor"]["open_prs"] == 3
+    assert result["pr_monitor"]["llm_reviews_dispatched"] == 2
+
+
 # ---- _format_run_result_human ----
 
 
@@ -145,6 +172,37 @@ def test_format_human_normal():
     assert "Exit code: 0" in text
     # Normal does NOT include output
     assert "hello world" not in text
+
+
+def test_format_human_normal_with_pr_monitor_metrics():
+    spec = _make_spec("pr-monitor", command_type="pr-monitor", title="PR Monitor")
+    run = _make_run_result(exit_code=0, output="summary")
+    run = CommandRunResult(
+        start_ts=run.start_ts,
+        end_ts=run.end_ts,
+        exit_code=run.exit_code,
+        output=run.output,
+        metadata={
+            "pr_monitor": {
+                "open_prs": 5,
+                "ready_prs": [11, 12],
+                "failing_prs": [13],
+                "skipped_prs": [14, 15],
+                "llm_reviews_dispatched": 2,
+                "llm_reviews_presented": 1,
+                "notifications_sent": 3,
+                "auto_review_enabled": True,
+            }
+        },
+    )
+    text = _format_run_result_human(spec, run, "normal", "host")
+    assert "Open PRs:  5" in text
+    assert "Ready:     2" in text
+    assert "Failing:   1" in text
+    assert "Skipped:   2" in text
+    assert "LLM Reviews: dispatched=2, presented=1" in text
+    assert "Notify:    sent=3" in text
+    assert "AutoReview:true" in text
 
 
 def test_format_human_full():
