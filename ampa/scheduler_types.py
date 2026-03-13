@@ -173,7 +173,7 @@ class SchedulerConfig:
             ),
             max_run_history=_int("AMPA_SCHEDULER_MAX_RUN_HISTORY", 50),
             container_dispatch_timeout_seconds=_int(
-                "AMPA_CONTAINER_DISPATCH_TIMEOUT", 30
+                "AMPA_CONTAINER_DISPATCH_TIMEOUT", 240
             ),
         )
 

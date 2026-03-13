@@ -123,7 +123,8 @@
         "dedup": true,
         "max_prs": 50,
         "discord_label": "pr monitor",
-        "truncate_chars": 65536
+        "truncate_chars": 65536,
+        "container_dispatch_timeout_seconds": 600
       },
       "priority": 0,
       "requires_llm": false,
