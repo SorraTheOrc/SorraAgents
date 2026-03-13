@@ -1,6 +1,7 @@
 """Candidate selection service for WL work items."""
 
 from __future__ import annotations
+import datetime as dt
 import hashlib
 import json
 import logging
@@ -33,8 +34,103 @@ def _candidate_content_hash(candidate: Dict[str, Any]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
-def _apply_content_dedup(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+class CandidateHashCache:
+    """Bounded TTL cache of candidate content hashes for cross-cycle dedup.
+
+    Persists seen candidate hashes between scheduler poll cycles so that
+    identical reports emitted in separate ``wl next`` invocations are
+    suppressed on subsequent ingestion passes.
+
+    Memory is bounded by two independent mechanisms:
+    - **TTL**: entries older than *ttl_seconds* are evicted on every write.
+    - **Max-size**: when the cache exceeds *max_size* the oldest entries
+      (by timestamp) are dropped, keeping the most-recent *max_size* hashes.
+
+    The cache is serialisable to/from a plain ``dict[str, str]``
+    (``{hash_hex: iso_timestamp}``) for storage in the scheduler state file.
+    """
+
+    DEFAULT_MAX_SIZE: int = 200
+    DEFAULT_TTL_SECONDS: int = 86400  # 24 hours
+
+    def __init__(
+        self,
+        entries: Optional[Dict[str, str]] = None,
+        max_size: int = DEFAULT_MAX_SIZE,
+        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    ) -> None:
+        self._entries: Dict[str, str] = dict(entries) if entries else {}
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+
+    # -- public interface ---------------------------------------------------
+
+    def is_duplicate(self, hash_str: str) -> bool:
+        """Return True if *hash_str* was marked seen and has not expired."""
+        return hash_str in self._entries
+
+    def mark_seen(self, hash_str: str) -> None:
+        """Record *hash_str* as seen (now) and evict stale/overflow entries."""
+        self._entries[hash_str] = dt.datetime.now(dt.timezone.utc).isoformat()
+        self._evict()
+
+    def to_dict(self) -> Dict[str, str]:
+        """Return a JSON-safe ``{hash: iso_timestamp}`` snapshot."""
+        return dict(self._entries)
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Any,
+        max_size: int = DEFAULT_MAX_SIZE,
+        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    ) -> "CandidateHashCache":
+        """Reconstruct a cache from a ``to_dict()`` snapshot."""
+        entries: Dict[str, str] = {}
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    entries[k] = v
+        return cls(entries=entries, max_size=max_size, ttl_seconds=ttl_seconds)
+
+    # -- eviction -----------------------------------------------------------
+
+    def _evict(self) -> None:
+        """Remove expired entries then trim to *max_size* (oldest first)."""
+        now = dt.datetime.now(dt.timezone.utc)
+        expired = []
+        for h, ts_str in self._entries.items():
+            try:
+                ts = dt.datetime.fromisoformat(ts_str)
+                if not ts.tzinfo:
+                    ts = ts.replace(tzinfo=dt.timezone.utc)
+                if (now - ts).total_seconds() > self.ttl_seconds:
+                    expired.append(h)
+            except Exception:
+                expired.append(h)
+        for h in expired:
+            del self._entries[h]
+        # Trim to max_size by removing the oldest (smallest) timestamps
+        if len(self._entries) > self.max_size:
+            sorted_entries = sorted(self._entries.items(), key=lambda x: x[1])
+            n_remove = len(self._entries) - self.max_size
+            for h, _ in sorted_entries[:n_remove]:
+                del self._entries[h]
+
+
+def _apply_content_dedup(
+    candidates: List[Dict[str, Any]],
+    hash_cache: Optional[CandidateHashCache] = None,
+) -> List[Dict[str, Any]]:
     """Remove exact-duplicate candidates using content hashing.
+
+    Performs two layers of deduplication:
+    1. **Within-payload**: suppresses candidates that appear more than once
+       in the current *candidates* list (ephemeral, per-call ``set``).
+    2. **Cross-cycle** (when *hash_cache* is supplied): suppresses candidates
+       whose hash was recorded in a previous ingestion pass and has not yet
+       expired.  New candidates are registered in *hash_cache* so they are
+       suppressed on the *next* cycle if the same payload is returned again.
 
     Preserves the first occurrence of each unique candidate (by content)
     and drops subsequent identical entries.  Operates in O(n) time with
@@ -46,10 +142,18 @@ def _apply_content_dedup(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any
         h = _candidate_content_hash(candidate)
         if h in seen:
             LOG.debug(
-                "Suppressing exact-duplicate candidate (content_hash=%s)", h[:12]
+                "Suppressing exact-duplicate candidate within payload (content_hash=%s)",
+                h[:12],
+            )
+            continue
+        if hash_cache is not None and hash_cache.is_duplicate(h):
+            LOG.debug(
+                "Suppressing cross-cycle duplicate candidate (content_hash=%s)", h[:12]
             )
             continue
         seen.add(h)
+        if hash_cache is not None:
+            hash_cache.mark_seen(h)
         unique.append(candidate)
     return unique
 
@@ -298,14 +402,22 @@ def _normalize_candidates(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def normalize_candidates(payload: Any) -> List[Dict[str, Any]]:
+def normalize_candidates(
+    payload: Any,
+    hash_cache: Optional[CandidateHashCache] = None,
+) -> List[Dict[str, Any]]:
     """Normalize and deduplicate candidates from a WL next payload.
 
     Applies both ID-based deduplication (in ``_normalize_candidates``) and
     exact-report content-hash deduplication so that identical candidates
     emitted multiple times are presented only once to the scheduler.
+
+    When *hash_cache* is supplied, an additional cross-cycle dedup layer
+    filters candidates that were already seen in a previous poll cycle.
+    New candidates are recorded in *hash_cache* (mutated in-place) for
+    suppression on subsequent cycles.
     """
-    return _apply_content_dedup(_normalize_candidates(payload))
+    return _apply_content_dedup(_normalize_candidates(payload), hash_cache=hash_cache)
 
 
 def select_candidate(
@@ -332,11 +444,28 @@ def fetch_candidates(
     run_shell: Optional[Callable[..., subprocess.CompletedProcess]] = None,
     command_cwd: Optional[str] = None,
     timeout_seconds: int = 10,
+    hash_cache: Optional[CandidateHashCache] = None,
 ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Fetch and normalize candidates from ``wl next``.
+
+    Parameters
+    ----------
+    run_shell:
+        Optional callable that executes shell commands (for testing).
+    command_cwd:
+        Working directory for the ``wl next`` invocation.
+    timeout_seconds:
+        Seconds to wait before aborting the ``wl next`` call.
+    hash_cache:
+        Optional :class:`CandidateHashCache` instance.  When supplied,
+        candidates whose content hash was recorded in a previous call are
+        suppressed (cross-cycle dedup).  New candidates are registered in
+        the cache (mutated in-place) for suppression on the next cycle.
+    """
     client = WLNextClient(
         run_shell=run_shell,
         command_cwd=command_cwd,
         timeout_seconds=timeout_seconds,
     )
     payload = client.fetch_payload()
-    return normalize_candidates(payload), payload
+    return normalize_candidates(payload, hash_cache=hash_cache), payload
