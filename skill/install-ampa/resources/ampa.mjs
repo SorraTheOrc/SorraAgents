@@ -796,7 +796,36 @@ function checkBinary(name) {
 function checkPrerequisites() {
   const required = ['podman', 'distrobox', 'git', 'wl'];
   const missing = required.filter((bin) => !checkBinary(bin));
-  return { ok: missing.length === 0, missing };
+  if (missing.length === 0) {
+    return { ok: true, missing: [], message: '' };
+  }
+
+  const installExamples = [];
+  if (missing.includes('podman') || missing.includes('distrobox')) {
+    installExamples.push('Ubuntu/Debian (simple): sudo apt update && sudo apt install -y podman distrobox');
+    installExamples.push('Ubuntu fallback if packages are not found:');
+    installExamples.push('  sudo apt update && sudo apt install -y software-properties-common ca-certificates curl gnupg');
+    installExamples.push('  sudo add-apt-repository -y universe && sudo apt update && sudo apt install -y podman');
+    installExamples.push('  if distrobox still missing: curl -s https://raw.githubusercontent.com/89luca89/distrobox/main/install | sudo sh');
+    installExamples.push('Fedora: sudo dnf install -y podman distrobox');
+    installExamples.push('Arch: sudo pacman -S --needed podman distrobox');
+  }
+
+  const messageLines = [
+    `Missing required binaries: ${missing.join(', ')}`,
+    '',
+    'Install requirements, then retry `wl ampa warm-pool`.',
+  ];
+  if (installExamples.length > 0) {
+    messageLines.push('', 'Install examples:');
+    installExamples.forEach((line) => messageLines.push(`  - ${line}`));
+  }
+
+  return {
+    ok: false,
+    missing,
+    message: messageLines.join('\n'),
+  };
 }
 
 /**
