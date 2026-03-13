@@ -389,13 +389,25 @@ def _format_run_result_human(
 
     if run.metadata and isinstance(run.metadata.get("pr_monitor"), dict):
         pm = run.metadata["pr_monitor"]
-        ready_count = len(pm.get("ready_prs", []) or [])
-        failing_count = len(pm.get("failing_prs", []) or [])
-        skipped_count = len(pm.get("skipped_prs", []) or [])
+        ready_prs = pm.get("ready_prs", []) or []
+        failing_prs = pm.get("failing_prs", []) or []
+        skipped_prs = pm.get("skipped_prs", []) or []
+        ready_count = len(ready_prs)
+        failing_count = len(failing_prs)
+        skipped_count = len(skipped_prs)
         lines.append(f"Open PRs:  {int(pm.get('open_prs', pm.get('prs_checked', 0)) or 0)}")
-        lines.append(f"Ready:     {ready_count}")
-        lines.append(f"Failing:   {failing_count}")
-        lines.append(f"Skipped:   {skipped_count}")
+        lines.append(
+            f"Ready:     {ready_count}"
+            + (f" (#{', #'.join(str(n) for n in ready_prs)})" if ready_prs else "")
+        )
+        lines.append(
+            f"Failing:   {failing_count}"
+            + (f" (#{', #'.join(str(n) for n in failing_prs)})" if failing_prs else "")
+        )
+        lines.append(
+            f"Skipped:   {skipped_count}"
+            + (f" (#{', #'.join(str(n) for n in skipped_prs)})" if skipped_prs else "")
+        )
         lines.append(
             f"LLM Reviews: dispatched={int(pm.get('llm_reviews_dispatched', 0) or 0)}, "
             f"presented={int(pm.get('llm_reviews_presented', 0) or 0)}"

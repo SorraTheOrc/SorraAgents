@@ -610,6 +610,83 @@ class TestPRMonitorErrorResilience:
         assert 88 not in result["ready_prs"]
         assert 88 not in result["failing_prs"]
 
+
+class TestPRMonitorSummaryNotification:
+    def test_summary_notification_uses_pr_number_links(self):
+        pr_list = _pr_list_json(
+            [
+                {
+                    "number": 1,
+                    "title": "Ready PR",
+                    "url": "https://github.com/repo/pull/1",
+                    "headRefName": "ready-branch",
+                },
+                {
+                    "number": 2,
+                    "title": "Failing PR",
+                    "url": "https://github.com/repo/pull/2",
+                    "headRefName": "fail-branch",
+                },
+                {
+                    "number": 3,
+                    "title": "Pending PR",
+                    "url": "https://github.com/repo/pull/3",
+                    "headRefName": "pending-branch",
+                },
+            ]
+        )
+
+        def run_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "gh --version" in cmd_str:
+                return subprocess.CompletedProcess([], 0, "gh version 2.x", "")
+            if "gh pr list" in cmd_str:
+                return subprocess.CompletedProcess([], 0, pr_list, "")
+            if "gh pr checks" in cmd_str:
+                if " 1 " in cmd_str:
+                    return subprocess.CompletedProcess(
+                        [], 0, _checks_json([{"name": "ci", "bucket": "pass"}]), ""
+                    )
+                if " 2 " in cmd_str:
+                    return subprocess.CompletedProcess(
+                        [], 1, _checks_json([{"name": "ci", "bucket": "fail"}]), ""
+                    )
+                if " 3 " in cmd_str:
+                    return subprocess.CompletedProcess(
+                        [], 0, _checks_json([{"name": "ci", "bucket": "pending"}]), ""
+                    )
+            if "gh pr view" in cmd_str:
+                return subprocess.CompletedProcess([], 0, json.dumps({"comments": []}), "")
+            if "gh pr comment" in cmd_str:
+                return subprocess.CompletedProcess([], 0, "", "")
+            if "wl" in cmd_str:
+                return subprocess.CompletedProcess([], 0, "[]", "")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        notifier = mock.MagicMock()
+        runner = PRMonitorRunner(run_shell=run_shell, command_cwd="/tmp", notifier=notifier)
+        result = runner.run(_make_pr_monitor_spec(auto_review=False))
+
+        assert result["ready_prs"] == [1]
+        assert result["failing_prs"] == [2]
+        assert result["skipped_prs"] == [3]
+
+        summary_payload = None
+        for c in notifier.notify.call_args_list:
+            payload = c.kwargs.get("payload")
+            if not payload:
+                continue
+            embeds = payload.get("embeds") or []
+            if embeds and embeds[0].get("title") == "PR Monitor Summary":
+                summary_payload = payload
+                break
+
+        assert summary_payload is not None
+        desc = summary_payload["embeds"][0]["description"]
+        assert "Ready for review: [#1](https://github.com/repo/pull/1)" in desc
+        assert "CI failing: [#2](https://github.com/repo/pull/2)" in desc
+        assert "Skipped (already notified or pending): [#3](https://github.com/repo/pull/3)" in desc
+
     def test_gh_comment_failure_does_not_crash(self):
         pr_list = _pr_list_json(
             [{"number": 99, "title": "Comment fail", "url": "https://github.com/repo/pull/99", "headRefName": "cf"}]

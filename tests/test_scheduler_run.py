@@ -197,9 +197,9 @@ def test_format_human_normal_with_pr_monitor_metrics():
     )
     text = _format_run_result_human(spec, run, "normal", "host")
     assert "Open PRs:  5" in text
-    assert "Ready:     2" in text
-    assert "Failing:   1" in text
-    assert "Skipped:   2" in text
+    assert "Ready:     2 (#11, #12)" in text
+    assert "Failing:   1 (#13)" in text
+    assert "Skipped:   2 (#14, #15)" in text
     assert "LLM Reviews: dispatched=2, presented=1" in text
     assert "Notify:    sent=3" in text
     assert "AutoReview:true" in text

@@ -1627,7 +1627,7 @@ class PRMonitorRunner:
                 for n in ready_prs:
                     meta = pr_map.get(n)
                     if meta and meta.get("url"):
-                        ready_links.append(f"[{meta.get('title')}]({meta.get('url')})")
+                        ready_links.append(f"[#{n}]({meta.get('url')})")
                     else:
                         ready_links.append(f"#{n}")
                 lines.append(f"Ready for review: {', '.join(ready_links)}")
@@ -1636,7 +1636,7 @@ class PRMonitorRunner:
                 for n in failing_prs:
                     meta = pr_map.get(n)
                     if meta and meta.get("url"):
-                        fail_links.append(f"[{meta.get('title')}]({meta.get('url')})")
+                        fail_links.append(f"[#{n}]({meta.get('url')})")
                     else:
                         fail_links.append(f"#{n}")
                 lines.append(f"CI failing: {', '.join(fail_links)}")
@@ -1645,7 +1645,7 @@ class PRMonitorRunner:
                 for n in skipped_prs:
                     meta = pr_map.get(n)
                     if meta and meta.get("url"):
-                        skip_links.append(f"[{meta.get('title')}]({meta.get('url')})")
+                        skip_links.append(f"[#{n}]({meta.get('url')})")
                     else:
                         skip_links.append(f"#{n}")
                 lines.append(

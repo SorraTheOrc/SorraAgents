@@ -670,9 +670,12 @@ class Scheduler:
                 # surfaces meaningful metrics in normal output mode.
                 if isinstance(run, CommandRunResult):
                     open_prs = int(result.get("open_prs", result.get("prs_checked", 0)))
-                    ready_count = len(result.get("ready_prs", []) or [])
-                    failing_count = len(result.get("failing_prs", []) or [])
-                    skipped_count = len(result.get("skipped_prs", []) or [])
+                    ready_prs = result.get("ready_prs", []) or []
+                    failing_prs = result.get("failing_prs", []) or []
+                    skipped_prs = result.get("skipped_prs", []) or []
+                    ready_count = len(ready_prs)
+                    failing_count = len(failing_prs)
+                    skipped_count = len(skipped_prs)
                     pending_count = int(result.get("skipped_pending_prs", 0) or 0)
                     dedup_count = int(result.get("skipped_dedup_prs", 0) or 0)
                     checks_unavailable = int(
@@ -688,8 +691,11 @@ class Scheduler:
                     summary_lines = [
                         f"open_prs={open_prs}",
                         f"ready_for_review={ready_count}",
+                        f"ready_pr_numbers={','.join(str(n) for n in ready_prs)}",
                         f"failing={failing_count}",
+                        f"failing_pr_numbers={','.join(str(n) for n in failing_prs)}",
                         f"skipped={skipped_count}",
+                        f"skipped_pr_numbers={','.join(str(n) for n in skipped_prs)}",
                         f"pending_checks={pending_count}",
                         f"dedup_skips={dedup_count}",
                         f"checks_unavailable={checks_unavailable}",
