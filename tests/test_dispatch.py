@@ -926,7 +926,8 @@ class TestPoolHelpers:
         f"{_POOL_MOD}._read_pool_state",
         return_value={"ampa-pool-0": {"workItemId": "WL-BUSY"}},
     )
-    def test_list_available_pool(self, mock_state, mock_existing):
+    @patch(f"{_POOL_MOD}._read_cleanup_list", return_value=[])
+    def test_list_available_pool(self, mock_cleanup, mock_state, mock_existing):
         """Returns containers that exist but are not claimed."""
         from ampa.engine.dispatch import _list_available_pool
 
