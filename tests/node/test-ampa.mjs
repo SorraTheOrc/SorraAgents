@@ -593,3 +593,64 @@ test('resolveDaemonStore prefers per-project store over package-dir store', asyn
     try { fs.rmSync(xdgDir, { recursive: true, force: true }); } catch (e) {}
   }
 });
+
+// ---------- extractErrorLines tests ----------
+
+test('extractErrorLines returns empty array for empty input', () => {
+  assert.deepEqual(plugin.extractErrorLines(''), []);
+  assert.deepEqual(plugin.extractErrorLines(null), []);
+});
+
+test('extractErrorLines captures ERROR lines', () => {
+  const text = 'INFO starting\nERROR something failed\nINFO done';
+  const result = plugin.extractErrorLines(text);
+  assert.ok(result.includes('ERROR something failed'));
+  assert.equal(result.length, 1);
+});
+
+test('extractErrorLines captures AMPA_DISCORD_BOT_TOKEN mention', () => {
+  const text = [
+    'INFO loading config',
+    'ERROR AMPA_DISCORD_BOT_TOKEN is not set; cannot send heartbeats',
+    'INFO exiting',
+  ].join('\n');
+  const result = plugin.extractErrorLines(text);
+  assert.ok(result.some((l) => l.includes('AMPA_DISCORD_BOT_TOKEN')));
+});
+
+test('extractErrorLines captures Traceback and Exception lines', () => {
+  const text = 'Traceback (most recent call last):\n  File "x.py"\nSomeException: oops';
+  const result = plugin.extractErrorLines(text);
+  assert.ok(result.some((l) => l.includes('Traceback')));
+  assert.ok(result.some((l) => l.includes('SomeException')));
+});
+
+// ---------- start() improved error output tests ----------
+
+test('start prints log errors and Discord hint on immediate exit', async () => {
+  await withTempDir('tmp-ampa-start-err', async (tmp) => {
+    // Use a daemon that mimics missing AMPA_DISCORD_BOT_TOKEN by writing the
+    // same log message the Python daemon would and then exiting immediately.
+    const daemon = path.join(tmp, 'fail_daemon.js');
+    fs.writeFileSync(
+      daemon,
+      `process.stderr.write('ERROR AMPA_DISCORD_BOT_TOKEN is not set; cannot send heartbeats\\n'); process.exit(2);`
+    );
+
+    const errors = [];
+    const originalError = console.error;
+    console.error = (...args) => { errors.push(args.join(' ')); };
+    try {
+      const code = await plugin.start(tmp, ['node', daemon], 'default');
+      assert.equal(code, 1, 'start should return 1 on failure');
+    } finally {
+      console.error = originalError;
+    }
+
+    const combined = errors.join('\n');
+    assert.ok(combined.includes('process exited immediately'), `missing main error: ${combined}`);
+    assert.ok(combined.includes('AMPA_DISCORD_BOT_TOKEN'), `missing token mention: ${combined}`);
+    assert.ok(combined.includes('Discord configuration'), `missing Discord hint: ${combined}`);
+    assert.ok(combined.includes('.worklog/ampa/.env'), `missing .env path hint: ${combined}`);
+  });
+});
