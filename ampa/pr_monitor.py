@@ -126,7 +126,7 @@ class PRMonitorRunner:
         metadata: Dict[str, Any] = getattr(spec, "metadata", {}) or {}
         gh_cmd = str(metadata.get("gh_command", _DEFAULT_GH_COMMAND))
         dedup = _coerce_bool(metadata.get("dedup", True))
-        auto_review = _coerce_bool(metadata.get("auto_review", False))
+        auto_review = _coerce_bool(metadata.get("auto_review", True))
         try:
             max_prs = int(metadata.get("max_prs", _DEFAULT_MAX_PRS))
         except (TypeError, ValueError):

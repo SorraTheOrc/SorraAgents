@@ -202,7 +202,7 @@ def ensure_pr_monitor_command(store: SchedulerStore) -> None:
             requires_llm=False,
             frequency_minutes=60,
             priority=0,
-            metadata={"dedup": True, "max_prs": 50, "auto_review": False},
+            metadata={"dedup": True, "max_prs": 50, "auto_review": True},
             title="PR Monitor",
             max_runtime_minutes=10,
             command_type="pr-monitor",

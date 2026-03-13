@@ -1470,7 +1470,7 @@ class TestAutoReviewIntegration:
         fake_dispatcher.dispatch.assert_called_once()
 
     def test_auto_review_false_does_not_dispatch(self):
-        """With auto_review=False (default), no dispatch occurs."""
+        """With auto_review=False (opt-out), no dispatch occurs."""
         fake_dispatcher = mock.MagicMock()
 
         pr_json = self._one_pr_json()
