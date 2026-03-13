@@ -1,0 +1,9 @@
+Increase container dispatch timeout for LLM audit runs and make it configurable via pr-monitor metadata key `auto_review_container_timeout` (seconds).
+
+Changes:
+- Pass metadata-driven timeout into `ContainerDispatcher` when `auto_review` is enabled.
+- Add default `auto_review_container_timeout: 600` to auto-registered `pr-monitor` command metadata.
+- Clamp timeout to [30, 3600] seconds to avoid extreme values.
+- Add unit tests verifying scheduler constructs dispatcher with default and overridden timeout.
+
+This branch is based on `feature/SA-0MMN9YNS41N1B77L-llm-pr-review` as requested. Do NOT re-run `wl ampa run pr-monitor` until this change is reviewed/merged.
