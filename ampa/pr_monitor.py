@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -43,6 +44,19 @@ _DEFAULT_MAX_PRS: int = 50
 _DEFAULT_GH_COMMAND: str = "gh"
 _READY_COMMENT_MARKER: str = "<!-- ampa-pr-monitor:ready -->"
 _FAILURE_COMMENT_MARKER: str = "<!-- ampa-pr-monitor:failure -->"
+_AUDIT_RESULT_MARKER: str = "<!-- ampa-pr-audit-result -->"
+_AUDIT_DISPATCH_MARKER_PREFIX: str = "<!-- ampa-pr-audit-dispatch:"
+
+# Pattern to extract work-item IDs from branch names.
+# Matches: feature/<ID>-*, bug/<ID>-*, wl-<ID>-*, or bare <PREFIX>-<HASH>
+_WORK_ITEM_ID_BRANCH_RE = re.compile(
+    r"(?:feature/|bug/|wl-)?((?:[A-Z]{2,}-)?[A-Za-z0-9]{10,})"
+)
+# Pattern to extract work-item IDs from PR body markers.
+_WORK_ITEM_ID_BODY_RE = re.compile(
+    r"(?:work[- ]?item|closes|fixes|resolves)[:\s]+([A-Z]{2,}-[A-Za-z0-9]*[0-9][A-Za-z0-9]*)",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +79,9 @@ class PRMonitorRunner:
     wl_shell:
         Optional separate callable for ``wl`` commands.  Defaults to
         *run_shell*.
+    dispatcher:
+        Optional :class:`~ampa.engine.dispatch.Dispatcher` used to
+        spawn LLM audit sessions when ``auto_review`` is enabled.
     """
 
     def __init__(
@@ -73,11 +90,13 @@ class PRMonitorRunner:
         command_cwd: str,
         notifier: Optional[Any] = None,
         wl_shell: Optional[Callable[..., subprocess.CompletedProcess]] = None,
+        dispatcher: Optional[Any] = None,
     ) -> None:
         self.run_shell = run_shell
         self.command_cwd = command_cwd
         self._notifier = notifier
         self._wl_shell = wl_shell or run_shell
+        self._dispatcher = dispatcher
 
     # ------------------------------------------------------------------
     # Public API
@@ -103,10 +122,19 @@ class PRMonitorRunner:
             * ``failing_prs`` — list of PR numbers with failing CI
             * ``skipped_prs`` — list of PR numbers skipped (already notified)
             * ``note`` — human-readable summary
+            * ``open_prs`` — number of open PRs found
+            * ``skipped_pending_prs`` — number skipped due to pending checks
+            * ``skipped_dedup_prs`` — number skipped due to dedup marker
+            * ``checks_unavailable_prs`` — number skipped due to check query errors
+            * ``llm_reviews_dispatched`` — number of LLM audits dispatched
+            * ``llm_reviews_presented`` — number of audit results presented in Discord
+            * ``notifications_sent`` — number of Discord notifications sent
         """
+        self._metrics_reset()
         metadata: Dict[str, Any] = getattr(spec, "metadata", {}) or {}
         gh_cmd = str(metadata.get("gh_command", _DEFAULT_GH_COMMAND))
         dedup = _coerce_bool(metadata.get("dedup", True))
+        auto_review = _coerce_bool(metadata.get("auto_review", True))
         try:
             max_prs = int(metadata.get("max_prs", _DEFAULT_MAX_PRS))
         except (TypeError, ValueError):
@@ -119,9 +147,16 @@ class PRMonitorRunner:
             return {
                 "action": "gh_unavailable",
                 "prs_checked": 0,
+                "open_prs": 0,
                 "ready_prs": [],
                 "failing_prs": [],
                 "skipped_prs": [],
+                "skipped_pending_prs": 0,
+                "skipped_dedup_prs": 0,
+                "checks_unavailable_prs": 0,
+                "llm_reviews_dispatched": 0,
+                "llm_reviews_presented": 0,
+                "notifications_sent": 0,
                 "note": note,
             }
 
@@ -133,9 +168,16 @@ class PRMonitorRunner:
             return {
                 "action": "list_failed",
                 "prs_checked": 0,
+                "open_prs": 0,
                 "ready_prs": [],
                 "failing_prs": [],
                 "skipped_prs": [],
+                "skipped_pending_prs": 0,
+                "skipped_dedup_prs": 0,
+                "checks_unavailable_prs": 0,
+                "llm_reviews_dispatched": 0,
+                "llm_reviews_presented": 0,
+                "notifications_sent": 0,
                 "note": note,
             }
         if not prs:
@@ -144,9 +186,16 @@ class PRMonitorRunner:
             return {
                 "action": "no_prs",
                 "prs_checked": 0,
+                "open_prs": 0,
                 "ready_prs": [],
                 "failing_prs": [],
                 "skipped_prs": [],
+                "skipped_pending_prs": 0,
+                "skipped_dedup_prs": 0,
+                "checks_unavailable_prs": 0,
+                "llm_reviews_dispatched": 0,
+                "llm_reviews_presented": 0,
+                "notifications_sent": 0,
                 "note": note,
             }
 
@@ -154,6 +203,9 @@ class PRMonitorRunner:
         ready_prs: List[int] = []
         failing_prs: List[int] = []
         skipped_prs: List[int] = []
+        skipped_pending_prs = 0
+        skipped_dedup_prs = 0
+        checks_unavailable_prs = 0
 
         for pr in prs:
             pr_number = pr.get("number")
@@ -169,6 +221,7 @@ class PRMonitorRunner:
                     "pr-monitor: could not retrieve check status for PR #%d",
                     pr_number,
                 )
+                checks_unavailable_prs += 1
                 continue
 
             all_passing, failing_checks, pending_checks = check_status
@@ -180,6 +233,7 @@ class PRMonitorRunner:
                     pr_number,
                 )
                 skipped_prs.append(pr_number)
+                skipped_pending_prs += 1
                 continue
 
             if all_passing:
@@ -192,40 +246,92 @@ class PRMonitorRunner:
                         pr_number,
                     )
                     skipped_prs.append(pr_number)
+                    skipped_dedup_prs += 1
+
+                    # Even though we skip the ready comment, check for
+                    # pending audit results when auto_review is enabled.
+                    if auto_review:
+                        self._check_and_present_audit_results(
+                            gh_cmd, pr, pr_number, pr_title,
+                            pr.get("url", ""),
+                        )
                     continue
 
                 self._handle_ready_pr(
                     gh_cmd, pr_number, pr_title, pr_url
                 )
                 ready_prs.append(pr_number)
+
+                # Dispatch LLM audit when auto_review is enabled
+                if auto_review:
+                    self._dispatch_review(gh_cmd, pr, pr_number, pr_title)
             elif failing_checks:
                 self._handle_failing_pr(
                     gh_cmd, pr_number, pr_title, pr_url, failing_checks
                 )
                 failing_prs.append(pr_number)
 
+        # Send summary notification (include PR metadata so we can format links)
+        self._notify_summary(ready_prs, failing_prs, skipped_prs, len(prs), prs)
+
         note = (
             f"pr-monitor: checked {len(prs)} PR(s) — "
             f"{len(ready_prs)} ready, {len(failing_prs)} failing, "
-            f"{len(skipped_prs)} skipped"
+            f"{len(skipped_prs)} skipped; "
+            f"{self._metrics.get('llm_reviews_dispatched', 0)} LLM dispatched; "
+            f"{self._metrics.get('llm_reviews_presented', 0)} LLM presented; "
+            f"{self._metrics.get('notifications_sent', 0)} notifications"
         )
         LOG.info(note)
-
-        # Send summary notification (include PR metadata so we can format links)
-        self._notify_summary(ready_prs, failing_prs, skipped_prs, len(prs), prs)
 
         return {
             "action": "completed",
             "prs_checked": len(prs),
+            "open_prs": len(prs),
             "ready_prs": ready_prs,
             "failing_prs": failing_prs,
             "skipped_prs": skipped_prs,
+            "skipped_pending_prs": skipped_pending_prs,
+            "skipped_dedup_prs": skipped_dedup_prs,
+            "checks_unavailable_prs": checks_unavailable_prs,
+            "llm_reviews_dispatched": int(
+                self._metrics.get("llm_reviews_dispatched", 0)
+            ),
+            "llm_reviews_presented": int(
+                self._metrics.get("llm_reviews_presented", 0)
+            ),
+            "notifications_sent": int(self._metrics.get("notifications_sent", 0)),
+            "auto_review_enabled": auto_review,
+            "dedup_enabled": dedup,
             "note": note,
         }
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _metrics_reset(self) -> None:
+        self._metrics = {
+            "llm_reviews_dispatched": 0,
+            "llm_reviews_presented": 0,
+            "notifications_sent": 0,
+        }
+
+    def _metric_inc(self, key: str, value: int = 1) -> None:
+        metrics = getattr(self, "_metrics", None)
+        if not isinstance(metrics, dict):
+            self._metrics_reset()
+            metrics = self._metrics
+        metrics[key] = int(metrics.get(key, 0)) + int(value)
+
+    def _send_notification(self, payload: Dict[str, Any], message_type: str) -> bool:
+        if self._notifier is None:
+            return False
+        # notifications.notify() requires a positional title argument even when
+        # sending a pre-built payload.
+        self._notifier.notify(title="", payload=payload, message_type=message_type)
+        self._metric_inc("notifications_sent")
+        return True
 
     def _gh_available(self, gh_cmd: str) -> bool:
         """Return True if the gh CLI is available."""
@@ -465,10 +571,292 @@ class PRMonitorRunner:
                         }
                     ],
                 }
-                self._notifier.notify(payload=payload, message_type="command")
+                self._send_notification(payload=payload, message_type="command")
         except Exception:
             LOG.exception(
                 "pr-monitor: failed to send ready notification for PR #%d",
+                pr_number,
+            )
+
+    # ------------------------------------------------------------------
+    # Auto-review dispatch
+    # ------------------------------------------------------------------
+
+    def _dispatch_review(
+        self,
+        gh_cmd: str,
+        pr: Dict[str, Any],
+        pr_number: int,
+        pr_title: str,
+    ) -> None:
+        """Dispatch an LLM audit session for a CI-passing PR.
+
+        Skips silently when:
+        - No dispatcher is configured.
+        - No work-item ID can be extracted from the PR.
+        - A dispatch marker already exists for this PR number.
+
+        Failures are logged and recorded as work-item comments but never
+        propagate — the rest of the pr-monitor run continues unaffected.
+        """
+        if self._dispatcher is None:
+            LOG.debug(
+                "pr-monitor: auto_review enabled but no dispatcher configured — "
+                "skipping PR #%d",
+                pr_number,
+            )
+            return
+
+        # Extract work-item ID
+        work_item_id = self._extract_work_item_id(pr, gh_cmd)
+        if not work_item_id:
+            LOG.debug(
+                "pr-monitor: no work-item ID found for PR #%d — "
+                "skipping auto-review",
+                pr_number,
+            )
+            return
+
+        # Check for existing dispatch
+        existing = self._get_audit_dispatch_state(work_item_id, pr_number)
+        if existing is not None:
+            LOG.info(
+                "pr-monitor: audit already dispatched for PR #%d "
+                "(work item %s) — skipping",
+                pr_number,
+                work_item_id,
+            )
+            return
+
+        # Compose review prompt
+        prompt = (
+            f"/implement {work_item_id} "
+            f"Review PR #{pr_number} ({pr_title}) against the acceptance "
+            f"criteria of work item {work_item_id}. "
+            f"Post your audit results as a structured comment on the work "
+            f"item using the marker format: "
+            f"{_AUDIT_RESULT_MARKER}"
+        )
+        command = f'opencode run "{prompt}"'
+
+        # Dispatch
+        try:
+            result = self._dispatcher.dispatch(
+                command=command, work_item_id=work_item_id
+            )
+        except Exception:
+            LOG.exception(
+                "pr-monitor: dispatch failed for PR #%d (work item %s)",
+                pr_number,
+                work_item_id,
+            )
+            return
+
+        if result.success:
+            LOG.info(
+                "pr-monitor: dispatched audit for PR #%d → work item %s "
+                "(pid=%s, container=%s)",
+                pr_number,
+                work_item_id,
+                result.pid,
+                result.container_id,
+            )
+            self._post_audit_dispatch_marker(
+                work_item_id,
+                pr_number,
+                dispatched_at=result.timestamp.isoformat(),
+                container_id=result.container_id or "",
+            )
+            self._metric_inc("llm_reviews_dispatched")
+        else:
+            LOG.warning(
+                "pr-monitor: audit dispatch failed for PR #%d "
+                "(work item %s): %s",
+                pr_number,
+                work_item_id,
+                result.error,
+            )
+            # Record the failure as a comment so operators can see it
+            try:
+                fail_comment = (
+                    f"Auto-review dispatch failed for PR #{pr_number}: "
+                    f"{result.error}"
+                )
+                self._wl_shell(
+                    f"wl comment add {work_item_id} "
+                    f'--comment "{fail_comment}" '
+                    f'--author "pr-monitor"',
+                    shell=True,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    cwd=self.command_cwd,
+                )
+            except Exception:
+                LOG.debug(
+                    "pr-monitor: failed to post dispatch failure comment "
+                    "for work item %s",
+                    work_item_id,
+                )
+
+    # ------------------------------------------------------------------
+    # Audit result collection and Discord presentation
+    # ------------------------------------------------------------------
+
+    def _check_and_present_audit_results(
+        self,
+        gh_cmd: str,
+        pr: Dict[str, Any],
+        pr_number: int,
+        pr_title: str,
+        pr_url: str,
+    ) -> None:
+        """Check for completed audit results and present them in Discord.
+
+        Called on subsequent runs for PRs that are already marked ready
+        and have a dispatch in progress.  If the audit agent has posted
+        results, a Discord embed with Approve/Reject buttons is sent.
+
+        If no dispatch marker or no results yet, this is a no-op.
+        """
+        try:
+            work_item_id = self._extract_work_item_id(pr, gh_cmd)
+            if not work_item_id:
+                return
+
+            # Check if a dispatch was made
+            dispatch_state = self._get_audit_dispatch_state(
+                work_item_id, pr_number
+            )
+            if dispatch_state is None:
+                # No dispatch recorded — nothing to check.
+                # (This can happen if auto_review was just enabled and the
+                # PR was already marked ready before dispatch existed.)
+                # Trigger a dispatch instead.
+                self._dispatch_review(gh_cmd, pr, pr_number, pr_title)
+                return
+
+            # Check for audit results
+            audit = self._get_audit_result(work_item_id, pr_number)
+            if audit is None:
+                LOG.debug(
+                    "pr-monitor: no audit result yet for PR #%d "
+                    "(work item %s) — audit may still be running",
+                    pr_number,
+                    work_item_id,
+                )
+                return
+
+            # Present the results in Discord
+            self._present_audit_results(
+                pr_number, pr_title, pr_url, work_item_id, audit
+            )
+        except Exception:
+            LOG.exception(
+                "pr-monitor: error checking audit results for PR #%d",
+                pr_number,
+            )
+
+    def _present_audit_results(
+        self,
+        pr_number: int,
+        pr_title: str,
+        pr_url: str,
+        work_item_id: str,
+        audit: Dict[str, Any],
+    ) -> None:
+        """Build and send a Discord embed with audit results and action buttons.
+
+        The embed includes:
+        - Overall verdict (pass/fail/partial)
+        - Per-criterion results
+        - Concerns
+        - Approve Merge / Reject buttons
+
+        Button custom_ids follow the convention:
+        ``pr_review_approve_{pr_number}`` and ``pr_review_reject_{pr_number}``.
+        """
+        if self._notifier is None:
+            LOG.debug(
+                "pr-monitor: no notifier — cannot present audit results "
+                "for PR #%d",
+                pr_number,
+            )
+            return
+
+        overall = audit.get("overall", "unknown")
+        summary = audit.get("summary", "No summary available.")
+        concerns = audit.get("concerns", [])
+        criteria = audit.get("criteria", [])
+
+        # Colour: green=pass, red=fail, yellow=partial
+        colour_map = {"pass": 0x2ECC71, "fail": 0xE74C3C, "partial": 0xF39C12}
+        colour = colour_map.get(overall, 0x95A5A6)
+
+        # Build criteria fields
+        fields = []
+        for c in criteria[:10]:  # Cap at 10 to avoid embed limits
+            name = c.get("name", "Criterion")
+            passed = c.get("pass", False)
+            notes = c.get("notes", "")
+            icon = "PASS" if passed else "FAIL"
+            value = f"[{icon}] {notes}" if notes else f"[{icon}]"
+            fields.append({"name": name, "value": value, "inline": False})
+
+        if concerns:
+            concern_text = "\n".join(f"- {c}" for c in concerns[:5])
+            fields.append({
+                "name": "Concerns",
+                "value": concern_text,
+                "inline": False,
+            })
+
+        embed = {
+            "title": f"Audit: PR #{pr_number} — {overall.upper()}",
+            "description": f"**{pr_title}**\n\n{summary}",
+            "url": pr_url,
+            "color": colour,
+            "fields": fields,
+            "footer": {"text": f"Work item: {work_item_id}"},
+        }
+
+        components = [
+            {
+                "type": "button",
+                "label": "Approve Merge",
+                "style": "success",
+                "custom_id": f"pr_review_approve_{pr_number}",
+            },
+            {
+                "type": "button",
+                "label": "Reject",
+                "style": "danger",
+                "custom_id": f"pr_review_reject_{pr_number}",
+            },
+        ]
+
+        payload = {
+            "content": (
+                f"Audit complete for PR #{pr_number}: "
+                f"{pr_title} — {overall.upper()}"
+            ),
+            "embeds": [embed],
+            "components": components,
+        }
+
+        try:
+            sent = self._send_notification(payload=payload, message_type="command")
+            if sent:
+                self._metric_inc("llm_reviews_presented")
+            LOG.info(
+                "pr-monitor: presented audit results for PR #%d "
+                "(verdict: %s)",
+                pr_number,
+                overall,
+            )
+        except Exception:
+            LOG.exception(
+                "pr-monitor: failed to send audit results for PR #%d",
                 pr_number,
             )
 
@@ -538,7 +926,7 @@ class PRMonitorRunner:
                         }
                     ],
                 }
-                self._notifier.notify(payload=payload, message_type="error")
+                self._send_notification(payload=payload, message_type="error")
         except Exception:
             LOG.exception(
                 "pr-monitor: failed to send failure notification for PR #%d",
@@ -650,6 +1038,567 @@ class PRMonitorRunner:
             LOG.exception("pr-monitor: exception creating critical work item")
             return None
 
+    # ------------------------------------------------------------------
+    # Work-item ID extraction
+    # ------------------------------------------------------------------
+
+    def _extract_work_item_id(
+        self, pr: Dict[str, Any], gh_cmd: str
+    ) -> Optional[str]:
+        """Extract a work-item ID from a PR.
+
+        Checks, in order:
+        1. The branch name (``headRefName``) for patterns like
+           ``feature/<ID>-*``, ``bug/<ID>-*``, ``wl-<ID>-*``.
+        2. The PR body for markers like ``work-item: <ID>``,
+           ``closes <ID>``, ``fixes <ID>``.
+
+        Returns the work-item ID string or ``None`` if not found.
+        """
+        # 1. Try branch name
+        branch = pr.get("headRefName", "")
+        if branch:
+            m = _WORK_ITEM_ID_BRANCH_RE.search(branch)
+            if m:
+                candidate = m.group(1)
+                # Validate it looks like a work-item ID (has a prefix separator)
+                if "-" in candidate:
+                    return candidate
+
+        # 2. Try PR body
+        pr_number = pr.get("number")
+        if pr_number is not None:
+            try:
+                cmd = f"{gh_cmd} pr view {pr_number} --json body"
+                proc = self.run_shell(
+                    cmd,
+                    shell=True,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    cwd=self.command_cwd,
+                )
+                if proc.returncode == 0 and (proc.stdout or "").strip():
+                    data = json.loads(proc.stdout.strip())
+                    body = data.get("body", "")
+                    m = _WORK_ITEM_ID_BODY_RE.search(body)
+                    if m:
+                        return m.group(1)
+            except Exception:
+                LOG.debug(
+                    "pr-monitor: exception extracting work item from PR #%s body",
+                    pr_number,
+                )
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Audit dispatch state tracking
+    # ------------------------------------------------------------------
+
+    def _get_audit_dispatch_state(
+        self, work_item_id: str, pr_number: int
+    ) -> Optional[Dict[str, Any]]:
+        """Query a work item's comments for a dispatch marker for *pr_number*.
+
+        Returns the parsed dispatch state dict or ``None`` if not found.
+        """
+        marker = f"{_AUDIT_DISPATCH_MARKER_PREFIX}{pr_number} -->"
+        try:
+            proc = self._wl_shell(
+                f"wl show {work_item_id} --json",
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                return None
+            stdout = (proc.stdout or "").strip()
+            if not stdout:
+                return None
+            data = json.loads(stdout)
+            comments = data.get("comments", [])
+            if not comments and "workItem" in data:
+                comments = data.get("comments", [])
+            for comment in comments:
+                body = comment.get("comment", "")
+                if marker in body:
+                    return self._parse_marker_json(body, marker)
+        except Exception:
+            LOG.debug(
+                "pr-monitor: exception reading dispatch state for %s PR #%d",
+                work_item_id,
+                pr_number,
+            )
+        return None
+
+    def _get_audit_result(
+        self,
+        work_item_id: str,
+        pr_number: int,
+        after_iso: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Query a work item's comments for an audit result for *pr_number*.
+
+        If *after_iso* is provided, only results whose ``audited_at``
+        timestamp is after that ISO-8601 string are considered.
+
+        Returns the parsed audit result dict or ``None``.
+        """
+        try:
+            proc = self._wl_shell(
+                f"wl show {work_item_id} --json",
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                return None
+            stdout = (proc.stdout or "").strip()
+            if not stdout:
+                return None
+            data = json.loads(stdout)
+            comments = data.get("comments", [])
+            for comment in comments:
+                body = comment.get("comment", "")
+                if _AUDIT_RESULT_MARKER not in body:
+                    continue
+                result = self._parse_marker_json(body, _AUDIT_RESULT_MARKER)
+                if result is None:
+                    continue
+                audit = result.get("audit_result", result)
+                # Check PR number match if present
+                if audit.get("pr_number") is not None and audit.get("pr_number") != pr_number:
+                    continue
+                # Check freshness
+                if after_iso and audit.get("audited_at"):
+                    if audit["audited_at"] <= after_iso:
+                        LOG.debug(
+                            "pr-monitor: stale audit result for %s PR #%d "
+                            "(audited_at=%s <= %s)",
+                            work_item_id,
+                            pr_number,
+                            audit["audited_at"],
+                            after_iso,
+                        )
+                        continue
+                return audit
+        except Exception:
+            LOG.debug(
+                "pr-monitor: exception reading audit result for %s PR #%d",
+                work_item_id,
+                pr_number,
+            )
+        return None
+
+    def _post_audit_dispatch_marker(
+        self,
+        work_item_id: str,
+        pr_number: int,
+        dispatched_at: str,
+        container_id: Optional[str] = None,
+    ) -> bool:
+        """Post a dispatch state marker comment to a work item.
+
+        Returns True on success.
+        """
+        marker = f"{_AUDIT_DISPATCH_MARKER_PREFIX}{pr_number} -->"
+        payload = json.dumps({
+            "dispatch_state": {
+                "pr_number": pr_number,
+                "dispatched_at": dispatched_at,
+                "container_id": container_id,
+                "work_item_id": work_item_id,
+            }
+        })
+        comment_body = f"{marker}\n{payload}"
+        try:
+            proc = self._wl_shell(
+                [
+                    "wl", "comment", "add", work_item_id,
+                    "--comment", comment_body,
+                    "--author", "ampa-pr-monitor",
+                    "--json",
+                ],
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                LOG.warning(
+                    "pr-monitor: failed to post dispatch marker for %s PR #%d: %s",
+                    work_item_id,
+                    pr_number,
+                    (proc.stderr or "")[:256],
+                )
+                return False
+            return True
+        except Exception:
+            LOG.exception(
+                "pr-monitor: exception posting dispatch marker for %s PR #%d",
+                work_item_id,
+                pr_number,
+            )
+            return False
+
+    @staticmethod
+    def _parse_marker_json(
+        body: str, marker: str
+    ) -> Optional[Dict[str, Any]]:
+        """Extract the JSON object following *marker* in a comment body."""
+        idx = body.find(marker)
+        if idx < 0:
+            return None
+        rest = body[idx + len(marker) :].strip()
+        # Try to find a JSON object in the remaining text
+        brace = rest.find("{")
+        if brace < 0:
+            return None
+        # Find the matching closing brace
+        depth = 0
+        for i, ch in enumerate(rest[brace:]):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(rest[brace : brace + i + 1])
+                    except json.JSONDecodeError:
+                        return None
+        return None
+
+    # ------------------------------------------------------------------
+    # Phase 4 — Merge / reject / cleanup on operator decision
+    # ------------------------------------------------------------------
+
+    def handle_review_decision(
+        self,
+        action: str,
+        pr_number: int,
+        work_item_id: Optional[str] = None,
+        approved_by: str = "unknown",
+        gh_cmd: str = _DEFAULT_GH_COMMAND,
+    ) -> Dict[str, Any]:
+        """Process an operator's approve or reject decision for a PR review.
+
+        This is the main entry point called after the Discord interaction is
+        routed through the conversation manager.  It orchestrates merge (or
+        rejection), work-item closure, branch cleanup, and notifications.
+
+        Parameters
+        ----------
+        action
+            ``"accept"`` to merge, anything else to reject.
+        pr_number
+            The GitHub PR number.
+        work_item_id
+            Optional work-item ID associated with the PR.  If *None*, the
+            method will attempt to extract it from the PR.
+        approved_by
+            Human-readable identifier of the operator (e.g. Discord username).
+        gh_cmd
+            The ``gh`` CLI executable name / path.
+
+        Returns
+        -------
+        dict
+            ``action`` key is ``"merged"``, ``"rejected"``, or ``"error"``
+            with a ``note`` describing the outcome.
+        """
+        is_approve = str(action).strip().lower() in ("accept", "approve")
+        LOG.info(
+            "pr-monitor: handling review decision action=%s pr_number=%d "
+            "work_item_id=%s approved_by=%s",
+            action,
+            pr_number,
+            work_item_id,
+            approved_by,
+        )
+
+        if is_approve:
+            return self._handle_approve(
+                gh_cmd, pr_number, work_item_id, approved_by
+            )
+        return self._handle_reject(
+            gh_cmd, pr_number, work_item_id, approved_by
+        )
+
+    def _handle_approve(
+        self,
+        gh_cmd: str,
+        pr_number: int,
+        work_item_id: Optional[str],
+        approved_by: str,
+    ) -> Dict[str, Any]:
+        """Execute merge, work-item closure, branch cleanup, and notifications."""
+        # 1. Merge the PR
+        merge_ok, merge_note = self._merge_pr(gh_cmd, pr_number)
+        if not merge_ok:
+            self._notify_review_outcome(
+                pr_number,
+                "Merge Failed",
+                merge_note,
+                color=0xE74C3C,
+            )
+            return {"action": "error", "note": merge_note}
+
+        # 2. Close the associated work item (best-effort)
+        if work_item_id:
+            reason = (
+                f"PR #{pr_number} merged via auto-review approval "
+                f"by {approved_by}"
+            )
+            self._close_work_item(work_item_id, reason)
+
+        # 3. Delete the remote branch (best-effort)
+        branch = self._get_pr_branch(gh_cmd, pr_number)
+        if branch:
+            self._cleanup_branch(gh_cmd, branch)
+
+        # 4. Record a Worklog comment (best-effort)
+        if work_item_id:
+            comment = (
+                f"PR #{pr_number} merged and branch cleaned up. "
+                f"Approved by {approved_by} via Discord."
+            )
+            self._add_wl_comment(work_item_id, comment)
+
+        # 5. Send confirmation notification to Discord
+        self._notify_review_outcome(
+            pr_number,
+            "PR Merged",
+            f"PR #{pr_number} has been merged and cleaned up.\n"
+            f"Approved by **{approved_by}**.",
+            color=0x2ECC71,
+        )
+
+        return {
+            "action": "merged",
+            "note": f"PR #{pr_number} merged by {approved_by}",
+        }
+
+    def _handle_reject(
+        self,
+        gh_cmd: str,
+        pr_number: int,
+        work_item_id: Optional[str],
+        approved_by: str,
+    ) -> Dict[str, Any]:
+        """Post rejection comment on PR and record in Worklog."""
+        # 1. Post a rejection comment on the PR
+        body = (
+            f"This PR was **declined** during auto-review by **{approved_by}**.\n\n"
+            "The automated audit was reviewed and the operator chose not to "
+            "merge at this time.  Please address any concerns and re-request "
+            "review when ready."
+        )
+        self._post_gh_comment(gh_cmd, pr_number, body)
+
+        # 2. Record rejection in Worklog (best-effort)
+        if work_item_id:
+            comment = (
+                f"PR #{pr_number} review rejected by {approved_by} "
+                "via Discord.  PR comment posted."
+            )
+            self._add_wl_comment(work_item_id, comment)
+
+        # 3. Notify Discord
+        self._notify_review_outcome(
+            pr_number,
+            "PR Review Rejected",
+            f"PR #{pr_number} was declined by **{approved_by}**.\n"
+            "A comment has been posted on the PR.",
+            color=0xE74C3C,
+        )
+
+        return {
+            "action": "rejected",
+            "note": f"PR #{pr_number} rejected by {approved_by}",
+        }
+
+    def _merge_pr(
+        self, gh_cmd: str, pr_number: int
+    ) -> Tuple[bool, str]:
+        """Merge a PR via ``gh pr merge``.
+
+        Returns ``(success, note)`` where *note* describes the outcome.
+        """
+        try:
+            proc = self.run_shell(
+                [gh_cmd, "pr", "merge", str(pr_number), "--merge"],
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                stderr = (proc.stderr or "").strip()[:512]
+                note = (
+                    f"pr-monitor: gh pr merge failed for PR #{pr_number}: "
+                    f"rc={proc.returncode} stderr={stderr!r}"
+                )
+                LOG.error(note)
+                return False, note
+            LOG.info("pr-monitor: merged PR #%d", pr_number)
+            return True, f"PR #{pr_number} merged successfully"
+        except Exception as exc:
+            note = f"pr-monitor: exception merging PR #{pr_number}: {exc}"
+            LOG.exception(note)
+            return False, note
+
+    def _reject_pr(
+        self, gh_cmd: str, pr_number: int, reason: str
+    ) -> bool:
+        """Post a rejection comment on a PR.  Returns True on success."""
+        return self._post_gh_comment(gh_cmd, pr_number, reason)
+
+    def _close_work_item(self, work_item_id: str, reason: str) -> bool:
+        """Close a Worklog work item.  Best-effort — failures are logged."""
+        try:
+            proc = self._wl_shell(
+                [
+                    "wl", "close", work_item_id,
+                    "--reason", reason,
+                    "--json",
+                ],
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                LOG.warning(
+                    "pr-monitor: wl close failed for %s: rc=%s stderr=%r",
+                    work_item_id,
+                    proc.returncode,
+                    (proc.stderr or "")[:512],
+                )
+                return False
+            LOG.info("pr-monitor: closed work item %s", work_item_id)
+            return True
+        except Exception:
+            LOG.exception(
+                "pr-monitor: exception closing work item %s", work_item_id
+            )
+            return False
+
+    def _cleanup_branch(self, gh_cmd: str, branch: str) -> bool:
+        """Delete a remote branch.  Best-effort — failures are logged."""
+        try:
+            proc = self.run_shell(
+                ["git", "push", "origin", "--delete", branch],
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                LOG.warning(
+                    "pr-monitor: branch cleanup failed for %s: rc=%s stderr=%r",
+                    branch,
+                    proc.returncode,
+                    (proc.stderr or "")[:512],
+                )
+                return False
+            LOG.info("pr-monitor: deleted remote branch %s", branch)
+            return True
+        except Exception:
+            LOG.exception(
+                "pr-monitor: exception deleting branch %s", branch
+            )
+            return False
+
+    def _get_pr_branch(
+        self, gh_cmd: str, pr_number: int
+    ) -> Optional[str]:
+        """Retrieve the head branch name for a PR.  Returns None on failure."""
+        try:
+            proc = self.run_shell(
+                f"{gh_cmd} pr view {pr_number} --json headRefName -q .headRefName",
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode == 0 and (proc.stdout or "").strip():
+                return proc.stdout.strip()
+            return None
+        except Exception:
+            LOG.exception(
+                "pr-monitor: failed to get branch for PR #%d", pr_number
+            )
+            return None
+
+    def _add_wl_comment(self, work_item_id: str, comment: str) -> bool:
+        """Add a comment to a Worklog work item.  Best-effort."""
+        try:
+            proc = self._wl_shell(
+                [
+                    "wl", "comment", "add", work_item_id,
+                    "--comment", comment,
+                    "--author", "ampa-pr-monitor",
+                    "--json",
+                ],
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=self.command_cwd,
+            )
+            if proc.returncode != 0:
+                LOG.warning(
+                    "pr-monitor: wl comment add failed for %s: rc=%s",
+                    work_item_id,
+                    proc.returncode,
+                )
+                return False
+            return True
+        except Exception:
+            LOG.exception(
+                "pr-monitor: exception adding WL comment to %s", work_item_id
+            )
+            return False
+
+    def _notify_review_outcome(
+        self,
+        pr_number: int,
+        title: str,
+        description: str,
+        color: int = 0x3498DB,
+    ) -> None:
+        """Send a Discord notification about a review outcome."""
+        if not self._notifier:
+            return
+        try:
+            payload = {
+                "content": f"{title} — PR #{pr_number}",
+                "embeds": [
+                    {
+                        "title": title,
+                        "description": description,
+                        "color": color,
+                    }
+                ],
+            }
+            self._send_notification(payload=payload, message_type="command")
+        except Exception:
+            LOG.exception(
+                "pr-monitor: failed to send review outcome notification "
+                "for PR #%d",
+                pr_number,
+            )
+
     def _notify_summary(
         self,
         ready_prs: List[int],
@@ -714,7 +1663,7 @@ class PRMonitorRunner:
                     }
                 ],
             }
-            self._notifier.notify(payload=payload, message_type="command")
+            self._send_notification(payload=payload, message_type="command")
         except Exception:
             LOG.exception("pr-monitor: failed to send summary notification")
 

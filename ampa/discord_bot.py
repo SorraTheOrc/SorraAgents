@@ -189,9 +189,11 @@ def _route_interaction(custom_id: str, user: str, timestamp: str) -> None:
     """Dispatch a button interaction through conversation_manager plumbing.
 
     For the MVP, interactions with ``test_*`` custom_id prefixes are treated
-    as no-ops (acknowledge only, no session started or resumed).  Future
-    interactive workflows with non-test prefixes will route through
-    ``conversation_manager.resume_session()`` here.
+    as no-ops (acknowledge only, no session started or resumed).
+
+    PR review interactions (``pr_review_approve_*`` / ``pr_review_reject_*``)
+    are routed through ``responder.resume_from_payload()`` to trigger
+    merge or rejection workflows.
 
     This function is called *before* the interaction acknowledgement is sent,
     so it must return quickly (well under the 3-second Discord timeout).
@@ -205,16 +207,76 @@ def _route_interaction(custom_id: str, user: str, timestamp: str) -> None:
         )
         return
 
-    # Future: route non-test interactions to conversation_manager.
-    # Example:
-    #   from . import conversation_manager
-    #   conversation_manager.resume_session(session_id, response, metadata)
+    # PR review approve/reject routing
+    if custom_id.startswith("pr_review_approve_") or custom_id.startswith(
+        "pr_review_reject_"
+    ):
+        _route_pr_review_interaction(custom_id, user, timestamp)
+        return
+
     LOG.info(
-        "Non-test interaction received (future routing): custom_id=%s user=%s ts=%s",
+        "Unrecognised interaction: custom_id=%s user=%s ts=%s",
         custom_id,
         user,
         timestamp,
     )
+
+
+def _route_pr_review_interaction(
+    custom_id: str, user: str, timestamp: str
+) -> None:
+    """Route pr_review_approve_* / pr_review_reject_* interactions.
+
+    Calls ``responder.resume_from_payload()`` with the appropriate action
+    and metadata.  Errors are caught and logged so the bot never crashes.
+    """
+    try:
+        from . import responder
+    except ImportError:
+        LOG.error("Cannot import responder — PR review routing unavailable")
+        return
+
+    is_approve = custom_id.startswith("pr_review_approve_")
+    # Extract the PR number from the custom_id suffix
+    prefix = "pr_review_approve_" if is_approve else "pr_review_reject_"
+    pr_number_str = custom_id[len(prefix):]
+    try:
+        pr_number = int(pr_number_str)
+    except (ValueError, TypeError):
+        LOG.error(
+            "Invalid PR number in custom_id=%s — cannot route", custom_id
+        )
+        return
+
+    action = "accept" if is_approve else "decline"
+    session_id = f"pr-review-{pr_number}"
+
+    LOG.info(
+        "Routing PR review interaction: custom_id=%s action=%s "
+        "pr_number=%d user=%s",
+        custom_id,
+        action,
+        pr_number,
+        user,
+    )
+
+    try:
+        responder.resume_from_payload({
+            "session_id": session_id,
+            "action": action,
+            "metadata": {
+                "pr_number": pr_number,
+                "approved_by": user,
+                "timestamp": timestamp,
+                "source": "discord_button",
+            },
+        })
+    except Exception:
+        LOG.exception(
+            "PR review routing failed for custom_id=%s pr_number=%d",
+            custom_id,
+            pr_number,
+        )
 
 
 async def process_interaction(interaction: object) -> None:

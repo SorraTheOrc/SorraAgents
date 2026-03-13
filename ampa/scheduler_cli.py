@@ -333,6 +333,8 @@ def _format_run_result_json(spec: CommandSpec, run: RunResult, instance: str) ->
         if deleg.get("rejected"):
             delegation_data["rejected_count"] = len(deleg["rejected"])
         data["delegation"] = delegation_data
+    if run.metadata and isinstance(run.metadata.get("pr_monitor"), dict):
+        data["pr_monitor"] = run.metadata["pr_monitor"]
     return json.dumps(data, indent=2, sort_keys=True)
 
 
@@ -384,6 +386,26 @@ def _format_run_result_human(
         rejected = deleg.get("rejected")
         if rejected:
             lines.append(f"Rejected:  {len(rejected)} candidate(s)")
+
+    if run.metadata and isinstance(run.metadata.get("pr_monitor"), dict):
+        pm = run.metadata["pr_monitor"]
+        ready_count = len(pm.get("ready_prs", []) or [])
+        failing_count = len(pm.get("failing_prs", []) or [])
+        skipped_count = len(pm.get("skipped_prs", []) or [])
+        lines.append(f"Open PRs:  {int(pm.get('open_prs', pm.get('prs_checked', 0)) or 0)}")
+        lines.append(f"Ready:     {ready_count}")
+        lines.append(f"Failing:   {failing_count}")
+        lines.append(f"Skipped:   {skipped_count}")
+        lines.append(
+            f"LLM Reviews: dispatched={int(pm.get('llm_reviews_dispatched', 0) or 0)}, "
+            f"presented={int(pm.get('llm_reviews_presented', 0) or 0)}"
+        )
+        lines.append(
+            f"Notify:    sent={int(pm.get('notifications_sent', 0) or 0)}"
+        )
+        lines.append(
+            f"AutoReview:{str(bool(pm.get('auto_review_enabled', False))).lower()}"
+        )
 
     if fmt == "full":
         lines.append(f"Instance:  {instance}")
@@ -542,7 +564,8 @@ def _cli_run(args: argparse.Namespace) -> int:
                     start_ts=start_ts,
                     end_ts=end_ts,
                     exit_code=int(daemon_result.get("exit_code", 0)),
-                    output=daemon_result.get("output"),
+                    output=daemon_result.get("output") or "",
+                    metadata=daemon_result.get("metadata"),
                 )
                 spec = CommandSpec(
                     command_id=daemon_result.get("id", command_id),
