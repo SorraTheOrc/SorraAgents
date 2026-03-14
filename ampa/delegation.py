@@ -505,9 +505,30 @@ class DelegationOrchestrator:
             except Exception:
                 import ampa.selection as selection  # type: ignore[no-redef]
 
+        # Load the cross-cycle hash cache from scheduler state so that
+        # identical candidates returned on separate wl next calls are
+        # suppressed across polling cycles.
+        hash_cache = None
+        try:
+            from .selection import CandidateHashCache
+
+            cache_data = self.store.get_candidate_hash_cache()
+            hash_cache = CandidateHashCache.from_dict(cache_data)
+        except Exception:
+            LOG.debug("Failed to load candidate hash cache; skipping cross-cycle dedup")
+
         candidates, _payload = selection.fetch_candidates(
-            run_shell=self.run_shell, command_cwd=self.command_cwd
+            run_shell=self.run_shell,
+            command_cwd=self.command_cwd,
+            hash_cache=hash_cache,
         )
+
+        # Persist the updated cache so the next poll cycle can use it.
+        if hash_cache is not None:
+            try:
+                self.store.update_candidate_hash_cache(hash_cache.to_dict())
+            except Exception:
+                LOG.debug("Failed to save candidate hash cache")
         top_candidate = candidates[0] if candidates else None
 
         report = _build_delegation_report(

@@ -906,11 +906,9 @@ def test_cli_run_falls_back_when_daemon_unavailable():
     scheduler = Scheduler(store, config, executor=lambda _: run_result)
 
     args = _make_args(command_id="fallback-cmd")
-    with (
-        mock.patch("ampa.scheduler_cli._try_daemon_run", return_value=None),
-        mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler),
-    ):
-        exit_code, output = _capture_cli_run(args)
+    with mock.patch("ampa.scheduler_cli._try_daemon_run", return_value=None):
+        with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
+            exit_code, output = _capture_cli_run(args)
 
     assert exit_code == 0
     assert "fallback-cmd" in output
@@ -956,11 +954,9 @@ def test_cli_run_watch_skips_daemon():
     # _try_daemon_run should NOT be called in watch mode
     try_daemon_mock = mock.MagicMock(return_value={"id": "x", "exit_code": 0})
     args = _make_args(command_id="watch-daemon-cmd", watch=1)
-    with (
-        mock.patch("ampa.scheduler_cli._try_daemon_run", try_daemon_mock),
-        mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler),
-        mock.patch("ampa.scheduler_cli.time.sleep", side_effect=interruptible_sleep),
-    ):
-        _capture_cli_run(args)
+    with mock.patch("ampa.scheduler_cli._try_daemon_run", try_daemon_mock):
+        with mock.patch("ampa.scheduler_cli.load_scheduler", return_value=scheduler):
+            with mock.patch("ampa.scheduler_cli.time.sleep", side_effect=interruptible_sleep):
+                _capture_cli_run(args)
 
     try_daemon_mock.assert_not_called()
