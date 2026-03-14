@@ -19,17 +19,22 @@ def main():
     assumptions = data.get("assumptions", [])
     unknowns = data.get("unknowns", [])
 
-    # Map tshirt codes to readable words
+    # Map tshirt codes to readable words; accept either codes or full-text
     tshirt_map = {
-        "XS": "ExtraSmall",
+        "XS": "Extra Small",
         "S": "Small",
         "M": "Medium",
         "L": "Large",
-        "XL": "XL",
+        "XL": "Extra Large",
     }
 
     tsh = effort.get("tshirt", "")
-    tsh_read = tshirt_map.get(tsh, tsh or "N/A")
+    if tsh in tshirt_map:
+        tsh_read = tshirt_map[tsh]
+    elif tsh in tshirt_map.values():
+        tsh_read = tsh
+    else:
+        tsh_read = tsh or "N/A"
 
     expected = effort.get("expected", 0)
     score = risk.get("score", 0)
@@ -41,7 +46,7 @@ def main():
     print("# Effort and Risk Report")
     print("")
     # Use expected (PERT) for the hours cell
-    print(f"Effort     | {tsh_read:<7} |  {expected:.2f}h")
+    print(f"Effort     | {tsh_read:<11} |  {expected:.2f}h")
     # Use /20 as the denominator as agreed
     print(f"Risk       | {level:<7} |  {score}/20")
     print(f"Confidence | {confidence}%     |  unknowns: {unknowns_str}")

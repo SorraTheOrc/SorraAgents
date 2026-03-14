@@ -8,6 +8,7 @@ Purpose
 Produce a concise, auditable engineering estimate (effort + risk) for a prepared work item. The skill's canonical outputs are:
 
 - A machine-readable JSON object containing effort (effort_units, tshirt size, O/M/P, expected, recommended, range), risk (probability, impact, score, level, top drivers, mitigations), confidence, assumptions, and unknowns.
+ - A machine-readable JSON object containing effort (effort_units, tshirt size (full-text, e.g. "Small", "Extra Large"), O/M/P, expected, recommended, range), risk (probability, impact, score, level, top drivers, mitigations), confidence, assumptions, and unknowns.
 - A human-readable summary generated and posted by the orchestrator; the posted content is included in the orchestrator output.
 
 Gating (mandatory)

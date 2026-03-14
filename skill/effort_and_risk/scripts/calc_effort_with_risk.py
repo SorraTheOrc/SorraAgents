@@ -84,6 +84,15 @@ def main():
         }
 
     tshirt = pick_tshirt(recommended, thresholds)
+    # Expand shorthand codes to full-text labels
+    tshirt_map = {
+        "XS": "Extra Small",
+        "S": "Small",
+        "M": "Medium",
+        "L": "Large",
+        "XL": "Extra Large",
+    }
+    tshirt = tshirt_map.get(tshirt, tshirt)
 
     # normalize risk
     if isinstance(risk_in, dict):

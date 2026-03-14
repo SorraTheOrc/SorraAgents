@@ -3,7 +3,7 @@
 - PERT (hours): O=120, M=240, P=480 → Expected E = (120 + 4*240 + 480)/6 = 1560/6 = 260.0h.
 - Additive overheads: coordination 24h, review 16h, testing/integration 32h, risk buffer 24h → overhead total 96h.
 - Final range and recommendation: min = O + overhead = 120+96 = 216h; max = P + overhead = 480+96 = 576h; recommended planning value ≈ 360h (rounded conservative from 356h).
-- T-shirt size: XL (thresholds: XL ≥ 240h).
+ - T-shirt size: Extra Large (thresholds: XL ≥ 240h).
 - Certainty for risk calculation: 65% (moderate uncertainty around integration and security constraints).
 - Risk (parent & children P/I): Parent SA-0MKSTQR3H1HLD7HC P=4 I=4; Child SA-0MKT9O9AY002COU8 (TOTP synthetic) P=3 I=3; other TEST CHILDs P=1 I=1.
 - Aggregated risk (script): probability=4.14, impact=4.14 → score=17 (High).
@@ -13,7 +13,7 @@
 {
   "effort": {
     "unit": "hours",
-    "tshirt": "XL",
+    "tshirt": "Extra Large",
     "o": 120,
     "m": 240,
     "p": 480,
