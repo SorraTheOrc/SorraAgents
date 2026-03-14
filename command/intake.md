@@ -35,6 +35,7 @@ The command implements the procedural workflow below. Each numbered step is part
 - Use an interview style: concise, high-signal questions grouped to a soft-maximum of three per iteration.
 - Do not invent requirements or constraints; if unknown, ask the user.
 - Do not ask leading questions that bias the user towards a particular answer.
+- Do not ask unnecessary questions, if an obvious answer exists, use it.
 - If a response is unclear or ambiguous, ask for clarification rather than guessing or asking a largely similar question.
 - Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or OpenCode ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
@@ -129,15 +130,14 @@ Update the description of the Worklog work item with the final intake brief from
 - Adding dependencies with `wl comment add <work-item-id> --comment "Blocks:<blocked-item-id>" --json` and `wl comment add <work-item-id> --comment "Blocked-by:<blocking-item-id>" --json`
 - Adjusting priority to better match the new understanding of scope and impact using `wl update <work-item-id> --priority <level> --json`
 
-10. Finishing (must do)
+10. Finishing (must do as the final step only)
 
 - DO NOT close the issue
 - Run `wl sync` to sync work item changes.
 - Run `wl show <work-item-id>` (not --json) to show the entire work item.
-- End with: "This completes the Intake process for <work-item-id>".
 - Remove all temporary files created during the process, including `.opencode/tmp/intake-draft-<title>.md`.
 - Output the new work item id, a 1–2 sentence summary headline
-- Finish with "This completes the Intake process for <work-item-id>"
+- Finish with "This completes the Intake process for <work-item-id> <work-itme-title>"
 
 ## Traceability & idempotence
 
