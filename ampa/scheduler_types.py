@@ -129,7 +129,10 @@ class SchedulerConfig:
     store_path: str
     llm_healthcheck_url: str
     max_run_history: int
-    container_dispatch_timeout_seconds: int
+    # Make this optional with a sensible default to preserve backwards
+    # compatibility for callers/tests that instantiate SchedulerConfig
+    # without this value.
+    container_dispatch_timeout_seconds: int = 240
 
     @staticmethod
     def from_env() -> "SchedulerConfig":
