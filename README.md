@@ -67,6 +67,8 @@ Pool state (`pool-state.json`, `pool-cleanup.json`, `pool-replenish.log`) is sto
 
 If the `ampa/Containerfile` has been modified since the image was last built, `warm-pool` will automatically tear down unclaimed pool containers and the template, rebuild the image, and re-fill the pool. Simply run `wl ampa warm-pool` again — no manual cleanup is needed.
 
+See the AMPA container pool reference for full details: `ampa/docs/ampa_container_pool.md`.
+
 ## Getting started
 1. Read the main workflow: [Workflow.md](Workflow.md).
 2. Pick a folder to work in (e.g., `skill/` or `agent/`).

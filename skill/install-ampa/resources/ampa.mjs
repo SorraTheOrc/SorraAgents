@@ -714,6 +714,11 @@ function printPoolStatus(projectRoot) {
     console.log(`  Image:     ${imgExists ? CONTAINER_IMAGE : 'not built'}${stale ? ' (stale — run warm-pool to rebuild)' : ''}`);
     console.log(`  Template:  ${templateExists ? TEMPLATE_CONTAINER_NAME : 'not created'}`);
     console.log(`  Available: ${available.length} / ${POOL_SIZE} target`);
+    if (available.length > 0) {
+      for (const name of available) {
+        console.log(`    - ${name}`);
+      }
+    }
     if (claimed.length > 0) {
       console.log(`  Claimed:   ${claimed.length}`);
       for (const c of claimed) {
@@ -1752,8 +1757,16 @@ async function startWork(projectRoot, workItemId, agentName) {
 /**
  * Finish work in a dev container: commit, push, update work item, destroy container.
  */
-async function finishWork(force = false, workItemIdArg) {
+async function finishWork(opts = {}, workItemIdArg) {
   // 1. Detect context — running inside a container or from the host?
+  // Backwards-compatible: callers may pass a boolean (old code) — treat that
+  // boolean as discard. We intentionally drop the legacy `--force` CLI flag
+  // entirely, but still accept code that used the old boolean parameter.
+  if (typeof opts !== 'object' || opts === null) {
+    opts = { discard: !!opts };
+  }
+  const discard = !!opts.discard;
+  const noPush = !!opts.noPush; // --no-push
   const insideContainer = !!process.env.AMPA_CONTAINER_NAME;
 
   let cName, workItemId, branch, projectRoot;
@@ -1822,7 +1835,7 @@ async function finishWork(force = false, workItemIdArg) {
     const statusResult = runSync('git', ['status', '--porcelain']);
     const hasUncommitted = statusResult.stdout.length > 0;
 
-    if (hasUncommitted && !force) {
+    if (hasUncommitted && !discard) {
       console.log('Uncommitted changes detected. Committing...');
       const addResult = runSync('git', ['add', '-A']);
       if (addResult.status !== 0) {
@@ -1836,38 +1849,47 @@ async function finishWork(force = false, workItemIdArg) {
         console.error(`git commit failed: ${commitResult.stderr}`);
         console.error('Uncommitted files:');
         console.error(statusResult.stdout);
-        console.error('Use --force to destroy the container without committing (changes will be lost).');
+        console.error('Use --discard to destroy the container without committing (changes will be lost).');
         return 1;
       }
       console.log(commitResult.stdout);
-    } else if (hasUncommitted && force) {
-      console.log('Warning: Discarding uncommitted changes (--force)');
+    } else if (hasUncommitted && discard) {
+      console.log('Warning: Discarding uncommitted changes (--discard)');
       console.log(statusResult.stdout);
     }
 
-    // 3. Push if there are commits to push
-    if (!force) {
-      const pushBranch = branch || 'HEAD';
-      console.log(`Pushing ${pushBranch} to origin...`);
-      const pushResult = runSync('git', ['push', '-u', 'origin', pushBranch]);
-      if (pushResult.status !== 0) {
-        console.error(`git push failed: ${pushResult.stderr}`);
-        console.error('Use --force to destroy the container without pushing.');
-        return 1;
+    // 3. Push if there are commits to push (skip entirely when discarding)
+    if (!discard) {
+      if (!noPush) {
+        const pushBranch = branch || 'HEAD';
+        console.log(`Pushing ${pushBranch} to origin...`);
+        const pushResult = runSync('git', ['push', '-u', 'origin', pushBranch]);
+        if (pushResult.status !== 0) {
+          console.error(`git push failed: ${pushResult.stderr}`);
+          console.error('Use --discard to destroy the container without pushing.');
+          return 1;
+        }
+        if (pushResult.stdout) console.log(pushResult.stdout);
+
+        // Ensure worklog data is synced even if the push was a no-op (which
+        // skips the pre-push hook) or if there were only worklog changes.
+        console.log('Syncing worklog data...');
+        runSync('wl', ['sync']);
+
+        const hashResult = runSync('git', ['rev-parse', '--short', 'HEAD']);
+        commitHash = hashResult.stdout || 'unknown';
+      } else {
+        // noPush: commit has been performed but do not push. Still sync worklog
+        console.log('Skipping push (--no-push).');
+        console.log('Syncing worklog data...');
+        runSync('wl', ['sync']);
+        const hashResult = runSync('git', ['rev-parse', '--short', 'HEAD']);
+        commitHash = hashResult.stdout || 'unknown';
       }
-      if (pushResult.stdout) console.log(pushResult.stdout);
-
-      // Ensure worklog data is synced even if the push was a no-op (which
-      // skips the pre-push hook) or if there were only worklog changes.
-      console.log('Syncing worklog data...');
-      runSync('wl', ['sync']);
-
-      const hashResult = runSync('git', ['rev-parse', '--short', 'HEAD']);
-      commitHash = hashResult.stdout || 'unknown';
     }
 
-    // 4. Update work item (always update, even when --force is used). When
-    // forced, there is no commit hash — note that in the comment.
+    // 4. Update work item (always update, even when --discard is used). When
+    // discarding, there is no commit hash — note that in the comment.
     try {
       console.log(`Updating work item ${workItemId}...`);
       spawnSync('wl', ['update', workItemId, '--stage', 'in_review', '--status', 'completed', '--json'], {
@@ -1876,7 +1898,7 @@ async function finishWork(force = false, workItemIdArg) {
       });
       const commentMsg = commitHash
         ? `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. Latest commit: ${commitHash}`
-        : `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. No commit pushed (finished with --force or no new commits).`;
+        : `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. No commit pushed (finished with --discard or no new commits).`;
       spawnSync('wl', ['comment', 'add', workItemId, '--comment', commentMsg, '--author', 'ampa', '--json'], {
         stdio: 'pipe',
         encoding: 'utf8',
@@ -1897,7 +1919,7 @@ async function finishWork(force = false, workItemIdArg) {
       // environments). If direct removal fails, fall back to marking it for
       // host-side cleanup.
       try {
-        const rmRes = runSync('distrobox', ['rm', '--force', cName]);
+    const rmRes = runSync('distrobox', ['rm', '--force', cName]);
         if (rmRes.status === 0) {
           console.log(`Container "${cName}" destroyed.`);
         } else {
@@ -1930,7 +1952,7 @@ async function finishWork(force = false, workItemIdArg) {
 
   console.log(`Finishing work in container "${cName}" (${workItemId}, branch: ${branch})...`);
 
-  if (!force) {
+  if (!discard) {
     // Build a script to commit, push, and sync worklog inside the container
     const commitPushScript = [
       `set -e`,
@@ -1961,7 +1983,7 @@ async function finishWork(force = false, workItemIdArg) {
 
     if (commitResult.status !== 0) {
       console.error(`Commit/push inside container failed: ${commitResult.stderr || commitResult.stdout}`);
-      console.error('Use --force to destroy the container without committing (changes will be lost).');
+      console.error('Use --discard to destroy the container without committing (changes will be lost).');
       return 1;
     }
     if (commitResult.stdout) console.log(commitResult.stdout);
@@ -1972,7 +1994,7 @@ async function finishWork(force = false, workItemIdArg) {
 
     }
 
-    // Update work item from the host (always update, even when --force).
+    // Update work item from the host (always update, even when --discard).
     try {
       console.log(`Updating work item ${workItemId}...`);
       spawnSync('wl', ['update', workItemId, '--stage', 'in_review', '--status', 'completed', '--json'], {
@@ -1981,7 +2003,7 @@ async function finishWork(force = false, workItemIdArg) {
       });
       const commentMsgHost = commitHashHost || (commitHash || null)
         ? `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. Latest commit: ${commitHashHost || commitHash}`
-        : `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. No commit pushed (finished with --force or no new commits).`;
+        : `Work completed in dev container ${cName}. Branch: ${branch || 'HEAD'}. No commit pushed (finished with --discard or no new commits).`;
       spawnSync('wl', ['comment', 'add', workItemId, '--comment', commentMsgHost, '--author', 'ampa', '--json'], {
         stdio: 'pipe',
         encoding: 'utf8',
@@ -1989,8 +2011,8 @@ async function finishWork(force = false, workItemIdArg) {
     } catch (e) {
       // Non-fatal
     }
-    if (force) {
-      console.log('Warning: Skipping commit/push (--force). Uncommitted changes will be lost.');
+    if (discard) {
+      console.log('Warning: Skipping commit/push (--discard). Uncommitted changes will be lost.');
     }
 
   // Release pool claim
@@ -2273,9 +2295,14 @@ export default function register(ctx) {
     .command('finish-work')
     .description('Commit, push, and clean up a dev container')
     .arguments('[work-item-id]')
-    .option('--force', 'Destroy container even with uncommitted changes', false)
-    .action(async (workItemId, opts) => {
-      const code = await finishWork(opts.force, workItemId);
+    .option('--discard', 'Discard uncommitted changes and destroy the container', false)
+    .option('--no-push', 'Do not push commits to origin (commits are still created locally)', false)
+    .action(async (workItemId, opts, cmd) => {
+      // Support both invocation styles used by the real CLI (opts,cmd)
+      // and the test harness (opts only). Prefer cmd.optsWithGlobals() when
+      // available so global flags are honored.
+      const allOpts = cmd && typeof cmd.optsWithGlobals === 'function' ? cmd.optsWithGlobals() : (opts || {});
+      const code = await finishWork({ discard: allOpts.discard, noPush: allOpts.noPush }, workItemId);
       process.exitCode = code;
     });
 
@@ -2283,9 +2310,11 @@ export default function register(ctx) {
     .command('fw')
     .description('Alias for finish-work')
     .arguments('[work-item-id]')
-    .option('--force', 'Destroy container even with uncommitted changes', false)
-    .action(async (workItemId, opts) => {
-      const code = await finishWork(opts.force, workItemId);
+    .option('--discard', 'Discard uncommitted changes and destroy the container', false)
+    .option('--no-push', 'Do not push commits to origin (commits are still created locally)', false)
+    .action(async (workItemId, opts, cmd) => {
+      const allOpts = cmd && typeof cmd.optsWithGlobals === 'function' ? cmd.optsWithGlobals() : (opts || {});
+      const code = await finishWork({ discard: allOpts.discard, noPush: allOpts.noPush }, workItemId);
       process.exitCode = code;
     });
 
