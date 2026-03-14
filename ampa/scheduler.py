@@ -649,8 +649,30 @@ class Scheduler:
                     try:
                         from .engine.dispatch import ContainerDispatcher
 
+                        # Allow per-command metadata to override the configured
+                        # container dispatch timeout. Metadata key:
+                        # "container_dispatch_timeout_seconds" (int seconds).
+                        meta_timeout = None
+                        try:
+                            mval = meta.get("container_dispatch_timeout_seconds")
+                            if mval is not None:
+                                meta_timeout = int(mval)
+                        except Exception:
+                            LOG.warning(
+                                "Invalid container_dispatch_timeout_seconds in metadata for %s: %r",
+                                spec.command_id,
+                                meta.get("container_dispatch_timeout_seconds"),
+                            )
+
+                        timeout_to_use = (
+                            meta_timeout
+                            if meta_timeout is not None
+                            else self.config.container_dispatch_timeout_seconds
+                        )
+
                         dispatcher = ContainerDispatcher(
                             project_root=self.command_cwd,
+                            timeout=timeout_to_use,
                         )
                     except Exception:
                         LOG.exception(

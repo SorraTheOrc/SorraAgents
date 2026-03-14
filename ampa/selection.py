@@ -1,6 +1,7 @@
 """Candidate selection service for WL work items."""
 
 from __future__ import annotations
+import hashlib
 import json
 import logging
 import os
@@ -14,6 +15,43 @@ LOG = logging.getLogger("ampa.selection")
 # sees multiple candidates (not just the single top candidate) and can try
 # fallbacks if the top candidate is unsupported.
 WL_NEXT_DEFAULT_COUNT = int(os.getenv("AMPA_WL_NEXT_COUNT", "3"))
+
+
+# ---------------------------------------------------------------------------
+# Content-hash helpers for exact-report deduplication
+# ---------------------------------------------------------------------------
+
+
+def _candidate_content_hash(candidate: Dict[str, Any]) -> str:
+    """Return a deterministic SHA-256 hex digest of a candidate dict.
+
+    Two candidates with identical content (same keys and values, in any
+    insertion order) produce the same hash.  Used for exact-report
+    deduplication at ingestion: O(1) per candidate with a set lookup.
+    """
+    serialized = json.dumps(candidate, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _apply_content_dedup(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove exact-duplicate candidates using content hashing.
+
+    Preserves the first occurrence of each unique candidate (by content)
+    and drops subsequent identical entries.  Operates in O(n) time with
+    O(n) memory, bounded by the number of candidates in *candidates*.
+    """
+    seen: set[str] = set()
+    unique: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        h = _candidate_content_hash(candidate)
+        if h in seen:
+            LOG.debug(
+                "Suppressing exact-duplicate candidate (content_hash=%s)", h[:12]
+            )
+            continue
+        seen.add(h)
+        unique.append(candidate)
+    return unique
 
 
 class WLNextClient:
@@ -261,7 +299,13 @@ def _normalize_candidates(payload: Any) -> List[Dict[str, Any]]:
 
 
 def normalize_candidates(payload: Any) -> List[Dict[str, Any]]:
-    return _normalize_candidates(payload)
+    """Normalize and deduplicate candidates from a WL next payload.
+
+    Applies both ID-based deduplication (in ``_normalize_candidates``) and
+    exact-report content-hash deduplication so that identical candidates
+    emitted multiple times are presented only once to the scheduler.
+    """
+    return _apply_content_dedup(_normalize_candidates(payload))
 
 
 def select_candidate(
@@ -276,7 +320,7 @@ def select_candidate(
         timeout_seconds=timeout_seconds,
     )
     payload = client.fetch_payload()
-    candidates = _normalize_candidates(payload)
+    candidates = normalize_candidates(payload)
     if not candidates:
         return None
 
@@ -295,4 +339,4 @@ def fetch_candidates(
         timeout_seconds=timeout_seconds,
     )
     payload = client.fetch_payload()
-    return _normalize_candidates(payload), payload
+    return normalize_candidates(payload), payload

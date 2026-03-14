@@ -129,6 +129,10 @@ class SchedulerConfig:
     store_path: str
     llm_healthcheck_url: str
     max_run_history: int
+    # Make this optional with a sensible default to preserve backwards
+    # compatibility for callers/tests that instantiate SchedulerConfig
+    # without this value.
+    container_dispatch_timeout_seconds: int = 240
 
     @staticmethod
     def from_env() -> "SchedulerConfig":
@@ -171,6 +175,9 @@ class SchedulerConfig:
                 "AMPA_LLM_HEALTHCHECK_URL", "http://localhost:8000/health"
             ),
             max_run_history=_int("AMPA_SCHEDULER_MAX_RUN_HISTORY", 50),
+            container_dispatch_timeout_seconds=_int(
+                "AMPA_CONTAINER_DISPATCH_TIMEOUT", 240
+            ),
         )
 
 
