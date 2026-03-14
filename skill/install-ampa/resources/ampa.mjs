@@ -577,6 +577,7 @@ async function start(projectRoot, cmd, name = 'default', foreground = false) {
     // Collect a helpful diagnostic snapshot: append the tail of the log to
     // the log itself with an explicit marker so operators can see what the
     // child process printed before exiting.
+    let logText = '';
     try {
       const maxBytes = 32 * 1024; // read up to last 32KB of log
       const stat = fs.existsSync(lpath) && fs.statSync(lpath);
@@ -587,13 +588,38 @@ async function start(projectRoot, cmd, name = 'default', foreground = false) {
         const pos = stat.size - toRead;
         fs.readSync(fd, buf, 0, toRead, pos);
         fs.closeSync(fd);
+        logText = buf.toString('utf8');
         fs.appendFileSync(lpath, `\n----- CHILD PROCESS OUTPUT (last ${toRead} bytes) -----\n`);
-        fs.appendFileSync(lpath, buf.toString('utf8') + '\n');
+        fs.appendFileSync(lpath, logText + '\n');
         fs.appendFileSync(lpath, `----- END CHILD OUTPUT -----\n`);
       }
     } catch (ex) {
       try { fs.appendFileSync(lpath, `Failed to capture child output: ${String(ex)}\n`); } catch (e) {}
     }
+    // Surface relevant error lines from the daemon log so the user does not
+    // need to open the log file manually.
+    const errorLines = extractErrorLines(logText);
+    if (errorLines.length > 0) {
+      console.error('');
+      console.error('Daemon log errors:');
+      for (const line of errorLines) console.error(`  ${line}`);
+    }
+    // Detect missing Discord configuration and provide actionable instructions.
+    if (errorLines.some((l) => l.includes('AMPA_DISCORD_BOT_TOKEN'))) {
+      console.error('');
+      console.error('Discord configuration is missing or incomplete.');
+      console.error('Create .worklog/ampa/.env in your project with the required settings:');
+      console.error('');
+      console.error('  mkdir -p .worklog/ampa');
+      console.error('  cat > .worklog/ampa/.env <<\'EOF\'');
+      console.error('  AMPA_DISCORD_BOT_TOKEN="<your-bot-token>"');
+      console.error('  AMPA_DISCORD_CHANNEL_ID="<your-channel-id>"');
+      console.error('  EOF');
+      console.error('');
+      console.error('See ampa/.env.sample for all available options.');
+    }
+    console.error('');
+    console.error(`Full log: ${lpath}`);
     return 1;
   }
   console.log(`Started ${name} pid=${proc.pid} log=${lpath}`);
@@ -2433,6 +2459,7 @@ export {
   CONTAINER_IMAGE,
   CONTAINER_PREFIX,
   DAEMON_NOT_RUNNING_MESSAGE,
+  extractErrorLines,
   POOL_PREFIX,
   POOL_SIZE,
   POOL_MAX_INDEX,
