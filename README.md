@@ -69,6 +69,30 @@ If the `ampa/Containerfile` has been modified since the image was last built, `w
 
 See the AMPA container pool reference for full details: `ampa/docs/ampa_container_pool.md`.
 
+### Installer: automatic post-install warm-pool
+
+The installer for the AMPA Worklog plugin will attempt to pre-warm the container pool automatically when it detects the required host tooling (`podman` and `distrobox`) and when the install is running non-interactively or with `--yes`.
+
+- Configure the target pool size with the `WL_AMPA_POOL_SIZE` environment variable or pass `--pool-size <n>` to the installer script (`skill/install-ampa/scripts/install-worklog-plugin.sh --pool-size 5`).
+- The warm-pool CLI also accepts `--size <n>` to override the configured pool size for a single invocation: `wl ampa warm-pool --non-interactive --size 4`.
+- The warm-pool CLI supports `--non-interactive` so installers can run it without prompts.
+- The installer skips the automatic warm-pool when running in CI (when `CI=true` is set) so CI jobs are not delayed by long-running container initialization.
+
+If the installer cannot find `podman` or `distrobox`, it will continue installation but print one-line actionable guidance explaining how to install the missing tools and how to run `wl ampa warm-pool` manually. Warm-pool failures are treated as non-fatal by the installer; it records the decision and prints short guidance and where the captured output is stored.
+
+Installer output capture and logs:
+- When the installer runs warm-pool it captures stdout/stderr to `/tmp/ampa_warm_pool.out` and `/tmp/ampa_warm_pool.err` and prints a short snippet on completion or a one-line actionable error on failure.
+
+Examples:
+
+```sh
+# set default pool size for this install
+WL_AMPA_POOL_SIZE=4 skill/install-ampa/scripts/install-worklog-plugin.sh --yes
+
+# run warm-pool manually (non-interactive, size 3)
+wl ampa warm-pool --non-interactive --size 3
+```
+
 ## Getting started
 1. Read the main workflow: [Workflow.md](Workflow.md).
 2. Pick a folder to work in (e.g., `skill/` or `agent/`).

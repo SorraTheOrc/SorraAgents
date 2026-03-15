@@ -147,7 +147,7 @@ parse_args() {
         LOCAL_INSTALL=1
         shift
         ;;
-      --help|-h)
+  --help|-h)
         echo "Usage: $0 [--bot-token <token>] [--channel-id <id>] [--yes] [--restart|--no-restart] [--local] [source-file] [target-dir]"
         echo ""
         echo "Options:"
@@ -162,6 +162,16 @@ parse_args() {
         echo "  \${XDG_CONFIG_HOME:-\$HOME/.config}/opencode/.worklog/plugins/"
         echo "Use --local to install into the current project's .worklog/plugins/ directory."
         exit 0
+        ;;
+      --pool-size)
+        shift
+        if [ "$#" -gt 0 ]; then
+          POOL_SIZE="$1"
+          shift
+        else
+          log_error "--pool-size requires a numeric value"
+          exit 2
+        fi
         ;;
       --*)
         log_error "Unknown option: $1"
@@ -189,6 +199,8 @@ parse_args() {
 
   # Set final values with defaults
   SRC="${SRC_ARG:-$DEFAULT_SRC}"
+  # Pool size: respect explicit flag, then env WL_AMPA_POOL_SIZE, default 3
+  POOL_SIZE="${POOL_SIZE:-${WL_AMPA_POOL_SIZE:-3}}"
   if [ -n "$TARGET_ARG" ]; then
     # Explicit target directory takes highest precedence
     TARGET_DIR="$TARGET_ARG"
@@ -1258,25 +1270,64 @@ main() {
      fi
    fi
 
-   # Start or restart daemon after install/upgrade completes, but only if a
-   # Python ampa package was installed into the plugin directory. If no python
-   # bundle is present there's nothing sensible to start and calling
-   # `wl ampa start` will fail with "No command resolved".
-   # Respect --no-restart flag.
-   if [ "$FORCE_NO_RESTART" -eq 0 ] && [ -f "$TARGET_DIR/$(basename "$SRC")" ]; then
-     if [ -d "$TARGET_DIR/ampa_py/ampa" ]; then
-       if [ "$do_restart" -eq 1 ]; then
-         log_info "Restarting daemon after upgrade..."
-         # stop_daemon was already called before install; just start
-         start_daemon
-       else
-         log_info "Starting daemon after installation..."
-         start_daemon
-       fi
-     else
-       log_info "No Python ampa package installed at $TARGET_DIR/ampa_py/ampa; skipping daemon start."
-     fi
-   fi
+  # Start or restart daemon after install/upgrade completes, but only if a
+  # Python ampa package was installed into the plugin directory. If no python
+  # bundle is present there's nothing sensible to start and calling
+  # `wl ampa start` will fail with "No command resolved".
+  # Respect --no-restart flag.
+  if [ "$FORCE_NO_RESTART" -eq 0 ] && [ -f "$TARGET_DIR/$(basename "$SRC")" ]; then
+    if [ -d "$TARGET_DIR/ampa_py/ampa" ]; then
+      if [ "$do_restart" -eq 1 ]; then
+        log_info "Restarting daemon after upgrade..."
+        # stop_daemon was already called before install; just start
+        start_daemon
+      else
+        log_info "Starting daemon after installation..."
+        start_daemon
+      fi
+    else
+      log_info "No Python ampa package installed at $TARGET_DIR/ampa_py/ampa; skipping daemon start."
+    fi
+  fi
+
+  # ==========================================================================
+  # Post-install: warm the AMPA container pool when possible
+  # ==========================================================================
+  # Decide whether to attempt warm-pool. Respect non-interactive installs
+  # (--yes / AUTO_YES) and environment hints such as CI=true. Default behaviour
+  # (per intake) is to warm the pool when prerequisites exist, including in
+  # non-interactive installs unless CI=true is set.
+  if [ -f "$TARGET_DIR/$(basename "$SRC")" ]; then
+    # Only attempt warm-pool when the Python package exists (we need the wl ampa command)
+    # Skip warm-pool in CI when CI=true is set
+    if [ "${CI:-}" = "true" ]; then
+      log_info "CI environment detected; skipping post-install warm-pool. To run manually: wl ampa warm-pool --size $POOL_SIZE"
+      log_decision "WARM_POOL=skipped_ci"
+    else
+      # Check for required host tooling: podman and distrobox
+      if command -v podman >/dev/null 2>&1 && command -v distrobox >/dev/null 2>&1; then
+        # Run warm-pool in non-interactive mode. We capture output and show
+        # a short progress summary. Failures are non-fatal: record decision and
+        # continue.
+        log_info "Detected podman and distrobox on PATH; attempting to pre-warm container pool (size=$POOL_SIZE)."
+        log_decision "WARM_POOL=begin SIZE=$POOL_SIZE"
+        if wl ampa warm-pool --non-interactive --size "$POOL_SIZE" 2>/tmp/ampa_warm_pool.err >/tmp/ampa_warm_pool.out; then
+          # Print succinct progress summary
+          awk 'NR<=20{print}' /tmp/ampa_warm_pool.out || true
+          log_info "warm-pool completed: see /tmp/ampa_warm_pool.out for details"
+          log_decision "WARM_POOL=ok"
+        else
+          # Non-fatal: print one-line actionable error and continue
+          log_error "warm-pool: encountered an error (non-fatal). Run: wl ampa warm-pool --size $POOL_SIZE  (see /tmp/ampa_warm_pool.err)"
+          log_decision "WARM_POOL=failed"
+        fi
+      else
+        # Missing prerequisites: print one-line actionable message
+        log_info "Podman or Distrobox not found; to pre-warm the container pool install them and run: wl ampa warm-pool --size $POOL_SIZE"
+        log_decision "WARM_POOL=prereqs_missing"
+      fi
+    fi
+  fi
 
 
   log_info "Installation complete."

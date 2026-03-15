@@ -1274,7 +1274,7 @@ function findPoolContainerForWorkItem(projectRoot, workItemId) {
  * Returns { created, errors } — the count of newly created containers
  * and an array of error messages for any that failed.
  */
-function replenishPool(projectRoot) {
+function replenishPool(projectRoot, sizeArg) {
   // Clean up any containers marked for destruction before counting slots
   cleanupMarkedContainers(projectRoot);
 
@@ -1282,24 +1282,28 @@ function replenishPool(projectRoot) {
   let created = 0;
   const errors = [];
 
+  // Determine target size for this invocation (optional override)
+  const targetSize = Number.isFinite(Number(sizeArg)) && Number(sizeArg) > 0 ? Number(sizeArg) : POOL_SIZE;
+  const poolMaxIndex = targetSize * 3;
+
   // Count how many unclaimed containers already exist
   const existing = existingPoolContainers();
   let unclaimed = 0;
-  for (let i = 0; i < POOL_MAX_INDEX; i++) {
+  for (let i = 0; i < poolMaxIndex; i++) {
     const name = poolContainerName(i);
     if (existing.has(name) && !state[name]) {
       unclaimed++;
     }
   }
 
-  const deficit = POOL_SIZE - unclaimed;
+  const deficit = targetSize - unclaimed;
   if (deficit <= 0) {
     return { created: 0, errors: [] };
   }
 
   // Collect free slot indices (where no container exists at all)
   const freeSlots = [];
-  for (let i = 0; i < POOL_MAX_INDEX && freeSlots.length < deficit; i++) {
+  for (let i = 0; i < poolMaxIndex && freeSlots.length < deficit; i++) {
     const name = poolContainerName(i);
     if (!existing.has(name)) {
       freeSlots.push(name);
@@ -1608,6 +1612,17 @@ async function startWork(projectRoot, workItemId, agentName) {
     `if [ -x /run/host/usr/bin/gh ] && [ ! -e /usr/local/bin/gh ]; then`,
     `  sudo ln -s /run/host/usr/bin/gh /usr/local/bin/gh`,
     `fi`,
+    // Ensure we use container-native Python instead of any legacy host-python
+    // bridge symlinks from earlier AMPA versions.
+    `if [ -L /usr/local/bin/python3 ] && [ "$(readlink /usr/local/bin/python3)" = "/run/host/usr/bin/python3" ]; then`,
+    `  sudo rm -f /usr/local/bin/python3`,
+    `fi`,
+    `if [ -L /usr/local/bin/python ] && [ "$(readlink /usr/local/bin/python)" = "/usr/local/bin/python3" ]; then`,
+    `  sudo rm -f /usr/local/bin/python`,
+    `fi`,
+    `if [ -x /usr/bin/python3 ] && [ ! -e /usr/local/bin/python ]; then`,
+    `  sudo ln -s /usr/bin/python3 /usr/local/bin/python`,
+    `fi`,
     // Create a wrapper for npm that delegates to the host's npm module tree
     // via the already-symlinked node.  npm is a Node.js script (not a native
     // binary) so a simple symlink won't work — the require() paths would
@@ -1642,6 +1657,7 @@ async function startWork(projectRoot, workItemId, agentName) {
     `export AMPA_WORK_ITEM_ID=${workItemId}`,
     `export AMPA_BRANCH=${branch}`,
     `export AMPA_PROJECT_ROOT=${projectRoot}`,
+    `export PATH=/usr/local/bin:/usr/bin:/bin:$PATH`,
     `AMPA_BASHRC_EOF`,
     // Append the prompt and exit trap via separate heredocs so that the
     // quoted delimiters prevent shell expansion of bash escape sequences.
@@ -1666,6 +1682,7 @@ async function startWork(projectRoot, workItemId, agentName) {
     `trap __ampa_exit_sync EXIT`,
     `AMPA_EXIT_TRAP`,
     `echo 'cd /workdir/project' | sudo tee -a /etc/ampa_bashrc > /dev/null`,
+    `echo '[ -f /workdir/project/.venv/bin/activate ] && . /workdir/project/.venv/bin/activate' | sudo tee -a /etc/ampa_bashrc > /dev/null`,
     // Add a one-line source guard to ~/.bashrc (idempotently) so that
     // /etc/ampa_bashrc is sourced only inside AMPA containers.  On the host
     // the file does not exist, so the guard is a no-op.
@@ -1686,6 +1703,26 @@ async function startWork(projectRoot, workItemId, agentName) {
     `    cat > .worklog/config.yaml << 'WLCFG'`,
     `${hostConfig}`,
     `WLCFG`,
+    `  fi`,
+    `  if [ -f pyproject.toml ] || [ -f ampa/requirements.txt ] || [ -f requirements.txt ]; then`,
+    `    echo "Preparing Python test environment..."`,
+    `    if [ ! -d .venv ]; then`,
+    `      python3 -m venv .venv || echo "Warning: failed to create .venv"`,
+    `    fi`,
+    `    if [ -f .venv/bin/activate ]; then`,
+    `      . .venv/bin/activate`,
+    `      python -m pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true`,
+    `      if [ -f ampa/requirements.txt ]; then`,
+    `        pip install -r ampa/requirements.txt >/dev/null 2>&1 || echo "Warning: pip install ampa/requirements.txt failed"`,
+    `      fi`,
+    `      if [ -f requirements.txt ]; then`,
+    `        pip install -r requirements.txt >/dev/null 2>&1 || echo "Warning: pip install requirements.txt failed"`,
+    `      fi`,
+    `      if [ -f pyproject.toml ]; then`,
+    `        pip install -e .[dev] >/dev/null 2>&1 || echo "Warning: pip install -e .[dev] failed"`,
+    `      fi`,
+    `      deactivate || true`,
+    `    fi`,
     `  fi`,
     `  echo "Initializing worklog..."`,
     `  wl init --project-name "${wlProjectName}" --prefix "${wlPrefix}" --auto-export yes --auto-sync no --agents-template skip --workflow-inline no --stats-plugin-overwrite no --json || echo "wl init skipped (may already be initialized)"`,
@@ -2345,7 +2382,21 @@ export default function register(ctx) {
   ampa
     .command('warm-pool')
     .description('Pre-warm the container pool (ensure template exists and fill empty pool slots)')
-    .action(async () => {
+    .option('--size <n>', 'Target pool size (overrides WL_AMPA_POOL_SIZE env var)')
+    .option('--non-interactive', 'Run without interactive prompts (suitable for installers)')
+    .action(async (opts, cmd) => {
+      const allOpts = cmd.optsWithGlobals();
+      // Respect --size flag, then WL_AMPA_POOL_SIZE env, default to POOL_SIZE
+      const requestedSize = parseInt(allOpts.size || process.env.WL_AMPA_POOL_SIZE || POOL_SIZE, 10) || POOL_SIZE;
+      // Temporarily override POOL_SIZE for this invocation
+      const origPoolSize = POOL_SIZE;
+      // Note: POOL_SIZE is a const; to allow per-invocation size we pass requestedSize
+      // into replenishPool by wrapping or using a new helper. For simplicity, we
+      // set a local variable here and pass it to replenishPool via an argument
+      // in the future; for now replenishPool reads POOL_SIZE constant. If callers
+      // rely on --size, they should set WL_AMPA_POOL_SIZE in the environment.
+      // Continue with existing behaviour.
+      
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
       const prereqs = checkPrerequisites();
@@ -2386,7 +2437,9 @@ export default function register(ctx) {
         return;
       }
       console.log('Template ready. Filling pool slots...');
-      const result = replenishPool(cwd);
+      // If caller supplied a size via env or flag, pass it through
+      const requestedSize = parseInt(allOpts.size || process.env.WL_AMPA_POOL_SIZE || POOL_SIZE, 10) || POOL_SIZE;
+      const result = replenishPool(cwd, requestedSize);
       if (result.errors.length) {
         result.errors.forEach(e => console.error(e));
       }
@@ -2396,6 +2449,7 @@ export default function register(ctx) {
         console.log('Pool is already fully warm — no new containers needed.');
       }
       process.exitCode = result.errors.length > 0 ? 1 : 0;
+    });
     });
 
   ampa

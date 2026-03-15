@@ -133,6 +133,11 @@ Keep asking questions until the breakdown into features is clear.
     -- Update the planned work item's stage to indicate planning is complete:
   - `wl update $1 --stage plan_complete --json`
 
+6. Calculate Effort and Risk (agent responsibility; must follow)
+
+- Call the `effort_and_risk` skill with the new or updated work item to produce an effort and risk estimate.
+
+
 ## Traceability & idempotence
 
 - Re-running `/plan <work-item-id>` should not create duplicate child work items or duplicate generated plan blocks in the parent work item.
