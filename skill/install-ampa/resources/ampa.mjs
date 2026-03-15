@@ -2450,57 +2450,6 @@ export default function register(ctx) {
       }
       process.exitCode = result.errors.length > 0 ? 1 : 0;
     });
-    
-      let cwd = process.cwd();
-      try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
-      const prereqs = checkPrerequisites();
-      if (!prereqs.ok) {
-        console.error(prereqs.message);
-        process.exitCode = 1;
-        return;
-      }
-      // Check if the image is stale (Containerfile newer than image)
-      if (isImageStale(cwd)) {
-        console.log('Containerfile is newer than the current image — rebuilding...');
-        const teardown = teardownStalePool(cwd);
-        if (teardown.destroyed.length > 0) {
-          console.log(`Removed stale containers: ${teardown.destroyed.join(', ')}`);
-        }
-        if (teardown.kept.length > 0) {
-          console.log(`Kept claimed containers (still in use): ${teardown.kept.join(', ')}`);
-        }
-        if (teardown.errors.length > 0) {
-          teardown.errors.forEach(e => console.error(e));
-        }
-      }
-      // Build image if needed
-      if (!imageExists(CONTAINER_IMAGE)) {
-        console.log('Building container image...');
-        const build = buildImage(cwd);
-        if (!build.ok) {
-          console.error(`Failed to build container image: ${build.message}`);
-          process.exitCode = 1;
-          return;
-        }
-      }
-      console.log('Ensuring template container exists...');
-      const tmpl = ensureTemplate();
-      if (!tmpl.ok) {
-        console.error(`Failed to create template: ${tmpl.message}`);
-        process.exitCode = 1;
-        return;
-      }
-      console.log('Template ready. Filling pool slots...');
-      const result = replenishPool(cwd);
-      if (result.errors.length) {
-        result.errors.forEach(e => console.error(e));
-      }
-      if (result.created > 0) {
-        console.log(`Created ${result.created} pool container(s). Pool is now warm.`);
-      } else {
-        console.log('Pool is already fully warm — no new containers needed.');
-      }
-      process.exitCode = result.errors.length > 0 ? 1 : 0;
     });
 
   ampa
