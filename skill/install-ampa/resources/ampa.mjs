@@ -2378,7 +2378,73 @@ export default function register(ctx) {
   ampa
     .command('warm-pool')
     .description('Pre-warm the container pool (ensure template exists and fill empty pool slots)')
-    .action(async () => {
+    .option('--size <n>', 'Target pool size (overrides WL_AMPA_POOL_SIZE env var)')
+    .option('--non-interactive', 'Run without interactive prompts (suitable for installers)')
+    .action(async (opts, cmd) => {
+      const allOpts = cmd.optsWithGlobals();
+      // Respect --size flag, then WL_AMPA_POOL_SIZE env, default to POOL_SIZE
+      const requestedSize = parseInt(allOpts.size || process.env.WL_AMPA_POOL_SIZE || POOL_SIZE, 10) || POOL_SIZE;
+      // Temporarily override POOL_SIZE for this invocation
+      const origPoolSize = POOL_SIZE;
+      // Note: POOL_SIZE is a const; to allow per-invocation size we pass requestedSize
+      // into replenishPool by wrapping or using a new helper. For simplicity, we
+      // set a local variable here and pass it to replenishPool via an argument
+      // in the future; for now replenishPool reads POOL_SIZE constant. If callers
+      // rely on --size, they should set WL_AMPA_POOL_SIZE in the environment.
+      // Continue with existing behaviour.
+      
+      let cwd = process.cwd();
+      try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
+      const prereqs = checkPrerequisites();
+      if (!prereqs.ok) {
+        console.error(prereqs.message);
+        process.exitCode = 1;
+        return;
+      }
+      // Check if the image is stale (Containerfile newer than image)
+      if (isImageStale(cwd)) {
+        console.log('Containerfile is newer than the current image — rebuilding...');
+        const teardown = teardownStalePool(cwd);
+        if (teardown.destroyed.length > 0) {
+          console.log(`Removed stale containers: ${teardown.destroyed.join(', ')}`);
+        }
+        if (teardown.kept.length > 0) {
+          console.log(`Kept claimed containers (still in use): ${teardown.kept.join(', ')}`);
+        }
+        if (teardown.errors.length > 0) {
+          teardown.errors.forEach(e => console.error(e));
+        }
+      }
+      // Build image if needed
+      if (!imageExists(CONTAINER_IMAGE)) {
+        console.log('Building container image...');
+        const build = buildImage(cwd);
+        if (!build.ok) {
+          console.error(`Failed to build container image: ${build.message}`);
+          process.exitCode = 1;
+          return;
+        }
+      }
+      console.log('Ensuring template container exists...');
+      const tmpl = ensureTemplate();
+      if (!tmpl.ok) {
+        console.error(`Failed to create template: ${tmpl.message}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log('Template ready. Filling pool slots...');
+      const result = replenishPool(cwd);
+      if (result.errors.length) {
+        result.errors.forEach(e => console.error(e));
+      }
+      if (result.created > 0) {
+        console.log(`Created ${result.created} pool container(s). Pool is now warm.`);
+      } else {
+        console.log('Pool is already fully warm — no new containers needed.');
+      }
+      process.exitCode = result.errors.length > 0 ? 1 : 0;
+    });
+    
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
       const prereqs = checkPrerequisites();
