@@ -1274,7 +1274,7 @@ function findPoolContainerForWorkItem(projectRoot, workItemId) {
  * Returns { created, errors } — the count of newly created containers
  * and an array of error messages for any that failed.
  */
-function replenishPool(projectRoot) {
+function replenishPool(projectRoot, sizeArg) {
   // Clean up any containers marked for destruction before counting slots
   cleanupMarkedContainers(projectRoot);
 
@@ -1282,24 +1282,28 @@ function replenishPool(projectRoot) {
   let created = 0;
   const errors = [];
 
+  // Determine target size for this invocation (optional override)
+  const targetSize = Number.isFinite(Number(sizeArg)) && Number(sizeArg) > 0 ? Number(sizeArg) : POOL_SIZE;
+  const poolMaxIndex = targetSize * 3;
+
   // Count how many unclaimed containers already exist
   const existing = existingPoolContainers();
   let unclaimed = 0;
-  for (let i = 0; i < POOL_MAX_INDEX; i++) {
+  for (let i = 0; i < poolMaxIndex; i++) {
     const name = poolContainerName(i);
     if (existing.has(name) && !state[name]) {
       unclaimed++;
     }
   }
 
-  const deficit = POOL_SIZE - unclaimed;
+  const deficit = targetSize - unclaimed;
   if (deficit <= 0) {
     return { created: 0, errors: [] };
   }
 
   // Collect free slot indices (where no container exists at all)
   const freeSlots = [];
-  for (let i = 0; i < POOL_MAX_INDEX && freeSlots.length < deficit; i++) {
+  for (let i = 0; i < poolMaxIndex && freeSlots.length < deficit; i++) {
     const name = poolContainerName(i);
     if (!existing.has(name)) {
       freeSlots.push(name);
