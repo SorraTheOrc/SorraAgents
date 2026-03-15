@@ -2437,7 +2437,9 @@ export default function register(ctx) {
         return;
       }
       console.log('Template ready. Filling pool slots...');
-      const result = replenishPool(cwd);
+      // If caller supplied a size via env or flag, pass it through
+      const requestedSize = parseInt(allOpts.size || process.env.WL_AMPA_POOL_SIZE || POOL_SIZE, 10) || POOL_SIZE;
+      const result = replenishPool(cwd, requestedSize);
       if (result.errors.length) {
         result.errors.forEach(e => console.error(e));
       }
