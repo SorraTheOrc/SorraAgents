@@ -87,6 +87,7 @@ The command implements the procedural workflow below. Each numbered step is part
   - Desired change: brief summary of the likely changes needed.
   - Related work: list of related documents or work items with brief descriptions and links/ids.
 - Present the draft brief to the user and ask the user to review it and provide feedback.
+- Do not claim this completes the process. The last thing printed in this step should be a question asking the user to approve the brief or request changes.
 - The user may:
   - Respond with edits or clarifications, in which case you must incorporate them, and re-present the updated draft for approval, or
   - Approve, in which case you must proceed to the next step.
@@ -130,7 +131,11 @@ Update the description of the Worklog work item with the final intake brief from
 - Adding dependencies with `wl comment add <work-item-id> --comment "Blocks:<blocked-item-id>" --json` and `wl comment add <work-item-id> --comment "Blocked-by:<blocking-item-id>" --json`
 - Adjusting priority to better match the new understanding of scope and impact using `wl update <work-item-id> --priority <level> --json`
 
-10. Finishing (must do as the final step only)
+10. Calculate Effort and Risk (agent responsibility; must follow)
+
+- Call the `effort_and_risk` skill with the new or updated work item to produce an effort and risk estimate.
+
+11.  Finishing (must do as the final step only)
 
 - DO NOT close the issue
 - Run `wl sync` to sync work item changes.
