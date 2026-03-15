@@ -130,3 +130,15 @@ class SchedulerStore:
 
     def last_global_start(self) -> Optional[dt.datetime]:
         return _from_iso(self.data.get("last_global_start_ts"))
+
+    def get_candidate_hash_cache(self) -> Dict[str, str]:
+        """Return the persisted candidate hash cache as a ``{hash: iso_ts}`` dict."""
+        raw = self.data.get("candidate_hash_cache", {})
+        if not isinstance(raw, dict):
+            return {}
+        return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
+
+    def update_candidate_hash_cache(self, entries: Dict[str, str]) -> None:
+        """Persist an updated ``{hash: iso_ts}`` candidate hash cache and save."""
+        self.data["candidate_hash_cache"] = dict(entries)
+        self.save()
