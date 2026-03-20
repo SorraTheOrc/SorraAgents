@@ -20,7 +20,7 @@ Follow thhe steps below whn completing tasks. If you are already working on a sp
    - Break down the work into smaller sub-tasks if necessary
    - Each sub-task should be a discrete unit of work that can be completed independently, if a sub-task is still too large break it down further with sub-tasks of its own
    - Verify and if possible improve the description of the goal and how it will change behaviour, preferably in the form of a user story
-   - Verify and if possible improve the references to important specifications, user-stories, designs, or other important context
+   - Verify and if possible improve the references to important specifications, user-stories, designs, or other important context. A work-item should not reference itself.
    - Verify and if possible improve the acceptance criteria so they are clear, measurable, and testable
    - Create child work-items for each sub-task using `wl create -t "<sub-task-title>" -d "<detailed-description>" --parent <base-item-id> --issue-type <type-of-work-item> --priority <critical|high|medium|low> --json`
    - Once planning is complete update the parent work-item stage to `plan_complete` using `wl update <base-item-id> --stage plan_complete`
