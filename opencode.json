@@ -5,11 +5,11 @@
             "name": "LLama",
             "npm": "@ai-sdk/openai-compatible",
             "options": {
-                "baseURL": "http://192.168.88.5:8000/v1"
+                "baseURL": "http://192.168.0.199:8000/v1"
             },
             "models": {
-                "Qwen3-Coder-Next-GGUF": {
-                    "name": "Qwen 3 Next (local)"
+                "qwen3-coder-next-GGUF": {
+                    "name": "Qwen3 Coder Next (local)"
                 },
                 "gpt-oss-120b-GGUF": {
                     "name": "GPT-OSS 120B (local)",
