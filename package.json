@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "@opencode-ai/plugin": "1.2.26"
+    "@opencode-ai/plugin": "1.2.27"
   },
   "devDependencies": {
     "bats": "^1.13.0"
