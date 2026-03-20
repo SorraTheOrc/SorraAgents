@@ -202,7 +202,7 @@ def main():
         print(json.dumps({"error": "missing required field: issue_id"}))
         sys.exit(2)
 
-    # Verify the issue is in plan_complete stage before applying updates
+    # Verify the issue is in intake_complete or plan_complete stage before applying updates
     try:
         import subprocess
 
@@ -220,10 +220,10 @@ def main():
             sys.exit(3)
         show_json = json.loads(show_proc.stdout)
         stage = show_json.get("workItem", {}).get("stage", "")
-        if stage != "plan_complete":
+        if stage not in ("plan_complete", "intake_complete"):
             # Per SKILL gating, output single sentence refusal
             print(
-                f"The issue does not have a sufficiently detailed plan, as shown by the lack of a `stage:plan_complete`. Run the planning command with `/plan {issue_id}`"
+                f"The issue does not have a sufficiently detailed plan, to proceed it must be in the stage of `intake_complete` or `plan_complete`. Run the intake command with `/intake {issue_id}` or the plan command with `/plan {issue_id}`."
             )
             sys.exit(4)
     except Exception as e:

@@ -20,6 +20,11 @@ The issue does not have a sufficiently detailed plan, to proceed it must be in t
 
 Do not output any other text when refusing.
 
+Orchestrator behavior
+---------------------
+
+The `orchestrate_estimate.py` script accepts work items in either `intake_complete` or `plan_complete` stages when applying effort and risk updates. This allows estimates to be applied early in the intake phase and refined later if needed. The script uses the same stage validation for both calculation and update phases.
+
 When to use
 -----------
 Use this skill only after the Producer has prepared a plan and set the work item's stage to `intake_complete` or `plan_complete`.
