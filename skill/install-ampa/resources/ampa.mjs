@@ -2386,10 +2386,6 @@ export default function register(ctx) {
     .option('--non-interactive', 'Run without interactive prompts (suitable for installers)')
     .action(async (opts, cmd) => {
       const allOpts = cmd.optsWithGlobals();
-      // Respect --size flag, then WL_AMPA_POOL_SIZE env, default to POOL_SIZE
-      const requestedSize = parseInt(allOpts.size || process.env.WL_AMPA_POOL_SIZE || POOL_SIZE, 10) || POOL_SIZE;
-      // Temporarily override POOL_SIZE for this invocation
-      const origPoolSize = POOL_SIZE;
       // Note: POOL_SIZE is a const; to allow per-invocation size we pass requestedSize
       // into replenishPool by wrapping or using a new helper. For simplicity, we
       // set a local variable here and pass it to replenishPool via an argument
@@ -2449,7 +2445,6 @@ export default function register(ctx) {
         console.log('Pool is already fully warm — no new containers needed.');
       }
       process.exitCode = result.errors.length > 0 ? 1 : 0;
-    });
     });
 
   ampa
