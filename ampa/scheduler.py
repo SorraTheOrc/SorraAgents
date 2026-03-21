@@ -736,32 +736,32 @@ class Scheduler:
 
         # always post the generic discord notification afterwards
         if spec.command_type != "heartbeat":
-            try:
-                from .delegation import _summarize_for_discord
-
-                short_output = _summarize_for_discord(output, max_chars=1000)
-            except Exception:
-                LOG.exception("Failed to summarize output for discord post")
-                short_output = output
             title = spec.title or spec.metadata.get("discord_label") or spec.command_id
             try:
                 # Deduplicate generic scheduled command notifications by
-                # storing a content hash in the scheduler state per-command.
-                # Only send when the summarized output differs from the
-                # last posted content. This mirrors delegation report
-                # deduplication behaviour but is generic for scheduled
-                # commands like `wl-in_progress`.
-                new_hash = hashlib.sha256((short_output or "").encode("utf-8")).hexdigest()
+                # hashing the *raw* command output (before any LLM
+                # summarization).  Previous versions hashed the LLM
+                # summary, which was non-deterministic and defeated
+                # dedup for commands like `wl-in_progress`.
+                raw_hash = hashlib.sha256((output or "").encode("utf-8")).hexdigest()
                 state = self.store.get_state(spec.command_id)
                 old_hash = state.get("last_output_hash")
-                if old_hash == new_hash:
+                if old_hash == raw_hash:
                     LOG.info(
                         "Output for %s unchanged (hash=%s); skipping Discord notification",
                         spec.command_id,
-                        new_hash[:12],
+                        raw_hash[:12],
                     )
                 else:
-                    state["last_output_hash"] = new_hash
+                    # Content changed — summarize if needed, then notify.
+                    try:
+                        from .delegation import _summarize_for_discord
+
+                        short_output = _summarize_for_discord(output, max_chars=2000)
+                    except Exception:
+                        LOG.exception("Failed to summarize output for discord post")
+                        short_output = output
+                    state["last_output_hash"] = raw_hash
                     self.store.update_state(spec.command_id, state)
                     notifications_module.notify(
                         title=title,

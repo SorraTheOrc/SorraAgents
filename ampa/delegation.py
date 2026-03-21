@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 from typing import Any, Callable, Dict, List, Optional
 
@@ -44,6 +45,61 @@ def _trim_text(value: Optional[str]) -> str:
     return value.strip() if value else ""
 
 
+def _normalize_in_progress_output(text: str) -> str:
+    """Normalize in_progress output to make it idempotent for deduplication.
+    
+    Filters out lines or parts of lines that change between runs but don't
+    affect the actual work items being reported (e.g., timestamps, summary
+    counts that may vary in formatting).
+    
+    This ensures that identical work item lists produce identical report
+    hashes and suppress duplicate Discord notifications.
+    """
+    if not text:
+        return text
+    
+    lines = text.splitlines()
+    normalized_lines = []
+    
+    for line in lines:
+        stripped = line.strip()
+        
+        # Skip lines that are just summary counts or timestamps
+        # These change between runs even when work items are identical
+        if not stripped:
+            continue
+        
+        # Remove common timestamp patterns at the start or end of lines
+        # e.g., "then two minutes later", timestamps like "2026-03-21 10:30:00"
+        normalized = stripped
+        
+        # Remove "then X minutes/hours later" patterns (standalone lines or partial)
+        # Match both numeric ("then 2 minutes later") and word forms ("then two minutes later")
+        normalized = re.sub(r'^then\s+\w+\s+(minutes?|hours?|seconds?)\s+later\s*$', '', normalized, flags=re.IGNORECASE)
+        
+        # Remove timestamps (ISO format or similar)
+        normalized = re.sub(r'\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}', '', normalized)
+        normalized = re.sub(r'\b\d{2}:\d{2}:\d{2}\b', '', normalized)
+        
+        # Remove common summary prefixes that may vary
+        # Handle "Found X in-progress work item(s)" and "Total: X items in-progress"
+        normalized = re.sub(r'^(Found\s+\d+\s+in-progress\s+work\s+item\(s\)|Total:\s+\d+\s+items\s+in-progress)\s*$', '', normalized, flags=re.IGNORECASE)
+        # Also handle variations like "In Progress", "In-progress", "Eight work items are in-progress"
+        normalized = re.sub(r'^(In Progress|In-progress|Eight|Found|Total)\s*[:\-]?\s*', '', normalized, flags=re.IGNORECASE)
+        
+        # Skip if line becomes empty after normalization
+        if not normalized.strip():
+            continue
+        
+        normalized_lines.append(normalized)
+    
+    # Rebuild the text, preserving the core work item lines
+    result = '\n'.join(normalized_lines)
+    
+    # If we filtered everything, return original to preserve at least some content
+    return result if result.strip() else text.strip()
+
+
 def _content_hash(text: Optional[str]) -> str:
     """Return a SHA-256 hex digest of *text* for change detection.
 
@@ -53,7 +109,7 @@ def _content_hash(text: Optional[str]) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
-def _summarize_for_discord(text: Optional[str], max_chars: int = 1000) -> str:
+def _summarize_for_discord(text: Optional[str], max_chars: int = 2000) -> str:
     """If text is longer than max_chars, call ``opencode run`` to produce a short summary.
 
     Returns the original text on any failure.
@@ -497,6 +553,8 @@ class DelegationOrchestrator:
             in_progress_text += proc.stdout
         if proc.stderr and not in_progress_text:
             in_progress_text += proc.stderr
+        
+        in_progress_text = _normalize_in_progress_output(in_progress_text)
 
         selection = self._selection_module
         if selection is None:

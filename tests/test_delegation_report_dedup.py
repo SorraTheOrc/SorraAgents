@@ -20,7 +20,7 @@ from ampa.scheduler_types import (
 )
 from ampa.scheduler import Scheduler
 from ampa.scheduler_store import SchedulerStore
-from ampa.delegation import _content_hash
+from ampa.delegation import _content_hash, _normalize_in_progress_output
 from ampa import notifications as notifications_module
 from ampa.engine.core import EngineConfig
 from ampa.engine.dispatch import DispatchResult
@@ -439,3 +439,226 @@ def test_dispatch_notification_always_sent(tmp_path, monkeypatch):
     assert second_dispatch >= 2, (
         "Dispatch notification should always be sent (not deduped)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests for idempotency with changing timestamps/summary lines
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_in_progress_output_filters_timestamp_lines():
+    """Verify that 'then X minutes later' lines are filtered out."""
+    from ampa.delegation import _normalize_in_progress_output
+    
+    text_with_timestamp = (
+        "In Progress\n"
+        "- SA-1 Busy item\n"
+        "then two minutes later\n"
+        "- SA-2 Another item"
+    )
+    
+    normalized = _normalize_in_progress_output(text_with_timestamp)
+    
+    assert "then two minutes later" not in normalized.lower()
+    assert "SA-1" in normalized
+    assert "SA-2" in normalized
+
+
+def test_normalize_in_progress_output_idempotent():
+    """Verify that identical reports produce identical normalized output."""
+    from ampa.delegation import _normalize_in_progress_output
+    
+    text1 = (
+        "In Progress\n"
+        "Eight work items are in-progress, all at Stage: in_review.\n"
+        "SA-0MMOLJEAS1H73NO8 — \"test\": priority critical\n"
+        "then two minutes later\n"
+        "SA-0MMN9YNS41N1B77L — \"another\": priority high"
+    )
+    
+    text2 = (
+        "In Progress\n"
+        "Eight work items are in-progress, all at Stage: in_review.\n"
+        "SA-0MMOLJEAS1H73NO8 — \"test\": priority critical\n"
+        "then two minutes later\n"
+        "SA-0MMN9YNS41N1B77L — \"another\": priority high"
+    )
+    
+    norm1 = _normalize_in_progress_output(text1)
+    norm2 = _normalize_in_progress_output(text2)
+    
+    assert norm1 == norm2, "Identical inputs should produce identical normalized output"
+
+
+def test_normalize_in_progress_output_different_content_detected():
+    """Verify that different work items produce different normalized output."""
+    from ampa.delegation import _normalize_in_progress_output
+    
+    text1 = "In Progress\n- SA-1 Item one\nthen two minutes later"
+    text2 = "In Progress\n- SA-2 Item two\nthen two minutes later"
+    
+    norm1 = _normalize_in_progress_output(text1)
+    norm2 = _normalize_in_progress_output(text2)
+    
+    assert norm1 != norm2, "Different work items should produce different output"
+    assert "SA-1" in norm1 and "SA-2" not in norm1
+    assert "SA-2" in norm2 and "SA-1" not in norm2
+
+
+# ---------------------------------------------------------------------------
+# Tests for generic shell command notification dedup (scheduler path)
+# ---------------------------------------------------------------------------
+
+
+def _make_shell_spec(command_id="wl-in_progress"):
+    return CommandSpec(
+        command_id=command_id,
+        command="wl in_progress",
+        requires_llm=False,
+        frequency_minutes=1,
+        priority=0,
+        metadata={"discord_label": "wl in_progress"},
+        title="In Progress",
+        command_type="shell",
+    )
+
+
+def test_shell_dedup_hashes_raw_output_not_summary(tmp_path, monkeypatch):
+    """Dedup should hash raw command output, not the LLM-summarized version.
+
+    Even when _summarize_for_discord returns different text each call
+    (simulating LLM non-determinism), identical raw output should be
+    deduped and only one notification sent.
+    """
+    notify_calls = []
+
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        notify_calls.append({"title": title, "body": body, "message_type": message_type})
+        return 204
+
+    monkeypatch.setattr(notifications_module, "notify", fake_notify)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
+
+    # Simulate non-deterministic LLM summaries
+    summarize_call_count = [0]
+    original_summarize = None
+
+    def nondeterministic_summarize(text, max_chars=2000):
+        summarize_call_count[0] += 1
+        return f"Summary variant {summarize_call_count[0]}: {text[:50]}"
+
+    monkeypatch.setattr(
+        "ampa.delegation._summarize_for_discord", nondeterministic_summarize
+    )
+
+    raw_output = "Found 1 in_progress:\n- SA-1 Busy item"
+
+    def shell_executor(_spec):
+        now = dt.datetime.now(dt.timezone.utc)
+        return CommandRunResult(start_ts=now, end_ts=now, exit_code=0, output=raw_output)
+
+    sched = _make_scheduler(lambda *a, **kw: None, tmp_path)
+    sched.executor = shell_executor
+    spec = _make_shell_spec()
+    sched.store.add_command(spec)
+
+    # First run: should send
+    sched.start_command(spec)
+    first_count = len([c for c in notify_calls if c["message_type"] == "command"])
+    assert first_count == 1, "First notification should be sent"
+
+    # Second run with identical raw output: should NOT send
+    sched.start_command(spec)
+    second_count = len([c for c in notify_calls if c["message_type"] == "command"])
+    assert second_count == 1, (
+        "Identical raw output should be deduped even if summarizer is non-deterministic"
+    )
+
+
+def test_shell_dedup_sends_when_raw_output_changes(tmp_path, monkeypatch):
+    """When raw command output changes, a new notification should be sent."""
+    notify_calls = []
+
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        notify_calls.append({"title": title, "body": body, "message_type": message_type})
+        return 204
+
+    monkeypatch.setattr(notifications_module, "notify", fake_notify)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
+
+    outputs = ["Found 1 in_progress:\n- SA-1 Item A"]
+
+    def shell_executor(_spec):
+        now = dt.datetime.now(dt.timezone.utc)
+        return CommandRunResult(
+            start_ts=now, end_ts=now, exit_code=0, output=outputs[0]
+        )
+
+    sched = _make_scheduler(lambda *a, **kw: None, tmp_path)
+    sched.executor = shell_executor
+    spec = _make_shell_spec()
+    sched.store.add_command(spec)
+
+    # First run
+    sched.start_command(spec)
+    first_count = len([c for c in notify_calls if c["message_type"] == "command"])
+    assert first_count == 1
+
+    # Change raw output
+    outputs[0] = "Found 2 in_progress:\n- SA-1 Item A\n- SA-2 Item B"
+    sched.start_command(spec)
+    second_count = len([c for c in notify_calls if c["message_type"] == "command"])
+    assert second_count == 2, "Changed raw output should trigger a new notification"
+
+
+def test_shell_summarizer_not_called_when_deduped(tmp_path, monkeypatch):
+    """_summarize_for_discord should NOT be called when output is unchanged."""
+    notify_calls = []
+
+    def fake_notify(title, body="", message_type="other", *, payload=None):
+        notify_calls.append({"title": title, "body": body, "message_type": message_type})
+        return 204
+
+    monkeypatch.setattr(notifications_module, "notify", fake_notify)
+    monkeypatch.setenv("AMPA_DISCORD_BOT_TOKEN", "test-token")
+
+    summarize_calls = [0]
+
+    def tracking_summarize(text, max_chars=2000):
+        summarize_calls[0] += 1
+        return text
+
+    monkeypatch.setattr(
+        "ampa.delegation._summarize_for_discord", tracking_summarize
+    )
+
+    raw_output = "Found 1 in_progress:\n- SA-1 Busy item"
+
+    def shell_executor(_spec):
+        now = dt.datetime.now(dt.timezone.utc)
+        return CommandRunResult(start_ts=now, end_ts=now, exit_code=0, output=raw_output)
+
+    sched = _make_scheduler(lambda *a, **kw: None, tmp_path)
+    sched.executor = shell_executor
+    spec = _make_shell_spec()
+    sched.store.add_command(spec)
+
+    # First run: summarizer called
+    sched.start_command(spec)
+    assert summarize_calls[0] == 1
+
+    # Second run: raw output unchanged, summarizer should NOT be called
+    sched.start_command(spec)
+    assert summarize_calls[0] == 1, (
+        "Summarizer should not be called when raw output is unchanged (deduped)"
+    )
+
+
+def test_summarize_for_discord_threshold_is_2000():
+    """Verify _summarize_for_discord default threshold is 2000 chars."""
+    import inspect
+    from ampa.delegation import _summarize_for_discord
+
+    sig = inspect.signature(_summarize_for_discord)
+    default = sig.parameters["max_chars"].default
+    assert default == 2000, f"Expected default max_chars=2000, got {default}"
