@@ -64,6 +64,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -261,7 +262,7 @@ def _route_pr_review_interaction(
     )
 
     try:
-        responder.resume_from_payload({
+        resume_result = responder.resume_from_payload({
             "session_id": session_id,
             "action": action,
             "metadata": {
@@ -271,6 +272,32 @@ def _route_pr_review_interaction(
                 "source": "discord_button",
             },
         })
+
+        # Execute merge/reject workflow directly in daemon process after
+        # successful session resume.
+        if not isinstance(resume_result, dict) or resume_result.get("status") != "resumed":
+            return
+
+        # Execute merge/reject workflow directly in daemon process.
+        work_item_id = None
+        context = resume_result.get("context")
+        if isinstance(context, list) and context:
+            first = context[0]
+            if isinstance(first, dict):
+                work_item_id = first.get("work_item_id")
+
+        from .pr_monitor import PRMonitorRunner
+
+        runner = PRMonitorRunner(
+            run_shell=subprocess.run,
+            command_cwd=os.getcwd(),
+        )
+        runner.handle_review_decision(
+            action=action,
+            pr_number=pr_number,
+            work_item_id=work_item_id,
+            approved_by=user,
+        )
     except Exception:
         LOG.exception(
             "PR review routing failed for custom_id=%s pr_number=%d",

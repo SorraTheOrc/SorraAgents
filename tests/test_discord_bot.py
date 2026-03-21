@@ -871,7 +871,8 @@ class TestRoutePrReviewInteraction:
 
     def test_approve_calls_responder_with_accept(self):
         """pr_review_approve_42 routes to responder with action=accept."""
-        with patch("ampa.responder.resume_from_payload") as mock_resume:
+        with patch("ampa.responder.resume_from_payload") as mock_resume, \
+            patch("ampa.pr_monitor.PRMonitorRunner.handle_review_decision") as mock_handle:
             mock_resume.return_value = {}
             _route_pr_review_interaction(
                 "pr_review_approve_42", "alice#1234", "2026-01-01T00:00:00Z"
@@ -884,10 +885,30 @@ class TestRoutePrReviewInteraction:
             assert payload["metadata"]["approved_by"] == "alice#1234"
             assert payload["metadata"]["timestamp"] == "2026-01-01T00:00:00Z"
             assert payload["metadata"]["source"] == "discord_button"
+            mock_handle.assert_not_called()
+
+    def test_approve_resumed_triggers_pr_monitor_decision(self):
+        """A resumed session should invoke PRMonitorRunner.handle_review_decision."""
+        with patch("ampa.responder.resume_from_payload") as mock_resume, \
+            patch("ampa.pr_monitor.PRMonitorRunner.handle_review_decision") as mock_handle:
+            mock_resume.return_value = {
+                "status": "resumed",
+                "context": [{"pr_number": 42, "work_item_id": "SA-123"}],
+            }
+            _route_pr_review_interaction(
+                "pr_review_approve_42", "alice#1234", "2026-01-01T00:00:00Z"
+            )
+            mock_handle.assert_called_once_with(
+                action="accept",
+                pr_number=42,
+                work_item_id="SA-123",
+                approved_by="alice#1234",
+            )
 
     def test_reject_calls_responder_with_decline(self):
         """pr_review_reject_99 routes to responder with action=decline."""
-        with patch("ampa.responder.resume_from_payload") as mock_resume:
+        with patch("ampa.responder.resume_from_payload") as mock_resume, \
+            patch("ampa.pr_monitor.PRMonitorRunner.handle_review_decision") as mock_handle:
             mock_resume.return_value = {}
             _route_pr_review_interaction(
                 "pr_review_reject_99", "bob#5678", "2026-02-15T12:00:00Z"
@@ -898,6 +919,25 @@ class TestRoutePrReviewInteraction:
             assert payload["action"] == "decline"
             assert payload["metadata"]["pr_number"] == 99
             assert payload["metadata"]["approved_by"] == "bob#5678"
+            mock_handle.assert_not_called()
+
+    def test_reject_resumed_triggers_pr_monitor_decision(self):
+        """A resumed reject session should invoke PRMonitorRunner decision flow."""
+        with patch("ampa.responder.resume_from_payload") as mock_resume, \
+            patch("ampa.pr_monitor.PRMonitorRunner.handle_review_decision") as mock_handle:
+            mock_resume.return_value = {
+                "status": "resumed",
+                "context": [{"pr_number": 99, "work_item_id": "SA-999"}],
+            }
+            _route_pr_review_interaction(
+                "pr_review_reject_99", "bob#5678", "2026-02-15T12:00:00Z"
+            )
+            mock_handle.assert_called_once_with(
+                action="decline",
+                pr_number=99,
+                work_item_id="SA-999",
+                approved_by="bob#5678",
+            )
 
     def test_invalid_pr_number_logs_error_and_returns(self, caplog):
         """Non-numeric PR suffix logs an error and does not call responder."""

@@ -724,7 +724,7 @@ class TestSchedulerPRMonitor:
         assert run is not None
 
     def test_scheduler_auto_review_missing_defaults_enabled(self):
-        """Missing auto_review metadata should still inject dispatcher."""
+        """Missing auto_review metadata should inject dispatcher."""
         sched = _make_scheduler()
         with mock.patch("ampa.scheduler.notifications_module"), \
             mock.patch("ampa.engine.dispatch.ContainerDispatcher") as dispatcher_cls, \
@@ -790,6 +790,7 @@ class TestSchedulerPRMonitor:
         assert cmd is not None
         assert cmd.metadata.get("dedup") is True
         assert cmd.metadata.get("max_prs") == 50
+        assert cmd.metadata.get("auto_review") is True
 
 
 # ---------------------------------------------------------------------------
@@ -1548,6 +1549,47 @@ class TestAutoReviewIntegration:
         assert 99 in result["ready_prs"]
         fake_dispatcher.dispatch.assert_not_called()
 
+    def test_auto_review_missing_defaults_to_true(self):
+        """Missing auto_review metadata defaults to enabled."""
+        fake_dispatcher = mock.MagicMock()
+        fake_dispatcher.dispatch.return_value = type(
+            "R",
+            (),
+            {
+                "success": True,
+                "pid": 999,
+                "error": None,
+                "container_id": "c-test",
+                "timestamp": dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc),
+            },
+        )()
+
+        pr_json = self._one_pr_json()
+        checks_json = self._all_pass_checks()
+
+        def run_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "pr list" in cmd_str:
+                return subprocess.CompletedProcess([], 0, pr_json, "")
+            if "pr checks" in cmd_str:
+                return subprocess.CompletedProcess([], 0, checks_json, "")
+            if "which" in cmd_str or "command -v" in cmd_str:
+                return subprocess.CompletedProcess([], 0, "/usr/bin/gh", "")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = PRMonitorRunner(
+            run_shell=run_shell,
+            command_cwd="/tmp",
+            dispatcher=fake_dispatcher,
+        )
+        # metadata without auto_review key
+        spec = type("FakeSpec", (), {"metadata": {"dedup": False}})()
+        result = runner.run(spec)
+
+        assert 99 in result["ready_prs"]
+        assert result["auto_review_enabled"] is True
+        fake_dispatcher.dispatch.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Unit tests for _present_audit_results (Phase 2)
@@ -1787,6 +1829,69 @@ class TestCheckAndPresentAuditResults:
         payload = notifier.notify.call_args[1]["payload"]
         assert "PASS" in payload["embeds"][0]["title"]
         assert payload["components"][0]["custom_id"] == "pr_review_approve_23"
+
+    def test_stale_result_triggers_redispatch(self):
+        """When PR updatedAt is newer than audit result, trigger re-dispatch."""
+        dispatch_comment = json.dumps({
+            "dispatch_state": {
+                "pr_number": 25,
+                "dispatched_at": "2026-01-01T00:00:00+00:00",
+                "container_id": "c1",
+                "work_item_id": "SA-TEST123456",
+            }
+        })
+        dispatch_marker = f"{self._DISPATCH_MARKER_PREFIX}25 -->"
+
+        stale_result_payload = json.dumps({
+            "audit_result": {
+                "overall": "pass",
+                "summary": "Old result",
+                "criteria": [],
+                "pr_number": 25,
+                "audited_at": "2026-01-01T00:00:00+00:00",
+            }
+        })
+
+        fake_result = type(
+            "R", (), {
+                "success": True,
+                "pid": 2,
+                "error": None,
+                "container_id": "c2",
+                "timestamp": dt.datetime(2026, 1, 3, tzinfo=dt.timezone.utc),
+            }
+        )()
+        fake_dispatcher = mock.MagicMock()
+        fake_dispatcher.dispatch.return_value = fake_result
+
+        def wl_shell(cmd, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if "wl show" in cmd_str:
+                return subprocess.CompletedProcess(
+                    [], 0,
+                    json.dumps({
+                        "comments": [
+                            {"comment": f"{dispatch_marker}\n{dispatch_comment}"},
+                            {
+                                "comment": (
+                                    f"{self._RESULT_MARKER}\n{stale_result_payload}"
+                                )
+                            },
+                        ]
+                    }),
+                    "",
+                )
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        runner = self._make_runner(wl_shell=wl_shell, dispatcher=fake_dispatcher)
+        pr = {
+            "headRefName": "feature/SA-TEST123456-foo",
+            "number": 25,
+            "updatedAt": "2026-01-02T00:00:00+00:00",
+        }
+        runner._check_and_present_audit_results("gh", pr, 25, "PR", "")
+
+        fake_dispatcher.dispatch.assert_called_once()
 
     def test_exception_does_not_propagate(self):
         """Internal errors are caught — run continues."""

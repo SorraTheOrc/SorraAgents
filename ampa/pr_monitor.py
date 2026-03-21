@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
+import tempfile
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 LOG = logging.getLogger("ampa.pr_monitor")
@@ -355,7 +357,8 @@ class PRMonitorRunner:
         """List open PRs using gh CLI.  Returns None on failure."""
         try:
             cmd = (
-                f"{gh_cmd} pr list --state open --json number,title,url,headRefName "
+                f"{gh_cmd} pr list --state open "
+                f"--json number,title,url,headRefName,updatedAt "
                 f"--limit {max_prs}"
             )
             proc = self.run_shell(
@@ -588,6 +591,7 @@ class PRMonitorRunner:
         pr: Dict[str, Any],
         pr_number: int,
         pr_title: str,
+        force: bool = False,
     ) -> None:
         """Dispatch an LLM audit session for a CI-passing PR.
 
@@ -618,15 +622,16 @@ class PRMonitorRunner:
             return
 
         # Check for existing dispatch
-        existing = self._get_audit_dispatch_state(work_item_id, pr_number)
-        if existing is not None:
-            LOG.info(
-                "pr-monitor: audit already dispatched for PR #%d "
-                "(work item %s) — skipping",
-                pr_number,
-                work_item_id,
-            )
-            return
+        if not force:
+            existing = self._get_audit_dispatch_state(work_item_id, pr_number)
+            if existing is not None:
+                LOG.info(
+                    "pr-monitor: audit already dispatched for PR #%d "
+                    "(work item %s) — skipping",
+                    pr_number,
+                    work_item_id,
+                )
+                return
 
         # Compose review prompt
         prompt = (
@@ -737,7 +742,27 @@ class PRMonitorRunner:
                 return
 
             # Check for audit results
-            audit = self._get_audit_result(work_item_id, pr_number)
+            pr_updated_at = str(pr.get("updatedAt") or "").strip() or None
+            audit = self._get_audit_result(
+                work_item_id, pr_number, after_iso=pr_updated_at
+            )
+
+            # If we found an audit result but it is stale (older than the PR
+            # update time), trigger a fresh dispatch.
+            if audit is None and pr_updated_at:
+                maybe_stale = self._get_audit_result(work_item_id, pr_number)
+                if maybe_stale is not None:
+                    LOG.info(
+                        "pr-monitor: stale audit result for PR #%d "
+                        "(work item %s) — re-dispatching",
+                        pr_number,
+                        work_item_id,
+                    )
+                    self._dispatch_review(
+                        gh_cmd, pr, pr_number, pr_title, force=True
+                    )
+                    return
+
             if audit is None:
                 LOG.debug(
                     "pr-monitor: no audit result yet for PR #%d "
@@ -748,6 +773,13 @@ class PRMonitorRunner:
                 return
 
             # Present the results in Discord
+            if self._review_action_taken(pr_number):
+                LOG.info(
+                    "pr-monitor: review decision already recorded for PR #%d — "
+                    "not re-presenting audit",
+                    pr_number,
+                )
+                return
             self._present_audit_results(
                 pr_number, pr_title, pr_url, work_item_id, audit
             )
@@ -843,6 +875,41 @@ class PRMonitorRunner:
             "embeds": [embed],
             "components": components,
         }
+
+        session_id = f"pr-review-{pr_number}"
+        try:
+            from . import conversation_manager
+
+            prompt = (
+                f"Review decision required for PR #{pr_number} ({pr_title}). "
+                "Choose accept to merge and close the work item, or decline "
+                "to reject without merging."
+            )
+            conversation_manager.start_conversation(
+                session_id,
+                prompt,
+                {
+                    "work_item": work_item_id,
+                    "summary": (
+                        f"PR review decision required for PR #{pr_number} "
+                        f"({overall.upper()})"
+                    ),
+                    "choices": ["accept", "decline"],
+                    "context": [
+                        {
+                            "pr_number": pr_number,
+                            "work_item_id": work_item_id,
+                            "pr_url": pr_url,
+                            "audit_overall": overall,
+                        }
+                    ],
+                },
+            )
+        except Exception:
+            LOG.exception(
+                "pr-monitor: failed to start review conversation for PR #%d",
+                pr_number,
+            )
 
         try:
             sent = self._send_notification(payload=payload, message_type="command")
@@ -1599,6 +1666,26 @@ class PRMonitorRunner:
                 pr_number,
             )
 
+    def _review_action_taken(self, pr_number: int) -> bool:
+        """Return True when a PR review session has already been resumed."""
+        session_id = f"pr-review-{pr_number}"
+        tool_output_dir = os.getenv("AMPA_TOOL_OUTPUT_DIR") or os.path.join(
+            tempfile.gettempdir(), "opencode_tool_output"
+        )
+        state_path = os.path.join(tool_output_dir, f"session_{session_id}.json")
+        if not os.path.exists(state_path):
+            return False
+        try:
+            with open(state_path, "r", encoding="utf-8") as fh:
+                state_data = json.load(fh)
+            return str(state_data.get("state", "")).strip().lower() == "running"
+        except Exception:
+            LOG.debug(
+                "pr-monitor: failed to read review session state for PR #%d",
+                pr_number,
+            )
+            return False
+
     def _notify_summary(
         self,
         ready_prs: List[int],
@@ -1614,9 +1701,9 @@ class PRMonitorRunner:
             # Build a mapping from PR number to title/url for link formatting
             pr_map: Dict[int, Dict[str, str]] = {}
             for p in prs:
-                num = p.get("number")
+                num_raw = p.get("number")
                 try:
-                    num = int(num)
+                    num = int(str(num_raw))
                 except Exception:
                     continue
                 pr_map[num] = {"title": p.get("title", f"PR #{num}"), "url": p.get("url", "")}
