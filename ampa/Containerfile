@@ -72,3 +72,34 @@ RUN printf '%s\n' '#!/bin/sh' 'exec /run/host/usr/bin/wl "$@"' > /usr/local/bin/
 WORKDIR /workdir
 
 CMD ["/bin/bash"]
+
+# Playwright runtime and browser binary (needed for browser smoke tests).
+# Pin the Playwright package version via ARG so we can reproduce builds.
+# Recorded tag: 1.58.2
+ARG PLAYWRIGHT_VERSION=1.58.2
+
+# Install Playwright system dependencies, npm (for npx), and the Chromium
+# browser binary for the pinned Playwright version. This installs the
+# minimum set of libraries required by Chromium in Debian-based images.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    npm \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libcups2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libxss1 \
+    libasound2 \
+    libgbm1 \
+    libx11-xcb1 \
+    libgtk-3-0 \
+ && rm -rf /var/lib/apt/lists/* \
+ # Ensure npm/npx available then install Chromium for the pinned playwright
+ && npx --yes playwright@${PLAYWRIGHT_VERSION} install --with-deps chromium
+
+# NOTE: After building the image, measure sizes with:
+#   podman build -t ampa-dev:latest ampa/ && podman images ampa-dev:latest --format "{{.Repository}}: {{.Size}}"
+# Record before/after image sizes and raise an Open Question if the image grows by >500MB.
