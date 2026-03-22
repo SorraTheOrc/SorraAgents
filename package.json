@@ -1,8 +1,12 @@
 {
+  "scripts": {
+    "test:smoke:node": "node --test tests/node/test-browser-smoke.mjs"
+  },
   "dependencies": {
     "@opencode-ai/plugin": "1.2.27"
   },
   "devDependencies": {
-    "bats": "^1.13.0"
+    "bats": "^1.13.0",
+    "playwright": "1.58.2"
   }
 }
