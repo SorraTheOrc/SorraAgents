@@ -5,7 +5,6 @@
 | Field | Value |
 |---|---|
 | Work Item | SA-0MM1OMHR10AAV9OQ |
-| Prior Version | SA-0MLT1ENFV0CTQ1IO (v1) |
 | Status | Draft |
 | Author | opencode |
 | Date | 2026-03-22 |
@@ -15,7 +14,7 @@
 
 ## 1. Overview
 
-This PRD is the single, authoritative reference for the AMPA engine's execution semantics. It reconciles the prior engine PRD (`docs/workflow/engine-prd.md`, SA-0MLT1ENFV0CTQ1IO) with the current code structure following the delegation orchestration extraction (SA-0MLXEM41U1VIK3TB) and the scheduler–engine integration (SA-0MLX8HGUW0718XI5).
+This PRD is the single, authoritative reference for the AMPA engine's execution semantics. It documents the current code structure following the delegation orchestration extraction (SA-0MLXEM41U1VIK3TB) and the scheduler–engine integration (SA-0MLX8HGUW0718XI5).
 
 ### 1.1 Purpose
 
@@ -761,7 +760,7 @@ The scheduler store (`scheduler_store.json`) defines scheduled commands. Key del
 
 ## 12. Schema-to-Behaviour Mapping
 
-This section addresses the gap identified in the prior PRD audit (SA-0MLT1ENFV0CTQ1IO): no itemized mapping proving every engine behaviour is expressible in the workflow schema.
+This section addresses the gap identified in the SA-0MLT1ENFV0CTQ1IO audit: no itemized mapping proving every engine behaviour is expressible in the workflow schema.
 
 ### 12.1 Command-to-Code Mapping
 
@@ -1126,27 +1125,13 @@ def test_single_concurrency_blocks_delegation():
 
 ## 14. Rollout Notes
 
-### 14.1 Changes from Prior PRD (v1)
-
-This PRD replaces the prior v1 (SA-0MLT1ENFV0CTQ1IO) at the same file path. Key changes:
-
-| Area | v1 State | v2 State | Reason |
-|---|---|---|---|
-| Module structure | Scheduler + Engine (2-layer) | Scheduler + DelegationOrchestrator + Engine (3-layer) | Delegation extracted (SA-0MLXEM41U1VIK3TB) |
-| Entry point | Scheduler → Engine directly | Scheduler → `DelegationOrchestrator.execute()` → `Engine.process_delegation()` | Integration change (SA-0MLX8HGUW0718XI5) |
-| Stale recovery | Mentioned as open question | Fully documented: `recover_stale_delegations()`, threshold, Discord notification | Implemented (SA-0MLXJCNMR0OQD7Z5) |
-| Container dispatch | Not covered | Full documentation: pool management, timeout, teardown | Implemented in `dispatch.py` |
-| Schema mapping | Partial gap noted | Complete command-to-code, invariant-to-code, and state-to-code mappings | Gap addressed (Section 12) |
-| Test plan | Out of scope | 4 executable test cases included | Acceptance criteria met |
-
-### 14.2 Compatibility Notes
+### 14.1 Compatibility Notes
 
 - No production code changes are required by this PRD
-- This document replaces the prior v1 at the same path (`docs/workflow/engine-prd.md`); all existing links remain valid
 - Audit comment format is backward-compatible with existing worklog conventions
 - Workflow descriptor (`workflow.yaml`) is unchanged
 
-### 14.3 Future Directions (Acknowledged, Not Prescribed)
+### 14.2 Future Directions (Acknowledged, Not Prescribed)
 
 - **SA-0MLYOP9XN1I6P8MX**: Proposes that the scheduler should only execute commands while the engine owns the full delegation lifecycle. This would collapse the DelegationOrchestrator layer into the engine. This PRD documents the current 3-layer architecture without prescribing this change.
 - **SA-0MLYEOF5J1CXPAJV**: Descriptor-driven audit command handlers depend on audit format decisions documented in this PRD (Section 10).
@@ -1177,7 +1162,7 @@ This PRD replaces the prior v1 (SA-0MLT1ENFV0CTQ1IO) at the same file path. Key 
 
 | ID | Title | Status | Relationship |
 |---|---|---|---|
-| SA-0MLT1ENFV0CTQ1IO | PRD: AMPA engine execution semantics (v1) | Completed | Superseded by this PRD |
+| SA-0MLT1ENFV0CTQ1IO | PRD: AMPA engine execution semantics (initial draft) | Completed | Design history |
 | SA-0MLR5LBFP1IZ8VLL | Define AMPA delegation & management workflow | Completed | Parent design history |
 | SA-0MLPYRLRY0ODG6YH | AMPA unidirectional delegation, audit, lifecycle | Completed | Foundational lifecycle decisions |
 | SA-0MLX8HGUW0718XI5 | Scheduler integration: replace hard-coded delegation | Completed | Scheduler/engine integration |
