@@ -154,3 +154,33 @@ Update the description of the Worklog work item with the final intake brief from
 - Keep edits minimal and conservative.
 - Respect `.gitignore` and other ignore rules when searching the repo.
 - If any automated step fails or is ambiguous, surface an explicit Open Question and pause for human guidance.
+
+## Appendix: Clarifying questions & answers (must include)
+
+- Purpose: Every interview-driven intake must produce an auditable Appendix that lists all clarifying questions the agent asked during the intake interview and the answers provided by the user (or other authoritative source). This Appendix must be appended to the final intake brief that is written to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` and must also be included in the Worklog work item description when the agent runs the final `wl update`.
+
+- Required contents for each entry (one line per item is acceptable, but the Appendix may include short context paragraphs where needed):
+  - The question text exactly as asked.
+  - The answer provided and the answering party (user, stakeholder, or agent inference) and any short evidence or link (work item id, file path, or PR) used to support the answer.
+  - If the answer changed during the process, record the earlier answer(s) and mark the final accepted answer.
+  - If the question resulted in a discussion and/or research, include a concise summary of what was discussed, the research performed, findings, and any links to supporting artifacts (files, PRs, issues). Keep summaries short and focused (1–6 sentences).
+
+- Example format:
+
+  - Q: "Who is the primary user for this feature?" — Answer (user@acme): "Internal support engineers". Source: interactive reply. Final: yes.
+  - Q: "Is a migration required? (yes/no)" — Answer (user@acme): "No, data model is unchanged". Source: interactive reply.
+  - Q: "Can we reuse service X?" — Answer (engineer@acme): "Partially; we need a small wrapper. Research: checked repo path services/x and PR #42; wrapper required to adapt interface." (Research summary: inspected services/x, found no adapter — created follow-up task wl-789)
+
+- Behavior and placement rules:
+  - The agent MUST append the complete Appendix to the final draft file `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` before presenting it for final human approval.
+  - When updating the Worklog work item with `wl update --description-file`, ensure the Appendix is included in the description content pushed to the work item (so the full Q&A and any summarized research is archived with the work item).
+  - Maintain idempotence: re-running `/intake` MUST NOT duplicate earlier Appendix entries. If a question/answer pair already exists, update its record (for example, add a short revision note) rather than creating a duplicate entry.
+  - If a clarifying question was asked but never answered (open question), include it in the Appendix marked as "OPEN QUESTION" with brief context (who it was directed to and why it matters).
+  - Do not include or quote content from files excluded by `.gitignore` or other OpenCode ignore rules as part of the Appendix.
+
+- Privacy & scope:
+  - Only record information that the user or an authorized stakeholder provided during the intake. Do not record secrets or sensitive data.
+  - If a user pastes sensitive content by mistake, redact it from the Appendix and record the redaction with a short note (e.g., "[REDACTED sensitive snippet] - user asked to remove").
+
+- Traceability:
+  - Each Appendix entry should be linkable from the work item (either in the work item body or in a wl comment). When practical, include `related-to:<work-item-id>` or file path references to aid future discovery.

@@ -172,3 +172,31 @@ Keep asking questions until the breakdown into features is clear.
   - Starts an interview to break epic `wl-456` into feature and task work items.
 - `/plan wl-456 MVP first`
   - Same as above, but seeds the interview with the phrase "MVP first".
+
+
+## Appendix: Clarifying questions & answers (must include)
+
+- Purpose: Every interview-driven planning session must produce an auditable Appendix that lists all clarifying questions the agent asked during the planning interview and the answers provided by the user or stakeholders. This Appendix must be appended to any plan content written into the parent work item or temporary draft files and must also be included in the Worklog work item description or a comment when the plan is finalized.
+
+- Required contents for each entry:
+  - The question text exactly as asked.
+  - The answer provided and the answering party (user, stakeholder, or agent inference) and any supporting evidence or references (work item id, file path, PR link).
+  - If the answer changed during the process, record prior answers and mark the final accepted answer.
+  - If the question resulted in a discussion and/or research, include a concise summary (1–6 sentences) describing the discussion, research performed, findings, and any links to supporting artifacts (files, PRs, issues). Summaries should focus on impact to scope, dependencies, or implementation choices.
+
+- Example format:
+
+  - Q: "Should feature X be behind a feature flag? (yes/no/ask)" — Answer (product@acme): "Yes, gradual rollout behind flag". Source: interactive reply. Final: yes.
+  - Q: "Can we reuse library Y?" — Answer (eng@acme): "Partially. Research: reviewed `libs/y` and PR #88; requires adapter wrapper. Follow-up: created wl-789 to implement adapter." (Research summary: adapter required; library lacks needed API surface.)
+
+- Behavior and placement rules:
+  - The agent MUST append the complete Appendix to any temporary draft file used for the plan and include it in the parent work item's description or as a `wl comment` when calling `wl update` or `wl comment add`.
+  - Preserve idempotence: re-running `/plan` MUST NOT create duplicate Appendix entries. If a Q/A pair exists, either skip re-recording it or append a short revision note rather than duplicating the original entry.
+  - Open questions that remain unanswered must be included and clearly labelled as "OPEN QUESTION" with brief context (who it was directed to and why it matters).
+  - Do not include or quote content from files excluded by `.gitignore` or other OpenCode ignore rules as part of the Appendix.
+
+- Privacy & scope:
+  - Only record information provided by authorized participants. Redact any inadvertent secrets and note the redaction.
+
+- Traceability:
+  - Each Appendix entry should be linkable from the work item (either embedded in the work item body or referenced in a comment) and include related item references for discovery (e.g., `related-to:<work-item-id>`).
