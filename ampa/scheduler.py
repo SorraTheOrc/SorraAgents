@@ -417,6 +417,37 @@ class Scheduler:
         if isinstance(run, CommandRunResult):
             output = run.output
             exit_code = run.exit_code
+
+        # Detect timeout (exit code 124) for delegation/opencode commands and
+        # record a structured worklog entry in the scheduler state so operators
+        # can diagnose stuck runs without digging through raw logs.
+        # A wl CLI comment on the underlying work item would require resolving
+        # the work_item_id from the delegation result — that is deferred to a
+        # follow-up task (see ampa/scheduler_executor.py warning log for the
+        # noted location).
+        is_delegation = spec.command_type == "delegation" or "opencode run" in (
+            spec.command or ""
+        )
+        if is_delegation and exit_code == 124:
+            timeout_note = (
+                f"[timeout] Delegated run for command '{spec.command_id}' "
+                f"exceeded its configured timeout and was terminated "
+                f"(SIGTERM with SIGKILL escalation if needed). "
+                f"running flag cleared by _record_run."
+            )
+            LOG.warning(
+                "Delegation timeout for command_id=%s — running flag will be "
+                "cleared. Timeout note: %s",
+                spec.command_id,
+                timeout_note,
+            )
+            # Persist the timeout reason as part of the run output so it
+            # appears in run_history and is visible via store inspection.
+            if output:
+                output = f"{timeout_note}\n{output}"
+            else:
+                output = timeout_note
+
         if spec.command_type == "delegation":
             run = self._delegation_orchestrator.execute(spec, run, output)
             self._record_run(spec, run, run.exit_code, getattr(run, "output", output))
