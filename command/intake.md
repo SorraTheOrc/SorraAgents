@@ -76,6 +76,8 @@ The command implements the procedural workflow below. Each numbered step is part
   - The goal is not a complete spec but a sufficient understanding to draft a problem definition with user stories, success criteria, and related work.
 - Do not proceed until you have gathered sufficient information to draft an intake brief.
 
+- Review existing Appendix entries first: the agent MUST NOT ask any question that already appears in the Appendix of the current work item or any parent work item unless further clarification is required. If additional clarification is needed, explicitly reference the existing Appendix entry and state why more detail is required before re-asking the question.
+
 4. Draft intake brief (agent responsibility + user confirmation)
 
 - Write a clear intake brief with at `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` the following sections:

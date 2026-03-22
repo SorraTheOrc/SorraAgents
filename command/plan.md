@@ -73,6 +73,8 @@ In interview iterations (≤ 3 questions each), gather the minimum information n
 
 Keep asking questions until the breakdown into features is clear.
 
+- Review existing Appendix entries first: the agent MUST NOT ask any question that already appears in the Appendix of the parent work item or the current work item unless further clarification is required. If further clarification is required, reference the existing Appendix entry in the question and explain what additional detail is needed before re-asking.
+
 3. Propose feature plan (agent responsibility + user confirmation)
 
 - Produce a draft plan (soft guide: 3–12 features) where each feature includes:
