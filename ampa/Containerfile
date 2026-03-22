@@ -56,6 +56,26 @@ RUN apt-get update \
     zip \
  && rm -rf /var/lib/apt/lists/*
 
+# --- Playwright / Chromium layer -----------------------------------------------
+# Install npm (not bundled with the Debian nodejs package), then use the
+# Playwright CLI to pull in all Chromium system dependencies and the browser
+# binary.  PLAYWRIGHT_BROWSERS_PATH is set to a system-wide location so every
+# user inside the container can launch Chromium without extra per-user setup.
+#
+# playwright install-deps chromium  — installs all required apt packages
+# playwright install chromium       — downloads the Playwright-managed Chromium
+#
+# The final chmod ensures the binary tree is world-readable/executable so the
+# non-root dev user (and any Distrobox-remapped UID) can run the browser.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends npm \
+ && npm install -g playwright \
+ && playwright install-deps chromium \
+ && playwright install chromium \
+ && rm -rf /var/lib/apt/lists/* /root/.npm \
+ && chmod -R o+rx /ms-playwright
+
 # Create a non-root developer user. Distrobox will often enter the container
 # with the host UID; having a matching non-root user and home dir makes the
 # image friendlier for interactive use.
