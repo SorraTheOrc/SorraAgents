@@ -180,3 +180,21 @@ Notes
 - `distrobox enter ... -- bash --login -c` is the same pattern used in the plugin for host→container scripted steps and is the safest way to preserve user mappings and environment.
 - For automation that needs to run many short commands prefer bundling them into a single script and executing that script inside the container to avoid repeated distrobox/process startup overhead.
 - Always prefer `wl ampa finish-work` to manually removing containers so pool state and cleanup logs remain consistent.
+
+Browser test support
+-------------------
+
+This repository's AMPA dev container image now includes pinned Playwright and the Chromium browser runtime so that browser smoke tests can be executed inside claimed AMPA containers.
+
+- Playwright is pinned via `ARG PLAYWRIGHT_VERSION` in `ampa/Containerfile` (see the Containerfile comment for the exact tag used).
+- The image includes the system libraries required by Chromium to run headless in typical CI/Dev environments.
+- To run the Node.js browser smoke test:
+
+  ```sh
+  # inside a claimed container (or a container started from ampa-dev:latest)
+  cd /workdir/project
+  npm ci --include=dev
+  node --test tests/node/test-browser-smoke.mjs
+  ```
+
+If the test fails on first run, ensure dev dependencies are installed (`npm ci` or `npm install`) before re-running; the image includes the browser runtime but not your repository's node_modules which are mounted from the workspace.

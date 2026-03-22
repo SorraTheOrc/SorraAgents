@@ -69,6 +69,23 @@ If the `ampa/Containerfile` has been modified since the image was last built, `w
 
 See the AMPA container pool reference for full details: `ampa/docs/ampa_container_pool.md`.
 
+### Browser test capability
+
+The AMPA development image may include pinned Playwright and the Chromium browser runtime to support running browser smoke tests inside claimed containers. When present:
+
+- The pinned Playwright version is recorded in `ampa/Containerfile` via an `ARG PLAYWRIGHT_VERSION` comment.
+- To run the repository's browser smoke test inside a claimed container:
+
+  ```sh
+  wl ampa start-work <work-item-id>
+  # inside the container
+  cd /workdir/project
+  npm ci --include=dev
+  node --test tests/node/test-browser-smoke.mjs
+  ```
+
+Note: the container includes the browser runtime but not your project's node_modules; install dev dependencies inside the container before running tests.
+
 ### Installer: automatic post-install warm-pool
 
 The installer for the AMPA Worklog plugin will attempt to pre-warm the container pool automatically when it detects the required host tooling (`podman` and `distrobox`) and when the install is running non-interactively or with `--yes`.
