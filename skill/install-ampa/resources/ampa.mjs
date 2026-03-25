@@ -1640,13 +1640,15 @@ async function startWork(projectRoot, workItemId, agentName, waitFlag, waitTimeo
     // checkout. Use a path under /tmp so it lives in the container overlay
     // (not on a host bind) and is writable by the container user.
     `CONTAINER_PROJECT_ROOT="${containerProjectRoot}"`,
+    // Determine numeric container UID/GID early so we can create parent dir
+    `if command -v id >/dev/null 2>&1; then CON_UID="$(id -u)"; CON_GID="$(id -g)"; else CON_UID=1000; CON_GID=1000; fi`,
     `sudo rm -rf "${containerProjectRoot}" || true`,
     `sudo mkdir -p "$(dirname ${containerProjectRoot})" || true`,
+    `sudo chown "${CON_UID}:${CON_GID}" "$(dirname ${containerProjectRoot})" || true`,
     `echo "Preparing container-local project at ${containerProjectRoot}..."`,
     `if git clone --depth 1 "${origin}" "${containerProjectRoot}" > /tmp/ampa_clone.log 2>&1; then`,
     `  echo "Clone succeeded into container-local path"`,
     // Prefer numeric uid/gid chown to avoid depending on a "dev" user existing
-    `  if command -v id >/dev/null 2>&1; then CON_UID="$(id -u)"; CON_GID="$(id -g)"; else CON_UID=1000; CON_GID=1000; fi`,
     `  sudo chown -R "\${CON_UID}:\${CON_GID}" "${containerProjectRoot}" || true`,
     `else`,
     `  echo "Clone to container-local path failed; showing diagnostic"`,
