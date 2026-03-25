@@ -1416,7 +1416,7 @@ function runSync(cmd, args, opts = {}) {
 /**
  * Create and enter a Distrobox container for a work item.
  */
-async function startWork(projectRoot, workItemId, agentName) {
+async function startWork(projectRoot, workItemId, agentName, waitFlag, waitTimeoutSec) {
   console.log(`Creating sandbox container to work on ${workItemId}...`);
 
   // 1. Check prerequisites
@@ -1598,6 +1598,10 @@ async function startWork(projectRoot, workItemId, agentName) {
     console.log('Warning: Could not read host .worklog/config.yaml — worklog init may prompt interactively.');
   }
 
+  // Use /tmp so the sandbox lives on the container's writable tmpfs/overlay
+  // rather than under /opt which may be root-owned or backed by a host bind.
+  const containerProjectRoot = `/tmp/ampa_sandbox_${cName}/project`;
+
   const setupScript = [
     `set -e`,
     // Symlink host Node.js into the container so tools like wl work.
@@ -1632,10 +1636,24 @@ async function startWork(projectRoot, workItemId, agentName) {
     `  printf '#!/bin/sh\\nexec /usr/local/bin/node /run/host/usr/lib/node_modules/npm/bin/npm-cli.js "$@"\\n' | sudo tee /usr/local/bin/npm > /dev/null`,
     `  sudo chmod +x /usr/local/bin/npm`,
     `fi`,
-    `cd /workdir`,
-    `echo "Cloning project from ${origin}..."`,
-    `git clone --depth 1 "${origin}" project`,
-    `cd project`,
+    // Always perform a fresh, container-local clone. Do NOT use the host
+    // checkout. Use a path under /tmp so it lives in the container overlay
+    // (not on a host bind) and is writable by the container user.
+    `CONTAINER_PROJECT_ROOT="${containerProjectRoot}"`,
+    `sudo rm -rf "${containerProjectRoot}" || true`,
+    `sudo mkdir -p "$(dirname ${containerProjectRoot})" || true`,
+    `echo "Preparing container-local project at ${containerProjectRoot}..."`,
+    `if git clone --depth 1 "${origin}" "${containerProjectRoot}" > /tmp/ampa_clone.log 2>&1; then`,
+    `  echo "Clone succeeded into container-local path"`,
+    // Prefer numeric uid/gid chown to avoid depending on a "dev" user existing
+    `  if command -v id >/dev/null 2>&1; then CON_UID="$(id -u)"; CON_GID="$(id -g)"; else CON_UID=1000; CON_GID=1000; fi`,
+    `  sudo chown -R "\${CON_UID}:\${CON_GID}" "${containerProjectRoot}" || true`,
+    `else`,
+    `  echo "Clone to container-local path failed; showing diagnostic"`,
+    `  cat /tmp/ampa_clone.log || true`,
+    `  exit 1`,
+    `fi`,
+    `cd "${containerProjectRoot}"`,
     // Check if branch exists on remote
     `if git ls-remote --heads origin "${branch}" | grep -q "${branch}"; then`,
     `  echo "Branch ${branch} exists on remote, checking out..."`,
@@ -1744,7 +1762,26 @@ async function startWork(projectRoot, workItemId, agentName) {
     `else`,
     `  echo "Warning: wl not found in PATH. Worklog will not be initialized."`,
     `fi`,
-    `echo "Setup complete. Project cloned to /workdir/project on branch ${branch}"`,
+    `echo "Setup complete. Project cloned to ${containerProjectRoot} on branch ${branch}"`,
+    `# Perform readiness checks: plugin copied and python/venv available. Only
+    # write the readiness sentinel when checks pass so callers can wait on it.
+    PLUGIN_OK=0`,
+    `if [ -f .worklog/plugins/ampa.mjs ]; then PLUGIN_OK=1; fi`,
+    `PY_OK=0`,
+    `if [ -x .venv/bin/python ]; then PY_OK=1; elif command -v python3 >/dev/null 2>&1; then PY_OK=1; fi`,
+    `if [ "$PLUGIN_OK" -eq 1 ] && [ "$PY_OK" -eq 1 ]; then`,
+    `  echo "Readiness checks passed: plugin present and python/venv available."`,
+    `  sudo sh -c 'echo READY > /tmp/ampa_ready' || true`,
+    `  sudo chmod 644 /tmp/ampa_ready || true`,
+    `else`,
+    `  echo "Readiness checks failed: plugin_ok=${PLUGIN_OK} python_ok=${PY_OK}" > /tmp/ampa_install_start.log 2>/dev/null || true`,
+    `  echo "--- Diagnostic: /workdir/project/.worklog/plugins listing ---" >> /tmp/ampa_install_start.log 2>/dev/null || true`,
+    `  ls -la .worklog/plugins >> /tmp/ampa_install_start.log 2>/dev/null || true`,
+    `  echo "--- Diagnostic: /tmp/ampa_clone.log ---" >> /tmp/ampa_install_start.log 2>/dev/null || true`,
+    `  cat /tmp/ampa_clone.log >> /tmp/ampa_install_start.log 2>/dev/null || true`,
+    `  echo "Readiness incomplete — leaving setup script with non-zero exit"`,
+    `  exit 1`,
+    `fi`,
   ].join('\n');
 
   console.log('Running setup inside container...');
@@ -1752,13 +1789,62 @@ async function startWork(projectRoot, workItemId, agentName) {
     'enter', cName, '--', 'bash', '--login', '-c', setupScript,
   ]);
   if (setupResult.status !== 0) {
-    console.error(`Container setup failed: ${setupResult.stderr || setupResult.stdout}`);
-    // Attempt cleanup
-    releasePoolContainer(projectRoot, cName);
-    spawnSync('distrobox', ['rm', '--force', cName], { stdio: 'pipe' });
-    return 1;
+    console.error(`Container setup returned non-zero status: ${setupResult.status}`);
+    // If the setup script failed but the repo was still cloned correctly
+    // inside the container (some commands are best-effort), treat it as a
+    // success. Check for an existing clone and a valid git repo.
+    const verify = runSync('distrobox', [
+      'enter', cName, '--', 'bash', '--login', '-c',
+      `if [ -d "${containerProjectRoot}/.git" ]; then echo OK; else echo NO; fi`,
+    ]);
+    if (verify.status === 0 && (verify.stdout || '').includes('OK')) {
+      console.log('Setup script failed but a valid clone exists — continuing.');
+    } else {
+      console.error(setupResult.stderr || setupResult.stdout);
+      // Attempt cleanup
+      releasePoolContainer(projectRoot, cName);
+      spawnSync('distrobox', ['rm', '--force', cName], { stdio: 'pipe' });
+      return 1;
+    }
   }
   if (setupResult.stdout) console.log(setupResult.stdout);
+
+  // Determine whether caller wants to wait for readiness and decide timeout.
+  // Behavior: explicit waitFlag controls waiting. If undefined, default to
+  // not waiting unless an agent name was provided (non-interactive callers),
+  // in which case we block by default. The caller may override via CLI
+  // flags (--wait / --timeout) which map into waitFlag / waitTimeoutSec.
+  const effectiveWait = typeof waitFlag === 'boolean' ? waitFlag : !!agentName;
+  const effectiveTimeout = Number(waitTimeoutSec !== undefined ? waitTimeoutSec : (process.env.WL_AMPA_WAIT_SECONDS || 30));
+
+  if (effectiveWait && effectiveTimeout > 0) {
+    const startTs = Date.now();
+    let ready = false;
+    while ((Date.now() - startTs) < effectiveTimeout * 1000) {
+      const chk = runSync('distrobox', [
+        'enter', cName, '--', 'bash', '-lc', `if [ -f /tmp/ampa_ready ]; then echo OK; else echo NO; fi`,
+      ]);
+      if (chk.status === 0 && (chk.stdout || '').includes('OK')) { ready = true; break; }
+      // sleep 1 second
+      spawnSync('bash', ['-lc', 'sleep 1']);
+    }
+    if (!ready) {
+      console.error(`Container did not signal readiness within ${effectiveTimeout}s`);
+      // Surface container-side diagnostics to help triage the failure.
+      try {
+        console.error('\n--- Container-side diagnostics (tail) ---');
+        const diag = runSync('distrobox', [
+          'enter', cName, '--', 'bash', '-lc', 'echo "--- /tmp/ampa_clone.log ---"; tail -n +1 /tmp/ampa_clone.log 2>/dev/null || true; echo "--- /tmp/ampa_install_start.log ---"; tail -n +1 /tmp/ampa_install_start.log 2>/dev/null || true; echo "--- /tmp listing ---"; ls -la /tmp || true',
+        ]);
+        if (diag.stdout) console.error(diag.stdout);
+        if (diag.stderr) console.error(diag.stderr);
+      } catch (e) {
+        console.error('Failed to collect container diagnostics:', e && e.message ? e.message : String(e));
+      }
+      // Return non-zero so automated callers know start-work failed.
+      return 1;
+    }
+  }
 
   // 10. Claim work item if agent name provided
   if (agentName) {
@@ -1773,12 +1859,12 @@ async function startWork(projectRoot, workItemId, agentName) {
 
   // 12. Enter the container interactively
   console.log(`\nEntering container "${cName}"...`);
-  console.log(`Work directory: /workdir/project`);
+  console.log(`Work directory: ${containerProjectRoot}`);
   console.log(`Branch: ${branch}`);
   console.log(`Work item: ${workItemId} - ${workItem.title}`);
   console.log(`\nRun 'wl ampa finish-work' when done.\n`);
 
-  const enterProc = spawn('distrobox', ['enter', cName, '--', 'bash', '--login', '-c', 'cd /workdir/project && exec bash --login'], {
+  const enterProc = spawn('distrobox', ['enter', cName, '--', 'bash', '--login', '-c', `cd ${containerProjectRoot} && exec bash --login`], {
     stdio: 'inherit',
   });
 
@@ -2309,10 +2395,14 @@ export default function register(ctx) {
     .description('Create an isolated dev container for a work item')
     .arguments('<work-item-id>')
     .option('--agent <name>', 'Agent name for work item assignment')
+    .option('--wait', 'Block until container signals readiness', false)
+    .option('--timeout <seconds>', 'Override readiness wait timeout seconds', parseInt)
     .action(async (workItemId, opts) => {
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
-      const code = await startWork(cwd, workItemId, opts.agent);
+      const waitFlag = opts.wait !== undefined ? !!opts.wait : undefined;
+      const timeout = opts.timeout !== undefined ? Number(opts.timeout) : undefined;
+      const code = await startWork(cwd, workItemId, opts.agent, waitFlag, timeout);
       process.exitCode = code;
     });
 
@@ -2380,10 +2470,30 @@ export default function register(ctx) {
     });
 
   ampa
+    .command('build-image')
+    .description('Build the container image from the Containerfile')
+    .action(async () => {
+      let cwd = process.cwd();
+      try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
+      const prereqs = checkPrerequisites();
+      if (!prereqs.ok) { console.error(prereqs.message); process.exitCode = 1; return; }
+      console.log('Building container image...');
+      const build = buildImage(cwd);
+      if (!build.ok) {
+        console.error(`Failed to build container image: ${build.message}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(build.message);
+      process.exitCode = 0;
+    });
+
+  ampa
     .command('warm-pool')
     .description('Pre-warm the container pool (ensure template exists and fill empty pool slots)')
     .option('--size <n>', 'Target pool size (overrides WL_AMPA_POOL_SIZE env var)')
     .option('--non-interactive', 'Run without interactive prompts (suitable for installers)')
+    .option('--rebuild', 'Force rebuild of the container image and recreate pool from it')
     .action(async (opts, cmd) => {
       const allOpts = cmd.optsWithGlobals();
       // Note: POOL_SIZE is a const; to allow per-invocation size we pass requestedSize
@@ -2401,18 +2511,33 @@ export default function register(ctx) {
         process.exitCode = 1;
         return;
       }
-      // Check if the image is stale (Containerfile newer than image)
-      if (isImageStale(cwd)) {
-        console.log('Containerfile is newer than the current image — rebuilding...');
+      // Rebuild image if requested, otherwise check if the image is stale
+      if (allOpts.rebuild) {
+        console.log('Rebuild requested — tearing down pool/template and removing image...');
         const teardown = teardownStalePool(cwd);
         if (teardown.destroyed.length > 0) {
-          console.log(`Removed stale containers: ${teardown.destroyed.join(', ')}`);
+          console.log(`Removed containers/template: ${teardown.destroyed.join(', ')}`);
         }
         if (teardown.kept.length > 0) {
           console.log(`Kept claimed containers (still in use): ${teardown.kept.join(', ')}`);
         }
         if (teardown.errors.length > 0) {
           teardown.errors.forEach(e => console.error(e));
+        }
+      } else {
+        // Check if the image is stale (Containerfile newer than image)
+        if (isImageStale(cwd)) {
+          console.log('Containerfile is newer than the current image — rebuilding...');
+          const teardown = teardownStalePool(cwd);
+          if (teardown.destroyed.length > 0) {
+            console.log(`Removed stale containers: ${teardown.destroyed.join(', ')}`);
+          }
+          if (teardown.kept.length > 0) {
+            console.log(`Kept claimed containers (still in use): ${teardown.kept.join(', ')}`);
+          }
+          if (teardown.errors.length > 0) {
+            teardown.errors.forEach(e => console.error(e));
+          }
         }
       }
       // Build image if needed
