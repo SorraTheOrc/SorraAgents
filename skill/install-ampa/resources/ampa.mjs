@@ -1416,7 +1416,7 @@ function runSync(cmd, args, opts = {}) {
 /**
  * Create and enter a Distrobox container for a work item.
  */
-async function startWork(projectRoot, workItemId, agentName) {
+async function startWork(projectRoot, workItemId, agentName, waitFlag, waitTimeoutSec) {
   console.log(`Creating sandbox container to work on ${workItemId}...`);
 
   // 1. Check prerequisites
@@ -1623,19 +1623,31 @@ async function startWork(projectRoot, workItemId, agentName) {
     `if [ -x /usr/bin/python3 ] && [ ! -e /usr/local/bin/python ]; then`,
     `  sudo ln -s /usr/bin/python3 /usr/local/bin/python`,
     `fi`,
-    // Create a wrapper for npm that delegates to the host's npm module tree
-    // via the already-symlinked node.  npm is a Node.js script (not a native
-    // binary) so a simple symlink won't work — the require() paths would
-    // resolve against the container's filesystem where the npm module tree
-    // doesn't exist.
-    `if [ -f /run/host/usr/lib/node_modules/npm/bin/npm-cli.js ] && [ ! -e /usr/local/bin/npm ]; then`,
+    `if [ -x /run/host/usr/lib/node_modules/npm/bin/npm-cli.js ] && [ ! -e /usr/local/bin/npm ]; then`,
     `  printf '#!/bin/sh\\nexec /usr/local/bin/node /run/host/usr/lib/node_modules/npm/bin/npm-cli.js "$@"\\n' | sudo tee /usr/local/bin/npm > /dev/null`,
     `  sudo chmod +x /usr/local/bin/npm`,
     `fi`,
-    `cd /workdir`,
-    `echo "Cloning project from ${origin}..."`,
-    `git clone --depth 1 "${origin}" project`,
-    `cd project`,
+    // Use /tmp so the sandbox lives on the container's writable tmpfs/overlay
+    // rather than under /opt which may be root-owned or backed by a host bind.
+    `CONTAINER_PROJECT_ROOT="/tmp/ampa_sandbox_${cName}/project"`,
+    `rm -rf "${CONTAINER_PROJECT_ROOT}" || true`,
+    `mkdir -p "$(dirname ${CONTAINER_PROJECT_ROOT})" || true`,
+    `echo "Preparing container-local project at ${CONTAINER_PROJECT_ROOT}..."`,
+    `if git clone --depth 1 "${origin}" "${CONTAINER_PROJECT_ROOT}" > /tmp/ampa_clone.log 2>&1; then`,
+    `  echo "Clone succeeded into container-local path"`,
+    // Prefer numeric uid/gid chown to avoid depending on a "dev" user existing
+    `  if command -v id >/dev/null 2>&1; then CON_UID="$(id -u)"; CON_GID="$(id -g)"; else CON_UID=1000; CON_GID=1000; fi`,
+    `  sudo chown -R "\${CON_UID}:\${CON_GID}" "${CONTAINER_PROJECT_ROOT}" || true`,
+    `else`,
+    `  echo "Clone to container-local path failed; showing diagnostic"`,
+    `  cat /tmp/ampa_clone.log || true`,
+    `  exit 1`,
+    `fi`,
+    `cd "${CONTAINER_PROJECT_ROOT}"`,
+    // Create a symlink from the expected /workdir/project location to the actual clone location
+    `if [ ! -e /workdir/project ]; then`,
+    `  sudo ln -s "${CONTAINER_PROJECT_ROOT}" /workdir/project`,
+    `fi`,
     // Check if branch exists on remote
     `if git ls-remote --heads origin "${branch}" | grep -q "${branch}"; then`,
     `  echo "Branch ${branch} exists on remote, checking out..."`,
@@ -1644,6 +1656,32 @@ async function startWork(projectRoot, workItemId, agentName) {
     `else`,
     `  echo "Creating new branch ${branch}..."`,
     `  git checkout -b "${branch}"`,
+    `fi`,
+    // Symlink host gh (GitHub CLI) into the container.  gh is a statically
+    // linked Go binary so it has no shared-library dependencies and is safe
+    // to use from /run/host.
+    `if [ -x /run/host/usr/bin/gh ] && [ ! -e /usr/local/bin/gh ]; then`,
+    `  sudo ln -s /run/host/usr/bin/gh /usr/local/bin/gh`,
+    `fi`,
+    // Ensure we use container-native Python instead of any legacy host-python
+    // bridge symlinks from earlier AMPA versions.
+    `if [ -L /usr/local/bin/python3 ] && [ "$(readlink /usr/local/bin/python3)" = "/run/host/usr/bin/python3" ]; then`,
+    `  sudo rm -f /usr/local/bin/python3`,
+    `fi`,
+    `if [ -L /usr/local/bin/python ] && [ "$(readlink /usr/local/bin/python)" = "/usr/local/bin/python3" ]; then`,
+    `  sudo rm -f /usr/local/bin/python`,
+    `fi`,
+    `if [ -x /usr/bin/python3 ] && [ ! -e /usr/local/bin/python ]; then`,
+    `  sudo ln -s /usr/bin/python3 /usr/local/bin/python`,
+    `fi`,
+    // Create a wrapper for npm that delegates to the host's npm module tree
+    // via the already-symlinked node.  npm is a Node.js script (not a native
+    // binary) so a simple symlink won't work — the require() paths would
+    // resolve against the container's filesystem where the npm module tree
+    // doesn't exist.
+    `if [ -f /run/host/usr/lib/node_modules/npm/bin/npm-cli.js ] && [ ! -e /usr/local/bin/npm ]; then`,
+    `  printf '#!/bin/sh\\nexec /usr/local/bin/node /run/host/usr/lib/node_modules/npm/bin/npm-cli.js "$@"\\n' | sudo tee /usr/local/bin/npm > /dev/null`,
+    `  sudo chmod +x /usr/local/bin/npm`,
     `fi`,
     // Write all AMPA container configuration to /etc/ampa_bashrc — a file on
     // the container's own overlay filesystem, invisible to the host and other
