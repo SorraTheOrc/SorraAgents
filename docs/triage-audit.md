@@ -7,7 +7,8 @@ References:
 - `ampa/triage_audit.py` (audit execution, Discord notifications, comment posting, auto-completion)
 - `ampa/scheduler.py` (routing)
 - `tests/test_audit_poller.py` (poller unit tests)
-- `tests/test_triage_audit.py` (integration and behavior tests)
+ - `tests/test_audit_poller.py` (poller unit tests)
+ - `tests/test_audit_handlers.py` and `tests/test_scheduler_audit_routing.py` (integration and behavior tests)
  - `skill/audit/SKILL.md` (the `/audit` command itself)
 
 ## Architecture
