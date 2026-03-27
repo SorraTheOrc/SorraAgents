@@ -738,53 +738,210 @@ function printPoolStatus(projectRoot) {
   }
 }
 
-async function status(projectRoot, name = 'default') {
+/**
+ * Inspect the scheduler daemon and return a structured status object.
+ * Does NOT print anything — callers decide on formatting.
+ *
+ * Returned object shape:
+ *   { name, state, pid, log, reason }
+ *   state: 'running' | 'stopped' | 'error'
+ */
+function getSchedulerDaemonStatus(projectRoot, name = 'default') {
   const ppath = pidPath(projectRoot, name);
   const lpath = logPath(projectRoot, name);
+
   if (!fs.existsSync(ppath)) {
-    // Even when there's no pidfile, the daemon may have started and exited
-    // quickly with an error recorded in the log. Surface any recent errors
-    // so `wl ampa status` provides helpful diagnostics. If the current
-    // daemon log path isn't present (no pidfile), attempt to find the most
-    // recent log under .worklog/ampa and show errors from there.
     const alt = findMostRecentLog(projectRoot) || lpath;
-    try { printLogErrors(alt); } catch (e) {}
-    console.log('stopped');
-    printPoolStatus(projectRoot);
-    return 3;
+    let errorLines = [];
+    try { errorLines = extractErrorLines(readLogTail(alt)); } catch (e) {}
+    return {
+      name: 'scheduler',
+      state: 'stopped',
+      pid: null,
+      log: lpath,
+      reason: 'no pid file',
+      recent_errors: errorLines.slice(-5),
+    };
   }
+
   let pid;
   try {
     pid = parseInt(fs.readFileSync(ppath, 'utf8'), 10);
   } catch (e) {
     try { fs.unlinkSync(ppath); } catch (e2) {}
     const alt = findMostRecentLog(projectRoot) || lpath;
-    try { printLogErrors(alt); } catch (e) {}
-    console.log('stopped (cleared corrupt pid file)');
-    printPoolStatus(projectRoot);
-    return 3;
+    let errorLines = [];
+    try { errorLines = extractErrorLines(readLogTail(alt)); } catch (ex) {}
+    return {
+      name: 'scheduler',
+      state: 'error',
+      pid: null,
+      log: lpath,
+      reason: 'corrupt pid file (cleared)',
+      recent_errors: errorLines.slice(-5),
+    };
   }
-    if (isRunning(pid)) {
-    // verify ownership before reporting running
+
+  if (isRunning(pid)) {
     const owned = pidOwnedByProject(projectRoot, pid, lpath);
     if (owned) {
-      console.log(`running pid=${pid} log=${lpath}`);
-      printPoolStatus(projectRoot);
-      return 0;
+      return { name: 'scheduler', state: 'running', pid, log: lpath, reason: null, recent_errors: [] };
     } else {
       try { fs.unlinkSync(ppath); } catch (e) {}
-      console.log('stopped (stale pid file removed)');
-      printPoolStatus(projectRoot);
-      return 3;
+      return {
+        name: 'scheduler',
+        state: 'stopped',
+        pid: null,
+        log: lpath,
+        reason: 'stale pid file removed (pid belongs to unrelated process)',
+        recent_errors: [],
+      };
     }
   } else {
     try { fs.unlinkSync(ppath); } catch (e) {}
     const alt = findMostRecentLog(projectRoot) || lpath;
-    try { printLogErrors(alt); } catch (e) {}
-    console.log('stopped (stale pid file removed)');
-    printPoolStatus(projectRoot);
-    return 3;
+    let errorLines = [];
+    try { errorLines = extractErrorLines(readLogTail(alt)); } catch (ex) {}
+    return {
+      name: 'scheduler',
+      state: 'stopped',
+      pid: null,
+      log: lpath,
+      reason: 'stale pid file removed (process not running)',
+      recent_errors: errorLines.slice(-5),
+    };
   }
+}
+
+/**
+ * Scan /proc for a running discord bot process (ampa.discord_bot).
+ * Returns the PID if found, null otherwise. Linux-only; no-op on other platforms.
+ * /proc is an in-memory filesystem so directory enumeration is fast even with many PIDs.
+ */
+function findDiscordBotPid() {
+  try {
+    if (!fs.existsSync('/proc')) return null;
+    const entries = fs.readdirSync('/proc');
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const cmdline = fs.readFileSync(`/proc/${entry}/cmdline`, 'utf8').replace(/\0/g, ' ');
+        if (cmdline.includes('ampa.discord_bot')) {
+          return parseInt(entry, 10);
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return null;
+}
+
+/**
+ * Return a structured status object for the Discord bot daemon.
+ * Checks whether AMPA_DISCORD_BOT_TOKEN is configured (in env or .env file)
+ * and whether the discord_bot process is currently running.
+ */
+function getDiscordDaemonStatus(projectRoot) {
+  // Check if token is configured: check process.env first, then .worklog/ampa/.env
+  const envFilePath = path.join(projectAmpaDir(projectRoot), '.env');
+  const fileEnv = readDotEnvFile(envFilePath);
+  const token = process.env.AMPA_DISCORD_BOT_TOKEN || fileEnv.AMPA_DISCORD_BOT_TOKEN || '';
+  const discordConfigured = !!token;
+
+  if (!discordConfigured) {
+    return {
+      name: 'discord',
+      state: 'not_configured',
+      pid: null,
+      reason: 'AMPA_DISCORD_BOT_TOKEN is not set',
+      discord_configured: false,
+    };
+  }
+
+  const discordPid = findDiscordBotPid();
+  if (discordPid !== null) {
+    return {
+      name: 'discord',
+      state: 'running',
+      pid: discordPid,
+      reason: null,
+      discord_configured: true,
+    };
+  }
+
+  return {
+    name: 'discord',
+    state: 'stopped',
+    pid: null,
+    reason: 'bot process not found',
+    discord_configured: true,
+  };
+}
+
+async function status(projectRoot, name = 'default', useJson = false) {
+  const schedulerInfo = getSchedulerDaemonStatus(projectRoot, name);
+  const discordInfo = getDiscordDaemonStatus(projectRoot);
+
+  if (useJson) {
+    const output = {
+      daemons: [
+        {
+          name: schedulerInfo.name,
+          state: schedulerInfo.state,
+          pid: schedulerInfo.pid,
+          log: schedulerInfo.log,
+          reason: schedulerInfo.reason,
+        },
+        {
+          name: discordInfo.name,
+          state: discordInfo.state,
+          pid: discordInfo.pid,
+          reason: discordInfo.reason,
+        },
+      ],
+      discord_configured: discordInfo.discord_configured,
+    };
+    console.log(JSON.stringify(output, null, 2));
+  } else {
+    // Human-readable output
+    // Scheduler line
+    if (schedulerInfo.state === 'running') {
+      console.log(`scheduler: running pid=${schedulerInfo.pid} log=${schedulerInfo.log}`);
+    } else {
+      const reason = schedulerInfo.reason ? ` (${schedulerInfo.reason})` : '';
+      console.log(`scheduler: ${schedulerInfo.state}${reason}`);
+      if (schedulerInfo.recent_errors && schedulerInfo.recent_errors.length > 0) {
+        console.log('Recent errors from log:');
+        for (const line of schedulerInfo.recent_errors) console.log(line);
+      }
+    }
+
+    // Discord line
+    if (discordInfo.state === 'running') {
+      console.log(`discord:   running pid=${discordInfo.pid}`);
+    } else if (discordInfo.state === 'not_configured') {
+      console.log(`discord:   not configured`);
+      console.error('');
+      console.error('WARNING: AMPA_DISCORD_BOT_TOKEN is not set — Discord notifications are disabled.');
+      console.error('  Set it in .worklog/ampa/.env to enable Discord integration:');
+      console.error('    AMPA_DISCORD_BOT_TOKEN="<your-bot-token>"');
+      console.error('    AMPA_DISCORD_CHANNEL_ID="<your-channel-id>"');
+    } else {
+      const reason = discordInfo.reason ? ` (${discordInfo.reason})` : '';
+      console.log(`discord:   ${discordInfo.state}${reason}`);
+    }
+
+    printPoolStatus(projectRoot);
+  }
+
+  // Determine exit code:
+  // 0 = all configured daemons running
+  // 1 = error state
+  // 3 = stopped
+  if (schedulerInfo.state === 'error') return 1;
+  if (schedulerInfo.state !== 'running') return 3;
+  // Scheduler is running; check Discord (only if configured)
+  if (discordInfo.discord_configured && discordInfo.state !== 'running') return 3;
+  return 0;
 }
 
 async function runOnce(projectRoot, cmdSpec) {
@@ -1416,7 +1573,7 @@ function runSync(cmd, args, opts = {}) {
 /**
  * Create and enter a Distrobox container for a work item.
  */
-async function startWork(projectRoot, workItemId, agentName, waitFlag, waitTimeoutSec) {
+async function startWork(projectRoot, workItemId, agentName) {
   console.log(`Creating sandbox container to work on ${workItemId}...`);
 
   // 1. Check prerequisites
@@ -1598,10 +1755,6 @@ async function startWork(projectRoot, workItemId, agentName, waitFlag, waitTimeo
     console.log('Warning: Could not read host .worklog/config.yaml — worklog init may prompt interactively.');
   }
 
-  // Use /tmp so the sandbox lives on the container's writable tmpfs/overlay
-  // rather than under /opt which may be root-owned or backed by a host bind.
-  const containerProjectRoot = `/tmp/ampa_sandbox_${cName}/project`;
-
   const setupScript = [
     `set -e`,
     // Symlink host Node.js into the container so tools like wl work.
@@ -1609,57 +1762,6 @@ async function startWork(projectRoot, workItemId, agentName, waitFlag, waitTimeo
     // (unlike git/ssh which must be installed natively).
     `if [ -x /run/host/usr/bin/node ] && [ ! -e /usr/local/bin/node ]; then`,
     `  sudo ln -s /run/host/usr/bin/node /usr/local/bin/node`,
-    `fi`,
-    // Symlink host gh (GitHub CLI) into the container.  gh is a statically
-    // linked Go binary so it has no shared-library dependencies and is safe
-    // to use from /run/host.
-    `if [ -x /run/host/usr/bin/gh ] && [ ! -e /usr/local/bin/gh ]; then`,
-    `  sudo ln -s /run/host/usr/bin/gh /usr/local/bin/gh`,
-    `fi`,
-    // Ensure we use container-native Python instead of any legacy host-python
-    // bridge symlinks from earlier AMPA versions.
-    `if [ -L /usr/local/bin/python3 ] && [ "$(readlink /usr/local/bin/python3)" = "/run/host/usr/bin/python3" ]; then`,
-    `  sudo rm -f /usr/local/bin/python3`,
-    `fi`,
-    `if [ -L /usr/local/bin/python ] && [ "$(readlink /usr/local/bin/python)" = "/usr/local/bin/python3" ]; then`,
-    `  sudo rm -f /usr/local/bin/python`,
-    `fi`,
-    `if [ -x /usr/bin/python3 ] && [ ! -e /usr/local/bin/python ]; then`,
-    `  sudo ln -s /usr/bin/python3 /usr/local/bin/python`,
-    `fi`,
-    `if [ -x /run/host/usr/lib/node_modules/npm/bin/npm-cli.js ] && [ ! -e /usr/local/bin/npm ]; then`,
-    `  printf '#!/bin/sh\\nexec /usr/local/bin/node /run/host/usr/lib/node_modules/npm/bin/npm-cli.js "$@"\\n' | sudo tee /usr/local/bin/npm > /dev/null`,
-    `  sudo chmod +x /usr/local/bin/npm`,
-    `fi`,
-    // Use /tmp so the sandbox lives on the container's writable tmpfs/overlay
-    // rather than under /opt which may be root-owned or backed by a host bind.
-    `CONTAINER_PROJECT_ROOT="/tmp/ampa_sandbox_${cName}/project"`,
-    `rm -rf "${CONTAINER_PROJECT_ROOT}" || true`,
-    `mkdir -p "$(dirname ${CONTAINER_PROJECT_ROOT})" || true`,
-    `echo "Preparing container-local project at ${CONTAINER_PROJECT_ROOT}..."`,
-    `if git clone --depth 1 "${origin}" "${CONTAINER_PROJECT_ROOT}" > /tmp/ampa_clone.log 2>&1; then`,
-    `  echo "Clone succeeded into container-local path"`,
-    // Prefer numeric uid/gid chown to avoid depending on a "dev" user existing
-    `  if command -v id >/dev/null 2>&1; then CON_UID="$(id -u)"; CON_GID="$(id -g)"; else CON_UID=1000; CON_GID=1000; fi`,
-    `  sudo chown -R "\${CON_UID}:\${CON_GID}" "${CONTAINER_PROJECT_ROOT}" || true`,
-    `else`,
-    `  echo "Clone to container-local path failed; showing diagnostic"`,
-    `  cat /tmp/ampa_clone.log || true`,
-    `  exit 1`,
-    `fi`,
-    `cd "${CONTAINER_PROJECT_ROOT}"`,
-    // Create a symlink from the expected /workdir/project location to the actual clone location
-    `if [ ! -e /workdir/project ]; then`,
-    `  sudo ln -s "${CONTAINER_PROJECT_ROOT}" /workdir/project`,
-    `fi`,
-    // Check if branch exists on remote
-    `if git ls-remote --heads origin "${branch}" | grep -q "${branch}"; then`,
-    `  echo "Branch ${branch} exists on remote, checking out..."`,
-    `  git fetch origin "${branch}:refs/remotes/origin/${branch}" --depth 1`,
-    `  git checkout -b "${branch}" "origin/${branch}"`,
-    `else`,
-    `  echo "Creating new branch ${branch}..."`,
-    `  git checkout -b "${branch}"`,
     `fi`,
     // Symlink host gh (GitHub CLI) into the container.  gh is a statically
     // linked Go binary so it has no shared-library dependencies and is safe
@@ -1686,6 +1788,19 @@ async function startWork(projectRoot, workItemId, agentName, waitFlag, waitTimeo
     `if [ -f /run/host/usr/lib/node_modules/npm/bin/npm-cli.js ] && [ ! -e /usr/local/bin/npm ]; then`,
     `  printf '#!/bin/sh\\nexec /usr/local/bin/node /run/host/usr/lib/node_modules/npm/bin/npm-cli.js "$@"\\n' | sudo tee /usr/local/bin/npm > /dev/null`,
     `  sudo chmod +x /usr/local/bin/npm`,
+    `fi`,
+    `cd /workdir`,
+    `echo "Cloning project from ${origin}..."`,
+    `git clone --depth 1 "${origin}" project`,
+    `cd project`,
+    // Check if branch exists on remote
+    `if git ls-remote --heads origin "${branch}" | grep -q "${branch}"; then`,
+    `  echo "Branch ${branch} exists on remote, checking out..."`,
+    `  git fetch origin "${branch}:refs/remotes/origin/${branch}" --depth 1`,
+    `  git checkout -b "${branch}" "origin/${branch}"`,
+    `else`,
+    `  echo "Creating new branch ${branch}..."`,
+    `  git checkout -b "${branch}"`,
     `fi`,
     // Write all AMPA container configuration to /etc/ampa_bashrc — a file on
     // the container's own overlay filesystem, invisible to the host and other
@@ -1786,26 +1901,7 @@ async function startWork(projectRoot, workItemId, agentName, waitFlag, waitTimeo
     `else`,
     `  echo "Warning: wl not found in PATH. Worklog will not be initialized."`,
     `fi`,
-    `echo "Setup complete. Project cloned to ${containerProjectRoot} on branch ${branch}"`,
-    `# Perform readiness checks: plugin copied and python/venv available. Only
-    # write the readiness sentinel when checks pass so callers can wait on it.
-    PLUGIN_OK=0`,
-    `if [ -f .worklog/plugins/ampa.mjs ]; then PLUGIN_OK=1; fi`,
-    `PY_OK=0`,
-    `if [ -x .venv/bin/python ]; then PY_OK=1; elif command -v python3 >/dev/null 2>&1; then PY_OK=1; fi`,
-    `if [ "$PLUGIN_OK" -eq 1 ] && [ "$PY_OK" -eq 1 ]; then`,
-    `  echo "Readiness checks passed: plugin present and python/venv available."`,
-    `  sudo sh -c 'echo READY > /tmp/ampa_ready' || true`,
-    `  sudo chmod 644 /tmp/ampa_ready || true`,
-    `else`,
-    `  echo "Readiness checks failed: plugin_ok=${PLUGIN_OK} python_ok=${PY_OK}" > /tmp/ampa_install_start.log 2>/dev/null || true`,
-    `  echo "--- Diagnostic: /workdir/project/.worklog/plugins listing ---" >> /tmp/ampa_install_start.log 2>/dev/null || true`,
-    `  ls -la .worklog/plugins >> /tmp/ampa_install_start.log 2>/dev/null || true`,
-    `  echo "--- Diagnostic: /tmp/ampa_clone.log ---" >> /tmp/ampa_install_start.log 2>/dev/null || true`,
-    `  cat /tmp/ampa_clone.log >> /tmp/ampa_install_start.log 2>/dev/null || true`,
-    `  echo "Readiness incomplete — leaving setup script with non-zero exit"`,
-    `  exit 1`,
-    `fi`,
+    `echo "Setup complete. Project cloned to /workdir/project on branch ${branch}"`,
   ].join('\n');
 
   console.log('Running setup inside container...');
@@ -1813,62 +1909,13 @@ async function startWork(projectRoot, workItemId, agentName, waitFlag, waitTimeo
     'enter', cName, '--', 'bash', '--login', '-c', setupScript,
   ]);
   if (setupResult.status !== 0) {
-    console.error(`Container setup returned non-zero status: ${setupResult.status}`);
-    // If the setup script failed but the repo was still cloned correctly
-    // inside the container (some commands are best-effort), treat it as a
-    // success. Check for an existing clone and a valid git repo.
-    const verify = runSync('distrobox', [
-      'enter', cName, '--', 'bash', '--login', '-c',
-      `if [ -d "${containerProjectRoot}/.git" ]; then echo OK; else echo NO; fi`,
-    ]);
-    if (verify.status === 0 && (verify.stdout || '').includes('OK')) {
-      console.log('Setup script failed but a valid clone exists — continuing.');
-    } else {
-      console.error(setupResult.stderr || setupResult.stdout);
-      // Attempt cleanup
-      releasePoolContainer(projectRoot, cName);
-      spawnSync('distrobox', ['rm', '--force', cName], { stdio: 'pipe' });
-      return 1;
-    }
+    console.error(`Container setup failed: ${setupResult.stderr || setupResult.stdout}`);
+    // Attempt cleanup
+    releasePoolContainer(projectRoot, cName);
+    spawnSync('distrobox', ['rm', '--force', cName], { stdio: 'pipe' });
+    return 1;
   }
   if (setupResult.stdout) console.log(setupResult.stdout);
-
-  // Determine whether caller wants to wait for readiness and decide timeout.
-  // Behavior: explicit waitFlag controls waiting. If undefined, default to
-  // not waiting unless an agent name was provided (non-interactive callers),
-  // in which case we block by default. The caller may override via CLI
-  // flags (--wait / --timeout) which map into waitFlag / waitTimeoutSec.
-  const effectiveWait = typeof waitFlag === 'boolean' ? waitFlag : !!agentName;
-  const effectiveTimeout = Number(waitTimeoutSec !== undefined ? waitTimeoutSec : (process.env.WL_AMPA_WAIT_SECONDS || 30));
-
-  if (effectiveWait && effectiveTimeout > 0) {
-    const startTs = Date.now();
-    let ready = false;
-    while ((Date.now() - startTs) < effectiveTimeout * 1000) {
-      const chk = runSync('distrobox', [
-        'enter', cName, '--', 'bash', '-lc', `if [ -f /tmp/ampa_ready ]; then echo OK; else echo NO; fi`,
-      ]);
-      if (chk.status === 0 && (chk.stdout || '').includes('OK')) { ready = true; break; }
-      // sleep 1 second
-      spawnSync('bash', ['-lc', 'sleep 1']);
-    }
-    if (!ready) {
-      console.error(`Container did not signal readiness within ${effectiveTimeout}s`);
-      // Surface container-side diagnostics to help triage the failure.
-      try {
-        console.error('\n--- Container-side diagnostics (tail) ---');
-        const diag = runSync('distrobox', [
-          'enter', cName, '--', 'bash', '-lc', 'echo "--- /tmp/ampa_clone.log ---"; tail -n +1 /tmp/ampa_clone.log 2>/dev/null || true; echo "--- /tmp/ampa_install_start.log ---"; tail -n +1 /tmp/ampa_install_start.log 2>/dev/null || true; echo "--- /tmp listing ---"; ls -la /tmp || true',
-        ]);
-        if (diag.stdout) console.error(diag.stdout);
-        if (diag.stderr) console.error(diag.stderr);
-      } catch (e) {
-        console.error('Failed to collect container diagnostics:', e && e.message ? e.message : String(e));
-      }
-      // Return non-zero so automated callers know start-work failed.
-      return 1;
-    }
-  }
 
   // 10. Claim work item if agent name provided
   if (agentName) {
@@ -1883,12 +1930,12 @@ async function startWork(projectRoot, workItemId, agentName, waitFlag, waitTimeo
 
   // 12. Enter the container interactively
   console.log(`\nEntering container "${cName}"...`);
-  console.log(`Work directory: ${containerProjectRoot}`);
+  console.log(`Work directory: /workdir/project`);
   console.log(`Branch: ${branch}`);
   console.log(`Work item: ${workItemId} - ${workItem.title}`);
   console.log(`\nRun 'wl ampa finish-work' when done.\n`);
 
-  const enterProc = spawn('distrobox', ['enter', cName, '--', 'bash', '--login', '-c', `cd ${containerProjectRoot} && exec bash --login`], {
+  const enterProc = spawn('distrobox', ['enter', cName, '--', 'bash', '--login', '-c', 'cd /workdir/project && exec bash --login'], {
     stdio: 'inherit',
   });
 
@@ -2302,10 +2349,13 @@ export default function register(ctx) {
     .command('status')
     .description('Show daemon status')
     .option('--name <name>', 'Daemon name', 'default')
-    .action(async (opts) => {
+    .option('--json', 'Output in JSON format')
+    .action(async (opts, cmd) => {
+      const allOpts = cmd && typeof cmd.optsWithGlobals === 'function' ? cmd.optsWithGlobals() : (opts || {});
+      const useJson = !!allOpts.json;
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
-      const code = await status(cwd, opts.name);
+      const code = await status(cwd, opts.name, useJson);
       process.exitCode = code;
     });
 
@@ -2320,7 +2370,7 @@ export default function register(ctx) {
     .action(async (commandId, opts, cmd) => {
       // Use optsWithGlobals() because wl defines a global --json flag that
       // captures the option before it reaches the local opts object.
-      const allOpts = cmd.optsWithGlobals();
+      const allOpts = cmd && typeof cmd.optsWithGlobals === 'function' ? cmd.optsWithGlobals() : (opts || {});
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
       // Build extra CLI args to pass through to the Python scheduler
@@ -2353,7 +2403,7 @@ export default function register(ctx) {
     .option('--name <name>', 'Daemon name', 'default')
     .option('--verbose', 'Print resolved store path', false)
     .action(async (opts, cmd) => {
-      const allOpts = cmd.optsWithGlobals();
+      const allOpts = cmd && typeof cmd.optsWithGlobals === 'function' ? cmd.optsWithGlobals() : (opts || {});
       const verbose = !!allOpts.verbose || process.argv.includes('--verbose');
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
@@ -2386,7 +2436,7 @@ export default function register(ctx) {
     .option('--name <name>', 'Daemon name', 'default')
     .option('--verbose', 'Print resolved store path', false)
     .action(async (opts, cmd) => {
-      const allOpts = cmd.optsWithGlobals();
+      const allOpts = cmd && typeof cmd.optsWithGlobals === 'function' ? cmd.optsWithGlobals() : (opts || {});
       const verbose = !!allOpts.verbose || process.argv.includes('--verbose');
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
@@ -2419,14 +2469,10 @@ export default function register(ctx) {
     .description('Create an isolated dev container for a work item')
     .arguments('<work-item-id>')
     .option('--agent <name>', 'Agent name for work item assignment')
-    .option('--wait', 'Block until container signals readiness', false)
-    .option('--timeout <seconds>', 'Override readiness wait timeout seconds', parseInt)
     .action(async (workItemId, opts) => {
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
-      const waitFlag = opts.wait !== undefined ? !!opts.wait : undefined;
-      const timeout = opts.timeout !== undefined ? Number(opts.timeout) : undefined;
-      const code = await startWork(cwd, workItemId, opts.agent, waitFlag, timeout);
+      const code = await startWork(cwd, workItemId, opts.agent);
       process.exitCode = code;
     });
 
@@ -2474,7 +2520,7 @@ export default function register(ctx) {
     .description('List dev containers created by start-work')
     .option('--json', 'Output JSON')
     .action(async (opts, cmd) => {
-      const allOpts = cmd.optsWithGlobals();
+      const allOpts = cmd && typeof cmd.optsWithGlobals === 'function' ? cmd.optsWithGlobals() : (opts || {});
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
       const code = listContainers(cwd, !!allOpts.json);
@@ -2486,7 +2532,7 @@ export default function register(ctx) {
     .description('Alias for list-containers')
     .option('--json', 'Output JSON')
     .action(async (opts, cmd) => {
-      const allOpts = cmd.optsWithGlobals();
+      const allOpts = cmd && typeof cmd.optsWithGlobals === 'function' ? cmd.optsWithGlobals() : (opts || {});
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
       const code = listContainers(cwd, !!allOpts.json);
@@ -2494,32 +2540,12 @@ export default function register(ctx) {
     });
 
   ampa
-    .command('build-image')
-    .description('Build the container image from the Containerfile')
-    .action(async () => {
-      let cwd = process.cwd();
-      try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
-      const prereqs = checkPrerequisites();
-      if (!prereqs.ok) { console.error(prereqs.message); process.exitCode = 1; return; }
-      console.log('Building container image...');
-      const build = buildImage(cwd);
-      if (!build.ok) {
-        console.error(`Failed to build container image: ${build.message}`);
-        process.exitCode = 1;
-        return;
-      }
-      console.log(build.message);
-      process.exitCode = 0;
-    });
-
-  ampa
     .command('warm-pool')
     .description('Pre-warm the container pool (ensure template exists and fill empty pool slots)')
     .option('--size <n>', 'Target pool size (overrides WL_AMPA_POOL_SIZE env var)')
     .option('--non-interactive', 'Run without interactive prompts (suitable for installers)')
-    .option('--rebuild', 'Force rebuild of the container image and recreate pool from it')
     .action(async (opts, cmd) => {
-      const allOpts = cmd.optsWithGlobals();
+      const allOpts = cmd && typeof cmd.optsWithGlobals === 'function' ? cmd.optsWithGlobals() : (opts || {});
       // Note: POOL_SIZE is a const; to allow per-invocation size we pass requestedSize
       // into replenishPool by wrapping or using a new helper. For simplicity, we
       // set a local variable here and pass it to replenishPool via an argument
@@ -2535,33 +2561,18 @@ export default function register(ctx) {
         process.exitCode = 1;
         return;
       }
-      // Rebuild image if requested, otherwise check if the image is stale
-      if (allOpts.rebuild) {
-        console.log('Rebuild requested — tearing down pool/template and removing image...');
+      // Check if the image is stale (Containerfile newer than image)
+      if (isImageStale(cwd)) {
+        console.log('Containerfile is newer than the current image — rebuilding...');
         const teardown = teardownStalePool(cwd);
         if (teardown.destroyed.length > 0) {
-          console.log(`Removed containers/template: ${teardown.destroyed.join(', ')}`);
+          console.log(`Removed stale containers: ${teardown.destroyed.join(', ')}`);
         }
         if (teardown.kept.length > 0) {
           console.log(`Kept claimed containers (still in use): ${teardown.kept.join(', ')}`);
         }
         if (teardown.errors.length > 0) {
           teardown.errors.forEach(e => console.error(e));
-        }
-      } else {
-        // Check if the image is stale (Containerfile newer than image)
-        if (isImageStale(cwd)) {
-          console.log('Containerfile is newer than the current image — rebuilding...');
-          const teardown = teardownStalePool(cwd);
-          if (teardown.destroyed.length > 0) {
-            console.log(`Removed stale containers: ${teardown.destroyed.join(', ')}`);
-          }
-          if (teardown.kept.length > 0) {
-            console.log(`Kept claimed containers (still in use): ${teardown.kept.join(', ')}`);
-          }
-          if (teardown.errors.length > 0) {
-            teardown.errors.forEach(e => console.error(e));
-          }
         }
       }
       // Build image if needed
@@ -2672,10 +2683,13 @@ export {
   containerName,
   ensureTemplate,
   existingPoolContainers,
+  findDiscordBotPid,
   findPoolContainerForWorkItem,
   getCleanupList,
+  getDiscordDaemonStatus,
   getGitOrigin,
   getPoolState,
+  getSchedulerDaemonStatus,
   globalAmpaDir,
   globalPluginsDir,
   imageCreatedDate,
