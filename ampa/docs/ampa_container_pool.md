@@ -39,6 +39,20 @@ Best practices
 - Prefer `wl ampa start-work` / `wl ampa finish-work` over manual `podman`/`distrobox` commands — the plugin manages pool state and cleanup.
 - Use `--no-push` when you want to preserve local commits but cannot push from the container/network; use `--discard` only when you deliberately want to lose uncommitted changes.
 
+Browser test support
+- The AMPA container image may include Playwright/Chromium runtime dependencies so that browser tests can run inside claimed containers. When present the image and pinned Playwright version will be documented in the Containerfile and noted here.
+
+Running browser tests inside a claimed container
+- Ensure the image includes the pinned Playwright-compatible browser runtime (see the comment in `ampa/Containerfile` for the pinned version).
+- To run the browser smoke test non-interactively from the host against a claimed container, run:
+
+  ```sh
+  CONTAINER=$(wl ampa list-containers --json | jq -r '.containers[0].name')
+  distrobox enter "$CONTAINER" -- bash --login -c '. /etc/ampa_bashrc && cd /workdir/project && npm ci && npm run test:smoke:node'
+  ```
+
+- When recording validation evidence, capture the exact representative branch used, the full command run, and the command exit code. Post that information as a comment on the parent validation work item (for example: `SA-0MN0VR4QU180IKU7`).
+
 Implementation reference
 - Core pool logic and helpers live in: `skill/install-ampa/resources/ampa.mjs` (functions: `poolStatePath`, `claimPoolContainer`, `replenishPool`, `replenishPoolBackground`, `startWork`, `finishWork`).
 

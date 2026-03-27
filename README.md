@@ -69,6 +69,9 @@ If the `ampa/Containerfile` has been modified since the image was last built, `w
 
 See the AMPA container pool reference for full details: `ampa/docs/ampa_container_pool.md`.
 
+Browser test capability
+- The AMPA dev container image can be built to include Playwright/Chromium runtime dependencies so that browser smoke tests run inside claimed AMPA containers. If the image includes browser runtime support, the Containerfile will contain a comment documenting the pinned Playwright version and rationale. See `ampa/docs/ampa_container_pool.md` for instructions on running smoke/browser tests inside a claimed container and for guidance on recording validation evidence.
+
 ### Installer: automatic post-install warm-pool
 
 The installer for the AMPA Worklog plugin will attempt to pre-warm the container pool automatically when it detects the required host tooling (`podman` and `distrobox`) and when the install is running non-interactively or with `--yes`.
