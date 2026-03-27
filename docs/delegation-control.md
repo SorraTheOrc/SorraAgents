@@ -53,3 +53,28 @@ Recommended practice
 3. If you need stricter enforcement (e.g. notification when delegation is attempted), ask to enable automatic WL comments when AMPA skips a tagged item — this can be added.
 
 If you want me to: (a) add a WL comment whenever AMPA skips an item for `do-not-delegate`, or (b) create a runbook snippet with copy/paste commands for triage engineers, tell me which and I'll add it.
+
+## Delegation watchdog / timeout
+
+AMPA enforces a configurable timeout on every delegated `opencode run` process to
+prevent the scheduler from being stuck with `running=true` indefinitely.
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DELEGATION_TIMEOUT_SECONDS` | 3600 | Maximum seconds a delegated `opencode run` may run before being terminated. Supercedes the legacy `AMPA_DELEGATION_OPENCODE_TIMEOUT` variable. |
+| `AMPA_DELEGATION_OPENCODE_TIMEOUT` | *(see above)* | Legacy alias for `DELEGATION_TIMEOUT_SECONDS`. Still honoured for backward compatibility. |
+| `AMPA_CMD_TIMEOUT_SECONDS` | 3600 | Global default timeout for all scheduled commands (used when neither delegation-specific variable is set). |
+
+### Termination sequence
+
+When the timeout expires the scheduler:
+
+1. Sends **SIGTERM** to the entire process group (the child shell and all its children) and waits up to 5 seconds for graceful shutdown.
+2. If the process group is still alive after the grace period, sends **SIGKILL**.
+3. Records `exit_code=124` in the run history and clears the `running` flag so the command is eligible to run again on the next poll.
+4. Logs a `WARNING` message with the command ID and timeout value, and sends a Discord error notification when configured.
+
+The `running` flag is always cleared via `Scheduler._record_run` whether the process exits normally, crashes, or times out.
+
