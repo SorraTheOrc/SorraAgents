@@ -396,7 +396,7 @@
       }
     },
     "audit_result": {
-      "description": "AMPA runs the audit skill on a work item in review to verify acceptance criteria are met. The audit result determines whether to close or escalate. Maps to scheduler.py _run_triage_audit.",
+      "description": "AMPA runs the audit skill on a work item in review to verify acceptance criteria are met. The audit result determines whether to close or escalate. Implemented via the scheduler wiring to the audit poller and descriptor-driven handlers (ampa/audit_poller.py, ampa/audit/handlers.py).",
       "from": [
         "review"
       ],

@@ -360,7 +360,9 @@ commands:
     description: >-
       AMPA runs the audit skill on a work item in review to verify acceptance
       criteria are met. The audit result determines whether to close or escalate.
-      Maps to scheduler.py _run_triage_audit.
+      Implemented via the scheduler wiring to the audit poller and the
+      descriptor-driven handlers in `ampa/audit_poller.py` and
+      `ampa/audit/handlers.py`.
     from: [review]
     to: audit_passed
     actor: QA

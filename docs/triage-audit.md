@@ -4,77 +4,66 @@ This document explains the AMPA scheduler's triage-audit post-processing. It is 
 
 References:
 - `ampa/audit_poller.py` (candidate detection, cooldown filtering, selection)
-- `ampa/triage_audit.py` (audit execution, Discord notifications, comment posting, auto-completion)
+- `ampa/audit/handlers.py` (descriptor-driven audit handlers: `audit_result`, `audit_fail`, `close_with_audit`)
+- `ampa/audit/result.py` (audit result parser and dataclasses: `AuditResult`, `CriterionResult`, `ParseError`)
 - `ampa/scheduler.py` (routing)
 - `tests/test_audit_poller.py` (poller unit tests)
- - `tests/test_audit_poller.py` (poller unit tests)
- - `tests/test_audit_handlers.py` and `tests/test_scheduler_audit_routing.py` (integration and behavior tests)
- - `skill/audit/SKILL.md` (the `/audit` command itself)
+- `tests/test_audit_handlers.py` and `tests/test_scheduler_audit_routing.py` (integration and behavior tests)
+- `skill/audit/SKILL.md` (the `/audit` command itself)
 
 ## Architecture
 
-The triage-audit flow is split into two modules:
+The triage-audit flow is organised around three responsibilities:
 
-- **`audit_poller.py`** — Detection layer. Queries for `in_review` items, applies store-based cooldown filtering, selects the oldest eligible candidate, persists the `last_audit_at` timestamp, and hands off the selected candidate to the audit handler.
-- **`triage_audit.py`** — Execution layer (`TriageAuditRunner`). Receives a pre-selected work item dict and performs audit execution, structured report extraction, Discord notifications, Worklog comment posting, and auto-completion checks.
+- `audit_poller.py` — Detection and selection. Queries for `in_review` items, applies store-based cooldown filtering, selects the oldest eligible candidate, persists the `last_audit_at` timestamp, and hands off the selected candidate to a handoff handler.
+- `ampa/audit/handlers.py` — Descriptor-driven handlers implementing the audit command lifecycle. Handlers run the audit (via `opencode run "/audit <id>"`), parse output using `ampa/audit/result.py`, write structured `# AMPA Audit Result` comments, evaluate invariants, and apply descriptor effects (state transitions, tags, notifications).
+- `ampa/audit/result.py` — Parsing and typed models. Extracts the structured report between marker delimiters and returns a typed `AuditResult` or `ParseError` for handlers to consume.
 
-The scheduler's `start_command()` routes `wl-triage-audit` commands through `poll_and_handoff()`, passing a handler adapter that delegates to `TriageAuditRunner.run()`.
+The scheduler's `start_command()` routes `wl-triage-audit` commands through `poll_and_handoff()` and passes a handler adapter that delegates to the descriptor-driven handlers in `ampa/audit/handlers.py`.
 
 ## End-to-end flow
 
-1. **Detect and select a candidate (audit poller)**
-   - Run `wl list --stage in_review --json` and normalize the response shape (handles list/dict formats, deduplicates by ID).
-   - Read the `last_audit_at_by_item` dict from the scheduler store.
-   - Filter out items whose last audit is within the cooldown window (`audit_cooldown_hours`).
-   - Sort remaining candidates by `updated_at` ascending (oldest first; items with no timestamp sorted first).
-   - Select the first (oldest) eligible candidate.
-   - Persist `last_audit_at_by_item[selected_id] = now` to the store **before** calling the handler (prevents re-selection during long-running audits).
+1. Detect and select a candidate (audit poller)
+   - Run `wl list --stage in_review --json` and normalise the response (handles list/dict formats, deduplicates by ID).
+   - Read the `last_audit_at_by_item` dict from the scheduler store and filter out items still in their cooldown window.
+   - Sort remaining candidates by `updated_at` ascending (oldest first).
+   - Select the first eligible candidate and persist `last_audit_at_by_item[selected_id] = now` to the store BEFORE calling the handler to avoid re-selection during long-running audits.
    - Hand off the selected work item dict to the handler.
 
-2. **Run the audit (TriageAuditRunner)**
-   - Execute `opencode run "/audit <work_id>"`.
+2. Run the audit (handler / opencode)
+   - The handler executes `opencode run "/audit <work_id>"` (via the injected `run_shell` / `opencode` adapter).
    - Capture stdout and stderr into a single audit output string.
-   - The audit agent produces a **structured report** bounded by delimiter markers (see [Structured audit output](#structured-audit-output) below).
+   - The audit agent is expected to produce a **structured report** bounded by delimiter markers (see below).
 
-3. **Extract the structured report**
-   - Parse the raw output looking for `--- AUDIT REPORT START ---` and `--- AUDIT REPORT END ---` delimiter lines.
-   - Extract the content between these markers as the structured audit report.
-   - If the markers are missing (e.g., the audit agent failed or produced legacy output), fall back to using the full raw output and log a warning.
+3. Parse the structured report
+   - Parsing is implemented in `ampa/audit/result.py`. The parser extracts content between `--- AUDIT REPORT START ---` and `--- AUDIT REPORT END ---`, parses the `## Summary`, the Acceptance Criteria table (rows → `CriterionResult`), `## Recommendation`, and detects closure recommendation.
+   - The parser returns a typed `AuditResult` with fields such as `summary`, `criteria`, `recommendation`, `audit_recommends_closure`, `raw_output`, and `report_text`. If the output is empty or malformed the parser returns a `ParseError`.
+   - Handlers use the parsed `AuditResult` to produce the Worklog comment and to evaluate invariants that gate descriptor effects.
 
-4. **Post a Discord summary (optional)**
-   - If `AMPA_DISCORD_BOT_TOKEN` is set, extract the `## Summary` section from the structured report.
-   - If no `## Summary` heading is found, fall back to the legacy regex extraction (`_extract_summary()`).
-   - If neither produces a summary, fall back to a short line with the work id, title, and exit code.
-   - Send a Discord message capped to ~1000 chars.
+4. Post a Discord summary (optional)
+   - If `AMPA_DISCORD_BOT_TOKEN` (or equivalent notification config) is present, handlers extract the `## Summary` section and send a Discord message capped in length.
 
-5. **Post structured audit report to Worklog**
-    - Create a Worklog comment with a standard heading: `# AMPA Audit Result`.
-    - The comment body contains the extracted structured report (not the full raw output).
-    - If the report is short enough, embed it directly in the comment.
-    - If the report is too large, write it to a temp file and post a comment that references the file path.
-    - Temp files used for comments are removed after posting.
+5. Post structured audit report to Worklog
+   - Handlers create a Worklog comment with heading `# AMPA Audit Result` and include the structured report (or the raw output when parsing fails).
+   - If the report is larger than the configured `truncate_chars`, the handler writes it to a temp file and posts a comment referencing the file path. Temp files are removed after posting.
 
-6. **Auto-complete check (optional)**
-   The scheduler will attempt to move the work item to `completed` and `in_review` when:
-   - The audit output indicates a merged PR (PR URL or "PR merged" token), and
-   - There are no open child work items, or the audit explicitly says it is ready to close.
-   - The update command includes `--needs-producer-review true` to flag the item for producer review.
-
-    If a GitHub PR URL is found, the scheduler can verify merge status with `gh pr view`.
+6. Auto-complete check (optional)
+   - The `close_with_audit` handler verifies `audit_recommends_closure` via the `InvariantEvaluator` pre-invariant, extracts PR URLs (from comments/text), optionally verifies merge status using `gh pr view` (configurable via `verify_pr_with_gh`), and checks that there are no open direct children via `wl show --children --json`.
+   - On success the handler issues `wl update --status completed --stage in_review --needs-producer-review true`, applies the `audit_closed` tag, and sends configured notifications.
 
 ## Cooldown logic
 
-Cooldown is determined solely from the scheduler store's `last_audit_at_by_item` dict. For each candidate, the poller looks up `last_audit_at_by_item[item_id]`. If `(now - last_audit_at) < audit_cooldown_hours`, the item is skipped. Items with no store entry are always eligible.
+Cooldown is determined solely from the scheduler store's `last_audit_at_by_item` dict. For each candidate the poller looks up `last_audit_at_by_item[item_id]`. If `(now - last_audit_at) < audit_cooldown_hours` the item is skipped. Items with no store entry are eligible immediately.
 
-The `last_audit_at` timestamp is written to the store **before** the handler is called (step 1 above). This means that if the audit handler fails or takes longer than the polling interval, the item won't be re-selected until the cooldown expires.
+The `last_audit_at` timestamp is written to the store BEFORE the handler is called. This prevents re-selection while an audit is running; if the store is lost or reset all items become immediately eligible again.
 
-> **Note:** Previous versions used comment scanning (`wl comment list` per candidate) to determine cooldown. This was removed in favor of store-only cooldown, which eliminates per-candidate shell calls and simplifies the implementation. If the store is lost or reset, all items become immediately eligible for re-audit.
+> Note: Older implementations used per-candidate comment scanning to determine cooldown. The current design uses the scheduler store to avoid per-candidate shell calls and simplify behaviour.
 
 ## Structured audit output
 
-The audit agent produces a structured report bounded by delimiter markers. The report follows this format:
+The audit agent should produce a structured report bounded by delimiter markers. The expected format is:
 
-```
+```text
 --- AUDIT REPORT START ---
 ## Summary
 
@@ -100,30 +89,25 @@ The audit agent produces a structured report bounded by delimiter markers. The r
 --- AUDIT REPORT END ---
 ```
 
-The `_extract_audit_report()` function in `triage_audit.py` extracts content between these markers. If the markers are missing, the full raw output is used with a warning logged.
+The parser in `ampa/audit/result.py` extracts the content between the markers and produces a typed `AuditResult` for handlers to consume.
 
 ## Output locations and formats
 
-- **Worklog comment**: A comment is added with heading `# AMPA Audit Result` containing the extracted structured report (between the delimiter markers).
-- **Discord summary**: The `## Summary` section is extracted from the structured report and sent to Discord. If no `## Summary` heading is found, the legacy regex fallback (`_extract_summary()`) is used. The notification includes extra fields:
-  - **Work Item**: The work item ID (always present).
-  - **GitHub**: A link to the corresponding GitHub issue (`https://github.com/<owner>/<repo>/issues/<number>`), included when `githubIssueNumber` is available on the work item and `githubRepo` is configured in `.worklog/config.yaml`.
-  - **Summary**: The extracted summary text.
-  - **PR**: A link to the associated pull request, included when a PR URL is found in the work item description or comments.
+- **Worklog comment**: Handlers post a comment with heading `# AMPA Audit Result` containing the extracted structured report (or raw output when parsing fails).
+- **Discord summary**: Handlers extract the `## Summary` and include it in a notification message. Additional metadata such as Work Item ID, GitHub issue link (when available), and PR link are included when present.
 
 ## Configuration and metadata
 
-Environment variables:
+Environment variables and per-command metadata used by the audit flow:
+
 - `AMPA_DISCORD_BOT_TOKEN`: If set, Discord summary messages are sent via the bot.
-- `AMPA_VERIFY_PR_WITH_GH`: If set to `1|true|yes`, verifies PR merge status with `gh` when a PR URL appears in output. If unset, defaults to enabled.
+- `AMPA_VERIFY_PR_WITH_GH`: When truthy, handlers verify PR merge state via `gh pr view`; otherwise PR verification is skipped.
 
-Migration note:
-- Older documentation sometimes references `AMPA_DISCORD_WEBHOOK` (an incoming webhook URL). The project migrated to a bot/token model; the code and tests expect `AMPA_DISCORD_BOT_TOKEN` (and an optional `AMPA_DISCORD_CHANNEL_ID` or configured socket/channel). If you operate a deployment that still uses an incoming webhook you should either set up a bot token or extend the `notifications` module to accept `AMPA_DISCORD_WEBHOOK` as a fallback.
+Per-command metadata (scheduler command spec):
 
-Per-command metadata (from the scheduler command spec):
-- `audit_cooldown_hours` (default: 6): Minimum hours between audits for the same work item. A single value applies to all items regardless of status.
+- `audit_cooldown_hours` (default: 6): Minimum hours between audits for the same work item.
 - `truncate_chars` (default: 65536): Max chars to inline in Worklog comments before writing to a temp file.
-- `verify_pr_with_gh` (default: true): Overrides `AMPA_VERIFY_PR_WITH_GH` when present.
+- `verify_pr_with_gh` (default: true): Overrides `AMPA_VERIFY_PR_WITH_GH` for this run.
 
 ## Module responsibilities
 
@@ -134,16 +118,17 @@ Per-command metadata (from the scheduler command spec):
 | Candidate selection | `audit_poller.py` | `_select_candidate()` |
 | Store persistence | `audit_poller.py` | `poll_and_handoff()` |
 | Handoff protocol | `audit_poller.py` | `AuditHandoffHandler` protocol |
-| Audit invocation | `triage_audit.py` | `TriageAuditRunner.run()` |
-| Report extraction | `triage_audit.py` | `_extract_audit_report()` |
-| Discord notifications | `triage_audit.py` | via `notifications` module |
-| Comment posting | `triage_audit.py` | `TriageAuditRunner.run()` |
-| Auto-completion | `triage_audit.py` | `TriageAuditRunner.run()` |
+| Audit invocation | `ampa/audit/handlers.py` | handler lifecycle: run audit, parse output, post comment |
+| Report parsing | `ampa/audit/result.py` | `parse_audit_output()` — returns `AuditResult` / `ParseError` |
+| Discord notifications | `ampa/audit/handlers.py` | via `notifications` module |
+| Comment posting | `ampa/audit/handlers.py` | posts `# AMPA Audit Result` |
+| Auto-completion | `ampa/audit/handlers.py` | `close_with_audit` handler (PR verification, children check) |
 | Scheduler routing | `scheduler.py` | `Scheduler.start_command()` |
 
 ## Notes
 
 - The triage-audit flow is post-processing only. The scheduler still records the command run normally before executing this logic.
-- The `/audit` command is a separate command definition; triage-audit invokes it. The audit agent is instructed to produce structured output with delimiter markers (see `skill/audit/SKILL.md`).
-- The structured report format enables reliable extraction of the report content and summary, replacing earlier regex-based heuristics.
-- `TriageAuditRunner.run()` requires a `work_item` keyword argument (a dict with at least `"id"` and `"title"` keys). Calling it without one raises `TypeError`. This ensures the old call convention (which included inline detection) cannot be used accidentally.
+- The `/audit` command is a separate command definition; triage-audit invokes it. The audit agent is instructed to produce structured output using the marker format above.
+- `ampa/audit/handlers.py` expect a work item dict (with at least `id` and `title`) when invoked by the scheduler poller.
+
+(End of file)
