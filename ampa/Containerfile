@@ -84,6 +84,14 @@ RUN set -eux \
  && mkdir -p /home/dev/.local/bin \
  && chown -R dev:dev /home/dev
 
+# Playwright / Chromium runtime
+# The AMPA dev container may include a pinned Playwright-compatible Chromium
+# runtime so that browser smoke tests can be executed inside claimed AMPA
+# containers. Pinning ensures reproducible validation evidence. Example pin:
+#   # PLAYWRIGHT: 1.42.0  (pinned for compatibility with Debian stable-slim)
+# Add the runtime and any additional system packages here when the project
+# elects to include browser support in the image.
+
 # Use the host-installed Worklog CLI entrypoint while avoiding legacy npm
 # worklog packages inside the container image.
 RUN printf '%s\n' '#!/bin/sh' 'exec /run/host/usr/bin/wl "$@"' > /usr/local/bin/wl \

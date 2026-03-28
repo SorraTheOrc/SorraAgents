@@ -7,6 +7,10 @@
   },
   "devDependencies": {
     "bats": "^1.13.0",
+<<<<<<< HEAD
     "playwright": "1.58.2"
+=======
+    "playwright": "1.58.2"
+>>>>>>> main
   }
 }
