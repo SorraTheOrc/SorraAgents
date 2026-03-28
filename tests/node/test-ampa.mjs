@@ -117,24 +117,32 @@ test('ampa start/status/stop lifecycle', async (t) => {
     const statusCmd = ampaCmd.subcommands.get('status');
     const stopCmd = ampaCmd.subcommands.get('stop');
 
-    const startCode = await runActionPreservingExitCode(
-      startCmd.actionFn,
-      { name: 't1', cmd: null, foreground: false, verbose: false }
-    );
-    assert.equal(startCode, 0, `start exit code unexpected: ${startCode}`);
+    const originalCwd = process.cwd();
+    let startCode, statusCode, stopCode;
+    try {
+      process.chdir(tmp);
 
-    let output = '';
-    const originalLog = console.log;
-    console.log = (...args) => {
-      output += args.join(' ') + '\n';
-    };
-    const statusCode = await runActionPreservingExitCode(statusCmd.actionFn, { name: 't1' });
-    console.log = originalLog;
-    assert.equal(statusCode, 0, `status exit code unexpected: ${statusCode}`);
-    assert.ok(/running pid=\d+/.test(output), `status output unexpected: ${output}`);
+      startCode = await runActionPreservingExitCode(
+        startCmd.actionFn,
+        { name: 't1', cmd: null, foreground: false, verbose: false }
+      );
+      assert.equal(startCode, 0, `start exit code unexpected: ${startCode}`);
 
-    const stopCode = await runActionPreservingExitCode(stopCmd.actionFn, { name: 't1' });
-    assert.equal(stopCode, 0, `stop exit code unexpected: ${stopCode}`);
+      let output = '';
+      const originalLog = console.log;
+      console.log = (...args) => {
+        output += args.join(' ') + '\n';
+      };
+      statusCode = await runActionPreservingExitCode(statusCmd.actionFn, { name: 't1' });
+      console.log = originalLog;
+      assert.equal(statusCode, 0, `status exit code unexpected: ${statusCode}`);
+      assert.ok(/running pid=\d+/.test(output), `status output unexpected: ${output}`);
+
+      stopCode = await runActionPreservingExitCode(stopCmd.actionFn, { name: 't1' });
+      assert.equal(stopCode, 0, `stop exit code unexpected: ${stopCode}`);
+    } finally {
+      process.chdir(originalCwd);
+    }
   });
 });
 
