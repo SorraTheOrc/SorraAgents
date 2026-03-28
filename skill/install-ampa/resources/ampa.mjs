@@ -738,53 +738,210 @@ function printPoolStatus(projectRoot) {
   }
 }
 
-async function status(projectRoot, name = 'default') {
+/**
+ * Inspect the scheduler daemon and return a structured status object.
+ * Does NOT print anything — callers decide on formatting.
+ *
+ * Returned object shape:
+ *   { name, state, pid, log, reason }
+ *   state: 'running' | 'stopped' | 'error'
+ */
+function getSchedulerDaemonStatus(projectRoot, name = 'default') {
   const ppath = pidPath(projectRoot, name);
   const lpath = logPath(projectRoot, name);
+
   if (!fs.existsSync(ppath)) {
-    // Even when there's no pidfile, the daemon may have started and exited
-    // quickly with an error recorded in the log. Surface any recent errors
-    // so `wl ampa status` provides helpful diagnostics. If the current
-    // daemon log path isn't present (no pidfile), attempt to find the most
-    // recent log under .worklog/ampa and show errors from there.
     const alt = findMostRecentLog(projectRoot) || lpath;
-    try { printLogErrors(alt); } catch (e) {}
-    console.log('stopped');
-    printPoolStatus(projectRoot);
-    return 3;
+    let errorLines = [];
+    try { errorLines = extractErrorLines(readLogTail(alt)); } catch (e) {}
+    return {
+      name: 'scheduler',
+      state: 'stopped',
+      pid: null,
+      log: lpath,
+      reason: 'no pid file',
+      recent_errors: errorLines.slice(-5),
+    };
   }
+
   let pid;
   try {
     pid = parseInt(fs.readFileSync(ppath, 'utf8'), 10);
   } catch (e) {
     try { fs.unlinkSync(ppath); } catch (e2) {}
     const alt = findMostRecentLog(projectRoot) || lpath;
-    try { printLogErrors(alt); } catch (e) {}
-    console.log('stopped (cleared corrupt pid file)');
-    printPoolStatus(projectRoot);
-    return 3;
+    let errorLines = [];
+    try { errorLines = extractErrorLines(readLogTail(alt)); } catch (ex) {}
+    return {
+      name: 'scheduler',
+      state: 'error',
+      pid: null,
+      log: lpath,
+      reason: 'corrupt pid file (cleared)',
+      recent_errors: errorLines.slice(-5),
+    };
   }
-    if (isRunning(pid)) {
-    // verify ownership before reporting running
+
+  if (isRunning(pid)) {
     const owned = pidOwnedByProject(projectRoot, pid, lpath);
     if (owned) {
-      console.log(`running pid=${pid} log=${lpath}`);
-      printPoolStatus(projectRoot);
-      return 0;
+      return { name: 'scheduler', state: 'running', pid, log: lpath, reason: null, recent_errors: [] };
     } else {
       try { fs.unlinkSync(ppath); } catch (e) {}
-      console.log('stopped (stale pid file removed)');
-      printPoolStatus(projectRoot);
-      return 3;
+      return {
+        name: 'scheduler',
+        state: 'stopped',
+        pid: null,
+        log: lpath,
+        reason: 'stale pid file removed (pid belongs to unrelated process)',
+        recent_errors: [],
+      };
     }
   } else {
     try { fs.unlinkSync(ppath); } catch (e) {}
     const alt = findMostRecentLog(projectRoot) || lpath;
-    try { printLogErrors(alt); } catch (e) {}
-    console.log('stopped (stale pid file removed)');
-    printPoolStatus(projectRoot);
-    return 3;
+    let errorLines = [];
+    try { errorLines = extractErrorLines(readLogTail(alt)); } catch (ex) {}
+    return {
+      name: 'scheduler',
+      state: 'stopped',
+      pid: null,
+      log: lpath,
+      reason: 'stale pid file removed (process not running)',
+      recent_errors: errorLines.slice(-5),
+    };
   }
+}
+
+/**
+ * Scan /proc for a running discord bot process (ampa.discord_bot).
+ * Returns the PID if found, null otherwise. Linux-only; no-op on other platforms.
+ * /proc is an in-memory filesystem so directory enumeration is fast even with many PIDs.
+ */
+function findDiscordBotPid() {
+  try {
+    if (!fs.existsSync('/proc')) return null;
+    const entries = fs.readdirSync('/proc');
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const cmdline = fs.readFileSync(`/proc/${entry}/cmdline`, 'utf8').replace(/\0/g, ' ');
+        if (cmdline.includes('ampa.discord_bot')) {
+          return parseInt(entry, 10);
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return null;
+}
+
+/**
+ * Return a structured status object for the Discord bot daemon.
+ * Checks whether AMPA_DISCORD_BOT_TOKEN is configured (in env or .env file)
+ * and whether the discord_bot process is currently running.
+ */
+function getDiscordDaemonStatus(projectRoot) {
+  // Check if token is configured: check process.env first, then .worklog/ampa/.env
+  const envFilePath = path.join(projectAmpaDir(projectRoot), '.env');
+  const fileEnv = readDotEnvFile(envFilePath);
+  const token = process.env.AMPA_DISCORD_BOT_TOKEN || fileEnv.AMPA_DISCORD_BOT_TOKEN || '';
+  const discordConfigured = !!token;
+
+  if (!discordConfigured) {
+    return {
+      name: 'discord',
+      state: 'not_configured',
+      pid: null,
+      reason: 'AMPA_DISCORD_BOT_TOKEN is not set',
+      discord_configured: false,
+    };
+  }
+
+  const discordPid = findDiscordBotPid();
+  if (discordPid !== null) {
+    return {
+      name: 'discord',
+      state: 'running',
+      pid: discordPid,
+      reason: null,
+      discord_configured: true,
+    };
+  }
+
+  return {
+    name: 'discord',
+    state: 'stopped',
+    pid: null,
+    reason: 'bot process not found',
+    discord_configured: true,
+  };
+}
+
+async function status(projectRoot, name = 'default', useJson = false) {
+  const schedulerInfo = getSchedulerDaemonStatus(projectRoot, name);
+  const discordInfo = getDiscordDaemonStatus(projectRoot);
+
+  if (useJson) {
+    const output = {
+      daemons: [
+        {
+          name: schedulerInfo.name,
+          state: schedulerInfo.state,
+          pid: schedulerInfo.pid,
+          log: schedulerInfo.log,
+          reason: schedulerInfo.reason,
+        },
+        {
+          name: discordInfo.name,
+          state: discordInfo.state,
+          pid: discordInfo.pid,
+          reason: discordInfo.reason,
+        },
+      ],
+      discord_configured: discordInfo.discord_configured,
+    };
+    console.log(JSON.stringify(output, null, 2));
+  } else {
+    // Human-readable output
+    // Scheduler line
+    if (schedulerInfo.state === 'running') {
+      console.log(`scheduler: running pid=${schedulerInfo.pid} log=${schedulerInfo.log}`);
+    } else {
+      const reason = schedulerInfo.reason ? ` (${schedulerInfo.reason})` : '';
+      console.log(`scheduler: ${schedulerInfo.state}${reason}`);
+      if (schedulerInfo.recent_errors && schedulerInfo.recent_errors.length > 0) {
+        console.log('Recent errors from log:');
+        for (const line of schedulerInfo.recent_errors) console.log(line);
+      }
+    }
+
+    // Discord line
+    if (discordInfo.state === 'running') {
+      console.log(`discord:   running pid=${discordInfo.pid}`);
+    } else if (discordInfo.state === 'not_configured') {
+      console.log(`discord:   not configured`);
+      console.error('');
+      console.error('WARNING: AMPA_DISCORD_BOT_TOKEN is not set — Discord notifications are disabled.');
+      console.error('  Set it in .worklog/ampa/.env to enable Discord integration:');
+      console.error('    AMPA_DISCORD_BOT_TOKEN="<your-bot-token>"');
+      console.error('    AMPA_DISCORD_CHANNEL_ID="<your-channel-id>"');
+    } else {
+      const reason = discordInfo.reason ? ` (${discordInfo.reason})` : '';
+      console.log(`discord:   ${discordInfo.state}${reason}`);
+    }
+
+    printPoolStatus(projectRoot);
+  }
+
+  // Determine exit code:
+  // 0 = all configured daemons running
+  // 1 = error state
+  // 3 = stopped
+  if (schedulerInfo.state === 'error') return 1;
+  if (schedulerInfo.state !== 'running') return 3;
+  // Scheduler is running; check Discord (only if configured)
+  if (discordInfo.discord_configured && discordInfo.state !== 'running') return 3;
+  return 0;
 }
 
 async function runOnce(projectRoot, cmdSpec) {
@@ -2302,10 +2459,13 @@ export default function register(ctx) {
     .command('status')
     .description('Show daemon status')
     .option('--name <name>', 'Daemon name', 'default')
-    .action(async (opts) => {
+    .option('--json', 'Output in JSON format')
+    .action(async (opts, cmd) => {
+      const allOpts = cmd.optsWithGlobals();
+      const useJson = !!allOpts.json;
       let cwd = process.cwd();
       try { cwd = findProjectRoot(cwd); } catch (e) { console.error(e.message); process.exitCode = 2; return; }
-      const code = await status(cwd, opts.name);
+      const code = await status(cwd, opts.name, useJson);
       process.exitCode = code;
     });
 
@@ -2672,10 +2832,13 @@ export {
   containerName,
   ensureTemplate,
   existingPoolContainers,
+  findDiscordBotPid,
   findPoolContainerForWorkItem,
   getCleanupList,
+  getDiscordDaemonStatus,
   getGitOrigin,
   getPoolState,
+  getSchedulerDaemonStatus,
   globalAmpaDir,
   globalPluginsDir,
   imageCreatedDate,

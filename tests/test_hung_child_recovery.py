@@ -103,11 +103,15 @@ class TestDefaultExecutorTimeout:
         """A delegation command that exceeds its timeout gets exit code 124."""
         spec = _make_spec(command_type="delegation")
 
-        # Simulate subprocess.run raising TimeoutExpired
-        def mock_subprocess_run(*args, **kwargs):
-            raise subprocess.TimeoutExpired(cmd=spec.command, timeout=5)
+        # Delegation commands now go through _run_command_with_graceful_timeout
+        # (SIGTERM → SIGKILL) instead of subprocess.run directly.
+        def mock_graceful_timeout(command, timeout, command_cwd):
+            raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
 
-        monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
+        monkeypatch.setattr(
+            "ampa.scheduler_executor._run_command_with_graceful_timeout",
+            mock_graceful_timeout,
+        )
 
         result = default_executor(spec)
 
@@ -125,10 +129,14 @@ class TestDefaultExecutorTimeout:
             command_type="shell",
         )
 
-        def mock_subprocess_run(*args, **kwargs):
-            raise subprocess.TimeoutExpired(cmd=spec.command, timeout=3600)
+        # Commands containing 'opencode run' also use the graceful timeout path.
+        def mock_graceful_timeout(command, timeout, command_cwd):
+            raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
 
-        monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
+        monkeypatch.setattr(
+            "ampa.scheduler_executor._run_command_with_graceful_timeout",
+            mock_graceful_timeout,
+        )
 
         result = default_executor(spec)
 
@@ -139,13 +147,16 @@ class TestDefaultExecutorTimeout:
         spec = _make_spec(max_runtime_minutes=2)
         captured_timeout = {}
 
-        def mock_subprocess_run(*args, **kwargs):
-            captured_timeout["value"] = kwargs.get("timeout")
+        def mock_graceful_timeout(command, timeout, command_cwd):
+            captured_timeout["value"] = timeout
             return subprocess.CompletedProcess(
-                args=spec.command, returncode=0, stdout="ok", stderr=""
+                args=command, returncode=0, stdout="ok", stderr=""
             )
 
-        monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
+        monkeypatch.setattr(
+            "ampa.scheduler_executor._run_command_with_graceful_timeout",
+            mock_graceful_timeout,
+        )
 
         default_executor(spec)
 
@@ -157,13 +168,16 @@ class TestDefaultExecutorTimeout:
         spec = _make_spec(command_type="delegation", max_runtime_minutes=None)
         captured_timeout = {}
 
-        def mock_subprocess_run(*args, **kwargs):
-            captured_timeout["value"] = kwargs.get("timeout")
+        def mock_graceful_timeout(command, timeout, command_cwd):
+            captured_timeout["value"] = timeout
             return subprocess.CompletedProcess(
-                args=spec.command, returncode=0, stdout="ok", stderr=""
+                args=command, returncode=0, stdout="ok", stderr=""
             )
 
-        monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
+        monkeypatch.setattr(
+            "ampa.scheduler_executor._run_command_with_graceful_timeout",
+            mock_graceful_timeout,
+        )
         monkeypatch.setenv("AMPA_DELEGATION_OPENCODE_TIMEOUT", "300")
 
         default_executor(spec)
@@ -174,14 +188,16 @@ class TestDefaultExecutorTimeout:
         """Partial stdout/stderr from a timed-out process is preserved."""
         spec = _make_spec()
 
-        exc = subprocess.TimeoutExpired(cmd=spec.command, timeout=5)
-        exc.output = "partial stdout before hang"
-        exc.stderr = "partial stderr"
-
-        def mock_subprocess_run(*args, **kwargs):
+        def mock_graceful_timeout(command, timeout, command_cwd):
+            exc = subprocess.TimeoutExpired(cmd=command, timeout=timeout)
+            exc.output = "partial stdout before hang"
+            exc.stderr = "partial stderr"
             raise exc
 
-        monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
+        monkeypatch.setattr(
+            "ampa.scheduler_executor._run_command_with_graceful_timeout",
+            mock_graceful_timeout,
+        )
 
         result = default_executor(spec)
 
@@ -639,9 +655,10 @@ class TestEndToEndHungChild:
     def test_real_subprocess_timeout_through_scheduler(self, monkeypatch):
         """End-to-end through Scheduler: real subprocess timeout clears state.
 
-        Injects default_executor with a mocked subprocess.run that raises
-        TimeoutExpired to verify the full path: Scheduler.start_command ->
-        default_executor -> TimeoutExpired -> exit 124 -> state cleared.
+        Injects default_executor with a mocked _run_command_with_graceful_timeout
+        that raises TimeoutExpired to verify the full path:
+        Scheduler.start_command -> default_executor -> TimeoutExpired ->
+        exit 124 -> state cleared.
 
         This avoids actually sleeping for 60+ seconds while still exercising
         the real default_executor (not a test double).
@@ -656,10 +673,14 @@ class TestEndToEndHungChild:
         )
         store.add_command(spec)
 
-        def mock_subprocess_run(*args, **kwargs):
-            raise subprocess.TimeoutExpired(cmd="opencode run ...", timeout=5)
+        # 'opencode run' in command → uses _run_command_with_graceful_timeout
+        def mock_graceful_timeout(command, timeout, command_cwd):
+            raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
 
-        monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
+        monkeypatch.setattr(
+            "ampa.scheduler_executor._run_command_with_graceful_timeout",
+            mock_graceful_timeout,
+        )
 
         # Use default_executor (the real one, not a mock)
         scheduler = Scheduler(store, _make_config())
@@ -689,8 +710,9 @@ class TestTimeoutDiscordNotification:
         spec = _make_spec()
         notify_calls = []
 
-        def mock_subprocess_run(*args, **kwargs):
-            raise subprocess.TimeoutExpired(cmd=spec.command, timeout=5)
+        # Delegation commands use _run_command_with_graceful_timeout now.
+        def mock_graceful_timeout(command, timeout, command_cwd):
+            raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
 
         def mock_notify(title="", body="", message_type="other", **kwargs):
             notify_calls.append(
@@ -698,7 +720,10 @@ class TestTimeoutDiscordNotification:
             )
             return True
 
-        monkeypatch.setattr("ampa.scheduler.subprocess.run", mock_subprocess_run)
+        monkeypatch.setattr(
+            "ampa.scheduler_executor._run_command_with_graceful_timeout",
+            mock_graceful_timeout,
+        )
 
         # Mock the notifications module
         monkeypatch.setattr("ampa.scheduler.notifications_module.notify", mock_notify)
