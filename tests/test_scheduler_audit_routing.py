@@ -34,7 +34,7 @@ def make_scheduler(run_shell_callable, tmp_path):
     return Scheduler(store, config, run_shell=run_shell_callable, command_cwd=str(tmp_path))
 
 
-def test_scheduler_triage_audit_routes_to_descriptor_handlers(tmp_path, monkeypatch):
+def test_scheduler_audit_routes_to_descriptor_handlers(tmp_path, monkeypatch):
     calls = []
     work_id = "ROUTE-001"
     current_status = "in_progress"
@@ -147,7 +147,7 @@ def test_scheduler_triage_audit_routes_to_descriptor_handlers(tmp_path, monkeypa
     assert any(c.startswith("gh pr view 42 --repo example/repo --json merged") for c in calls)
 
 
-def test_scheduler_triage_audit_query_failure_is_graceful(tmp_path):
+def test_scheduler_audit_query_failure_is_graceful(tmp_path):
     def fake_run_shell(cmd, **kwargs):
         if cmd.strip() == "wl list --stage in_review --json":
             return subprocess.CompletedProcess(cmd, 1, "", "query failed")

@@ -117,7 +117,7 @@ Mixed results: 8 of 11 acceptance criteria are met.
 | 7 | close_with_audit handler | met | ampa/audit/handlers.py:180 |
 | 8 | Structured output format | met | See report markers |
 | 9 | Discord integration | unmet | No notification calls found |
-| 10 | TriageAuditRunner removed | unmet | File still exists |
+| 10 | Legacy triage runner removed | unmet | File still exists |
 | 11 | Tests refactored | partial | Some tests still reference old API |
 
 ## Recommendation
