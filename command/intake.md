@@ -123,16 +123,14 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
 - Adding dependencies with `wl comment add <work-item-id> --comment "Blocks:<blocked-item-id>" --json` and `wl comment add <work-item-id> --comment "Blocked-by:<blocking-item-id>" --json`
 - Adjusting priority to better match the new understanding of scope and impact using `wl update <work-item-id> --priority <level> --json`
 
-8. Calculate Effort and Risk (agent responsibility; must follow)
+8. Update the work item with the final brief using `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --status intake_complete--json`
+
+9. Calculate Effort and Risk (agent responsibility; must follow)
 
 - Call the `effort_and_risk` skill with the new or updated work item to produce an effort and risk estimate.
 
-
-9. Update the work item with the final brief using `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --status intake_complete--json`
- 
 10.   Finishing (must do as the final step only)
     
-11.   
 - DO NOT close the issue
 - Run `wl sync` to sync work item changes.
 - Run `wl show <work-item-id>` (not --json) to show the entire work item.

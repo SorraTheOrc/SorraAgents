@@ -2,9 +2,9 @@
 
 Defines the ``AuditResult`` dataclass — the contract between the audit
 skill output and the descriptor-driven audit command handlers.  The
-parser extracts structured data from the audit skill's marker-delimited
-output (``--- AUDIT REPORT START/END ---``), replacing the ad-hoc regex
-parsing previously embedded in ``TriageAuditRunner``.
+    parser extracts structured data from the audit skill's marker-delimited
+    output (``--- AUDIT REPORT START/END ---``), replacing the ad-hoc regex
+    parsing previously embedded in the legacy monolithic triage-audit runner.
 
 Usage::
 

@@ -1,10 +1,10 @@
 """Audit detection & polling flow.
 
 This module extracts audit candidate detection, cooldown filtering, and
-one-at-a-time selection from ``TriageAuditRunner`` into a focused polling
-layer.  It queries for ``in_review`` items, applies store-based cooldown,
-selects the oldest eligible candidate, and hands it off to the audit
-command handlers via a well-defined protocol.
+one-at-a-time selection into a focused polling layer. It queries for
+``in_review`` items, applies store-based cooldown, selects the oldest
+eligible candidate, and hands it off to the audit command handlers via a
+well-defined protocol.
 
 Work item: SA-0MLYEOG9V107HE1D
 """
