@@ -116,33 +116,27 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
   5. Polish & handoff
   - Tighten language for reading speed, ensure copy-paste-ready commands, and produce the final 1–2 sentence summary used as the work item body headline.
 
-6. Present final artifact for approval (human step)
+6. Call the `find_related` skill to collect related work and add a report to the work item description.
 
-- After the five reviews, output the content of `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` for the user.
-- Ask the user to approve the final artifact or request further changes.
-- Only proceed to the next step when the user approves the final intake brief.
-
-7. Update the Worklog work item (agent responsibility; must follow)
-
-Update the description of the Worklog work item with the final intake brief from `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` using `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --stage intake_complete --json`.
-
-8. Call the `find_related` skill to collect related work and add a report to the work item description.
-
-9. Review the new issue in the overall context of the project and consider:
+7. Review the new issue in the overall context of the project and consider:
 
 - Adding dependencies with `wl comment add <work-item-id> --comment "Blocks:<blocked-item-id>" --json` and `wl comment add <work-item-id> --comment "Blocked-by:<blocking-item-id>" --json`
 - Adjusting priority to better match the new understanding of scope and impact using `wl update <work-item-id> --priority <level> --json`
 
-10. Calculate Effort and Risk (agent responsibility; must follow)
+8. Calculate Effort and Risk (agent responsibility; must follow)
 
 - Call the `effort_and_risk` skill with the new or updated work item to produce an effort and risk estimate.
 
-11.  Finishing (must do as the final step only)
 
+9. Update the work item with the final brief using `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --status intake_complete--json`
+ 
+10.   Finishing (must do as the final step only)
+    
+11.   
 - DO NOT close the issue
 - Run `wl sync` to sync work item changes.
 - Run `wl show <work-item-id>` (not --json) to show the entire work item.
-- Remove all temporary files created during the process, including `.opencode/tmp/intake-draft-<title>.md`.
+- Remove all temporary files created during the process, including `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
 - Output the new work item id, a 1–2 sentence summary headline
 - Finish with "This completes the Intake process for <work-item-id> <work-itme-title>"
 
