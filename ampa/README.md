@@ -232,7 +232,7 @@ Scheduler admin CLI
 
 Live delegation
 
-  Delegation runs as part of triage-audit and only when `audit_only` is false.
+  Delegation runs as part of the audit cycle and only when `audit_only` is false.
   It also requires no in-progress work items. When idle, it selects the top
   `wl next` candidate and dispatches the appropriate workflow:
 

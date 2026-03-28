@@ -751,7 +751,7 @@ The scheduler store (`scheduler_store.json`) defines scheduled commands. Key del
 | Command ID | Type | Frequency | Purpose |
 |---|---|---|---|
 | `delegation` | `delegation` | 2 min | Main delegation cycle |
-| `wl-triage-audit` | `triage-audit` | 2 min | Audit poller for completed work |
+| `wl-audit` | `audit` | 2 min | Descriptor-driven audit poller for completed work |
 | `stale-delegation-watchdog` | (auto-registered) | 30 min | Stale delegation recovery |
 | `wl-in_progress` | `shell` | 1 min | In-progress status report |
 | `wl-stats` | `shell` | 10 min | Stats report |

@@ -28,7 +28,7 @@ Scheduled shell commands run in the working directory where the scheduler daemon
 
 ## Delegation gating
 
-Delegation is gated by `audit_only` metadata in the triage-audit and delegation commands. When
+Delegation is gated by `audit_only` metadata in the audit and delegation commands. When
 `audit_only` is true, delegation is skipped. Otherwise it no-ops if any `wl in_progress` items
 exist. When idle, it selects the top `wl next` candidate and dispatches the appropriate workflow
 command.

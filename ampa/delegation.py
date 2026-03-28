@@ -193,7 +193,7 @@ def _build_dry_run_report(
     if in_progress_items:
         lines: List[str] = ["Agents are currently busy with:"]
         for item in in_progress_items:
-            # match the visual style requested (em dash bullets)
+    # match the visual style requested (em dash bullets)
             lines.append(f"── {item}")
         return "\n".join(lines)
 

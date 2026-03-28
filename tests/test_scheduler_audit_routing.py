@@ -125,13 +125,13 @@ def test_scheduler_audit_routes_to_descriptor_handlers(tmp_path, monkeypatch):
 
     sched = make_scheduler(fake_run_shell, tmp_path)
     spec = CommandSpec(
-        command_id="wl-triage-audit",
+        command_id="wl-audit",
         command="true",
         requires_llm=False,
         frequency_minutes=1,
         priority=0,
         metadata={"audit_cooldown_hours": 0},
-        command_type="triage-audit",
+        command_type="audit",
     )
     sched.store.add_command(spec)
 
@@ -155,13 +155,13 @@ def test_scheduler_audit_query_failure_is_graceful(tmp_path):
 
     sched = make_scheduler(fake_run_shell, tmp_path)
     spec = CommandSpec(
-        command_id="wl-triage-audit",
+        command_id="wl-audit",
         command="true",
         requires_llm=False,
         frequency_minutes=1,
         priority=0,
         metadata={"audit_cooldown_hours": 0},
-        command_type="triage-audit",
+        command_type="audit",
     )
     sched.store.add_command(spec)
 

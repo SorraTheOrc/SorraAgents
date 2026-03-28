@@ -454,10 +454,15 @@ class Scheduler:
             return run
         self._record_run(spec, run, exit_code, output)
         # After recording run, perform any command-specific post actions
-        if spec.command_id == "wl-triage-audit" or spec.command_type == "triage-audit":
-            # Route triage-audit through the audit poller for candidate
-            # detection and cooldown filtering, then execute descriptor-driven
-            # audit handlers via the handoff handler protocol.
+        if spec.command_id in ("wl-triage-audit", "wl-audit") or spec.command_type in (
+            "triage-audit",
+            "audit",
+        ):
+            # Route audit (legacy name: triage-audit) through the audit
+            # poller for candidate detection and cooldown filtering, then
+            # execute descriptor-driven audit handlers via the handoff
+            # handler protocol. This accepts both the legacy and the new
+            # canonical names during a migration window.
             try:
                 from .audit_poller import PollerOutcome, poll_and_handoff
                 from .audit.handlers import (
@@ -626,7 +631,7 @@ class Scheduler:
                     )
             except Exception:
                 LOG.exception("Failed to run audit poller / descriptor handlers")
-            # triage-audit posts its own discord summary; avoid generic post
+            # audit posts its own discord summary; avoid generic post
             return run
         if spec.command_type == "stale-delegation-watchdog":
             try:
