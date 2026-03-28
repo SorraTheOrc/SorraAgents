@@ -47,12 +47,7 @@ def _make_scheduler(now: dt.datetime, llm_available: bool) -> Scheduler:
         "stale-delegation-watchdog",
         {"last_run_ts": now.isoformat()},
     )
-    # Same for the test-button command (auto-registered when
-    # AMPA_DISCORD_BOT_TOKEN is set).
-    scheduler.store.update_state(
-        "test-button",
-        {"last_run_ts": now.isoformat()},
-    )
+    # Exclude removed test-button command
     # Same for the auto-delegate command (auto-registered at init,
     # disabled by default).
     scheduler.store.update_state(

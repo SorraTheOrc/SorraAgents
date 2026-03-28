@@ -22,7 +22,8 @@ LOG = logging.getLogger("ampa.scheduler")
 # ---------------------------------------------------------------------------
 
 _WATCHDOG_COMMAND_ID = "stale-delegation-watchdog"
-_TEST_BUTTON_COMMAND_ID = "test-button"
+# (removed) _TEST_BUTTON_COMMAND_ID was intentionally deleted — test-button
+# command has been removed from the codebase.
 _AUTO_DELEGATE_COMMAND_ID = "auto-delegate"
 _PR_MONITOR_COMMAND_ID = "pr-monitor"
 _AUDIT_COMMAND_ID = "wl-audit"
@@ -108,18 +109,8 @@ def ensure_watchdog_command(store: SchedulerStore) -> None:
         LOG.exception("Failed to auto-register watchdog command")
 
 
-def ensure_test_button_command(store: SchedulerStore) -> None:
-    """Register the interactive test-button command if absent.
-
-    Only registers when ``AMPA_DISCORD_BOT_TOKEN`` is set — without a bot
-    the buttons cannot be rendered or clicked.
-    """
-    # Test-button auto-registration intentionally disabled. Keep the helper
-    # as a no-op for historical context; operators who want an interactive
-    # test message should add a `test-button` command to their
-    # project-local scheduler_store.json.
-    LOG.debug("ensure_test_button_command: auto-registration disabled")
-    return
+# ensure_test_button_command was removed along with the test-button
+# feature. No code path should call this function.
     try:
         existing = store.list_commands()
         for cmd in existing:
@@ -131,23 +122,10 @@ def ensure_test_button_command(store: SchedulerStore) -> None:
                 return
         test_button_spec = CommandSpec(
             command_id=_TEST_BUTTON_COMMAND_ID,
-            command="echo test-button",
-            requires_llm=False,
-            frequency_minutes=15,
-            priority=0,
-            metadata={},
-            title="Interactive Test Button",
-            max_runtime_minutes=1,
-            command_type="test-button",
-        )
-        store.add_command(test_button_spec)
-        LOG.info(
-            "Auto-registered test-button command: %s (every %dm)",
-            _TEST_BUTTON_COMMAND_ID,
-            test_button_spec.frequency_minutes,
+            # (removed) test-button example previously existed here
         )
     except Exception:
-        LOG.exception("Failed to auto-register test-button command")
+        LOG.exception("Failed to process test-button removal helper")
 
 
 def ensure_auto_delegate_command(store: SchedulerStore) -> None:
@@ -262,23 +240,7 @@ def ensure_audit_command(store: SchedulerStore) -> None:
         LOG.exception("Failed to auto-register audit command")
 
 
-def send_test_button_message(notifier: Any) -> None:
-    """Send the "Blue or Red?" test message with interactive buttons."""
-    components = [
-        {
-            "type": "button",
-            "label": "Blue",
-            "style": "primary",
-            "custom_id": "test_blue",
-        },
-        {"type": "button", "label": "Red", "style": "danger", "custom_id": "test_red"},
-    ]
-    notifier.notify(
-        title="Blue or Red?",
-        body="Pick a colour by clicking a button below.",
-        message_type="command",
-        components=components,
-    )
+# send_test_button_message removed — test-button feature removed.
 
 
 def log_health(store: SchedulerStore) -> None:

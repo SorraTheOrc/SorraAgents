@@ -647,12 +647,7 @@ class Scheduler:
             except Exception:
                 LOG.exception("Stale delegation watchdog failed")
             return run
-        if spec.command_type == "test-button":
-            try:
-                _send_test_button_message(notifications_module)
-            except Exception:
-                LOG.exception("Test-button message failed")
-            return run
+        # `test-button` command removed — no-op
         if spec.command_type == "auto-delegate":
             try:
                 meta = getattr(spec, "metadata", {}) or {}

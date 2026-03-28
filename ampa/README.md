@@ -498,15 +498,13 @@ Clicking a button triggers the `on_interaction` event in `discord_bot.py`. The h
 4. Derives a human-readable label from the `custom_id` (e.g. `test_blue` -> `Blue`).
 5. Sends an in-channel acknowledgement: "You selected Blue, good luck. (clicked by user#1234, 2026-01-01T00:00:00Z)".
 
-### Scheduler test-button command
+### Scheduler interactive buttons
 
-The scheduler auto-registers a `test-button` command that fires every 15 minutes,
-sending a "Blue or Red?" message with two interactive buttons. This provides ongoing
-MVP validation of the interactive buttons feature. The command can be run manually:
-
-```bash
-python -m ampa.scheduler run-once test-button
-```
+The scheduler previously included an interactive `test-button` command for
+feature validation. That command and its auto-registration were removed —
+operators who want an interactive test message may add a custom command to
+their project-local `scheduler_store.json` and invoke `ampa.notifications.notify`
+with a `components` payload (see the "Interactive Buttons (MVP)" section).
 
 Project References
 ------------------
