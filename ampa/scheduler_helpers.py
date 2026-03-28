@@ -25,6 +25,7 @@ _WATCHDOG_COMMAND_ID = "stale-delegation-watchdog"
 _TEST_BUTTON_COMMAND_ID = "test-button"
 _AUTO_DELEGATE_COMMAND_ID = "auto-delegate"
 _PR_MONITOR_COMMAND_ID = "pr-monitor"
+_AUDIT_COMMAND_ID = "wl-audit"
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +221,46 @@ def ensure_pr_monitor_command(store: SchedulerStore) -> None:
         )
     except Exception:
         LOG.exception("Failed to auto-register PR monitor command")
+
+
+def ensure_audit_command(store: SchedulerStore) -> None:
+    """Register the audit poller command if absent.
+
+    The audit poller selects in-review work items and runs the descriptor-
+    driven audit handlers. It is safe to auto-register with a conservative
+    default; operators may customize or remove the entry in their
+    project-local scheduler_store.json.
+    """
+    try:
+        existing = store.list_commands()
+        for cmd in existing:
+            if cmd.command_id == _AUDIT_COMMAND_ID:
+                LOG.debug("Audit command already registered: %s", _AUDIT_COMMAND_ID)
+                return
+        audit_spec = CommandSpec(
+            command_id=_AUDIT_COMMAND_ID,
+            command="true",
+            requires_llm=False,
+            frequency_minutes=2,
+            priority=0,
+            metadata={
+                "discord_label": "wl audit",
+                "audit_cooldown_hours": 6,
+                "audit_cooldown_hours_in_review": 1,
+                "truncate_chars": 65536,
+            },
+            title="Audit",
+            max_runtime_minutes=5,
+            command_type="audit",
+        )
+        store.add_command(audit_spec)
+        LOG.info(
+            "Auto-registered audit command: %s (every %dm)",
+            _AUDIT_COMMAND_ID,
+            audit_spec.frequency_minutes,
+        )
+    except Exception:
+        LOG.exception("Failed to auto-register audit command")
 
 
 def send_test_button_message(notifier: Any) -> None:

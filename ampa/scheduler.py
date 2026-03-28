@@ -74,15 +74,16 @@ from .engine_factory import build_engine  # noqa: E402
 from .delegation import DelegationOrchestrator  # noqa: E402
 import hashlib
 
-from .scheduler_helpers import (  # noqa: E402
-    clear_stale_running_states as _clear_stale_running_states,
-    ensure_watchdog_command as _ensure_watchdog_command,
-    ensure_test_button_command as _ensure_test_button_command,
-    ensure_auto_delegate_command as _ensure_auto_delegate_command,
-    ensure_pr_monitor_command as _ensure_pr_monitor_command,
-    send_test_button_message as _send_test_button_message,
-    log_health as _log_health,
-)
+    from .scheduler_helpers import (  # noqa: E402
+        clear_stale_running_states as _clear_stale_running_states,
+        ensure_watchdog_command as _ensure_watchdog_command,
+        ensure_test_button_command as _ensure_test_button_command,
+        ensure_auto_delegate_command as _ensure_auto_delegate_command,
+        ensure_pr_monitor_command as _ensure_pr_monitor_command,
+        ensure_audit_command as _ensure_audit_command,
+        send_test_button_message as _send_test_button_message,
+        log_health as _log_health,
+    )
 
 
 class Scheduler:
@@ -247,6 +248,11 @@ class Scheduler:
         # safe rollout).  When enabled it periodically runs ``wl next`` and
         # delegates plan-complete high/critical items.
         _ensure_auto_delegate_command(self.store)
+
+        # Auto-register the audit poller command so the scheduler will run
+        # the audit flow if the operator has not explicitly added a custom
+        # entry in their project-local scheduler_store.json.
+        _ensure_audit_command(self.store)
 
         # Auto-register the PR monitor command — scans open PRs hourly,
         # posts "ready for review" when CI passes, and creates critical
