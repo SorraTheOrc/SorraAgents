@@ -3,7 +3,7 @@
 This module contains the pure data types (``CommandSpec``, ``SchedulerConfig``,
 ``RunResult``, ``CommandRunResult``) and stateless utility functions
 (``_utc_now``, ``_to_iso``, ``_from_iso``, ``_seconds_between``, ``_bool_meta``)
-that are used across the scheduler, delegation, triage-audit, CLI, and store
+ that are used across the scheduler, delegation, audit, CLI, and store
 modules.
 
 Extracting these into their own module breaks the dependency on

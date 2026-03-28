@@ -454,15 +454,10 @@ class Scheduler:
             return run
         self._record_run(spec, run, exit_code, output)
         # After recording run, perform any command-specific post actions
-        if spec.command_id in ("wl-triage-audit", "wl-audit") or spec.command_type in (
-            "triage-audit",
-            "audit",
-        ):
-            # Route audit (legacy name: triage-audit) through the audit
-            # poller for candidate detection and cooldown filtering, then
-            # execute descriptor-driven audit handlers via the handoff
-            # handler protocol. This accepts both the legacy and the new
-            # canonical names during a migration window.
+        if spec.command_id == "wl-audit" or spec.command_type == "audit":
+            # Route audit through the audit poller for candidate detection
+            # and cooldown filtering, then execute descriptor-driven audit
+            # handlers via the handoff handler protocol.
             try:
                 from .audit_poller import PollerOutcome, poll_and_handoff
                 from .audit.handlers import (

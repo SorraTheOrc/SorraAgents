@@ -1,6 +1,6 @@
 # AMPA triage-audit flow
 
-This document explains the AMPA scheduler's audit post-processing (historically called "triage-audit"). It is triggered for scheduled commands with `command_id="wl-audit"` or `command_type="audit"` (the runtime continues to accept the legacy `wl-triage-audit` / `triage-audit` identifiers during a migration window) and describes the descriptor-driven handlers now used to perform audits.
+This document explains the AMPA scheduler's audit post-processing (historically called "triage-audit"). It is triggered for scheduled commands with `command_id="wl-audit"` or `command_type="audit"` and describes the descriptor-driven handlers now used to perform audits.
 
 References:
 - `ampa/audit_poller.py` (candidate detection, cooldown filtering, selection)
@@ -19,7 +19,7 @@ The audit flow is organised around three responsibilities:
 - `ampa/audit/handlers.py` — Descriptor-driven handlers implementing the audit command lifecycle. Handlers run the audit (via `opencode run "/audit <id>"`), parse output using `ampa/audit/result.py`, write structured `# AMPA Audit Result` comments, evaluate invariants, and apply descriptor effects (state transitions, tags, notifications).
 - `ampa/audit/result.py` — Parsing and typed models. Extracts the structured report between marker delimiters and returns a typed `AuditResult` or `ParseError` for handlers to consume.
 
-The scheduler's `start_command()` routes `wl-audit` (legacy: `wl-triage-audit`) commands through `poll_and_handoff()` and passes a handler adapter that delegates to the descriptor-driven handlers in `ampa/audit/handlers.py`.
+The scheduler's `start_command()` routes `wl-audit` commands through `poll_and_handoff()` and passes a handler adapter that delegates to the descriptor-driven handlers in `ampa/audit/handlers.py`.
 
 ## End-to-end flow
 

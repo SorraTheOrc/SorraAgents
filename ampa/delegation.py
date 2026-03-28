@@ -287,7 +287,7 @@ class DelegationOrchestrator:
     * ``execute(spec, run)`` — full delegation flow called from
       ``Scheduler.start_command()``
     * ``run_idle_delegation(audit_only, spec)`` — engine wrapper used by
-      triage-audit and the delegation flow
+      audit and the delegation flow
     * ``run_delegation_report(spec)`` — human-readable report generation
     * ``recover_stale_delegations()`` — stale delegation watchdog
     """
