@@ -13,7 +13,7 @@ Each scheduled command is represented by a `CommandSpec` entry.
 - `priority` (int, required): higher numbers increase scheduling weight.
 - `metadata` (object, optional): arbitrary metadata for operators.
 - `max_runtime_minutes` (int, optional): execution timeout in minutes.
-- `type` (string, optional): `shell` (default) or `heartbeat`. Heartbeat triggers the heartbeat sender without running a shell command. Other built-in types: `stale-delegation-watchdog` (auto-registered, runs every 30m) and `test-button` (auto-registered, sends interactive button message every 15m).
+ - `type` (string, optional): `shell` (default) or `heartbeat`. Heartbeat triggers the heartbeat sender without running a shell command. Other built-in types: `stale-delegation-watchdog` (auto-registered, runs every 30m). The `test-button` command is available but not auto-registered.
 
 ## Config knobs (env)
 
@@ -100,17 +100,9 @@ The store is a JSON file with the following top-level structure (see `ampa/sched
       "max_runtime_minutes": 5,
       "type": "shell"
     },
-    "test-button": {
-      "id": "test-button",
-      "command": "echo test-button",
-      "requires_llm": false,
-      "frequency_minutes": 15,
-      "priority": 0,
-      "metadata": {},
-      "title": "Interactive Test Button",
-      "max_runtime_minutes": 1,
-      "type": "test-button"
-    }
+    /* The test-button example is intentionally omitted; operators who want
+       an interactive test message can add a `test-button` command to their
+       local scheduler_store.json. */
   },
   "state": {
     "cmd-1": {

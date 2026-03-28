@@ -239,10 +239,10 @@ class Scheduler:
         # delegation timing.
         _ensure_watchdog_command(self.store)
 
-        # Auto-register the interactive test-button command so a periodic
-        # "Blue or Red?" message with discord.ui.Button components is sent
-        # every 15 minutes (MVP validation for interactive buttons).
-        _ensure_test_button_command(self.store)
+        # Test-button auto-registration is intentionally disabled;
+        # operators who want a test message can add a `test-button` command
+        # to their project-local scheduler_store.json. The helper remains
+        # in `ampa.scheduler_helpers` as a no-op for historical context.
 
         # Auto-register the auto-delegate command (disabled by default for
         # safe rollout).  When enabled it periodically runs ``wl next`` and

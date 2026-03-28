@@ -114,12 +114,11 @@ def ensure_test_button_command(store: SchedulerStore) -> None:
     Only registers when ``AMPA_DISCORD_BOT_TOKEN`` is set — without a bot
     the buttons cannot be rendered or clicked.
     """
-    # Disabled: do not auto-register the interactive test-button command.
-    # Operators who want a test message can add a command to their
-    # per-project scheduler_store.json explicitly. Auto-registration
-    # caused the command to reappear after restarts/installer runs, so
-    # keep this function as a no-op to make the behaviour permanent.
-    LOG.debug("ensure_test_button_command: auto-registration disabled by local policy")
+    # Test-button auto-registration intentionally disabled. Keep the helper
+    # as a no-op for historical context; operators who want an interactive
+    # test message should add a `test-button` command to their
+    # project-local scheduler_store.json.
+    LOG.debug("ensure_test_button_command: auto-registration disabled")
     return
     try:
         existing = store.list_commands()
