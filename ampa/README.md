@@ -4,6 +4,42 @@ Run locally:
 
 AMPA_DISCORD_BOT_TOKEN="your-bot-token" AMPA_DISCORD_CHANNEL_ID="your-channel-id" python -m ampa.daemon
 
+## Separate test and CI channels
+
+To prevent test noise from polluting the production/ops Discord channel, you can
+route test notifications to a dedicated test channel using either:
+
+1. **Per-message override** — pass `channel_id` to `notify()`:
+   ```python
+   from ampa.notifications import notify
+
+   # Sends to a test channel instead of the configured default
+   notify("Test", "Message", "test", channel_id=123456789012345678)
+   ```
+
+2. **Environment variable** — set `AMPA_TEST_CHANNEL_ID` in your `.env`:
+   ```bash
+   AMPA_TEST_CHANNEL_ID="123456789012345678"
+   ```
+
+The per-message override takes precedence over the environment variable.
+If neither is set, messages go to `AMPA_DISCORD_CHANNEL_ID`.
+
+## CI / dry-run mode
+
+In CI pipelines, set `AMPA_DISABLE_DISCORD="1"` to skip actual Discord sends:
+
+```yaml
+env:
+  AMPA_DISABLE_DISCORD: "1"
+```
+
+When set, `notify()` returns `True` immediately without sending to Discord.
+The bot also respects this flag and skips sending in `_send_to_discord()`.
+
+This lets you run tests that exercise the notification path without creating
+Discord messages.
+
 Scheduler
 
 The scheduler runs periodic commands with a normalized-lateness algorithm and stores state on disk.
