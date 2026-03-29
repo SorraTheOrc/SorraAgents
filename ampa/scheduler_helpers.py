@@ -110,22 +110,8 @@ def ensure_watchdog_command(store: SchedulerStore) -> None:
 
 
 # ensure_test_button_command was removed along with the test-button
-# feature. No code path should call this function.
-    try:
-        existing = store.list_commands()
-        for cmd in existing:
-            if cmd.command_id == _TEST_BUTTON_COMMAND_ID:
-                LOG.debug(
-                    "Test-button command already registered: %s",
-                    _TEST_BUTTON_COMMAND_ID,
-                )
-                return
-        test_button_spec = CommandSpec(
-            command_id=_TEST_BUTTON_COMMAND_ID,
-            # (removed) test-button example previously existed here
-        )
-    except Exception:
-        LOG.exception("Failed to process test-button removal helper")
+# feature. No code path should call this function and any historical
+# artifacts have been removed.
 
 
 def ensure_auto_delegate_command(store: SchedulerStore) -> None:
@@ -209,6 +195,14 @@ def ensure_audit_command(store: SchedulerStore) -> None:
     project-local scheduler_store.json.
     """
     try:
+        # Avoid auto-registering the audit command for in-memory/test stores
+        # (e.g. unit tests set store.path = ":memory:"). Operators should
+        # have an explicit entry in their per-project scheduler_store.json
+        # when deploying; only auto-register for real stores.
+        store_path = getattr(store, "path", None)
+        if store_path == ":memory:":
+            LOG.debug("Skipping audit auto-registration for in-memory store")
+            return
         existing = store.list_commands()
         for cmd in existing:
             if cmd.command_id == _AUDIT_COMMAND_ID:
