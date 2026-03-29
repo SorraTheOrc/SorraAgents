@@ -259,6 +259,7 @@ def notify(
     *,
     payload: Optional[Dict[str, Any]] = None,
     components: Optional[List[Dict[str, Any]]] = None,
+    channel_id: Optional[int] = None,
 ) -> bool:
     """Send a notification to Discord via the bot's Unix socket.
 
@@ -309,6 +310,29 @@ def notify(
         if components:
             msg["components"] = components
     msg["message_type"] = message_type
+    # Optional per-message channel override (forwarded to the bot socket).
+    # Keep backward compatibility: callers that do not pass channel_id are
+    # unaffected.
+    if channel_id is not None:
+        try:
+            # Store as int when possible, but allow string-y values from callers
+            # (the bot accepts either and attempts resolution).
+            msg["channel_id"] = int(channel_id)
+        except Exception:
+            msg["channel_id"] = channel_id
+        # Log when a non-default channel is explicitly requested so operators
+        # can audit test/CI messages.
+        default_chan = os.getenv("AMPA_DISCORD_CHANNEL_ID")
+        try:
+            if default_chan is None or str(channel_id) != str(default_chan):
+                LOG.info(
+                    "notify: forwarding to non-default channel_id=%s message_type=%s",
+                    channel_id,
+                    message_type,
+                )
+        except Exception:
+            # Avoid raising from logging logic.
+            pass
 
     # Try to send via Unix socket.
     ok = _send_via_socket(socket_path, msg)

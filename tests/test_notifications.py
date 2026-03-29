@@ -524,6 +524,27 @@ class TestNotify:
 
         asyncio.run(_test())
 
+    def test_notify_forward_channel_id(self, tmp_path, monkeypatch):
+        """When notify is called with channel_id it is forwarded in the socket payload."""
+        sock = str(tmp_path / "test.sock")
+        monkeypatch.setenv("AMPA_BOT_SOCKET_PATH", sock)
+        state_file = str(tmp_path / "state.json")
+        monkeypatch.setenv("AMPA_STATE_FILE", state_file)
+
+        async def _test():
+            srv = _FakeSocketServer(sock)
+            await srv.start()
+            try:
+                # Call notify with explicit channel_id kwarg
+                result = await _run_sync_in_async(lambda: notify("Title", "Body", "other", channel_id=55555))
+                assert result is True
+                assert len(srv.received) == 1
+                assert srv.received[0]["channel_id"] == 55555
+            finally:
+                await srv.stop()
+
+        asyncio.run(_test())
+
 
 # ---------------------------------------------------------------------------
 # Tests: notify with components parameter

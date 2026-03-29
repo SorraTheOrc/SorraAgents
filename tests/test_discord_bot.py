@@ -225,6 +225,29 @@ class TestAMPABotSocketProtocol:
 
         asyncio.run(_test())
 
+    def test_requested_channel_override_routes_message(self, bot, socket_path, fake_channel):
+        """When a message includes channel_id it is resolved via client.get_channel and used."""
+
+        async def _test():
+            # Default channel should not receive the message when override works.
+            bot._channel = fake_channel
+            # Prepare an alternate channel and a fake client that resolves it.
+            alt_channel = FakeChannel(name="alt-channel", channel_id=99999)
+            mock_client = MagicMock()
+            mock_client.get_channel.return_value = alt_channel
+            bot._client = mock_client
+
+            messages = [{"content": "Routed message", "channel_id": 99999}]
+            responses = await _run_socket_test(bot, socket_path, messages)
+            assert len(responses) == 1
+            assert responses[0]["ok"] is True
+            # Ensure alt channel received message and default did not.
+            assert len(alt_channel.sent) == 1
+            assert alt_channel.sent[0]["content"] == "Routed message"
+            assert len(fake_channel.sent) == 0
+
+        asyncio.run(_test())
+
     def test_discord_message_truncated_at_2000_chars(
         self, bot, socket_path, fake_channel
     ):

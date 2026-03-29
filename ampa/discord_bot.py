@@ -550,6 +550,32 @@ class AMPABot:
                 raw_embeds = data.get("embeds")
                 has_embeds = isinstance(raw_embeds, list) and len(raw_embeds) > 0
 
+                # Optional per-message channel override. If provided, attempt
+                # to resolve the requested channel; fall back to the default
+                # configured channel on failure.  We accept either int or
+                # string channel IDs for compatibility.
+                requested_channel = data.get("channel_id")
+                target_channel = self._channel
+                if requested_channel is not None:
+                    try:
+                        # Normalize to int when possible.
+                        requested_channel_int = int(requested_channel)
+                        resolved = self._client.get_channel(requested_channel_int)  # type: ignore
+                        if resolved is None:
+                            LOG.warning(
+                                "Requested channel_id=%s not found or not visible to bot; using default channel",
+                                requested_channel,
+                            )
+                        else:
+                            target_channel = resolved
+                            LOG.info(
+                                "Routing message to requested channel #%s (id=%s)",
+                                getattr(resolved, "name", "?"),
+                                getattr(resolved, "id", requested_channel_int),
+                            )
+                    except Exception:
+                        LOG.exception("Invalid requested channel_id=%r; using default channel", requested_channel)
+
                 if not content and not has_embeds:
                     response = {
                         "ok": False,
@@ -585,7 +611,15 @@ class AMPABot:
                 if content and len(content) > 2000:
                     content = content[:1997] + "..."
 
-                ok = await self._send_to_discord(content, view=view, embeds=embeds_out)
+                # Use the resolved target_channel when sending. Temporarily
+                # swap self._channel so _send_to_discord uses the selected
+                # channel with minimal code changes.
+                orig_channel = self._channel
+                try:
+                    self._channel = target_channel
+                    ok = await self._send_to_discord(content, view=view, embeds=embeds_out)
+                finally:
+                    self._channel = orig_channel
                 response: Dict[str, Any] = {"ok": ok}
                 if not ok:
                     response["error"] = "failed to send to Discord"
