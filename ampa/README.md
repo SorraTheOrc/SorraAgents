@@ -17,9 +17,9 @@ route test notifications to a dedicated test channel using either:
    notify("Test", "Message", "test", channel_id=123456789012345678)
    ```
 
-2. **Environment variable** — set `AMPA_TEST_CHANNEL_ID` in your `.env`:
+2. **Environment variable** — set `AMPA_DISCORD_TEST_CHANNEL_ID` in your `.env`:
    ```bash
-   AMPA_TEST_CHANNEL_ID="123456789012345678"
+   AMPA_DISCORD_TEST_CHANNEL_ID="123456789012345678"
    ```
 
 The per-message override takes precedence over the environment variable.
