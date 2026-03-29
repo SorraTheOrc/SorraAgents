@@ -685,3 +685,27 @@ class TestNotifyWithComponents:
                 await srv.stop()
 
         asyncio.run(_test())
+
+    def test_disable_discord_env_noop(self, tmp_path, monkeypatch):
+        """When AMPA_DISABLE_DISCORD is set, notify becomes a no-op and returns True."""
+        sock = str(tmp_path / "test.sock")
+        monkeypatch.setenv("AMPA_BOT_SOCKET_PATH", sock)
+        monkeypatch.setenv("AMPA_DISABLE_DISCORD", "1")
+        state_file = str(tmp_path / "state.json")
+        monkeypatch.setenv("AMPA_STATE_FILE", state_file)
+
+        async def _test():
+            srv = _FakeSocketServer(sock)
+            await srv.start()
+            try:
+                # notify should return True and not send any message
+                result = await _run_sync_in_async(
+                    lambda: notify("Test", "Body", "other")
+                )
+                assert result is True
+                # No message should have been sent to the fake socket
+                assert len(srv.received) == 0
+            finally:
+                await srv.stop()
+
+        asyncio.run(_test())

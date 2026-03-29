@@ -288,7 +288,16 @@ def notify(
     -------
     bool
         ``True`` if the message was accepted by the bot; ``False`` if the
-        message was dead-lettered.
+        message was dead-lettered.  Returns ``True`` immediately if
+        ``AMPA_DISABLE_DISCORD`` is set (no-op for CI).
+
+    Notes
+    -----
+    Environment variables
+    - ``AMPA_DISABLE_DISCORD``: if set (any non-empty value), ``notify()``
+      becomes a no-op and returns ``True`` immediately.  Useful for CI runs
+      where you want to exercise the notification path without posting to
+      Discord.
     """
     socket_path = os.getenv("AMPA_BOT_SOCKET_PATH", DEFAULT_SOCKET_PATH)
 
@@ -310,6 +319,18 @@ def notify(
         if components:
             msg["components"] = components
     msg["message_type"] = message_type
+
+    # CI / dry-run support: if AMPA_DISABLE_DISCORD is set, skip sending and
+    # return True (no-op). This prevents CI from actually posting to Discord.
+    disable_discord = os.getenv("AMPA_DISABLE_DISCORD")
+    if disable_discord is not None:
+        LOG.debug(
+            "notify: AMPA_DISABLE_DISCORD=%s, skipping Discord send (message_type=%s)",
+            disable_discord,
+            message_type,
+        )
+        return True
+
     # Optional per-message channel override (forwarded to the bot socket).
     # Keep backward compatibility: callers that do not pass channel_id are
     # unaffected.

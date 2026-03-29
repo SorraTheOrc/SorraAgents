@@ -883,6 +883,21 @@ class TestSendToDiscordWithView:
 
         asyncio.run(_test())
 
+    def test_disable_discord_env_skip_send(self, monkeypatch):
+        """When AMPA_DISABLE_DISCORD is set, _send_to_discord returns True without sending."""
+        import os
+
+        async def _test():
+            ch = FakeChannel()
+            bot = AMPABot(token="t", channel_id=1)
+            bot._channel = ch
+            monkeypatch.setenv("AMPA_DISABLE_DISCORD", "1")
+            result = await bot._send_to_discord("hello")
+            assert result is True
+            assert len(ch.sent) == 0
+
+        asyncio.run(_test())
+
 
 # ---------------------------------------------------------------------------
 # Tests: _route_pr_review_interaction

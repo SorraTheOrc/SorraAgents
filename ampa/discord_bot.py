@@ -13,6 +13,12 @@ Environment variables:
 - ``AMPA_DISCORD_BOT_TOKEN``  – Discord bot token (required)
 - ``AMPA_DISCORD_CHANNEL_ID`` – Target channel ID as an integer (required)
 - ``AMPA_BOT_SOCKET_PATH``    – Unix socket path (default: ``/tmp/ampa_bot.sock``)
+- ``AMPA_DISABLE_DISCORD``    – If set (any non-empty value), the bot will
+  skip sending messages to Discord and log a debug message instead. Useful
+  for local testing or CI scenarios where you want to exercise the socket
+  protocol without actually posting to Discord. When this is set, the bot
+  will still accept connections and respond ``{"ok": true}`` to requests,
+  but no messages will be sent to Discord.
 
     The bot accepts newline-delimited JSON messages on the Unix socket.  Each
     message must be a JSON object; it is sent to the configured Discord channel.
@@ -648,6 +654,15 @@ class AMPABot:
         view:
             Optional ``discord.ui.View`` to attach interactive components.
         """
+        # CI / dry-run support: skip actual send if AMPA_DISABLE_DISCORD is set.
+        disable_discord = os.getenv("AMPA_DISABLE_DISCORD")
+        if disable_discord is not None:
+            LOG.debug(
+                "_send_to_discord: AMPA_DISABLE_DISCORD=%s, skipping Discord send",
+                disable_discord,
+            )
+            return True
+
         if self._channel is None:
             LOG.error("Cannot send message: channel not resolved")
             return False
