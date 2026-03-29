@@ -12,6 +12,10 @@ Environment variables:
 
 - ``AMPA_DISCORD_BOT_TOKEN``  – Discord bot token (required)
 - ``AMPA_DISCORD_CHANNEL_ID`` – Target channel ID as an integer (required)
+- ``AMPA_DISCORD_TEST_CHANNEL_ID`` – Test channel ID as an integer. When set,
+  messages without a per-message ``channel_id`` override will be sent to this
+  test channel instead of the default ``AMPA_DISCORD_CHANNEL_ID``. Useful for
+  routing test/CI notifications to a separate channel.
 - ``AMPA_BOT_SOCKET_PATH``    – Unix socket path (default: ``/tmp/ampa_bot.sock``)
 - ``AMPA_DISABLE_DISCORD``    – If set (any non-empty value), the bot will
   skip sending messages to Discord and log a debug message instead. Useful
@@ -562,6 +566,27 @@ class AMPABot:
                 # string channel IDs for compatibility.
                 requested_channel = data.get("channel_id")
                 target_channel = self._channel
+                # If no per-message override, check for env var default
+                if requested_channel is None:
+                    test_channel_env = os.getenv("AMPA_DISCORD_TEST_CHANNEL_ID")
+                    if test_channel_env is not None:
+                        try:
+                            test_channel_int = int(test_channel_env)
+                            resolved = self._client.get_channel(test_channel_int)  # type: ignore
+                            if resolved is None:
+                                LOG.warning(
+                                    "AMPA_DISCORD_TEST_CHANNEL_ID=%s not found or not visible to bot; using default channel",
+                                    test_channel_env,
+                                )
+                            else:
+                                target_channel = resolved
+                                LOG.info(
+                                    "Routing message to test channel #%s (id=%s) via AMPA_DISCORD_TEST_CHANNEL_ID",
+                                    getattr(resolved, "name", "?"),
+                                    getattr(resolved, "id", test_channel_int),
+                                )
+                        except Exception:
+                            LOG.exception("Invalid AMPA_DISCORD_TEST_CHANNEL_ID=%r; using default channel", test_channel_env)
                 if requested_channel is not None:
                     try:
                         # Normalize to int when possible.
