@@ -26,6 +26,7 @@ Provide a concise, human-friendly summary of project status or a specific work i
 ## Steps
 
 1. Detect whether the user provided a work item id in the request.
+
 2. If no work item id is provided complete this step, otherwise skip to step 3:
 
 - Run `wl list --json` to fetch work items in JSON format to get more information, but do not display it.
@@ -73,7 +74,8 @@ For each direct child work item (do NOT recurse into grandchildren):
 Wrap the final report output in delimiter markers. The report MUST follow this exact structure:
 
 ```
---- AUDIT REPORT START ---
+Ready to close: Yes/No
+
 ## Summary
 
 <concise 2-4 sentence summary of overall status, key findings, and whether the item can be closed>
@@ -97,22 +99,28 @@ Wrap the final report output in delimiter markers. The report MUST follow this e
 
 <Repeat for each direct child. If a child has no acceptance criteria, write: "No acceptance criteria defined.">
 <If there are no children, write: "No children.">
-
-## Recommendation
-
-<One of the following:>
-<- "This item can be closed: all acceptance criteria are met, all children are completed, and the PR is merged.">
-<- "This item cannot be closed: <brief reason — e.g., 2 acceptance criteria are unmet, 1 child is still open>.">
-<- If there is an open PR, note: "Open PR awaiting review: <PR URL>">
---- AUDIT REPORT END ---
 ```
 
 CRITICAL rules for the structured report:
-- The `--- AUDIT REPORT START ---` and `--- AUDIT REPORT END ---` delimiters MUST appear on their own lines.
-- DO NOT output anything after the `--- AUDIT REPORT END ---` marker.
+- The first line must be `Ready to close: Yes` or `Ready to close: No` based on whether all acceptance criteria (parent and children) are met.
 - Keep the report concise despite the deep analysis. Each evidence note should be ONE line.
 - For project-level audits (no work item id), omit the `## Acceptance Criteria Status` and `## Children Status` sections. Include only `## Summary` and `## Recommendation`.
 - Review only direct children, never grandchildren. If there are many children (>10), note in the report that only the first 10 were reviewed and the rest were omitted for brevity.
+
+7. **Record the audit using the CLI structured write path:**
+
+   This step only applies when a work item id was provided (not for project-level audits).
+
+   After producing the structured audit report, record the audit in the work item's structured `audit` field using the CLI write path:
+
+   - Run: `wl update <work-item-id> --audit-text "<complete-report-content>" --json`
+   - The CLI will automatically:
+     - Populate the `audit.time` field with the current UTC timestamp (ISO8601 format)
+     - Populate the `audit.author` field with the current user
+     - Apply email redaction to the `audit.text` field if needed
+     - Parse the text to derive `audit.status` (Complete/Partial/Not Started/Missing Criteria)
+
+   - This stores the audit as structured metadata, making it machine-readable and queryable via `wl show --json`.
 
 ## Notes
 

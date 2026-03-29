@@ -566,30 +566,11 @@ class AMPABot:
                 # string channel IDs for compatibility.
                 requested_channel = data.get("channel_id")
                 target_channel = self._channel
-                # If no per-message override, check for env var default
-                if requested_channel is None:
-                    test_channel_env = os.getenv("AMPA_DISCORD_TEST_CHANNEL_ID")
-                    if test_channel_env is not None:
-                        try:
-                            test_channel_int = int(test_channel_env)
-                            resolved = self._client.get_channel(test_channel_int)  # type: ignore
-                            if resolved is None:
-                                LOG.warning(
-                                    "AMPA_DISCORD_TEST_CHANNEL_ID=%s not found or not visible to bot; using default channel",
-                                    test_channel_env,
-                                )
-                            else:
-                                target_channel = resolved
-                                LOG.info(
-                                    "Routing message to test channel #%s (id=%s) via AMPA_DISCORD_TEST_CHANNEL_ID",
-                                    getattr(resolved, "name", "?"),
-                                    getattr(resolved, "id", test_channel_int),
-                                )
-                        except Exception:
-                            LOG.exception("Invalid AMPA_DISCORD_TEST_CHANNEL_ID=%r; using default channel", test_channel_env)
+                message_type = data.get("message_type", "other")
+
+                # Priority 1: If channel_id is explicitly set in message, use it
                 if requested_channel is not None:
                     try:
-                        # Normalize to int when possible.
                         requested_channel_int = int(requested_channel)
                         resolved = self._client.get_channel(requested_channel_int)  # type: ignore
                         if resolved is None:
@@ -606,6 +587,29 @@ class AMPABot:
                             )
                     except Exception:
                         LOG.exception("Invalid requested channel_id=%r; using default channel", requested_channel)
+                # Priority 2: If it's a test/CI message, use test channel if configured
+                elif message_type in ("test", "ci"):
+                    test_channel_env = os.getenv("AMPA_DISCORD_TEST_CHANNEL_ID")
+                    if test_channel_env is not None:
+                        try:
+                            test_channel_int = int(test_channel_env)
+                            resolved = self._client.get_channel(test_channel_int)  # type: ignore
+                            if resolved is None:
+                                LOG.warning(
+                                    "AMPA_DISCORD_TEST_CHANNEL_ID=%s not found or not visible to bot; using default channel",
+                                    test_channel_env,
+                                )
+                            else:
+                                target_channel = resolved
+                                LOG.info(
+                                    "Routing %s message to test channel #%s (id=%s) via AMPA_DISCORD_TEST_CHANNEL_ID",
+                                    message_type,
+                                    getattr(resolved, "name", "?"),
+                                    getattr(resolved, "id", test_channel_int),
+                                )
+                        except Exception:
+                            LOG.exception("Invalid AMPA_DISCORD_TEST_CHANNEL_ID=%r; using default channel", test_channel_env)
+                    # If test channel not configured or not found, fall through to default
 
                 if not content and not has_embeds:
                     response = {

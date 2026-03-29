@@ -318,6 +318,20 @@ def notify(
         # Attach components when building from title/body (not from payload).
         if components:
             msg["components"] = components
+    # Auto-detect CI/test environment and route to test channel
+    # Check for common CI environment variables or pytest
+    is_ci_env = (
+        os.getenv("CI") == "true" or
+        os.getenv("PYTEST_CURRENT_TEST") is not None or
+        os.getenv("GITHUB_ACTIONS") == "true" or
+        os.getenv("GITLAB_CI") == "true" or
+        os.getenv("CIRCLECI") == "true" or
+        os.getenv("JENKINS_URL") is not None or
+        os.getenv("TRAVIS") == "true"
+    )
+    if is_ci_env and message_type not in ("test", "ci"):
+        message_type = "ci"
+    
     msg["message_type"] = message_type
 
     # CI / dry-run support: if AMPA_DISABLE_DISCORD is set, skip sending and
@@ -356,6 +370,23 @@ def notify(
             pass
 
     # Try to send via Unix socket.
+    # Log the exact payload we're about to send so operators can audit what
+    # the scheduler is instructing the bot to post. This helps diagnose
+    # misrouting when messages unexpectedly appear in the test channel.
+    try:
+        # Diagnostic payload logging should be at DEBUG in normal runs so
+        # message content isn't emitted to default INFO logs.  Use DEBUG to
+        # preserve the ability to audit payloads when the operator enables
+        # detailed logging.
+        LOG.debug(
+            "notify: sending payload to bot socket %s: %s",
+            socket_path,
+            json.dumps(msg),
+        )
+    except Exception:
+        # Avoid raising from logging; fall back to a concise message.
+        LOG.debug("notify: sending payload to bot socket %s (payload redacted due to logging error)", socket_path)
+
     ok = _send_via_socket(socket_path, msg)
 
     # Update state file regardless of success/failure (matches legacy behavior
