@@ -41,7 +41,36 @@ For example:
 skill/install-ampa/scripts/install-worklog-plugin.sh --bot-token <discord_bot_token> --channel-id <discord_channel_id> --yes
 ```
 
-Notes:
+### Installation Sources
+
+The installer clones AMPA source code from the remote repository (`github.com/opencode/ampa` by default) as the primary installation method. The installer will:
+
+1. Clone from the remote repository (preferred)
+2. Fall back to local project `ampa/` directory if remote fails
+3. Fall back to bundled resources if both above fail
+
+### Specifying a Version
+
+To install a specific version or tag:
+
+```
+skill/install-ampa/scripts/install-worklog-plugin.sh --version v1.0.0 --yes
+```
+
+### Environment Variables
+
+- `AMPA_REMOTE_REPO`: Override the default repository URL (default: `https://github.com/opencode/ampa.git`)
+
+### Error Handling
+
+The installer handles network failures gracefully:
+- Tests network connectivity before attempting clone
+- Provides clear error messages for common failure scenarios
+- Falls back to local sources if remote is unavailable
+- Logs detailed error information to decision log
+
+### Notes
 
 - The script writes logs and decision traces under `/tmp` (e.g. `/tmp/ampa_install_decisions.<pid>` and `/tmp/ampa_install_*.log`).
-- The installer bundles a minimal Python `ampa` package in `skill/install-ampa/resources/ampa_py/ampa` so projects that lack a local `ampa/` get a working copy. The installer will also look in `${XDG_CONFIG_HOME:-$HOME/.config}/opencode/ampa`.
+- Git is required for remote repository cloning.
+- Backward compatibility is maintained for existing configurations and local `ampa/` directories.

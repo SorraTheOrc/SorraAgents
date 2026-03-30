@@ -55,8 +55,15 @@ setup_test_env() {
   mkdir -p plugins/wl_ampa
   mkdir -p ampa
   
-  # Copy installer script
-  cp /home/rogardle/.config/opencode/skill/install-ampa/scripts/install-worklog-plugin.sh ./install-test.sh
+  # Copy installer script - look in multiple locations
+  if [ -f "skill/install-ampa/scripts/install-worklog-plugin.sh" ]; then
+    cp skill/install-ampa/scripts/install-worklog-plugin.sh ./install-test.sh
+  elif [ -f "/home/rgardler/.config/opencode/skill/install-ampa/scripts/install-worklog-plugin.sh" ]; then
+    cp /home/rgardler/.config/opencode/skill/install-ampa/scripts/install-worklog-plugin.sh ./install-test.sh
+  else
+    echo "Error: Cannot find installer script"
+    exit 1
+  fi
   chmod +x ./install-test.sh
   
   # Create test plugin files
@@ -333,7 +340,7 @@ test_decision_log() {
 # Main test execution
 main() {
   printf "\n${YELLOW}=== Ampa Plugin Installer Test Suite ===${NC}\n"
-  printf "Testing: %s\n\n" "/home/rogardle/.config/opencode/skill/install-ampa/scripts/install-worklog-plugin.sh"
+  printf "Testing: %s\n\n" "skill/install-ampa/scripts/install-worklog-plugin.sh"
   
   setup_test_env
   
