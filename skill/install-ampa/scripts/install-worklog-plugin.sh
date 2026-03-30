@@ -25,6 +25,9 @@ GLOBAL_PLUGINS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/.worklog/plugins"
 LOCK_DIR="/tmp/ampa_install.lock"
 DECISION_LOG="/tmp/ampa_install_decisions.$$"
 PID_FILE=".worklog/ampa/default/default.pid"
+# Remote AMPA repository to clone from when local/bundled sources are absent.
+# Can be overridden by setting AMPA_REMOTE_REPO in the environment.
+AMPA_REMOTE_REPO="${AMPA_REMOTE_REPO:-https://github.com/SorraTheOrc/ampa.git}"
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -823,9 +826,33 @@ copy_python_package() {
         cp -R "$bundled" "$py_target_dir/ampa"
         log_decision "COPIED_FROM_BUNDLED_RESOURCES=$bundled"
       else
-        log_decision "COPY_SRC_MISSING=$src_dir"
-        log_error "AMPA source directory not found: $src_dir"
-        return 1
+        # As a last resort, attempt to clone the remote AMPA repository and
+        # copy from the freshly-cloned repo. This allows migration to a new
+        # remote repo without bundling the package in this repository.
+        log_decision "COPY_SRC_MISSING=$src_dir;ATTEMPT_REMOTE_CLONE=${AMPA_REMOTE_REPO}"
+        if command -v git >/dev/null 2>&1; then
+          tmp_clone_dir="$(mktemp -d 2>/dev/null || echo "/tmp/ampa_clone_$$")"
+          if git clone --depth 1 "$AMPA_REMOTE_REPO" "$tmp_clone_dir" >/dev/null 2>&1; then
+            if [ -d "$tmp_clone_dir/ampa" ]; then
+              cp -R "$tmp_clone_dir/ampa" "$py_target_dir/ampa"
+              log_decision "COPIED_FROM_REMOTE=${AMPA_REMOTE_REPO}"
+            else
+              # Some repos may have the package at repo root; use root as src
+              cp -R "$tmp_clone_dir" "$py_target_dir/ampa"
+              log_decision "COPIED_FROM_REMOTE_ROOT=${AMPA_REMOTE_REPO}"
+            fi
+            # cleanup
+            rm -rf "$tmp_clone_dir" || true
+          else
+            log_decision "REMOTE_CLONE_FAILED=${AMPA_REMOTE_REPO}"
+            log_error "AMPA source directory not found: $src_dir and remote clone failed"
+            return 1
+          fi
+        else
+          log_decision "COPY_SRC_MISSING=${src_dir};GIT_NOT_AVAILABLE"
+          log_error "AMPA source directory not found: $src_dir (and git not available for remote clone)"
+          return 1
+        fi
       fi
     fi
    

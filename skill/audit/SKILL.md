@@ -109,18 +109,8 @@ CRITICAL rules for the structured report:
 
 7. **Record the audit using the CLI structured write path:**
 
-   This step only applies when a work item id was provided (not for project-level audits).
-
-   After producing the structured audit report, record the audit in the work item's structured `audit` field using the CLI write path:
-
    - Run: `wl update <work-item-id> --audit-text "<complete-report-content>" --json`
-   - The CLI will automatically:
-     - Populate the `audit.time` field with the current UTC timestamp (ISO8601 format)
-     - Populate the `audit.author` field with the current user
-     - Apply email redaction to the `audit.text` field if needed
-     - Parse the text to derive `audit.status` (Complete/Partial/Not Started/Missing Criteria)
-
-   - This stores the audit as structured metadata, making it machine-readable and queryable via `wl show --json`.
+    - This stores the audit as structured metadata, making it machine-readable and queryable via `wl show --json`.
 
 ## Notes
 
