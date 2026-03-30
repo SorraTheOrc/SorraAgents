@@ -318,20 +318,6 @@ def notify(
         # Attach components when building from title/body (not from payload).
         if components:
             msg["components"] = components
-    # Auto-detect CI/test environment and route to test channel
-    # Check for common CI environment variables or pytest
-    is_ci_env = (
-        os.getenv("CI") == "true" or
-        os.getenv("PYTEST_CURRENT_TEST") is not None or
-        os.getenv("GITHUB_ACTIONS") == "true" or
-        os.getenv("GITLAB_CI") == "true" or
-        os.getenv("CIRCLECI") == "true" or
-        os.getenv("JENKINS_URL") is not None or
-        os.getenv("TRAVIS") == "true"
-    )
-    if is_ci_env and message_type not in ("test", "ci"):
-        message_type = "ci"
-    
     msg["message_type"] = message_type
 
     # CI / dry-run support: if AMPA_DISABLE_DISCORD is set, skip sending and

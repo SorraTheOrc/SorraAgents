@@ -458,8 +458,53 @@ def load_descriptor(
         If *path* does not exist.
     """
     file_path = Path(path)
+
+    # If the given path doesn't exist, try sensible fallbacks before
+    # raising FileNotFoundError. Tests and consumers expect the canonical
+    # docs to live at the repository root (docs/workflow). Engine code that
+    # constructs a package-relative path (e.g. ampa/docs/...) should still
+    # resolve to repo-root docs/workflow when present.
     if not file_path.exists():
-        raise FileNotFoundError(f"Descriptor file not found: {file_path}")
+        # If caller passed an absolute path, do not attempt repo-root fallbacks
+        # — preserve the previous behaviour and raise FileNotFoundError so
+        # callers can detect and handle missing absolute paths explicitly.
+        if file_path.is_absolute():
+            raise FileNotFoundError(f"Descriptor file not found: {file_path}")
+        # Find repository root by walking up to a directory containing
+        # pyproject.toml (same logic used elsewhere in this module).
+        candidate = Path(__file__).resolve().parent
+        while candidate != candidate.parent:
+            if (candidate / "pyproject.toml").exists():
+                break
+            candidate = candidate.parent
+        repo_root = candidate
+
+        tried: list[Path] = []
+
+        # If path was relative, try resolving it relative to the repo root.
+        if not file_path.is_absolute():
+            tried.append(repo_root / file_path)
+
+        # Also try the conventional docs/workflow location at repo root.
+        tried.append(repo_root / "docs" / "workflow" / file_path.name)
+
+        # Try canonical names as last resort.
+        tried.append(repo_root / "docs" / "workflow" / "workflow.yaml")
+        tried.append(repo_root / "docs" / "workflow" / "workflow.json")
+
+        found: Path | None = None
+        for p in tried:
+            if p.exists():
+                found = p
+                break
+
+        if found is None:
+            attempted = ", ".join(str(p) for p in tried)
+            raise FileNotFoundError(
+                f"Descriptor file not found: {file_path}. Tried: {attempted}"
+            )
+
+        file_path = found
 
     with open(file_path) as f:
         suffix = file_path.suffix.lower()
