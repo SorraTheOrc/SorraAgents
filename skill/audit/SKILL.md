@@ -71,7 +71,7 @@ For each direct child work item (do NOT recurse into grandchildren):
 
 6. **Produce the structured audit report:**
 
-Wrap the final report output in delimiter markers. The report MUST follow this exact structure:
+Produce the structured audit report content only. Do NOT include wrapper or surrounding markers (for example: `--- AUDIT REPORT START ---` / `--- AUDIT REPORT END ---`, `*** START REPORT ***`, XML/HTML comment delimiters, or any additional surrounding delimiter lines). The report MUST follow this exact structure (without any surrounding wrapper markers):
 
 ```
 Ready to close: Yes/No
@@ -101,8 +101,9 @@ Ready to close: Yes/No
 <If there are no children, write: "No children.">
 ```
 
-CRITICAL rules for the structured report:
+-CRITICAL rules for the structured report:
 - The first line must be `Ready to close: Yes` or `Ready to close: No` based on whether all acceptance criteria (parent and children) are met.
+ - Do NOT include wrapper or surrounding markers in the text passed to `wl update --audit-text`. The audit handlers expect the report content only; including markers (any of the forms shown above or similar) will cause the CLI/handler to reject the audit.
 - Keep the report concise despite the deep analysis. Each evidence note should be ONE line.
 - For project-level audits (no work item id), omit the `## Acceptance Criteria Status` and `## Children Status` sections. Include only `## Summary` and `## Recommendation`.
 - Review only direct children, never grandchildren. If there are many children (>10), note in the report that only the first 10 were reviewed and the rest were omitted for brevity.
