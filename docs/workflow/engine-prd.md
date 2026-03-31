@@ -838,6 +838,9 @@ pytest tests/test_engine_prd.py -v
 
 Place this block at the top of the test file, before any test functions.
 All test cases below depend on these imports and helpers.
+
+NOTE: These tests have been moved to the AMPA repository (https://github.com/opencode/ampa).
+The examples below are for reference only and require AMPA to be installed from that repository.
 """
 import json
 import os
@@ -845,11 +848,14 @@ import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock
 
-from ampa.engine.core import Engine, EngineConfig, EngineStatus
-from ampa.engine.candidates import CandidateSelector
-from ampa.engine.descriptor import load_descriptor
-from ampa.engine.dispatch import DryRunDispatcher
-from ampa.engine.invariants import InvariantEvaluator
+try:
+    from ampa.engine.core import Engine, EngineConfig, EngineStatus
+    from ampa.engine.candidates import CandidateSelector
+    from ampa.engine.descriptor import load_descriptor
+    from ampa.engine.dispatch import DryRunDispatcher
+    from ampa.engine.invariants import InvariantEvaluator
+except ImportError:
+    pytest.skip("AMPA not installed. Install from https://github.com/opencode/ampa", allow_module_level=True)
 
 
 # Path to the workflow descriptor — adjust if running from a different CWD
@@ -1025,7 +1031,10 @@ def test_successful_dispatch_plan_complete():
 ```python
 def test_stale_delegation_recovery():
     """Watchdog resets items stuck in delegated state past threshold."""
-    from ampa.delegation import DelegationOrchestrator
+    try:
+        from ampa.delegation import DelegationOrchestrator
+    except ImportError:
+        pytest.skip("AMPA not installed. Install from https://github.com/opencode/ampa")
 
     # Arrange: Mock a stale delegated item (3 hours old, threshold 2 hours)
     stale_time = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
