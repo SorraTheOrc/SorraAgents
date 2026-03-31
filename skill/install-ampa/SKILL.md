@@ -46,8 +46,7 @@ skill/install-ampa/scripts/install-worklog-plugin.sh --bot-token <discord_bot_to
 The installer clones AMPA source code from the remote repository (`github.com/opencode/ampa` by default) as the primary installation method. The installer will:
 
 1. Clone from the remote repository (preferred)
-2. Fall back to local project `ampa/` directory if remote fails
-3. Fall back to bundled resources if both above fail
+2. Fall back to bundled resources if remote fails
 
 ### Specifying a Version
 
@@ -73,4 +72,4 @@ The installer handles network failures gracefully:
 
 - The script writes logs and decision traces under `/tmp` (e.g. `/tmp/ampa_install_decisions.<pid>` and `/tmp/ampa_install_*.log`).
 - Git is required for remote repository cloning.
-- Backward compatibility is maintained for existing configurations and local `ampa/` directories.
+- Backward compatibility is maintained for existing configurations.

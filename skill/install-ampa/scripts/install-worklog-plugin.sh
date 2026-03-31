@@ -479,21 +479,17 @@ check_for_bundled_env() {
   return 1  # No bundled .env
 }
 
-# Detect existing bot token in current install or repo
+# Detect existing bot token in current install
 detect_existing_bot_token() {
   if [ -f "$TARGET_DIR/ampa_py/ampa/.env" ]; then
     awk -F= '/AMPA_DISCORD_BOT_TOKEN/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "$TARGET_DIR/ampa_py/ampa/.env" | tr -d '"' | tr -d "'"
-  elif [ -f "ampa/.env" ]; then
-    awk -F= '/AMPA_DISCORD_BOT_TOKEN/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "ampa/.env" | tr -d '"' | tr -d "'"
   fi
 }
 
-# Detect existing channel ID in current install or repo
+# Detect existing channel ID in current install
 detect_existing_channel_id() {
   if [ -f "$TARGET_DIR/ampa_py/ampa/.env" ]; then
     awk -F= '/AMPA_DISCORD_CHANNEL_ID/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "$TARGET_DIR/ampa_py/ampa/.env" | tr -d '"' | tr -d "'"
-  elif [ -f "ampa/.env" ]; then
-    awk -F= '/AMPA_DISCORD_CHANNEL_ID/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "ampa/.env" | tr -d '"' | tr -d "'"
   fi
 }
 
@@ -596,10 +592,6 @@ find_env_sample() {
     echo "$TARGET_DIR/ampa_py/ampa/.env.sample"
   elif [ -f "$TARGET_DIR/ampa_py/ampa/.env.samplw" ]; then
     echo "$TARGET_DIR/ampa_py/ampa/.env.samplw"
-  elif [ -f "ampa/.env.sample" ]; then
-    echo "ampa/.env.sample"
-  elif [ -f "ampa/.env.samplw" ]; then
-    echo "ampa/.env.samplw"
   fi
 }
 
@@ -873,8 +865,6 @@ clone_ampa_from_remote() {
 
 # Copy Python package into plugin directory
 copy_python_package() {
-   # Optional first arg: source dir to copy python package from. Defaults to "ampa"
-   local src_dir="${1:-ampa}"
    local py_target_dir="$TARGET_DIR/ampa_py"
    local env_backup=""
    local store_backup=""
@@ -904,17 +894,12 @@ copy_python_package() {
     if clone_ampa_from_remote "$py_target_dir" "$tmp_clone_dir" "$AMPA_REMOTE_REPO" "$AMPA_VERSION"; then
       : # Success - continue to post-copy steps
     else
-      # Remote clone failed - try fallback methods
-      log_info "Remote clone failed, attempting fallback sources..."
+      # Remote clone failed - try fallback to bundled resources
+      log_info "Remote clone failed, attempting fallback to bundled resources..."
       rm -rf "$tmp_clone_dir"
       
-      # Fallback 1: Use local project ampa/ directory
-      if [ -d "$src_dir" ]; then
-        cp -R "$src_dir" "$py_target_dir/ampa"
-        log_decision "COPIED_FROM_LOCAL_FALLBACK=$src_dir"
-        log_info "Warning: Installed from local source instead of remote repository"
-      # Fallback 2: Use bundled installer resources
-      elif [ -d "$SCRIPT_DIR/../resources/ampa_py/ampa" ]; then
+      # Fallback: Use bundled installer resources
+      if [ -d "$SCRIPT_DIR/../resources/ampa_py/ampa" ]; then
         local bundled="$SCRIPT_DIR/../resources/ampa_py/ampa"
         cp -R "$bundled" "$py_target_dir/ampa"
         log_decision "COPIED_FROM_BUNDLED_FALLBACK=$bundled"
@@ -923,15 +908,13 @@ copy_python_package() {
         log_error "Error: Failed to install AMPA Python package"
         log_error "All installation methods failed:"
         log_error "  1. Remote clone from $AMPA_REMOTE_REPO failed"
-        log_error "  2. Local source directory '$src_dir' not found"
-        log_error "  3. Bundled resources not available"
+        log_error "  2. Bundled resources not available"
         log_error ""
         log_error "Please ensure:"
         log_error "  - You have a working network connection"
         log_error "  - Git is installed and available in PATH"
         log_error "  - The repository $AMPA_REMOTE_REPO is accessible"
         log_error ""
-        log_error "To use a local source instead, ensure the 'ampa/' directory exists in your project."
         return 1
       fi
     fi
@@ -1337,7 +1320,7 @@ main() {
      log_info "Target version: $AMPA_VERSION"
    fi
    
-   if ! copy_python_package "ampa"; then
+   if ! copy_python_package; then
      log_error "Critical: Failed to install AMPA Python package"
      exit 2
    fi

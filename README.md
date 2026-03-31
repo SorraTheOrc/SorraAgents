@@ -57,7 +57,7 @@ wl ampa warm-pool
 
 This will:
 
-1. **Build the container image** (`ampa-dev:latest`) from `ampa/Containerfile` if it does not already exist
+1. **Build the container image** (`ampa-dev:latest`) from the AMPA repository's Containerfile if it does not already exist
 2. **Create the template container** (`ampa-template`) via Distrobox and run its one-off host-integration init (this is the slowest step on first run)
 3. **Fill the pool** with 3 pre-warmed containers cloned from the template
 
@@ -65,15 +65,15 @@ The pool is replenished automatically in the background after each `start-work`,
 
 Pool state (`pool-state.json`, `pool-cleanup.json`, `pool-replenish.log`) is stored globally at `~/.config/opencode/.worklog/ampa/` so that container claims and cleanup records are shared across all projects on the host. Per-project config (`.env`, `scheduler_store.json`, daemon PID/log) remains under `<project>/.worklog/ampa/`.
 
-If the `ampa/Containerfile` has been modified since the image was last built, `warm-pool` will automatically tear down unclaimed pool containers and the template, rebuild the image, and re-fill the pool. Simply run `wl ampa warm-pool` again — no manual cleanup is needed.
+If the AMPA Containerfile has been modified since the image was last built, `warm-pool` will automatically tear down unclaimed pool containers and the template, rebuild the image, and re-fill the pool. Simply run `wl ampa warm-pool` again — no manual cleanup is needed.
 
-See the AMPA container pool reference for full details: `ampa/docs/ampa_container_pool.md`.
+See the AMPA container pool reference for full details: https://github.com/opencode/ampa/blob/main/docs/ampa_container_pool.md
 
 ### Browser test capability
 
 The AMPA development image may include pinned Playwright and the Chromium browser runtime to support running browser smoke tests inside claimed containers. When present:
 
-- The pinned Playwright version is recorded in `ampa/Containerfile` via an `ARG PLAYWRIGHT_VERSION` comment.
+- The pinned Playwright version is recorded in the AMPA repository's Containerfile via an `ARG PLAYWRIGHT_VERSION` comment.
 - To run the repository's browser smoke test inside a claimed container:
 
   ```sh
@@ -117,12 +117,13 @@ wl ampa warm-pool --non-interactive --size 3
 
 Daemon / scheduler note
 
-- Some packages in this repository provide a long-running "daemon" that can
-  either perform a one-off action or run a scheduler loop. By default those
-  daemons often send a single heartbeat and exit; to run the scheduler loop
-  you must explicitly enable it (for example: use `--start-scheduler` or set
-  an environment flag like `AMPA_RUN_SCHEDULER=1`). Check the package README
-  (for example `ampa/README.md`) for the exact flag and environment variables.
+- The AMPA Worklog plugin provides a long-running "daemon" that can either
+  perform a one-off action or run a scheduler loop. By default the daemon
+  sends a single heartbeat and exits; to run the scheduler loop you must
+  explicitly enable it (for example: use `--start-scheduler` or set an
+  environment flag like `AMPA_RUN_SCHEDULER=1`). Check the AMPA repository
+  README at https://github.com/opencode/ampa for the exact flags and
+  environment variables.
 
 ## Contributing
 - Open an issue describing the change you'd like to make.

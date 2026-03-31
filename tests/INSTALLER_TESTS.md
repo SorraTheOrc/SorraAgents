@@ -65,7 +65,7 @@ The test suite covers the following areas:
 - Create target directory if it doesn't exist
 
 ### Python Package Installation
-- Detect Python package in source (`ampa/` directory)
+- Clone Python package from remote repository (github.com/opencode/ampa)
 - Copy Python package to `.worklog/plugins/ampa_py/ampa`
 - Install Python dependencies via pip
 - Handle missing Python executable error
@@ -267,4 +267,4 @@ The manual test suite runs in approximately 5-10 seconds depending on system per
 
 - `skill/install-ampa/scripts/install-worklog-plugin.sh` - The canonical installer script
 - `skill/install-ampa/resources/ampa.mjs` - Canonical AMPA plugin source
-- `ampa/README.md` - AMPA daemon documentation
+- https://github.com/opencode/ampa/blob/main/README.md - AMPA daemon documentation
