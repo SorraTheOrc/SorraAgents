@@ -16,17 +16,16 @@ set -eu
 # skill/install-ampa/scripts and the canonical resources live at
 # ../resources/ampa.mjs relative to this script.
 SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)"
+# Default plugin source
 DEFAULT_SRC="$SCRIPT_DIR/../resources/ampa.mjs"
-# Directory to copy AMPA python package from when not present in the project.
-# Prefer XDG_CONFIG_HOME if set, otherwise default to $HOME/.config/opencode/ampa
-CONFIG_AMPA_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/ampa"
 # Global plugin install directory (default when --local is not specified)
 GLOBAL_PLUGINS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/.worklog/plugins"
 LOCK_DIR="/tmp/ampa_install.lock"
 DECISION_LOG="/tmp/ampa_install_decisions.$$"
 PID_FILE=".worklog/ampa/default/default.pid"
-# Remote AMPA repository to clone from when local/bundled sources are absent.
+# Remote AMPA repository to clone from.
 # Can be overridden by setting AMPA_REMOTE_REPO in the environment.
+# Default points to the canonical SorraTheOrc/ampa repository.
 AMPA_REMOTE_REPO="${AMPA_REMOTE_REPO:-https://github.com/SorraTheOrc/ampa.git}"
 
 # ============================================================================
@@ -107,6 +106,7 @@ parse_args() {
   FORCE_RESTART=0
   FORCE_NO_RESTART=0
   LOCAL_INSTALL=0
+  AMPA_VERSION=""
 
   # Parse options
   while [ "$#" -gt 0 ]; do
@@ -151,11 +151,12 @@ parse_args() {
         shift
         ;;
   --help|-h)
-        echo "Usage: $0 [--bot-token <token>] [--channel-id <id>] [--yes] [--restart|--no-restart] [--local] [source-file] [target-dir]"
+        echo "Usage: $0 [--bot-token <token>] [--channel-id <id>] [--version <tag>] [--yes] [--restart|--no-restart] [--local] [source-file] [target-dir]"
         echo ""
         echo "Options:"
         echo "  --bot-token <token>  Set the Discord bot token in .env"
         echo "  --channel-id <id>    Set the Discord channel ID in .env"
+        echo "  --version <tag>      Install specific version/tag from remote repository"
         echo "  --yes, -y            Non-interactive mode (auto-accept prompts)"
         echo "  --restart            Force daemon restart after install"
         echo "  --no-restart         Skip daemon restart after install"
@@ -173,6 +174,16 @@ parse_args() {
           shift
         else
           log_error "--pool-size requires a numeric value"
+          exit 2
+        fi
+        ;;
+      --version|--tag)
+        shift
+        if [ "$#" -gt 0 ]; then
+          AMPA_VERSION="$1"
+          shift
+        else
+          log_error "--version requires a value (e.g., v1.0.0 or a commit hash)"
           exit 2
         fi
         ;;
@@ -467,21 +478,17 @@ check_for_bundled_env() {
   return 1  # No bundled .env
 }
 
-# Detect existing bot token in current install or repo
+# Detect existing bot token in current install
 detect_existing_bot_token() {
   if [ -f "$TARGET_DIR/ampa_py/ampa/.env" ]; then
     awk -F= '/AMPA_DISCORD_BOT_TOKEN/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "$TARGET_DIR/ampa_py/ampa/.env" | tr -d '"' | tr -d "'"
-  elif [ -f "ampa/.env" ]; then
-    awk -F= '/AMPA_DISCORD_BOT_TOKEN/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "ampa/.env" | tr -d '"' | tr -d "'"
   fi
 }
 
-# Detect existing channel ID in current install or repo
+# Detect existing channel ID in current install
 detect_existing_channel_id() {
   if [ -f "$TARGET_DIR/ampa_py/ampa/.env" ]; then
     awk -F= '/AMPA_DISCORD_CHANNEL_ID/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "$TARGET_DIR/ampa_py/ampa/.env" | tr -d '"' | tr -d "'"
-  elif [ -f "ampa/.env" ]; then
-    awk -F= '/AMPA_DISCORD_CHANNEL_ID/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "ampa/.env" | tr -d '"' | tr -d "'"
   fi
 }
 
@@ -584,10 +591,6 @@ find_env_sample() {
     echo "$TARGET_DIR/ampa_py/ampa/.env.sample"
   elif [ -f "$TARGET_DIR/ampa_py/ampa/.env.samplw" ]; then
     echo "$TARGET_DIR/ampa_py/ampa/.env.samplw"
-  elif [ -f "ampa/.env.sample" ]; then
-    echo "ampa/.env.sample"
-  elif [ -f "ampa/.env.samplw" ]; then
-    echo "ampa/.env.samplw"
   fi
 }
 
@@ -790,10 +793,82 @@ install_worklog_plugin() {
   log_info "Installed Worklog plugin $SRC to $TARGET_DIR/$basename"
 }
 
+# Clone AMPA from remote repository with optional version/tag
+clone_ampa_from_remote() {
+  local py_target_dir="$1"
+  local clone_dir="$2"
+  local repo_url="$3"
+  local version="$4"
+  
+  log_info "Cloning AMPA from $repo_url..."
+  log_decision "REMOTE_CLONE_START repo=$repo_url version=${version:-(latest)}"
+  
+  if ! command -v git >/dev/null 2>&1; then
+    log_error "Error: git is required but not installed."
+    log_decision "REMOTE_CLONE_FAILED=git_not_available"
+    return 1
+  fi
+  
+  # Test network connectivity first
+  if ! curl -s --max-time 10 -o /dev/null "$repo_url" 2>/dev/null; then
+    log_error "Error: Cannot reach remote repository at $repo_url"
+    log_error "Please check your network connection and try again."
+    log_decision "REMOTE_CLONE_FAILED=network_unreachable"
+    return 1
+  fi
+  
+  # Clone the repository
+  local clone_depth=""
+  if [ -z "$version" ]; then
+    # No specific version, use shallow clone for efficiency
+    clone_depth="--depth 1"
+  fi
+  
+  if ! git clone $clone_depth "$repo_url" "$clone_dir" 2>/tmp/ampa_clone_err.log; then
+    log_error "Error: Failed to clone from $repo_url"
+    log_error "Details: $(cat /tmp/ampa_clone_err.log 2>/dev/null || echo 'Unknown error')"
+    log_decision "REMOTE_CLONE_FAILED=clone_error"
+    return 1
+  fi
+  
+  # Checkout specific version if requested
+  if [ -n "$version" ]; then
+    log_info "Checking out version: $version"
+    if ! git -C "$clone_dir" checkout "$version" 2>/tmp/ampa_checkout_err.log; then
+      log_error "Error: Failed to checkout version '$version'"
+      log_error "Details: $(cat /tmp/ampa_checkout_err.log 2>/dev/null || echo 'Unknown error')"
+      log_error "Available versions can be viewed at: ${repo_url%.git}/tags"
+      log_decision "REMOTE_CLONE_FAILED=checkout_error version=$version"
+      rm -rf "$clone_dir"
+      return 1
+    fi
+    log_decision "CHECKOUT_OK version=$version"
+  fi
+  
+  # Find and copy the ampa package
+  # Check common locations: ampa/ subdirectory, src/ampa/ (SorraTheOrc/ampa structure), or repo root
+  if [ -d "$clone_dir/ampa" ]; then
+    cp -R "$clone_dir/ampa" "$py_target_dir/ampa"
+    log_decision "COPIED_FROM_REMOTE repo=$repo_url version=${version:-(latest)}"
+  elif [ -d "$clone_dir/src/ampa" ]; then
+    # SorraTheOrc/ampa repo structure: package is under src/ampa/
+    cp -R "$clone_dir/src/ampa" "$py_target_dir/ampa"
+    log_decision "COPIED_FROM_REMOTE_SRC repo=$repo_url version=${version:-(latest)}"
+  else
+    # Some repos may have the package at repo root; use root as src
+    cp -R "$clone_dir" "$py_target_dir/ampa"
+    log_decision "COPIED_FROM_REMOTE_ROOT repo=$repo_url version=${version:-(latest)}"
+  fi
+  
+  # Cleanup clone directory
+  rm -rf "$clone_dir"
+  
+  log_info "Successfully installed AMPA from remote repository"
+  return 0
+}
+
 # Copy Python package into plugin directory
 copy_python_package() {
-   # Optional first arg: source dir to copy python package from. Defaults to "ampa"
-   local src_dir="${1:-ampa}"
    local py_target_dir="$TARGET_DIR/ampa_py"
    local env_backup=""
    local store_backup=""
@@ -814,46 +889,25 @@ copy_python_package() {
     fi
 
 
-   # Remove old bundle and copy new one
+   # Remove old bundle and prepare target
     mkdir -p "$py_target_dir"
     rm -rf "$py_target_dir/ampa"
-    if [ -d "$src_dir" ]; then
-      cp -R "$src_dir" "$py_target_dir/ampa"
+    
+    # Primary method: Clone from remote repository. Failure is fatal for the
+    # Python package installation — we no longer fall back to bundled or local
+    # copies. This keeps installs predictable and reduces support burden.
+    local tmp_clone_dir="$(mktemp -d 2>/dev/null || echo "/tmp/ampa_clone_$$")"
+    if clone_ampa_from_remote "$py_target_dir" "$tmp_clone_dir" "$AMPA_REMOTE_REPO" "$AMPA_VERSION"; then
+      : # Success - continue to post-copy steps
     else
-      # Fall back to bundled installer resources in the repo
-      local bundled="$SCRIPT_DIR/../resources/ampa_py/ampa"
-      if [ -d "$bundled" ]; then
-        cp -R "$bundled" "$py_target_dir/ampa"
-        log_decision "COPIED_FROM_BUNDLED_RESOURCES=$bundled"
-      else
-        # As a last resort, attempt to clone the remote AMPA repository and
-        # copy from the freshly-cloned repo. This allows migration to a new
-        # remote repo without bundling the package in this repository.
-        log_decision "COPY_SRC_MISSING=$src_dir;ATTEMPT_REMOTE_CLONE=${AMPA_REMOTE_REPO}"
-        if command -v git >/dev/null 2>&1; then
-          tmp_clone_dir="$(mktemp -d 2>/dev/null || echo "/tmp/ampa_clone_$$")"
-          if git clone --depth 1 "$AMPA_REMOTE_REPO" "$tmp_clone_dir" >/dev/null 2>&1; then
-            if [ -d "$tmp_clone_dir/ampa" ]; then
-              cp -R "$tmp_clone_dir/ampa" "$py_target_dir/ampa"
-              log_decision "COPIED_FROM_REMOTE=${AMPA_REMOTE_REPO}"
-            else
-              # Some repos may have the package at repo root; use root as src
-              cp -R "$tmp_clone_dir" "$py_target_dir/ampa"
-              log_decision "COPIED_FROM_REMOTE_ROOT=${AMPA_REMOTE_REPO}"
-            fi
-            # cleanup
-            rm -rf "$tmp_clone_dir" || true
-          else
-            log_decision "REMOTE_CLONE_FAILED=${AMPA_REMOTE_REPO}"
-            log_error "AMPA source directory not found: $src_dir and remote clone failed"
-            return 1
-          fi
-        else
-          log_decision "COPY_SRC_MISSING=${src_dir};GIT_NOT_AVAILABLE"
-          log_error "AMPA source directory not found: $src_dir (and git not available for remote clone)"
-          return 1
-        fi
-      fi
+      # Remote clone failed — abort the Python package install with a clear
+      # diagnostic. Do not attempt bundled or local fallbacks.
+      log_error "Error: Failed to clone AMPA from $AMPA_REMOTE_REPO"
+      log_error "Please ensure network connectivity and that 'git' is available in PATH."
+      log_error "If you need offline installation options, place the Python package at: $TARGET_DIR/ampa_py/ampa"
+      log_decision "REMOTE_CLONE_FAILED=clone_error"
+      rm -rf "$tmp_clone_dir"
+      return 1
     fi
    
     # Record post-copy state
@@ -1056,15 +1110,15 @@ stop_daemon() {
       log_info "wl ampa stop returned non-zero (output):"
       printf "%s\n" "$_out"
     fi
-  else
-    log_info "Skipping 'wl ampa stop' because 'wl' does not expose the ampa command on PATH."
-    # Provide diagnostics: show pidfile and process info if available so the
-    # operator can act manually. Do not attempt to load the plugin.
-    if [ -f "$PID_FILE" ]; then
-      local _pidfile_pid
-      _pidfile_pid=$(sed -n '1p' "$PID_FILE" 2>/dev/null || true)
-      log_info "Observed pidfile $PID_FILE pid=${_pidfile_pid:-(none)}"
-      if [ -n "$_pidfile_pid" ]; then
+    else
+      log_info "Skipping 'wl ampa stop' because 'wl' does not expose the ampa command on PATH."
+      # Provide diagnostics: show pidfile and process info if available so the
+      # operator can act manually. Do not attempt to load the plugin.
+      if [ -f "$PID_FILE" ]; then
+        local _pidfile_pid
+        _pidfile_pid=$(sed -n '1p' "$PID_FILE" 2>/dev/null || true)
+        log_info "Observed pidfile $PID_FILE pid=${_pidfile_pid:-(none)}"
+        if [ -n "$_pidfile_pid" ]; then
         if [ -r "/proc/$_pidfile_pid/cmdline" ]; then
           log_info "Process cmdline:"
           tr '\0' ' ' < "/proc/$_pidfile_pid/cmdline" 2>/dev/null || true
@@ -1075,9 +1129,9 @@ stop_daemon() {
         fi
         log_info "To stop the process manually: kill $_pidfile_pid (or use SIGTERM then SIGKILL if needed)."
       fi
-    else
-      log_info "No pidfile $PID_FILE present; nothing to stop via installer fallback."
-    fi
+      else
+        log_info "No pidfile $PID_FILE present; no running AMPA daemon detected."
+      fi
   fi
 
   # Wait for the pid file to be removed or the process to exit. This provides
@@ -1245,39 +1299,24 @@ main() {
   if [ -n "$BOT_TOKEN" ]; then
     tk_mask="$(printf "%.8s" "$BOT_TOKEN")..."
   fi
-  log_decision "SRC=$SRC TARGET=$TARGET_DIR BOT_TOKEN=$tk_mask CHANNEL_ID=${CHANNEL_ID:-(empty)}"
+  log_decision "SRC=$SRC TARGET=$TARGET_DIR BOT_TOKEN=$tk_mask CHANNEL_ID=${CHANNEL_ID:-(empty)} VERSION=${AMPA_VERSION:-(latest)} REPO=$AMPA_REMOTE_REPO"
 
   # Install plugin
   install_worklog_plugin
 
-   # Install Python package: prefer project-local `ampa/`, fall back to
-   # user's config directory (e.g. ~/.config/opencode/ampa). Missing AMPA is a
-   # critical error for installations that expect the daemon; report and exit.
-    if [ -d "ampa" ]; then
-      if ! copy_python_package "ampa"; then
-        log_error "Critical: failed to copy AMPA from project 'ampa' directory"
-        exit 2
-      fi
-      setup_python_package
-    elif [ -d "$CONFIG_AMPA_DIR" ]; then
-      log_info "Copying AMPA package from $CONFIG_AMPA_DIR"
-      if ! copy_python_package "$CONFIG_AMPA_DIR"; then
-        log_error "Critical: failed to copy AMPA from $CONFIG_AMPA_DIR"
-        exit 2
-      fi
-      setup_python_package
-    elif [ -d "$SCRIPT_DIR/../resources/ampa_py/ampa" ]; then
-      log_info "Copying AMPA package from bundled installer resources"
-      if ! copy_python_package "$SCRIPT_DIR/../resources/ampa_py/ampa"; then
-        log_error "Critical: failed to copy AMPA from bundled resources"
-        exit 2
-      fi
-      setup_python_package
-   else
-     log_error "Critical: AMPA Python package not found in project (ampa/) or $CONFIG_AMPA_DIR"
-     log_error "Install cannot proceed without AMPA; aborting."
+    # Install Python package from the remote repository. copy_python_package
+    # will abort on failure; there is no bundled/local fallback for the Python
+    # package.
+   log_info "Installing AMPA Python package..."
+   if [ -n "$AMPA_VERSION" ]; then
+     log_info "Target version: $AMPA_VERSION"
+   fi
+   
+   if ! copy_python_package; then
+     log_error "Critical: Failed to install AMPA Python package"
      exit 2
    fi
+   setup_python_package
 
    # Ensure scheduler store exists in the project runtime location.
    ensure_project_scheduler_store
