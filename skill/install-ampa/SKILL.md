@@ -55,7 +55,7 @@ skill/install-ampa/scripts/install-worklog-plugin.sh --version v1.0.0 --yes
 
 ### Environment Variables
 
-- `AMPA_REMOTE_REPO`: Override the default repository URL (default: `https://github.com/SorraTheOrc/ampa.git`)
+- `AMPA_REMOTE_REPO`: Override the default repository URL (default: `https://github.com/SorraTheOrc/ampa`)
 
 ### Error Handling
 

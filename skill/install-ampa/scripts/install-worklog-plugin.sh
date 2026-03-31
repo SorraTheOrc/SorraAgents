@@ -25,6 +25,7 @@ DECISION_LOG="/tmp/ampa_install_decisions.$$"
 PID_FILE=".worklog/ampa/default/default.pid"
 # Remote AMPA repository to clone from.
 # Can be overridden by setting AMPA_REMOTE_REPO in the environment.
+# Default points to the canonical SorraTheOrc/ampa repository.
 AMPA_REMOTE_REPO="${AMPA_REMOTE_REPO:-https://github.com/SorraTheOrc/ampa.git}"
 
 # ============================================================================
