@@ -130,19 +130,20 @@ Daemon / scheduler note
 - Follow the relevant guide under `command/` for design and review steps.
 - If adding a new skill, consider using the scripts in `skill/skill-creator/scripts` to scaffold and package it.
 
-### AMPA plugin development
+### AMPA Development
 
-The canonical source for the AMPA Worklog plugin is:
+The AMPA Worklog plugin has been moved to its own independent repository:
 
-```
-skill/install-ampa/resources/ampa.mjs
-```
+**https://github.com/opencode/ampa**
 
-**Do not create copies in other directories** (e.g. `plugins/`, `.worklog/plugins/`). The installer (`skill/install-ampa/scripts/install-worklog-plugin.sh`) deploys the canonical source to the global plugin directory at `~/.config/opencode/.worklog/plugins/ampa.mjs` by default. Use `--local` to install to the current project's `.worklog/plugins/` instead. To develop or modify the plugin:
+The `skill/install-ampa/resources/ampa.mjs` file in this repository is a runtime loader that delegates to the installed AMPA package. To develop or modify AMPA:
 
-1. Edit `skill/install-ampa/resources/ampa.mjs` directly.
-2. Run `node --test tests/node/test-ampa.mjs tests/node/test-ampa-devcontainer.mjs` to verify.
-3. Re-install with `skill/install-ampa/scripts/install-worklog-plugin.sh --yes` to deploy changes globally.
+1. Clone the AMPA repository: `git clone https://github.com/opencode/ampa.git`
+2. Make changes in the AMPA repository
+3. Run tests in the AMPA repository (see its README for test commands)
+4. Re-install with `skill/install-ampa/scripts/install-worklog-plugin.sh --yes` to get the latest version
+
+See the [Migration Guide](docs/AMPA_MIGRATION.md) for information about transitioning from the old bundled installation to the new repository-based installation.
 
 ## Next steps / Suggestions
 - Add a CI workflow to validate new skills and docs.
