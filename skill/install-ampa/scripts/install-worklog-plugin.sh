@@ -16,10 +16,8 @@ set -eu
 # skill/install-ampa/scripts and the canonical resources live at
 # ../resources/ampa.mjs relative to this script.
 SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)"
+# Default plugin source
 DEFAULT_SRC="$SCRIPT_DIR/../resources/ampa.mjs"
-# Directory to copy AMPA python package from when not present in the project.
-# Prefer XDG_CONFIG_HOME if set, otherwise default to $HOME/.config/opencode/ampa
-CONFIG_AMPA_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/ampa"
 # Global plugin install directory (default when --local is not specified)
 GLOBAL_PLUGINS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/.worklog/plugins"
 LOCK_DIR="/tmp/ampa_install.lock"
@@ -27,7 +25,7 @@ DECISION_LOG="/tmp/ampa_install_decisions.$$"
 PID_FILE=".worklog/ampa/default/default.pid"
 # Remote AMPA repository to clone from.
 # Can be overridden by setting AMPA_REMOTE_REPO in the environment.
-AMPA_REMOTE_REPO="${AMPA_REMOTE_REPO:-https://github.com/opencode/ampa.git}"
+AMPA_REMOTE_REPO="${AMPA_REMOTE_REPO:-https://github.com/SorraTheOrc/ampa.git}"
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -847,9 +845,14 @@ clone_ampa_from_remote() {
   fi
   
   # Find and copy the ampa package
+  # Check common locations: ampa/ subdirectory, src/ampa/ (SorraTheOrc/ampa structure), or repo root
   if [ -d "$clone_dir/ampa" ]; then
     cp -R "$clone_dir/ampa" "$py_target_dir/ampa"
     log_decision "COPIED_FROM_REMOTE repo=$repo_url version=${version:-(latest)}"
+  elif [ -d "$clone_dir/src/ampa" ]; then
+    # SorraTheOrc/ampa repo structure: package is under src/ampa/
+    cp -R "$clone_dir/src/ampa" "$py_target_dir/ampa"
+    log_decision "COPIED_FROM_REMOTE_SRC repo=$repo_url version=${version:-(latest)}"
   else
     # Some repos may have the package at repo root; use root as src
     cp -R "$clone_dir" "$py_target_dir/ampa"
@@ -889,34 +892,21 @@ copy_python_package() {
     mkdir -p "$py_target_dir"
     rm -rf "$py_target_dir/ampa"
     
-    # Primary method: Clone from remote repository
+    # Primary method: Clone from remote repository. Failure is fatal for the
+    # Python package installation — we no longer fall back to bundled or local
+    # copies. This keeps installs predictable and reduces support burden.
     local tmp_clone_dir="$(mktemp -d 2>/dev/null || echo "/tmp/ampa_clone_$$")"
     if clone_ampa_from_remote "$py_target_dir" "$tmp_clone_dir" "$AMPA_REMOTE_REPO" "$AMPA_VERSION"; then
       : # Success - continue to post-copy steps
     else
-      # Remote clone failed - try fallback to bundled resources
-      log_info "Remote clone failed, attempting fallback to bundled resources..."
+      # Remote clone failed — abort the Python package install with a clear
+      # diagnostic. Do not attempt bundled or local fallbacks.
+      log_error "Error: Failed to clone AMPA from $AMPA_REMOTE_REPO"
+      log_error "Please ensure network connectivity and that 'git' is available in PATH."
+      log_error "If you need offline installation options, place the Python package at: $TARGET_DIR/ampa_py/ampa"
+      log_decision "REMOTE_CLONE_FAILED=clone_error"
       rm -rf "$tmp_clone_dir"
-      
-      # Fallback: Use bundled installer resources
-      if [ -d "$SCRIPT_DIR/../resources/ampa_py/ampa" ]; then
-        local bundled="$SCRIPT_DIR/../resources/ampa_py/ampa"
-        cp -R "$bundled" "$py_target_dir/ampa"
-        log_decision "COPIED_FROM_BUNDLED_FALLBACK=$bundled"
-        log_info "Warning: Installed from bundled resources instead of remote repository"
-      else
-        log_error "Error: Failed to install AMPA Python package"
-        log_error "All installation methods failed:"
-        log_error "  1. Remote clone from $AMPA_REMOTE_REPO failed"
-        log_error "  2. Bundled resources not available"
-        log_error ""
-        log_error "Please ensure:"
-        log_error "  - You have a working network connection"
-        log_error "  - Git is installed and available in PATH"
-        log_error "  - The repository $AMPA_REMOTE_REPO is accessible"
-        log_error ""
-        return 1
-      fi
+      return 1
     fi
    
     # Record post-copy state
@@ -1119,15 +1109,15 @@ stop_daemon() {
       log_info "wl ampa stop returned non-zero (output):"
       printf "%s\n" "$_out"
     fi
-  else
-    log_info "Skipping 'wl ampa stop' because 'wl' does not expose the ampa command on PATH."
-    # Provide diagnostics: show pidfile and process info if available so the
-    # operator can act manually. Do not attempt to load the plugin.
-    if [ -f "$PID_FILE" ]; then
-      local _pidfile_pid
-      _pidfile_pid=$(sed -n '1p' "$PID_FILE" 2>/dev/null || true)
-      log_info "Observed pidfile $PID_FILE pid=${_pidfile_pid:-(none)}"
-      if [ -n "$_pidfile_pid" ]; then
+    else
+      log_info "Skipping 'wl ampa stop' because 'wl' does not expose the ampa command on PATH."
+      # Provide diagnostics: show pidfile and process info if available so the
+      # operator can act manually. Do not attempt to load the plugin.
+      if [ -f "$PID_FILE" ]; then
+        local _pidfile_pid
+        _pidfile_pid=$(sed -n '1p' "$PID_FILE" 2>/dev/null || true)
+        log_info "Observed pidfile $PID_FILE pid=${_pidfile_pid:-(none)}"
+        if [ -n "$_pidfile_pid" ]; then
         if [ -r "/proc/$_pidfile_pid/cmdline" ]; then
           log_info "Process cmdline:"
           tr '\0' ' ' < "/proc/$_pidfile_pid/cmdline" 2>/dev/null || true
@@ -1138,9 +1128,9 @@ stop_daemon() {
         fi
         log_info "To stop the process manually: kill $_pidfile_pid (or use SIGTERM then SIGKILL if needed)."
       fi
-    else
-      log_info "No pidfile $PID_FILE present; nothing to stop via installer fallback."
-    fi
+      else
+        log_info "No pidfile $PID_FILE present; no running AMPA daemon detected."
+      fi
   fi
 
   # Wait for the pid file to be removed or the process to exit. This provides
@@ -1313,8 +1303,9 @@ main() {
   # Install plugin
   install_worklog_plugin
 
-   # Install Python package: prefer remote repository, fall back to local sources
-   # copy_python_package handles all fallback logic internally
+    # Install Python package from the remote repository. copy_python_package
+    # will abort on failure; there is no bundled/local fallback for the Python
+    # package.
    log_info "Installing AMPA Python package..."
    if [ -n "$AMPA_VERSION" ]; then
      log_info "Target version: $AMPA_VERSION"

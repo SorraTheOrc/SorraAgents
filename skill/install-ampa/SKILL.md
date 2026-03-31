@@ -43,10 +43,7 @@ skill/install-ampa/scripts/install-worklog-plugin.sh --bot-token <discord_bot_to
 
 ### Installation Sources
 
-The installer clones AMPA source code from the remote repository (`github.com/opencode/ampa` by default) as the primary installation method. The installer will:
-
-1. Clone from the remote repository (preferred)
-2. Fall back to bundled resources if remote fails
+The installer clones AMPA source code from the remote repository (`github.com/SorraTheOrc/ampa` by default). The installer does not provide a local or bundled-resource fallback for the Python package; a failure to clone from the remote repository is treated as a fatal error and the installer will exit with a clear diagnostic. Ensure network access and git are available when running the installer.
 
 ### Specifying a Version
 
@@ -58,15 +55,14 @@ skill/install-ampa/scripts/install-worklog-plugin.sh --version v1.0.0 --yes
 
 ### Environment Variables
 
-- `AMPA_REMOTE_REPO`: Override the default repository URL (default: `https://github.com/opencode/ampa.git`)
+- `AMPA_REMOTE_REPO`: Override the default repository URL (default: `https://github.com/SorraTheOrc/ampa.git`)
 
 ### Error Handling
 
 The installer handles network failures gracefully:
 - Tests network connectivity before attempting clone
-- Provides clear error messages for common failure scenarios
-- Falls back to local sources if remote is unavailable
-- Logs detailed error information to decision log
+- Provides clear error messages for common failure scenarios and writes diagnostics to the decision log
+- Does NOT fall back to local or bundled resources for the Python package; remote clone failures are reported and the install aborts
 
 ### Notes
 
