@@ -78,9 +78,9 @@ The command implements the procedural workflow below. Each numbered step is part
 
 - Review existing Appendix entries first: the agent MUST NOT ask any question that already appears in the Appendix of the current work item or any parent work item unless further clarification is required. If additional clarification is needed, explicitly reference the existing Appendix entry and state why more detail is required before re-asking the question.
 
-4. Draft intake brief (agent responsibility + user confirmation)
+4. Draft intake brief (agent responsibility)
 
-- Write a clear intake brief with at `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` the following sections:
+- Write a clear intake brief to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` containing the following sections:
   - Problem statement: one or two sentences summarizing the problem to be solved.
   - Users: who will benefit from or use the feature and examples of their user stories.
   - Success criteria: 3–5 concise, measurable bullets describing how success will be evaluated.
@@ -88,15 +88,11 @@ The command implements the procedural workflow below. Each numbered step is part
   - Existing state: brief summary of the current state of affairs related to the problem.
   - Desired change: brief summary of the likely changes needed.
   - Related work: list of related documents or work items with brief descriptions and links/ids.
-- Present the draft brief to the user and ask the user to review it and provide feedback.
-- Do not claim this completes the process. The last thing printed in this step should be a question asking the user to approve the brief or request changes.
-- The user may:
-  - Respond with edits or clarifications, in which case you must incorporate them, and re-present the updated draft for approval, or
-  - Approve, in which case you must proceed to the next step.
+- Present the draft brief to the user and invite feedback. Incorporate any edits or clarifications supplied by the user, but do not block progress waiting for an explicit approval. Apply edits when provided and proceed automatically to the review stages.
 
 5. Five mini-review stages (agent responsibility; must follow)
 
-After the user approves the draft brief, run five review iterations. Each review will make any necessary changes to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
+Run five review iterations automatically on the draft brief; each review will make any necessary conservative edits to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
 
 In each review stage apply only conservative edits. If a proposed change could alter intent, ask a clarifying question before making any changes.
 
@@ -125,18 +121,28 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
 
 8. Update the work item with the final brief using `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --status intake_complete--json`
 
-9. Calculate Effort and Risk (agent responsibility; must follow)
+9n. Calculate Effort and Risk (agent responsibility; must follow)
 
 - Call the `effort_and_risk` skill with the new or updated work item to produce an effort and risk estimate.
 
 10.   Finishing (must do as the final step only)
     
-- DO NOT close the issue
-- Run `wl sync` to sync work item changes.
-- Run `wl show <work-item-id>` (not --json) to show the entire work item.
-- Remove all temporary files created during the process, including `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
-- Output the new work item id, a 1–2 sentence summary headline
-- Finish with "This completes the Intake process for <work-item-id> <work-itme-title>"
+ - DO NOT close the issue
+ - Run `wl sync` to sync work item changes.
+ - Run `wl show <work-item-id>` (not --json) to show the entire work item.
+ - Remove all temporary files created during the process, including `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
+ - Output the new work item id and a structured summary containing the following sections exactly:
+
+  # Objective
+  Headline summary of the issue
+
+  # Acceptance Criteria
+  Complete list of acceptance criteria
+
+  # Effort and Risk
+  T-shirt sizing and one line description of the biggest risks
+
+ - Finish with "This completes the Intake process for <work-item-id> <work-item-title>"
 
 ## Traceability & idempotence
 
