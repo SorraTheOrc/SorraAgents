@@ -32,7 +32,7 @@ The command implements the procedural workflow below. Each numbered step is part
 ## Hard requirements:
 
 - Do not create a work item for this intake process itself; the output of this command is the completion of a description for the work item of interest.
-- Use an interview style: concise, high-signal questions grouped to a soft-maximum of three per iteration.
+- Use an interview style if additional information is needed: concise, high-signal questions grouped to a soft-maximum of three per iteration.
 - Do not invent requirements or constraints; if unknown, ask the user.
 - Do not ask leading questions that bias the user towards a particular answer.
 - Do not ask unnecessary questions, if an obvious answer exists, use it.
@@ -70,13 +70,15 @@ The command implements the procedural workflow below. Each numbered step is part
 
 3. Interview
 
-- In user interview iterations with a soft limit of 3 questions per round, build a full understanding of the work, offering suggested answers and examples informed by repo context where possible.
+If there are no ambiguities and the seed context and previously asked questions are sufficient to draft a clear intake brief, you may skip this step. However, if there are any gaps in understanding or if the seed context is vague, proceed with the interview.
+
+- A user interview consistes of 1 or more iterations, with a soft limit of 3 questions per round.
+- Do not ask questions that can be easily answered by searching the repo or related work items; instead, use the context you have gathered to answer those questions yourself. If you find that you do not have enough context to answer a question, ask the user for that specific piece of information.
+- The goal is to build a full understanding of the work, by asking clear and concise questions, and offering suggested answers and examples informed by repo context where possible.
 - If anything is ambiguous, ask for clarification rather than guessing.
-- Keep asking the user questions until all core information is captured and clarifications are made.
+- Keep asking the user questions until all core information is captured and no important ambiguities remain.
   - The goal is not a complete spec but a sufficient understanding to draft a problem definition with user stories, success criteria, and related work.
 - Do not proceed until you have gathered sufficient information to draft an intake brief.
-
-- Review existing Appendix entries first: the agent MUST NOT ask any question that already appears in the Appendix of the current work item or any parent work item unless further clarification is required. If additional clarification is needed, explicitly reference the existing Appendix entry and state why more detail is required before re-asking the question.
 
 4. Draft intake brief (agent responsibility)
 

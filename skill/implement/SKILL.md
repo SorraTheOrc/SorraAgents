@@ -41,6 +41,7 @@ any sensitive values before writing them to logs or comments.
 ## Best Practices
 
 - Follow the steps in order and do not skip steps.
+- Do not use search tools such as grep, ripgrep, or code search in the implementation process. Rely on the context provided in the work item, linked documentation, and your understanding of the codebase. If you find that you do not have enough context to implement, use the intake interview to gather more information and update the work item before proceeding.
 - Keep implementation focused on meeting acceptance criteria with minimal changes.
 - Use work item comments to document your process, decisions, and next steps.
 - Handle errors gracefully and provide actionable messages for remediation.
