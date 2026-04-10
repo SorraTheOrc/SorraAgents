@@ -123,13 +123,13 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
 
 8. Update the work item with the final brief using `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --status intake_complete--json`
 
-9n. Calculate Effort and Risk (agent responsibility; must follow)
+9. Calculate Effort and Risk (agent responsibility; must follow)
 
 - Call the `effort_and_risk` skill with the new or updated work item to produce an effort and risk estimate.
 
 10.   Finishing (must do as the final step only)
     
- - DO NOT close the issue
+ - change the issue to state "open" (wl update <work-item-id> --status open --json). DO NOT close the issue
  - Run `wl sync` to sync work item changes.
  - Run `wl show <work-item-id>` (not --json) to show the entire work item.
  - Remove all temporary files created during the process, including `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
@@ -139,7 +139,15 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
   Headline summary of the issue
 
   # Acceptance Criteria
-  Complete list of acceptance criteria
+  Complete list of acceptance criteria which *must* be measurable. If any acceptance criteria are not measurable, add a clarifying question to the Appendix asking for clarification and mark that criterion as "TBD pending clarification".
+
+  Always include at least one acceptance criterion related to testing and validation of the work.
+
+  Always include the criteria "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries." If this criterion is not already present, add it.
+
+  Always include the criteria "Full project test suite must pass with the new changes." If this criterion is not already present, add it.
+
+  Do not include tests related to continuous integration or deployment pipelines as acceptance criteria.
 
   # Effort and Risk
   T-shirt sizing and one line description of the biggest risks
