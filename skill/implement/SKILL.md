@@ -43,6 +43,8 @@ any sensitive values before writing them to logs or comments.
 - Follow the steps in order and do not skip steps.
 - Do not use search tools such as grep, ripgrep, or code search in the implementation process. Rely on the context provided in the work item, linked documentation, and your understanding of the codebase. If you find that you do not have enough context to implement, use the intake interview to gather more information and update the work item before proceeding.
 - Keep implementation focused on meeting acceptance criteria with minimal changes.
+- Never edit code outside of the src/ and tests/ for this project. Do not edit code in bundled libraries such as dist/ and node_modules/.
+- When implementing a CLI or API always provide a way to obtain a JSON formatted output for agents to consume.
 - Use work item comments to document your process, decisions, and next steps.
 - Handle errors gracefully and provide actionable messages for remediation.
 - If the work item is not well-defined, do not proceed with implementation. Instead, run the intake interview to clarify and update the work item before implementing.
@@ -101,7 +103,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 - inspect the current branch name via `git rev-parse --abbrev-ref HEAD`.
 - If the current branch was created for a work item that is an ancestor of <work-item-id>, continue on that branch (that is if the name has an ancestor work item id).
-- Otherwise create a new branch named `feature/<work-item-id>-<short>` or `bug/<work-item-id>-<short>` (include the work item id).
+- Otherwise create or switch to a branch named `feature/<work-item-id>-<short>` or `bug/<work-item-id>-<short>` (include the work item id).
 - Never commit directly to `main`.
 
 3. Implement
@@ -111,7 +113,11 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
   - Recursively implement that work item as described in this procedure.
   - When a work item is completed commit the work and update the stage: `wl update <work-item-id> --stage in_review --json`
-- Write tests and code to ensure all acceptance criteria defined in or related to the current work item are met:
+
+- If the work item does not have a recorded audit (see the output of wl show <work-item-id> --json) go to the next item in this step of the process, otherwise:
+  - review the audit notes and address any unmet acceptance criteria or other issues identified.
+  - once all items in the audit are addressed continue to step 4.
+- if there is no existing audit record, write tests and code to ensure all acceptance criteria defined in or related to the current work item are met:
   - Make minimal, focused changes that satisfy acceptance criteria.
   - Follow a test-driven development approach where applicable.
   - Ensure code follows project style and conventions.
