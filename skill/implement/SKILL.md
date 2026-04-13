@@ -113,7 +113,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Select te most appropriate work item to work on next (blocker > dependency; most critical first).
   - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
   - Recursively implement that work item as described in this procedure.
-  - When a work item is completed commit the work and update the stage: `wl update <work-item-id> --stage in_review --json`
+  - When a work item is completed commit the work and update the stage: `wl update <work-item-id> --status in_progress --stage in_review --json`
 
 - If the work item does not have a recorded audit (see the output of wl show <work-item-id> --json) go to the next item in this step of the process, otherwise:
   - review the audit notes and address any unmet acceptance criteria or other issues identified.
