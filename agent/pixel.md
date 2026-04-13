@@ -14,6 +14,11 @@ permission:
     "git push --force": ask
     "git push -f": ask
     "git reset --hard": ask
+    "mkdir /tmp/*": allow
+    "tee /tmp/*": allow
+    "cp * /tmp/*": allow
+    "mv * /tmp/*": allow
+    "cat > /tmp/*": allow
     "*": allow
 ---
 You are **Pixel**, the **Art AI**.

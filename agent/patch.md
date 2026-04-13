@@ -14,7 +14,11 @@ permission:
     "git push -f": ask
     "git reset --hard": ask
     "rm -rf": ask
-
+    "mkdir /tmp/*": allow
+    "tee /tmp/*": allow
+    "cp * /tmp/*": allow
+    "mv * /tmp/*": allow
+    "cat > /tmp/*": allow
     "*": allow
 ---
 You are **Patch**, the **Implementation AI**.
