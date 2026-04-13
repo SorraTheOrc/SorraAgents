@@ -2,21 +2,23 @@
 
 ## Workflow for AI Agents
 
-Follow thhe steps below whn completing tasks. If you are already working on a specific work item and are not provided with a different one then continue to use that work item. However, if you do not have a current work-item id and one is not provided you must stop and ask the user to either create one for you or give you permission to create one for the request.
+Follow thhe steps below when completing tasks. If you are already working on a specific work item and are not provided with a different id then continue to use that work item. However, if you do not have a current work-item id and one is not provided you must stop and ask the user to either create one for you or give you permission to create one for the request. If the user gives you permission to skip work-item creation for a requestyou can proceed and ignore any work-item update steps below.
 
-0. **Claim the work-item** created by the operator:
-   - Claim it with `wl update <id> --status in_progress --assignee <your-agent-name>`
-1. **Ensure the work-item is clearly defined**:
-   - Review the description, acceptance criteria, and any related files/paths in the work item description and comments (retrieved with `wl show <id> --children --json`)
-   - Review any existing work-items in the repository that may be related to this work-item (`wl search <search-terms> --json` and `wl show <id> --children --json`).
+1. **Claim the work-item** created by the operator:
+   - If you do not have a work-item id for the task you have been given and it is not a trivial task, ask the operator to create on, provide a work-item-id or give you permission to create a work-item yourself. The work-item must include a clear description of the goal and how it will change behaviour, preferably in the form of a user story, along with acceptance criteria that can be used to verify completion and references to important specifications, user-stories, designs, or other important context.
+   - Claim the work-item with `wl update <id> --status in_progress --assignee <your-agent-name>`
+2. **Ensure the work-item is clearly defined**:
+   - retrieve the work-item details with `wl show <id> --children --json`
+   - Read the the work-item and any related files/paths/work-items identified within
    - If the work-item is not clearly defined (it _MUST_ included a clear description of the goal and how it will change behaviour, preferably in the form of a user story, along with acceptance criteria that can be used to verify completion and references to important specifications, user-stories, designs, or other important context):
      - Search the worklog (`wl search <search-terms> --json` and `wl show <id> --children --json`) and repository for any existing information that may clarify the requirements
      - If the operator has allowed further questions ask for clarification on specific requirements, acceptance criteria, and context. Where possible provide suggested responses, but always allow for a free form text response.
      - If the operator has not allowed further questions attempt to clarify the requirements based on the existing information in the repository and worklog.
-     - Update the work-item description and acceptance criteria with any clarifications found `wl update <id> --description "<updated-description>"`. DO NOT remove existing content unless it is incorrect, ONLY add to it with appropriate clarifications.
+       - If there are still ambiguities or missing information after this process record them as open questions in the description of the item.
+     - Update the work-item description and acceptance criteria with any clarifications made or open questions remaining using `wl update <id> --description "<updated-description>"`. DO NOT remove existing content unless it is incorrect, ONLY add to it with appropriate clarifications.
    - Once the work-item is clearly defined update its stage to `intake_complete` using `wl update <id> --stage intake_complete`
    - Report back to the operator summarising any clarifications made and proceed to the next step.
-2. **Plan the work**:
+3. **Plan the work**:
    - Break down the work into smaller sub-tasks if necessary
    - Each sub-task should be a discrete unit of work that can be completed independently, if a sub-task is still too large break it down further with sub-tasks of its own
    - Verify and if possible improve the description of the goal and how it will change behaviour, preferably in the form of a user story
@@ -25,14 +27,14 @@ Follow thhe steps below whn completing tasks. If you are already working on a sp
    - Create child work-items for each sub-task using `wl create -t "<sub-task-title>" -d "<detailed-description>" --parent <base-item-id> --issue-type <type-of-work-item> --priority <critical|high|medium|low> --json`
    - Once planning is complete update the parent work-item stage to `plan_complete` using `wl update <base-item-id> --stage plan_complete`
    - Report back to the operator summarising the plan using `wl show <base-item-id> --children` and proceed to the next step.
-3. **Decide what to work on next**:
+4. **Decide what to work on next**:
    - Use `wl next --json` to get a recommendation for the next work-item to work on. The id of this item will be referred to below as <WIP-id>.
    - If the recommended work-item has no children proceed to the next step.
    - If the recommended work-item has children claim this work-item and mark it as in progress using `wl update <WIP-id> --status in_progress --assignee <your-agent-name>`
    - Repeat this step to get the next recommended work-item until a leaf work-item (one with no children) is reached.
    - if there are no descendents of <base-item-id> left to work on go to the `End session` step.
    - Report back to the operator summarising the selected work-item and proceed to the next step.
-4. **Implement the work-item**:
+5. **Implement the work-item**:
    - Review the content of the selected work-item
    - Review the description, acceptance criteria, and any related files/paths in the work item description and comments (retrieved with `wl show <WIP-id> --children --json`)
    - Review any existing work-items in the repository that may be related to this work-item (`wl search <search-terms> --json` and `wl show <id> --children --json`).
@@ -52,7 +54,7 @@ Follow thhe steps below whn completing tasks. If you are already working on a sp
    - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
    - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
    - Report back to the operator summarising the work completed and proceed to the next step.
-5. **Merge work into main**:
+6. **Merge work into main**:
    - Update the branch to bring it into line with main
      - resolve any conflicts that arise
    - Build the application and run all tests and checks to ensure nothing is broken
@@ -61,12 +63,12 @@ Follow thhe steps below whn completing tasks. If you are already working on a sp
    - Switch back to main, merge the branch and push the updated main branch to the remote repository
    - Close the work-item with a comment summarising the changes made and the reason for them, including the commit hash using `wl close <WIP-id> --reason "Completed work, see merge commit <merge-commit-hash> for details." --json`
    - Proceed to the next step.
-6. **Update the operator**:
+7. **Update the operator**:
    - Provide the operator a summary of the work completed, including any relevant links (work-item id, commit hashes, PR links, etc.)
    - Do not suggest next steps at this point, simply report what has been done and proceed to the next step.
-7. **Repeat**:
+8. **Repeat**:
    - Go back to the `Decide what to work on next` step.
-8. **End session**:
+9. **End session**:
    - When there are no descendents of <base-item-id> left to work on, inform the operator that all required work is complete and summarize any discovered tasks, or pre-existing tasks in the worklog (`wl list --json`).
    - Ask the operator if they would like to address any of these remaining tasks now or if they would like to end the session.
    - If the operator wishes to address any remaining tasks, return to the `Claim the work-item` with the selected work-item id as the new <base-item-id>.
@@ -96,7 +98,7 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - Do not escape content in the commit comments, PR body, or work-item description or comment body; use markdown formatting as needed for clarity and readability.
 - Never close an work item without ensuring all acceptance criteria are met, all child items are closed, all blockers resolved, and a Producer has reviewed and approved the work and any associated PRs have been merged.
 
-### Important Rules
+## Important Rules
 
 - Use wl as a primary source of truth, only the source code is more authoritative
 - Always use `--json` flag for programmatic use
@@ -112,7 +114,7 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - Use stages to track workflow progress
 - Do NOT clutter repo root with planning documents
 
-### work-item Types
+## work-item Types
 
 Track work-item types with `--issue-type`:
 
@@ -122,7 +124,7 @@ Track work-item types with `--issue-type`:
 - epic - Large feature with subtasks
 - chore - Maintenance (dependencies, tooling)
 
-### Work Item Descriptions
+## Work Item Descriptions
 
 - Use clear, concise titles summarizing the work item.
 - Do not escape special characters
@@ -136,7 +138,7 @@ Track work-item types with `--issue-type`:
   - Links to related work items or documentation.
   - Measurable and testable acceptance criteria.
 
-### Priorities
+## Priorities
 
 Worklog uses named priorities:
 
@@ -145,7 +147,7 @@ Worklog uses named priorities:
 - medium - Default, nice-to-have
 - low - Polish, optimization
 
-### Dependencies
+## Dependencies
 
 Use parent/child relationships to track blocking dependencies.
 
@@ -158,7 +160,7 @@ Other types of dependencies can be tracked in descriptions, for example `discove
 
 Worklog does not enforce these relationships but they can be used for planning and tracking.
 
-### Workflow management
+## Workflow management
 
 - Use the `--stage` flag to track workflow stages according to your particular process,
   - e.g. `idea`, `intake_complete`, `plan_complete`, `in_progress`, `done`.
@@ -168,7 +170,7 @@ Worklog does not enforce these relationships but they can be used for planning a
 - Use `risk` and `effort` fields to track complexity and potential issues.
   - If available use the `effort_and_risk` agent skill to estimate these values.
 
-### Test-failure triage policy
+## Test-failure triage policy
 
 - When an agent discovers a failing test that appears to be outside its ownership/scope, it should call the triage helper `skill/triage/scripts/check_or_create.py` with structured evidence (test name, stdout excerpt, optional stack trace/commit/CI URL).
 - Any incomplete (open or in_progress) work item tagged `test-failure` that matches the failing test name in title or body should be considered a match and will be linked/updated. If no match exists the helper will create a `critical` work item using the repository template `skill/triage/resources/test-failure-template.md`.
@@ -185,7 +187,7 @@ Worklog does not enforce these relationships but they can be used for planning a
 5. Complete: `wl close <id> --reason "PR #123 merged"`
 6. Sync: run `wl sync` before ending the session
 
-### Work-Item Management
+## Work-Item Management
 
 ```bash
 # Create work items
@@ -223,7 +225,7 @@ wl dep list <work-item-id> --json
 wl dep remove <dependent-work-item-id> <prereq-work-item-id>
 ```
 
-### Project Status
+## Project Status
 
 ```bash
 # Show the next ready work items (JSON output)
@@ -270,7 +272,7 @@ wl search <keywords> --status open --json
 wl show <work-item-id> --format full --json
 ```
 
-#### Team
+### Team
 
 ```bash
  # Sync local worklog data with the remote (shares changes)
@@ -281,11 +283,11 @@ wl show <work-item-id> --format full --json
  wl github push
 ```
 
-#### Plugins
+### Plugins
 
 Depending on your setup, you may have additional wl plugins installed. Check available plugins with `wl --help` (See plugins section) to view more information about the features provided by each plugin run `wl <plugin-command> --help`
 
-#### Help
+### Help
 
 Run `wl --help` to see general help text and available commands.
 Run `wl <command> --help` to see help text and all available flags for any command.
