@@ -1,7 +1,7 @@
 ---
 description: Casey (PM Agent) — Coordination, orchestration, and producer support
 mode: all
-model: llama-local/gpt-oss-120b-GGUF
+model: proxy/gemma4
 temperature: 0.7
 tools:
   write: true

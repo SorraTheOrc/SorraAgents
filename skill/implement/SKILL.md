@@ -142,6 +142,8 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 4. Automated self-review
 
+- Build and lint the code to catch basic issues, fix any issues raised before proceeding.
+- Run all tests again to ensure nothing is broken, fix any failing tests before proceeding.
 - Audit the work item to confirm all acceptance criteria are met: `audit <work-item-id> using the audit skill`.
   - If the audit reveals any unmet acceptance criteria, inform the user of the findings and return to step 3 to address them.
 - Perform sequential self-review passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff.
