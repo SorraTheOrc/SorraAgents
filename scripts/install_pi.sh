@@ -70,24 +70,46 @@ fi
 PROMPTS_SRC="$SRC_DIR/command"
 SKILLS_SRC="$SRC_DIR/skill"
 
-# Validate source subdirs exist
-missing=0
-if [ ! -d "$PROMPTS_SRC" ]; then
-  echo "Warning: prompts source directory not found: $PROMPTS_SRC" >&2
-  missing=1
-fi
-if [ ! -d "$SKILLS_SRC" ]; then
-  echo "Warning: skills source directory not found: $SKILLS_SRC" >&2
-  missing=1
-fi
-if [ "$missing" -eq 1 ]; then
-  read -r -e -p "One or more source dirs are missing. Continue anyway? [y/N]: " ans
-  ans=${ans:-N}
-  case "$ans" in
-    [yY]|[yY][eE][sS]) echo "Continuing..." ;;
-    *) echo "Aborted."; exit 1 ;;
-  esac
-fi
+# Validate source subdirs exist. If missing, prompt for a different root dir until both are found.
+while true; do
+  missing_prompts=0
+  missing_skills=0
+
+  if [ ! -d "$PROMPTS_SRC" ]; then
+    echo "Missing: prompts source directory not found: $PROMPTS_SRC" >&2
+    missing_prompts=1
+  fi
+  if [ ! -d "$SKILLS_SRC" ]; then
+    echo "Missing: skills source directory not found: $SKILLS_SRC" >&2
+    missing_skills=1
+  fi
+
+  if [ $missing_prompts -eq 0 ] && [ $missing_skills -eq 0 ]; then
+    break
+  fi
+
+  echo ""
+  read -r -e -p "Enter the SorraAgents project folder that contains 'command' and 'skill' (or 'q' to quit): " user_root
+  if [ -z "$user_root" ]; then
+    echo "No directory entered. Aborted."; exit 1
+  fi
+  if [ "$user_root" = "q" ] || [ "$user_root" = "Q" ]; then
+    echo "Aborted by user." >&2
+    exit 1
+  fi
+  user_root=$(expand_path "$user_root")
+  if [ ! -d "$user_root" ]; then
+    echo "Directory not found: $user_root" >&2
+    continue
+  fi
+
+  SRC_DIR="$user_root"
+  PROMPTS_SRC="$SRC_DIR/command"
+  SKILLS_SRC="$SRC_DIR/skill"
+  echo "Using source directory: $SRC_DIR"
+
+  # loop back and re-check
+done
 
 create_symlink "$PROMPTS_LINK" "$PROMPTS_SRC"
 create_symlink "$SKILLS_LINK" "$SKILLS_SRC"
