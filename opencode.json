@@ -1,18 +1,27 @@
 {
     "$schema": "https://opencode.ai/config.json",
     "provider": {
-        "llama-local": { 
-            "name": "LLama",
+        "proxy": {
+            "name": "Proxy",
             "npm": "@ai-sdk/openai-compatible",
             "options": {
                 "baseURL": "http://192.168.0.199:8000/v1"
             },
             "models": {
-                "qwen3-coder-next-GGUF": {
-                    "name": "Qwen3 Coder Next (local)"
+                "Qwen3": {
+                    "name": "Qwen3 Coder Next"
                 },
-                "gpt-oss-120b-GGUF": {
-                    "name": "GPT-OSS 120B (local)",
+                "gemma4": {
+                    "name": "Gemma 4",
+                    "limit": {
+                        "context": 262144,
+                        "output": 32768
+                    },
+                    "reasoning": true,
+                    "tool_call": true
+                },
+                "gpt120": {
+                    "name": "GPT-OSS 120B",
                     "limit": {
                         "context": 131072,
                         "output": 32768
@@ -22,7 +31,7 @@
                 }
             }
         },
-        "foundry-local": { 
+        "foundry-local": {
             "name": "Foundry",
             "npm": "@ai-sdk/openai-compatible",
             "options": {
@@ -32,41 +41,39 @@
                 "qwen2.5-7b-instruct-qnn-npu:2": {
                     "name": "Qwen 2.5 7b (local npu)"
                 }
-            } 
+            }
         }
     },
-
     "model": "github-copilot/gpt-5-mini",
     "small_model": "github-copilot/gpt-5-mini",
     "default_agent": "build",
-
     "agent": {
         "build": {
             "permission": {
                 "bash": {
-                "rm -rf /": "ask",
-                "rm -rf /*": "ask",
-                "rm -rf .*": "ask",
-                "dd if=* of=/dev/sd*": "ask",
-                "mkfs* /dev/*": "ask",
-                "fdisk /dev/*": "ask",
-                "parted /dev/*": "ask",
-                "mount *": "ask",
-                "umount *": "ask",
-                "chown -R /": "ask",
-                "chmod -R 777 /": "ask",
-                "iptables -F": "ask",
-                "ufw disable": "ask",
-                "systemctl stop *": "ask",
-                "systemctl disable *": "ask",
-                "shutdown *": "ask",
-                "reboot": "ask",
-                "docker system prune -a": "ask",
-                "kubectl delete namespace *": "ask",
-                "git push --force": "ask",
-                "git push -f": "ask",
-                "git reset --hard": "ask",
-                "*": "allow"
+                    "rm -rf /": "ask",
+                    "rm -rf /*": "ask",
+                    "rm -rf .*": "ask",
+                    "dd if=* of=/dev/sd*": "ask",
+                    "mkfs* /dev/*": "ask",
+                    "fdisk /dev/*": "ask",
+                    "parted /dev/*": "ask",
+                    "mount *": "ask",
+                    "umount *": "ask",
+                    "chown -R /": "ask",
+                    "chmod -R 777 /": "ask",
+                    "iptables -F": "ask",
+                    "ufw disable": "ask",
+                    "systemctl stop *": "ask",
+                    "systemctl disable *": "ask",
+                    "shutdown *": "ask",
+                    "reboot": "ask",
+                    "docker system prune -a": "ask",
+                    "kubectl delete namespace *": "ask",
+                    "git push --force": "ask",
+                    "git push -f": "ask",
+                    "git reset --hard": "ask",
+                    "*": "allow"
                 }
             }
         }
