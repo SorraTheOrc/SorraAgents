@@ -1,5 +1,5 @@
 ---
-name: effort_and_risk
+name: effort-and-risk
 description: "Produce engineering effort and risk estimates using WBS, three-point (PERT) estimating, risk matrix, uncertainty, and assumptions. Operates on a provided issue id and its prepared plan."
 ---
 

@@ -1,12 +1,16 @@
 ---
 name: implement
-description: Implement a Worklog work item by writing code, tests and documentation to meet acceptance criteria, following a deterministic workflow. Trigger on user queries such as: 'Implement <work-item-id>', 'Complete <work-item-id>', 'Work on <work-item-id>'.
+description: |
+  Write tests, docs and code for a Worklog work item by following a
+  deterministic workflow. Ensure implementation meets defined acceptance
+  criteria. Trigger on user queries such as: 'Implement <work-item-id>',
+  'Complete <work-item-id>', 'Work on <work-item-id>'.
 ---
 
 ## Purpose
 
 Provide a deterministic, step-by-step implementation workflow for completing a
-Worklog work item thorugh the creation of code, tests, and documentation.
+Worklog work item through the creation of code, tests, and documentation.
 
 ## Inputs
 

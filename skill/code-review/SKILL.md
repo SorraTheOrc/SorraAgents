@@ -1,5 +1,5 @@
 ---
-name: code_review
+name: code-review
 description:
   Use this skill to review local code. It focuses on correctness, maintainability,
   and adherence to project standards.

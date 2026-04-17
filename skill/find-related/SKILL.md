@@ -1,5 +1,5 @@
 ---
-name: find_related
+name: find-related
 description: Discover related work for a Worklog work item and generate a concise, auditable "Related work" report that can be appended to the work item description.
 ---
 
