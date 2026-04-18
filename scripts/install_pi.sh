@@ -114,4 +114,80 @@ done
 create_symlink "$PROMPTS_LINK" "$PROMPTS_SRC"
 create_symlink "$SKILLS_LINK" "$SKILLS_SRC"
 
+# --- Pi global config installation / export --------------------------------
+# Repo-side pi config directory (relative to repo root)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_PI_CONFIG="$REPO_ROOT/.pi-config/agent"
+DEST_PI="$HOME/.pi/agent"
+
+# Helper to copy file with optional overwrite prompt
+copy_if_missing_or_prompt() {
+  local src="$1" dst="$2"
+  if [ -e "$dst" ]; then
+    read -r -e -p "File exists: $dst. Overwrite? [y/N]: " resp
+    case "$resp" in
+      [yY]|[yY][eE][sS]) cp -f "$src" "$dst" && echo "Overwrote $dst" ;; 
+      *) echo "Skipped $dst" ;;
+    esac
+  else
+    cp -a "$src" "$dst" && echo "Installed $dst"
+  fi
+}
+
+# If the repo contains a .pi-config/agent, use it to create the global config
+if [ -d "$REPO_PI_CONFIG" ]; then
+  echo "Installing global pi config from repository: $REPO_PI_CONFIG -> $DEST_PI"
+  mkdir -p "$DEST_PI"
+  for f in settings.json models.json; do
+    if [ -e "$REPO_PI_CONFIG/$f" ]; then
+      copy_if_missing_or_prompt "$REPO_PI_CONFIG/$f" "$DEST_PI/$f"
+    fi
+  done
+  # If an example auth exists in the repo, do NOT copy auth files. Instead instruct the user to login with pi
+  if [ -e "$REPO_PI_CONFIG/auth.json.example" ] && [ ! -e "$DEST_PI/auth.json" ]; then
+    echo "Authentication not configured. After installation run:"
+    echo "  pi login"
+    echo "This will open a browser and create ~/.pi/agent/auth.json for you. Do NOT store real credentials in the repository."
+  fi
+
+else
+  # No repo config - if user has a local config, offer to export it into the repo for tracking
+  if [ -d "$DEST_PI" ]; then
+    found=0
+    for f in settings.json models.json; do
+      [ -e "$DEST_PI/$f" ] && found=1 || true
+    done
+    if [ $found -eq 1 ]; then
+      read -r -e -p "Found existing ~/.pi/agent config. Would you like to copy non-secret config files into $REPO_ROOT/.pi-config/agent for tracking in git? [y/N]: " resp
+      case "$resp" in
+        [yY]|[yY][eE][sS])
+          mkdir -p "$REPO_PI_CONFIG"
+          for f in settings.json models.json; do
+            if [ -e "$DEST_PI/$f" ]; then
+              cp -a "$DEST_PI/$f" "$REPO_PI_CONFIG/$f" && echo "Exported $f -> $REPO_PI_CONFIG/$f"
+            fi
+          done
+          # Do NOT export auth.json or create an auth.json.example. Instead instruct the user to run `pi login` locally to create auth credentials
+          if [ -e "$DEST_PI/auth.json" ]; then
+            echo "Found local auth.json. For security we will NOT export it into the repository."
+            echo "Users should run:"
+            echo "  pi login"
+            echo "after installing the tracked config to create their own ~/.pi/agent/auth.json."
+          fi
+          ;;
+        *) echo "Skipping export of local config." ;;
+      esac
+    fi
+  fi
+fi
+
+# If auth.json is still missing, remind the user to login with pi to create credentials
+if [ ! -e "$DEST_PI/auth.json" ]; then
+  echo ""
+  echo "To finish setup and authenticate, run the following command now:"
+  echo "  pi login"
+  echo "This will open a browser and create ~/.pi/agent/auth.json for your account."
+fi
+
 echo "Done."

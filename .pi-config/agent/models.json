@@ -1,0 +1,14 @@
+{
+  "providers": {
+    "Local Proxy": {
+      "api": "openai-completions",
+      "baseUrl": "http://192.168.0.199:8000/v1",
+      "apiKey": "not_needed",
+      "models": [
+        { "id": "qwen3" },
+        { "id": "gemma4" },
+        { "id": "gpt120" }
+      ]
+    }
+  }
+}
