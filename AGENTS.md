@@ -50,7 +50,7 @@ Follow thhe steps below when completing tasks. If you are already working on a s
        - If the build or any tests/checks fail, fix the issues and repeat until all tests/checks pass
      - Commit changes whenever the Producer observes that a significant amount of progress has been made (ask if you think it is due), use clear commit messages that reference the WIP id and summarise the changes made.
    - If a particularly complex issue is identified or a significant design decisions or assumption is made record this in a comment on the work-item using `wl comment add <WIP-id> --comment "<detailed-comment>" --author <your-agent-name> --json`
-   - Once the acceptance criteria of <WIP-id> has been satisfied and all tests pass, Commit final changes to the branch with a message such as `<WIP-id>: Completed work to satisfy acceptance criteria: <acceptance-criteria-summary>`
+   - Once the acceptance criteria of <WIP-id> has been satisfied and all tests pass (meaning you have built the project and run all tests), Commit final changes to the branch with a message such as `<WIP-id>: Completed work to satisfy acceptance criteria: <acceptance-criteria-summary>`
    - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
    - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
    - Report back to the operator summarising the work completed and proceed to the next step.

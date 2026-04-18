@@ -63,11 +63,14 @@ For each acceptance criterion found in step 3, perform a thorough code review:
 5. **Deep code review of children's acceptance criteria:**
 
 For each direct child work item (do NOT recurse into grandchildren):
-- Run `wl show <child-id> --json` to fetch the child's details.
-- Extract the child's acceptance criteria from its description.
-  - If no acceptance criteria section is found, note: "No acceptance criteria defined."
-- Perform the same deep code review as described in step 4 for each of the child's acceptance criteria.
-- Assign per-criterion verdicts (`met`/`unmet`/`partial`) with file:line evidence.
+- If the Status/Stage of the child is completed/done, mark the child as "met" without review.
+- If the child item is marked as deleted ignore the item.
+- For all other child items:
+  - Run `wl show <child-id> --json` to fetch the child's details.
+  - Extract the child's acceptance criteria from its description.
+    - If no acceptance criteria section is found, note: "No acceptance criteria defined."
+  - Perform the same deep code review as described in step 4 for each of the child's acceptance criteria.
+  - Assign per-criterion verdicts (`met`/`unmet`/`partial`) with file:line evidence.
 
 6. **Produce the structured audit report:**
 
