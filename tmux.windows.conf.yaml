@@ -1,9 +1,9 @@
 session_name: Dev
 windows:
   - name: Agents
-    cwd: ~/.config/opencode
+    cwd: ~/projects/SorraAgents
     panes:
-      - cmd: "opencode -c"
+      - cmd: "pi --continue"
         focus: true
       - cmd: "wl tui"
         split:
