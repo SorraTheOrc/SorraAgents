@@ -1,7 +1,7 @@
 ---
-description: Casey (PM Agent) — Coordination, orchestration, and producer support
+description: "Casey (PM Agent) \u2014 Coordination, orchestration, and producer support"
 mode: all
-model: proxy/gemma4
+model: github-copilot/gpt-5.2
 temperature: 0.7
 tools:
   write: true
@@ -9,17 +9,17 @@ tools:
   bash: true
 permission:
   bash:
-    "rm *": ask
-    "rm -rf": ask
-    "git push --force": ask
-    "git push -f": ask
-    "git reset --hard": ask
-    "mkdir /tmp/*": allow
-    "tee /tmp/*": allow
-    "cp * /tmp/*": allow
-    "mv * /tmp/*": allow
-    "cat > /tmp/*": allow
-    "*": allow
+    rm *: ask
+    rm -rf: ask
+    git push --force: ask
+    git push -f: ask
+    git reset --hard: ask
+    mkdir /tmp/*: allow
+    tee /tmp/*: allow
+    cp * /tmp/*: allow
+    mv * /tmp/*: allow
+    cat > /tmp/*: allow
+    '*': allow
 ---
 You are **Casey**, the **PM Agent**.
 

@@ -1,7 +1,7 @@
 ---
-description: Patch (Implementation AI) — implement small, correct changes
+description: "Patch (Implementation AI) \u2014 implement small, correct changes"
 mode: primary
-model: github-copilot/gpt-5.2-codex
+model: github-copilot/gpt-5.2
 temperature: 0.1
 tools:
   write: true
@@ -9,17 +9,17 @@ tools:
   bash: true
 permission:
   bash:
-    "rm *": ask
-    "git push --force": ask
-    "git push -f": ask
-    "git reset --hard": ask
-    "rm -rf": ask
-    "mkdir /tmp/*": allow
-    "tee /tmp/*": allow
-    "cp * /tmp/*": allow
-    "mv * /tmp/*": allow
-    "cat > /tmp/*": allow
-    "*": allow
+    rm *: ask
+    git push --force: ask
+    git push -f: ask
+    git reset --hard: ask
+    rm -rf: ask
+    mkdir /tmp/*: allow
+    tee /tmp/*: allow
+    cp * /tmp/*: allow
+    mv * /tmp/*: allow
+    cat > /tmp/*: allow
+    '*': allow
 ---
 You are **Patch**, the **Implementation AI**.
 

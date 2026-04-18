@@ -343,3 +343,40 @@ Validators should execute in this order to produce the most useful error message
 
 Errors at any level should be collected and reported together (do not fail on the first error).
 Warnings should be reported but should not cause overall validation failure.
+
+---
+
+## Agent front-matter validation (agent/*.md)
+
+This repository includes lightweight validation rules for agent definition files stored under `agent/*.md`.
+The validator enforces a minimal front-matter schema and canonical model mappings to ensure consistent runtime behaviour and predictable model selection.
+
+Rules
+
+- Required front-matter fields for agents: `description`, `mode`, `model`.
+- Allowed canonical model values (subject to change via policy): `github-copilot/gpt-5.2`, `github-copilot/gpt-5-mini`.
+- Model mappings: known model variants (e.g. `github-copilot/gpt-5.2-codex`, `proxy/gemma4`) will be suggested/automatically migrated to the canonical model where safe.
+- Unknown or unapproved model values are reported as errors and require owner review.
+
+Migration and exemption policy
+
+- Automated migration is allowed when the existing model matches a documented mapping; files updated automatically will include per-file notes in the migration PR requesting owner sign-off.
+- Files with models that do not match a known mapping are not modified by automated scripts and will be flagged for manual review.
+- Explicit per-agent overrides remain authoritative: the migration script only changes models when a clear, safe mapping exists.
+
+Tooling
+
+- A linter is provided at `scripts/agent_frontmatter_lint.py` which checks agent files for required fields and allowed model values. It exits non-zero when errors or warnings are found and can emit JSON for CI consumption.
+- A migration helper `scripts/migrate_agent_models.py` safely applies canonical model mappings where patterns are recognised. It supports dry-run and apply modes and prints a per-file changelog summary.
+
+CI integration
+
+- The linter should be added as a pre-merge check for any PR that modifies `agent/*.md`. The CI workflow must treat linter errors as blocking; warnings should be visible but non-blocking.
+
+Exceptions
+
+- Agents that require a non-canonical model for functional reasons should be documented in the PR and assigned an owner for explicit sign-off. If an exception is accepted, update the file with an inline comment in the front-matter (e.g., `# exception-reason: <short reason>`), and add an entry to the PR body documenting the acceptance.
+
+References
+
+- See `scripts/agent_frontmatter_lint.py` and `scripts/migrate_agent_models.py` for implementation details and usage examples.
