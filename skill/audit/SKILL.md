@@ -114,6 +114,12 @@ Ready to close: Yes/No
    - Run: `wl update <work-item-id> --audit-text "<complete-report-content>" --json`
     - This stores the audit as structured metadata, making it machine-readable and queryable via `wl show --json`.
 
+8. **Output the same structured report content to the user in markdown format.**
+
+  - Do NOT include any additional text, explanations, or next steps in the output (other than the information in the next bullets). The output should be the structured report content only.
+  - After the structured report content, you should include a final line: "This audit has been recorded in the system." to confirm to the user that the audit was saved. If it as not been saved yet, then run the CLI command to save it before confirming (see previous step).
+  - If any of the acceptance criteria were unmet or partially met, include a final note: "Note: Some acceptance criteria were not fully met. Please review the evidence for details." and offer to address the gamps in the audit if the user wants to follow up.
+
 ## Notes
 
 - Keep the output concise and actionable for quick human consumption.
