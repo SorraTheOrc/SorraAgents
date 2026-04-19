@@ -85,14 +85,16 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 1. Understand the work item
 
-- Claim by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` (omit `--assignee` if not applicable).
+- If the work item is not already assigned to you, claim it by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` (omit `--assignee` if not applicable).
+- If the work item is in-progress then run the audit skill to understand what work has already been done and what remains: `audit <work-item-id> using the audit skill`.
 - Fetch the work item JSON if not already present: `wl show <work-item-id> --json` and `wl show <work-item-id> --json`.
-- Restate acceptance criteria and constraints from the work item JSON.
+  - pay particular attention to the `description`, `acceptance criterria` and `comments`
+- Restate acceptance criteria and current status along with any constraints from the work item JSON.
 - Surface blockers, dependencies and missing requirements.
 - Inspect linked PRDs, plans or docs referenced in the work item.
 - Confirm expected tests or validation steps.
 
-  1.1) Definition gate (must pass before implementation)
+1.1. Definition gate (must pass before implementation)
 
 - Verify:
   - Clear scope (in/out-of-scope).
@@ -106,7 +108,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 2. Create a working branch
 
-- inspect the current branch name via `git rev-parse --abbrev-ref HEAD`.
+- Inspect the current branch name via `git rev-parse --abbrev-ref HEAD`.
 - If the current branch was created for a work item that is an ancestor of <work-item-id>, continue on that branch (that is if the name has an ancestor work item id).
 - Otherwise create or switch to a branch named `feature/<work-item-id>-<short>` or `bug/<work-item-id>-<short>` (include the work item id).
 - Never commit directly to `main`.
@@ -114,7 +116,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 3. Implement
 
 - If the work item has any open or in_progress blockers or dependencies:
-  - Select te most appropriate work item to work on next (blocker > dependency; most critical first).
+  - Select the most appropriate work item to work on next (blocker > dependency; most critical first).
   - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
   - Recursively implement that work item as described in this procedure.
   - When a work item is completed commit the work and update the stage: `wl update <work-item-id> --status in_progress --stage in_review --json`
