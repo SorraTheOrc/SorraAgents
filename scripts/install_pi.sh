@@ -4,6 +4,7 @@ set -euo pipefail
 DEFAULT_SRC="$HOME/projects/SorraAgents"
 PROMPTS_LINK="$HOME/.pi/agent/prompts"
 SKILLS_LINK="$HOME/.pi/agent/skills"
+AGENTS_LINK="$HOME/.pi/agent/AGENTS.md"
 
 # expand leading ~ if present
 expand_path() {
@@ -69,6 +70,7 @@ fi
 
 PROMPTS_SRC="$SRC_DIR/command"
 SKILLS_SRC="$SRC_DIR/skill"
+AGENTS_SRC="$SRC_DIR/AGENTS.md"
 
 # Validate source subdirs exist. If missing, prompt for a different root dir until both are found.
 while true; do
@@ -113,6 +115,7 @@ done
 
 create_symlink "$PROMPTS_LINK" "$PROMPTS_SRC"
 create_symlink "$SKILLS_LINK" "$SKILLS_SRC"
+create_symlink "$AGENTS_LINK" "$AGENTS_SRC"
 
 # --- Pi global config installation / export --------------------------------
 # Repo-side pi config directory (relative to repo root)

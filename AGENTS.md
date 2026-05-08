@@ -1,3 +1,15 @@
+Core principles for AI Agents working with work-items tracked in Worklog (wl) and the workflow to follow when completing tasks.
+
+- Tasks will either be provided with an associated work-item id, or if not, the agent must ask for one to be created or permission to create one. This ensures all work is tracked in Worklog (wl) and can be properly managed and referenced.
+- When asked to complete a task, the agent MUST follow the workflow outlined below, which includes claiming work-items, ensuring they are clearly defined, planning the work, deciding what to work on next, implementing the work-item, merging changes, updating the operator, and repeating this process until all work is complete.
+- Do NOT ask unnecessary questions. The goal is to complete a task without furtherr interaction with the operator. Only ask questions if you need information that is not already available in the worklog or repository to clarify requirements, acceptance criteria, or context. Always check existing information first before asking the operator.
+- Always write tests *before* writing code to help guide your implementation. If the requirements are not clear enough to write tests, seek clarification before proceeding with implementation.
+- It is OK to make reasonable assumptions to fill in gaps in information, but these assumptions should be clearly documented in the work-item description or comments and should be concisely and clearly communicated to the operator upon completion of the task.
+- Do not stop working on a task until you hit an explicit gating step in the workflow.
+- A task is not complete until all acceptance criteria are satisfied, all tests pass, and the work-item is ready for review. Use the `audit` skill to verify that all acceptance criteria are satisfied and all tests pass before marking a work-item as ready for review.
+- If you encounter an issue that blocks completion of the current work-item, create a new work-item to address that issue, record the blocking relationship, report to the user and start working on the blocking item.
+- When you have completed a task, report back to the operator with a concise summary of the work completed, including any relevant links (work-item id, commit hashes, PR links, etc.)
+
 <!-- WORKFLOW: start -->
 
 ## Workflow for AI Agents
