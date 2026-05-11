@@ -58,7 +58,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
   - If the work item already has child features/tasks that cover the intended scope (use `wl list --parent <work-item-id> --json` and compare), and those children are adequate and idempotent, skip full planning and mark `plan_complete`.
   - If a concise plan block already exists in the work item (for example a labeled "Plan:" or a short numbered feature list with acceptance criteria), treat that as sufficient evidence to skip the full interview.
 - If the checks indicate planning is not needed, update the work item to record the decision and advance the stage:
-  - `wl update <work-item-id> --stage plan_complete --json`
+  - `wl update <work-item-id> --stage plan_complete --status open --json`
   - Optionally add a comment documenting the reason: `wl comment add <work-item-id> "Plan auto-complete: work item appears sufficiently sized/defined for direct implementation." --actor Map --json`
 - If evidence is borderline or key uncertainties remain, proceed with the normal planning process (ask clarifying questions rather than auto-completing).
 
@@ -148,7 +148,7 @@ Keep asking questions until the breakdown into features is clear.
 - Add a comment to the planned work item:
   - `wl comments add $1 "Planning Complete. <Summary of the approved feature list, any open questions that remain>" --actor <your-agent-name> --json`
     -- Update the planned work item's stage to indicate planning is complete:
-  - `wl update $1 --stage plan_complete --json`
+  - `wl update $1 --stage plan_complete --status open --json`
 
 6. Calculate Effort and Risk (agent responsibility; must follow)
 
@@ -172,13 +172,13 @@ Keep asking questions until the breakdown into features is clear.
 ## Finishing steps (must do)
 
 -- On the parent work item set the work item's stage to `plan_complete`:
-`wl update <work-item-id> --stage plan_complete --json`
+`wl update <work-item-id> --stage plan_complete --status open --json`
 
 - Run `wl sync` to sync work item changes.
 - Run `wl show <work-item-id>` (not --json) to show the entire work item.
 - End with: "This completes the Plan process for <work-item-id>".
   - On the parent work item set the machine-readable `stage` field to `plan_complete`:
-    `wl update <work-item-id> --stage plan_complete --json`
+    `wl update <work-item-id> --stage plan_complete --status open --json`
 - Run `wl sync` to sync work item changes.
 - Run `wl show <work-item-id>` (without `--json`) to display the entire work item.
 - End with: "This completes the Plan process for <work-item-id>".
