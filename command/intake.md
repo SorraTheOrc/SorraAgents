@@ -45,6 +45,21 @@ The command implements the procedural workflow below. Each numbered step is part
 
 ## Process (must follow)
 
+0. Evaluate whether intake is required (agent responsibility)
+
+- Before performing the full intake, run a lightweight evaluation to determine whether the work item already contains sufficient information to skip the interview/draft process and simply mark intake as complete.
+- Suggested checks (conservative, idempotent heuristics):
+  - If the work item `stage` is already `intake_complete` or a later stage, skip intake.
+  - If the work item description contains a clear one-line headline, a short "## Acceptance Criteria" section with 1–3 measurable bullets, and a concise "Desired change" or implementation notes (for example <= ~200 words of implementation guidance), then it is likely sufficiently well-defined to skip a full intake.
+  - If the work item is small (type `task` or `bug` rather than `epic`) and the description contains explicit acceptance criteria and a minimal implementation sketch, prefer to mark intake complete.
+  - If duplicate or parent/child relationships already express the required context (see earlier related-work checks), consider skipping a full intake.
+- If the checks indicate intake is not needed, update the work item to record the decision and advance the stage:
+  - `wl update <work-item-id> --stage intake_complete --json`
+  - Optionally add a comment documenting the reason: `wl comment add <work-item-id> "Intake auto-complete: work item appears sufficiently defined (acceptance criteria present / small task)." --actor Map --json`
+- If any heuristic is uncertain, fall back to running the normal intake process (do not auto-complete on borderline evidence).
+
+
+
 1. Gather context (agent responsibility)
 
 - Derive 2–6 keywords from the <seed-context> and user input to guide repository.

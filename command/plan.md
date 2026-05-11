@@ -49,6 +49,21 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 ## Process (must follow)
 
+0. Evaluate whether planning is required (agent responsibility)
+
+- Before starting the full planning interview and decomposition, run a quick assessment to determine whether the work item already has a sufficient plan or is too small to require decomposition.
+- Suggested checks (conservative, idempotent heuristics):
+  - If the work item's `stage` is `plan_complete` or later, ask the user whether they want to re-run planning; do not re-run automatically.
+  - If the work item is not an `epic` (for example `task` or `bug`) and the description already contains measurable acceptance criteria and a minimal implementation sketch, consider it "ready" and mark planning complete.
+  - If the work item already has child features/tasks that cover the intended scope (use `wl list --parent <work-item-id> --json` and compare), and those children are adequate and idempotent, skip full planning and mark `plan_complete`.
+  - If a concise plan block already exists in the work item (for example a labeled "Plan:" or a short numbered feature list with acceptance criteria), treat that as sufficient evidence to skip the full interview.
+- If the checks indicate planning is not needed, update the work item to record the decision and advance the stage:
+  - `wl update <work-item-id> --stage plan_complete --json`
+  - Optionally add a comment documenting the reason: `wl comment add <work-item-id> "Plan auto-complete: work item appears sufficiently sized/defined for direct implementation." --actor Map --json`
+- If evidence is borderline or key uncertainties remain, proceed with the normal planning process (ask clarifying questions rather than auto-completing).
+
+
+
 1. Fetch & summarise (agent responsibility)
 
 - Run `wl show <work-item-id> --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing child tasks and plan info.
