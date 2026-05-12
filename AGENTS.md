@@ -62,7 +62,7 @@ Follow thhe steps below when completing tasks. If you are already working on a s
        - If the build or any tests/checks fail, fix the issues and repeat until all tests/checks pass
      - Commit changes whenever the Producer observes that a significant amount of progress has been made (ask if you think it is due), use clear commit messages that reference the WIP id and summarise the changes made.
    - If a particularly complex issue is identified or a significant design decisions or assumption is made record this in a comment on the work-item using `wl comment add <WIP-id> --comment "<detailed-comment>" --author <your-agent-name> --json`
-   - Once the acceptance criteria of <WIP-id> has been satisfied and all tests pass (meaning you have built the project and run all tests), Commit final changes to the branch with a message such as `<WIP-id>: Completed work to satisfy acceptance criteria: <acceptance-criteria-summary>`
+   - Once the acceptance criteria of <WIP-id> has been satisfied and all tests pass (meaning you have built the project, rebuilt the application, and run all tests successfully), commit final changes to the branch with a message such as `<WIP-id>: Completed work to satisfy acceptance criteria: <acceptance-criteria-summary>`
    - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
    - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
    - Report back to the operator summarising the work completed and proceed to the next step.
@@ -103,6 +103,7 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - When writing content for work-item descriptions, comments, or commit messages, do not escape special character EXCEPT backticks. Use markdown formatting as needed for clarity and readability, but do not add unnecessary escaping that could reduce readability or cause confusion.
 - Never commit changes without associating them with a work item
 - Never commit changes without ensuring all tests and quality checks pass
+- Before reporting coding work as done (for example marking a work-item ready for review or closing it locally), agents MUST rebuild the application and run the full test suite locally, confirming the build completes successfully and there are no failing tests or runtime errors.
 - Always record the commit message and hash of any commits made in a comment on the relevant work item(s)
 - Whenever a comment is made add a comment to impacted the work item(s) describing the changes, the files affected, and including the commit hash.
 - If push fails, resolve and retry until it succeeds
