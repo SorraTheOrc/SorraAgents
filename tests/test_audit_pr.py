@@ -76,7 +76,7 @@ def test_run_audit_dry_run(tmp_path):
 def test_record_audit_text_dry_run(tmp_path):
     ok = audit_pr.record_audit_text('SA-TEST', '---AUDIT---\nOK', dry_run=True)
     assert ok
-    fpath = os.path.join('.opencode', 'tmp', 'audit-SA-TEST.txt')
+    fpath = os.path.join('.pi', 'tmp', 'audit-SA-TEST.txt')
     assert os.path.exists(fpath)
     assert 'AUDIT' in open(fpath).read()
 

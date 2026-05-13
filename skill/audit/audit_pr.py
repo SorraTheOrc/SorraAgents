@@ -103,7 +103,7 @@ def create_ephemeral_checkout(owner: str, repo: str, pr_number: int, head_ref: O
     - If dry_run is False the function attempts a minimal clone into a tempdir and checks out the PR head.
     - The function is conservative and cleans up partially created dirs on error.
     """
-    base = os.path.abspath(os.path.join('.opencode', 'tmp'))
+    base = os.path.abspath(os.path.join('.pi', 'tmp'))
     os.makedirs(base, exist_ok=True)
     dest = os.path.join(base, f'pr-{owner}-{repo}-{pr_number}')
 
@@ -136,7 +136,7 @@ def run_build_test(path: str, build_cmd: str, timeout: int = 600, dry_run: bool 
 
     In dry_run mode the function returns (0, <proposed-log-path>) without running commands.
     """
-    logs_dir = os.path.abspath(os.path.join('.opencode', 'tmp', 'logs'))
+    logs_dir = os.path.abspath(os.path.join('.pi', 'tmp', 'logs'))
     os.makedirs(logs_dir, exist_ok=True)
     safe_name = os.path.basename(path).replace('/', '_')
     log_path = os.path.join(logs_dir, f'{safe_name}.log')
@@ -173,17 +173,17 @@ def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bo
     with the worktree as cwd so the audit skill can inspect the code. If `opencode` is not available
     the function will attempt to fall back to a direct `wl` invocation if appropriate.
     """
-    logs_dir = os.path.abspath(os.path.join('.opencode', 'tmp', 'logs'))
+    logs_dir = os.path.abspath(os.path.join('.pi', 'tmp', 'logs'))
     os.makedirs(logs_dir, exist_ok=True)
     safe_name = os.path.basename(path).replace('/', '_')
     log_path = os.path.join(logs_dir, f'audit-{safe_name}.log')
 
     if dry_run:
         with open(log_path, 'w') as f:
-            f.write(f'DRY-RUN: would run `opencode run "/audit {wl_id}"` in {path}\n')
+            f.write(f'DRY-RUN: would run `pi run "/audit {wl_id}"` in {path}\n')
         return 0, log_path
 
-    cmd = ['opencode', 'run', f"/audit {wl_id}"]
+    cmd = ['pi', 'run', f"/audit {wl_id}"]
     try:
         proc = subprocess.run(cmd, cwd=path, capture_output=True, text=True, timeout=timeout)
         with open(log_path, 'w') as f:
@@ -195,7 +195,7 @@ def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bo
     except FileNotFoundError:
         # opencode not installed; record error
         with open(log_path, 'w') as f:
-            f.write('opencode CLI not found in PATH\n')
+            f.write('pi CLI not found in PATH\n')
         return 127, log_path
     except subprocess.TimeoutExpired:
         with open(log_path, 'w') as f:
@@ -210,10 +210,10 @@ def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bo
 def record_audit_text(wl_id: str, audit_text: str, dry_run: bool = True) -> bool:
     """Record the structured audit text on the work item using the `wl` CLI.
 
-    In dry_run mode the function writes a local file under .opencode/tmp and returns True.
+    In dry_run mode the function writes a local file under .pi/tmp and returns True.
     """
     if dry_run:
-        outpath = os.path.abspath(os.path.join('.opencode', 'tmp', f'audit-{wl_id}.txt'))
+        outpath = os.path.abspath(os.path.join('.pi', 'tmp', f'audit-{wl_id}.txt'))
         os.makedirs(os.path.dirname(outpath), exist_ok=True)
         with open(outpath, 'w') as f:
             f.write(audit_text)
