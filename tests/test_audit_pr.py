@@ -33,8 +33,7 @@ def test_detect_build_command(tmp_path, monkeypatch):
     assert audit_pr.detect_build_command(str(cwd)) == 'npm test'
     (cwd / 'package.json').unlink()
     # pyproject
-    (cwd / 'pyproject.toml').write_text('[tool]
-')
+    (cwd / 'pyproject.toml').write_text('[tool]\n')
     assert audit_pr.detect_build_command(str(cwd)) == 'pytest'
 
 
