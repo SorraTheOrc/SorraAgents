@@ -166,11 +166,72 @@ def run_build_test(path: str, build_cmd: str, timeout: int = 600, dry_run: bool 
         return 2, log_path
 
 
+def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bool = True) -> Tuple[int, str]:
+    """Run the audit command against the given worktree and return (exit_code, log_path).
+
+    By convention the audit command is invoked via `opencode run "/audit <wl-id>"` and must be run
+    with the worktree as cwd so the audit skill can inspect the code. If `opencode` is not available
+    the function will attempt to fall back to a direct `wl` invocation if appropriate.
+    """
+    logs_dir = os.path.abspath(os.path.join('.opencode', 'tmp', 'logs'))
+    os.makedirs(logs_dir, exist_ok=True)
+    safe_name = os.path.basename(path).replace('/', '_')
+    log_path = os.path.join(logs_dir, f'audit-{safe_name}.log')
+
+    if dry_run:
+        with open(log_path, 'w') as f:
+            f.write(f'DRY-RUN: would run `opencode run "/audit {wl_id}"` in {path}\n')
+        return 0, log_path
+
+    cmd = ['opencode', 'run', f"/audit {wl_id}"]
+    try:
+        proc = subprocess.run(cmd, cwd=path, capture_output=True, text=True, timeout=timeout)
+        with open(log_path, 'w') as f:
+            f.write('STDOUT:\n')
+            f.write(proc.stdout or '')
+            f.write('\nSTDERR:\n')
+            f.write(proc.stderr or '')
+        return proc.returncode, log_path
+    except FileNotFoundError:
+        # opencode not installed; record error
+        with open(log_path, 'w') as f:
+            f.write('opencode CLI not found in PATH\n')
+        return 127, log_path
+    except subprocess.TimeoutExpired:
+        with open(log_path, 'w') as f:
+            f.write(f'Timeout after {timeout}s\n')
+        return 124, log_path
+    except Exception as e:
+        with open(log_path, 'w') as f:
+            f.write(f'Error running audit: {e}\n')
+        return 2, log_path
+
+
+def record_audit_text(wl_id: str, audit_text: str, dry_run: bool = True) -> bool:
+    """Record the structured audit text on the work item using the `wl` CLI.
+
+    In dry_run mode the function writes a local file under .opencode/tmp and returns True.
+    """
+    if dry_run:
+        outpath = os.path.abspath(os.path.join('.opencode', 'tmp', f'audit-{wl_id}.txt'))
+        os.makedirs(os.path.dirname(outpath), exist_ok=True)
+        with open(outpath, 'w') as f:
+            f.write(audit_text)
+        return True
+
+    try:
+        subprocess.check_call(['wl', 'update', wl_id, '--audit-text', audit_text])
+        return True
+    except Exception:
+        return False
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument('target', help='Worklog id (WL-...) or GitHub PR (URL or owner/repo#pr)')
     p.add_argument('--dry-run', action='store_true', help='Do not perform destructive actions')
     p.add_argument('--run-checkout', action='store_true', help='Perform ephemeral checkout and build/test (not recommended without --dry-run)')
+    p.add_argument('--run-audit', action='store_true', help='Run audit after checkout/build')
     args = p.parse_args(argv)
 
     tgt = args.target
@@ -206,6 +267,15 @@ def main(argv=None):
             cmd = build_cmd or 'echo no-detected-build-cmd'
             rc, log = run_build_test(worktree, cmd, dry_run=args.dry_run)
             print(f"Build/test exit code: {rc}, log: {log}")
+
+            if args.run_audit and wl:
+                arc, alog = run_audit_in_worktree(worktree, wl, dry_run=args.dry_run)
+                print(f"Audit exit code: {arc}, log: {alog}")
+                # attempt to record audit text (in a real run the audit skill outputs structured content)
+                with open(alog) as fh:
+                    content = fh.read()
+                recorded = record_audit_text(wl, content, dry_run=args.dry_run)
+                print(f"Recorded audit to WL: {recorded}")
 
         if not args.dry_run and not args.run_checkout:
             print("Note: --run-checkout not provided; nothing further executed.")

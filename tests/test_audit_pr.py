@@ -66,5 +66,20 @@ def test_run_build_test_real(tmp_path):
     assert 'hello' in content
 
 
+def test_run_audit_dry_run(tmp_path):
+    rc, log = audit_pr.run_audit_in_worktree(str(tmp_path), 'SA-TEST', dry_run=True)
+    assert rc == 0
+    content = open(log).read()
+    assert 'DRY-RUN' in content
+
+
+def test_record_audit_text_dry_run(tmp_path):
+    ok = audit_pr.record_audit_text('SA-TEST', '---AUDIT---\nOK', dry_run=True)
+    assert ok
+    fpath = os.path.join('.opencode', 'tmp', 'audit-SA-TEST.txt')
+    assert os.path.exists(fpath)
+    assert 'AUDIT' in open(fpath).read()
+
+
 if __name__ == '__main__':
     pytest.main([__file__])
