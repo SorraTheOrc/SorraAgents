@@ -43,5 +43,28 @@ def test_gh_get_pr_no_gh(monkeypatch):
     assert audit_pr.gh_get_pr('owner', 'repo', 1) is None
 
 
+def test_create_ephemeral_checkout_dry_run(tmp_path):
+    dest = audit_pr.create_ephemeral_checkout('owner', 'repo', 123, 'branch', dry_run=True)
+    assert 'pr-owner-repo-123' in dest
+    # dry-run must not create the directory
+    assert not os.path.exists(dest)
+
+
+def test_run_build_test_dry_run(tmp_path):
+    rc, log = audit_pr.run_build_test(str(tmp_path), 'echo hi', dry_run=True)
+    assert rc == 0
+    assert os.path.exists(log)
+    content = open(log).read()
+    assert 'DRY-RUN' in content
+
+
+def test_run_build_test_real(tmp_path):
+    # run a simple command that prints to stdout
+    rc, log = audit_pr.run_build_test(str(tmp_path), 'echo hello', dry_run=False)
+    assert rc == 0
+    content = open(log).read()
+    assert 'hello' in content
+
+
 if __name__ == '__main__':
     pytest.main([__file__])
