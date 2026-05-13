@@ -225,6 +225,22 @@ def record_audit_text(wl_id: str, audit_text: str, dry_run: bool = True) -> bool
         return False
 
 
+def append_audit_comment(wl_id: str, audit_text: str, dry_run: bool = True) -> bool:
+    """Append a human-readable AMPA audit comment to the work item."""
+    comment = f"# AMPA Audit Result\n\n{audit_text}"
+    if dry_run:
+        outpath = os.path.abspath(os.path.join('.pi', 'tmp', f'audit-comment-{wl_id}.md'))
+        os.makedirs(os.path.dirname(outpath), exist_ok=True)
+        with open(outpath, 'w') as f:
+            f.write(comment)
+        return True
+    try:
+        subprocess.check_call(['wl', 'comment', 'add', wl_id, '--comment', comment, '--author', 'ampa-audit'])
+        return True
+    except Exception:
+        return False
+
+
 def create_wl_from_pr(pr: PRInfo, dry_run: bool = True) -> Optional[str]:
     """Create a WL work item from PR metadata and return the new WL id."""
     title = f"Audit PR flow follow-up: {pr.title or f'PR #{pr.number}'}"
@@ -311,6 +327,30 @@ def merge_pr(owner: str, repo: str, number: int, dry_run: bool = True) -> bool:
         return False
 
 
+def extract_structured_audit_text(raw_output: str) -> str:
+    """Extract structured audit report text from marker-delimited output.
+
+    If markers are not present, return the original text unchanged.
+    """
+    start_marker = '--- AUDIT REPORT START ---'
+    end_marker = '--- AUDIT REPORT END ---'
+    if start_marker in raw_output and end_marker in raw_output:
+        start = raw_output.index(start_marker) + len(start_marker)
+        end = raw_output.index(end_marker, start)
+        return raw_output[start:end].strip()
+    return raw_output
+
+
+def summarize_unmet_criteria(report_text: str) -> list[str]:
+    """Best-effort extraction of unmet/partial criteria lines from audit table rows."""
+    lines = []
+    for line in report_text.splitlines():
+        # Table rows look like: | 1 | criterion | unmet | evidence |
+        if line.strip().startswith('|') and ('| unmet |' in line.lower() or '| partial |' in line.lower()):
+            lines.append(line.strip())
+    return lines
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument('target', help='Worklog id (WL-...) or GitHub PR (URL or owner/repo#pr)')
@@ -372,15 +412,22 @@ def main(argv=None):
                 arc, alog = run_audit_in_worktree(worktree, wl, dry_run=args.dry_run)
                 print(f"Audit exit code: {arc}, log: {alog}")
                 with open(alog) as fh:
-                    content = fh.read()
-                recorded = record_audit_text(wl, content, dry_run=args.dry_run)
-                print(f"Recorded audit to WL: {recorded}")
-                audit_ok = (arc == 0 and recorded)
+                    raw_content = fh.read()
+                structured_content = extract_structured_audit_text(raw_content)
+                recorded = record_audit_text(wl, structured_content, dry_run=args.dry_run)
+                commented = append_audit_comment(wl, structured_content, dry_run=args.dry_run)
+                print(f"Recorded audit to WL: {recorded}, comment appended: {commented}")
+                audit_ok = (arc == 0 and recorded and commented)
                 if not audit_ok:
+                    unmet = summarize_unmet_criteria(structured_content)
                     print(
                         "Audit did not pass. Still on PR branch/worktree context. "
                         "Please provide next steps."
                     )
+                    if unmet:
+                        print("Unmet/partial criteria evidence:")
+                        for row in unmet:
+                            print(f"  {row}")
 
         checks = gh_get_pr_checks(owner, repo, number)
         if args.offer_merge:
