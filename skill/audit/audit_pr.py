@@ -20,9 +20,8 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 WL_ID_RE = re.compile(r"\b([A-Z]+-[0-9A-Z]+)\b")
 PR_URL_RE = re.compile(r"https?://github.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)")
@@ -169,9 +168,9 @@ def run_build_test(path: str, build_cmd: str, timeout: int = 600, dry_run: bool 
 def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bool = True) -> Tuple[int, str]:
     """Run the audit command against the given worktree and return (exit_code, log_path).
 
-    By convention the audit command is invoked via `opencode run "/audit <wl-id>"` and must be run
-    with the worktree as cwd so the audit skill can inspect the code. If `opencode` is not available
-    the function will attempt to fall back to a direct `wl` invocation if appropriate.
+    By convention the audit command is invoked via `pi run "/audit <wl-id>"` and must be run
+    with the worktree as cwd so the audit skill can inspect the code. If `pi` is not available
+    the function returns an executable-not-found code in the audit log.
     """
     logs_dir = os.path.abspath(os.path.join('.pi', 'tmp', 'logs'))
     os.makedirs(logs_dir, exist_ok=True)
@@ -226,12 +225,102 @@ def record_audit_text(wl_id: str, audit_text: str, dry_run: bool = True) -> bool
         return False
 
 
+def create_wl_from_pr(pr: PRInfo, dry_run: bool = True) -> Optional[str]:
+    """Create a WL work item from PR metadata and return the new WL id."""
+    title = f"Audit PR flow follow-up: {pr.title or f'PR #{pr.number}'}"
+    description = (
+        f"Created from GitHub PR {pr.owner}/{pr.repo}#{pr.number}.\n\n"
+        f"PR title: {pr.title}\n\n"
+        f"PR body:\n{pr.body}\n"
+    )
+
+    if dry_run:
+        return "SA-DRYRUN"
+
+    try:
+        out = subprocess.check_output([
+            'wl', 'create', '--title', title, '--description', description,
+            '--issue-type', 'task', '--priority', 'medium', '--json'
+        ], text=True)
+        data = json.loads(out)
+        return data.get('workItem', {}).get('id')
+    except Exception:
+        return None
+
+
+def resolve_wl_for_pr(pr: PRInfo, explicit_wl: Optional[str] = None, allow_create: bool = False, dry_run: bool = True) -> Tuple[Optional[str], str]:
+    """Resolve WL id for a PR using explicit id, title/body extraction, or optional create flow.
+
+    Returns (wl_id, resolution_note).
+    """
+    if explicit_wl:
+        return explicit_wl, 'provided-explicitly'
+
+    wl = extract_wl_id(pr.title) or extract_wl_id(pr.body)
+    if wl:
+        return wl, 'resolved-from-pr-metadata'
+
+    if allow_create:
+        created = create_wl_from_pr(pr, dry_run=dry_run)
+        if created:
+            return created, 'created-from-pr'
+        return None, 'create-failed'
+
+    return None, 'unresolved-needs-user-input'
+
+
+def gh_get_pr_checks(owner: str, repo: str, number: int) -> Dict[str, Any]:
+    """Get PR check/merge readiness summary using gh.
+
+    Returns dict with keys:
+      checks_ok (bool|None), merge_state (str), raw (dict)
+    """
+    try:
+        out = subprocess.check_output([
+            'gh', 'pr', 'view', str(number), '--repo', f'{owner}/{repo}', '--json',
+            'mergeStateStatus,statusCheckRollup'
+        ], text=True)
+        data = json.loads(out)
+        rollup = data.get('statusCheckRollup') or []
+        # If no checks are present, return None (unknown)
+        if not rollup:
+            checks_ok = None
+        else:
+            conclusions = [
+                (item.get('conclusion') or '').upper()
+                for item in rollup if isinstance(item, dict)
+            ]
+            checks_ok = all(c in ('SUCCESS', 'NEUTRAL', 'SKIPPED') for c in conclusions if c)
+        return {
+            'checks_ok': checks_ok,
+            'merge_state': data.get('mergeStateStatus', ''),
+            'raw': data,
+        }
+    except Exception:
+        return {'checks_ok': None, 'merge_state': '', 'raw': {}}
+
+
+def merge_pr(owner: str, repo: str, number: int, dry_run: bool = True) -> bool:
+    """Merge PR via gh. Requires explicit confirmation by caller."""
+    if dry_run:
+        return True
+    try:
+        subprocess.check_call(['gh', 'pr', 'merge', str(number), '--repo', f'{owner}/{repo}', '--merge'])
+        return True
+    except Exception:
+        return False
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument('target', help='Worklog id (WL-...) or GitHub PR (URL or owner/repo#pr)')
     p.add_argument('--dry-run', action='store_true', help='Do not perform destructive actions')
     p.add_argument('--run-checkout', action='store_true', help='Perform ephemeral checkout and build/test (not recommended without --dry-run)')
     p.add_argument('--run-audit', action='store_true', help='Run audit after checkout/build')
+    p.add_argument('--wl-id', help='Explicit WL id to use for PR flow')
+    p.add_argument('--allow-create-wl', action='store_true', help='Allow creating a WL item when PR metadata has no WL id')
+    p.add_argument('--offer-merge', action='store_true', help='Print merge offer when checks pass')
+    p.add_argument('--confirm-merge', action='store_true', help='Actually perform merge after offer and checks pass')
     args = p.parse_args(argv)
 
     tgt = args.target
@@ -251,11 +340,19 @@ def main(argv=None):
     prinfo = gh_get_pr(owner, repo, number)
     if prinfo:
         print(f"PR title: {prinfo.title}")
-        wl = extract_wl_id(prinfo.title) or extract_wl_id(prinfo.body)
+        wl, wl_resolution = resolve_wl_for_pr(
+            prinfo,
+            explicit_wl=args.wl_id,
+            allow_create=args.allow_create_wl,
+            dry_run=args.dry_run,
+        )
         if wl:
-            print(f"Found WL id in PR metadata: {wl}")
+            print(f"WL resolution: {wl_resolution} -> {wl}")
         else:
-            print("No WL id found in PR title/body. Operator must be prompted (not implemented in scaffold).")
+            print(
+                "WL resolution: unresolved-needs-user-input. "
+                "Please provide --wl-id or rerun with --allow-create-wl to create one."
+            )
 
         build_cmd = detect_build_command()
         print(f"Suggested build/test command: {build_cmd}")
@@ -263,19 +360,43 @@ def main(argv=None):
         worktree = create_ephemeral_checkout(owner, repo, number, prinfo.head_ref, dry_run=args.dry_run or not args.run_checkout)
         print(f"Ephemeral checkout path: {worktree}")
 
+        build_ok = False
+        audit_ok = False
         if args.run_checkout:
             cmd = build_cmd or 'echo no-detected-build-cmd'
             rc, log = run_build_test(worktree, cmd, dry_run=args.dry_run)
             print(f"Build/test exit code: {rc}, log: {log}")
+            build_ok = (rc == 0)
 
             if args.run_audit and wl:
                 arc, alog = run_audit_in_worktree(worktree, wl, dry_run=args.dry_run)
                 print(f"Audit exit code: {arc}, log: {alog}")
-                # attempt to record audit text (in a real run the audit skill outputs structured content)
                 with open(alog) as fh:
                     content = fh.read()
                 recorded = record_audit_text(wl, content, dry_run=args.dry_run)
                 print(f"Recorded audit to WL: {recorded}")
+                audit_ok = (arc == 0 and recorded)
+                if not audit_ok:
+                    print(
+                        "Audit did not pass. Still on PR branch/worktree context. "
+                        "Please provide next steps."
+                    )
+
+        checks = gh_get_pr_checks(owner, repo, number)
+        if args.offer_merge:
+            checks_ok = checks.get('checks_ok')
+            if build_ok and audit_ok and (checks_ok in (True, None)):
+                print(
+                    "Code appears ready. Offer: merge this PR into main and push. "
+                    "Run with --confirm-merge to proceed."
+                )
+                if args.confirm_merge:
+                    merged = merge_pr(owner, repo, number, dry_run=args.dry_run)
+                    print(f"Merge executed: {merged}")
+            else:
+                print(
+                    "Merge offer withheld: build/tests and audit must pass, and checks must be green/unknown."
+                )
 
         if not args.dry_run and not args.run_checkout:
             print("Note: --run-checkout not provided; nothing further executed.")

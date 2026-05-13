@@ -13,6 +13,7 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 - User asks general project status (e.g., "What is the current status?", "Status of the project?", "status", "audit the project", "audit").
 - User asks about a specific work item id (e.g., "What is the status of wl-123?", "status wl-123", "audit wl-123").
+- User asks to audit a GitHub PR (URL or owner/repo#number). In PR mode, resolve the related work item from PR title/body or prompt/offer creation, check out the PR branch, run build/tests and audit there, then offer merge only when everything passes.
 
 ## Best Practices
 
@@ -25,9 +26,9 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 ## Steps
 
-1. Detect whether the user provided a work item id in the request.
+1. Detect whether the user provided a work item id or a GitHub PR reference in the request.
 
-2. If no work item id is provided complete this step, otherwise skip to step 3:
+2. If neither a work item id nor a PR reference is provided complete this step, otherwise skip to step 3:
 
 - Run `wl list --json` to fetch work items in JSON format to get more information, but do not display it.
 - Present a one line summary of the overall project status based on the JSON data. Including:
@@ -39,7 +40,7 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 Skip to step 6.
 
-3. If a work item id is provided:
+3. If a work item id is provided (or resolved from PR metadata):
 
 - Run `wl show <work-item-id> --children --json` to fetch work item details (with all comments and children).
 - Extract the acceptance criteria from the description (they are usually in a markdown section starting with `## Acceptance Criteria` or `### Acceptance Criteria` and formatted as a numbered or bulleted list).
@@ -122,6 +123,9 @@ Ready to close: Yes/No
 
 ## Notes
 
+- In PR mode, run commands from the checked-out PR worktree and use `pi run "/audit <work-item-id>"` for audit invocation.
+- If audit fails in PR mode, explicitly state that you are still on the PR branch/worktree and ask for next steps.
+- If build/tests and audit pass in PR mode, offer merge into main and push, but require explicit confirmation before executing merge.
 - Keep the output concise and actionable for quick human consumption.
 - Handle errors gracefully: if `wl` or any other command is not available or return invalid JSON, present a helpful error and possible remediation steps.
 - The depth of code review is critical: read implementation files, check function signatures, verify test coverage, and assess edge cases. Do not just check that files exist.

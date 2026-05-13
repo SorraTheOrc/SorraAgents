@@ -81,5 +81,58 @@ def test_record_audit_text_dry_run(tmp_path):
     assert 'AUDIT' in open(fpath).read()
 
 
+def test_resolve_wl_for_pr_from_metadata():
+    pr = audit_pr.PRInfo(owner='o', repo='r', number=1, title='Fix SA-12345 bug', body='details')
+    wl, note = audit_pr.resolve_wl_for_pr(pr)
+    assert wl == 'SA-12345'
+    assert note == 'resolved-from-pr-metadata'
+
+
+def test_resolve_wl_for_pr_create_dry_run():
+    pr = audit_pr.PRInfo(owner='o', repo='r', number=2, title='No WL here', body='body')
+    wl, note = audit_pr.resolve_wl_for_pr(pr, allow_create=True, dry_run=True)
+    assert wl == 'SA-DRYRUN'
+    assert note == 'created-from-pr'
+
+
+def test_resolve_wl_for_pr_unresolved():
+    pr = audit_pr.PRInfo(owner='o', repo='r', number=3, title='No WL here', body='body')
+    wl, note = audit_pr.resolve_wl_for_pr(pr, allow_create=False)
+    assert wl is None
+    assert note == 'unresolved-needs-user-input'
+
+
+def test_gh_get_pr_checks_fallback(monkeypatch):
+    monkeypatch.setattr(subprocess, 'check_output', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
+    result = audit_pr.gh_get_pr_checks('o', 'r', 1)
+    assert result['checks_ok'] is None
+
+
+def test_merge_pr_dry_run():
+    assert audit_pr.merge_pr('o', 'r', 1, dry_run=True) is True
+
+
+def test_resolve_wl_for_pr_explicit_wl():
+    pr = audit_pr.PRInfo(owner='o', repo='r', number=4, title='No wl')
+    wl, note = audit_pr.resolve_wl_for_pr(pr, explicit_wl='SA-EXPLICIT')
+    assert wl == 'SA-EXPLICIT'
+    assert note == 'provided-explicitly'
+
+
+def test_gh_get_pr_checks_parses_rollup(monkeypatch):
+    payload = {
+        'mergeStateStatus': 'CLEAN',
+        'statusCheckRollup': [
+            {'conclusion': 'SUCCESS'},
+            {'conclusion': 'NEUTRAL'},
+        ],
+    }
+
+    monkeypatch.setattr(subprocess, 'check_output', lambda *a, **k: json.dumps(payload))
+    result = audit_pr.gh_get_pr_checks('o', 'r', 9)
+    assert result['checks_ok'] is True
+    assert result['merge_state'] == 'CLEAN'
+
+
 if __name__ == '__main__':
     pytest.main([__file__])
