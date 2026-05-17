@@ -120,24 +120,15 @@ def _resolve_model(cli_model: str | None, config_model: str | None) -> str:
     return DEFAULT_MODEL
 
 
-def _build_remediation_prompt(findings: Iterable[CriterionResult], audit_text: str = "") -> str:
+def _build_remediation_prompt(audit_text: str) -> str:
     """Build a prompt for the implement step that addresses audit failures.
 
     Includes the full audit text so the agent can see the detailed evidence
-    and reasoning, plus a structured list of unmet/partial criteria.
+    and reasoning. The agent already knows how to read the audit format.
     """
-    items = list(findings)
-    if not items and not audit_text:
+    if not audit_text:
         return ""
-    lines = ["The previous audit found issues that need to be fixed. Address these problems:"]
-    if items:
-        for idx, finding in enumerate(items, start=1):
-            lines.append(f"{idx}. [{finding.verdict}] {finding.text} ({finding.evidence})")
-    if audit_text:
-        lines.append("")
-        lines.append("Full audit report:")
-        lines.append(audit_text)
-    return "\n".join(lines)
+    return "The previous audit found issues. Address all the gaps identified in the audit.\n\n" + audit_text
 
 
 def _parse_pi_json_line(line: str) -> tuple[str, bool, str | None]:
@@ -656,7 +647,7 @@ class RalphLoop:
                     "merge_executed": self.confirm_merge,
                 }
 
-            remediation = _build_remediation_prompt(audit.unmet_or_partial, audit_text=audit_output)
+            remediation = _build_remediation_prompt(audit_output)
             logger.info(
                 "ralph.loop.remediate target=%s attempt=%d unmet_count=%d remediation_len=%d",
                 target_id, attempt, len(audit.unmet_or_partial), len(remediation),
