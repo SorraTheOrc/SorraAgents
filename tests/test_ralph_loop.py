@@ -128,7 +128,7 @@ def test_retry_path_uses_remediation_in_next_implement_prompt():
     assert result["status"] == "success"
     implement_prompts = [c[-1] for c in runner.calls if c[0] == "pi" and "-p" in c and c[-1].startswith("implement")]
     assert len(implement_prompts) == 2
-    assert "retry loop" in implement_prompts[1]
+    assert "Address all the gaps identified in the audit" in implement_prompts[1]
 
 
 def test_cancel_file_stops_loop():

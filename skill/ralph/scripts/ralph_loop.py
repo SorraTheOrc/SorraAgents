@@ -120,15 +120,9 @@ def _resolve_model(cli_model: str | None, config_model: str | None) -> str:
     return DEFAULT_MODEL
 
 
-def _build_remediation_prompt(audit_text: str) -> str:
-    """Build a prompt for the implement step that addresses audit failures.
-
-    Includes the full audit text so the agent can see the detailed evidence
-    and reasoning. The agent already knows how to read the audit format.
-    """
-    if not audit_text:
-        return ""
-    return "The previous audit found issues. Address all the gaps identified in the audit.\n\n" + audit_text
+def _build_remediation_prompt() -> str:
+    """Build a prompt for the implement step that addresses audit failures."""
+    return "The previous audit found issues. Address all the gaps identified in the audit."
 
 
 def _parse_pi_json_line(line: str) -> tuple[str, bool, str | None]:
@@ -647,16 +641,11 @@ class RalphLoop:
                     "merge_executed": self.confirm_merge,
                 }
 
-            remediation = _build_remediation_prompt(audit_output)
+            remediation = _build_remediation_prompt()
             logger.info(
-                "ralph.loop.remediate target=%s attempt=%d unmet_count=%d remediation_len=%d",
-                target_id, attempt, len(audit.unmet_or_partial), len(remediation),
+                "ralph.loop.remediate target=%s attempt=%d unmet_count=%d",
+                target_id, attempt, len(audit.unmet_or_partial),
             )
-            if not remediation:
-                logger.warning(
-                    "ralph.loop.no_remediation target=%s attempt=%d — audit found no unmet criteria but ready_to_close is False",
-                    target_id, attempt,
-                )
 
         logger.warning("ralph.loop.max_attempts target=%s", target_id)
         return {"status": "max_attempts", "attempt": self.max_attempts, "scope": scope_ids}
