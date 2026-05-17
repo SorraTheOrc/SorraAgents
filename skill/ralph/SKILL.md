@@ -26,5 +26,5 @@ Use this skill when the operator asks to run `ralph <work-item-id>`.
 Run deterministic script:
 
 ```bash
-python skill/ralph/scripts/ralph_loop.py <work-item-id> [--max-attempts 10] [--check-cmd "pytest -q"] [--confirm-merge]
+python skill/ralph/scripts/ralph_loop.py <work-item-id> [--max-attempts 10] [--check-cmd "pytest -q"] [--confirm-merge] [--verbose] [--quiet]
 ```

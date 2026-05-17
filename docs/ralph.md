@@ -26,6 +26,7 @@ python skill/ralph/scripts/ralph_loop.py <work-item-id> [options]
 | `--confirm-merge` | off | Execute `git fetch`, `git merge --ff-only`, `git push` after successful audit and checks. **Without this flag, no merge side effects occur.** |
 | `--cancel-file` | (none) | Path checked each attempt; if the file exists, the loop stops with status `cancelled`. |
 | `--quiet` | off | Suppress console progress output; only print the final JSON result. |
+| `--verbose` | off | Show detailed delegation commands, subprocess stdout/stderr, and raw audit output. |
 | `--pi-bin` | `pi` | Path to the `pi` binary for delegating implement and audit. |
 | `--wl-bin` | `wl` | Path to the `wl` binary for worklog operations. |
 
@@ -56,6 +57,25 @@ Ralph will **never** merge or push without explicit operator confirmation:
 By default, ralph prints structured progress messages to the console using the `ralph` Python logger at INFO level. Each lifecycle event (start, attempt, audit, remediate, merge, cancel, max_attempts) is reported so the operator can see what's happening during long-running loops.
 
 Use `--quiet` to suppress progress output and only see the final JSON result — useful when invoking ralph from scripts.
+
+Use `--verbose` to see detailed delegation information, including:
+
+- Every `wl` and `pi` command before it runs
+- Subprocess output (first 300–500 chars of stdout/stderr for check and merge commands)
+- Pi run prompts and the start of their output
+- Raw audit output (first 500 chars) and parsed criteria details
+- Comment counts and result keys from worklog commands
+
+Typical `--verbose` output includes:
+
+```
+DEBUG ralph ralph.cmd.wl.show cmd=['wl', 'show', 'SA-1234', '--json', '--children']
+DEBUG ralph ralph.cmd.wl.show result_keys=['success', 'workItem', 'children']
+DEBUG ralph ralph.cmd.pi.run prompt_len=142 prompt_start=implement SA-1234\nTarget scope includes direct children only: SA-5678.\nContinue...
+DEBUG ralph ralph.cmd.pi.run stdout_len=2048 stdout_start=Audit report...
+DEBUG ralph ralph.loop.audit.raw_output target=SA-1234 attempt=1 len=2048 output_start=Ready to close: No...
+DEBUG ralph ralph.loop.audit.parsed target=SA-1234 attempt=1 ready=False criteria_count=3 unmet=2
+```
 
 ## Observability
 

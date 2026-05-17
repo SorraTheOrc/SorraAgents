@@ -104,6 +104,7 @@ class RalphLoop:
         max_attempts: int = 10,
         confirm_merge: bool = False,
         cancel_file: str | None = None,
+        verbose: bool = False,
     ):
         self.runner = runner or _default_runner
         self.pi_bin = pi_bin
@@ -112,46 +113,68 @@ class RalphLoop:
         self.confirm_merge = confirm_merge
         self.cancel_file = cancel_file
         self.check_cmds = check_cmds or []
+        self.verbose = verbose
 
     def _wl_show(self, work_item_id: str, children: bool = False) -> dict:
         cmd = [self.wl_bin, "show", work_item_id, "--json"]
         if children:
             cmd.insert(3, "--children")
-        return _run_json(self.runner, cmd)
+        logger.debug("ralph.cmd.wl.show cmd=%s", cmd)
+        result = _run_json(self.runner, cmd)
+        if self.verbose:
+            logger.debug("ralph.cmd.wl.show result_keys=%s", list(result.keys()) if isinstance(result, dict) else type(result).__name__)
+        return result
 
     def _wl_comment_list(self, work_item_id: str) -> list[dict]:
-        data = _run_json(self.runner, [self.wl_bin, "comment", "list", work_item_id, "--json"])
-        return data.get("comments", [])
+        cmd = [self.wl_bin, "comment", "list", work_item_id, "--json"]
+        logger.debug("ralph.cmd.wl.comment_list cmd=%s", cmd)
+        data = _run_json(self.runner, cmd)
+        comments = data.get("comments", [])
+        if self.verbose:
+            logger.debug("ralph.cmd.wl.comment_list count=%d", len(comments))
+        return comments
 
     def _wl_comment_add(self, work_item_id: str, comment: str) -> None:
-        _run_json(
-            self.runner,
-            [
-                self.wl_bin,
-                "comment",
-                "add",
-                work_item_id,
-                "--author",
-                "ralph",
-                "--comment",
-                comment,
-                "--json",
-            ],
-        )
+        cmd = [
+            self.wl_bin,
+            "comment",
+            "add",
+            work_item_id,
+            "--author",
+            "ralph",
+            "--comment",
+            comment,
+            "--json",
+        ]
+        logger.debug("ralph.cmd.wl.comment_add target=%s comment_len=%d", work_item_id, len(comment))
+        _run_json(self.runner, cmd)
 
     def _wl_update_audit(self, work_item_id: str, audit_text: str) -> None:
-        _run_json(self.runner, [self.wl_bin, "update", work_item_id, "--audit-text", audit_text, "--json"])
+        cmd = [self.wl_bin, "update", work_item_id, "--audit-text", audit_text, "--json"]
+        logger.debug("ralph.cmd.wl.update_audit target=%s text_len=%d", work_item_id, len(audit_text))
+        _run_json(self.runner, cmd)
 
     def _run_pi(self, prompt: str) -> str:
-        proc = self.runner([self.pi_bin, "run", prompt])
+        cmd = [self.pi_bin, "run", prompt]
+        logger.debug("ralph.cmd.pi.run prompt_len=%d prompt_start=%s", len(prompt), prompt[:120])
+        proc = self.runner(cmd)
         if proc.returncode != 0:
+            if self.verbose:
+                logger.debug("ralph.cmd.pi.run stderr=%s", proc.stderr.strip()[:500])
             raise RalphError(f"pi run failed: {proc.stderr.strip()}")
+        if self.verbose:
+            logger.debug("ralph.cmd.pi.run stdout_len=%d stdout_start=%s", len(proc.stdout), proc.stdout[:500])
         return proc.stdout
 
     def _run_checks(self) -> None:
         for cmd in self.check_cmds:
+            logger.debug("ralph.cmd.check cmd=%s", cmd)
             proc = self.runner(["bash", "-lc", cmd])
+            if self.verbose:
+                logger.debug("ralph.cmd.check stdout=%s", proc.stdout.strip()[:300])
             if proc.returncode != 0:
+                if self.verbose:
+                    logger.debug("ralph.cmd.check stderr=%s", proc.stderr.strip()[:300])
                 raise RalphError(f"Check failed ({cmd}): {proc.stderr.strip() or proc.stdout.strip()}")
 
     def _run_merge(self) -> None:
@@ -162,8 +185,13 @@ class RalphLoop:
             ["git", "merge", "--ff-only", "origin/main"],
             ["git", "push", "origin", "HEAD"],
         ):
+            logger.debug("ralph.cmd.merge step=%s", shlex.join(cmd))
             proc = self.runner(cmd)
+            if self.verbose:
+                logger.debug("ralph.cmd.merge stdout=%s", proc.stdout.strip()[:300])
             if proc.returncode != 0:
+                if self.verbose:
+                    logger.debug("ralph.cmd.merge stderr=%s", proc.stderr.strip()[:500])
                 raise RalphError(f"Merge step failed ({' '.join(cmd)}): {proc.stderr.strip()}")
 
     def _append_ampa_comment_once(self, work_item_id: str, audit_text: str) -> None:
@@ -231,9 +259,13 @@ class RalphLoop:
 
             logger.info("ralph.loop.audit.start target=%s attempt=%d", target_id, attempt)
             audit_output = self._run_pi(f"/audit {target_id}")
+            if self.verbose:
+                logger.debug("ralph.loop.audit.raw_output target=%s attempt=%d len=%d output_start=%s", target_id, attempt, len(audit_output), audit_output[:500])
             self._wl_update_audit(target_id, audit_output)
             self._append_ampa_comment_once(target_id, audit_output)
             audit = parse_audit_report(audit_output)
+            if self.verbose:
+                logger.debug("ralph.loop.audit.parsed target=%s attempt=%d ready=%s criteria_count=%d unmet=%d", target_id, attempt, audit.ready_to_close, len(audit.criteria), len(audit.unmet_or_partial))
 
             logger.info(
                 "ralph.loop.audit.complete target=%s attempt=%d ready=%s unmet=%d",
@@ -268,6 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirm-merge", action="store_true", help="Execute merge/push steps after successful audit")
     parser.add_argument("--cancel-file", default=None, help="Path checked each attempt; if present, stop loop")
     parser.add_argument("--quiet", action="store_true", help="Suppress console progress output (only print final JSON result)")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed delegation commands and subprocess output")
     parser.add_argument("--pi-bin", default="pi")
     parser.add_argument("--wl-bin", default="wl")
     return parser
@@ -277,13 +310,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Configure console logging so the operator sees progress.
-    # Use --quiet to suppress progress and only see the final JSON result.
+    # Configure console logging based on verbosity.
+    #   --quiet    : WARNING only, no progress output
+    #   (default)  : INFO — lifecycle progress (attempt, audit, merge)
+    #   --verbose  : DEBUG — adds delegated commands, subprocess output, raw audit
     if not args.quiet:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
         logging.getLogger("ralph").addHandler(handler)
-    logging.getLogger("ralph").setLevel(logging.INFO)
+    if args.verbose:
+        logging.getLogger("ralph").setLevel(logging.DEBUG)
+    else:
+        logging.getLogger("ralph").setLevel(logging.INFO)
 
     loop = RalphLoop(
         pi_bin=args.pi_bin,
@@ -292,6 +330,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_attempts=args.max_attempts,
         confirm_merge=args.confirm_merge,
         cancel_file=args.cancel_file,
+        verbose=args.verbose,
     )
     try:
         result = loop.run(args.work_item_id)

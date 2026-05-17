@@ -262,6 +262,15 @@ def test_cli_parser_accepts_all_flags():
     assert args.quiet is True
     assert args.pi_bin == "/usr/local/bin/pi"
     assert args.wl_bin == "/usr/local/bin/wl"
+    assert args.verbose is False
+
+
+def test_cli_parser_verbose_flag():
+    from skill.ralph.scripts.ralph_loop import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["SA-X2", "--verbose"])
+    assert args.verbose is True
 
 
 def test_main_returns_error_on_precondition_failure():
@@ -319,3 +328,33 @@ def test_audit_text_written_via_wl_update():
     assert len(update_calls) >= 1
     audit_text_idx = update_calls[0].index("--audit-text")
     assert update_calls[0][audit_text_idx + 1] == AUDIT_PASS
+
+
+def test_verbose_mode_logs_pi_output_start():
+    """Verbose=True causes DEBUG-level logs for pi run stdout."""
+    import logging
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logger = logging.getLogger("ralph")
+    logger.addHandler(handler)
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+
+    try:
+        runner = FakeRunner()
+        runner.audit_outputs = [AUDIT_PASS]
+        loop = RalphLoop(runner=runner, verbose=True)
+        loop.run("SA-TARGET")
+
+        debug_msgs = [r for r in records if r.levelno == logging.DEBUG]
+        pi_debug_msgs = [r for r in debug_msgs if "ralph.cmd.pi.run" in r.getMessage()]
+        # Should have at least implement and audit pi.run debug logs
+        assert len(pi_debug_msgs) >= 2
+        # Check that stdout_start is logged (the implement output)
+        stdout_msgs = [r for r in pi_debug_msgs if "stdout_start" in r.getMessage()]
+        assert len(stdout_msgs) >= 1
+    finally:
+        logger.setLevel(old_level)
+        logger.removeHandler(handler)
