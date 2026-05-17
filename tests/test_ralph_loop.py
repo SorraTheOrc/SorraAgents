@@ -571,3 +571,49 @@ def test_extract_text_from_json_output():
 
     # Empty input
     assert _extract_text_from_json_output("") == ""
+
+
+def test_wl_update_audit_uses_file_for_large_text():
+    """When audit text exceeds _MAX_ARG_LEN, ralph uses --audit-file with a temp file."""
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+    # Create audit text larger than _MAX_ARG_LEN
+    large_audit = "Ready to close: Yes\n" + "x" * (RalphLoop._MAX_ARG_LEN + 1)
+    loop._wl_update_audit("SA-TARGET", large_audit)
+    # The runner should have been called with --audit-file
+    calls = [c for c in runner.calls if c[0] == "wl" and "update" in c]
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert "--audit-file" in cmd
+    # The temp file should have been cleaned up (no lingering files)
+
+
+def test_wl_update_audit_uses_inline_for_small_text():
+    """When audit text is small, ralph uses --audit-text inline."""
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+    loop._wl_update_audit("SA-TARGET", "Ready to close: Yes")
+    calls = [c for c in runner.calls if c[0] == "wl" and "update" in c]
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert "--audit-text" in cmd
+    assert "--audit-file" not in cmd
+
+
+def test_wl_comment_add_truncates_large_comment():
+    """When a comment exceeds _MAX_ARG_LEN, it is truncated with a note."""
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+    large_comment = "x" * (RalphLoop._MAX_ARG_LEN + 1000)
+    loop._wl_comment_add("SA-TARGET", large_comment)
+    calls = [c for c in runner.calls if c[0] == "wl" and "comment" in c]
+    assert len(calls) == 1
+    cmd = calls[0]
+    # Find the comment argument (after --comment)
+    comment_idx = cmd.index("--comment")
+    comment_text = cmd[comment_idx + 1]
+    assert len(comment_text) < RalphLoop._MAX_ARG_LEN + 200  # includes truncation note
+    assert "truncated" in comment_text

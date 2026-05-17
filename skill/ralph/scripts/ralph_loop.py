@@ -264,7 +264,18 @@ class RalphLoop:
             logger.debug("ralph.cmd.wl.comment_list count=%d", len(comments))
         return comments
 
+    # Maximum argument size before we switch to temp-file or truncation (bytes)
+    # Linux ARG_MAX is typically 2MB, but we use a conservative threshold
+    # to leave headroom for other args, env vars, etc.
+    _MAX_ARG_LEN = 100_000  # 100 KB
+
     def _wl_comment_add(self, work_item_id: str, comment: str) -> None:
+        if len(comment) > self._MAX_ARG_LEN:
+            logger.info(
+                "ralph.cmd.wl.comment_add target=%s comment_len=%d truncating_to=%d",
+                work_item_id, len(comment), self._MAX_ARG_LEN,
+            )
+            comment = comment[: self._MAX_ARG_LEN] + "\n\n... [comment truncated; full audit text is stored in the work item audit field]"
         cmd = [
             self.wl_bin,
             "comment",
@@ -282,9 +293,27 @@ class RalphLoop:
         _run_json(self.runner, cmd)
 
     def _wl_update_audit(self, work_item_id: str, audit_text: str) -> None:
-        cmd = [self.wl_bin, "update", work_item_id, "--audit-text", audit_text, "--json"]
-        logger.debug("ralph.cmd.wl.update_audit target=%s text_len=%d", work_item_id, len(audit_text))
-        _run_json(self.runner, cmd)
+        if len(audit_text) > self._MAX_ARG_LEN:
+            self._wl_update_audit_via_file(work_item_id, audit_text)
+        else:
+            cmd = [self.wl_bin, "update", work_item_id, "--audit-text", audit_text, "--json"]
+            logger.debug("ralph.cmd.wl.update_audit target=%s text_len=%d", work_item_id, len(audit_text))
+            _run_json(self.runner, cmd)
+
+    def _wl_update_audit_via_file(self, work_item_id: str, audit_text: str) -> None:
+        """Write audit text to a temp file and use --audit-file to avoid arg length limits."""
+        import tempfile
+        import os
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write(audit_text)
+            f.flush()
+            tmp_path = f.name
+        try:
+            cmd = [self.wl_bin, "update", work_item_id, "--audit-file", tmp_path, "--json"]
+            logger.debug("ralph.cmd.wl.update_audit target=%s text_len=%d via_file=%s", work_item_id, len(audit_text), tmp_path)
+            _run_json(self.runner, cmd)
+        finally:
+            os.unlink(tmp_path)
 
     def _run_pi(self, prompt: str) -> str:
         cmd = [self.pi_bin, "-p", "--mode", "json", "--model", self.model, prompt]
