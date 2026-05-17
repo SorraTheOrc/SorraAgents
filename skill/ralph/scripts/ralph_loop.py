@@ -130,6 +130,61 @@ def _build_remediation_prompt(findings: Iterable[CriterionResult]) -> str:
     return "\n".join(lines)
 
 
+def _extract_text_from_json_line(line: str) -> str | None:
+    """Try to extract text content from a single JSON line from pi --mode json.
+
+    Pi with --mode json outputs one JSON object per line. Each object may
+    contain text content in various fields depending on the message type.
+    Returns the extracted text, or None if the line is not valid JSON.
+    """
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    # Common field names for text content in LLM streaming formats
+    for key in ("content", "text", "delta", "message"):
+        val = obj.get(key)
+        if isinstance(val, str):
+            return val
+        if isinstance(val, dict):
+            # Nested objects like {"delta": {"text": "..."}}
+            for inner_key in ("text", "content"):
+                inner_val = val.get(inner_key)
+                if isinstance(inner_val, str):
+                    return inner_val
+    # If no text field found, this might be a metadata/event line — skip it
+    return None
+
+
+def _extract_text_from_json_output(raw: str) -> str:
+    """Extract the full text content from pi --mode json -p output.
+
+    Parses the complete output (which may contain multiple JSON lines) and
+    concatenates all text content found. Falls back to returning the raw
+    string if no valid JSON is found.
+    """
+    parts: list[str] = []
+    found_json = False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        text = _extract_text_from_json_line(stripped)
+        if text is not None:
+            found_json = True
+            if text:
+                parts.append(text)
+        elif found_json:
+            # Inside JSON output but line wasn't parseable — skip
+            pass
+    if found_json and parts:
+        return "".join(parts)
+    # No JSON found — return raw output (backward compat for plain text)
+    return raw
+
+
 def _comment_hash(audit_text: str) -> str:
     return hashlib.sha256(audit_text.encode("utf-8")).hexdigest()[:16]
 
@@ -205,14 +260,12 @@ class RalphLoop:
         _run_json(self.runner, cmd)
 
     def _run_pi(self, prompt: str) -> str:
-        cmd = [self.pi_bin, "run", "--model", self.model, prompt]
+        cmd = [self.pi_bin, "-p", "--mode", "json", "--model", self.model, prompt]
         logger.debug("ralph.cmd.pi.run model=%s prompt_len=%d", self.model, len(prompt))
         if self.verbose:
             logger.debug("ralph.cmd.pi.run prompt_full=\n%s", prompt)
 
         if self.stream:
-            # Stream pi output to the console in real-time so the operator can
-            # see progress. Also captures the output for programmatic use.
             return self._stream_pi(cmd, prompt)
 
         proc = self.runner(cmd)
@@ -220,17 +273,17 @@ class RalphLoop:
             if self.verbose:
                 logger.debug("ralph.cmd.pi.run stderr=%s", proc.stderr.strip()[:1000])
             raise RalphError(f"pi run failed: {proc.stderr.strip()}")
+        text = _extract_text_from_json_output(proc.stdout)
         if self.verbose:
-            logger.debug("ralph.cmd.pi.run stdout_len=%d stdout_start=%s", len(proc.stdout), proc.stdout[:1000])
-        return proc.stdout
+            logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(text), text[:1000])
+        return text
 
     def _stream_pi(self, cmd: list[str], prompt: str) -> str:
-        """Run pi with real-time stdout streaming to the console.
+        """Run pi with --mode json and stream output to console in real-time.
 
-        Lines from pi's stdout are printed as they arrive so the operator can
-        follow progress during long-running implement/audit passes. The full
-        output is also captured and returned for programmatic use (e.g. audit
-        report parsing).
+        Each line from pi's stdout is a JSON object. We parse each line to
+        extract text content, print it to the console for the operator, and
+        accumulate the full text for the return value.
         """
         logger.info("ralph.cmd.pi.stream_start model=%s cmd_len=%d", self.model, len(cmd))
         try:
@@ -244,14 +297,24 @@ class RalphLoop:
         except FileNotFoundError:
             raise RalphError(f"pi binary not found: {self.pi_bin}")
 
-        output_lines: list[str] = []
+        text_parts: list[str] = []
         for line in process.stdout:
-            # Echo each line to the console so the operator sees progress
-            print(line, end="")
-            output_lines.append(line)
+            stripped = line.rstrip("\n")
+            if not stripped:
+                continue
+            # Try to parse as JSON and extract text content
+            text_delta = _extract_text_from_json_line(stripped)
+            if text_delta is not None:
+                # Parsed a JSON line — stream the text content to console
+                if text_delta:
+                    print(text_delta, flush=True)
+                text_parts.append(text_delta)
+            else:
+                # Not valid JSON — print raw line (backward compat)
+                print(line, end="", flush=True)
+                text_parts.append(line)
 
         process.wait()
-        stdout = "".join(output_lines)
         stderr = process.stderr.read()
 
         if process.returncode != 0:
@@ -259,11 +322,12 @@ class RalphLoop:
                 logger.debug("ralph.cmd.pi.run stderr=%s", stderr.strip()[:1000])
             raise RalphError(f"pi run failed: {stderr.strip()}")
 
+        full_text = "".join(text_parts)
         if self.verbose:
-            logger.debug("ralph.cmd.pi.run stdout_len=%d stdout_start=%s", len(stdout), stdout[:1000])
+            logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(full_text), full_text[:1000])
 
-        logger.info("ralph.cmd.pi.stream_end returncode=%d output_len=%d", process.returncode, len(stdout))
-        return stdout
+        logger.info("ralph.cmd.pi.stream_end returncode=%d text_len=%d", process.returncode, len(full_text))
+        return full_text
 
     def _run_checks(self) -> None:
         for cmd in self.check_cmds:

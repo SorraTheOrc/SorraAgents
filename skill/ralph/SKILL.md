@@ -15,8 +15,8 @@ Use this skill when the operator asks to run `ralph <work-item-id>`.
    - At `in_review`: skip the first implement pass and audit immediately. If audit fails, start the implement→audit loop.
 3. Scope is target + direct children only.
 4. Run iterative loop:
-   - delegate implement pass via `pi run "implement <id> ..."`
-   - run `pi run "/audit <id>"`
+   - delegate implement pass via `pi -p --mode json --model <model> "implement <id> ..."`
+   - run `pi -p --mode json --model <model> "/audit <id>"`
    - persist structured report via `wl update <id> --audit-text "..."`
    - append AMPA-style comment once per unique audit payload
    - if audit has unmet/partial criteria, feed remediation into next implement pass

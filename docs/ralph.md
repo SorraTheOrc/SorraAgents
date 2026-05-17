@@ -51,6 +51,13 @@ Ralph reads settings from a `.ralph.json` file in the current directory (or `ral
 }
 ```
 
+The file supports these keys:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `model` | string | Model ID passed to `pi -p --mode json --model <model>`. Overrides the default. |
+| `max_attempts` | integer | Default maximum implement→audit cycles. Overridden by `--max-attempts` CLI flag. |
+
 A config key like `"model"` sets the default model used for all `pi run` commands. Command-line `--model` overrides it.
 
 ## Exit Codes

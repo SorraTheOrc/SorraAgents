@@ -47,8 +47,9 @@ class FakeRunner:
         if cmd[:3] == ["wl", "update", "SA-TARGET"]:
             return Result(stdout='{"success":true}')
 
-        if cmd[0] == "pi" and cmd[1] == "run":
-            # Find the prompt: it's the last positional arg after flags like --model
+        if cmd[0] == "pi" and "-p" in cmd:
+            # pi -p --mode json --model <model> <prompt>
+            # Find the prompt: it's the last positional arg
             prompt = cmd[-1]
             if prompt.startswith("/audit"):
                 output = self.audit_outputs.pop(0)
@@ -125,7 +126,7 @@ def test_retry_path_uses_remediation_in_next_implement_prompt():
     result = loop.run("SA-TARGET")
 
     assert result["status"] == "success"
-    implement_prompts = [c[-1] for c in runner.calls if c[0] == "pi" and c[1] == "run" and c[-1].startswith("implement")]
+    implement_prompts = [c[-1] for c in runner.calls if c[0] == "pi" and "-p" in c and c[-1].startswith("implement")]
     assert len(implement_prompts) == 2
     assert "retry loop" in implement_prompts[1]
 
@@ -358,9 +359,9 @@ def test_verbose_mode_logs_pi_output_start():
         assert len(prompt_msgs) >= 1
         # The prompt should contain the implement instruction in full
         assert "Continue until scope items are in_review" in prompt_msgs[0].getMessage()
-        # stdout_start should be logged
-        stdout_msgs = [r for r in pi_debug_msgs if "stdout_start" in r.getMessage()]
-        assert len(stdout_msgs) >= 1
+        # text_start should be logged (the extracted text content)
+        text_msgs = [r for r in pi_debug_msgs if "text_start" in r.getMessage()]
+        assert len(text_msgs) >= 1
     finally:
         logger.setLevel(old_level)
         logger.removeHandler(handler)
@@ -402,7 +403,7 @@ def test_in_review_skips_first_implement():
 
     assert result["status"] == "success"
     # There should be NO implement calls, only an audit call
-    pi_calls = [c for c in runner.calls if c[0] == "pi" and c[1] == "run"]
+    pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
     implement_calls = [c for c in pi_calls if c[-1].startswith("implement")]
     audit_calls = [c for c in pi_calls if c[-1].startswith("/audit")]
     assert len(implement_calls) == 0, f"Expected no implement calls, got {implement_calls}"
@@ -422,7 +423,7 @@ def test_in_review_implement_after_failed_audit():
     assert result["attempt"] == 2
     # First attempt: audit only (skip implement)
     # Second attempt: implement + audit
-    pi_calls = [c for c in runner.calls if c[0] == "pi" and c[1] == "run"]
+    pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
     first_call = pi_calls[0][-1]
     assert first_call.startswith("/audit"), f"First call should be audit, got: {first_call[:60]}"
     second_call = pi_calls[1][-1]
@@ -432,19 +433,22 @@ def test_in_review_implement_after_failed_audit():
 
 
 def test_model_passed_to_pi_commands():
-    """The --model flag is passed through to pi run commands."""
+    """The --model flag is passed through to pi commands."""
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False, model="opencode-go/glm-5.1")
     loop.run("SA-TARGET")
 
-    pi_calls = [c for c in runner.calls if c[0] == "pi" and c[1] == "run"]
+    pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
     assert len(pi_calls) >= 1
-    # Command should include --model <model_value> before the prompt
+    # Command should include --model <model_value> and --mode json
     for call in pi_calls:
         assert "--model" in call, f"Expected --model in pi call: {call[:6]}"
         model_idx = call.index("--model")
         assert call[model_idx + 1] == "opencode-go/glm-5.1"
+        assert "--mode" in call, f"Expected --mode in pi call: {call[:6]}"
+        mode_idx = call.index("--mode")
+        assert call[mode_idx + 1] == "json"
 
 
 def test_default_model_is_used_when_none_specified():
@@ -482,3 +486,40 @@ def test_load_config_from_json_file(tmp_path):
         assert config["max_attempts"] == 5
     finally:
         os.chdir(original_cwd)
+
+
+def test_extract_text_from_json_line():
+    """_extract_text_from_json_line extracts text from various JSON shapes."""
+    from skill.ralph.scripts.ralph_loop import _extract_text_from_json_line
+
+    # Simple content field
+    assert _extract_text_from_json_line('{"content": "hello"}') == "hello"
+    # Text field
+    assert _extract_text_from_json_line('{"text": "world"}') == "world"
+    # Nested delta.text
+    assert _extract_text_from_json_line('{"delta": {"text": "hola"}}') == "hola"
+    # Delta.content
+    assert _extract_text_from_json_line('{"delta": {"content": "bonjour"}}') == "bonjour"
+    # Message field
+    assert _extract_text_from_json_line('{"message": "guten tag"}') == "guten tag"
+    # Non-JSON returns None
+    assert _extract_text_from_json_line("plain text line") is None
+    # JSON with no text field returns None (metadata line)
+    assert _extract_text_from_json_line('{"type": "tool_use", "id": "x"}') is None
+    # Empty string in content returns empty string (filtered by caller)
+    assert _extract_text_from_json_line('{"content": ""}') == ""
+
+
+def test_extract_text_from_json_output():
+    """_extract_text_from_json_output concatenates text from multiple JSON lines."""
+    from skill.ralph.scripts.ralph_loop import _extract_text_from_json_output
+
+    json_lines = '{"content": "Hello "}\n{"content": "World"}\n{"type": "metadata"}'
+    assert _extract_text_from_json_output(json_lines) == "Hello World"
+
+    # Plain text passthrough
+    plain = "Just a plain text response"
+    assert _extract_text_from_json_output(plain) == plain
+
+    # Empty input
+    assert _extract_text_from_json_output("") == ""
