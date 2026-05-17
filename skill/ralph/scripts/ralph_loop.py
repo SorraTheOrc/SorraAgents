@@ -13,6 +13,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 
@@ -105,6 +106,7 @@ class RalphLoop:
         confirm_merge: bool = False,
         cancel_file: str | None = None,
         verbose: bool = False,
+        stream: bool = True,
     ):
         self.runner = runner or _default_runner
         self.pi_bin = pi_bin
@@ -114,6 +116,10 @@ class RalphLoop:
         self.cancel_file = cancel_file
         self.check_cmds = check_cmds or []
         self.verbose = verbose
+        # When stream=True (default for production), pi subprocess output is
+        # echoed to stdout in real-time. When stream=False (tests), the mock
+        # runner is used instead.
+        self.stream = stream
 
     def _wl_show(self, work_item_id: str, children: bool = False) -> dict:
         cmd = [self.wl_bin, "show", work_item_id, "--json"]
@@ -162,6 +168,12 @@ class RalphLoop:
         logger.debug("ralph.cmd.pi.run prompt_len=%d", len(prompt))
         if self.verbose:
             logger.debug("ralph.cmd.pi.run prompt_full=\n%s", prompt)
+
+        if self.stream:
+            # Stream pi output to the console in real-time so the operator can
+            # see progress. Also captures the output for programmatic use.
+            return self._stream_pi(cmd, prompt)
+
         proc = self.runner(cmd)
         if proc.returncode != 0:
             if self.verbose:
@@ -170,6 +182,47 @@ class RalphLoop:
         if self.verbose:
             logger.debug("ralph.cmd.pi.run stdout_len=%d stdout_start=%s", len(proc.stdout), proc.stdout[:1000])
         return proc.stdout
+
+    def _stream_pi(self, cmd: list[str], prompt: str) -> str:
+        """Run pi with real-time stdout streaming to the console.
+
+        Lines from pi's stdout are printed as they arrive so the operator can
+        follow progress during long-running implement/audit passes. The full
+        output is also captured and returned for programmatic use (e.g. audit
+        report parsing).
+        """
+        logger.info("ralph.cmd.pi.stream_start cmd_len=%d", len(cmd))
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            raise RalphError(f"pi binary not found: {self.pi_bin}")
+
+        output_lines: list[str] = []
+        for line in process.stdout:
+            # Echo each line to the console so the operator sees progress
+            print(line, end="")
+            output_lines.append(line)
+
+        process.wait()
+        stdout = "".join(output_lines)
+        stderr = process.stderr.read()
+
+        if process.returncode != 0:
+            if self.verbose:
+                logger.debug("ralph.cmd.pi.run stderr=%s", stderr.strip()[:1000])
+            raise RalphError(f"pi run failed: {stderr.strip()}")
+
+        if self.verbose:
+            logger.debug("ralph.cmd.pi.run stdout_len=%d stdout_start=%s", len(stdout), stdout[:1000])
+
+        logger.info("ralph.cmd.pi.stream_end returncode=%d output_len=%d", process.returncode, len(stdout))
+        return stdout
 
     def _run_checks(self) -> None:
         for cmd in self.check_cmds:
@@ -303,8 +356,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-cmd", action="append", default=[], help="Build/test command to run on success")
     parser.add_argument("--confirm-merge", action="store_true", help="Execute merge/push steps after successful audit")
     parser.add_argument("--cancel-file", default=None, help="Path checked each attempt; if present, stop loop")
-    parser.add_argument("--quiet", action="store_true", help="Suppress console progress output (only print final JSON result)")
+    parser.add_argument("--quiet", action="store_true", help="Suppress console progress output and pi streaming (only print final JSON result)")
     parser.add_argument("--verbose", action="store_true", help="Show detailed delegation commands and subprocess output")
+    parser.add_argument("--no-stream", action="store_true", help="Don't stream pi subprocess output to console (use buffered capture instead)")
     parser.add_argument("--pi-bin", default="pi")
     parser.add_argument("--wl-bin", default="wl")
     return parser
@@ -315,9 +369,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     # Configure console logging based on verbosity.
-    #   --quiet    : WARNING only, no progress output
-    #   (default)  : INFO — lifecycle progress (attempt, audit, merge)
+    #   --quiet    : WARNING only, no progress, no pi streaming
+    #   (default)  : INFO — lifecycle progress (attempt, audit, merge) + pi streaming
     #   --verbose  : DEBUG — adds delegated commands, subprocess output, raw audit
+    #   --no-stream: disable pi stdout streaming (use buffered capture)
     if not args.quiet:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
@@ -335,6 +390,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         confirm_merge=args.confirm_merge,
         cancel_file=args.cancel_file,
         verbose=args.verbose,
+        stream=not args.quiet and not args.no_stream,
     )
     try:
         result = loop.run(args.work_item_id)

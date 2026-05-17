@@ -25,8 +25,9 @@ python skill/ralph/scripts/ralph_loop.py <work-item-id> [options]
 | `--check-cmd` | (none) | Build/test command(s) to run after a successful audit. Can be specified multiple times. |
 | `--confirm-merge` | off | Execute `git fetch`, `git merge --ff-only`, `git push` after successful audit and checks. **Without this flag, no merge side effects occur.** |
 | `--cancel-file` | (none) | Path checked each attempt; if the file exists, the loop stops with status `cancelled`. |
-| `--quiet` | off | Suppress console progress output; only print the final JSON result. |
+| `--quiet` | off | Suppress all console output and pi streaming; only print the final JSON result. |
 | `--verbose` | off | Show detailed delegation commands, subprocess stdout/stderr, and raw audit output. |
+| `--no-stream` | off | Don't stream pi subprocess output to console (use buffered capture). Progress logging still shown. |
 | `--pi-bin` | `pi` | Path to the `pi` binary for delegating implement and audit. |
 | `--wl-bin` | `wl` | Path to the `wl` binary for worklog operations. |
 
@@ -54,13 +55,20 @@ Ralph will **never** merge or push without explicit operator confirmation:
 
 ## Console Output
 
-By default, ralph prints structured progress messages to the console using the `ralph` Python logger at INFO level. Each lifecycle event (start, attempt, audit, remediate, merge, cancel, max_attempts) is reported so the operator can see what's happening during long-running loops.
+By default, ralph prints two kinds of output to the console:
 
-Use `--quiet` to suppress progress output and only see the final JSON result — useful when invoking ralph from scripts.
+1. **Structured progress messages** (logger at INFO level): lifecycle events like attempt start, audit result, merge decision, etc.
+2. **Pi subprocess streaming**: the stdout of `pi run` commands is echoed to the console in real-time, line by line, so you can see implement and audit progress as it happens.
 
-Use `--verbose` to see detailed delegation information, including:
+This means during an implement or audit pass, you'll see the pi agent's output appear in your terminal as it works — just as if you'd run `pi run` yourself.
 
-- Every `wl` and `pi` command before it runs
+Use `--quiet` to suppress all progress output and pi streaming — only the final JSON result is printed. Useful for scripted invocations.
+
+Use `--no-stream` to keep progress logging but disable pi output streaming (output is still captured, just not echoed to the console).
+
+Use `--verbose` to see detailed delegation information in addition to streaming:
+
+- Every `wl`, `pi`, `git`, and `bash` command before it runs
 - Subprocess output (first 1000 chars of stdout/stderr for check and merge commands)
 - Full pi run prompts (logged under `prompt_full`)
 - Pi run output (first 1000 chars)

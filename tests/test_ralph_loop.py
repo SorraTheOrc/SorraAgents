@@ -97,7 +97,7 @@ def test_parse_audit_report_extracts_readiness_and_rows():
 def test_precondition_requires_plan_complete():
     runner = FakeRunner()
     runner.items["SA-TARGET"]["stage"] = "in_progress"
-    loop = RalphLoop(runner=runner)
+    loop = RalphLoop(runner=runner, stream=False)
 
     with pytest.raises(RalphError):
         loop.run("SA-TARGET")
@@ -106,7 +106,7 @@ def test_precondition_requires_plan_complete():
 def test_happy_path_success_with_merge_offer_not_executed_without_confirm():
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, check_cmds=["pytest -q"], max_attempts=2, confirm_merge=False)
+    loop = RalphLoop(runner=runner, stream=False, check_cmds=["pytest -q"], max_attempts=2, confirm_merge=False)
 
     result = loop.run("SA-TARGET")
 
@@ -119,7 +119,7 @@ def test_happy_path_success_with_merge_offer_not_executed_without_confirm():
 def test_retry_path_uses_remediation_in_next_implement_prompt():
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_FAIL, AUDIT_PASS]
-    loop = RalphLoop(runner=runner, max_attempts=3)
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
 
     result = loop.run("SA-TARGET")
 
@@ -135,7 +135,7 @@ def test_cancel_file_stops_loop():
     with tempfile.TemporaryDirectory() as td:
         cancel_file = os.path.join(td, "cancel")
         open(cancel_file, "w", encoding="utf-8").close()
-        loop = RalphLoop(runner=runner, cancel_file=cancel_file)
+        loop = RalphLoop(runner=runner, stream=False, cancel_file=cancel_file)
         result = loop.run("SA-TARGET")
 
     assert result["status"] == "cancelled"
@@ -144,7 +144,7 @@ def test_cancel_file_stops_loop():
 def test_max_attempts_returns_max_attempts_status():
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL]
-    loop = RalphLoop(runner=runner, max_attempts=2)
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
 
     result = loop.run("SA-TARGET")
 
@@ -154,7 +154,7 @@ def test_max_attempts_returns_max_attempts_status():
 def test_confirm_merge_executes_git_steps():
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, confirm_merge=True)
+    loop = RalphLoop(runner=runner, stream=False, confirm_merge=True)
 
     result = loop.run("SA-TARGET")
 
@@ -168,7 +168,7 @@ def test_idempotent_audit_comment_append_skips_duplicate_hash():
     digest = _comment_hash(AUDIT_PASS)
     runner.comments = [{"comment": f"# AMPA Audit Result\naudit-hash:{digest}\n\n..."}]
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner)
+    loop = RalphLoop(runner=runner, stream=False)
 
     loop.run("SA-TARGET")
 
@@ -183,7 +183,7 @@ def test_changed_audit_appends_new_comment_not_duplicate():
     old_digest = _comment_hash(AUDIT_FAIL)
     runner.comments = [{"comment": f"# AMPA Audit Result\naudit-hash:{old_digest}\n\nold content"}]
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner)
+    loop = RalphLoop(runner=runner, stream=False)
 
     loop.run("SA-TARGET")
 
@@ -278,7 +278,7 @@ def test_main_returns_error_on_precondition_failure():
 
     runner = FakeRunner()
     runner.items["SA-TARGET"]["stage"] = "idea"
-    loop = RalphLoop(runner=runner)
+    loop = RalphLoop(runner=runner, stream=False)
 
     # Direct API call gives RalphError
     with pytest.raises(RalphError, match="plan_complete"):
@@ -295,7 +295,7 @@ class FakeRunnerWithPushFailure(FakeRunner):
 def test_merge_permission_failure_raises_ralph_error():
     runner = FakeRunnerWithPushFailure()
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, confirm_merge=True)
+    loop = RalphLoop(runner=runner, stream=False, confirm_merge=True)
 
     with pytest.raises(RalphError, match="Merge step failed"):
         loop.run("SA-TARGET")
@@ -311,7 +311,7 @@ class FakeRunnerWithCheckFailure(FakeRunner):
 def test_check_cmd_failure_raises_ralph_error():
     runner = FakeRunnerWithCheckFailure()
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, check_cmds=["pytest -q"])
+    loop = RalphLoop(runner=runner, stream=False, check_cmds=["pytest -q"])
 
     with pytest.raises(RalphError, match="Check failed"):
         loop.run("SA-TARGET")
@@ -320,7 +320,7 @@ def test_check_cmd_failure_raises_ralph_error():
 def test_audit_text_written_via_wl_update():
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner)
+    loop = RalphLoop(runner=runner, stream=False)
 
     loop.run("SA-TARGET")
 
@@ -345,7 +345,7 @@ def test_verbose_mode_logs_pi_output_start():
     try:
         runner = FakeRunner()
         runner.audit_outputs = [AUDIT_PASS]
-        loop = RalphLoop(runner=runner, verbose=True)
+        loop = RalphLoop(runner=runner, stream=False, verbose=True)
         loop.run("SA-TARGET")
 
         debug_msgs = [r for r in records if r.levelno == logging.DEBUG]
@@ -363,3 +363,27 @@ def test_verbose_mode_logs_pi_output_start():
     finally:
         logger.setLevel(old_level)
         logger.removeHandler(handler)
+
+
+def test_stream_pi_captures_and_returns_output():
+    """When stream=True (default), _stream_pi echoes lines to stdout and returns full output."""
+    import subprocess
+    from unittest.mock import patch, MagicMock
+
+    # Simulate a pi subprocess that produces two lines of output
+    fake_process = MagicMock()
+    fake_process.returncode = 0
+    fake_process.stdout = iter(["line 1\n", "line 2\n"])
+    fake_process.stderr = MagicMock()
+    fake_process.stderr.read.return_value = ""
+    fake_process.wait.return_value = None
+
+    captured_lines: list[str] = []
+
+    with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process):
+        loop = RalphLoop(verbose=False, stream=True)
+        # Override pi_bin to something that would exist
+        loop.pi_bin = "echo"
+        result = loop._stream_pi(["echo", "test"], "test prompt")
+
+    assert result == "line 1\nline 2\n"
