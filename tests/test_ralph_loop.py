@@ -542,22 +542,22 @@ def test_parse_pi_json_line_thinking_suppressed():
     from skill.ralph.scripts.ralph_loop import _parse_pi_json_line
 
     # thinking_delta: suppressed (not user-facing)
-    text, should_print = _parse_pi_json_line(
+    stream_text, should_print, complete_text = _parse_pi_json_line(
         '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"The user is asking me"}}'
     )
-    assert text == "" and should_print is False
+    assert stream_text == "" and should_print is False
 
     # thinking_start: suppressed
-    text, should_print = _parse_pi_json_line(
+    stream_text, should_print, complete_text = _parse_pi_json_line(
         '{"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}'
     )
-    assert text == "" and should_print is False
+    assert stream_text == "" and should_print is False
 
     # thinking_end: suppressed
-    text, should_print = _parse_pi_json_line(
+    stream_text, should_print, complete_text = _parse_pi_json_line(
         '{"type":"message_update","assistantMessageEvent":{"type":"thinking_end","contentIndex":0}}'
     )
-    assert text == "" and should_print is False
+    assert stream_text == "" and should_print is False
 
 
 def test_parse_pi_json_line_text_delta_shown():
@@ -565,24 +565,24 @@ def test_parse_pi_json_line_text_delta_shown():
     from skill.ralph.scripts.ralph_loop import _parse_pi_json_line
 
     # text_delta: additive, user-facing — should be printed
-    text, should_print = _parse_pi_json_line(
+    stream_text, should_print, complete_text = _parse_pi_json_line(
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"hello"}}'
     )
-    assert text == "hello"
+    assert stream_text == "hello"
     assert should_print is True
 
     # text_delta with longer content
-    text, should_print = _parse_pi_json_line(
+    stream_text, should_print, complete_text = _parse_pi_json_line(
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":" world"}}'
     )
-    assert text == " world"
+    assert stream_text == " world"
     assert should_print is True
 
     # text_delta with empty string: suppress
-    text, should_print = _parse_pi_json_line(
+    stream_text, should_print, complete_text = _parse_pi_json_line(
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":""}}'
     )
-    assert text == "" and should_print is False
+    assert stream_text == "" and should_print is False
 
 
 def test_parse_pi_json_line_metadata_suppressed():
@@ -598,23 +598,27 @@ def test_parse_pi_json_line_metadata_suppressed():
         '{"type":"message_start","message":{"role":"user"}}',
         '{"type":"message_end","message":{"role":"user"}}',
     ]:
-        text, should_print = _parse_pi_json_line(event_json)
-        assert text == "" and should_print is False, f"Failed for: {event_json[:60]}"
+        stream_text, should_print, complete_text = _parse_pi_json_line(event_json)
+        assert stream_text == "" and should_print is False, f"Failed for: {event_json[:60]}"
 
 
-def test_parse_pi_json_line_text_start_end_suppressed():
-    """text_start and text_end are structural — suppressed (not additive content)."""
+def test_parse_pi_json_line_text_start_end():
+    """text_start is suppressed; text_end returns complete content for return value."""
     from skill.ralph.scripts.ralph_loop import _parse_pi_json_line
 
-    text, should_print = _parse_pi_json_line(
+    # text_start: structural — suppressed
+    stream_text, should_print, complete_text = _parse_pi_json_line(
         '{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":1}}'
     )
-    assert text == "" and should_print is False
+    assert stream_text == "" and should_print is False
+    assert complete_text is None
 
-    text, should_print = _parse_pi_json_line(
-        '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":1}}'
+    # text_end: returns complete content block for return value
+    stream_text, should_print, complete_text = _parse_pi_json_line(
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":1,"content":"Hello World"}}'
     )
-    assert text == "" and should_print is False
+    assert stream_text == "" and should_print is False
+    assert complete_text == "Hello World"
 
 
 def test_parse_pi_json_line_fallback_for_unknown_json():
@@ -622,33 +626,51 @@ def test_parse_pi_json_line_fallback_for_unknown_json():
     from skill.ralph.scripts.ralph_loop import _parse_pi_json_line
 
     # Fallback: unknown type with content field
-    text, should_print = _parse_pi_json_line('{"type":"unknown","content":"hello"}')
-    assert text == "hello" and should_print is True
+    stream_text, should_print, complete_text = _parse_pi_json_line('{"type":"unknown","content":"hello"}')
+    assert stream_text == "hello" and should_print is True
 
     # Fallback: unknown type with no text → suppressed
-    text, should_print = _parse_pi_json_line('{"type":"unknown","id":"x"}')
-    assert text == "" and should_print is False
+    stream_text, should_print, complete_text = _parse_pi_json_line('{"type":"unknown","id":"x"}')
+    assert stream_text == "" and should_print is False
 
-    # Non-JSON line → (None, False) for fallback
-    text, should_print = _parse_pi_json_line("plain text line")
-    assert text is None and should_print is False
+    # Non-JSON line → (None, False, None) for fallback
+    stream_text, should_print, complete_text = _parse_pi_json_line("plain text line")
+    assert stream_text is None and should_print is False and complete_text is None
 
 
 def test_extract_text_from_json_output():
-    """_extract_text_from_json_output concatenates text_delta content from pi JSON."""
+    """_extract_text_from_json_output prefers text_end/agent_end over deltas."""
     from skill.ralph.scripts.ralph_loop import _extract_text_from_json_output
 
-    # Simulate pi JSON output with text_delta events
+    # Simulate pi JSON output with text_delta events (no text_end or agent_end)
     json_lines = '\n'.join([
         '{"type":"session","version":3}',
         '{"type":"agent_start"}',
         '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"internal thinking"}}',
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello "}}',
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"World"}}',
-        '{"type":"agent_end"}',
     ])
     # Only text_delta content is extracted, thinking and metadata are suppressed
     assert _extract_text_from_json_output(json_lines) == "Hello World"
+
+    # With text_end, the complete content replaces deltas
+    json_lines_with_end = '\n'.join([
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello"}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":" World"}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":1,"content":"Hello World"}}',
+    ])
+    # text_end provides complete content, preferred over deltas
+    assert _extract_text_from_json_output(json_lines_with_end) == "Hello World"
+
+    # With agent_end, the final message text is used (most authoritative)
+    json_lines_with_final = '\n'.join([
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Partial"}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":1,"content":"Partial text from single block"}}',
+        '{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"ignored"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"thought"},{"type":"text","text":"Final audit report text"}]}]}',
+    ])
+    result = _extract_text_from_json_output(json_lines_with_final)
+    # agent_end should take priority with the FINAL assistant text
+    assert "Final audit report text" in result
 
     # Plain text passthrough
     plain = "Just a plain text response"

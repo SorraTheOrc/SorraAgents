@@ -130,28 +130,33 @@ def _build_remediation_prompt(findings: Iterable[CriterionResult]) -> str:
     return "\n".join(lines)
 
 
-def _parse_pi_json_line(line: str) -> tuple[str, bool]:
+def _parse_pi_json_line(line: str) -> tuple[str, bool, str | None]:
     """Parse a single JSON line from pi --mode json and extract user-facing text.
 
     Pi's JSON streaming protocol uses typed events:
     - thinking_start/thinking_delta/thinking_end: internal reasoning (suppressed)
-    - text_start/text_delta/text_end: user-facing content (streamed additively)
-    - session/agent_start/agent_end/turn_start/turn_end/message_start/message_end: metadata (suppressed)
+    - text_delta: additive user-facing text (shown on console)
+    - text_end: complete content block (captured for return value)
+    - toolcall_start/delta/end: tool calls (suppressed)
+    - tool_execution_*: tool results (suppressed)
+    - session/agent_start/agent_end/turn_start/end/message_start/end: metadata
 
-    For text_delta events, the `delta` field is additive — it contains only the
-    new text since the last delta, so we print only the delta content.
+    For streaming, text_delta events are printed additively.
+    For the return value, text_end and agent_end events provide complete text
+    blocks that replace any accumulated deltas for that content index.
 
-    Returns a tuple of (text_delta, should_print):
-    - ("some text", True): additive text content to print to the console
-    - ("", False): metadata/thinking event — skip silently
-    - (None, False): not valid JSON — caller should fall back
+    Returns a tuple of (stream_text, should_print, complete_text):
+    - stream_text: text to print to console (additive delta for streaming)
+    - should_print: True if stream_text should be shown on console
+    - complete_text: if not None, a COMPLETE content block to use for the
+      final return value (replaces accumulated deltas for this content)
     """
     try:
         obj = json.loads(line)
     except (json.JSONDecodeError, ValueError):
-        return None, False
+        return None, False, None
     if not isinstance(obj, dict):
-        return None, False
+        return None, False, None
 
     event_type = obj.get("type", "")
 
@@ -160,68 +165,131 @@ def _parse_pi_json_line(line: str) -> tuple[str, bool]:
         assistant_event = obj.get("assistantMessageEvent")
         if isinstance(assistant_event, dict):
             inner_type = assistant_event.get("type", "")
-            # Text delta: additive user-facing text — this is what we show
+            # Text delta: additive user-facing text — stream to console
             if inner_type == "text_delta":
                 delta = assistant_event.get("delta", "")
                 if isinstance(delta, str) and delta:
-                    return delta, True
-                return "", False
-            # Thinking delta: internal reasoning — suppress
+                    return delta, True, None
+                return "", False, None
+            # Text end: complete content block — capture for return value
+            if inner_type == "text_end":
+                content = assistant_event.get("content", "")
+                if isinstance(content, str) and content:
+                    return "", False, content
+                return "", False, None
+            # Thinking events: suppress entirely
             if inner_type in ("thinking_start", "thinking_delta", "thinking_end"):
-                return "", False
-            # text_start, text_end: structural — suppress
-            if inner_type in ("text_start", "text_end"):
-                return "", False
-            # Other assistant events (tool_use, etc.) — suppress
-            return "", False
-        return "", False
+                return "", False, None
+            # Tool call events: suppress
+            if inner_type in ("toolcall_start", "toolcall_delta", "toolcall_end"):
+                return "", False, None
+            # text_start: structural — suppress (would duplicate delta)
+            if inner_type == "text_start":
+                return "", False, None
+            # Other assistant events — suppress
+            return "", False, None
+        return "", False, None
+
+    # --- Agent end: final message with complete content ---
+    if event_type == "agent_end":
+        messages = obj.get("messages", [])
+        if isinstance(messages, list):
+            complete_parts: list[str] = []
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("role") != "assistant":
+                    continue
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if text:
+                                complete_parts.append(text)
+                elif isinstance(content, str) and content:
+                    complete_parts.append(content)
+            if complete_parts:
+                return "", False, "\n".join(complete_parts)
+        return "", False, None
 
     # --- Structural events: suppress all ---
     if event_type in (
-        "session", "agent_start", "agent_end",
-        "turn_start", "turn_end",
+        "session", "agent_start", "turn_start", "turn_end",
         "message_start", "message_end",
     ):
-        return "", False
+        return "", False, None
+
+    # --- Tool execution events: suppress ---
+    if event_type in ("tool_execution_start", "tool_execution_update", "tool_execution_end"):
+        return "", False, None
 
     # --- Fallback: unknown JSON event types ---
-    # Try to extract text content from common fields as a last resort
     for key in ("content", "text", "delta"):
         val = obj.get(key)
         if isinstance(val, str) and val:
-            return val, True
+            return val, True, None
         if isinstance(val, dict):
             for inner_key in ("text", "content"):
                 inner_val = val.get(inner_key)
                 if isinstance(inner_val, str) and inner_val:
-                    return inner_val, True
+                    return inner_val, True, None
     # Valid JSON but no extractable user text
-    return "", False
+    return "", False, None
 
 
 def _extract_text_from_json_output(raw: str) -> str:
     """Extract the full user-facing text from pi --mode json -p output.
 
-    Parses the complete streamed output and concatenates all text_delta content
-    (the additive user-facing text). Falls back to returning the raw string if
-    no text content could be extracted from JSON.
+    Uses text_end and agent_end events (which contain complete content blocks)
+    as the primary source. Falls back to text_delta accumulation. If neither is
+    found, returns the raw output.
     """
-    parts: list[str] = []
+    delta_parts: list[str] = []
+    complete_blocks: list[str] = []
     found_json = False
+    has_agent_end = False
+
     for line in raw.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
-        text, should_print = _parse_pi_json_line(stripped)
-        if text is None:
+        stream_text, should_print, complete_text = _parse_pi_json_line(stripped)
+        if stream_text is None and complete_text is None:
             # Not valid JSON — skip during JSON parsing
             continue
         found_json = True
-        if should_print and text:
-            parts.append(text)
-    if found_json and parts:
-        return "".join(parts)
-    # No text content extracted from JSON — return raw output
+        if complete_text is not None:
+            complete_blocks.append(complete_text)
+            # Check if this came from an agent_end event — it contains the
+            # complete final messages and is the most authoritative source
+            try:
+                obj = json.loads(stripped)
+                if obj.get("type") == "agent_end":
+                    has_agent_end = True
+            except (json.JSONDecodeError, ValueError):
+                pass
+        elif should_print and stream_text:
+            delta_parts.append(stream_text)
+
+    # If we got an agent_end with complete text blocks, use those — they
+    # contain ALL assistant text blocks from the entire conversation
+    if has_agent_end and complete_blocks:
+        # Use only the last agent_end complete text (it's the full response)
+        # agent_end text is the most authoritative
+        return complete_blocks[-1]
+
+    # If we got text_end events with complete blocks, use those
+    if complete_blocks:
+        return "\n".join(complete_blocks)
+
+    # Fall back to accumulated deltas
+    if delta_parts:
+        return "".join(delta_parts)
+
+    # No text content extracted from JSON
+    if found_json:
+        return ""
     return raw
 
 
@@ -368,6 +436,7 @@ class RalphLoop:
             raise RalphError(f"pi binary not found: {self.pi_bin}")
 
         text_parts: list[str] = []
+        complete_blocks: list[str] = []
         json_lines_seen = 0
         text_lines_seen = 0
         for line in process.stdout:
@@ -375,26 +444,28 @@ class RalphLoop:
             if not stripped:
                 continue
             # Parse the JSON line using pi's streaming protocol
-            text, should_print = _parse_pi_json_line(stripped)
-            if text is not None:
-                # Successfully parsed as JSON
-                json_lines_seen += 1
-                if should_print and text:
-                    # User-facing additive text delta — show to operator
-                    print(text, end="", flush=True)
-                    text_parts.append(text)
-                    text_lines_seen += 1
-                # Metadata / thinking / structural events: skip silently
-                # In verbose mode, also log the raw JSON line
-                if self.verbose:
-                    logger.debug("ralph.cmd.pi.json_line %s", stripped[:500])
-            else:
+            stream_text, should_print, complete_text = _parse_pi_json_line(stripped)
+            if stream_text is None and complete_text is None:
                 # Not valid JSON — show raw line as fallback
                 print(line, end="", flush=True)
                 text_parts.append(line)
                 text_lines_seen += 1
                 if self.verbose:
                     logger.debug("ralph.cmd.pi.raw_line %s", stripped[:500])
+            elif stream_text is not None or complete_text is not None:
+                # Successfully parsed as JSON
+                json_lines_seen += 1
+                if should_print and stream_text:
+                    # User-facing additive text delta — show to operator
+                    print(stream_text, end="", flush=True)
+                    text_parts.append(stream_text)
+                    text_lines_seen += 1
+                if complete_text:
+                    # Complete content block — capture for return value
+                    complete_blocks.append(complete_text)
+                # In verbose mode, also log the raw JSON line
+                if self.verbose:
+                    logger.debug("ralph.cmd.pi.json_line %s", stripped[:500])
 
         process.wait()
         stderr = process.stderr.read()
@@ -404,15 +475,27 @@ class RalphLoop:
                 logger.debug("ralph.cmd.pi.run stderr=%s", stderr.strip()[:1000])
             raise RalphError(f"pi run failed: {stderr.strip()}")
 
+        # Prefer complete text blocks from text_end/agent_end events over
+        # accumulated deltas — they give us the full, assembled content
+        if complete_blocks:
+            full_text = "\n".join(complete_blocks)
+        else:
+            full_text = "".join(text_parts)
+
         # If JSON lines were seen but no text extracted, warn
-        if json_lines_seen > 0 and text_lines_seen == 0:
+        if json_lines_seen > 0 and text_lines_seen == 0 and not complete_blocks:
             logger.warning(
                 "ralph.cmd.pi.no_text_extracted json_lines=%d — "
                 "pi produced JSON but no user-facing text content was found",
                 json_lines_seen,
             )
+        elif json_lines_seen > 0 and len(full_text) < 50 and not complete_blocks:
+            logger.warning(
+                "ralph.cmd.pi.very_short_text json_lines=%d text_len=%d — "
+                "pi produced very little text content, audit may be incomplete",
+                json_lines_seen, len(full_text),
+            )
 
-        full_text = "".join(text_parts)
         if self.verbose:
             logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(full_text), full_text[:1000])
 
@@ -535,8 +618,8 @@ class RalphLoop:
                 logger.debug("ralph.loop.audit.parsed target=%s attempt=%d ready=%s criteria_count=%d unmet=%d", target_id, attempt, audit.ready_to_close, len(audit.criteria), len(audit.unmet_or_partial))
 
             logger.info(
-                "ralph.loop.audit.complete target=%s attempt=%d ready=%s unmet=%d",
-                target_id, attempt, audit.ready_to_close, len(audit.unmet_or_partial),
+                "ralph.loop.audit.complete target=%s attempt=%d ready=%s unmet=%d criteria=%d",
+                target_id, attempt, audit.ready_to_close, len(audit.unmet_or_partial), len(audit.criteria),
             )
 
             if audit.ready_to_close and self._scope_in_review(scope_ids):
@@ -553,7 +636,15 @@ class RalphLoop:
                 }
 
             remediation = _build_remediation_prompt(audit.unmet_or_partial)
-            logger.info("ralph.loop.remediate target=%s attempt=%d unmet_count=%d", target_id, attempt, len(audit.unmet_or_partial))
+            logger.info(
+                "ralph.loop.remediate target=%s attempt=%d unmet_count=%d remediation_len=%d",
+                target_id, attempt, len(audit.unmet_or_partial), len(remediation),
+            )
+            if not remediation:
+                logger.warning(
+                    "ralph.loop.no_remediation target=%s attempt=%d — audit found no unmet criteria but ready_to_close is False",
+                    target_id, attempt,
+                )
 
         logger.warning("ralph.loop.max_attempts target=%s", target_id)
         return {"status": "max_attempts", "attempt": self.max_attempts, "scope": scope_ids}
