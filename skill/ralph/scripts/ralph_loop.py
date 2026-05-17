@@ -191,26 +191,35 @@ def _parse_pi_json_line(line: str) -> tuple[str, bool, str | None]:
         return "", False, None
 
     # --- Agent end: final message with complete content ---
+    # Only extract text from the LAST assistant message — this is the final,
+    # authoritative response. Earlier assistant messages may contain tool calls
+    # or intermediate text that should not be included in the audit output.
     if event_type == "agent_end":
         messages = obj.get("messages", [])
         if isinstance(messages, list):
-            complete_parts: list[str] = []
-            for msg in messages:
+            # Find the last assistant message with text content
+            last_assistant_text: str | None = None
+            for msg in reversed(messages):
                 if not isinstance(msg, dict):
                     continue
                 if msg.get("role") != "assistant":
                     continue
                 content = msg.get("content", [])
                 if isinstance(content, list):
+                    parts: list[str] = []
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "text":
                             text = block.get("text", "")
                             if text:
-                                complete_parts.append(text)
+                                parts.append(text)
+                    if parts:
+                        last_assistant_text = "\n".join(parts)
+                        break
                 elif isinstance(content, str) and content:
-                    complete_parts.append(content)
-            if complete_parts:
-                return "", False, "\n".join(complete_parts)
+                    last_assistant_text = content
+                    break
+            if last_assistant_text:
+                return "", False, last_assistant_text
         return "", False, None
 
     # --- Structural events: suppress all ---
@@ -272,16 +281,16 @@ def _extract_text_from_json_output(raw: str) -> str:
         elif should_print and stream_text:
             delta_parts.append(stream_text)
 
-    # If we got an agent_end with complete text blocks, use those — they
-    # contain ALL assistant text blocks from the entire conversation
+    # If we got an agent_end with complete text, use it — it's the final
+    # authoritative response containing only the last assistant message's text.
     if has_agent_end and complete_blocks:
-        # Use only the last agent_end complete text (it's the full response)
-        # agent_end text is the most authoritative
+        # agent_end returns the last assistant message, which is the audit report
         return complete_blocks[-1]
 
-    # If we got text_end events with complete blocks, use those
+    # If we got text_end events with complete blocks, use only the LAST one —
+    # it's the final response. Earlier blocks may be intermediate text.
     if complete_blocks:
-        return "\n".join(complete_blocks)
+        return complete_blocks[-1]
 
     # Fall back to accumulated deltas
     if delta_parts:
@@ -476,9 +485,11 @@ class RalphLoop:
             raise RalphError(f"pi run failed: {stderr.strip()}")
 
         # Prefer complete text blocks from text_end/agent_end events over
-        # accumulated deltas — they give us the full, assembled content
+        # accumulated deltas — they give us the full, assembled content.
+        # Use only the LAST complete block — it's the final, authoritative
+        # response (earlier blocks may be intermediate text from tool-use turns).
         if complete_blocks:
-            full_text = "\n".join(complete_blocks)
+            full_text = complete_blocks[-1]
         else:
             full_text = "".join(text_parts)
 

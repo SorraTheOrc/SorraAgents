@@ -662,6 +662,16 @@ def test_extract_text_from_json_output():
     # text_end provides complete content, preferred over deltas
     assert _extract_text_from_json_output(json_lines_with_end) == "Hello World"
 
+    # With multiple text_end blocks, only the LAST one is used (the final response)
+    json_lines_multi = '\n'.join([
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":1,"content":"I will audit this item."}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":1,"content":"Ready to close: No\\n\\n| # | Criterion | Verdict | Evidence |\\n|---|-----------|---------|----------|\\n| 1 | Tests | unmet | No tests |"}}',
+    ])
+    result = _extract_text_from_json_output(json_lines_multi)
+    # Should return only the LAST text_end block (the audit report), not both
+    assert "Ready to close: No" in result
+    assert "I will audit this item" not in result
+
     # With agent_end, the final message text is used (most authoritative)
     json_lines_with_final = '\n'.join([
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Partial"}}',
@@ -669,8 +679,8 @@ def test_extract_text_from_json_output():
         '{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"ignored"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"thought"},{"type":"text","text":"Final audit report text"}]}]}',
     ])
     result = _extract_text_from_json_output(json_lines_with_final)
-    # agent_end should take priority with the FINAL assistant text
-    assert "Final audit report text" in result
+    # agent_end returns the LAST assistant message text
+    assert result == "Final audit report text"
 
     # Plain text passthrough
     plain = "Just a plain text response"
