@@ -250,6 +250,7 @@ def test_cli_parser_accepts_all_flags():
         "--check-cmd", "pytest",
         "--confirm-merge",
         "--cancel-file", "/tmp/cancel",
+        "--quiet",
         "--pi-bin", "/usr/local/bin/pi",
         "--wl-bin", "/usr/local/bin/wl",
     ])
@@ -258,6 +259,7 @@ def test_cli_parser_accepts_all_flags():
     assert args.check_cmd == ["pytest"]
     assert args.confirm_merge is True
     assert args.cancel_file == "/tmp/cancel"
+    assert args.quiet is True
     assert args.pi_bin == "/usr/local/bin/pi"
     assert args.wl_bin == "/usr/local/bin/wl"
 

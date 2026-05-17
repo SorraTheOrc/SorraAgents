@@ -25,6 +25,7 @@ python skill/ralph/scripts/ralph_loop.py <work-item-id> [options]
 | `--check-cmd` | (none) | Build/test command(s) to run after a successful audit. Can be specified multiple times. |
 | `--confirm-merge` | off | Execute `git fetch`, `git merge --ff-only`, `git push` after successful audit and checks. **Without this flag, no merge side effects occur.** |
 | `--cancel-file` | (none) | Path checked each attempt; if the file exists, the loop stops with status `cancelled`. |
+| `--quiet` | off | Suppress console progress output; only print the final JSON result. |
 | `--pi-bin` | `pi` | Path to the `pi` binary for delegating implement and audit. |
 | `--wl-bin` | `wl` | Path to the `wl` binary for worklog operations. |
 
@@ -49,6 +50,12 @@ Ralph will **never** merge or push without explicit operator confirmation:
 - Without `--confirm-merge`: ralph reports success and notes that merge is available, but performs **no git operations**.
 - With `--confirm-merge`: ralph executes `git fetch origin main`, `git merge --ff-only origin/main`, and `git push origin HEAD`.
 - If any git step fails (e.g., permission denied, push rejected), ralph raises a clear error.
+
+## Console Output
+
+By default, ralph prints structured progress messages to the console using the `ralph` Python logger at INFO level. Each lifecycle event (start, attempt, audit, remediate, merge, cancel, max_attempts) is reported so the operator can see what's happening during long-running loops.
+
+Use `--quiet` to suppress progress output and only see the final JSON result — useful when invoking ralph from scripts.
 
 ## Observability
 

@@ -267,6 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-cmd", action="append", default=[], help="Build/test command to run on success")
     parser.add_argument("--confirm-merge", action="store_true", help="Execute merge/push steps after successful audit")
     parser.add_argument("--cancel-file", default=None, help="Path checked each attempt; if present, stop loop")
+    parser.add_argument("--quiet", action="store_true", help="Suppress console progress output (only print final JSON result)")
     parser.add_argument("--pi-bin", default="pi")
     parser.add_argument("--wl-bin", default="wl")
     return parser
@@ -275,6 +276,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Configure console logging so the operator sees progress.
+    # Use --quiet to suppress progress and only see the final JSON result.
+    if not args.quiet:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+        logging.getLogger("ralph").addHandler(handler)
+    logging.getLogger("ralph").setLevel(logging.INFO)
 
     loop = RalphLoop(
         pi_bin=args.pi_bin,
