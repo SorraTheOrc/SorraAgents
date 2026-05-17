@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""Lint agent front-matter for required fields and allowed model values.
+"""Lint agent front-matter for required fields, allowed model values, wildcard permissions, and tool/boundary contradictions.
 
 Usage:
   scripts/agent_frontmatter_lint.py [--path agent] [--allowed-models-file file] [--format json]
+
+Checks:
+  - Required fields: description, mode, model, temperature
+  - Allowed model values and canonical mappings
+  - Wildcard bash permissions (flagged as warnings)
+  - Tool/boundary contradictions (flagged as warnings)
 
 Exits with code 0 if no errors found, 1 if warnings only, 2 if errors found.
 """
@@ -13,7 +19,7 @@ import yaml
 import re
 from pathlib import Path
 
-REQUIRED_FIELDS = ["description", "mode", "model"]
+REQUIRED_FIELDS = ["description", "mode", "model", "temperature"]
 # Allowed canonical models list. Keep this small and extendable.
 ALLOWED_MODELS = [
     "github-copilot/gpt-5.2",
@@ -31,13 +37,16 @@ MODEL_CANONICAL_MAP = {
 
 
 def extract_front_matter(text):
-    # Extract YAML between leading '---' pairs
+    """Extract YAML between leading '---' pairs.
+
+    Returns (fm_text, body_text) or (None, None) if no front-matter found.
+    """
     if not text.startswith("---"):
-        return None
+        return None, None
     parts = text.split("---", 2)
     if len(parts) < 3:
-        return None
-    return parts[1]
+        return None, None
+    return parts[1], parts[2]
 
 
 def find_agent_files(base):
@@ -47,7 +56,7 @@ def find_agent_files(base):
 
 def validate_file(path):
     text = Path(path).read_text(encoding="utf-8")
-    fm_text = extract_front_matter(text)
+    fm_text, body = extract_front_matter(text)
     if fm_text is None:
         return {"file": path, "errors": ["missing front-matter"], "warnings": []}
     try:
@@ -73,6 +82,38 @@ def validate_file(path):
                 errors.append(f"disallowed model value '{model}' (not in allowed list)")
     else:
         errors.append("model missing or empty")
+
+    # Wildcard bash permission detection
+    perm = data.get("permission") or {}
+    bash_perm = perm.get("bash") if isinstance(perm, dict) else None
+    if isinstance(bash_perm, dict):
+        if any(k == "*" for k in bash_perm.keys()):
+            # Check for documented justification in raw front-matter
+            if re.search(r"wildcard\-bash\-justification:", fm_text):
+                pass  # documented exception
+            else:
+                warnings.append("wildcard bash permission '*' detected; require justification")
+
+    # Tools vs boundaries contradiction detection (conservative)
+    tools = data.get("tools") or {}
+    write_allowed = bool(tools.get("write")) if isinstance(tools, dict) else False
+    boundaries_text = ""
+    if body:
+        m = re.search(r"\nBoundaries:\n(.*?)(\n\S|$)", body, re.S)
+        if m:
+            boundaries_text = m.group(1)
+        else:
+            idx = body.find("Boundaries:")
+            if idx != -1:
+                boundaries_text = body[idx:]
+    if write_allowed and boundaries_text:
+        if re.search(r"never (write|modify|commit|push)", boundaries_text, re.I):
+            # Check for documented justification in raw front-matter
+            if re.search(r"tools\-write\-contradiction\-justification:", fm_text):
+                pass  # documented exception
+            else:
+                warnings.append("tools.write=true but boundaries contain 'never write/modify' — possible contradiction")
+
     return {"file": path, "errors": errors, "warnings": warnings}
 
 

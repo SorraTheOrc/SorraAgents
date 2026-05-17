@@ -26,8 +26,8 @@ def find_agent_files(base: str = "agent") -> List[Path]:
     return sorted([x for x in p.glob("*.md") if x.is_file()])
 
 
-def extract_front_matter(text: str) -> Tuple[Dict, str]:
-    """Return (front_matter_dict, body_text). Raises ValueError on parse error."""
+def extract_front_matter(text: str) -> Tuple[Dict, str, str]:
+    """Return (front_matter_dict, body_text, raw_fm_text). Raises ValueError on parse error."""
     if not text.startswith("---"):
         raise ValueError("missing front-matter delimiters")
     parts = text.split("---", 2)
@@ -36,15 +36,20 @@ def extract_front_matter(text: str) -> Tuple[Dict, str]:
     fm_text = parts[1]
     body = parts[2]
     data = yaml.safe_load(fm_text) or {}
-    return data, body
+    return data, body, fm_text
 
 
-def validate_front_matter(data: Dict, body: str) -> Tuple[List[str], List[str]]:
+def validate_front_matter(data: Dict, body: str, fm_raw: str = "") -> Tuple[List[str], List[str]]:
     """Validate a single agent front-matter dict.
 
     Returns (errors, warnings).
     - errors: missing required fields, disallowed model values
-    - warnings: canonicalisation suggestions, wildcard permissions, tool/boundary contradictions
+    - warnings: canonicalisation suggestions, wildcard permissions (unless justified),
+      tool/boundary contradictions (unless justified)
+
+    Justification comments in the raw front-matter text suppress warnings:
+    - `wildcard-bash-justification:` suppresses wildcard bash permission warnings
+    - `tools-write-contradiction-justification:` suppresses tool/boundary contradiction warnings
     """
     errors: List[str] = []
     warnings: List[str] = []
@@ -75,7 +80,10 @@ def validate_front_matter(data: Dict, body: str) -> Tuple[List[str], List[str]]:
     if isinstance(bash_perm, dict):
         # look for wildcard key '*' or quoted '*' which YAML parses to '*'
         if any(k == "*" for k in bash_perm.keys()):
-            warnings.append("wildcard bash permission '*' detected; require justification")
+            if re.search(r"wildcard\-bash\-justification:", fm_raw):
+                pass  # documented exception
+            else:
+                warnings.append("wildcard bash permission '*' detected; require justification")
 
     # tools vs boundaries contradiction detection (conservative)
     tools = data.get("tools") or {}
@@ -93,7 +101,10 @@ def validate_front_matter(data: Dict, body: str) -> Tuple[List[str], List[str]]:
 
     if write_allowed and boundaries_text:
         if re.search(r"never (write|modify|commit|push)", boundaries_text, re.I):
-            warnings.append("tools.write=true but boundaries contain 'never write/modify' — possible contradiction")
+            if re.search(r"tools\-write\-contradiction\-justification:", fm_raw):
+                pass  # documented exception
+            else:
+                warnings.append("tools.write=true but boundaries contain 'never write/modify' — possible contradiction")
 
     return errors, warnings
 
@@ -102,16 +113,17 @@ def validate_all_agents(base: str = "agent") -> Dict[str, Dict]:
     """Run validation across all agent files and return a map of path -> {errors, warnings}.
 
     This is intentionally lightweight and conservative to avoid false positives.
+    Justification comments in front-matter suppress warnings: see validate_front_matter docstring.
     """
     files = find_agent_files(base)
     out = {}
     for p in files:
         txt = p.read_text(encoding="utf-8")
         try:
-            data, body = extract_front_matter(txt)
+            data, body, fm_raw = extract_front_matter(txt)
         except Exception as e:
             out[str(p)] = {"errors": [f"front-matter parse error: {e}"], "warnings": []}
             continue
-        errors, warnings = validate_front_matter(data, body)
+        errors, warnings = validate_front_matter(data, body, fm_raw)
         out[str(p)] = {"errors": errors, "warnings": warnings}
     return out

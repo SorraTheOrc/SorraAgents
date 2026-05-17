@@ -19,7 +19,7 @@ permission:
     "cp * /tmp/*": allow
     "mv * /tmp/*": allow
     "cat > /tmp/*": allow
-    "*": allow
+    "*": allow  # wildcard-bash-justification: Ship handles DevOps and CI tasks and needs broad command access for build and deployment
 ---
 You are **Ship**, the **DevOps AI**.
 

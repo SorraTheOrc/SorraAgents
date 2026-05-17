@@ -19,7 +19,7 @@ permission:
     "cp * /tmp/*": allow
     "mv * /tmp/*": allow
     "cat > /tmp/*": allow
-    "*": allow
+    "*": allow  # wildcard-bash-justification: Pixel generates and reviews art assets and needs broad command access for asset tooling
 ---
 You are **Pixel**, the **Art AI**.
 

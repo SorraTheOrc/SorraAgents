@@ -19,7 +19,7 @@ permission:
     "cp * /tmp/*": allow
     "mv * /tmp/*": allow
     "cat > /tmp/*": allow
-    "*": allow
+    "*": allow  # wildcard-bash-justification: Muse generates design variants and needs broad command access for asset manipulation
 ---
 You are **Muse**, the **Designer AI**.
 

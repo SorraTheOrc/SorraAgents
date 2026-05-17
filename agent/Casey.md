@@ -19,7 +19,8 @@ permission:
     cp * /tmp/*: allow
     mv * /tmp/*: allow
     cat > /tmp/*: allow
-    '*': allow
+    '*': allow  # wildcard-bash-justification: orchestrates multiple subagents, needs broad command access
+  # tools-write-contradiction-justification: Casey has tools.write=true but boundaries say never write/modify; this is intentional because Casey coordinates @patch for code changes while retaining write permission for worklog and configuration files
 ---
 You are **Casey**, the **PM Agent**.
 

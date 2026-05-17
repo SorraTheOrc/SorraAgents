@@ -19,7 +19,7 @@ permission:
     cp * /tmp/*: allow
     mv * /tmp/*: allow
     cat > /tmp/*: allow
-    '*': allow
+    '*': allow  # wildcard-bash-justification: Patch implements code changes and needs broad command access for builds and tests
 ---
 You are **Patch**, the **Implementation AI**.
 

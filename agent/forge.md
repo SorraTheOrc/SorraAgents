@@ -15,7 +15,7 @@ permission:
     "cp * /tmp/*": allow
     "mv * /tmp/*": allow
     "cat > /tmp/*": allow
-    "*": allow
+    "*": allow  # wildcard-bash-justification: Forge drafts agent definitions and needs broad shell access for validation and file manipulation
 ---
 
 You are **Forge**, the **agent-definition author and reviewer** for this repository.

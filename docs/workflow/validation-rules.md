@@ -349,14 +349,16 @@ Warnings should be reported but should not cause overall validation failure.
 ## Agent front-matter validation (agent/*.md)
 
 This repository includes lightweight validation rules for agent definition files stored under `agent/*.md`.
-The validator enforces a minimal front-matter schema and canonical model mappings to ensure consistent runtime behaviour and predictable model selection.
+The validator enforces a minimal front-matter schema, canonical model mappings, wildcard permission detection, and tool/boundary contradiction checks to ensure consistent runtime behaviour and predictable model selection.
 
 Rules
 
-- Required front-matter fields for agents: `description`, `mode`, `model`.
+- Required front-matter fields for agents: `description`, `mode`, `model`, `temperature`.
 - Allowed canonical model values (subject to change via policy): `github-copilot/gpt-5.2`, `github-copilot/gpt-5-mini`.
 - Model mappings: known model variants (e.g. `github-copilot/gpt-5.2-codex`, `proxy/gemma4`) will be suggested/automatically migrated to the canonical model where safe.
 - Unknown or unapproved model values are reported as errors and require owner review.
+- Wildcard bash permissions: the pattern `"*": allow` under `permission.bash` is flagged as a warning because it grants unrestricted command access. Each wildcard must have an explicit justification documented in the agent file (see Exceptions below).
+- Tool/boundary contradiction detection: if `tools.write` is `true` in the front-matter but the body contains a "Boundaries" section with phrases like "never write", "never modify", or "never commit", this is flagged as a warning indicating a possible contradiction. Such contradictions should be resolved or documented as intentional (see Exceptions below).
 
 Migration and exemption policy
 
@@ -366,7 +368,8 @@ Migration and exemption policy
 
 Tooling
 
-- A linter is provided at `scripts/agent_frontmatter_lint.py` which checks agent files for required fields and allowed model values. It exits non-zero when errors or warnings are found and can emit JSON for CI consumption.
+- A CLI linter is provided at `scripts/agent_frontmatter_lint.py` which checks agent files for required fields, allowed model values, wildcard bash permissions, and tool/boundary contradictions. It exits non-zero when errors or warnings are found and can emit JSON for CI consumption.
+- A pytest-based validator at `tests/validate_agents.py` provides the same checks as importable functions (`validate_front_matter`, `validate_all_agents`) for use in the test suite.
 - A migration helper `scripts/migrate_agent_models.py` safely applies canonical model mappings where patterns are recognised. It supports dry-run and apply modes and prints a per-file changelog summary.
 
 CI integration
@@ -376,7 +379,9 @@ CI integration
 Exceptions
 
 - Agents that require a non-canonical model for functional reasons should be documented in the PR and assigned an owner for explicit sign-off. If an exception is accepted, update the file with an inline comment in the front-matter (e.g., `# exception-reason: <short reason>`), and add an entry to the PR body documenting the acceptance.
+- Wildcard bash permissions (`"*": allow`) require justification. Document the reason in the PR and add an inline comment in the front-matter (e.g., `# wildcard-bash-justification: <short reason>`). If the wildcard is acceptable (e.g., an orchestration agent that coordinates other agents), note the rationale.
+- Tool/boundary contradictions (e.g., `tools.write=true` alongside "never write/modify" in boundaries) should be resolved by either removing the tool permission or adjusting the boundary text. If the contradiction is intentional (e.g., an agent that writes under specific circumstances despite a general boundary), document the reason in the PR and add a comment in the agent file.
 
 References
 
-- See `scripts/agent_frontmatter_lint.py` and `scripts/migrate_agent_models.py` for implementation details and usage examples.
+- See `scripts/agent_frontmatter_lint.py`, `tests/validate_agents.py`, and `scripts/migrate_agent_models.py` for implementation details and usage examples.

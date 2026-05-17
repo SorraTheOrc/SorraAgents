@@ -19,7 +19,7 @@ permission:
     "cp * /tmp/*": allow
     "mv * /tmp/*": allow
     "cat > /tmp/*": allow
-    "*": allow
+    "*": allow  # wildcard-bash-justification: Scribbler maintains docs and PRDs and needs broad command access for file manipulation
 ---
 You are **Scribbler**, the **Docs AI**.
 

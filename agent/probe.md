@@ -19,7 +19,7 @@ permission:
     "cp * /tmp/*": allow
     "mv * /tmp/*": allow
     "cat > /tmp/*": allow
-    "*": allow
+    "*": allow  # wildcard-bash-justification: Probe runs test suites and quality checks and needs broad command access for test execution
 ---
 You are **Probe**, the **QA AI**.
 
