@@ -82,9 +82,9 @@ Ralph will **never** merge or push without explicit operator confirmation:
 By default, ralph prints two kinds of output to the console:
 
 1. **Structured progress messages** (logger at INFO level): lifecycle events like attempt start, audit result, merge decision, etc.
-2. **Pi subprocess streaming**: the stdout of `pi run` commands is echoed to the console in real-time, line by line, so you can see implement and audit progress as it happens.
+2. **Pi subprocess streaming**: pi output is parsed as JSON. Only the essential text content (assistant messages, tool results) is shown in real-time. Metadata events, tool-use envelopes, and empty deltas are suppressed for a clean, readable console.
 
-This means during an implement or audit pass, you'll see the pi agent's output appear in your terminal as it works — just as if you'd run `pi run` yourself.
+This means during an implement or audit pass, you'll see the assistant's actual responses appear line by line — not the underlying JSON protocol.
 
 Use `--quiet` to suppress all progress output and pi streaming — only the final JSON result is printed. Useful for scripted invocations.
 
@@ -93,6 +93,7 @@ Use `--no-stream` to keep progress logging but disable pi output streaming (outp
 Use `--verbose` to see detailed delegation information in addition to streaming:
 
 - Every `wl`, `pi`, `git`, and `bash` command before it runs
+- Raw JSON lines from pi (logged at DEBUG level)
 - Subprocess output (first 1000 chars of stdout/stderr for check and merge commands)
 - Full pi run prompts (logged under `prompt_full`)
 - Pi run output (first 1000 chars)

@@ -368,27 +368,73 @@ def test_verbose_mode_logs_pi_output_start():
 
 
 def test_stream_pi_captures_and_returns_output():
-    """When stream=True (default), _stream_pi echoes lines to stdout and returns full output."""
+    """When stream=True, _stream_pi parses JSON and returns extracted text."""
     import subprocess
     from unittest.mock import patch, MagicMock
 
-    # Simulate a pi subprocess that produces two lines of output
+    # Simulate a pi subprocess that produces JSON lines
     fake_process = MagicMock()
     fake_process.returncode = 0
-    fake_process.stdout = iter(["line 1\n", "line 2\n"])
+    fake_process.stdout = iter([
+        '{"content": "Hello "}\n',
+        '{"content": "World"}\n',
+        '{"type": "tool_use", "id": "x"}\n',  # metadata — suppressed
+    ])
     fake_process.stderr = MagicMock()
     fake_process.stderr.read.return_value = ""
     fake_process.wait.return_value = None
 
-    captured_lines: list[str] = []
-
     with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process):
         loop = RalphLoop(verbose=False, stream=True)
-        # Override pi_bin to something that would exist
         loop.pi_bin = "echo"
         result = loop._stream_pi(["echo", "test"], "test prompt")
 
-    assert result == "line 1\nline 2\n"
+    # Only text content is concatenated — metadata line is skipped
+    assert result == "Hello World"
+
+
+def test_stream_pi_verbose_logs_raw_json(capsys):
+    """When verbose=True, raw JSON lines are logged at DEBUG level."""
+    import logging
+    from unittest.mock import patch, MagicMock
+
+    fake_process = MagicMock()
+    fake_process.returncode = 0
+    fake_process.stdout = iter([
+        '{"content": "Hello"}\n',
+        '{"type": "tool_use", "id": "call_123"}\n',
+        '{"content": " World"}\n',
+    ])
+    fake_process.stderr = MagicMock()
+    fake_process.stderr.read.return_value = ""
+    fake_process.wait.return_value = None
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logger = logging.getLogger("ralph")
+    logger.addHandler(handler)
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+
+    try:
+        with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process):
+            loop = RalphLoop(verbose=True, stream=True)
+            loop.pi_bin = "echo"
+            result = loop._stream_pi(["echo", "test"], "test prompt")
+
+        assert result == "Hello World"
+        # Verbose mode should log raw JSON lines
+        json_logs = [r for r in records if r.levelno == logging.DEBUG and "json_line" in r.getMessage()]
+        assert len(json_logs) >= 1  # metadata line also logged
+        # Console should show only text content
+        captured = capsys.readouterr()
+        assert "Hello" in captured.out
+        assert "World" in captured.out
+        assert "tool_use" not in captured.out  # metadata suppressed from console
+    finally:
+        logger.setLevel(old_level)
+        logger.removeHandler(handler)
 
 
 def test_in_review_skips_first_implement():

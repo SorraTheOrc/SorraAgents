@@ -279,11 +279,11 @@ class RalphLoop:
         return text
 
     def _stream_pi(self, cmd: list[str], prompt: str) -> str:
-        """Run pi with --mode json and stream output to console in real-time.
+        """Run pi with --mode json and stream essential output to the console.
 
-        Each line from pi's stdout is a JSON object. We parse each line to
-        extract text content, print it to the console for the operator, and
-        accumulate the full text for the return value.
+        In default mode, only human-readable text content is printed — metadata
+        lines, tool-use events, and empty deltas are suppressed.
+        In verbose mode, raw JSON lines are also logged at DEBUG level.
         """
         logger.info("ralph.cmd.pi.stream_start model=%s cmd_len=%d", self.model, len(cmd))
         try:
@@ -305,14 +305,18 @@ class RalphLoop:
             # Try to parse as JSON and extract text content
             text_delta = _extract_text_from_json_line(stripped)
             if text_delta is not None:
-                # Parsed a JSON line — stream the text content to console
+                # Parsed a JSON line — only show non-empty text to the operator
                 if text_delta:
                     print(text_delta, flush=True)
                 text_parts.append(text_delta)
+                # In verbose mode, also log the raw JSON line for debugging
+                if self.verbose:
+                    logger.debug("ralph.cmd.pi.json_line %s", stripped[:500])
             else:
-                # Not valid JSON — print raw line (backward compat)
-                print(line, end="", flush=True)
-                text_parts.append(line)
+                # Not valid JSON — only show in verbose mode
+                if self.verbose:
+                    logger.debug("ralph.cmd.pi.raw_line %s", stripped[:500])
+                # Don't print to console in default mode — suppress noise
 
         process.wait()
         stderr = process.stderr.read()
