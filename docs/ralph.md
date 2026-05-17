@@ -28,6 +28,7 @@ python skill/ralph/scripts/ralph_loop.py <work-item-id> [options]
 | `--quiet` | off | Suppress all console output and pi streaming; only print the final JSON result. |
 | `--verbose` | off | Show detailed delegation commands, subprocess stdout/stderr, and raw audit output. |
 | `--no-stream` | off | Don't stream pi subprocess output to console (use buffered capture). Progress logging still shown. |
+| `--model` | `opencode-go/glm-5.1` | Model ID to pass to `pi run --model`. Can also be set in `.ralph.json`. |
 | `--pi-bin` | `pi` | Path to the `pi` binary for delegating implement and audit. |
 | `--wl-bin` | `wl` | Path to the `wl` binary for worklog operations. |
 
@@ -38,6 +39,19 @@ python skill/ralph/scripts/ralph_loop.py <work-item-id> [options]
   - At `in_review`: ralph **skips the first implement pass** and audits immediately. If audit passes, ralph proceeds to checks/merge without any implement step. If audit fails, ralph falls into the normal implement→audit loop with remediation.
   - At any other stage: ralph exits with an error.
 - **Scope**: Only the target item and its direct children are processed.
+
+## Configuration File
+
+Ralph reads settings from a `.ralph.json` file in the current directory (or `ralph.config.json`). The file is a simple JSON object. Values from the config file are used as defaults; CLI flags take precedence.
+
+```json
+{
+    "model": "opencode-go/glm-5.1",
+    "max_attempts": 10
+}
+```
+
+A config key like `"model"` sets the default model used for all `pi run` commands. Command-line `--model` overrides it.
 
 ## Exit Codes
 

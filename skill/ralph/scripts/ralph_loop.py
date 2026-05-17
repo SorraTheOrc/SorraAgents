@@ -15,9 +15,18 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 logger = logging.getLogger("ralph")
+
+DEFAULT_MODEL = "opencode-go/glm-5.1"
+RALPH_CONFIG_FILES = [
+    Path(".ralph.toml"),
+    Path(".ralph.json"),
+    Path("ralph.config.toml"),
+    Path("ralph.config.json"),
+]
 
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
@@ -81,6 +90,36 @@ def parse_audit_report(report_text: str) -> AuditParseResult:
     return AuditParseResult(ready_to_close=ready, criteria=criteria)
 
 
+def _load_config() -> dict:
+    """Load config from the first found config file in the list.
+
+    Supports JSON files only. TOML support can be added when tomllib is
+    available (Python 3.11+ stdlib). For now, .ralph.json and
+    ralph.config.json are the supported config files.
+    """
+    for path in RALPH_CONFIG_FILES:
+        if not path.exists():
+            continue
+        if path.suffix == ".json":
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except (json.JSONDecodeError, OSError):
+                logger.debug("ralph.config: failed to load %s", path)
+    return {}
+
+
+def _resolve_model(cli_model: str | None, config_model: str | None) -> str:
+    """Resolve the model to use: CLI flag > config file > default."""
+    if cli_model:
+        return cli_model
+    if config_model:
+        return config_model
+    return DEFAULT_MODEL
+
+
 def _build_remediation_prompt(findings: Iterable[CriterionResult]) -> str:
     items = list(findings)
     if not items:
@@ -101,6 +140,7 @@ class RalphLoop:
         runner: Runner | None = None,
         pi_bin: str = "pi",
         wl_bin: str = "wl",
+        model: str | None = None,
         check_cmds: list[str] | None = None,
         max_attempts: int = 10,
         confirm_merge: bool = False,
@@ -111,6 +151,7 @@ class RalphLoop:
         self.runner = runner or _default_runner
         self.pi_bin = pi_bin
         self.wl_bin = wl_bin
+        self.model = model or DEFAULT_MODEL
         self.max_attempts = max_attempts
         self.confirm_merge = confirm_merge
         self.cancel_file = cancel_file
@@ -164,8 +205,8 @@ class RalphLoop:
         _run_json(self.runner, cmd)
 
     def _run_pi(self, prompt: str) -> str:
-        cmd = [self.pi_bin, "run", prompt]
-        logger.debug("ralph.cmd.pi.run prompt_len=%d", len(prompt))
+        cmd = [self.pi_bin, "run", "--model", self.model, prompt]
+        logger.debug("ralph.cmd.pi.run model=%s prompt_len=%d", self.model, len(prompt))
         if self.verbose:
             logger.debug("ralph.cmd.pi.run prompt_full=\n%s", prompt)
 
@@ -191,7 +232,7 @@ class RalphLoop:
         output is also captured and returned for programmatic use (e.g. audit
         report parsing).
         """
-        logger.info("ralph.cmd.pi.stream_start cmd_len=%d", len(cmd))
+        logger.info("ralph.cmd.pi.stream_start model=%s cmd_len=%d", self.model, len(cmd))
         try:
             process = subprocess.Popen(
                 cmd,
@@ -374,6 +415,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="Suppress console progress output and pi streaming (only print final JSON result)")
     parser.add_argument("--verbose", action="store_true", help="Show detailed delegation commands and subprocess output")
     parser.add_argument("--no-stream", action="store_true", help="Don't stream pi subprocess output to console (use buffered capture instead)")
+    parser.add_argument("--model", default=None, help=f"Model to use for pi run (default: {DEFAULT_MODEL}, or 'model' key in .ralph.json)")
     parser.add_argument("--pi-bin", default="pi")
     parser.add_argument("--wl-bin", default="wl")
     return parser
@@ -400,6 +442,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     loop = RalphLoop(
         pi_bin=args.pi_bin,
         wl_bin=args.wl_bin,
+        model=_resolve_model(args.model, _load_config().get("model")),
         check_cmds=args.check_cmd,
         max_attempts=args.max_attempts,
         confirm_merge=args.confirm_merge,

@@ -47,8 +47,9 @@ class FakeRunner:
         if cmd[:3] == ["wl", "update", "SA-TARGET"]:
             return Result(stdout='{"success":true}')
 
-        if cmd[:2] == ["pi", "run"]:
-            prompt = cmd[2]
+        if cmd[0] == "pi" and cmd[1] == "run":
+            # Find the prompt: it's the last positional arg after flags like --model
+            prompt = cmd[-1]
             if prompt.startswith("/audit"):
                 output = self.audit_outputs.pop(0)
                 return Result(stdout=output)
@@ -124,7 +125,7 @@ def test_retry_path_uses_remediation_in_next_implement_prompt():
     result = loop.run("SA-TARGET")
 
     assert result["status"] == "success"
-    implement_prompts = [c[2] for c in runner.calls if c[:2] == ["pi", "run"] and c[2].startswith("implement")]
+    implement_prompts = [c[-1] for c in runner.calls if c[0] == "pi" and c[1] == "run" and c[-1].startswith("implement")]
     assert len(implement_prompts) == 2
     assert "retry loop" in implement_prompts[1]
 
@@ -401,8 +402,9 @@ def test_in_review_skips_first_implement():
 
     assert result["status"] == "success"
     # There should be NO implement calls, only an audit call
-    implement_calls = [c for c in runner.calls if c[:2] == ["pi", "run"] and c[2].startswith("implement")]
-    audit_calls = [c for c in runner.calls if c[:2] == ["pi", "run"] and c[2].startswith("/audit")]
+    pi_calls = [c for c in runner.calls if c[0] == "pi" and c[1] == "run"]
+    implement_calls = [c for c in pi_calls if c[-1].startswith("implement")]
+    audit_calls = [c for c in pi_calls if c[-1].startswith("/audit")]
     assert len(implement_calls) == 0, f"Expected no implement calls, got {implement_calls}"
     assert len(audit_calls) == 1
 
@@ -420,10 +422,63 @@ def test_in_review_implement_after_failed_audit():
     assert result["attempt"] == 2
     # First attempt: audit only (skip implement)
     # Second attempt: implement + audit
-    pi_calls = [c for c in runner.calls if c[:2] == ["pi", "run"]]
-    first_call = pi_calls[0][2]
+    pi_calls = [c for c in runner.calls if c[0] == "pi" and c[1] == "run"]
+    first_call = pi_calls[0][-1]
     assert first_call.startswith("/audit"), f"First call should be audit, got: {first_call[:60]}"
-    second_call = pi_calls[1][2]
+    second_call = pi_calls[1][-1]
     assert second_call.startswith("implement"), f"Second call should be implement, got: {second_call[:60]}"
-    third_call = pi_calls[2][2]
+    third_call = pi_calls[2][-1]
     assert third_call.startswith("/audit"), f"Third call should be audit, got: {third_call[:60]}"
+
+
+def test_model_passed_to_pi_commands():
+    """The --model flag is passed through to pi run commands."""
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, model="opencode-go/glm-5.1")
+    loop.run("SA-TARGET")
+
+    pi_calls = [c for c in runner.calls if c[0] == "pi" and c[1] == "run"]
+    assert len(pi_calls) >= 1
+    # Command should include --model <model_value> before the prompt
+    for call in pi_calls:
+        assert "--model" in call, f"Expected --model in pi call: {call[:6]}"
+        model_idx = call.index("--model")
+        assert call[model_idx + 1] == "opencode-go/glm-5.1"
+
+
+def test_default_model_is_used_when_none_specified():
+    """When no model is specified, the default model is used."""
+    from skill.ralph.scripts.ralph_loop import DEFAULT_MODEL
+    loop = RalphLoop(runner=FakeRunner(), stream=False)
+    assert loop.model == DEFAULT_MODEL
+    assert DEFAULT_MODEL == "opencode-go/glm-5.1"
+
+
+def test_config_file_model_resolved():
+    """Config file model is used when CLI model is not specified."""
+    from skill.ralph.scripts.ralph_loop import _resolve_model
+    # CLI takes precedence
+    assert _resolve_model("cli-model", "config-model") == "cli-model"
+    # Config file is used when CLI is None
+    assert _resolve_model(None, "config-model") == "config-model"
+    # Default is used when both are None
+    assert _resolve_model(None, None) == "opencode-go/glm-5.1"
+
+
+def test_load_config_from_json_file(tmp_path):
+    """Config is loaded from .ralph.json in the current directory."""
+    from skill.ralph.scripts.ralph_loop import _load_config
+    import json
+
+    config_file = tmp_path / ".ralph.json"
+    config_file.write_text(json.dumps({"model": "test-model", "max_attempts": 5}))
+
+    original_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        config = _load_config()
+        assert config["model"] == "test-model"
+        assert config["max_attempts"] == 5
+    finally:
+        os.chdir(original_cwd)
