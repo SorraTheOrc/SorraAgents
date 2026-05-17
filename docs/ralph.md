@@ -33,7 +33,10 @@ python skill/ralph/scripts/ralph_loop.py <work-item-id> [options]
 
 ### Preconditions
 
-- **Stage gate**: The target work item must be at stage `plan_complete`. If not, ralph exits with an error.
+- **Stage gate**: The target work item must be at stage `plan_complete` or `in_review`.
+  - At `plan_complete`: ralph runs the full implement→audit loop.
+  - At `in_review`: ralph **skips the first implement pass** and audits immediately. If audit passes, ralph proceeds to checks/merge without any implement step. If audit fails, ralph falls into the normal implement→audit loop with remediation.
+  - At any other stage: ralph exits with an error.
 - **Scope**: Only the target item and its direct children are processed.
 
 ## Exit Codes

@@ -275,10 +275,11 @@ class RalphLoop:
 
     def _assert_precondition(self, target_id: str) -> None:
         item = self._wl_show(target_id).get("workItem", {})
-        if item.get("stage") != "plan_complete":
+        stage = item.get("stage", "unknown")
+        if stage not in {"plan_complete", "in_review"}:
             raise RalphError(
-                f"Target {target_id} must be stage plan_complete before running ralph; "
-                f"current stage is {item.get('stage', 'unknown')}."
+                f"Target {target_id} must be stage plan_complete or in_review before running ralph; "
+                f"current stage is {stage}."
             )
 
     def _scope_in_review(self, scope_ids: Iterable[str]) -> bool:
@@ -294,9 +295,19 @@ class RalphLoop:
     def run(self, target_id: str) -> dict:
         self._assert_precondition(target_id)
         scope_ids = self._scope_ids(target_id)
+
+        # If the target is already in_review, skip the first implement pass and
+        # go straight to audit. If audit passes, we're done. If it fails, we
+        # fall into the normal implement→audit loop.
+        target_item = self._wl_show(target_id).get("workItem", {})
+        target_stage = target_item.get("stage", "unknown")
+        skip_implement = target_stage == "in_review"
         remediation = ""
 
-        logger.info("ralph.loop.start target=%s scope=%s max_attempts=%d", target_id, scope_ids, self.max_attempts)
+        logger.info(
+            "ralph.loop.start target=%s scope=%s max_attempts=%d skip_implement=%s",
+            target_id, scope_ids, self.max_attempts, skip_implement,
+        )
 
         for attempt in range(1, self.max_attempts + 1):
             if self.cancel_file and os.path.exists(self.cancel_file):
@@ -305,14 +316,18 @@ class RalphLoop:
 
             logger.info("ralph.loop.attempt.start target=%s attempt=%d", target_id, attempt)
 
-            prompt_parts = [
-                f"implement {target_id}",
-                f"Target scope includes direct children only: {', '.join(scope_ids[1:]) or '(none)'}.",
-                "Continue until scope items are in_review, but do not merge.",
-            ]
-            if remediation:
-                prompt_parts.append(remediation)
-            self._run_pi("\n".join(prompt_parts))
+            if skip_implement and attempt == 1:
+                # Target already in_review — audit first, only implement if audit fails
+                logger.info("ralph.loop.skip_implement target=%s stage=in_review", target_id)
+            else:
+                prompt_parts = [
+                    f"implement {target_id}",
+                    f"Target scope includes direct children only: {', '.join(scope_ids[1:]) or '(none)'}.",
+                    "Continue until scope items are in_review, but do not merge.",
+                ]
+                if remediation:
+                    prompt_parts.append(remediation)
+                self._run_pi("\n".join(prompt_parts))
 
             logger.info("ralph.loop.audit.start target=%s attempt=%d", target_id, attempt)
             audit_output = self._run_pi(f"/audit {target_id}")

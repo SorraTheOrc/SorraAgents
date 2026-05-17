@@ -10,7 +10,9 @@ Use this skill when the operator asks to run `ralph <work-item-id>`.
 ## Behavior
 
 1. Validate input id is provided.
-2. Validate target stage is `plan_complete`; fail fast with actionable message otherwise.
+2. Validate target stage is `plan_complete` or `in_review`; fail fast with actionable message otherwise.
+   - At `plan_complete`: run full implement→audit loop.
+   - At `in_review`: skip the first implement pass and audit immediately. If audit fails, start the implement→audit loop.
 3. Scope is target + direct children only.
 4. Run iterative loop:
    - delegate implement pass via `pi run "implement <id> ..."`

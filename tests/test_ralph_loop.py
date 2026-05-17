@@ -94,12 +94,12 @@ def test_parse_audit_report_extracts_readiness_and_rows():
     assert parsed.unmet_or_partial[0].text == "retry loop"
 
 
-def test_precondition_requires_plan_complete():
+def test_precondition_requires_plan_complete_or_in_review():
     runner = FakeRunner()
     runner.items["SA-TARGET"]["stage"] = "in_progress"
     loop = RalphLoop(runner=runner, stream=False)
 
-    with pytest.raises(RalphError):
+    with pytest.raises(RalphError, match="plan_complete or in_review"):
         loop.run("SA-TARGET")
 
 
@@ -281,7 +281,7 @@ def test_main_returns_error_on_precondition_failure():
     loop = RalphLoop(runner=runner, stream=False)
 
     # Direct API call gives RalphError
-    with pytest.raises(RalphError, match="plan_complete"):
+    with pytest.raises(RalphError, match="plan_complete or in_review"):
         loop.run("SA-TARGET")
 
 
@@ -387,3 +387,43 @@ def test_stream_pi_captures_and_returns_output():
         result = loop._stream_pi(["echo", "test"], "test prompt")
 
     assert result == "line 1\nline 2\n"
+
+
+def test_in_review_skips_first_implement():
+    """When target is already in_review, ralph skips the first implement and audits directly."""
+    runner = FakeRunner()
+    # Target starts in_review (not plan_complete)
+    runner.items["SA-TARGET"]["stage"] = "in_review"
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    # There should be NO implement calls, only an audit call
+    implement_calls = [c for c in runner.calls if c[:2] == ["pi", "run"] and c[2].startswith("implement")]
+    audit_calls = [c for c in runner.calls if c[:2] == ["pi", "run"] and c[2].startswith("/audit")]
+    assert len(implement_calls) == 0, f"Expected no implement calls, got {implement_calls}"
+    assert len(audit_calls) == 1
+
+
+def test_in_review_implement_after_failed_audit():
+    """When target is in_review but audit fails, ralph implements then re-audits."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "in_review"
+    runner.audit_outputs = [AUDIT_FAIL, AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    assert result["attempt"] == 2
+    # First attempt: audit only (skip implement)
+    # Second attempt: implement + audit
+    pi_calls = [c for c in runner.calls if c[:2] == ["pi", "run"]]
+    first_call = pi_calls[0][2]
+    assert first_call.startswith("/audit"), f"First call should be audit, got: {first_call[:60]}"
+    second_call = pi_calls[1][2]
+    assert second_call.startswith("implement"), f"Second call should be implement, got: {second_call[:60]}"
+    third_call = pi_calls[2][2]
+    assert third_call.startswith("/audit"), f"Third call should be audit, got: {third_call[:60]}"
