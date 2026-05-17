@@ -368,17 +368,19 @@ def test_verbose_mode_logs_pi_output_start():
 
 
 def test_stream_pi_captures_and_returns_output():
-    """When stream=True, _stream_pi parses JSON and returns extracted text."""
+    """When stream=True, _stream_pi parses JSON and streams only text_delta content."""
     import subprocess
     from unittest.mock import patch, MagicMock
 
-    # Simulate a pi subprocess that produces JSON lines
+    # Simulate a pi subprocess producing pi JSON protocol events
     fake_process = MagicMock()
     fake_process.returncode = 0
     fake_process.stdout = iter([
-        '{"content": "Hello "}\n',
-        '{"content": "World"}\n',
-        '{"type": "tool_use", "id": "x"}\n',  # metadata — suppressed
+        '{"type":"agent_start"}\n',
+        '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"thinking"}}\n',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello "}}\n',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"World"}}\n',
+        '{"type":"agent_end"}\n',
     ])
     fake_process.stderr = MagicMock()
     fake_process.stderr.read.return_value = ""
@@ -389,7 +391,7 @@ def test_stream_pi_captures_and_returns_output():
         loop.pi_bin = "echo"
         result = loop._stream_pi(["echo", "test"], "test prompt")
 
-    # Only text content is concatenated — metadata line is skipped
+    # Only text_delta content is returned — thinking and metadata are suppressed
     assert result == "Hello World"
 
 
@@ -401,9 +403,9 @@ def test_stream_pi_verbose_logs_raw_json(capsys):
     fake_process = MagicMock()
     fake_process.returncode = 0
     fake_process.stdout = iter([
-        '{"content": "Hello"}\n',
-        '{"type": "tool_use", "id": "call_123"}\n',
-        '{"content": " World"}\n',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello"}}\n',
+        '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"internal"}}\n',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":" World"}}\n',
     ])
     fake_process.stderr = MagicMock()
     fake_process.stderr.read.return_value = ""
@@ -426,12 +428,13 @@ def test_stream_pi_verbose_logs_raw_json(capsys):
         assert result == "Hello World"
         # Verbose mode should log raw JSON lines
         json_logs = [r for r in records if r.levelno == logging.DEBUG and "json_line" in r.getMessage()]
-        assert len(json_logs) >= 1  # metadata line also logged
-        # Console should show only text content
+        assert len(json_logs) >= 1  # all JSON lines logged at DEBUG
+        # Console should show only text_delta content — thinking suppressed
         captured = capsys.readouterr()
         assert "Hello" in captured.out
         assert "World" in captured.out
-        assert "tool_use" not in captured.out  # metadata suppressed from console
+        assert "internal" not in captured.out  # thinking not shown
+        assert "thinking_delta" not in captured.out
     finally:
         logger.setLevel(old_level)
         logger.removeHandler(handler)
@@ -534,35 +537,117 @@ def test_load_config_from_json_file(tmp_path):
         os.chdir(original_cwd)
 
 
-def test_extract_text_from_json_line():
-    """_extract_text_from_json_line extracts text from various JSON shapes."""
-    from skill.ralph.scripts.ralph_loop import _extract_text_from_json_line
+def test_parse_pi_json_line_thinking_suppressed():
+    """Thinking events are suppressed — only text_delta content is shown."""
+    from skill.ralph.scripts.ralph_loop import _parse_pi_json_line
 
-    # Simple content field
-    assert _extract_text_from_json_line('{"content": "hello"}') == ("hello", False)
-    # Text field
-    assert _extract_text_from_json_line('{"text": "world"}') == ("world", False)
-    # Nested delta.text
-    assert _extract_text_from_json_line('{"delta": {"text": "hola"}}') == ("hola", False)
-    # Delta.content
-    assert _extract_text_from_json_line('{"delta": {"content": "bonjour"}}') == ("bonjour", False)
-    # Message field
-    assert _extract_text_from_json_line('{"message": "guten tag"}') == ("guten tag", False)
-    # OpenAI-style content blocks
-    assert _extract_text_from_json_line('{"content": [{"type": "text", "text": "block text"}]}') == ("block text", False)
-    # Non-JSON returns (None, False)
-    assert _extract_text_from_json_line("plain text line") == (None, False)
-    # JSON with no text field returns empty metadata
-    assert _extract_text_from_json_line('{"type": "tool_use", "id": "x"}') == ("", True)
-    # Empty string in content returns empty string (not metadata)
-    assert _extract_text_from_json_line('{"content": ""}') == ("", False)
+    # thinking_delta: suppressed (not user-facing)
+    text, should_print = _parse_pi_json_line(
+        '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"The user is asking me"}}'
+    )
+    assert text == "" and should_print is False
+
+    # thinking_start: suppressed
+    text, should_print = _parse_pi_json_line(
+        '{"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}'
+    )
+    assert text == "" and should_print is False
+
+    # thinking_end: suppressed
+    text, should_print = _parse_pi_json_line(
+        '{"type":"message_update","assistantMessageEvent":{"type":"thinking_end","contentIndex":0}}'
+    )
+    assert text == "" and should_print is False
+
+
+def test_parse_pi_json_line_text_delta_shown():
+    """text_delta events are shown — they contain user-facing text."""
+    from skill.ralph.scripts.ralph_loop import _parse_pi_json_line
+
+    # text_delta: additive, user-facing — should be printed
+    text, should_print = _parse_pi_json_line(
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"hello"}}'
+    )
+    assert text == "hello"
+    assert should_print is True
+
+    # text_delta with longer content
+    text, should_print = _parse_pi_json_line(
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":" world"}}'
+    )
+    assert text == " world"
+    assert should_print is True
+
+    # text_delta with empty string: suppress
+    text, should_print = _parse_pi_json_line(
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":""}}'
+    )
+    assert text == "" and should_print is False
+
+
+def test_parse_pi_json_line_metadata_suppressed():
+    """Structural metadata events are suppressed."""
+    from skill.ralph.scripts.ralph_loop import _parse_pi_json_line
+
+    for event_json in [
+        '{"type":"session","version":3}',
+        '{"type":"agent_start"}',
+        '{"type":"agent_end"}',
+        '{"type":"turn_start"}',
+        '{"type":"turn_end"}',
+        '{"type":"message_start","message":{"role":"user"}}',
+        '{"type":"message_end","message":{"role":"user"}}',
+    ]:
+        text, should_print = _parse_pi_json_line(event_json)
+        assert text == "" and should_print is False, f"Failed for: {event_json[:60]}"
+
+
+def test_parse_pi_json_line_text_start_end_suppressed():
+    """text_start and text_end are structural — suppressed (not additive content)."""
+    from skill.ralph.scripts.ralph_loop import _parse_pi_json_line
+
+    text, should_print = _parse_pi_json_line(
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":1}}'
+    )
+    assert text == "" and should_print is False
+
+    text, should_print = _parse_pi_json_line(
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":1}}'
+    )
+    assert text == "" and should_print is False
+
+
+def test_parse_pi_json_line_fallback_for_unknown_json():
+    """Unknown JSON types fall back to extracting text from content/text/delta fields."""
+    from skill.ralph.scripts.ralph_loop import _parse_pi_json_line
+
+    # Fallback: unknown type with content field
+    text, should_print = _parse_pi_json_line('{"type":"unknown","content":"hello"}')
+    assert text == "hello" and should_print is True
+
+    # Fallback: unknown type with no text → suppressed
+    text, should_print = _parse_pi_json_line('{"type":"unknown","id":"x"}')
+    assert text == "" and should_print is False
+
+    # Non-JSON line → (None, False) for fallback
+    text, should_print = _parse_pi_json_line("plain text line")
+    assert text is None and should_print is False
 
 
 def test_extract_text_from_json_output():
-    """_extract_text_from_json_output concatenates text from multiple JSON lines."""
+    """_extract_text_from_json_output concatenates text_delta content from pi JSON."""
     from skill.ralph.scripts.ralph_loop import _extract_text_from_json_output
 
-    json_lines = '{"content": "Hello "}\n{"content": "World"}\n{"type": "metadata"}'
+    # Simulate pi JSON output with text_delta events
+    json_lines = '\n'.join([
+        '{"type":"session","version":3}',
+        '{"type":"agent_start"}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"internal thinking"}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello "}}',
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"World"}}',
+        '{"type":"agent_end"}',
+    ])
+    # Only text_delta content is extracted, thinking and metadata are suppressed
     assert _extract_text_from_json_output(json_lines) == "Hello World"
 
     # Plain text passthrough

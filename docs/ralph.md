@@ -82,9 +82,11 @@ Ralph will **never** merge or push without explicit operator confirmation:
 By default, ralph prints two kinds of output to the console:
 
 1. **Structured progress messages** (logger at INFO level): lifecycle events like attempt start, audit result, merge decision, etc.
-2. **Pi subprocess streaming**: pi output is parsed as JSON. Only the essential text content (assistant messages, tool results) is shown in real-time. Metadata events, tool-use envelopes, and empty deltas are suppressed for a clean, readable console.
+2. **Pi subprocess streaming**: pi output is parsed per pi's JSON streaming protocol. Only `text_delta` events (the agent's actual user-facing response) are shown in real-time, printed additively. Thinking/reasoning, metadata, and structural events are suppressed for a clean, readable console.
 
-This means during an implement or audit pass, you'll see the assistant's actual responses appear line by line — not the underlying JSON protocol.
+This means during an implement or audit pass, you'll see the assistant's response appear token-by-token as `text_delta` events stream in — no thinking blocks, no JSON envelope, no session metadata.
+
+The `text_delta` content is additive (each delta contains only the new text since the last delta), so there's no duplication.
 
 Use `--quiet` to suppress all progress output and pi streaming — only the final JSON result is printed. Useful for scripted invocations.
 

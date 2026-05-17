@@ -130,13 +130,21 @@ def _build_remediation_prompt(findings: Iterable[CriterionResult]) -> str:
     return "\n".join(lines)
 
 
-def _extract_text_from_json_line(line: str) -> tuple[str | None, bool]:
-    """Try to extract text content from a single JSON line from pi --mode json.
+def _parse_pi_json_line(line: str) -> tuple[str, bool]:
+    """Parse a single JSON line from pi --mode json and extract user-facing text.
 
-    Returns a tuple of (text, is_metadata):
-    - (text_str, False): text content was successfully extracted
-    - ("", True): valid JSON but no text content (metadata/event line)
-    - (None, False): not valid JSON at all
+    Pi's JSON streaming protocol uses typed events:
+    - thinking_start/thinking_delta/thinking_end: internal reasoning (suppressed)
+    - text_start/text_delta/text_end: user-facing content (streamed additively)
+    - session/agent_start/agent_end/turn_start/turn_end/message_start/message_end: metadata (suppressed)
+
+    For text_delta events, the `delta` field is additive — it contains only the
+    new text since the last delta, so we print only the delta content.
+
+    Returns a tuple of (text_delta, should_print):
+    - ("some text", True): additive text content to print to the console
+    - ("", False): metadata/thinking event — skip silently
+    - (None, False): not valid JSON — caller should fall back
     """
     try:
         obj = json.loads(line)
@@ -144,53 +152,59 @@ def _extract_text_from_json_line(line: str) -> tuple[str | None, bool]:
         return None, False
     if not isinstance(obj, dict):
         return None, False
-    # Try common field names for text content in LLM streaming formats
-    for key in ("content", "text", "delta", "message"):
+
+    event_type = obj.get("type", "")
+
+    # --- Streaming message_update events (primary streaming path) ---
+    if event_type == "message_update":
+        assistant_event = obj.get("assistantMessageEvent")
+        if isinstance(assistant_event, dict):
+            inner_type = assistant_event.get("type", "")
+            # Text delta: additive user-facing text — this is what we show
+            if inner_type == "text_delta":
+                delta = assistant_event.get("delta", "")
+                if isinstance(delta, str) and delta:
+                    return delta, True
+                return "", False
+            # Thinking delta: internal reasoning — suppress
+            if inner_type in ("thinking_start", "thinking_delta", "thinking_end"):
+                return "", False
+            # text_start, text_end: structural — suppress
+            if inner_type in ("text_start", "text_end"):
+                return "", False
+            # Other assistant events (tool_use, etc.) — suppress
+            return "", False
+        return "", False
+
+    # --- Structural events: suppress all ---
+    if event_type in (
+        "session", "agent_start", "agent_end",
+        "turn_start", "turn_end",
+        "message_start", "message_end",
+    ):
+        return "", False
+
+    # --- Fallback: unknown JSON event types ---
+    # Try to extract text content from common fields as a last resort
+    for key in ("content", "text", "delta"):
         val = obj.get(key)
-        if isinstance(val, str):
-            return val, False
-        if isinstance(val, list):
-            # OpenAI-style content blocks: [{"type": "text", "text": "..."}]
-            parts: list[str] = []
-            for item in val:
-                if isinstance(item, dict):
-                    for item_key in ("text", "content"):
-                        inner_val = item.get(item_key)
-                        if isinstance(inner_val, str):
-                            parts.append(inner_val)
-                elif isinstance(item, str):
-                    parts.append(item)
-            if parts:
-                return "\n".join(parts), False
+        if isinstance(val, str) and val:
+            return val, True
         if isinstance(val, dict):
-            # Nested objects like {"delta": {"text": "..."}}
             for inner_key in ("text", "content"):
                 inner_val = val.get(inner_key)
-                if isinstance(inner_val, str):
-                    return inner_val, False
-                if isinstance(inner_val, list):
-                    # Also handle list-of-dicts inside delta
-                    parts_inner: list[str] = []
-                    for item in inner_val:
-                        if isinstance(item, dict):
-                            for ik in ("text", "content"):
-                                iv = item.get(ik)
-                                if isinstance(iv, str):
-                                    parts_inner.append(iv)
-                        elif isinstance(item, str):
-                            parts_inner.append(item)
-                    if parts_inner:
-                        return "\n".join(parts_inner), False
-    # Valid JSON but no text content found — metadata/event line
-    return "", True
+                if isinstance(inner_val, str) and inner_val:
+                    return inner_val, True
+    # Valid JSON but no extractable user text
+    return "", False
 
 
 def _extract_text_from_json_output(raw: str) -> str:
-    """Extract the full text content from pi --mode json -p output.
+    """Extract the full user-facing text from pi --mode json -p output.
 
-    Parses the complete output (which may contain multiple JSON lines) and
-    concatenates all text content found. Falls back to returning the raw
-    string if no text content could be extracted from JSON.
+    Parses the complete streamed output and concatenates all text_delta content
+    (the additive user-facing text). Falls back to returning the raw string if
+    no text content could be extracted from JSON.
     """
     parts: list[str] = []
     found_json = False
@@ -198,14 +212,13 @@ def _extract_text_from_json_output(raw: str) -> str:
         stripped = line.strip()
         if not stripped:
             continue
-        text, is_metadata = _extract_text_from_json_line(stripped)
-        if text is not None:
-            found_json = True
-            if not is_metadata and text:
-                parts.append(text)
-        elif found_json:
-            # Inside JSON output but line wasn't parseable — skip
-            pass
+        text, should_print = _parse_pi_json_line(stripped)
+        if text is None:
+            # Not valid JSON — skip during JSON parsing
+            continue
+        found_json = True
+        if should_print and text:
+            parts.append(text)
     if found_json and parts:
         return "".join(parts)
     # No text content extracted from JSON — return raw output
@@ -335,12 +348,11 @@ class RalphLoop:
         return text
 
     def _stream_pi(self, cmd: list[str], prompt: str) -> str:
-        """Run pi with --mode json and stream essential output to the console.
+        """Run pi with --mode json and stream user-facing text to the console.
 
-        In default mode, only extracted text content is printed — metadata
-        lines, tool-use events, and empty deltas are suppressed.
-        Non-JSON lines are printed as a fallback so the operator always sees
-        something.
+        Only text_delta events (the agent's actual response) are printed.
+        Thinking, metadata, and structural events are suppressed.
+        Non-JSON lines are printed as a fallback.
         In verbose mode, raw JSON lines are also logged at DEBUG level.
         """
         logger.info("ralph.cmd.pi.stream_start model=%s cmd_len=%d", self.model, len(cmd))
@@ -362,17 +374,17 @@ class RalphLoop:
             stripped = line.rstrip("\n")
             if not stripped:
                 continue
-            # Try to parse as JSON and extract text content
-            text, is_metadata = _extract_text_from_json_line(stripped)
+            # Parse the JSON line using pi's streaming protocol
+            text, should_print = _parse_pi_json_line(stripped)
             if text is not None:
                 # Successfully parsed as JSON
                 json_lines_seen += 1
-                if not is_metadata and text:
-                    # Real text content — show to operator
-                    print(text, flush=True)
+                if should_print and text:
+                    # User-facing additive text delta — show to operator
+                    print(text, end="", flush=True)
                     text_parts.append(text)
                     text_lines_seen += 1
-                # is_metadata == True or empty string: skip silently
+                # Metadata / thinking / structural events: skip silently
                 # In verbose mode, also log the raw JSON line
                 if self.verbose:
                     logger.debug("ralph.cmd.pi.json_line %s", stripped[:500])
@@ -392,12 +404,11 @@ class RalphLoop:
                 logger.debug("ralph.cmd.pi.run stderr=%s", stderr.strip()[:1000])
             raise RalphError(f"pi run failed: {stderr.strip()}")
 
-        # If JSON lines were seen but no text extracted, warn so the operator
-        # knows pi produced output but we couldn't parse text from it
+        # If JSON lines were seen but no text extracted, warn
         if json_lines_seen > 0 and text_lines_seen == 0:
             logger.warning(
                 "ralph.cmd.pi.no_text_extracted json_lines=%d — "
-                "pi produced JSON but no text content could be extracted",
+                "pi produced JSON but no user-facing text content was found",
                 json_lines_seen,
             )
 
