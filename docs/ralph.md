@@ -61,17 +61,22 @@ Use `--quiet` to suppress progress output and only see the final JSON result —
 Use `--verbose` to see detailed delegation information, including:
 
 - Every `wl` and `pi` command before it runs
-- Subprocess output (first 300–500 chars of stdout/stderr for check and merge commands)
-- Pi run prompts and the start of their output
-- Raw audit output (first 500 chars) and parsed criteria details
-- Comment counts and result keys from worklog commands
+- Subprocess output (first 1000 chars of stdout/stderr for check and merge commands)
+- Full pi run prompts (logged under `prompt_full`)
+- Pi run output (first 1000 chars)
+- Raw audit output (first 1000 chars) and parsed criteria details
+- Comment counts and work item stage/status from worklog commands
 
 Typical `--verbose` output includes:
 
 ```
 DEBUG ralph ralph.cmd.wl.show cmd=['wl', 'show', 'SA-1234', '--json', '--children']
-DEBUG ralph ralph.cmd.wl.show result_keys=['success', 'workItem', 'children']
-DEBUG ralph ralph.cmd.pi.run prompt_len=142 prompt_start=implement SA-1234\nTarget scope includes direct children only: SA-5678.\nContinue...
+DEBUG ralph ralph.cmd.wl.show id=SA-1234 stage=plan_complete status=open children=1
+DEBUG ralph ralph.cmd.pi.run prompt_len=142
+DEBUG ralph ralph.cmd.pi.run prompt_full=
+implement SA-1234
+Target scope includes direct children only: SA-5678.
+Continue until scope items are in_review, but do not merge.
 DEBUG ralph ralph.cmd.pi.run stdout_len=2048 stdout_start=Audit report...
 DEBUG ralph ralph.loop.audit.raw_output target=SA-1234 attempt=1 len=2048 output_start=Ready to close: No...
 DEBUG ralph ralph.loop.audit.parsed target=SA-1234 attempt=1 ready=False criteria_count=3 unmet=2

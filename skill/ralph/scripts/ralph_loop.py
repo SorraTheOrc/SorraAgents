@@ -122,7 +122,8 @@ class RalphLoop:
         logger.debug("ralph.cmd.wl.show cmd=%s", cmd)
         result = _run_json(self.runner, cmd)
         if self.verbose:
-            logger.debug("ralph.cmd.wl.show result_keys=%s", list(result.keys()) if isinstance(result, dict) else type(result).__name__)
+            item = result.get("workItem", {})
+            logger.debug("ralph.cmd.wl.show id=%s stage=%s status=%s children=%d", item.get("id"), item.get("stage"), item.get("status"), len(result.get("children", [])))
         return result
 
     def _wl_comment_list(self, work_item_id: str) -> list[dict]:
@@ -147,6 +148,8 @@ class RalphLoop:
             "--json",
         ]
         logger.debug("ralph.cmd.wl.comment_add target=%s comment_len=%d", work_item_id, len(comment))
+        if self.verbose:
+            logger.debug("ralph.cmd.wl.comment_add comment_start=%s", comment[:500])
         _run_json(self.runner, cmd)
 
     def _wl_update_audit(self, work_item_id: str, audit_text: str) -> None:
@@ -156,14 +159,16 @@ class RalphLoop:
 
     def _run_pi(self, prompt: str) -> str:
         cmd = [self.pi_bin, "run", prompt]
-        logger.debug("ralph.cmd.pi.run prompt_len=%d prompt_start=%s", len(prompt), prompt[:120])
+        logger.debug("ralph.cmd.pi.run prompt_len=%d", len(prompt))
+        if self.verbose:
+            logger.debug("ralph.cmd.pi.run prompt_full=\n%s", prompt)
         proc = self.runner(cmd)
         if proc.returncode != 0:
             if self.verbose:
-                logger.debug("ralph.cmd.pi.run stderr=%s", proc.stderr.strip()[:500])
+                logger.debug("ralph.cmd.pi.run stderr=%s", proc.stderr.strip()[:1000])
             raise RalphError(f"pi run failed: {proc.stderr.strip()}")
         if self.verbose:
-            logger.debug("ralph.cmd.pi.run stdout_len=%d stdout_start=%s", len(proc.stdout), proc.stdout[:500])
+            logger.debug("ralph.cmd.pi.run stdout_len=%d stdout_start=%s", len(proc.stdout), proc.stdout[:1000])
         return proc.stdout
 
     def _run_checks(self) -> None:
@@ -171,10 +176,9 @@ class RalphLoop:
             logger.debug("ralph.cmd.check cmd=%s", cmd)
             proc = self.runner(["bash", "-lc", cmd])
             if self.verbose:
-                logger.debug("ralph.cmd.check stdout=%s", proc.stdout.strip()[:300])
+                logger.debug("ralph.cmd.check stdout=%s", proc.stdout.strip()[:1000])
+                logger.debug("ralph.cmd.check stderr=%s", proc.stderr.strip()[:1000])
             if proc.returncode != 0:
-                if self.verbose:
-                    logger.debug("ralph.cmd.check stderr=%s", proc.stderr.strip()[:300])
                 raise RalphError(f"Check failed ({cmd}): {proc.stderr.strip() or proc.stdout.strip()}")
 
     def _run_merge(self) -> None:
@@ -188,10 +192,10 @@ class RalphLoop:
             logger.debug("ralph.cmd.merge step=%s", shlex.join(cmd))
             proc = self.runner(cmd)
             if self.verbose:
-                logger.debug("ralph.cmd.merge stdout=%s", proc.stdout.strip()[:300])
+                logger.debug("ralph.cmd.merge stdout=%s", proc.stdout.strip()[:1000])
             if proc.returncode != 0:
                 if self.verbose:
-                    logger.debug("ralph.cmd.merge stderr=%s", proc.stderr.strip()[:500])
+                    logger.debug("ralph.cmd.merge stderr=%s", proc.stderr.strip()[:1000])
                 raise RalphError(f"Merge step failed ({' '.join(cmd)}): {proc.stderr.strip()}")
 
     def _append_ampa_comment_once(self, work_item_id: str, audit_text: str) -> None:
@@ -260,7 +264,7 @@ class RalphLoop:
             logger.info("ralph.loop.audit.start target=%s attempt=%d", target_id, attempt)
             audit_output = self._run_pi(f"/audit {target_id}")
             if self.verbose:
-                logger.debug("ralph.loop.audit.raw_output target=%s attempt=%d len=%d output_start=%s", target_id, attempt, len(audit_output), audit_output[:500])
+                logger.debug("ralph.loop.audit.raw_output target=%s attempt=%d len=%d output_start=%s", target_id, attempt, len(audit_output), audit_output[:1000])
             self._wl_update_audit(target_id, audit_output)
             self._append_ampa_comment_once(target_id, audit_output)
             audit = parse_audit_report(audit_output)
