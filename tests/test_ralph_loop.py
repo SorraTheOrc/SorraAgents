@@ -539,21 +539,23 @@ def test_extract_text_from_json_line():
     from skill.ralph.scripts.ralph_loop import _extract_text_from_json_line
 
     # Simple content field
-    assert _extract_text_from_json_line('{"content": "hello"}') == "hello"
+    assert _extract_text_from_json_line('{"content": "hello"}') == ("hello", False)
     # Text field
-    assert _extract_text_from_json_line('{"text": "world"}') == "world"
+    assert _extract_text_from_json_line('{"text": "world"}') == ("world", False)
     # Nested delta.text
-    assert _extract_text_from_json_line('{"delta": {"text": "hola"}}') == "hola"
+    assert _extract_text_from_json_line('{"delta": {"text": "hola"}}') == ("hola", False)
     # Delta.content
-    assert _extract_text_from_json_line('{"delta": {"content": "bonjour"}}') == "bonjour"
+    assert _extract_text_from_json_line('{"delta": {"content": "bonjour"}}') == ("bonjour", False)
     # Message field
-    assert _extract_text_from_json_line('{"message": "guten tag"}') == "guten tag"
-    # Non-JSON returns None
-    assert _extract_text_from_json_line("plain text line") is None
-    # JSON with no text field returns None (metadata line)
-    assert _extract_text_from_json_line('{"type": "tool_use", "id": "x"}') is None
-    # Empty string in content returns empty string (filtered by caller)
-    assert _extract_text_from_json_line('{"content": ""}') == ""
+    assert _extract_text_from_json_line('{"message": "guten tag"}') == ("guten tag", False)
+    # OpenAI-style content blocks
+    assert _extract_text_from_json_line('{"content": [{"type": "text", "text": "block text"}]}') == ("block text", False)
+    # Non-JSON returns (None, False)
+    assert _extract_text_from_json_line("plain text line") == (None, False)
+    # JSON with no text field returns empty metadata
+    assert _extract_text_from_json_line('{"type": "tool_use", "id": "x"}') == ("", True)
+    # Empty string in content returns empty string (not metadata)
+    assert _extract_text_from_json_line('{"content": ""}') == ("", False)
 
 
 def test_extract_text_from_json_output():

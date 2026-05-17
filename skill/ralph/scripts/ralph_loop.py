@@ -130,32 +130,59 @@ def _build_remediation_prompt(findings: Iterable[CriterionResult]) -> str:
     return "\n".join(lines)
 
 
-def _extract_text_from_json_line(line: str) -> str | None:
+def _extract_text_from_json_line(line: str) -> tuple[str | None, bool]:
     """Try to extract text content from a single JSON line from pi --mode json.
 
-    Pi with --mode json outputs one JSON object per line. Each object may
-    contain text content in various fields depending on the message type.
-    Returns the extracted text, or None if the line is not valid JSON.
+    Returns a tuple of (text, is_metadata):
+    - (text_str, False): text content was successfully extracted
+    - ("", True): valid JSON but no text content (metadata/event line)
+    - (None, False): not valid JSON at all
     """
     try:
         obj = json.loads(line)
     except (json.JSONDecodeError, ValueError):
-        return None
+        return None, False
     if not isinstance(obj, dict):
-        return None
-    # Common field names for text content in LLM streaming formats
+        return None, False
+    # Try common field names for text content in LLM streaming formats
     for key in ("content", "text", "delta", "message"):
         val = obj.get(key)
         if isinstance(val, str):
-            return val
+            return val, False
+        if isinstance(val, list):
+            # OpenAI-style content blocks: [{"type": "text", "text": "..."}]
+            parts: list[str] = []
+            for item in val:
+                if isinstance(item, dict):
+                    for item_key in ("text", "content"):
+                        inner_val = item.get(item_key)
+                        if isinstance(inner_val, str):
+                            parts.append(inner_val)
+                elif isinstance(item, str):
+                    parts.append(item)
+            if parts:
+                return "\n".join(parts), False
         if isinstance(val, dict):
             # Nested objects like {"delta": {"text": "..."}}
             for inner_key in ("text", "content"):
                 inner_val = val.get(inner_key)
                 if isinstance(inner_val, str):
-                    return inner_val
-    # If no text field found, this might be a metadata/event line — skip it
-    return None
+                    return inner_val, False
+                if isinstance(inner_val, list):
+                    # Also handle list-of-dicts inside delta
+                    parts_inner: list[str] = []
+                    for item in inner_val:
+                        if isinstance(item, dict):
+                            for ik in ("text", "content"):
+                                iv = item.get(ik)
+                                if isinstance(iv, str):
+                                    parts_inner.append(iv)
+                        elif isinstance(item, str):
+                            parts_inner.append(item)
+                    if parts_inner:
+                        return "\n".join(parts_inner), False
+    # Valid JSON but no text content found — metadata/event line
+    return "", True
 
 
 def _extract_text_from_json_output(raw: str) -> str:
@@ -163,7 +190,7 @@ def _extract_text_from_json_output(raw: str) -> str:
 
     Parses the complete output (which may contain multiple JSON lines) and
     concatenates all text content found. Falls back to returning the raw
-    string if no valid JSON is found.
+    string if no text content could be extracted from JSON.
     """
     parts: list[str] = []
     found_json = False
@@ -171,17 +198,17 @@ def _extract_text_from_json_output(raw: str) -> str:
         stripped = line.strip()
         if not stripped:
             continue
-        text = _extract_text_from_json_line(stripped)
+        text, is_metadata = _extract_text_from_json_line(stripped)
         if text is not None:
             found_json = True
-            if text:
+            if not is_metadata and text:
                 parts.append(text)
         elif found_json:
             # Inside JSON output but line wasn't parseable — skip
             pass
     if found_json and parts:
         return "".join(parts)
-    # No JSON found — return raw output (backward compat for plain text)
+    # No text content extracted from JSON — return raw output
     return raw
 
 
@@ -281,8 +308,10 @@ class RalphLoop:
     def _stream_pi(self, cmd: list[str], prompt: str) -> str:
         """Run pi with --mode json and stream essential output to the console.
 
-        In default mode, only human-readable text content is printed — metadata
+        In default mode, only extracted text content is printed — metadata
         lines, tool-use events, and empty deltas are suppressed.
+        Non-JSON lines are printed as a fallback so the operator always sees
+        something.
         In verbose mode, raw JSON lines are also logged at DEBUG level.
         """
         logger.info("ralph.cmd.pi.stream_start model=%s cmd_len=%d", self.model, len(cmd))
@@ -298,25 +327,33 @@ class RalphLoop:
             raise RalphError(f"pi binary not found: {self.pi_bin}")
 
         text_parts: list[str] = []
+        json_lines_seen = 0
+        text_lines_seen = 0
         for line in process.stdout:
             stripped = line.rstrip("\n")
             if not stripped:
                 continue
             # Try to parse as JSON and extract text content
-            text_delta = _extract_text_from_json_line(stripped)
-            if text_delta is not None:
-                # Parsed a JSON line — only show non-empty text to the operator
-                if text_delta:
-                    print(text_delta, flush=True)
-                text_parts.append(text_delta)
-                # In verbose mode, also log the raw JSON line for debugging
+            text, is_metadata = _extract_text_from_json_line(stripped)
+            if text is not None:
+                # Successfully parsed as JSON
+                json_lines_seen += 1
+                if not is_metadata and text:
+                    # Real text content — show to operator
+                    print(text, flush=True)
+                    text_parts.append(text)
+                    text_lines_seen += 1
+                # is_metadata == True or empty string: skip silently
+                # In verbose mode, also log the raw JSON line
                 if self.verbose:
                     logger.debug("ralph.cmd.pi.json_line %s", stripped[:500])
             else:
-                # Not valid JSON — only show in verbose mode
+                # Not valid JSON — show raw line as fallback
+                print(line, end="", flush=True)
+                text_parts.append(line)
+                text_lines_seen += 1
                 if self.verbose:
                     logger.debug("ralph.cmd.pi.raw_line %s", stripped[:500])
-                # Don't print to console in default mode — suppress noise
 
         process.wait()
         stderr = process.stderr.read()
@@ -325,6 +362,15 @@ class RalphLoop:
             if self.verbose:
                 logger.debug("ralph.cmd.pi.run stderr=%s", stderr.strip()[:1000])
             raise RalphError(f"pi run failed: {stderr.strip()}")
+
+        # If JSON lines were seen but no text extracted, warn so the operator
+        # knows pi produced output but we couldn't parse text from it
+        if json_lines_seen > 0 and text_lines_seen == 0:
+            logger.warning(
+                "ralph.cmd.pi.no_text_extracted json_lines=%d — "
+                "pi produced JSON but no text content could be extracted",
+                json_lines_seen,
+            )
 
         full_text = "".join(text_parts)
         if self.verbose:
