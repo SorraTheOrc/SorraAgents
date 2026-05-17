@@ -13,9 +13,9 @@ const DEFAULT_OVERRIDES = [
   {
     // Match any capitalization of: implement <work-item-id> ...
     pattern: '^implement\\s+(\\S+)[\\s\\S]*$',
-    // Prepend a reminder including the entire first user message (match[0]).
-    template: 'You are continuing work on the original user request of {0}',
-    mode: 'prepend',
+    // Convert compaction prompt into an audit-driven follow-up.
+    template: 'audit {1} and address any issues the audit identifies',
+    mode: 'replace',
     flags: 'i',
   },
 ];
@@ -81,10 +81,15 @@ function renderTemplate(template, match) {
  */
 function extractUserPrompt(messages) {
   if (!Array.isArray(messages)) return '';
-  // pick the earliest user message with text
-  for (let i = 0; i < messages.length; i++) {
-    const entry = messages[i];
-    if (!entry || !entry.info || entry.info.role !== 'user') continue;
+  // Sort by timestamp to pick the chronologically earliest user message with text.
+  const sorted = messages
+    .filter((e) => e && e.info && e.info.role === 'user')
+    .sort((a, b) => {
+      const ta = a.info.time && typeof a.info.time.created === 'number' ? a.info.time.created : 0;
+      const tb = b.info.time && typeof b.info.time.created === 'number' ? b.info.time.created : 0;
+      return ta - tb;
+    });
+  for (const entry of sorted) {
     const parts = Array.isArray(entry.parts) ? entry.parts : [];
     const text = parts.map(p => (p && typeof p.text === 'string' ? p.text : '')).join('').trim();
     if (text) return text;
@@ -133,7 +138,9 @@ export function createRalphPlugin(deps = {}) {
 
   return async function RalphPlugin(ctx, options = {}) {
     const opts = { ...defaultOptions, ...(options && typeof options === 'object' ? options : {}) };
-    const overrides = compileOverrides(opts.overrides || DEFAULT_OVERRIDES);
+    const builtinOverrides = opts.disableDefaultOverrides ? [] : DEFAULT_OVERRIDES;
+    const configuredOverrides = Array.isArray(opts.overrides) ? opts.overrides : [];
+    const overrides = compileOverrides([...builtinOverrides, ...configuredOverrides]);
     // Log plugin initialization and the number of compiled overrides.
     safeLog(ctx, 'RalphPlugin: initialized', { overridesCount: overrides.length });
 
@@ -207,8 +214,8 @@ export function createRalphPlugin(deps = {}) {
             if (!rendered) continue;
 
             if (ov.mode === 'replace') {
-              output.prompt = rendered;
-              safeLog(ctx, 'RalphPlugin:compacting:output.prompt set', { rendered: rendered.slice(0, 200) });
+              output.prompt = `${rendered}\n\nOriginal user prompt: ${original}`;
+              safeLog(ctx, 'RalphPlugin:compacting:output.prompt set', { rendered: output.prompt.slice(0, 200) });
             } else {
               if (!Array.isArray(output.context)) output.context = [];
               output.context.unshift(rendered);
@@ -217,24 +224,11 @@ export function createRalphPlugin(deps = {}) {
             return;
           }
 
-          // No override matched — move the original prompt into output.prompt so the
-          // LLM treats it as part of the compaction prompt (output.context is often
-          // treated as supplementary and can be omitted by the model).
-          safeLog(ctx, 'RalphPlugin:compacting:no override matched; setting output.prompt to original');
-          try {
-            if (typeof output.prompt === 'string' && output.prompt.trim()) {
-              // Preserve any existing prompt by prepending the original prompt.
-              output.prompt = `Original user prompt: ${original}\n\n${output.prompt}`;
-            } else {
-              output.prompt = `Original user prompt: ${original}`;
-            }
-            safeLog(ctx, 'RalphPlugin:compacting:output.prompt set', { preview: output.prompt.slice(0, 200) });
-          } catch (e) {
-            // Fallback to context if something goes wrong (should be rare)
-            safeLog(ctx, 'RalphPlugin:compacting:failed to set output.prompt, falling back to context', e && e.message ? e.message : e);
-            if (!Array.isArray(output.context)) output.context = [];
-            output.context.push(`Original user prompt: ${original}`);
-          }
+          // No override matched — append the original prompt to output.context.
+          // The compaction pipeline may merge context entries into downstream prompts.
+          safeLog(ctx, 'RalphPlugin:compacting:no override matched; appending original to context');
+          if (!Array.isArray(output.context)) output.context = [];
+          output.context.push(`Original user prompt: ${original}`);
         } catch (err) {
           safeLog(ctx, 'RalphPlugin:compacting:error', err && err.message ? err.message : err);
           return;

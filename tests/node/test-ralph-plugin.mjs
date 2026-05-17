@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createRalphPlugin } from '../../.opencode/plugins/ralph.js';
+import { createRalphPlugin } from '../../plugins/ralph.js';
 
 function buildCtx(messagesResult) {
   return {

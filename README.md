@@ -10,13 +10,13 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 - agent/: workflow and agent-focused reference guides (e.g., [agent/forge.md](agent/forge.md)).
 - command/: design, intake, implementation and review process documents (see [command/implement.md](command/implement.md)).
 - skill/: skill templates and utilities to scaffold and package agent skills (see [skill/skill-creator/SKILL.md](skill/skill-creator/SKILL.md)).
-- .opencode/plugins/: local OpenCode plugins auto-loaded by the CLI (includes `ralph` compaction plugin).
+- plugins/: local OpenCode plugins used by this repository (includes `ralph` compaction plugin).
 - Workflow.md: high-level workflow for using this repository.
 - package.json: basic metadata used by tooling.
 
 ## Ralph compaction plugin
 
-This repository includes a local plugin at `.opencode/plugins/ralph.js` that
+This repository includes a local plugin at `plugins/ralph.js` that
 implements `experimental.session.compacting` to preserve original session intent
 during compaction.
 

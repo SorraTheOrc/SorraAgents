@@ -53,5 +53,5 @@ To disable built-in defaults, set:
 
 ## File locations
 
-- Plugin implementation: `.opencode/plugins/ralph.js`
+- Plugin implementation: `plugins/ralph.js`
 - Tests: `tests/node/test-ralph-plugin.mjs`

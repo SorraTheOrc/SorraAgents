@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import RalphPlugin from '../../.opencode/plugins/ralph.js';
+import RalphPlugin from '../../plugins/ralph.js';
 
 function makeUserMessage(text, created = 1) {
   return {
