@@ -649,10 +649,23 @@ class RalphLoop:
                             except Exception:
                                 logger.debug("ralph.loop.autoplan.marker_failed target=%s", target_id)
                             # Use pi to invoke the plan command non-interactively
+                            # Run pi with explicit flags (non-interactive, json mode) to invoke the plan command
+                            plan_prompt = f"/plan {target_id}"
+                            plan_cmd = [self.pi_bin, "-p", "--mode", "json", "--model", self.model, plan_prompt]
+                            logger.debug("ralph.cmd.pi.plan_cmd %s", plan_cmd)
                             try:
-                                self._run_pi(f"/plan {target_id}")
+                                if self.stream:
+                                    # stream the plan invocation (prints progress to console)
+                                    self._stream_pi(plan_cmd, plan_prompt)
+                                    plan_rc = 0
+                                else:
+                                    proc = self.runner(plan_cmd)
+                                    plan_rc = getattr(proc, "returncode", 0)
+                                    if plan_rc != 0:
+                                        logger.debug("ralph.cmd.pi.plan_stderr=%s", getattr(proc, "stderr", "")[:1000])
+                                if plan_rc != 0:
+                                    raise RalphError(f"pi plan command failed rc={plan_rc}")
                             except RalphError as e:
-                                # surface meaningful error
                                 logger.error("ralph.loop.autoplan.plan_failed target=%s err=%s", target_id, e)
                                 raise
                             logger.info("ralph.loop.autoplan.plan_invoked_ok target=%s", target_id)
