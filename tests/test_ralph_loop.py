@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 
+import json
 from skill.ralph.scripts.ralph_loop import RalphError, RalphLoop, _comment_hash, parse_audit_report
 
 
@@ -46,6 +47,15 @@ class FakeRunner:
 
         if cmd[:3] == ["wl", "update", "SA-TARGET"]:
             return Result(stdout='{"success":true}')
+
+        if cmd[0] == "python3" and len(cmd) > 1 and "orchestrate_estimate.py" in cmd[1]:
+            # Return pre-configured effort_and_risk output if provided
+            out = getattr(self, "effort_outputs", None)
+            if out:
+                val = out.pop(0)
+                return Result(stdout=val)
+            # default to small/low
+            return Result(stdout=json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low"}}))
 
         if cmd[0] == "pi" and "-p" in cmd:
             # pi -p --mode json --model <model> <prompt>
@@ -129,6 +139,42 @@ def test_retry_path_uses_remediation_in_next_implement_prompt():
     implement_prompts = [c[-1] for c in runner.calls if c[0] == "pi" and "-p" in c and c[-1].startswith("implement")]
     assert len(implement_prompts) == 2
     assert "Address all the gaps identified in the audit" in implement_prompts[1]
+
+
+def test_autoplan_skips_plan_for_small_low():
+    """When stage is intake_complete and effort/risk are Small/Low, do not invoke /plan and proceed to implement."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    # effort_and_risk returns Small / Low
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low"}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # ensure no plan invocation (opencode run /plan)
+    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    # ensure implement was invoked (pi with implement prompt)
+    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
+
+
+def test_autoplan_invokes_plan_for_medium_high():
+    """When stage is intake_complete and effort/risk are Medium/High, invoke /plan then implement."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    # effort_and_risk returns Medium / High
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Medium"}, "risk": {"level": "High"}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # ensure plan invocation occurred
+    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    # ensure implement was invoked after plan
+    plan_indices = [i for i,c in enumerate(runner.calls) if c[0] == "opencode" and "/plan" in " ".join(c)]
+    impl_indices = [i for i,c in enumerate(runner.calls) if c[0] == "pi" and c[-1].startswith("implement")]
+    assert plan_indices and impl_indices and min(impl_indices) > min(plan_indices)
 
 
 def test_cancel_file_stops_loop():

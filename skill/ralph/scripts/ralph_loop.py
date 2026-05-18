@@ -560,10 +560,11 @@ class RalphLoop:
     def _assert_precondition(self, target_id: str) -> None:
         item = self._wl_show(target_id).get("workItem", {})
         stage = item.get("stage", "unknown")
-        if stage not in {"plan_complete", "in_review"}:
+        # Accept intake_complete as a valid entrypoint for the auto-plan flow
+        if stage not in {"plan_complete", "in_review", "intake_complete"}:
+            # Keep legacy phrasing for compatibility with callers/tests but mention intake_complete
             raise RalphError(
-                f"Target {target_id} must be stage plan_complete or in_review before running ralph; "
-                f"current stage is {stage}."
+                f"Target {target_id} must be stage plan_complete or in_review (or intake_complete for auto-plan) before running ralph; current stage is {stage}."
             )
 
     def _scope_in_review(self, scope_ids: Iterable[str]) -> bool:
@@ -600,7 +601,60 @@ class RalphLoop:
 
             logger.info("ralph.loop.attempt.start target=%s attempt=%d", target_id, attempt)
 
-            if skip_implement and attempt == 1:
+            if target_stage == "intake_complete":
+                # Optional pre-implementation auto-plan step
+                logger.info("ralph.loop.autoplan.start target=%s attempt=%d", target_id, attempt)
+                try:
+                    # Call effort-and-risk skill. If runner is default, run subprocess with stdin.
+                    payload = json.dumps({"issue_id": target_id, "o": 0, "m": 0, "p": 0, "certainty": 100})
+                    if self.runner == _default_runner:
+                        proc = subprocess.run(
+                            ["python3", "skill/effort-and-risk/scripts/orchestrate_estimate.py"],
+                            input=payload,
+                            text=True,
+                            capture_output=True,
+                        )
+                    else:
+                        # Non-default runners (tests) may accept payload as last arg
+                        proc = self.runner(["python3", "skill/effort-and-risk/scripts/orchestrate_estimate.py", payload])
+                    if proc.returncode != 0:
+                        logger.warning("ralph.loop.autoplan.failed target=%s rc=%s", target_id, getattr(proc, "returncode", None))
+                        # fail-open: treat as unknown -> run /plan
+                        do_plan = True
+                    else:
+                        try:
+                            er = json.loads(proc.stdout)
+                            tshirt = er.get("effort", {}).get("tshirt", "")
+                            risk_level = er.get("risk", {}).get("level", "")
+                            # Decision rule: proceed to implement only when effort is Small/Extra Small and risk is Low
+                            do_plan = not (tshirt in {"Extra Small", "Small"} and risk_level == "Low")
+                            logger.info("ralph.loop.autoplan.result target=%s tshirt=%s risk=%s do_plan=%s", target_id, tshirt, risk_level, do_plan)
+                        except Exception:
+                            logger.exception("ralph.loop.autoplan.parse_error target=%s", target_id)
+                            do_plan = True
+                    if do_plan:
+                        # invoke plan and continue to implement once plan completes
+                        logger.info("ralph.loop.autoplan.plan_invoked target=%s", target_id)
+                        # Use opencode run "/plan <id>" to create or update plan artifacts
+                        plan_cmd = ["opencode", "run", f"/plan {target_id}"]
+                        plan_proc = self.runner(plan_cmd)
+                        if getattr(plan_proc, "returncode", 0) != 0:
+                            raise RalphError(f"plan command failed: {getattr(plan_proc, 'stderr', '')}")
+                        logger.info("ralph.loop.autoplan.plan_complete target=%s", target_id)
+                except RalphError:
+                    raise
+                except Exception:
+                    logger.exception("ralph.loop.autoplan.unexpected target=%s", target_id)
+                # After autoplan step (whether plan ran or not), proceed to implement
+                prompt_parts = [
+                    f"implement {target_id}",
+                    "Continue until the work item and all dependencies are completed, but do not merge.",
+                ]
+                # Add a short remediation instruction if an audit produced unmet criteria previously
+                if remediation:
+                    prompt_parts.append(remediation)
+                self._run_pi("\n".join(prompt_parts))
+            elif skip_implement and attempt == 1:
                 # Target already in_review — audit first, only implement if audit fails
                 logger.info("ralph.loop.skip_implement target=%s stage=in_review", target_id)
             else:
