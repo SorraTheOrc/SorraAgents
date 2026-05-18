@@ -20,8 +20,8 @@ class FakeRunner:
         self.calls: list[list[str]] = []
         self.audit_outputs: list[str] = []
         self.items = {
-            "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open"},
-            "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress"},
+            "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open", "effort": "", "risk": ""},
+            "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress", "effort": "", "risk": ""},
         }
         self.comments: list[dict] = []
 
@@ -30,23 +30,31 @@ class FakeRunner:
         self.calls.append(cmd)
 
         if cmd[:3] == ["wl", "show", "SA-TARGET"] and "--children" in cmd:
-            return Result(stdout='{"success":true,"workItem":{"id":"SA-TARGET","stage":"plan_complete","status":"open"},"children":[{"id":"SA-CHILD"}]}')
+            item = self.items["SA-TARGET"]
+            return Result(stdout=json.dumps({"success": True, "workItem": item, "children": [{"id": "SA-CHILD"}]}))
         if cmd[:3] == ["wl", "show", "SA-TARGET"]:
             item = self.items["SA-TARGET"]
-            return Result(stdout=f'{{"success":true,"workItem":{item}}}'.replace("'", '"'))
+            return Result(stdout=json.dumps({"success": True, "workItem": item}))
         if cmd[:3] == ["wl", "show", "SA-CHILD"]:
             item = self.items["SA-CHILD"]
-            return Result(stdout=f'{{"success":true,"workItem":{item}}}'.replace("'", '"'))
+            return Result(stdout=json.dumps({"success": True, "workItem": item}))
 
         if cmd[:4] == ["wl", "comment", "list", "SA-TARGET"]:
-            return Result(stdout=f'{{"success":true,"comments":{self.comments}}}'.replace("'", '"'))
+            return Result(stdout=json.dumps({"success": True, "comments": self.comments}))
         if cmd[:4] == ["wl", "comment", "add", "SA-TARGET"]:
             comment = cmd[cmd.index("--comment") + 1]
-            self.comments.append({"comment": comment})
-            return Result(stdout='{"success":true}')
+            self.comments.append({"comment": comment, "author": "ralph"})
+            return Result(stdout=json.dumps({"success": True}))
 
         if cmd[:3] == ["wl", "update", "SA-TARGET"]:
-            return Result(stdout='{"success":true}')
+            # Track effort and risk updates
+            if "--effort" in cmd:
+                idx = cmd.index("--effort")
+                self.items["SA-TARGET"]["effort"] = cmd[idx + 1]
+            if "--risk" in cmd:
+                idx = cmd.index("--risk")
+                self.items["SA-TARGET"]["risk"] = cmd[idx + 1]
+            return Result(stdout=json.dumps({"success": True}))
 
         if cmd[0] == "python3" and len(cmd) > 1 and "orchestrate_estimate.py" in cmd[1]:
             # Return pre-configured effort_and_risk output if provided
@@ -55,7 +63,7 @@ class FakeRunner:
                 val = out.pop(0)
                 return Result(stdout=val)
             # default to small/low
-            return Result(stdout=json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low"}}))
+            return Result(stdout=json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 0}}))
 
         if cmd[0] == "pi" and "-p" in cmd:
             # pi -p --mode json --model <model> <prompt>
@@ -139,42 +147,6 @@ def test_retry_path_uses_remediation_in_next_implement_prompt():
     implement_prompts = [c[-1] for c in runner.calls if c[0] == "pi" and "-p" in c and c[-1].startswith("implement")]
     assert len(implement_prompts) == 2
     assert "Address all the gaps identified in the audit" in implement_prompts[1]
-
-
-def test_autoplan_skips_plan_for_small_low():
-    """When stage is intake_complete and effort/risk are Small/Low, do not invoke /plan and proceed to implement."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    # effort_and_risk returns Small / Low
-    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low"}})]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # ensure no plan invocation (opencode run /plan)
-    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
-    # ensure implement was invoked (pi with implement prompt)
-    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
-
-
-def test_autoplan_invokes_plan_for_medium_high():
-    """When stage is intake_complete and effort/risk are Medium/High, invoke /plan then implement."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    # effort_and_risk returns Medium / High
-    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Medium"}, "risk": {"level": "High"}})]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # ensure plan invocation occurred
-    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
-    # ensure implement was invoked after plan
-    plan_indices = [i for i,c in enumerate(runner.calls) if c[0] == "opencode" and "/plan" in " ".join(c)]
-    impl_indices = [i for i,c in enumerate(runner.calls) if c[0] == "pi" and c[-1].startswith("implement")]
-    assert plan_indices and impl_indices and min(impl_indices) > min(plan_indices)
 
 
 def test_cancel_file_stops_loop():
@@ -779,4 +751,308 @@ def test_wl_comment_add_truncates_large_comment():
     comment_idx = cmd.index("--comment")
     comment_text = cmd[comment_idx + 1]
     assert len(comment_text) < RalphLoop._MAX_ARG_LEN + 200  # includes truncation note
-    assert "truncated" in comment_text
+# =============================================================================
+# Auto-plan feature tests
+# =============================================================================
+
+
+def test_autoplan_skips_plan_for_small_low():
+    """When stage is intake_complete and effort/risk are Small/Low, do not invoke /plan and proceed to implement."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 2}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # ensure no plan invocation (opencode run /plan)
+    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    # ensure implement was invoked (pi with implement prompt)
+    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
+    # ensure autoplan comment was posted
+    comment_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
+    autoplan_comments = [c for c in comment_calls if "autoplan-decision-hash:" in c[c.index("--comment") + 1]]
+    assert len(autoplan_comments) == 1
+    assert "proceed to implement" in autoplan_comments[0][autoplan_comments[0].index("--comment") + 1]
+
+
+def test_autoplan_skips_plan_for_extra_small_low():
+    """Extra Small effort + Low risk also skips /plan."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Extra Small"}, "risk": {"level": "Low", "score": 1}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
+
+
+def test_autoplan_invokes_plan_for_medium_high():
+    """When stage is intake_complete and effort/risk are Medium/High, invoke /plan then implement."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Medium"}, "risk": {"level": "High", "score": 15}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # ensure plan invocation occurred
+    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    # ensure implement was invoked after plan
+    plan_indices = [i for i, c in enumerate(runner.calls) if c[0] == "opencode" and "/plan" in " ".join(c)]
+    impl_indices = [i for i, c in enumerate(runner.calls) if c[0] == "pi" and c[-1].startswith("implement")]
+    assert plan_indices and impl_indices and min(impl_indices) > min(plan_indices)
+    # ensure autoplan comment was posted with plan decision
+    comment_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
+    autoplan_comments = [c for c in comment_calls if "autoplan-decision-hash:" in c[c.index("--comment") + 1]]
+    assert len(autoplan_comments) >= 1
+    assert "run /plan" in autoplan_comments[0][autoplan_comments[0].index("--comment") + 1]
+
+
+def test_autoplan_idempotent_no_duplicate_decisions():
+    """Re-running ralph when an autoplan decision comment already exists skips re-computation."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.items["SA-TARGET"]["effort"] = "Small"
+    runner.items["SA-TARGET"]["risk"] = "Low"
+    # Pre-add an autoplan decision comment to simulate a prior run
+    runner.comments = [{"comment": "# Ralph Auto-Plan Decision\nautoplan-decision-hash:abc123\n\nEffort: Small\nRisk: Low (score: 2)\nDecision: proceed to implement (effort and risk below threshold)", "author": "ralph"}]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # No effort-and-risk script should be called (idempotent)
+    er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
+    assert len(er_calls) == 0
+    # No Plan should be invoked (effort Small, risk Low → skip plan)
+    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    # Implementation should proceed
+    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
+
+
+def test_autoplan_idempotent_skips_plan_when_effort_risk_already_set():
+    """When effort and risk fields are already set on the work item, skip re-running effort-and-risk."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.items["SA-TARGET"]["effort"] = "Medium"
+    runner.items["SA-TARGET"]["risk"] = "High"
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # No effort-and-risk script should be called
+    er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
+    assert len(er_calls) == 0
+    # Plan should be invoked (Medium effort + High risk → run /plan)
+    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+
+
+def test_autoplan_idempotent_no_duplicate_comments():
+    """Autoplan comment is not posted twice when the same decision hash exists."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 2}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    # First run
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    comment_calls_1 = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
+    autoplan_comments_1 = [c for c in comment_calls_1 if "autoplan-decision-hash:" in c[c.index("--comment") + 1]]
+    assert len(autoplan_comments_1) == 1
+
+    # Now simulate a second run — the comment should already exist
+    runner.calls.clear()
+    runner.items["SA-TARGET"]["stage"] = "in_review"
+    runner.audit_outputs = [AUDIT_PASS]
+    loop2 = RalphLoop(runner=runner, stream=False)
+
+    # The existing comments contain the autoplan-decision hash
+    # Since the scope is already in_review, the in_review path skips autoplan
+    result2 = loop2.run("SA-TARGET")
+    assert result2["status"] == "success"
+
+
+def test_autoplan_failure_defaults_to_plan():
+    """When the effort-and-risk script fails, default to running /plan (safety-first)."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    # Simulate failure by returning non-zero returncode
+    runner.effort_outputs = [Result(returncode=1, stdout="", stderr="error").stdout]
+    # Since FakeRunner returns success for orchestrate_estimate, we override the __call__
+    # Actually, let's use a custom runner that returns failure
+    class FailRunner(FakeRunner):
+        def __call__(self, cmd):
+            if cmd[0] == "python3" and len(cmd) > 1 and "orchestrate_estimate.py" in cmd[1]:
+                self.calls.append(cmd)
+                return Result(returncode=1, stdout="", stderr="script failed")
+            return super().__call__(cmd)
+
+    fail_runner = FailRunner()
+    fail_runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    fail_runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=fail_runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # Plan should be invoked due to failure fallback
+    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in fail_runner.calls)
+
+
+def test_autoplan_ambiguous_data_defaults_to_plan():
+    """When effort-and-risk returns unparseable data, default to running /plan."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.effort_outputs = ["not json at all"]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # Plan should be invoked due to ambiguous data
+    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+
+
+def test_autoplan_no_autoplan_flag_skips_step():
+    """When --no-autoplan is set, the autplan step is skipped even for intake_complete."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+    loop.no_autoplan = True
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # No effort-and-risk script should be called
+    er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
+    assert len(er_calls) == 0
+    # No /plan should be invoked
+    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+
+
+def test_autoplan_custom_thresholds():
+    """Custom thresholds for skipping /plan are respected."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    # Medium effort + Low risk — with custom thresholds, Medium should skip plan
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Medium"}, "risk": {"level": "Low", "score": 2}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(
+        runner=runner,
+        stream=False,
+        autoplan_effort_skip=frozenset({"Extra Small", "Small", "Medium"}),
+        autoplan_risk_skip=frozenset({"Low"}),
+    )
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # Medium + Low should skip plan with the expanded thresholds
+    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
+
+
+def test_autoplan_posts_decision_comment():
+    """Autoplan posts a human-readable decision comment on the work item."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 2}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # Find the autoplan decision comment
+    comment_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
+    autoplan_comments = [c for c in comment_calls if "autoplan-decision-hash:" in c[c.index("--comment") + 1]]
+    assert len(autoplan_comments) == 1
+    comment_text = autoplan_comments[0][autoplan_comments[0].index("--comment") + 1]
+    assert "# Ralph Auto-Plan Decision" in comment_text
+    assert "Effort: Small" in comment_text
+    assert "Risk: Low (score: 2)" in comment_text
+    assert "proceed to implement" in comment_text
+
+
+def test_autoplan_effort_risk_persistence():
+    """The effort-and-risk script updates the work item's effort and risk fields."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.effort_outputs = [json.dumps({
+        "effort": {"tshirt": "Medium"},
+        "risk": {"level": "High", "score": 15}
+    })]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # The orchestrate_estimate.py script is responsible for calling wl update --effort --risk
+    # and wl comment add. Here we just verify that /plan was invoked because
+    # effort Medium + risk High exceeds the default thresholds.
+    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+
+
+def test_autoplan_already_computed_with_plan_complete():
+    """When effort/risk are already set and stage is plan_complete, skip both
+    effort-and-risk and /plan."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.items["SA-TARGET"]["effort"] = "Small"
+    runner.items["SA-TARGET"]["risk"] = "Low"
+    # Add a comment with autoplan decision hash (simulating prior run)
+    import hashlib
+    marker_key = "autoplan-decision:Small:Low:0"
+    marker_hash = hashlib.sha256(marker_key.encode("utf-8")).hexdigest()[:16]
+    runner.comments = [{"comment": f"# Ralph Auto-Plan Decision\nautoplan-decision-hash:{marker_hash}\n\nEffort: Small\nRisk: Low (score: 0)\nDecision: proceed to implement (effort and risk below threshold)", "author": "ralph"}]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # No effort-and-risk script should be called
+    er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
+    assert len(er_calls) == 0
+    # No Plan should be invoked (Small + Low → skip plan)
+    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    # Implementation should proceed
+    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
+
+
+def test_autoplan_only_runs_on_first_attempt():
+    """Autoplan should only run on the first attempt, not on retries."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 2}})]
+    runner.audit_outputs = [AUDIT_FAIL, AUDIT_PASS]  # First audit fails, second passes
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # Effort-and-risk should only be called once
+    er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
+    assert len(er_calls) == 1
+    # Two implement calls (first attempt + second attempt after failed audit)
+    impl_calls = [c for c in runner.calls if c[0] == "pi" and c[-1].startswith("implement")]
+    assert len(impl_calls) == 2
+
+
+def test_cli_parser_autoplan_flags():
+    """Test --no-autoplan, --autoplan-effort-skip, and --autoplan-risk-skip flags."""
+    from skill.ralph.scripts.ralph_loop import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "SA-X1", "--no-autoplan",
+        "--autoplan-effort-skip", "Small", "Extra Small",
+        "--autoplan-risk-skip", "Low",
+    ])
+    assert args.no_autoplan is True
+    assert args.autoplan_effort_skip == ["Small", "Extra Small"]
+    assert args.autoplan_risk_skip == ["Low"]

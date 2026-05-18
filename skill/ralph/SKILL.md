@@ -27,3 +27,20 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 python skill/ralph/scripts/ralph_loop.py <work-item-id> --json
 ```
 
+## Auto-Plan Decision
+
+When the target work item is at stage `intake_complete`, ralph automatically runs an **auto-plan** decision before the first implementation pass:
+
+1. **Evaluate effort and risk**: ralph calls the `effort-and-risk` skill to compute the effort t-shirt size and risk level.
+2. **Threshold check**:
+   - If effort is **Extra Small** or **Small** AND risk is **Low** → skip `/plan` and proceed directly to implementation.
+   - If effort or risk exceed these thresholds → invoke `/plan <id>` before implementation.
+   - If the effort-and-risk skill fails → default to running `/plan` (safety-first).
+3. **Idempotence**: If effort/risk are already computed or a decision comment exists, ralph skips re-computation and uses the stored values.
+4. **Decision comment**: ralph posts a human-readable comment documenting the auto-plan decision.
+
+Use `--no-autoplan` to disable this step and proceed directly to implementation.
+Use `--autoplan-effort-skip` and `--autoplan-risk-skip` to customize the thresholds.
+
+See `docs/ralph.md` for full details.
+

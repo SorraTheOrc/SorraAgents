@@ -31,12 +31,16 @@ python skill/ralph/scripts/ralph_loop.py <work-item-id> [options]
 | `--model` | `opencode-go/glm-5.1` | Model ID to pass to `pi run --model`. Can also be set in `.ralph.json`. |
 | `--pi-bin` | `pi` | Path to the `pi` binary for delegating implement and audit. |
 | `--wl-bin` | `wl` | Path to the `wl` binary for worklog operations. |
+| `--no-autoplan` | off | Disable the auto-plan step for `intake_complete` items. When set, ralph proceeds directly to implementation without running effort-and-risk evaluation. |
+| `--autoplan-effort-skip` | Extra Small, Small | T-shirt effort sizes that allow skipping `/plan`. Accepts multiple space-separated values. |
+| `--autoplan-risk-skip` | Low | Risk levels that allow skipping `/plan`. Accepts multiple space-separated values. |
 
 ### Preconditions
 
-- **Stage gate**: The target work item must be at stage `plan_complete` or `in_review`.
-  - At `plan_complete`: ralph runs the full implement→audit loop.
-  - At `in_review`: ralph **skips the first implement pass** and audits immediately. If audit passes, ralph proceeds to checks/merge without any implement step. If audit fails, ralph falls into the normal implement→audit loop with remediation.
+- **Stage gate**: The target work item must be at stage `plan_complete`, `in_review`, or `intake_complete`.
+  - At `intake_complete`: ralph automatically runs the **auto-plan** decision (see Auto-Plan Decision section). If effort and risk are below thresholds, ralph proceeds directly to implementation. If effort or risk exceed thresholds, `/plan` is invoked first, then implementation continues. Auto-plan only runs on the first attempt; subsequent iterations proceed directly to implementation.
+  - At `plan_complete`: ralph runs the full implement\u2192audit loop.
+  - At `in_review`: ralph **skips the first implement pass** and audits immediately. If audit passes, ralph proceeds to checks/merge without any implement step. If audit fails, ralph falls into the normal implement\u2192audit loop with remediation.
   - At any other stage: ralph exits with an error.
 - **Scope**: Only the target item and its direct children are processed.
 
@@ -133,10 +137,59 @@ Ralph emits structured log events at key lifecycle points using the `ralph` Pyth
 | `ralph.loop.cancelled` | INFO | target, attempt |
 | `ralph.loop.max_attempts` | WARNING | target |
 
+## Auto-Plan Decision
+
+When a work item is at stage `intake_complete`, ralph automatically runs an **auto-plan** decision before the first implementation pass:
+
+1. **Check idempotence**: If the work item already has non-empty `effort` and `risk` fields, or an existing `autoplan-decision-hash:` comment, ralph skips the effort-and-risk computation and uses the stored values for the threshold check.
+2. **Evaluate effort and risk**: Otherwise, ralph calls the `effort-and-risk` skill (`orchestrate_estimate.py`) to compute the effort t-shirt size and risk level.
+3. **Threshold decision**:
+   - If effort is **Extra Small** or **Small** **AND** risk is **Low**, ralph skips planning and proceeds directly to implementation.
+   - If effort or risk exceed these thresholds, ralph invokes `/plan <id>` to create a plan before implementation.
+   - If the effort-and-risk skill fails or returns ambiguous data, ralph defaults to running `/plan` (safety-first).
+4. **Post decision comment**: ralph posts a human-readable comment on the work item documenting the auto-plan decision (effort, risk, outcome). This comment is idempotent \u2014 re-running ralph will not create duplicate comments.
+
+### Auto-plan observability
+
+| Event | Level | Data |
+|-------|-------|------|
+| `ralph.autoplan.start` | INFO | target |
+| `ralph.autoplan.already_computed` | INFO | target, effort, risk |
+| `ralph.autoplan.effort_risk.start` | INFO | target |
+| `ralph.autoplan.effort_risk.complete` | INFO | target, t-shirt, risk level |
+| `ralph.autoplan.effort_risk.failed` | WARNING | target, return code |
+| `ralph.autoplan.result` | INFO | target, t-shirt, risk level, do_plan |
+| `ralph.autoplan.plan_invoked` | INFO | target |
+| `ralph.autoplan.plan_complete` | INFO | target |
+| `ralph.autoplan.skip_plan` | INFO | target |
+| `ralph.autoplan.cached_decision` | INFO | target, effort, risk, do_plan |
+
+### Disabling auto-plan
+
+Use `--no-autoplan` to skip the auto-plan step entirely and proceed directly to implementation for `intake_complete` items:
+
+```bash
+python skill/ralph/scripts/ralph_loop.py SA-1234 --no-autoplan
+```
+
+### Customizing thresholds
+
+Override the default thresholds for skipping `/plan`:
+
+```bash
+# Allow Medium effort to skip /plan (in addition to Extra Small and Small)
+python skill/ralph/scripts/ralph_loop.py SA-1234 --autoplan-effort-skip Extra Small Small Medium
+
+# Allow Low and Medium risk to skip /plan
+python skill/ralph/scripts/ralph_loop.py SA-1234 --autoplan-risk-skip Low Medium
+```
+
 ## Idempotence
 
 - Audit comments are deduplicated by content hash. Re-running ralph with identical audit output will not create duplicate AMPA comments.
 - Changed audit content appends a new comment (clear revision, not a duplicate).
+- Auto-plan decision comments are deduplicated by a deterministic hash of the effort/risk values. Re-running ralph when effort and risk are unchanged will not create duplicate auto-plan comments.
+- When effort and risk fields are already set on the work item, ralph skips the effort-and-risk computation and uses the stored values for the threshold decision.
 
 ## Examples
 
