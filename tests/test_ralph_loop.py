@@ -358,7 +358,7 @@ def test_verbose_mode_logs_pi_output_start():
         prompt_msgs = [r for r in pi_debug_msgs if "prompt_full" in r.getMessage()]
         assert len(prompt_msgs) >= 1
         # The prompt should contain the implement instruction in full
-        assert "Continue until scope items are in_review" in prompt_msgs[0].getMessage()
+        assert "Continue until the work item and all dependencies are completed, but do not merge." in prompt_msgs[0].getMessage()
         # text_start should be logged (the extracted text content)
         text_msgs = [r for r in pi_debug_msgs if "text_start" in r.getMessage()]
         assert len(text_msgs) >= 1

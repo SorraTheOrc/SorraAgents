@@ -606,8 +606,7 @@ class RalphLoop:
             else:
                 prompt_parts = [
                     f"implement {target_id}",
-                    f"Target scope includes direct children only: {', '.join(scope_ids[1:]) or '(none)'}.",
-                    "Continue until scope items are in_review, but do not merge.",
+                    "Continue until the work item and all dependencies are completed, but do not merge.",
                 ]
                 if remediation:
                     prompt_parts.append(remediation)
