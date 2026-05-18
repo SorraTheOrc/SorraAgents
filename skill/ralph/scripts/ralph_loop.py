@@ -648,11 +648,13 @@ class RalphLoop:
                                 self._wl_comment_add(target_id, f"autoplan-invoked:{int(time.time())}")
                             except Exception:
                                 logger.debug("ralph.loop.autoplan.marker_failed target=%s", target_id)
-                            # Use opencode run "/plan <id>" to create or update plan artifacts
-                            plan_cmd = ["opencode", "run", f"/plan {target_id}"]
-                            plan_proc = self.runner(plan_cmd)
-                            if getattr(plan_proc, "returncode", 0) != 0:
-                                raise RalphError(f"plan command failed: {getattr(plan_proc, 'stderr', '')}")
+                            # Use pi to invoke the plan command non-interactively
+                            try:
+                                self._run_pi(f"/plan {target_id}")
+                            except RalphError as e:
+                                # surface meaningful error
+                                logger.error("ralph.loop.autoplan.plan_failed target=%s err=%s", target_id, e)
+                                raise
                             logger.info("ralph.loop.autoplan.plan_invoked_ok target=%s", target_id)
                             # Wait for plan completion: poll wl show until stage becomes plan_complete
                             poll_timeout = 600  # seconds

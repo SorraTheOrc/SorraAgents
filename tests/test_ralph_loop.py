@@ -152,8 +152,8 @@ def test_autoplan_skips_plan_for_small_low():
 
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"
-    # ensure no plan invocation (opencode run /plan)
-    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    # ensure no plan invocation (pi /plan)
+    assert not any(c[0] == "pi" and c[-1].startswith("/plan") for c in runner.calls)
     # ensure implement was invoked (pi with implement prompt)
     assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
 
@@ -169,10 +169,10 @@ def test_autoplan_invokes_plan_for_medium_high():
 
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"
-    # ensure plan invocation occurred
-    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    # ensure plan invocation occurred (pi /plan)
+    assert any(c[0] == "pi" and c[-1].startswith("/plan") for c in runner.calls)
     # ensure implement was invoked after plan
-    plan_indices = [i for i,c in enumerate(runner.calls) if c[0] == "opencode" and "/plan" in " ".join(c)]
+    plan_indices = [i for i,c in enumerate(runner.calls) if c[0] == "pi" and c[-1].startswith("/plan")]
     impl_indices = [i for i,c in enumerate(runner.calls) if c[0] == "pi" and c[-1].startswith("implement")]
     assert plan_indices and impl_indices and min(impl_indices) > min(plan_indices)
 
