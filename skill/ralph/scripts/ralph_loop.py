@@ -633,14 +633,27 @@ class RalphLoop:
                             logger.exception("ralph.loop.autoplan.parse_error target=%s", target_id)
                             do_plan = True
                     if do_plan:
-                        # invoke plan and continue to implement once plan completes
-                        logger.info("ralph.loop.autoplan.plan_invoked target=%s", target_id)
-                        # Use opencode run "/plan <id>" to create or update plan artifacts
-                        plan_cmd = ["opencode", "run", f"/plan {target_id}"]
-                        plan_proc = self.runner(plan_cmd)
-                        if getattr(plan_proc, "returncode", 0) != 0:
-                            raise RalphError(f"plan command failed: {getattr(plan_proc, 'stderr', '')}")
-                        logger.info("ralph.loop.autoplan.plan_complete target=%s", target_id)
+                        # Check idempotence marker: if we've already invoked autoplan, skip to avoid recursion
+                        try:
+                            comments = self._wl_comment_list(target_id)
+                            if any((c.get("comment") or "").find("autoplan-invoked:") >= 0 for c in comments):
+                                logger.info("ralph.loop.autoplan.skipped_already_invoked target=%s", target_id)
+                                do_plan = False
+                        except Exception:
+                            logger.debug("ralph.loop.autoplan.comment_list_failed target=%s", target_id)
+                        if do_plan:
+                            logger.info("ralph.loop.autoplan.plan_invoked target=%s", target_id)
+                            # record marker to avoid re-entrant autoplan
+                            try:
+                                self._wl_comment_add(target_id, f"autoplan-invoked:{int(time.time())}")
+                            except Exception:
+                                logger.debug("ralph.loop.autoplan.marker_failed target=%s", target_id)
+                            # Use opencode run "/plan <id>" to create or update plan artifacts
+                            plan_cmd = ["opencode", "run", f"/plan {target_id}"]
+                            plan_proc = self.runner(plan_cmd)
+                            if getattr(plan_proc, "returncode", 0) != 0:
+                                raise RalphError(f"plan command failed: {getattr(plan_proc, 'stderr', '')}")
+                            logger.info("ralph.loop.autoplan.plan_complete target=%s", target_id)
                 except RalphError:
                     raise
                 except Exception:
