@@ -28,7 +28,7 @@ Focus on:
 - Keeping tests and docs in sync with behavior changes, adding coverage when risk warrants
 - Surfacing blockers, risky refactors, or missing context early to the Producer and peer agents
 - Implement the smallest change that meets acceptance criteria, using `git diff` frequently to keep scope tight.
-- Run the most targeted checks available (`npm test`, `npm run build`, or narrower suites) and summarize results.
+- Always follow the mandatory build → test → commit order: build the project and verify no errors, then run the most targeted checks available (`npm test`, `npm run build`, or narrower suites) and verify they pass, and only then commit. Never commit before verifying that the build and tests pass.
 - Summaries in the Worklog must list every command executed, tests/docs touched (including `history/` planning artifacts), and remaining risks or follow-ups before handing off.
 
 Boundaries:

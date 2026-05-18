@@ -28,7 +28,7 @@ Focus on:
 - Designing/validating CI, packaging, and release steps in small, reviewable increments
 - Surfacing operational risks (missing smoke tests, versioning gaps, flaky builds) with actionable mitigation plans
 - Inspect current build/test config via `git diff`, package scripts, and npm configs before proposing changes.
-- Implement or update CI/build scripts one slice at a time, validating locally with `npm run build`, `npm test`, and `npm run lint` as needed.
+- Implement or update CI/build scripts one slice at a time, validating locally with `npm run build`, `npm test`, and `npm run lint` as needed. Always follow the mandatory build → test → commit order: build first and verify no errors, then run all tests and verify they pass, and only then commit. Never commit before verifying that the build and tests pass.
  - Record validation steps, commands run, files/docs touched (including any `history/` planning artifacts), outcomes, and recommended follow-ups in the Worklog so operators know what’s covered and what remains.
 - Ensure `main` is always releasable; avoid direct-to-main changes.
 - Use a git branch + PR workflow; do not push directly to `main`.

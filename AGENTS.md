@@ -58,19 +58,18 @@ Follow thhe steps below when completing tasks. If you are already working on a s
    - Create a new branch for the work-item following the branch naming conventions (e.g. `wl-<WIP-id>-short-description`)
    - Complete all work required to meet the acceptance criteria (code, tests, documentation, etc.)
      - If new work-items are discovered during implementation create new work-items using `wl create "<work-item-title>" --description "<detailed-description-of-goals-and-context>" --issue-type <type-of-work-item> --json`. If the item must be completed in order to satisfy the requirements of the parent work-item, make the new item a child of the parent work-item using `--parent <parent-id>`. If it is an optional item make it a sibling of the <base-item-id> and add a reference to the base item in the description using `discovered-from:<base-item-id>`.
-     - Regularly build and run all tests and checks to ensure nothing is broken
+     - Regularly build the project and run all tests and checks to ensure nothing is broken. Always follow the build → test → commit order: build first, then test, then commit.
        - If the build or any tests/checks fail, fix the issues and repeat until all tests/checks pass
-     - Commit changes whenever the Producer observes that a significant amount of progress has been made (ask if you think it is due), use clear commit messages that reference the WIP id and summarise the changes made.
+     - Commit changes only after the build completes without errors and all tests pass. Before committing, always run the build first, then the test suite, and only commit if both succeed. Never commit before verifying that the build and tests pass. When committing, use clear commit messages that reference the WIP id and summarise the changes made.
    - If a particularly complex issue is identified or a significant design decisions or assumption is made record this in a comment on the work-item using `wl comment add <WIP-id> --comment "<detailed-comment>" --author <your-agent-name> --json`
-   - Once the acceptance criteria of <WIP-id> has been satisfied and all tests pass (meaning you have built the project, rebuilt the application, and run all tests successfully), commit final changes to the branch with a message such as `<WIP-id>: Completed work to satisfy acceptance criteria: <acceptance-criteria-summary>`
+   - Once the acceptance criteria of <WIP-id> has been satisfied, follow the mandatory build → test → commit order: first build the project (verify no errors), then run all tests (verify all pass), and only then commit final changes to the branch with a message such as `<WIP-id>: Completed work to satisfy acceptance criteria: <acceptance-criteria-summary>`
    - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
    - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
    - Report back to the operator summarising the work completed and proceed to the next step.
 6. **Merge work into main**:
    - Update the branch to bring it into line with main
      - resolve any conflicts that arise
-   - Build the application and run all tests and checks to ensure nothing is broken
-     - If the build failes or any tests/checks fail, fix the issues and repeat until all tests/checks pass
+   - Build the project and run all tests and checks to ensure nothing is broken. Only proceed with merging after the build succeeds without error and all tests pass.
    - Push the branch to the remote repository
    - Switch back to main, merge the branch and push the updated main branch to the remote repository
    - Close the work-item with a comment summarising the changes made and the reason for them, including the commit hash using `wl close <WIP-id> --reason "Completed work, see merge commit <merge-commit-hash> for details." --json`
@@ -102,7 +101,8 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - Always ensure that any work-item created is associated with a clear goal and context, preferably in the form of a user story, along with measurable and testable acceptance criteria. If the requirements are not clear, seek clarification and update the work-item accordingly before proceeding with implementation.
 - When writing content for work-item descriptions, comments, or commit messages, do not escape special character EXCEPT backticks. Use markdown formatting as needed for clarity and readability, but do not add unnecessary escaping that could reduce readability or cause confusion.
 - Never commit changes without associating them with a work item
-- Never commit changes without ensuring all tests and quality checks pass
+- Never commit changes without ensuring the build completes without errors and all tests and quality checks pass
+- Always follow the build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit changes. Never reverse this order or skip steps.
 - Before reporting coding work as done (for example marking a work-item ready for review or closing it locally), agents MUST rebuild the application and run the full test suite locally, confirming the build completes successfully and there are no failing tests or runtime errors.
 - Always record the commit message and hash of any commits made in a comment on the relevant work item(s)
 - Whenever a comment is made add a comment to impacted the work item(s) describing the changes, the files affected, and including the commit hash.

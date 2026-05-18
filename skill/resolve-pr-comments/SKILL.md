@@ -164,9 +164,18 @@ For each approved actionable fix:
 1. Use Edit tool to make the change
 2. Track which comment IDs were addressed
 
-#### Step 3.2: Commit and push
+#### Step 3.2: Build, test, commit and push
+
+Before committing, follow the mandatory build → test → commit order: build the project and verify no errors, then run all tests and verify they pass, and only then commit changes. Never commit before verifying that the build and tests pass.
 
 ```bash
+# Build the project first
+npm run build  # or the project's build command
+
+# Then run all tests
+npm test  # or the project's test command
+
+# Only commit after build and tests pass
 git add <modified_files>
 git commit -m "Address PR review feedback
 

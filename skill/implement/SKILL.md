@@ -55,6 +55,7 @@ any sensitive values before writing them to logs or comments.
 - If the work item is not well-defined, do not proceed with implementation. Instead, run the intake interview to clarify and update the work item before implementing.
 - If the work item has blockers or dependencies, implement those first before proceeding with the main work item.
 - Never commit directly to `main`. Always create a feature or bug branch for implementation.
+- The required order of operations before any commit is always: **build → test → commit**. First build the project and verify no errors, then run all tests and verify they pass, and only then commit. Never commit before verifying that the build and tests pass.
 - When creating branches, include the work item id in the branch name for traceability (e.g., `feature/WL-123-add-auth`).
 - When creating a commit message, review the diff and write a concise message summarizing the changes made and the reason for the change, referencing the work item id.
 - When committing add a comment to the work item with the commit message and hash.
@@ -119,7 +120,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Select the most appropriate work item to work on next (blocker > dependency; most critical first).
   - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
   - Recursively implement that work item as described in this procedure.
-  - When a work item is completed commit the work and update the stage: `wl update <work-item-id> --status in_progress --stage in_review --json`
+  - When a work item is completed, follow the mandatory build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit the work. Update the stage: `wl update <work-item-id> --status in_progress --stage in_review --json`
 
 - If the work item does not have a recorded audit (see the output of wl show <work-item-id> --json) go to the next item in this step of the process, otherwise:
   - review the audit notes and address any unmet acceptance criteria or other issues identified.
@@ -131,6 +132,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Add comments to the work item describing any significant design decisions, code edits or tradeoffs.
   - If additional work is discovered, create linked work items: `wl create "<title>" --deps discovered-from:<work-item-id> --json`
 - Once all acceptance criteria for the primary work item and all blockers and dependents are met:
+  - Build the project and verify the build completes without errors.
   - Run the entire test suite.
     - Report the reults
     - Fix any failing tests before continuing.
@@ -155,6 +157,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 5. Commit, Push and create PR
 
+- Before committing, follow the mandatory build → test → commit order: build the project and verify no errors, then run all tests and verify they pass, and only then commit changes.
 - Ensure all work has been committed
 - Push the branch to `origin`.
 - Create a Pull Request (PR) against the repository's default branch.
