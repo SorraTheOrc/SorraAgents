@@ -152,6 +152,28 @@ class TestPlanUpdateWorkItemsStepForTestFirst:
             "implementation work items' or 'Test tasks must be created first'."
         )
 
+    def test_dependency_command_present_in_update_step(self, plan_content: str) -> None:
+        """The 'Update work items' step must include an example or instruction
+        to add dependency edges using `wl dep add <DependentFeatureId> <PrereqFeatureId>` so that
+        implementation items depend on their corresponding test authoring items.
+        """
+        update_section_match = re.search(
+            r"Update work items.*?(?=\n#{1,3}\s|\Z)",
+            plan_content,
+            re.DOTALL | re.IGNORECASE,
+        )
+        assert update_section_match is not None, (
+            "Could not find 'Update work items' section in plan.md"
+        )
+        update_section = update_section_match.group(0)
+
+        # Look for a wl dep add example or instruction
+        dep_pattern = re.compile(r"wl\s+dep\s+add\s+<[^>]+>\s+<[^>]+>", re.IGNORECASE)
+        assert dep_pattern.search(update_section), (
+            "The 'Update work items' step must include an example using `wl dep add <implementation-work-item-id> <test-work-item-id>` "
+            "or similar instruction to create dependency edges so implementation depends on tests."
+        )
+
 
 class TestPlanSequencingReviewForTestFirst:
     """Verify that the automated review stage for sequencing and dependencies

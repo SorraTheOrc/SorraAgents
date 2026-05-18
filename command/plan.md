@@ -144,7 +144,9 @@ Keep asking questions until the breakdown into features is clear.
 - `wl create --title "<Short Title>" --description "<Full feature description>" --parent <work-item-id> --priority P2 --stage idea --json`
 - Create dependency edges between feature work items where the plan specifies dependencies:
   - `wl dep add <DependentFeatureId> <PrereqFeatureId>`
-  - In particular, ensure implementation features depend on (have a prerequisite of) their corresponding test features, so that `wl next` always recommends test items first.
+  - Specifically: when creating implementation/code work items, add a dependency from the implementation work item to its corresponding test authoring work item so the implementation depends on the test. Example:
+    - `wl dep add <implementation-work-item-id> <test-work-item-id>`
+  - Operators may also link existing items using the same command pattern, for example: `wl dep add <work-item0id> <test-item-id>`. This ensures `wl next` and other scheduling tools favour test authoring tasks before implementation.
 
 - When creating child work items, ensure idempotence:
 - If a child work item with the same canonical name already exists, reuse it instead of creating a duplicate.
