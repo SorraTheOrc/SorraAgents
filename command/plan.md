@@ -32,6 +32,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 - Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or any OpenCode ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
 - If the user indicates uncertainty, add clarifying questions rather than guessing.
+- **Test-first ordering**: When creating child work items, test/verification work items must always be created before implementation work items. This ensures a test-driven development approach is followed — tests are defined first and implementation follows. The feature plan must list test features before implementation features, and the `wl create` commands for test items must be issued before those for implementation items.
 
 - Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
 
@@ -104,6 +105,8 @@ Keep asking questions until the breakdown into features is clear.
 - Each of the features should clearly identify how the player experience will be changed by the feature and what acceptance critera are required to validate it.
 - Each of the features should clearly identify how the user experience will be changed by the feature and what acceptance criteria are required to validate it.
 
+- **Test-first ordering**: Test and verification features must be listed before implementation features in the proposed plan. This ensures that when work items are created from the plan, test tasks are created first and establish the validation criteria that implementation tasks must satisfy.
+
 - Present the draft as a numbered list and ask the user to: accept, edit titles/scopes, reorder, or split/merge features.
 - If the user requests changes, iterate until the feature list is approved.
 
@@ -123,7 +126,7 @@ Keep asking questions until the breakdown into features is clear.
   - Actions: Add missing placeholders only when obvious; otherwise add Open Questions.
   2. Sequencing & dependencies review
   - Purpose: Ensure dependencies are coherent and actionable.
-  - Actions: Detect cycles, missing prerequisites, or vague dependencies; propose minimal fixes that do not change intent; record uncertainty as Open Questions.
+  - Actions: Detect cycles, missing prerequisites, or vague dependencies; propose minimal fixes that do not change intent; record uncertainty as Open Questions. Verify that test/verification features appear before implementation features — if they do not, reorder them so test features come first.
   3. Scope sizing review
   - Purpose: Ensure features are sized as deliverable increments.
   - Actions: Flag features that are too broad/vague or duplicate scope; suggest split/merge candidates as Open Questions.
@@ -136,10 +139,12 @@ Keep asking questions until the breakdown into features is clear.
 
 5. Update work items (agent)
 
+- **Test-first creation**: When creating child work items, always create test/verification work items before implementation work items. This ensures that test tasks are available first, enabling a test-driven development workflow where tests define the validation criteria before implementation begins.
 - Create child work items for each feature with a parent link to the original work item:
 - `wl create --title "<Short Title>" --description "<Full feature description>" --parent <work-item-id> --priority P2 --stage idea --json`
 - Create dependency edges between feature work items where the plan specifies dependencies:
   - `wl dep add <DependentFeatureId> <PrereqFeatureId>`
+  - In particular, ensure implementation features depend on (have a prerequisite of) their corresponding test features, so that `wl next` always recommends test items first.
 
 - When creating child work items, ensure idempotence:
 - If a child work item with the same canonical name already exists, reuse it instead of creating a duplicate.
