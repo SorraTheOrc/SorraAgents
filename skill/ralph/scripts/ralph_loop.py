@@ -653,6 +653,33 @@ class RalphLoop:
                             plan_proc = self.runner(plan_cmd)
                             if getattr(plan_proc, "returncode", 0) != 0:
                                 raise RalphError(f"plan command failed: {getattr(plan_proc, 'stderr', '')}")
+                            logger.info("ralph.loop.autoplan.plan_invoked_ok target=%s", target_id)
+                            # Wait for plan completion: poll wl show until stage becomes plan_complete
+                            poll_timeout = 600  # seconds
+                            poll_interval = 5
+                            waited = 0
+                            logger.info("ralph.loop.autoplan.poll_start target=%s timeout=%d", target_id, poll_timeout)
+                            while waited < poll_timeout:
+                                try:
+                                    data = self._wl_show(target_id)
+                                    item = data.get("workItem", {})
+                                    stage_now = item.get("stage", "")
+                                    if stage_now == "plan_complete":
+                                        logger.info("ralph.loop.autoplan.plan_complete target=%s waited=%d", target_id, waited)
+                                        break
+                                    # if item moved to in_review or done, we can also proceed
+                                    if stage_now in {"in_review", "done", "completed", "closed"}:
+                                        logger.info("ralph.loop.autoplan.proceed_on_stage target=%s stage=%s", target_id, stage_now)
+                                        break
+                                except Exception:
+                                    logger.debug("ralph.loop.autoplan.poll_wl_failed target=%s", target_id)
+                                time.sleep(poll_interval)
+                                waited += poll_interval
+                            else:
+                                # timed out
+                                logger.warning("ralph.loop.autoplan.poll_timeout target=%s waited=%d", target_id, waited)
+                                # Fail-safe: raise error to avoid proceeding blindly and creating potential loops
+                                raise RalphError(f"Timeout waiting for plan to complete for {target_id}")
                             logger.info("ralph.loop.autoplan.plan_complete target=%s", target_id)
                 except RalphError:
                     raise
