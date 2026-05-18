@@ -663,6 +663,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None, help=f"Model to use for pi run (default: {DEFAULT_MODEL}, or 'model' key in .ralph.json)")
     parser.add_argument("--pi-bin", default="pi")
     parser.add_argument("--wl-bin", default="wl")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON Lines (jsonl) for lifecycle events and final result")
     return parser
 
 
@@ -670,19 +671,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Configure console logging based on verbosity.
+    # Configure console logging based on verbosity or json mode.
     #   --quiet    : WARNING only, no progress, no pi streaming
     #   (default)  : INFO — lifecycle progress (attempt, audit, merge) + pi streaming
     #   --verbose  : DEBUG — adds delegated commands, subprocess output, raw audit
     #   --no-stream: disable pi stdout streaming (use buffered capture)
-    if not args.quiet:
+    if args.json:
+        # Emit compact JSON lines with timestamp, level, logger, and message
+        class JsonLineFormatter(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                payload = {
+                    "ts": int(record.created * 1000),
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "msg": record.getMessage(),
+                }
+                return json.dumps(payload, ensure_ascii=False)
         handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+        handler.setFormatter(JsonLineFormatter())
         logging.getLogger("ralph").addHandler(handler)
-    if args.verbose:
-        logging.getLogger("ralph").setLevel(logging.DEBUG)
+        logging.getLogger("ralph").setLevel(logging.DEBUG if args.verbose else logging.INFO)
     else:
-        logging.getLogger("ralph").setLevel(logging.INFO)
+        if not args.quiet:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+            logging.getLogger("ralph").addHandler(handler)
+        if args.verbose:
+            logging.getLogger("ralph").setLevel(logging.DEBUG)
+        else:
+            logging.getLogger("ralph").setLevel(logging.INFO)
 
     loop = RalphLoop(
         pi_bin=args.pi_bin,
@@ -698,10 +715,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = loop.run(args.work_item_id)
     except RalphError as exc:
-        print(f"ralph: {exc}")
+        if args.json:
+            # emit error as single JSON line
+            print(json.dumps({"error": str(exc)}))
+        else:
+            print(f"ralph: {exc}")
         return 2
 
-    print(json.dumps(result, indent=2))
+    if args.json:
+        # final result as a single JSON line
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print(json.dumps(result, indent=2))
+
     if result.get("status") == "success":
         return 0
     if result.get("status") == "cancelled":
