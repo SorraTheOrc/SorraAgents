@@ -24,7 +24,19 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 2. Run deterministic script locally:
 
 ```bash
-python skill/ralph/scripts/ralph_loop.py <work-item-id> --json
+# Run the ralph orchestrator from the skill installation so it works
+# regardless of the current working directory. Use the skill-installed
+# path (expand ~ in shell):
+# Preferred: use the executable wrapper that is safe to invoke from any CWD
+/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --json
+
+# Alternatively, run the script directly from the installed skill directory:
+# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> --json
+
+# If your skills are installed at a different location (for example a
+# project-level skills directory), run the script using the full path to
+# that skill directory instead, e.g.:
+# python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id> --json
 ```
 
 ## Auto-Plan Decision

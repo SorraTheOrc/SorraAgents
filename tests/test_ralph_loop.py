@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 import json
-from skill.ralph.scripts.ralph_loop import RalphError, RalphLoop, _comment_hash, parse_audit_report
+from skill.ralph.scripts.ralph_loop import RalphError, RalphLoop, parse_audit_report
 
 
 @dataclass
@@ -20,8 +20,8 @@ class FakeRunner:
         self.calls: list[list[str]] = []
         self.audit_outputs: list[str] = []
         self.items = {
-            "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open", "effort": "", "risk": ""},
-            "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress", "effort": "", "risk": ""},
+            "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
+            "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress", "effort": "", "risk": "", "audit": ""},
         }
         self.comments: list[dict] = []
 
@@ -69,8 +69,10 @@ class FakeRunner:
             # pi -p --mode json --model <model> <prompt>
             # Find the prompt: it's the last positional arg
             prompt = cmd[-1]
-            if prompt.startswith("/audit"):
+            if prompt.startswith("/skill:audit"):
                 output = self.audit_outputs.pop(0)
+                # Simulate the audit skill persisting the audit into the work item
+                self.items["SA-TARGET"]["audit"] = output
                 return Result(stdout=output)
             if prompt.startswith("implement"):
                 # emulate implementation moving target to in_review after first implement call
@@ -185,8 +187,8 @@ def test_confirm_merge_executes_git_steps():
 
 def test_idempotent_audit_comment_append_skips_duplicate_hash():
     runner = FakeRunner()
-    digest = _comment_hash(AUDIT_PASS)
-    runner.comments = [{"comment": f"# AMPA Audit Result\naudit-hash:{digest}\n\n..."}]
+    # Simulate an existing AMPA comment (content not validated by ralph in this mode)
+    runner.comments = [{"comment": "# AMPA Audit Result\n\n..."}]
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
 
@@ -194,24 +196,26 @@ def test_idempotent_audit_comment_append_skips_duplicate_hash():
 
     add_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
     assert add_calls == []
+    # Also verify that wl update --audit-text is not called by ralph
+    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in c]
+    assert update_calls == []
 
 
 def test_changed_audit_appends_new_comment_not_duplicate():
-    """When audit content changes, a new comment is appended (not skipped)."""
+    """When audit content changes, ralph must still rely on the persisted audit and
+    must NOT write audit text or AMPA audit comments itself."""
     runner = FakeRunner()
-    # Existing comment has hash of AUDIT_FAIL
-    old_digest = _comment_hash(AUDIT_FAIL)
-    runner.comments = [{"comment": f"# AMPA Audit Result\naudit-hash:{old_digest}\n\nold content"}]
+    runner.comments = [{"comment": "# AMPA Audit Result\n\nold content"}]
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
 
     loop.run("SA-TARGET")
 
-    # Should add a new comment because the hash differs
+    # Ralph should not write audit text or append AMPA audit comments
     add_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
-    assert len(add_calls) == 1
-    new_digest = _comment_hash(AUDIT_PASS)
-    assert f"audit-hash:{new_digest}" in add_calls[0][add_calls[0].index("--comment") + 1]
+    assert add_calls == []
+    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in c]
+    assert update_calls == []
 
 
 AUDIT_PARTIAL = """Ready to close: No
@@ -337,17 +341,17 @@ def test_check_cmd_failure_raises_ralph_error():
         loop.run("SA-TARGET")
 
 
-def test_audit_text_written_via_wl_update():
+def test_audit_text_written_via_wl_update_is_not_called_by_ralph():
+    """Ralph should NOT write the audit text; it must be persisted by the audit skill."""
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
 
     loop.run("SA-TARGET")
 
-    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"]]
-    assert len(update_calls) >= 1
-    audit_text_idx = update_calls[0].index("--audit-text")
-    assert update_calls[0][audit_text_idx + 1] == AUDIT_PASS
+    # Ralph must not call wl update with --audit-text
+    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in c]
+    assert update_calls == []
 
 
 def test_verbose_mode_logs_pi_output_start():
@@ -472,7 +476,7 @@ def test_in_review_skips_first_implement():
     # There should be NO implement calls, only an audit call
     pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
     implement_calls = [c for c in pi_calls if c[-1].startswith("implement")]
-    audit_calls = [c for c in pi_calls if c[-1].startswith("/audit")]
+    audit_calls = [c for c in pi_calls if c[-1].startswith("/skill:audit")]
     assert len(implement_calls) == 0, f"Expected no implement calls, got {implement_calls}"
     assert len(audit_calls) == 1
 
@@ -492,11 +496,11 @@ def test_in_review_implement_after_failed_audit():
     # Second attempt: implement + audit
     pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
     first_call = pi_calls[0][-1]
-    assert first_call.startswith("/audit"), f"First call should be audit, got: {first_call[:60]}"
+    assert first_call.startswith("/skill:audit"), f"First call should be audit, got: {first_call[:60]}"
     second_call = pi_calls[1][-1]
     assert second_call.startswith("implement"), f"Second call should be implement, got: {second_call[:60]}"
     third_call = pi_calls[2][-1]
-    assert third_call.startswith("/audit"), f"Third call should be audit, got: {third_call[:60]}"
+    assert third_call.startswith("/skill:audit"), f"Third call should be audit, got: {third_call[:60]}"
 
 
 def test_model_passed_to_pi_commands():
@@ -708,33 +712,39 @@ def test_extract_text_from_json_output():
     assert _extract_text_from_json_output("") == ""
 
 
-def test_wl_update_audit_uses_file_for_large_text():
-    """When audit text exceeds _MAX_ARG_LEN, ralph uses --audit-file with a temp file."""
+def test_ralph_reads_persisted_audit_and_does_not_update():
+    """Ralph should read the audit persisted by the audit skill via wl show and
+    must NOT attempt to write the audit itself."""
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
-    # Create audit text larger than _MAX_ARG_LEN
-    large_audit = "Ready to close: Yes\n" + "x" * (RalphLoop._MAX_ARG_LEN + 1)
-    loop._wl_update_audit("SA-TARGET", large_audit)
-    # The runner should have been called with --audit-file
-    calls = [c for c in runner.calls if c[0] == "wl" and "update" in c]
-    assert len(calls) == 1
-    cmd = calls[0]
-    assert "--audit-file" in cmd
-    # The temp file should have been cleaned up (no lingering files)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+
+    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"]]
+    # Ralph must not write the audit to the work item; the audit skill owns persistence
+    assert update_calls == []
 
 
-def test_wl_update_audit_uses_inline_for_small_text():
-    """When audit text is small, ralph uses --audit-text inline."""
-    runner = FakeRunner()
+def test_ralph_errors_if_no_persisted_audit_found():
+    """If the audit skill does not persist a structured audit to the work item,
+    ralph should abort and report an error (no fallback allowed)."""
+    class NoPersistRunner(FakeRunner):
+        def __call__(self, cmd):
+            cmd = list(cmd)
+            # when asked to run /skill:audit, return a response but do NOT persist it
+            if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("/skill:audit"):
+                output = self.audit_outputs.pop(0)
+                return Result(stdout=output)
+            return super().__call__(cmd)
+
+    runner = NoPersistRunner()
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
-    loop._wl_update_audit("SA-TARGET", "Ready to close: Yes")
-    calls = [c for c in runner.calls if c[0] == "wl" and "update" in c]
-    assert len(calls) == 1
-    cmd = calls[0]
-    assert "--audit-text" in cmd
-    assert "--audit-file" not in cmd
+
+    with pytest.raises(RalphError, match="No persisted audit found"):
+        loop.run("SA-TARGET")
 
 
 def test_wl_comment_add_truncates_large_comment():

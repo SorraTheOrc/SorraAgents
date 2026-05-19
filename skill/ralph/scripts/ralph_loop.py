@@ -90,6 +90,12 @@ def parse_audit_report(report_text: str) -> AuditParseResult:
     return AuditParseResult(ready_to_close=ready, criteria=criteria)
 
 
+# Audit sanitization removed: ralph now relies on the audit persisted by the audit skill in the work item (wl show).
+# The audit skill is responsible for producing the canonical structured
+# report (starting with "Ready to close:") and storing it on the work item.
+# Ralph will read that persisted audit and fail if it is missing or invalid.
+
+
 def _load_config() -> dict:
     """Load config from the first found config file in the list.
 
@@ -304,8 +310,6 @@ DEFAULT_AUTOPLAN_EFFORT_SKIP: frozenset[str] = frozenset({"Extra Small", "Small"
 DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
 
 
-def _comment_hash(audit_text: str) -> str:
-    return hashlib.sha256(audit_text.encode("utf-8")).hexdigest()[:16]
 
 
 class RalphLoop:
@@ -393,28 +397,6 @@ class RalphLoop:
             logger.debug("ralph.cmd.wl.comment_add comment_start=%s", comment[:500])
         _run_json(self.runner, cmd)
 
-    def _wl_update_audit(self, work_item_id: str, audit_text: str) -> None:
-        if len(audit_text) > self._MAX_ARG_LEN:
-            self._wl_update_audit_via_file(work_item_id, audit_text)
-        else:
-            cmd = [self.wl_bin, "update", work_item_id, "--audit-text", audit_text, "--json"]
-            logger.debug("ralph.cmd.wl.update_audit target=%s text_len=%d", work_item_id, len(audit_text))
-            _run_json(self.runner, cmd)
-
-    def _wl_update_audit_via_file(self, work_item_id: str, audit_text: str) -> None:
-        """Write audit text to a temp file and use --audit-file to avoid arg length limits."""
-        import tempfile
-        import os
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write(audit_text)
-            f.flush()
-            tmp_path = f.name
-        try:
-            cmd = [self.wl_bin, "update", work_item_id, "--audit-file", tmp_path, "--json"]
-            logger.debug("ralph.cmd.wl.update_audit target=%s text_len=%d via_file=%s", work_item_id, len(audit_text), tmp_path)
-            _run_json(self.runner, cmd)
-        finally:
-            os.unlink(tmp_path)
 
     def _run_pi(self, prompt: str) -> str:
         cmd = [self.pi_bin, "-p", "--mode", "json", "--model", self.model, prompt]
@@ -551,21 +533,6 @@ class RalphLoop:
                     logger.debug("ralph.cmd.merge stderr=%s", proc.stderr.strip()[:1000])
                 raise RalphError(f"Merge step failed ({' '.join(cmd)}): {proc.stderr.strip()}")
 
-    def _append_ampa_comment_once(self, work_item_id: str, audit_text: str) -> None:
-        digest = _comment_hash(audit_text)
-        marker = f"audit-hash:{digest}"
-        for existing in self._wl_comment_list(work_item_id):
-            if marker in (existing.get("comment") or ""):
-                return
-        comment = "\n".join(
-            [
-                "# AMPA Audit Result",
-                f"{marker}",
-                "",
-                audit_text,
-            ]
-        )
-        self._wl_comment_add(work_item_id, comment)
 
     def _is_effort_risk_computed(self, target_id: str) -> bool:
         """Check whether effort and risk have already been set on the work item."""
@@ -596,7 +563,12 @@ class RalphLoop:
             "unknowns": [],
         })
 
-        cmd = ["python3", "skill/effort-and-risk/scripts/orchestrate_estimate.py"]
+                # Resolve the effort-and-risk orchestrator relative to the skills root so the
+        # script works even when invoked from a different repository CWD.
+        skill_root = Path(__file__).resolve().parents[2]
+        orchestrate_script = skill_root / "effort-and-risk" / "scripts" / "orchestrate_estimate.py"
+        py = "python3"
+        cmd = [py, str(orchestrate_script)]
         logger.info("ralph.autoplan.effort_risk.start target=%s", target_id)
 
         # Use subprocess.run for the default runner (production) with stdin,
@@ -834,12 +806,19 @@ class RalphLoop:
                 self._run_pi("\n".join(prompt_parts))
 
             logger.info("ralph.loop.audit.start target=%s attempt=%d", target_id, attempt)
-            audit_output = self._run_pi(f"/audit {target_id}")
-            if self.verbose:
-                logger.debug("ralph.loop.audit.raw_output target=%s attempt=%d len=%d output_start=%s", target_id, attempt, len(audit_output), audit_output[:1000])
-            self._wl_update_audit(target_id, audit_output)
-            self._append_ampa_comment_once(target_id, audit_output)
-            audit = parse_audit_report(audit_output)
+            # Run the audit skill; it MUST persist the structured audit to the work item.
+            self._run_pi(f"/skill:audit {target_id}")
+            # Read the persisted audit from the work item via wl show.
+            item = self._wl_show(target_id).get("workItem", {})
+            audit_text = item.get("audit") or item.get("auditText") or ""
+            if not audit_text:
+                raise RalphError(f"No persisted audit found for {target_id} after running /skill:audit; expected workItem.audit to contain the structured report.")
+            # Validate presence of the required header
+            lines = [l.strip() for l in audit_text.splitlines() if l.strip()]
+            if not any(l.lower().startswith("ready to close:") for l in lines):
+                excerpt = audit_text.strip().replace("\n", " ")[:200]
+                raise RalphError(f"No 'Ready to close:' header found in persisted audit for {target_id}. Excerpt: {excerpt}")
+            audit = parse_audit_report(audit_text)
             if self.verbose:
                 logger.debug("ralph.loop.audit.parsed target=%s attempt=%d ready=%s criteria_count=%d unmet=%d", target_id, attempt, audit.ready_to_close, len(audit.criteria), len(audit.unmet_or_partial))
 

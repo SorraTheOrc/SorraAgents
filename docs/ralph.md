@@ -14,7 +14,14 @@ Ralph drives an iterative cycle of:
 ## Usage
 
 ```bash
-python skill/ralph/scripts/ralph_loop.py <work-item-id> [options]
+# Run the ralph orchestrator from the skill installation so it works
+# regardless of the current working directory. Use the skill-installed
+# path (expand ~ in shell):
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> [options]
+
+# If your skills are installed at a different location, run the script
+# using the full path to that skill directory instead, e.g.:
+# python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id> [options]
 ```
 
 ### Options
@@ -169,7 +176,7 @@ When a work item is at stage `intake_complete`, ralph automatically runs an **au
 Use `--no-autoplan` to skip the auto-plan step entirely and proceed directly to implementation for `intake_complete` items:
 
 ```bash
-python skill/ralph/scripts/ralph_loop.py SA-1234 --no-autoplan
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --no-autoplan
 ```
 
 ### Customizing thresholds
@@ -178,16 +185,30 @@ Override the default thresholds for skipping `/plan`:
 
 ```bash
 # Allow Medium effort to skip /plan (in addition to Extra Small and Small)
-python skill/ralph/scripts/ralph_loop.py SA-1234 --autoplan-effort-skip Extra Small Small Medium
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --autoplan-effort-skip Extra Small Small Medium
 
 # Allow Low and Medium risk to skip /plan
-python skill/ralph/scripts/ralph_loop.py SA-1234 --autoplan-risk-skip Low Medium
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --autoplan-risk-skip Low Medium
 ```
+
+## Audit Processing
+
+When ralph receives audit output from the `/audit` skill, it processes it in two stages:
+
+### Sanitization
+
+The `/audit` skill may produce user-facing preamble text before the structured audit report (e.g., explanatory notes, formatting markers). Ralph sanitises the raw audit output by extracting only the structured block beginning with `Ready to close: Yes` or `Ready to close: No`. Any content before this header is stripped. This ensures that `wl update --audit-text` always receives text whose first non-empty line is the structured header, regardless of preamble content.
+
+If no `Ready to close:` header is found in the audit output, ralph raises a `RalphError` with a short excerpt of the raw output to help the operator triage the issue.
+
+### Deduplication
+
+When ralph re-runs audit (e.g., after a failed attempt) and produces the same structured audit text (same content hash), it skips both `wl update --audit-text` and the AMPA comment to avoid overwriting or duplicating the persisted result. A changed audit (different content hash) is persisted as a revised entry.
 
 ## Idempotence
 
-- Audit comments are deduplicated by content hash. Re-running ralph with identical audit output will not create duplicate AMPA comments.
-- Changed audit content appends a new comment (clear revision, not a duplicate).
+- Audit results are deduplicated by content hash. Re-running ralph with identical audit output will not overwrite the persisted audit text or create duplicate AMPA comments.
+- Changed audit content (different hash) calls both `wl update --audit-text` and appends a new AMPA comment (clear revision, not a duplicate).
 - Auto-plan decision comments are deduplicated by a deterministic hash of the effort/risk values. Re-running ralph when effort and risk are unchanged will not create duplicate auto-plan comments.
 - When effort and risk fields are already set on the work item, ralph skips the effort-and-risk computation and uses the stored values for the threshold decision.
 
@@ -196,18 +217,18 @@ python skill/ralph/scripts/ralph_loop.py SA-1234 --autoplan-risk-skip Low Medium
 ### Basic run (no merge)
 
 ```bash
-python skill/ralph/scripts/ralph_loop.py SA-1234 --max-attempts 5
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --max-attempts 5
 ```
 
 ### Run with build checks and merge
 
 ```bash
-python skill/ralph/scripts/ralph_loop.py SA-1234 --check-cmd "pytest -q" --confirm-merge
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --check-cmd "pytest -q" --confirm-merge
 ```
 
 ### Run with cancellation support
 
 ```bash
-python skill/ralph/scripts/ralph_loop.py SA-1234 --cancel-file /tmp/ralph-cancel
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --cancel-file /tmp/ralph-cancel
 # To cancel: touch /tmp/ralph-cancel
 ```
