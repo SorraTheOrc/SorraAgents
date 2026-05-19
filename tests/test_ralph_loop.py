@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 import json
-from skill.ralph.scripts.ralph_loop import RalphError, RalphLoop, _comment_hash, parse_audit_report
+from skill.ralph.scripts.ralph_loop import RalphError, RalphLoop, _comment_hash, _sanitize_audit_text, parse_audit_report
 
 
 @dataclass
@@ -194,6 +194,9 @@ def test_idempotent_audit_comment_append_skips_duplicate_hash():
 
     add_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
     assert add_calls == []
+    # Also verify that wl update --audit-text is skipped when audit already persisted
+    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in c]
+    assert update_calls == []
 
 
 def test_changed_audit_appends_new_comment_not_duplicate():
@@ -735,6 +738,153 @@ def test_wl_update_audit_uses_inline_for_small_text():
     cmd = calls[0]
     assert "--audit-text" in cmd
     assert "--audit-file" not in cmd
+
+
+def test_sanitize_audit_strips_multiline_preamble():
+    """Unit test: _sanitize_audit_text strips multi-line preamble and returns
+    only the structured block (with no leading whitespace)."""
+    raw = "Note: preamble\nLine 2\n\nReady to close: Yes\n\ncriteria"
+    result = _sanitize_audit_text(raw)
+    assert result.startswith("Ready to close: Yes")
+    assert "criteria" in result
+
+
+def test_sanitize_audit_strips_indented_header():
+    """Unit test: _sanitize_audit_text handles an indented Ready to close line."""
+    raw = "Preamble\n  Ready to close: No\n\ncriteria"
+    result = _sanitize_audit_text(raw)
+    assert result.startswith("Ready to close: No")
+
+
+def test_sanitize_audit_preserves_clean_report():
+    """Unit test: _sanitize_audit_text is a no-op for clean audit text."""
+    result = _sanitize_audit_text(AUDIT_PASS)
+    assert result == AUDIT_PASS
+
+
+def test_sanitize_audit_empty_raises_error():
+    """Unit test: _sanitize_audit_text raises RalphError for empty string."""
+    with pytest.raises(RalphError, match="empty or missing"):
+        _sanitize_audit_text("")
+
+
+def test_sanitize_audit_no_header_raises_error():
+    """Unit test: _sanitize_audit_text raises RalphError with excerpt when header is missing."""
+    with pytest.raises(RalphError, match="No 'Ready to close:' header found"):
+        _sanitize_audit_text("Some text without a header")
+
+
+def test_sanitize_audit_hash_consistency_with_preamble():
+    """Unit test: sanitizing two texts that differ only in preamble produces
+    identical hashes, ensuring deduplication works across preamble changes."""
+    no_preamble = AUDIT_PASS
+    with_preamble = "Note: extra context\n\n" + AUDIT_PASS
+    assert _comment_hash(_sanitize_audit_text(no_preamble)) == _comment_hash(_sanitize_audit_text(with_preamble))
+
+
+def test_audit_with_preamble_is_sanitized_before_wl_update():
+    """If the audit output contains a human-friendly preamble before the
+    structured report, ralph should strip the preamble and persist only the
+    structured block starting with Ready to close:.
+    """
+    runner = FakeRunner()
+    # preamble lines before the Ready to close header
+    preambled = """Note: this audit includes extra context for operators
+
+Please review the summary below.
+
+""" + AUDIT_PASS
+    runner.audit_outputs = [preambled]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    loop.run("SA-TARGET")
+
+    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"]]
+    assert len(update_calls) >= 1
+    audit_text_idx = update_calls[0].index("--audit-text")
+    # persisted text should begin with Ready to close (sanitizer removed preamble)
+    # with no leading whitespace or newlines — exact match, not just .strip()
+    assert update_calls[0][audit_text_idx + 1].startswith("Ready to close:")
+
+
+def test_malformed_audit_raises_error_with_excerpt():
+    """If no Ready to close header exists in the audit output, ralph should
+    raise RalphError with a short excerpt to aid triage.
+    """
+    runner = FakeRunner()
+    runner.audit_outputs = ["This is a broken audit with no header\n| bad | table |"]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    with pytest.raises(RalphError, match="No 'Ready to close:' header found"):
+        loop.run("SA-TARGET")
+
+
+def test_already_persisted_audit_skips_wl_update_and_comment():
+    """When an identical audit has already been persisted (same content hash),
+    ralph skips both wl update --audit-text and the AMPA comment to avoid
+    overwriting or duplicating the persisted result.
+    """
+    runner = FakeRunner()
+    digest = _comment_hash(AUDIT_PASS)
+    runner.comments = [{"comment": f"# AMPA Audit Result\naudit-hash:{digest}\n\n{AUDIT_PASS}"}]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    loop.run("SA-TARGET")
+
+    # Neither wl update --audit-text nor wl comment add should be called
+    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in c]
+    assert update_calls == []
+    add_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
+    assert add_calls == []
+
+
+def test_changed_audit_persists_new_wl_update_and_comment():
+    """When the audit content changes, ralph persists the new audit text and
+    appends a new comment (not skipped as duplicate).
+    """
+    runner = FakeRunner()
+    old_digest = _comment_hash(AUDIT_FAIL)
+    runner.comments = [{"comment": f"# AMPA Audit Result\naudit-hash:{old_digest}\n\n{AUDIT_FAIL}"}]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    loop.run("SA-TARGET")
+
+    # The new audit should be persisted via wl update --audit-text
+    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in c]
+    assert len(update_calls) == 1
+    audit_text_idx = update_calls[0].index("--audit-text")
+    assert update_calls[0][audit_text_idx + 1] == AUDIT_PASS
+    # A new AMPA comment with the new hash should also be added
+    add_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
+    assert len(add_calls) == 1
+    new_digest = _comment_hash(AUDIT_PASS)
+    assert f"audit-hash:{new_digest}" in add_calls[0][add_calls[0].index("--comment") + 1]
+
+
+def test_already_persisted_with_preamble_deduplicated():
+    """When audit output has a preamble but the underlying structured report
+    has the same hash as an already-persisted audit, ralph skips both
+    wl update --audit-text and the AMPA comment.
+    """
+    runner = FakeRunner()
+    sanitized = AUDIT_PASS
+    digest = _comment_hash(sanitized)
+    runner.comments = [{"comment": f"# AMPA Audit Result\naudit-hash:{digest}\n\n{AUDIT_PASS}"}]
+    # Audit output includes preamble before Ready to close:
+    preambled = "Note: extra context for operators\n\n" + AUDIT_PASS
+    runner.audit_outputs = [preambled]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    loop.run("SA-TARGET")
+
+    # Both wl update --audit-text and wl comment add should be skipped
+    # because the sanitized audit has the same hash as the persisted one
+    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in c]
+    assert update_calls == []
+    add_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
+    assert add_calls == []
 
 
 def test_wl_comment_add_truncates_large_comment():

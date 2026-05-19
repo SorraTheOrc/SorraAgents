@@ -76,6 +76,8 @@ For each direct child work item (do NOT recurse into grandchildren):
 
 Produce the structured audit report content only. The report MUST follow this exact structure. IMPORTANT: the very first character of the report MUST be the "R" of `Ready to close:` — there must be no backticks, code fences, or any other characters or text before the first line.
 
+> **Note for ralph orchestrator users:** Ralph sanitises audit output before persisting it. If a preamble (introductory text) appears before the `Ready to close:` header, ralph strips it automatically so that only the structured block is persisted. However, the audit skill itself should produce output that starts directly with `Ready to close:` to avoid ambiguity.
+
 Ready to close: Yes/No
 
 ## Summary

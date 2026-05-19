@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Wrapper to run the ralph orchestrator from the installed skill directory.
+# This script is safe to invoke from any current working directory.
+set -euo pipefail
+# Resolve the real directory of this script (handles symlinks)
+BASEDIR=$(dirname "$(readlink -f "$0")")
+exec python3 "$BASEDIR/scripts/ralph_loop.py" "$@"

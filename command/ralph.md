@@ -25,5 +25,9 @@ Run the dedicated ralph orchestrator loop for a target work item.
 ## Script entrypoint
 
 ```bash
-python skill/ralph/scripts/ralph_loop.py <work-item-id>
+# Run from the skill installation to avoid ambiguous relative paths.
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id>
+
+# If skills are installed elsewhere, run using the full path to the skill.
+# python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id>
 ```

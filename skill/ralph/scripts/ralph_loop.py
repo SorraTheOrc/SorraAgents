@@ -90,6 +90,46 @@ def parse_audit_report(report_text: str) -> AuditParseResult:
     return AuditParseResult(ready_to_close=ready, criteria=criteria)
 
 
+def _sanitize_audit_text(raw: str) -> str:
+    """Return the substring of raw starting at the first line that begins
+    with "Ready to close:" (case-insensitive). Preserve the original
+    formatting of the remainder.
+
+    Any user-facing preamble text before the structured audit header is
+    stripped so that only the structured block (starting with
+    "Ready to close:") is returned. This ensures that ``wl update
+    --audit-text`` always receives text whose first non-empty line is
+    the structured header, and that content hashes are consistent
+    regardless of preamble content.
+
+    If no such header is found, raise RalphError with a short excerpt of the
+    raw output to help operator triage.
+    """
+    import re
+
+    if not raw:
+        raise RalphError("Audit output is empty or missing; expected a report containing 'Ready to close:'")
+
+    # Search for a line that begins with "Ready to close:", optionally
+    # preceded by horizontal whitespace (spaces/tabs) on the same line.
+    # Use [ \t]* instead of \s* to prevent matching across newlines in
+    # MULTILINE mode, which would include preamble line breaks in the result.
+    m = re.search(r"^[ \t]*ready to close:", raw, re.IGNORECASE | re.MULTILINE)
+    if not m:
+        excerpt = raw.strip().replace("\n", " ")[:200]
+        raise RalphError(f"No 'Ready to close:' header found in audit output. Excerpt: {excerpt}")
+
+    # Strip leading horizontal whitespace on the matched line so the result
+    # always starts exactly with "Ready to close:" for consistent hashing.
+    result = raw[m.start():]
+    # Remove leading whitespace (spaces/tabs only, not newlines) from the
+    # first line to ensure the result begins with the header text.
+    first_newline = result.find("\n")
+    if first_newline == -1:
+        return result.lstrip(" \t")
+    return result[:first_newline].lstrip(" \t") + result[first_newline:]
+
+
 def _load_config() -> dict:
     """Load config from the first found config file in the list.
 
@@ -551,6 +591,16 @@ class RalphLoop:
                     logger.debug("ralph.cmd.merge stderr=%s", proc.stderr.strip()[:1000])
                 raise RalphError(f"Merge step failed ({' '.join(cmd)}): {proc.stderr.strip()}")
 
+    def _is_audit_already_persisted(self, work_item_id: str, audit_text: str) -> bool:
+        """Check whether an AMPA comment with the same audit hash already exists,
+        indicating the audit has already been persisted to the work item."""
+        digest = _comment_hash(audit_text)
+        marker = f"audit-hash:{digest}"
+        for existing in self._wl_comment_list(work_item_id):
+            if marker in (existing.get("comment") or ""):
+                return True
+        return False
+
     def _append_ampa_comment_once(self, work_item_id: str, audit_text: str) -> None:
         digest = _comment_hash(audit_text)
         marker = f"audit-hash:{digest}"
@@ -596,7 +646,12 @@ class RalphLoop:
             "unknowns": [],
         })
 
-        cmd = ["python3", "skill/effort-and-risk/scripts/orchestrate_estimate.py"]
+                # Resolve the effort-and-risk orchestrator relative to the skills root so the
+        # script works even when invoked from a different repository CWD.
+        skill_root = Path(__file__).resolve().parents[2]
+        orchestrate_script = skill_root / "effort-and-risk" / "scripts" / "orchestrate_estimate.py"
+        py = "python3"
+        cmd = [py, str(orchestrate_script)]
         logger.info("ralph.autoplan.effort_risk.start target=%s", target_id)
 
         # Use subprocess.run for the default runner (production) with stdin,
@@ -837,9 +892,27 @@ class RalphLoop:
             audit_output = self._run_pi(f"/audit {target_id}")
             if self.verbose:
                 logger.debug("ralph.loop.audit.raw_output target=%s attempt=%d len=%d output_start=%s", target_id, attempt, len(audit_output), audit_output[:1000])
-            self._wl_update_audit(target_id, audit_output)
-            self._append_ampa_comment_once(target_id, audit_output)
-            audit = parse_audit_report(audit_output)
+            # Sanitize audit output to the structured block starting with
+            # the first 'Ready to close:' header. This tolerates user-facing
+            # preamble lines that some skills include.
+            try:
+                sanitized = _sanitize_audit_text(audit_output)
+            except RalphError:
+                # Re-raise with context preserved
+                raise
+            # If an identical audit was already persisted (same content hash),
+            # skip both the wl update and the AMPA comment to avoid overwriting
+            # or duplicating. A changed audit (different hash) will still be
+            # persisted as a revised entry.
+            if self._is_audit_already_persisted(target_id, sanitized):
+                logger.info(
+                    "ralph.loop.audit.already_persisted target=%s attempt=%d",
+                    target_id, attempt,
+                )
+            else:
+                self._wl_update_audit(target_id, sanitized)
+                self._append_ampa_comment_once(target_id, sanitized)
+            audit = parse_audit_report(sanitized)
             if self.verbose:
                 logger.debug("ralph.loop.audit.parsed target=%s attempt=%d ready=%s criteria_count=%d unmet=%d", target_id, attempt, audit.ready_to_close, len(audit.criteria), len(audit.unmet_or_partial))
 
