@@ -810,7 +810,18 @@ class RalphLoop:
             self._run_pi(f"/skill:audit {target_id}")
             # Read the persisted audit from the work item via wl show.
             item = self._wl_show(target_id).get("workItem", {})
-            audit_text = item.get("audit") or item.get("auditText") or ""
+            # Normalize persisted audit extraction to handle both object and string shapes.
+            # - If workItem.audit is an object (dict), prefer audit.get("text")
+            # - If it's a string, use it directly
+            # - Otherwise fall back to workItem.auditText
+            audit_field = item.get("audit")
+            if isinstance(audit_field, dict):
+                audit_text = audit_field.get("text", "") or item.get("auditText", "") or ""
+            elif isinstance(audit_field, str):
+                audit_text = audit_field
+            else:
+                audit_text = item.get("auditText", "") or ""
+
             if not audit_text:
                 raise RalphError(f"No persisted audit found for {target_id} after running /skill:audit; expected workItem.audit to contain the structured report.")
             # Validate presence of the required header

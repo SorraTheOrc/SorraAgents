@@ -727,6 +727,49 @@ def test_ralph_reads_persisted_audit_and_does_not_update():
     assert update_calls == []
 
 
+def test_ralph_handles_persisted_audit_object_text_field():
+    """When the persisted audit is stored as an object with a `text` field,
+    Ralph should extract the text and proceed without error."""
+    class PersistObjectRunner(FakeRunner):
+        def __call__(self, cmd):
+            cmd = list(cmd)
+            # Intercept the audit skill invocation to persist the audit as an object
+            if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("/skill:audit"):
+                output = self.audit_outputs.pop(0)
+                # Persist as an object on the work item (audit.text)
+                self.items["SA-TARGET"]["audit"] = {"text": output}
+                return Result(stdout=output)
+            return super().__call__(cmd)
+
+    runner = PersistObjectRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+
+
+def test_ralph_uses_auditText_fallback_when_audit_field_missing():
+    """If workItem.audit is absent but auditText is present, Ralph should use auditText."""
+    class AuditTextFallbackRunner(FakeRunner):
+        def __call__(self, cmd):
+            cmd = list(cmd)
+            if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("/skill:audit"):
+                output = self.audit_outputs.pop(0)
+                # Simulate persistence to auditText instead of audit
+                self.items["SA-TARGET"].pop("audit", None)
+                self.items["SA-TARGET"]["auditText"] = output
+                return Result(stdout=output)
+            return super().__call__(cmd)
+
+    runner = AuditTextFallbackRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+
+
 def test_ralph_errors_if_no_persisted_audit_found():
     """If the audit skill does not persist a structured audit to the work item,
     ralph should abort and report an error (no fallback allowed)."""
