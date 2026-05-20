@@ -74,10 +74,15 @@ class FakeRunner:
                 # Simulate the audit skill persisting the audit into the work item
                 self.items["SA-TARGET"]["audit"] = output
                 return Result(stdout=output)
+            if prompt.startswith("/skill:plan"):
+                # emulate plan moving target to plan_complete after plan call
+                self.items["SA-TARGET"]["stage"] = "plan_complete"
+                return Result(stdout="planned")
             if prompt.startswith("implement"):
                 # emulate implementation moving target to in_review after first implement call
                 self.items["SA-TARGET"]["stage"] = "in_review"
                 return Result(stdout="implemented")
+
 
         if cmd[:2] == ["bash", "-lc"]:
             return Result(stdout="ok")
@@ -872,7 +877,7 @@ def test_autoplan_skips_plan_for_small_low():
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"
     # ensure no plan invocation (opencode run /plan)
-    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
     # ensure implement was invoked (pi with implement prompt)
     assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
     # ensure autoplan comment was posted
@@ -892,7 +897,7 @@ def test_autoplan_skips_plan_for_extra_small_low():
 
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"
-    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
     assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
 
 
@@ -907,9 +912,9 @@ def test_autoplan_invokes_plan_for_medium_high():
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"
     # ensure plan invocation occurred
-    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
     # ensure implement was invoked after plan
-    plan_indices = [i for i, c in enumerate(runner.calls) if c[0] == "opencode" and "/plan" in " ".join(c)]
+    plan_indices = [i for i, c in enumerate(runner.calls) if c[0] == "pi" and c[-1].startswith("/skill:plan")]
     impl_indices = [i for i, c in enumerate(runner.calls) if c[0] == "pi" and c[-1].startswith("implement")]
     assert plan_indices and impl_indices and min(impl_indices) > min(plan_indices)
     # ensure autoplan comment was posted with plan decision
@@ -936,7 +941,7 @@ def test_autoplan_idempotent_no_duplicate_decisions():
     er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
     assert len(er_calls) == 0
     # No Plan should be invoked (effort Small, risk Low → skip plan)
-    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
     # Implementation should proceed
     assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
 
@@ -956,7 +961,7 @@ def test_autoplan_idempotent_skips_plan_when_effort_risk_already_set():
     er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
     assert len(er_calls) == 0
     # Plan should be invoked (Medium effort + High risk → run /plan)
-    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
 
 
 def test_autoplan_idempotent_no_duplicate_comments():
@@ -1009,7 +1014,7 @@ def test_autoplan_failure_defaults_to_plan():
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"
     # Plan should be invoked due to failure fallback
-    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in fail_runner.calls)
+    assert any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in fail_runner.calls)
 
 
 def test_autoplan_ambiguous_data_defaults_to_plan():
@@ -1023,7 +1028,7 @@ def test_autoplan_ambiguous_data_defaults_to_plan():
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"
     # Plan should be invoked due to ambiguous data
-    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
 
 
 def test_autoplan_no_autoplan_flag_skips_step():
@@ -1040,7 +1045,7 @@ def test_autoplan_no_autoplan_flag_skips_step():
     er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
     assert len(er_calls) == 0
     # No /plan should be invoked
-    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
 
 
 def test_autoplan_custom_thresholds():
@@ -1060,7 +1065,7 @@ def test_autoplan_custom_thresholds():
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"
     # Medium + Low should skip plan with the expanded thresholds
-    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
     assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
 
 
@@ -1101,7 +1106,7 @@ def test_autoplan_effort_risk_persistence():
     # The orchestrate_estimate.py script is responsible for calling wl update --effort --risk
     # and wl comment add. Here we just verify that /plan was invoked because
     # effort Medium + risk High exceeds the default thresholds.
-    assert any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
 
 
 def test_autoplan_already_computed_with_plan_complete():
@@ -1125,7 +1130,7 @@ def test_autoplan_already_computed_with_plan_complete():
     er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
     assert len(er_calls) == 0
     # No Plan should be invoked (Small + Low → skip plan)
-    assert not any(c[0] == "opencode" and "/plan" in " ".join(c) for c in runner.calls)
+    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
     # Implementation should proceed
     assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
 

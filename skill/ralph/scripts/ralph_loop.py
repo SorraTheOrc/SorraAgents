@@ -680,10 +680,11 @@ class RalphLoop:
                     return False, "plan_complete"
                 # Need to run plan
                 logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
-                plan_cmd = ["opencode", "run", f"/plan {target_id}"]
-                plan_proc = self.runner(plan_cmd)
-                if getattr(plan_proc, "returncode", 0) != 0:
-                    raise RalphError(f"plan command failed: {getattr(plan_proc, 'stderr', '')}")
+                # Use pi to run the plan skill so the configured model is used.
+                try:
+                    self._run_pi(f"/skill:plan {target_id}")
+                except RalphError as e:
+                    raise RalphError(f"plan command failed: {e}") from e
                 logger.info("ralph.autoplan.plan_complete target=%s", target_id)
                 return True, "plan_complete"
             return False, "intake_complete"
@@ -714,10 +715,11 @@ class RalphLoop:
         if do_plan:
             # Invoke plan and wait for completion
             logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
-            plan_cmd = ["opencode", "run", f"/plan {target_id}"]
-            plan_proc = self.runner(plan_cmd)
-            if getattr(plan_proc, "returncode", 0) != 0:
-                raise RalphError(f"plan command failed: {getattr(plan_proc, 'stderr', '')}")
+            # Use pi to run the plan skill so the configured model is used.
+            try:
+                self._run_pi(f"/skill:plan {target_id}")
+            except RalphError as e:
+                raise RalphError(f"plan command failed: {e}") from e
             logger.info("ralph.autoplan.plan_complete target=%s", target_id)
             return True, "plan_complete"
 
