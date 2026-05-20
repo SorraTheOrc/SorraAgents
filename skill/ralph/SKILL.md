@@ -25,6 +25,8 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 
 Start-of-iteration audit skipping: When the target is already at stage `in_review`, Ralph will normally run a start-of-iteration audit. To avoid redundant audits, Ralph will skip invoking the audit skill at the start of the iteration if the most recent `# AMPA Audit Result` comment (across the target and all recursive descendants) has a `createdAt` timestamp that is equal to or newer than the most-recent `updatedAt` timestamp in the same scope. In that case Ralph will read the persisted audit from the work item and proceed without re-running the audit skill.
 
+Accepting `in_progress`: Ralph now accepts work items in stage `in_progress` as a valid entrypoint. Invoking Ralph on an `in_progress` item resumes the implement→audit loop and behaves like a `plan_complete` entrypoint (i.e., it will perform the full implement→audit cycle). Note: the auto-plan decision is still only applied to `intake_complete` items and is not automatically invoked for `in_progress` targets.
+
 
 ```bash
 # Run the ralph orchestrator from the skill installation so it works

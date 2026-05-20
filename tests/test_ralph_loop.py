@@ -121,13 +121,14 @@ def test_parse_audit_report_extracts_readiness_and_rows():
     assert parsed.unmet_or_partial[0].text == "retry loop"
 
 
-def test_precondition_requires_plan_complete_or_in_review():
+def test_accepts_in_progress_and_runs():
     runner = FakeRunner()
     runner.items["SA-TARGET"]["stage"] = "in_progress"
+    runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
 
-    with pytest.raises(RalphError, match="plan_complete or in_review"):
-        loop.run("SA-TARGET")
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
 
 
 def test_happy_path_success_with_merge_offer_not_executed_without_confirm():
@@ -310,7 +311,7 @@ def test_main_returns_error_on_precondition_failure():
     loop = RalphLoop(runner=runner, stream=False)
 
     # Direct API call gives RalphError
-    with pytest.raises(RalphError, match="plan_complete or in_review"):
+    with pytest.raises(RalphError, match="plan_complete, in_review, or in_progress"):
         loop.run("SA-TARGET")
 
 
