@@ -78,3 +78,28 @@ test('compaction integration includes plugin-provided context when no override a
   assert.equal(output.prompt, undefined);
   assert.deepEqual(output.context, ['Original user prompt: triage flaky scheduler test']);
 });
+
+test('compaction integration derives target from session without explicit id in /compact', async () => {
+  const ctx = {
+    client: {
+      session: {
+        messages: async () => ({
+          data: [
+            makeUserMessage('implement SA-99', 1),
+            makeUserMessage('/compact', 2),
+          ],
+          error: undefined,
+        }),
+      },
+    },
+  };
+
+  const hooks = await RalphPlugin(ctx);
+  const output = { context: [] };
+  await hooks['experimental.session.compacting'](
+    { sessionID: 'session-integration' },
+    output,
+  );
+
+  assert.ok(output.prompt?.startsWith('audit SA-99 and address any issues the audit identifies'));
+});

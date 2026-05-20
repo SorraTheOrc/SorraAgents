@@ -11,6 +11,16 @@ session intent.
 - If no override matches, appends the original prompt to `output.context`.
 - On malformed input or runtime errors, returns safe defaults and does not throw.
 
+## Ralph loop invocation semantics
+
+When Ralph detects a child transition to `in_review`, it invokes `/compact` with no explicit work-item id. The plugin uses session history (earliest user prompt such as `implement SA-123`) to derive the correct context.
+
+Operational guarantees in Ralph:
+
+- `/compact` is best-effort: failures are logged and the loop continues.
+- Compaction output is not persisted to worklog comments (logs only).
+- Ralph logs cumulative counters as `compact.invocations` and `compact.failures`.
+
 ## Default override
 
 Without any configuration, `ralph` includes this override:

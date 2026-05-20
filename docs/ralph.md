@@ -7,9 +7,10 @@
 Ralph drives an iterative cycle of:
 
 1. **Implement** — delegate implementation of the target work item (+ direct children) via the `implement` skill.
-2. **Audit** — run the `audit` skill and persist structured results.
-3. **Remediate** — if audit finds unmet or partial criteria, feed those into the next implement pass.
-4. **Repeat** until audit passes, max attempts are reached, or the operator cancels.
+2. **Compact on child transition** — after each implement pass, detect children that moved to `in_review` and invoke `/compact` once per transition before auditing.
+3. **Audit** — run the `audit` skill and persist structured results.
+4. **Remediate** — if audit finds unmet or partial criteria, feed those into the next implement pass.
+5. **Repeat** until audit passes, max attempts are reached, or the operator cancels.
 
 ## Usage
 
@@ -51,6 +52,23 @@ python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-i
   - At `in_review`: ralph **skips the first implement pass** and audits immediately. If audit passes, ralph proceeds to checks/merge without any implement step. If audit fails, ralph falls into the normal implement\u2192audit loop with remediation.
   - At any other stage: ralph exits with an error.
 - **Scope**: Only the target item and its direct children are processed.
+
+## Compaction trigger behavior
+
+After every implement pass (including the first pass after auto-plan), Ralph snapshots child stages before implementation and compares them to the child stages immediately after implementation.
+
+For each child where:
+
+- previous stage != `in_review`
+- new stage == `in_review`
+
+Ralph invokes `/compact` once before continuing to audit.
+
+Key semantics:
+
+- `/compact` is invoked **without** an explicit work-item id; the compaction plugin derives context from the current session.
+- `/compact` failures are **non-fatal**. Ralph logs a warning and continues with the loop.
+- Compaction evidence is **logs only** (no worklog comments are persisted for compact output).
 
 ## Configuration File
 
@@ -144,6 +162,20 @@ Ralph emits structured log events at key lifecycle points using the `ralph` Pyth
 | `ralph.loop.merge` | INFO | target, confirm flag |
 | `ralph.loop.cancelled` | INFO | target, attempt |
 | `ralph.loop.max_attempts` | WARNING | target |
+| `ralph.compact.transition` | INFO | target, child, attempt, `compact.invocations` |
+| `ralph.compact.failed` | WARNING | target, child, attempt, `compact.failures`, error |
+| `ralph.compact.metrics` | INFO | target, attempt, cumulative `compact.invocations`, cumulative `compact.failures` |
+
+The final JSON result now includes a `compact` object:
+
+```json
+{
+  "compact": {
+    "invocations": 1,
+    "failures": 0
+  }
+}
+```
 
 ## Auto-Plan Decision
 

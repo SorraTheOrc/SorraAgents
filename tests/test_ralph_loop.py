@@ -19,11 +19,13 @@ class FakeRunner:
     def __init__(self):
         self.calls: list[list[str]] = []
         self.audit_outputs: list[str] = []
+        self.child_ids = ["SA-CHILD"]
         self.items = {
             "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
             "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress", "effort": "", "risk": "", "audit": ""},
         }
         self.comments: list[dict] = []
+        self.compact_failures_remaining = 0
 
     def __call__(self, cmd):
         cmd = list(cmd)
@@ -31,7 +33,12 @@ class FakeRunner:
 
         if cmd[:3] == ["wl", "show", "SA-TARGET"] and "--children" in cmd:
             item = self.items["SA-TARGET"]
-            return Result(stdout=json.dumps({"success": True, "workItem": item, "children": [{"id": "SA-CHILD"}]}))
+            children = [
+                {"id": child_id, "stage": self.items.get(child_id, {}).get("stage", "")}
+                for child_id in self.child_ids
+                if child_id in self.items
+            ]
+            return Result(stdout=json.dumps({"success": True, "workItem": item, "children": children}))
         if cmd[:3] == ["wl", "show", "SA-TARGET"]:
             item = self.items["SA-TARGET"]
             return Result(stdout=json.dumps({"success": True, "workItem": item}))
@@ -82,7 +89,11 @@ class FakeRunner:
                 # emulate implementation moving target to in_review after first implement call
                 self.items["SA-TARGET"]["stage"] = "in_review"
                 return Result(stdout="implemented")
-
+            if prompt == "/compact":
+                if self.compact_failures_remaining > 0:
+                    self.compact_failures_remaining -= 1
+                    return Result(returncode=1, stderr="compact failed")
+                return Result(stdout="compacted")
 
         if cmd[:2] == ["bash", "-lc"]:
             return Result(stdout="ok")
@@ -559,6 +570,48 @@ def test_in_review_runs_start_of_iteration_audit_when_persisted_comment_outdated
     # Because the persisted comment was stale, Ralph should have invoked /skill:audit
     audit_calls = [c for c in pi_calls if c[-1].startswith("/skill:audit")]
     assert len(audit_calls) == 1
+
+
+class TransitionToInReviewRunner(FakeRunner):
+    def __init__(self):
+        super().__init__()
+        self.items["SA-CHILD"]["stage"] = "in_progress"
+
+    def __call__(self, cmd):
+        cmd = list(cmd)
+        if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("implement"):
+            self.items["SA-CHILD"]["stage"] = "in_review"
+        return super().__call__(cmd)
+
+
+def test_compact_invoked_when_child_transitions_to_in_review():
+    runner = TransitionToInReviewRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    assert result["compact"]["invocations"] == 1
+    assert result["compact"]["failures"] == 0
+    compact_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c and c[-1] == "/compact"]
+    assert len(compact_calls) == 1
+
+
+def test_compact_failure_is_non_fatal_and_loop_continues():
+    runner = TransitionToInReviewRunner()
+    runner.compact_failures_remaining = 1
+    runner.audit_outputs = [AUDIT_FAIL, AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    assert result["attempt"] == 2
+    assert result["compact"]["invocations"] == 1
+    assert result["compact"]["failures"] == 1
+    audit_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c and c[-1].startswith("/skill:audit")]
+    assert len(audit_calls) == 2
 
 
 def test_model_passed_to_pi_commands():

@@ -861,6 +861,76 @@ class RalphLoop:
                 return False
         return True
 
+    def _child_stage_map(self, target_id: str) -> dict[str, str]:
+        """Return direct child stage map for a target item.
+
+        If child stage is not present in `wl show --children`, fall back to
+        reading the child item directly.
+        """
+        data = self._wl_show(target_id, children=True)
+        children = data.get("children", [])
+        stages: dict[str, str] = {}
+        for child in children:
+            child_id = child.get("id")
+            if not child_id:
+                continue
+            child_stage = child.get("stage")
+            if not child_stage:
+                child_stage = self._wl_show(child_id).get("workItem", {}).get("stage", "")
+            stages[child_id] = child_stage or ""
+        return stages
+
+    def _compact_after_child_transition(
+        self,
+        target_id: str,
+        previous_child_stages: dict[str, str],
+        attempt: int,
+    ) -> tuple[int, int]:
+        """Run `/compact` for children that newly transitioned to in_review.
+
+        Returns a tuple of (invocation_count, failure_count).
+        """
+        try:
+            current_child_stages = self._child_stage_map(target_id)
+        except Exception as exc:
+            logger.warning(
+                "ralph.compact.stage_snapshot_failed target=%s attempt=%d error=%s",
+                target_id,
+                attempt,
+                exc,
+            )
+            return 0, 0
+
+        invocations = 0
+        failures = 0
+        for child_id, new_stage in current_child_stages.items():
+            previous_stage = previous_child_stages.get(child_id, "")
+            if previous_stage == "in_review" or new_stage != "in_review":
+                continue
+
+            invocations += 1
+            logger.info(
+                "ralph.compact.transition target=%s child=%s attempt=%d compact.invocations=%d",
+                target_id,
+                child_id,
+                attempt,
+                invocations,
+            )
+            try:
+                self._run_pi("/compact")
+            except Exception as exc:
+                failures += 1
+                logger.warning(
+                    "ralph.compact.failed target=%s child=%s attempt=%d compact.failures=%d error=%s",
+                    target_id,
+                    child_id,
+                    attempt,
+                    failures,
+                    exc,
+                )
+
+        return invocations, failures
+
     def run(self, target_id: str) -> dict:
         self._assert_precondition(target_id)
         scope_ids = self._scope_ids_recursive(target_id)
@@ -873,6 +943,8 @@ class RalphLoop:
         target_stage = target_item.get("stage", "unknown")
         skip_implement = target_stage == "in_review"
         remediation = ""
+        compact_invocations = 0
+        compact_failures = 0
 
         logger.info(
             "ralph.loop.start target=%s scope=%s max_attempts=%d skip_implement=%s",
@@ -882,7 +954,12 @@ class RalphLoop:
         for attempt in range(1, self.max_attempts + 1):
             if self.cancel_file and os.path.exists(self.cancel_file):
                 logger.info("ralph.loop.cancelled target=%s attempt=%d", target_id, attempt)
-                return {"status": "cancelled", "attempt": attempt, "scope": scope_ids}
+                return {
+                    "status": "cancelled",
+                    "attempt": attempt,
+                    "scope": scope_ids,
+                    "compact": {"invocations": compact_invocations, "failures": compact_failures},
+                }
 
             logger.info("ralph.loop.attempt.start target=%s attempt=%d", target_id, attempt)
 
@@ -908,7 +985,28 @@ class RalphLoop:
                 # Add a short remediation instruction if an audit produced unmet criteria previously
                 if remediation:
                     prompt_parts.append(remediation)
+                try:
+                    previous_child_stages = self._child_stage_map(target_id)
+                except Exception as exc:
+                    logger.warning(
+                        "ralph.compact.pre_snapshot_failed target=%s attempt=%d error=%s",
+                        target_id,
+                        attempt,
+                        exc,
+                    )
+                    previous_child_stages = {}
                 self._run_pi("\n".join(prompt_parts))
+                invocations, failures = self._compact_after_child_transition(target_id, previous_child_stages, attempt)
+                compact_invocations += invocations
+                compact_failures += failures
+                if invocations or failures:
+                    logger.info(
+                        "ralph.compact.metrics target=%s attempt=%d compact.invocations=%d compact.failures=%d",
+                        target_id,
+                        attempt,
+                        compact_invocations,
+                        compact_failures,
+                    )
             elif skip_implement and attempt == 1:
                 # Target already in_review — decide whether start-of-iteration audit is needed
                 logger.info("ralph.loop.skip_implement target=%s stage=in_review", target_id)
@@ -930,7 +1028,28 @@ class RalphLoop:
                 ]
                 if remediation:
                     prompt_parts.append(remediation)
+                try:
+                    previous_child_stages = self._child_stage_map(target_id)
+                except Exception as exc:
+                    logger.warning(
+                        "ralph.compact.pre_snapshot_failed target=%s attempt=%d error=%s",
+                        target_id,
+                        attempt,
+                        exc,
+                    )
+                    previous_child_stages = {}
                 self._run_pi("\n".join(prompt_parts))
+                invocations, failures = self._compact_after_child_transition(target_id, previous_child_stages, attempt)
+                compact_invocations += invocations
+                compact_failures += failures
+                if invocations or failures:
+                    logger.info(
+                        "ralph.compact.metrics target=%s attempt=%d compact.invocations=%d compact.failures=%d",
+                        target_id,
+                        attempt,
+                        compact_invocations,
+                        compact_failures,
+                    )
 
             logger.info("ralph.loop.audit.start target=%s attempt=%d", target_id, attempt)
             # Run the audit skill unless we've determined that the persisted audit
@@ -981,6 +1100,7 @@ class RalphLoop:
                     "scope": scope_ids,
                     "merge_offered": True,
                     "merge_executed": self.confirm_merge,
+                    "compact": {"invocations": compact_invocations, "failures": compact_failures},
                 }
 
             remediation = _build_remediation_prompt()
@@ -990,7 +1110,12 @@ class RalphLoop:
             )
 
         logger.warning("ralph.loop.max_attempts target=%s", target_id)
-        return {"status": "max_attempts", "attempt": self.max_attempts, "scope": scope_ids}
+        return {
+            "status": "max_attempts",
+            "attempt": self.max_attempts,
+            "scope": scope_ids,
+            "compact": {"invocations": compact_invocations, "failures": compact_failures},
+        }
 
 
 def build_parser() -> argparse.ArgumentParser:
