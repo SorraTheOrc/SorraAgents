@@ -842,11 +842,13 @@ class RalphLoop:
     def _assert_precondition(self, target_id: str) -> None:
         item = self._wl_show(target_id).get("workItem", {})
         stage = item.get("stage", "unknown")
-        # Accept intake_complete as a valid entrypoint for the auto-plan flow
-        if stage not in {"plan_complete", "in_review", "intake_complete"}:
-            # Keep legacy phrasing for compatibility with callers/tests but mention intake_complete
+        # Accept intake_complete and in_progress as valid entrypoints.
+        # - intake_complete: triggers the auto-plan decision before the first implement pass
+        # - in_progress: resume or continue an already-started implement→audit loop
+        if stage not in {"plan_complete", "in_review", "intake_complete", "in_progress"}:
+            # Updated phrasing to include in_progress and intake_complete for clarity
             raise RalphError(
-                f"Target {target_id} must be stage plan_complete or in_review (or intake_complete for auto-plan) before running ralph; current stage is {stage}."
+                f"Target {target_id} must be stage plan_complete, in_review, or in_progress (or intake_complete for auto-plan) before running ralph; current stage is {stage}."
             )
 
     def _scope_in_review(self, scope_ids: Iterable[str]) -> bool:

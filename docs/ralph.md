@@ -44,9 +44,10 @@ python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-i
 
 ### Preconditions
 
-- **Stage gate**: The target work item must be at stage `plan_complete`, `in_review`, or `intake_complete`.
+- **Stage gate**: The target work item must be at stage `plan_complete`, `in_review`, `in_progress`, or `intake_complete`.
   - At `intake_complete`: ralph automatically runs the **auto-plan** decision (see Auto-Plan Decision section). If effort and risk are below thresholds, ralph proceeds directly to implementation. If effort or risk exceed thresholds, `/plan` is invoked first, then implementation continues. Auto-plan only runs on the first attempt; subsequent iterations proceed directly to implementation.
   - At `plan_complete`: ralph runs the full implement\u2192audit loop.
+  - At `in_progress`: ralph accepts an `in_progress` work item as a valid entrypoint and will resume the implement→audit loop. Behavior is equivalent to `plan_complete` for orchestration purposes. Note that the auto-plan decision is not automatically run for `in_progress` targets (auto-plan remains limited to `intake_complete`).
   - At `in_review`: ralph **skips the first implement pass** and audits immediately. If audit passes, ralph proceeds to checks/merge without any implement step. If audit fails, ralph falls into the normal implement\u2192audit loop with remediation.
   - At any other stage: ralph exits with an error.
 - **Scope**: Only the target item and its direct children are processed.
