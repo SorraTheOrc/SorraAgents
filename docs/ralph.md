@@ -152,7 +152,7 @@ When a work item is at stage `intake_complete`, ralph automatically runs an **au
 2. **Evaluate effort and risk**: Otherwise, ralph calls the `effort-and-risk` skill (`orchestrate_estimate.py`) to compute the effort t-shirt size and risk level.
 3. **Threshold decision**:
    - If effort is **Extra Small** or **Small** **AND** risk is **Low**, ralph skips planning and proceeds directly to implementation.
-   - If effort or risk exceed these thresholds, ralph invokes `/plan <id>` to create a plan before implementation.
+   - If effort or risk exceed these thresholds, ralph invokes `/plan <id>` to create a plan before implementation. Ralph runs the plan via the Pi agent runtime (the `pi` binary) by invoking the plan skill (e.g. `/skill:plan <id>`), so planning executes inside the agent framework with the configured model and runtime semantics. This is distinct from engine-level `opencode run "/plan <id>"` dispatch.
    - If the effort-and-risk skill fails or returns ambiguous data, ralph defaults to running `/plan` (safety-first).
 4. **Post decision comment**: ralph posts a human-readable comment on the work item documenting the auto-plan decision (effort, risk, outcome). This comment is idempotent \u2014 re-running ralph will not create duplicate comments.
 

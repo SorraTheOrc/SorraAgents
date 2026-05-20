@@ -49,7 +49,7 @@ When the target work item is at stage `intake_complete`, ralph automatically run
 1. **Evaluate effort and risk**: ralph calls the `effort-and-risk` skill to compute the effort t-shirt size and risk level.
 2. **Threshold check**:
    - If effort is **Extra Small** or **Small** AND risk is **Low** → skip `/plan` and proceed directly to implementation.
-   - If effort or risk exceed these thresholds → invoke `/plan <id>` before implementation.
+   - If effort or risk exceed these thresholds → invoke `/plan <id>` before implementation. Ralph invokes `/plan` via the Pi agent runtime (using the `pi` binary and `/skill:plan <id>`), so planning runs inside the agent framework with the configured model. This differs from engine-level `opencode run "/plan <id>"` dispatch.
    - If the effort-and-risk skill fails → default to running `/plan` (safety-first).
 3. **Idempotence**: If effort/risk are already computed or a decision comment exists, ralph skips re-computation and uses the stored values.
 4. **Decision comment**: ralph posts a human-readable comment documenting the auto-plan decision.
