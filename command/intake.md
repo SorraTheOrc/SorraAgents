@@ -39,6 +39,7 @@ The command implements the procedural workflow below. Each numbered step is part
 - If a response is unclear or ambiguous, ask for clarification rather than guessing or asking a largely similar question.
 - Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or OpenCode ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
+- All work‑item descriptions and comments **must be written in Markdown** format.
 - The goal is not to capture an exhaustive spec, but to gather sufficient detail to create a clear Worklog work item that will be used to either seed a PRD, update an existing one, or if the work is small and well-defined, be implemented directly from the Worklog work item.
 
 - Do not include procedural next steps (e.g., "Proceed to planning", "Break into sub-tasks") in the intake brief or work item description. Workflow progression is handled by the workflow system via stage transitions and delegation dispatch, not by the work item content.
