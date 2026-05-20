@@ -39,9 +39,9 @@ class FakeRunner:
             item = self.items["SA-CHILD"]
             return Result(stdout=json.dumps({"success": True, "workItem": item}))
 
-        if cmd[:4] == ["wl", "comment", "list", "SA-TARGET"]:
+        if cmd[:3] == ["wl", "comment", "list"]:
             return Result(stdout=json.dumps({"success": True, "comments": self.comments}))
-        if cmd[:4] == ["wl", "comment", "add", "SA-TARGET"]:
+        if cmd[:3] == ["wl", "comment", "add"]:
             comment = cmd[cmd.index("--comment") + 1]
             self.comments.append({"comment": comment, "author": "ralph"})
             return Result(stdout=json.dumps({"success": True}))
@@ -501,6 +501,58 @@ def test_in_review_implement_after_failed_audit():
     assert second_call.startswith("implement"), f"Second call should be implement, got: {second_call[:60]}"
     third_call = pi_calls[2][-1]
     assert third_call.startswith("/skill:audit"), f"Third call should be audit, got: {third_call[:60]}"
+
+
+def test_in_review_skips_start_of_iteration_audit_when_persisted_comment_up_to_date():
+    """When the most recent '# AMPA Audit Result' comment is newer than the
+    most-recent updatedAt across the recursive scope, Ralph should skip the
+    start-of-iteration /skill:audit invocation and use the persisted audit.
+    """
+    runner = FakeRunner()
+    # Target starts in_review
+    runner.items["SA-TARGET"]["stage"] = "in_review"
+    # Set updatedAt timestamps for target and child (child older)
+    runner.items["SA-TARGET"]["updatedAt"] = "2026-05-20T11:00:00Z"
+    runner.items["SA-CHILD"]["updatedAt"] = "2026-05-20T10:00:00Z"
+    # Persisted audit already present on the work item
+    runner.items["SA-TARGET"]["audit"] = AUDIT_PASS
+    # A recent AMPA comment whose createdAt is later than the updatedAt values
+    runner.comments = [{"comment": "# AMPA Audit Result\n\n...", "author": "ralph", "createdAt": "2026-05-20T12:00:00Z"}]
+
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    # There should be NO implement or /skill:audit calls — Ralph relied on persisted audit
+    pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
+    implement_calls = [c for c in pi_calls if c[-1].startswith("implement")]
+    audit_calls = [c for c in pi_calls if c[-1].startswith("/skill:audit")]
+    assert len(implement_calls) == 0
+    assert len(audit_calls) == 0
+
+
+def test_in_review_runs_start_of_iteration_audit_when_persisted_comment_outdated():
+    """When the latest AMPA comment is older than the most-recent updatedAt in
+    the scope, Ralph must invoke /skill:audit at the start of the iteration.
+    """
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "in_review"
+    # Child updated more recently than the audit comment
+    runner.items["SA-TARGET"]["updatedAt"] = "2026-05-20T10:00:00Z"
+    runner.items["SA-CHILD"]["updatedAt"] = "2026-05-20T12:00:00Z"
+    # A stale AMPA comment
+    runner.comments = [{"comment": "# AMPA Audit Result\n\nold", "author": "ralph", "createdAt": "2026-05-20T09:00:00Z"}]
+    # The audit skill will be invoked and will persist the audit
+    runner.audit_outputs = [AUDIT_PASS]
+
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
+    # Because the persisted comment was stale, Ralph should have invoked /skill:audit
+    audit_calls = [c for c in pi_calls if c[-1].startswith("/skill:audit")]
+    assert len(audit_calls) == 1
 
 
 def test_model_passed_to_pi_commands():

@@ -17,6 +17,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
+from datetime import datetime, timezone
 
 logger = logging.getLogger("ralph")
 
@@ -729,6 +730,113 @@ class RalphLoop:
         scope.extend(child["id"] for child in data.get("children", []))
         return scope
 
+    def _scope_ids_recursive(self, target_id: str) -> list[str]:
+        """Return the target id and all recursive descendant ids.
+
+        Uses a BFS-like traversal and calls `wl show --children` for each
+        discovered item. On errors, traversal stops for that branch but the
+        already discovered ids are still returned.
+        """
+        scope: list[str] = []
+        seen: set[str] = set()
+        queue: list[str] = [target_id]
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            scope.append(current)
+            try:
+                data = self._wl_show(current, children=True)
+                children = data.get("children", [])
+                for child in children:
+                    cid = child.get("id")
+                    if cid and cid not in seen:
+                        queue.append(cid)
+            except Exception:
+                logger.exception("ralph.scope_recursive_failed id=%s", current)
+                # Continue with whatever we've discovered so far
+                continue
+        return scope
+
+    def _parse_iso_ts(self, ts: str):
+        """Parse an ISO-8601-ish timestamp into a timezone-aware datetime.
+
+        Handles strings with a trailing 'Z' by normalizing to '+00:00'. Also
+        accepts numeric epoch seconds as int/float.
+        Returns None on parse failure.
+        """
+        if not ts:
+            return None
+        # Numeric epoch seconds
+        if isinstance(ts, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+            except Exception:
+                return None
+        if isinstance(ts, str):
+            s = ts
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            try:
+                return datetime.fromisoformat(s)
+            except Exception:
+                # Fallback: try to parse as float epoch string
+                try:
+                    return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+                except Exception:
+                    return None
+        return None
+
+    def _latest_audit_comment_ts(self, work_item_id: str):
+        """Return the most-recent createdAt timestamp (as datetime) for comments
+        on work_item_id whose first non-empty line starts with
+        '# AMPA Audit Result'. Returns None if no such comment exists.
+        """
+        comments = self._wl_comment_list(work_item_id)
+        latest = None
+        for c in comments:
+            comment_text = (c.get("comment") or "")
+            # first non-empty line
+            first = None
+            for line in comment_text.splitlines():
+                if line.strip():
+                    first = line.strip()
+                    break
+            if not first:
+                continue
+            if not first.startswith("# AMPA Audit Result"):
+                continue
+            created = c.get("createdAt") or c.get("created_at") or c.get("created") or c.get("postedAt")
+            ts = self._parse_iso_ts(created)
+            if ts and (latest is None or ts > latest):
+                latest = ts
+        return latest
+
+    def _latest_audit_comment_ts_for_scope(self, scope_ids):
+        latest = None
+        for wid in scope_ids:
+            ts = self._latest_audit_comment_ts(wid)
+            if ts and (latest is None or ts > latest):
+                latest = ts
+        return latest
+
+    def _max_updated_at_for_scope(self, scope_ids):
+        """Return the most-recent updatedAt timestamp (as datetime) across the scope.
+        Returns None if no updatedAt values are available.
+        """
+        latest = None
+        for wid in scope_ids:
+            try:
+                item = self._wl_show(wid).get("workItem", {})
+            except Exception:
+                continue
+            updated = item.get("updatedAt") or item.get("updated_at") or item.get("updated")
+            ts = self._parse_iso_ts(updated)
+            if ts and (latest is None or ts > latest):
+                latest = ts
+        return latest
+
     def _assert_precondition(self, target_id: str) -> None:
         item = self._wl_show(target_id).get("workItem", {})
         stage = item.get("stage", "unknown")
@@ -751,11 +859,12 @@ class RalphLoop:
 
     def run(self, target_id: str) -> dict:
         self._assert_precondition(target_id)
-        scope_ids = self._scope_ids(target_id)
+        scope_ids = self._scope_ids_recursive(target_id)
 
         # If the target is already in_review, skip the first implement pass and
-        # go straight to audit. If audit passes, we're done. If it fails, we
-        # fall into the normal implement→audit loop.
+        # go straight to audit. If a persisted audit comment shows the scope is
+        # up-to-date, we can skip invoking the audit skill at the start of the
+        # iteration and instead rely on the persisted audit.
         target_item = self._wl_show(target_id).get("workItem", {})
         target_stage = target_item.get("stage", "unknown")
         skip_implement = target_stage == "in_review"
@@ -772,6 +881,9 @@ class RalphLoop:
                 return {"status": "cancelled", "attempt": attempt, "scope": scope_ids}
 
             logger.info("ralph.loop.attempt.start target=%s attempt=%d", target_id, attempt)
+
+            # Whether we will rely on a persisted audit without invoking the audit skill
+            use_persisted_audit = False
 
             if target_stage == "intake_complete" and attempt == 1 and not self.no_autoplan:
                 # Auto-plan step: evaluate effort/risk and decide whether
@@ -794,8 +906,19 @@ class RalphLoop:
                     prompt_parts.append(remediation)
                 self._run_pi("\n".join(prompt_parts))
             elif skip_implement and attempt == 1:
-                # Target already in_review — audit first, only implement if audit fails
+                # Target already in_review — decide whether start-of-iteration audit is needed
                 logger.info("ralph.loop.skip_implement target=%s stage=in_review", target_id)
+                try:
+                    latest_comment_ts = self._latest_audit_comment_ts_for_scope(scope_ids)
+                    max_updated_at = self._max_updated_at_for_scope(scope_ids)
+                    if latest_comment_ts and max_updated_at and latest_comment_ts >= max_updated_at:
+                        logger.info(
+                            "ralph.loop.audit.skipping_start target=%s latest_comment_ts=%s max_updated_at=%s",
+                            target_id, latest_comment_ts.isoformat(), max_updated_at.isoformat()
+                        )
+                        use_persisted_audit = True
+                except Exception:
+                    logger.exception("ralph.loop.pre_audit_check_failed target=%s", target_id)
             else:
                 prompt_parts = [
                     f"implement {target_id}",
@@ -806,8 +929,13 @@ class RalphLoop:
                 self._run_pi("\n".join(prompt_parts))
 
             logger.info("ralph.loop.audit.start target=%s attempt=%d", target_id, attempt)
-            # Run the audit skill; it MUST persist the structured audit to the work item.
-            self._run_pi(f"/skill:audit {target_id}")
+            # Run the audit skill unless we've determined that the persisted audit
+            # is up-to-date and can be used without re-running the audit skill.
+            if use_persisted_audit:
+                logger.info("ralph.loop.audit.skipped_using_persisted target=%s attempt=%d", target_id, attempt)
+            else:
+                # Run the audit skill; it MUST persist the structured audit to the work item.
+                self._run_pi(f"/skill:audit {target_id}")
             # Read the persisted audit from the work item via wl show.
             item = self._wl_show(target_id).get("workItem", {})
             # Normalize persisted audit extraction to handle both object and string shapes.
