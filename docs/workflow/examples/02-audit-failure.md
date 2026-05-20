@@ -179,3 +179,4 @@ This item can be closed: all acceptance criteria are met, all children are compl
 2. The `retry_delegation` command resets the state to `plan_complete`, allowing the normal delegation flow to re-engage.
 3. The audit cooldown prevents redundant audits — at least 6 hours between attempts.
 4. Tags track the history: `audit_failed` is removed on retry, but the audit comments remain as an audit trail.
+4a. Redundant audit suppression: tools like Ralph avoid re-running a start-of-iteration audit when it would be redundant. If the most recent `# AMPA Audit Result` comment for the work item and its recursive descendants has a `createdAt` timestamp that is equal to or later than the most-recent `updatedAt` across the same scope, the orchestrator may skip the start-of-iteration `/skill:audit` invocation and rely on the persisted audit instead. This reduces noise and unnecessary audit invocations while preserving safety by still performing audits when scoped changes occur.

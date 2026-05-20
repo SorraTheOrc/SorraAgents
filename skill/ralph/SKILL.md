@@ -23,6 +23,9 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id (or permission to create one).
 2. Run deterministic script locally:
 
+Start-of-iteration audit skipping: When the target is already at stage `in_review`, Ralph will normally run a start-of-iteration audit. To avoid redundant audits, Ralph will skip invoking the audit skill at the start of the iteration if the most recent `# AMPA Audit Result` comment (across the target and all recursive descendants) has a `createdAt` timestamp that is equal to or newer than the most-recent `updatedAt` timestamp in the same scope. In that case Ralph will read the persisted audit from the work item and proceed without re-running the audit skill.
+
+
 ```bash
 # Run the ralph orchestrator from the skill installation so it works
 # regardless of the current working directory. Use the skill-installed
