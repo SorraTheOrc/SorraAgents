@@ -127,3 +127,18 @@ Ready to close: Yes/No
 - Keep the output concise and actionable for quick human consumption.
 - Handle errors gracefully: if `wl` or any other command is not available or return invalid JSON, present a helpful error and possible remediation steps.
 - The depth of code review is critical: read implementation files, check function signatures, verify test coverage, and assess edge cases. Do not just check that files exist.
+
+## Scripts
+
+The audit skill provides a small helper script to persist the structured audit report to Worklog using the `wl` CLI:
+
+- Path: `skill/audit/scripts/persist_audit.py`
+- Usage:
+  - Persist from stdin: `cat report.md | python3 skill/audit/scripts/persist_audit.py --issue-id SA-123` 
+  - Persist from a file: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --file report.md`
+  - Persist from a CLI string: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --report "Ready to close: Yes\n..."`
+
+Notes:
+- The script calls: `wl update <issue-id> --audit-text "<report>" --json` and returns a non-zero exit code on failure.
+- The audit skill must produce structured audit text that begins with the header `Ready to close: Yes` or `Ready to close: No` on the very first non-empty line. Ralph and other orchestrators rely on this canonical header when reading the persisted audit from the work item.
+- Do not include any wrapper markers or surrounding fences when passing the text to `wl update --audit-text`.
