@@ -3,7 +3,12 @@ import subprocess
 
 import pytest
 
-from skill.ralph.scripts.ralph_loop import RalphLoop, RalphError
+from skill.ralph.scripts.ralph_loop import (
+    RalphError,
+    RalphLoop,
+    _extract_text_from_json_output,
+    _parse_pi_json_line,
+)
 
 
 def test_wl_show_default_raises():
@@ -38,6 +43,81 @@ def test_wl_show_retry_success():
     loop = RalphLoop(runner=fake_runner, retry=1, retry_delay=0.0)
     res = loop._wl_show("WI")
     assert "workItem" in res
+
+
+def test_parse_pi_json_line_extracts_text_from_message_end_event():
+    line = json.dumps(
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Ready to close: Yes"},
+                    {"type": "text", "text": "| # | Criterion | Verdict | Evidence |"},
+                ],
+            },
+        }
+    )
+
+    stream_text, should_print, complete_text = _parse_pi_json_line(line)
+
+    assert stream_text == ""
+    assert should_print is False
+    assert complete_text == "Ready to close: Yes\n| # | Criterion | Verdict | Evidence |"
+
+
+def test_extract_text_from_json_output_handles_structured_message_events():
+    raw = "\n".join(
+        [
+            json.dumps({"type": "session", "version": 3}),
+            json.dumps({"type": "agent_start"}),
+            json.dumps({"type": "turn_start"}),
+            json.dumps(
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "Ready to close: Yes"},
+                            {"type": "text", "text": "| # | Criterion | Verdict | Evidence |"},
+                        ],
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn_end",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "Ready to close: Yes"},
+                            {"type": "text", "text": "| # | Criterion | Verdict | Evidence |"},
+                        ],
+                    },
+                    "toolResults": [],
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "agent_end",
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "text", "text": "Ready to close: Yes"},
+                                {"type": "text", "text": "| # | Criterion | Verdict | Evidence |"},
+                            ],
+                        }
+                    ],
+                    "willRetry": False,
+                }
+            ),
+        ]
+    )
+
+    text = _extract_text_from_json_output(raw)
+
+    assert text == "Ready to close: Yes\n| # | Criterion | Verdict | Evidence |"
 
 
 def test_loop_with_failing_check_and_fail_open():

@@ -194,6 +194,51 @@ def _build_remediation_prompt() -> str:
     return "The previous audit found issues. Address all the gaps identified in the audit."
 
 
+def _extract_text_from_content(content: object) -> str | None:
+    """Recursively extract user-facing text from a JSON content payload."""
+    if isinstance(content, str):
+        return content if content else None
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            text = _extract_text_from_content(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts) if parts else None
+    if isinstance(content, dict):
+        if content.get("type") == "text":
+            text = content.get("text")
+            if isinstance(text, str) and text:
+                return text
+        for key in ("text", "content", "delta"):
+            value = content.get(key)
+            if value is not None:
+                text = _extract_text_from_content(value)
+                if text:
+                    return text
+    return None
+
+
+def _extract_text_from_assistant_message(message: object) -> str | None:
+    """Extract text from an assistant message payload when present."""
+    if not isinstance(message, dict):
+        return None
+    if message.get("role") != "assistant":
+        return None
+    return _extract_text_from_content(message.get("content"))
+
+
+def _extract_last_assistant_message_text(messages: object) -> str | None:
+    """Return the last assistant message text from a message list."""
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        text = _extract_text_from_assistant_message(message)
+        if text:
+            return text
+    return None
+
+
 def _parse_pi_json_line(line: str) -> tuple[str, bool, str | None]:
     """Parse a single JSON line from pi --mode json and extract user-facing text.
 
@@ -203,11 +248,14 @@ def _parse_pi_json_line(line: str) -> tuple[str, bool, str | None]:
     - text_end: complete content block (captured for return value)
     - toolcall_start/delta/end: tool calls (suppressed)
     - tool_execution_*: tool results (suppressed)
-    - session/agent_start/agent_end/turn_start/end/message_start/end: metadata
+    - message_start/message_end/turn_end/agent_end: may include final assistant
+      message content in structured JSON form
+    - session/agent_start/turn_start: structural metadata
 
     For streaming, text_delta events are printed additively.
-    For the return value, text_end and agent_end events provide complete text
-    blocks that replace any accumulated deltas for that content index.
+    For the return value, text_end, message_end, turn_end, and agent_end
+    events can provide complete text blocks that replace any accumulated
+    deltas for that content index.
 
     Returns a tuple of (stream_text, should_print, complete_text):
     - stream_text: text to print to console (additive delta for streaming)
@@ -250,8 +298,21 @@ def _parse_pi_json_line(line: str) -> tuple[str, bool, str | None]:
             # text_start: structural — suppress (would duplicate delta)
             if inner_type == "text_start":
                 return "", False, None
+            # Some pi versions place the assistant's completed response inside
+            # a structured payload rather than a dedicated text_end event.
+            content_text = _extract_text_from_content(assistant_event.get("content"))
+            if content_text:
+                return "", False, content_text
             # Other assistant events — suppress
             return "", False, None
+        return "", False, None
+
+    # --- Message events: final assistant message content ---
+    if event_type in {"message_start", "message_end", "turn_end"}:
+        message = obj.get("message")
+        text = _extract_text_from_assistant_message(message)
+        if text:
+            return "", False, text
         return "", False, None
 
     # --- Agent end: final message with complete content ---
@@ -259,37 +320,14 @@ def _parse_pi_json_line(line: str) -> tuple[str, bool, str | None]:
     # authoritative response. Earlier assistant messages may contain tool calls
     # or intermediate text that should not be included in the audit output.
     if event_type == "agent_end":
-        messages = obj.get("messages", [])
-        if isinstance(messages, list):
-            # Find the last assistant message with text content
-            last_assistant_text: str | None = None
-            for msg in reversed(messages):
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("role") != "assistant":
-                    continue
-                content = msg.get("content", [])
-                if isinstance(content, list):
-                    parts: list[str] = []
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "")
-                            if text:
-                                parts.append(text)
-                    if parts:
-                        last_assistant_text = "\n".join(parts)
-                        break
-                elif isinstance(content, str) and content:
-                    last_assistant_text = content
-                    break
-            if last_assistant_text:
-                return "", False, last_assistant_text
+        text = _extract_last_assistant_message_text(obj.get("messages"))
+        if text:
+            return "", False, text
         return "", False, None
 
     # --- Structural events: suppress all ---
     if event_type in (
-        "session", "agent_start", "turn_start", "turn_end",
-        "message_start", "message_end",
+        "session", "agent_start", "turn_start",
     ):
         return "", False, None
 
