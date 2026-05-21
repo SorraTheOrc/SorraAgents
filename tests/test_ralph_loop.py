@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 import json
-from skill.ralph.scripts.ralph_loop import RalphError, RalphLoop, parse_audit_report
+from skill.ralph.scripts.ralph_loop import JsonLineFormatter, RalphError, RalphLoop, parse_audit_report
 
 
 @dataclass
@@ -414,6 +414,108 @@ def test_check_cmds_are_canonicalized_to_quiet_npm_test():
     assert result["status"] == "success"
     check_calls = [c[2] for c in runner.calls if c[:2] == ["bash", "-lc"]]
     assert any(call == "npm --silent test" for call in check_calls)
+
+
+def test_delegated_commands_are_logged_in_console_output():
+    import io
+    import logging
+    import shlex
+
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    logger = logging.getLogger("ralph")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    try:
+        result = loop.run("SA-TARGET")
+    finally:
+        logger.setLevel(old_level)
+        logger.removeHandler(handler)
+
+    assert result["status"] == "success"
+    console_output = stream.getvalue()
+    delegated_calls = [c for c in runner.calls if c[0] in {"pi", "wl"}]
+    assert delegated_calls
+    for call in delegated_calls:
+        assert shlex.join(call) in console_output
+
+
+def test_delegated_commands_include_machine_readable_json_fields():
+    import io
+    import logging
+    import shlex
+
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(JsonLineFormatter())
+    logger = logging.getLogger("ralph")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    try:
+        result = loop.run("SA-TARGET")
+    finally:
+        logger.setLevel(old_level)
+        logger.removeHandler(handler)
+
+    assert result["status"] == "success"
+    lines = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+    delegated_lines = [line for line in lines if line.get("category") in {"pi", "wl"} and "cmd" in line]
+    assert delegated_lines
+    rendered_calls = {shlex.join(c) for c in runner.calls if c[0] in {"pi", "wl"}}
+    observed_cmds = {line["cmd"] for line in delegated_lines}
+    assert rendered_calls <= observed_cmds
+    assert all(isinstance(line.get("argv"), list) for line in delegated_lines)
+
+
+def test_failed_pi_command_still_logs_exact_command_before_raising():
+    import io
+    import logging
+    import shlex
+
+    class FailOnAuditRunner(FakeRunner):
+        def __call__(self, cmd):
+            cmd = list(cmd)
+            if cmd[:2] == ["pi", "-p"] and cmd[-1].startswith("/skill:audit"):
+                self.calls.append(cmd)
+                return Result(returncode=1, stderr="audit failed")
+            return super().__call__(cmd)
+
+    runner = FailOnAuditRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    logger = logging.getLogger("ralph")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    try:
+        with pytest.raises(RalphError, match="pi run failed"):
+            loop.run("SA-TARGET")
+    finally:
+        logger.setLevel(old_level)
+        logger.removeHandler(handler)
+
+    console_output = stream.getvalue()
+    failing_calls = [c for c in runner.calls if c[0] == "pi" and c[-1].startswith("/skill:audit")]
+    assert failing_calls
+    assert shlex.join(failing_calls[0]) in console_output
 
 
 def test_verbose_mode_logs_pi_output_start():

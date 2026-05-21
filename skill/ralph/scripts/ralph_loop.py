@@ -62,6 +62,56 @@ class AuditParseResult:
         return [c for c in self.criteria if c.verdict in {"unmet", "partial"}]
 
 
+class JsonLineFormatter(logging.Formatter):
+    """Emit log records as JSON lines and preserve structured extras.
+
+    The formatter keeps the canonical `msg` field for human-readable text and
+    serializes any extra fields attached to the log record so callers can
+    inspect delegated command details machine-readably.
+    """
+
+    _STANDARD_KEYS = {
+        "name",
+        "msg",
+        "args",
+        "levelname",
+        "levelno",
+        "pathname",
+        "filename",
+        "module",
+        "exc_info",
+        "exc_text",
+        "stack_info",
+        "lineno",
+        "funcName",
+        "created",
+        "msecs",
+        "relativeCreated",
+        "thread",
+        "threadName",
+        "processName",
+        "process",
+        "message",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": int(record.created * 1000),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key in self._STANDARD_KEYS or key.startswith("_"):
+                continue
+            try:
+                json.dumps(value)
+            except TypeError:
+                value = str(value)
+            payload[key] = value
+        return json.dumps(payload, ensure_ascii=False)
+
+
 def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=False, text=True, capture_output=True)
 
@@ -133,6 +183,10 @@ def _resolve_model(cli_model: str | None, config_model: str | None) -> str:
     if config_model:
         return config_model
     return DEFAULT_MODEL
+
+
+def _render_command(cmd: Sequence[str]) -> str:
+    return shlex.join(list(cmd))
 
 
 def _build_remediation_prompt() -> str:
@@ -407,6 +461,14 @@ class RalphLoop:
         attempts = 0
         last_proc: subprocess.CompletedProcess | None = None
         while True:
+            if category in {"wl", "pi"}:
+                rendered = _render_command(cmd)
+                logger.info(
+                    "ralph.cmd.%s.execute cmd=%s",
+                    category,
+                    rendered,
+                    extra={"category": category, "cmd": rendered, "argv": list(cmd), "attempt": attempts + 1},
+                )
             proc = self._call_runner(list(cmd), input_data=input_data)
             last_proc = proc
             # Basic success check
@@ -561,6 +623,12 @@ class RalphLoop:
         Non-JSON lines are printed as a fallback.
         In verbose mode, raw JSON lines are also logged at DEBUG level.
         """
+        rendered = _render_command(cmd)
+        logger.info(
+            "ralph.cmd.pi.execute cmd=%s",
+            rendered,
+            extra={"category": "pi", "cmd": rendered, "argv": list(cmd), "attempt": 1},
+        )
         logger.info("ralph.cmd.pi.stream_start model=%s cmd_len=%d", self.model, len(cmd))
         try:
             process = subprocess.Popen(
@@ -1293,16 +1361,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     #   --verbose  : DEBUG — adds delegated commands, subprocess output, raw audit
     #   --no-stream: disable pi stdout streaming (use buffered capture)
     if args.json:
-        # Emit compact JSON lines with timestamp, level, logger, and message
-        class JsonLineFormatter(logging.Formatter):
-            def format(self, record: logging.LogRecord) -> str:
-                payload = {
-                    "ts": int(record.created * 1000),
-                    "level": record.levelname,
-                    "logger": record.name,
-                    "msg": record.getMessage(),
-                }
-                return json.dumps(payload, ensure_ascii=False)
+        # Emit compact JSON lines with timestamp, level, logger, message, and
+        # any structured extras attached to the record (for example, delegated
+        # command details such as `cmd` and `argv`).
         handler = logging.StreamHandler()
         handler.setFormatter(JsonLineFormatter())
         logging.getLogger("ralph").addHandler(handler)

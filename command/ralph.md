@@ -19,6 +19,7 @@ Run the dedicated ralph orchestrator loop for a target work item.
 - Validates `<work-item-id>` and stage precondition (`plan_complete`).
 - Targets only `<work-item-id>` + direct children.
 - Iteratively runs implement + audit passes with remediation feedback.
+- Logs every delegated `pi` and `wl` command before execution so the console and `--json` output show the exact command Ralph ran.
 - Records structured audit output and AMPA-style deduplicated comment.
 - Offers merge only after checks pass; merge executes only with explicit confirmation.
 
