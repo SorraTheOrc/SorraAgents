@@ -26,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from skill.ralph.scripts.structured_response import StructuredResponse, parse_structured_response
 from skill.test_runner import canonicalize_quiet_test_command
 
 logger = logging.getLogger("ralph")
@@ -489,6 +490,22 @@ def _extract_text_from_json_output(raw: str) -> str:
     return raw
 
 
+def _extract_text_and_structured_response_from_json_output(raw: str) -> tuple[str, StructuredResponse | None]:
+    """Return plain text if available, otherwise a structured fallback.
+
+    The structured fallback preserves the user-facing summary text and the
+    extracted action list so Ralph can reuse them when constructing the next
+    remediation prompt.
+    """
+    text = _extract_text_from_json_output(raw)
+    if text:
+        return text, None
+    structured = parse_structured_response(raw)
+    if structured:
+        return structured.render(), structured
+    return text, None
+
+
 # Default thresholds for auto-plan decision
 # If effort t-shirt is in this set AND risk level is in the risk set,
 # skip /plan and proceed directly to implement.
@@ -556,6 +573,7 @@ class RalphLoop:
         self.non_fatal_by_default = {"effort_and_risk"}
         self.debug_persist = debug_persist
         self._debug_context: dict[str, object] = {}
+        self._last_structured_response: StructuredResponse | None = None
 
     def _call_runner(self, cmd: Sequence[str], input_data: str | None = None) -> subprocess.CompletedProcess:
         """Invoke the configured runner in a consistent way.
@@ -726,6 +744,7 @@ class RalphLoop:
         if self.verbose:
             logger.debug("ralph.cmd.pi.run prompt_full=\n%s", prompt)
 
+        self._last_structured_response = None
         if self.stream:
             return self._stream_pi(cmd, prompt)
 
@@ -737,7 +756,9 @@ class RalphLoop:
             if self.verbose:
                 logger.debug("ralph.cmd.pi.run stderr=%s", (getattr(proc, "stderr", "") or "").strip()[:1000])
             raise RalphError(f"pi run failed: {(getattr(proc, 'stderr', '') or '').strip()}")
-        text = _extract_text_from_json_output(getattr(proc, "stdout", "") or "")
+        self._last_structured_response = None
+        text, structured = _extract_text_and_structured_response_from_json_output(getattr(proc, "stdout", "") or "")
+        self._last_structured_response = structured
         if self.verbose:
             logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(text), text[:1000])
         return text
@@ -751,6 +772,7 @@ class RalphLoop:
         Non-JSON lines are printed as a fallback.
         In verbose mode, raw JSON lines are also logged at DEBUG level.
         """
+        self._last_structured_response = None
         rendered = _render_command(cmd)
         logger.info(
             "ralph.cmd.pi.execute cmd=%s",
@@ -818,6 +840,9 @@ class RalphLoop:
                 logger.debug("ralph.cmd.pi.run stderr=%s", stderr.strip()[:1000])
             raise RalphError(f"pi run failed: {stderr.strip()}")
 
+        raw_output = "".join(raw_output_parts)
+        self._last_structured_response = None
+
         # Prefer complete text blocks from text_end/agent_end events over
         # accumulated deltas — they give us the full, assembled content.
         # Use only the LAST complete block — it's the final, authoritative
@@ -827,8 +852,19 @@ class RalphLoop:
         else:
             full_text = "".join(text_parts)
 
-        # If JSON lines were seen but no text extracted, warn
+        structured_response: StructuredResponse | None = None
         if json_lines_seen > 0 and text_lines_seen == 0 and not complete_blocks:
+            structured_response = parse_structured_response(raw_output)
+            if structured_response:
+                full_text = structured_response.render()
+                logger.info(
+                    "ralph.cmd.pi.structured_response actions=%d summary_len=%d",
+                    len(structured_response.actions),
+                    len(structured_response.summary),
+                )
+
+        # If JSON lines were seen but no text extracted, warn
+        if structured_response is None and json_lines_seen > 0 and text_lines_seen == 0 and not complete_blocks:
             logger.warning(
                 "ralph.cmd.pi.no_text_extracted json_lines=%d — "
                 "pi produced JSON but no user-facing text content was found",
@@ -836,7 +872,7 @@ class RalphLoop:
             )
             if self.debug_persist:
                 persisted_path = _persist_debug_payload(
-                    "".join(raw_output_parts),
+                    raw_output,
                     {
                         **self._debug_context,
                         "reason": "no_text_extracted",
@@ -850,12 +886,14 @@ class RalphLoop:
                 )
                 if persisted_path:
                     logger.info("ralph.cmd.pi.debug_payload_saved path=%s", persisted_path)
-        elif json_lines_seen > 0 and len(full_text) < 50 and not complete_blocks:
+        elif json_lines_seen > 0 and len(full_text) < 50 and not complete_blocks and structured_response is None:
             logger.warning(
                 "ralph.cmd.pi.very_short_text json_lines=%d text_len=%d — "
                 "pi produced very little text content, audit may be incomplete",
                 json_lines_seen, len(full_text),
             )
+
+        self._last_structured_response = structured_response
 
         if self.verbose:
             logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(full_text), full_text[:1000])
@@ -1253,6 +1291,13 @@ class RalphLoop:
             stages[child_id] = child_stage or ""
         return stages
 
+    def _structured_remediation_hint(self) -> str:
+        """Return a concise remediation hint from the last structured response."""
+        response = self._last_structured_response
+        if not response:
+            return ""
+        return response.remediation_hint()
+
     def _compact_after_child_transition(
         self,
         target_id: str,
@@ -1455,8 +1500,16 @@ class RalphLoop:
 
             if not audit_text:
                 raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit; expected workItem.audit to contain the structured report.")
-            # Validate presence of the required header
+
+            structured_audit = None
             lines = [l.strip() for l in audit_text.splitlines() if l.strip()]
+            if not any(l.lower().startswith("ready to close:") for l in lines):
+                structured_audit = parse_structured_response(audit_text)
+                if structured_audit:
+                    audit_text = structured_audit.render()
+                    self._last_structured_response = structured_audit
+                    lines = [l.strip() for l in audit_text.splitlines() if l.strip()]
+
             if not any(l.lower().startswith("ready to close:") for l in lines):
                 excerpt = audit_text.strip().replace("\n", " ")[:200]
                 raise RalphError(f"No 'Ready to close:' header found in persisted audit for {focus_id}. Excerpt: {excerpt}")
@@ -1484,6 +1537,15 @@ class RalphLoop:
                 }
 
             remediation = _build_remediation_prompt()
+            structured_hint = self._structured_remediation_hint()
+            if structured_hint:
+                remediation = "\n\n".join([remediation, structured_hint])
+                logger.info(
+                    "ralph.loop.remediate.structured target=%s attempt=%d actions=%d",
+                    focus_id,
+                    attempt,
+                    len(self._last_structured_response.actions) if self._last_structured_response else 0,
+                )
             logger.info(
                 "ralph.loop.remediate target=%s attempt=%d unmet_count=%d",
                 focus_id, attempt, len(audit.unmet_or_partial),

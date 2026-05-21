@@ -212,6 +212,36 @@ def test_retry_path_uses_remediation_in_next_implement_prompt():
     assert "Address all the gaps identified in the audit" in implement_prompts[1]
 
 
+def test_structured_audit_actions_feed_next_remediation_prompt():
+    runner = FakeRunner()
+    structured_audit = json.dumps(
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "text": "Ready to close: No\n\n## Acceptance Criteria Status\n\n| # | Criterion | Verdict | Evidence |\n|---|-----------|---------|----------|\n| 1 | parser coverage | unmet | missing tests |",
+                "summary": "Need to add a regression test before closing.",
+                "actions": [
+                    {"command": "pytest", "args": ["tests/test_ralph_loop.py", "-q"]},
+                    {"command": "edit", "args": ["skill/ralph/scripts/ralph_loop.py"]},
+                ],
+            },
+        }
+    )
+    runner.audit_outputs = [structured_audit, AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    implement_prompts = [c[-1] for c in runner.calls if c[0] == "pi" and "-p" in c and c[-1].startswith("implement")]
+    assert len(implement_prompts) == 2
+    assert "Need to add a regression test before closing." in implement_prompts[1]
+    assert "pytest tests/test_ralph_loop.py -q" in implement_prompts[1]
+    assert "edit skill/ralph/scripts/ralph_loop.py" in implement_prompts[1]
+
+
 def test_cancel_file_stops_loop():
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
