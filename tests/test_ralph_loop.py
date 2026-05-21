@@ -362,6 +362,12 @@ def test_cli_parser_accepts_child_flag():
     assert args.child == "SA-CHILD"
 
 
+def test_cli_parser_accepts_debug_persist_flag():
+    parser = build_parser()
+    args = parser.parse_args(["SA-X4", "--debug-persist"])
+    assert args.debug_persist is True
+
+
 def test_main_returns_error_on_precondition_failure():
     from skill.ralph.scripts.ralph_loop import main
 
@@ -666,6 +672,50 @@ def test_stream_pi_verbose_logs_raw_json(capsys):
     finally:
         logger.setLevel(old_level)
         logger.removeHandler(handler)
+
+
+def test_debug_persist_writes_raw_payload_for_no_text_stream(tmp_path):
+    from unittest.mock import patch, MagicMock
+
+    fake_process = MagicMock()
+    fake_process.returncode = 0
+    fake_process.stdout = iter([
+        '{"type":"session","id":"session-123"}\n',
+        '{"type":"agent_start"}\n',
+        '{"type":"turn_start"}\n',
+        '{"type":"message_end","message":{"role":"assistant","content":[]}}\n',
+        '{"type":"agent_end","messages":[{"role":"assistant","content":[]}]}\n',
+    ])
+    fake_process.stderr = MagicMock()
+    fake_process.stderr.read.return_value = ""
+    fake_process.wait.return_value = None
+
+    with patch("skill.ralph.scripts.ralph_loop.tempfile.gettempdir", return_value=str(tmp_path)):
+        with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process):
+            loop = RalphLoop(verbose=False, stream=True, debug_persist=True)
+            loop.pi_bin = "pi"
+            loop._debug_context = {
+                "target_id": "SA-TARGET",
+                "focus_id": "SA-CHILD",
+                "child_id": "SA-CHILD",
+                "attempt": 4,
+            }
+            result = loop._run_pi("implement SA-CHILD")
+
+    assert result == ""
+    payload_dir = tmp_path / "ralph-payloads"
+    files = list(payload_dir.glob("*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text())
+    assert payload["metadata"]["reason"] == "no_text_extracted"
+    assert payload["metadata"]["target_id"] == "SA-TARGET"
+    assert payload["metadata"]["focus_id"] == "SA-CHILD"
+    assert payload["metadata"]["child_id"] == "SA-CHILD"
+    assert payload["metadata"]["attempt"] == 4
+    assert payload["metadata"]["model"] == "opencode-go/glm-5.1"
+    assert payload["metadata"]["session_id"] == "session-123"
+    assert "agent_end" in payload["raw_output"]
+    assert payload["truncated"] is False
 
 
 def test_run_pi_stream_mode_uses_ephemeral_sessions():

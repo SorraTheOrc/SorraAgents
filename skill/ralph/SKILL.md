@@ -24,6 +24,7 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 2. Run deterministic script locally:
 
    - Use `--child <id>` when you need to focus Ralph on a single direct child work item while keeping the parent as context.
+   - Use `--debug-persist` when you need to save raw Pi payloads for `no_text_extracted` debugging.
 
 Delegated `pi` and `wl` commands are logged before execution in both normal console output and `--json` output, so operators and automation can see the exact command Ralph ran.
 

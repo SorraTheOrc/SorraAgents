@@ -11,15 +11,16 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
-from datetime import datetime, timezone
-
-import time
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -30,6 +31,10 @@ from skill.test_runner import canonicalize_quiet_test_command
 logger = logging.getLogger("ralph")
 
 DEFAULT_MODEL = "opencode-go/glm-5.1"
+DEBUG_PAYLOAD_DIR_NAME = "ralph-payloads"
+DEBUG_PAYLOAD_MAX_BYTES = 1_000_000
+DEBUG_PAYLOAD_MAX_FILES = 200
+DEBUG_PAYLOAD_TTL_SECONDS = 7 * 24 * 60 * 60
 RALPH_CONFIG_FILES = [
     Path(".ralph.toml"),
     Path(".ralph.json"),
@@ -187,6 +192,86 @@ def _resolve_model(cli_model: str | None, config_model: str | None) -> str:
 
 def _render_command(cmd: Sequence[str]) -> str:
     return shlex.join(list(cmd))
+
+
+def _safe_filename_component(value: str | None, fallback: str = "unknown") -> str:
+    if not value:
+        return fallback
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
+    return cleaned or fallback
+
+
+def _extract_pi_session_id(raw_output: str) -> str | None:
+    for line in raw_output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "session":
+            continue
+        for key in ("id", "session_id", "sessionId"):
+            value = obj.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _prune_debug_payloads(payload_dir: Path) -> None:
+    try:
+        now = time.time()
+        files: list[Path] = []
+        for path in payload_dir.glob("*.json"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if now - stat.st_mtime > DEBUG_PAYLOAD_TTL_SECONDS:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                continue
+            files.append(path)
+        files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+        while len(files) > DEBUG_PAYLOAD_MAX_FILES:
+            path = files.pop(0)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    except OSError:
+        logger.debug("ralph.cmd.pi.debug_payload_prune_failed dir=%s", payload_dir)
+
+
+def _persist_debug_payload(raw_output: str, metadata: dict[str, object]) -> Path | None:
+    if not raw_output:
+        return None
+    payload_dir = Path(tempfile.gettempdir()) / DEBUG_PAYLOAD_DIR_NAME
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    _prune_debug_payloads(payload_dir)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    child_label = _safe_filename_component(str(metadata.get("child_id") or metadata.get("focus_id") or metadata.get("target_id")))
+    session_id = _extract_pi_session_id(raw_output)
+    payload = {
+        "metadata": {
+            **metadata,
+            "session_id": session_id,
+            "persisted_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "raw_output": raw_output[:DEBUG_PAYLOAD_MAX_BYTES],
+        "truncated": len(raw_output) > DEBUG_PAYLOAD_MAX_BYTES,
+    }
+    filename = f"{timestamp}-{child_label}.json"
+    tmp_path = payload_dir / f".{filename}.{os.getpid()}.tmp"
+    final_path = payload_dir / filename
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    os.replace(tmp_path, final_path)
+    return final_path
 
 
 def _build_remediation_prompt() -> str:
@@ -432,6 +517,7 @@ class RalphLoop:
         retry: int = 0,
         retry_delay: float = 0.0,
         fatal_cmds: list[str] | None = None,
+        debug_persist: bool = False,
     ):
         self.runner = runner or _default_runner
         self.pi_bin = pi_bin
@@ -468,6 +554,8 @@ class RalphLoop:
         # the effort-and-risk orchestrator returns None on failure rather than
         # raising an exception).
         self.non_fatal_by_default = {"effort_and_risk"}
+        self.debug_persist = debug_persist
+        self._debug_context: dict[str, object] = {}
 
     def _call_runner(self, cmd: Sequence[str], input_data: str | None = None) -> subprocess.CompletedProcess:
         """Invoke the configured runner in a consistent way.
@@ -683,9 +771,11 @@ class RalphLoop:
 
         text_parts: list[str] = []
         complete_blocks: list[str] = []
+        raw_output_parts: list[str] = []
         json_lines_seen = 0
         text_lines_seen = 0
         for line in process.stdout:
+            raw_output_parts.append(line)
             stripped = line.rstrip("\n")
             if not stripped:
                 continue
@@ -744,6 +834,22 @@ class RalphLoop:
                 "pi produced JSON but no user-facing text content was found",
                 json_lines_seen,
             )
+            if self.debug_persist:
+                persisted_path = _persist_debug_payload(
+                    "".join(raw_output_parts),
+                    {
+                        **self._debug_context,
+                        "reason": "no_text_extracted",
+                        "model": self.model,
+                        "command": list(cmd),
+                        "returncode": process.returncode,
+                        "json_lines_seen": json_lines_seen,
+                        "text_lines_seen": text_lines_seen,
+                        "stream": True,
+                    },
+                )
+                if persisted_path:
+                    logger.info("ralph.cmd.pi.debug_payload_saved path=%s", persisted_path)
         elif json_lines_seen > 0 and len(full_text) < 50 and not complete_blocks:
             logger.warning(
                 "ralph.cmd.pi.very_short_text json_lines=%d text_len=%d — "
@@ -1230,6 +1336,12 @@ class RalphLoop:
                 }
 
             logger.info("ralph.loop.attempt.start target=%s attempt=%d", focus_id, attempt)
+            self._debug_context = {
+                "target_id": target_id,
+                "focus_id": focus_id,
+                "child_id": child_id,
+                "attempt": attempt,
+            }
 
             # Whether we will rely on a persisted audit without invoking the audit skill
             use_persisted_audit = False
@@ -1394,6 +1506,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirm-merge", action="store_true", help="Execute merge/push steps after successful audit")
     parser.add_argument("--cancel-file", default=None, help="Path checked each attempt; if present, stop loop")
     parser.add_argument("--child", default=None, help="Run the loop focused on a direct child work-item instead of the positional target")
+    parser.add_argument("--debug-persist", action="store_true", help="Persist raw Pi payloads when a streamed run produces no user-facing text")
     parser.add_argument("--quiet", action="store_true", help="Suppress console progress output and pi streaming (only print final JSON result)")
     parser.add_argument("--verbose", action="store_true", help="Show detailed delegation commands and subprocess output")
     parser.add_argument("--no-stream", action="store_true", help="Don't stream pi subprocess output to console (use buffered capture instead)")
@@ -1457,6 +1570,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         retry=args.retry,
         retry_delay=args.retry_delay,
         fatal_cmds=args.fatal_cmd,
+        debug_persist=args.debug_persist,
     )
     loop.no_autoplan = args.no_autoplan
     try:
