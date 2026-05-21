@@ -191,6 +191,7 @@ def test_create_issue_uses_template_sections(monkeypatch):
     assert "test_tpl" in body
     assert "deadbeef" in body
     assert "test-owner" in body
+    assert "pytest -q -r a --disable-warnings -k test_tpl" in body
 
 
 # ---------------------------------------------------------------------------

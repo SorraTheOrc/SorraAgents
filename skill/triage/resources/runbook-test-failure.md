@@ -49,7 +49,7 @@ AttributeError: 'NoneType' object has no attribute 'send_heartbeat'
 ## Steps To Reproduce
 
 1. Checkout the commit: git checkout abc1234
-2. Run the failing test: pytest -k \"test_scheduler_heartbeat\" -q
+2. Run the failing test: pytest -q -r a --disable-warnings -k \"test_scheduler_heartbeat\"
 3. Capture full logs and attach to the work item
 
 ## Impact

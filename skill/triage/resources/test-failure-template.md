@@ -17,7 +17,7 @@ Attach larger logs as links rather than inline when necessary.
 ## Steps To Reproduce
 
 1. Checkout the commit: `git checkout <commit-hash>`
-2. Run the failing test: `pytest -k "<test-name>" -q` (or equivalent command)
+2. Run the failing test: `pytest -q -r a --disable-warnings -k "<test-name>"` (or equivalent command)
 3. Capture full logs and attach to the work item
 
 ## Impact

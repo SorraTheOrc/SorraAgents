@@ -145,7 +145,13 @@ def test_accepts_in_progress_and_runs():
 def test_happy_path_success_with_merge_offer_not_executed_without_confirm():
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, check_cmds=["pytest -q"], max_attempts=2, confirm_merge=False)
+    loop = RalphLoop(
+        runner=runner,
+        stream=False,
+        check_cmds=["pytest -q -r a --disable-warnings"],
+        max_attempts=2,
+        confirm_merge=False,
+    )
 
     result = loop.run("SA-TARGET")
 
@@ -352,7 +358,11 @@ class FakeRunnerWithCheckFailure(FakeRunner):
 def test_check_cmd_failure_raises_ralph_error():
     runner = FakeRunnerWithCheckFailure()
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, check_cmds=["pytest -q"])
+    loop = RalphLoop(
+        runner=runner,
+        stream=False,
+        check_cmds=["pytest -q -r a --disable-warnings"],
+    )
 
     with pytest.raises(RalphError, match="Check failed"):
         loop.run("SA-TARGET")
@@ -369,6 +379,25 @@ def test_audit_text_written_via_wl_update_is_not_called_by_ralph():
     # Ralph must not call wl update with --audit-text
     update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in c]
     assert update_calls == []
+
+
+def test_check_cmds_are_canonicalized_to_quiet_pytest():
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(
+        runner=runner,
+        stream=False,
+        check_cmds=["pytest tests/test_example.py"],
+    )
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    check_calls = [c[2] for c in runner.calls if c[:2] == ["bash", "-lc"]]
+    assert any(
+        call == "pytest -q -r a --disable-warnings tests/test_example.py"
+        for call in check_calls
+    )
 
 
 def test_verbose_mode_logs_pi_output_start():

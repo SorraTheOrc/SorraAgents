@@ -17,9 +17,17 @@ attach a comment to the most recent candidate and alert triage.
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from skill.test_runner import canonicalize_quiet_pytest_command
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +164,9 @@ def render_template(
     checkout_step = (
         f"git checkout {commit_hash}" if commit_hash else "git checkout <commit-hash>"
     )
+    quiet_test_cmd = canonicalize_quiet_pytest_command(
+        f"pytest -k {shlex.quote(test_name)}"
+    )
 
     return f"""## Failure Signature
 
@@ -174,7 +185,7 @@ def render_template(
 ## Steps To Reproduce
 
 1. Checkout the commit: `{checkout_step}`
-2. Run the failing test: `pytest -k "{test_name}" -q` (or equivalent command)
+2. Run the failing test: `{quiet_test_cmd}` (or equivalent command)
 3. Capture full logs and attach to the work item
 
 ## Impact
