@@ -21,7 +21,7 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 ## Behavior
 
 1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id or abort, except for `ralph status`, which intentionally runs without a work-item id.
-2. Run the deterministic loop in the background under `nohup` so the caller is free to keep working.
+2. Run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`.
 3. Use `ralph status` to inspect the current background run without needing the original work-item id.
 
 For direct foreground debugging, run the script locally:
@@ -33,10 +33,8 @@ Delegated `pi` and `wl` commands are logged before execution in both normal cons
 
 
 ```bash
-# Run the ralph orchestrator from the skill installation so it works
-# regardless of the current working directory. Use the skill-installed
-# path (expand ~ in shell):
-# Preferred: use the executable wrapper that is safe to invoke from any CWD
+# Launch a background Ralph run from the skill installation.
+# The wrapper handles nohup plus PID/start-time capture for status reporting.
 /home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --json
 
 # Inspect the current background run (no work item id required):
@@ -66,6 +64,4 @@ When the operator runs `ralph status`, keep the report brief and focused on esse
 4. Include any other essential information only if it materially helps the operator understand the current run.
 
 Keep any remembered values needed for status reporting, such as issue counts and the last log cursor, in the control-loop context. Do not persist them between runs.
-
-When launching the script for a Ralph run, use `nohup` and capture the start time and PID so `ralph status` can report them later.
 
