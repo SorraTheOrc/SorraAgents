@@ -631,7 +631,9 @@ class RalphLoop:
 
 
     def _run_pi(self, prompt: str) -> str:
-        cmd = [self.pi_bin, "-p", "--mode", "json", "--model", self.model, prompt]
+        # Use an ephemeral session for each orchestration call so nested or
+        # retried runs never attempt to continue a previous assistant turn.
+        cmd = [self.pi_bin, "-p", "--no-session", "--mode", "json", "--model", self.model, prompt]
         logger.debug("ralph.cmd.pi.run model=%s prompt_len=%d", self.model, len(prompt))
         if self.verbose:
             logger.debug("ralph.cmd.pi.run prompt_full=\n%s", prompt)
