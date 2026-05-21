@@ -5,7 +5,7 @@ description: "Run an iterative implement→audit loop for a target work item unt
 
 # Ralph
 
-Use this skill when the operator asks to run `ralph <work-item-id>`.
+Use this skill when the operator asks to run `ralph <work-item-id>` or `ralph status`.
 
 ## Command invocation and ID detection
 
@@ -16,11 +16,11 @@ The skill accepts a work-item id provided inline in the user's command. Supporte
 - `run ralph <WORKITEM>`
 - `ralph loop <WORKITEM>`
 
-A work-item id is any short token matching the Worklog id pattern used in your environment (for example `WL-1234`, `CG-0MP12H40Q003Y7OU`, or an 8+ char identifier). When an id is present in the command the skill will use it and will not prompt for an id. If no id is detected the skill will ask the operator to provide one (or permission to create one).
+A work-item id is any short token matching the Worklog id pattern used in your environment (for example `WL-1234`, `CG-0MP12H40Q003Y7OU`, or an 8+ char identifier). When an id is present in the command the skill will use it and will not prompt for an id. If no id is detected, the skill will ask the operator to provide one or abort, except for `ralph status`, which is an intentional no-id exception.
 
 ## Behavior
 
-1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id (or permission to create one).
+1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id (or permission to create one), except for `ralph status`, which intentionally runs without a work-item id.
 2. Launch the deterministic loop in the background under `nohup` so the caller is free to keep working.
 3. Use `ralph status` to inspect the current background run without needing the original work-item id.
 4. Run deterministic script locally:
