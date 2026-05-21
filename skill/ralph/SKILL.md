@@ -54,27 +54,18 @@ Delegated `pi` and `wl` commands are logged before execution in both normal cons
 # python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id> --json
 ```
 
-## Auto-Plan Decision
+See `docs/ralph.md` and `ralph --help` for full details of the features available.
 
-When the target work item is at stage `intake_complete`, ralph automatically runs an **auto-plan** decision before the first implementation pass:
+## Ralph Status
 
-1. **Evaluate effort and risk**: ralph calls the `effort-and-risk` skill to compute the effort t-shirt size and risk level.
-2. **Threshold check**:
-   - If effort is **Extra Small** or **Small** AND risk is **Low** → skip `/plan` and proceed directly to implementation.
-   - If effort or risk exceed these thresholds → invoke `/plan <id>` before implementation. Ralph invokes `/plan` via the Pi agent runtime (using the `pi` binary and `/skill:plan <id>`), so planning runs inside the agent framework with the configured model. This differs from engine-level `opencode run "/plan <id>"` dispatch.
-   - If the effort-and-risk skill fails → default to running `/plan` (safety-first).
-3. **Idempotence**: If effort/risk are already computed or a decision comment exists, ralph skips re-computation and uses the stored values.
-4. **Decision comment**: ralph posts a human-readable comment documenting the auto-plan decision.
+When the operator runs `ralph status`, keep the report brief and focused on essentials:
 
-Use `--no-autoplan` to disable this step and proceed directly to implementation.
-Use `--autoplan-effort-skip` and `--autoplan-risk-skip` to customize the thresholds.
+1. Check whether the PID is still active and report how long the run has been operating.
+2. Review the logs since the last status update and summarize the work completed.
+3. Count the work items and children in the Ralph scope, grouped by Worklog `status`, and report the totals plus deltas since the last status report.
+4. Include any other essential information only if it materially helps the operator understand the current run.
 
-When you supply `--check-cmd`, use quiet test mode by default:
-`pytest -q -r a --disable-warnings`
+Keep any remembered values needed for status reporting, such as issue counts and the last log cursor, in the control-loop context. Do not persist them between runs.
 
-Non-pytest test runners should be invoked in quiet form, for example `npm --silent test`.
-
-For deeper debugging, the shared test-runner helper can add `--showlocals`.
-
-See `docs/ralph.md` for full details.
+When launching the script for a Ralph run, use `nohup` and capture the start time and PID so `ralph status` can report them later.
 
