@@ -21,12 +21,13 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 ## Behavior
 
 1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id (or permission to create one), except for `ralph status`, which intentionally runs without a work-item id.
-2. Launch the deterministic loop in the background under `nohup` so the caller is free to keep working.
+2. Run the deterministic loop in the background under `nohup` so the caller is free to keep working.
 3. Use `ralph status` to inspect the current background run without needing the original work-item id.
-4. Run deterministic script locally:
 
-   - Use `--child <id>` when you need to focus Ralph on a single direct child work item while keeping the parent as context.
-   - Use `--debug-persist` when you need to save raw Pi payloads for `no_text_extracted` debugging.
+For direct foreground debugging, run the script locally:
+
+- Use `--child <id>` when you need to focus Ralph on a single direct child work item while keeping the parent as context.
+- Use `--debug-persist` when you need to save raw Pi payloads for `no_text_extracted` debugging.
 
 Delegated `pi` and `wl` commands are logged before execution in both normal console output and `--json` output, so operators and automation can see the exact command Ralph ran.
 
