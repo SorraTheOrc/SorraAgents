@@ -42,6 +42,52 @@ python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-i
 | `--no-autoplan` | off | Disable the auto-plan step for `intake_complete` items. When set, ralph proceeds directly to implementation without running effort-and-risk evaluation. |
 | `--autoplan-effort-skip` | Extra Small, Small | T-shirt effort sizes that allow skipping `/plan`. Accepts multiple space-separated values. |
 | `--autoplan-risk-skip` | Low | Risk levels that allow skipping `/plan`. Accepts multiple space-separated values. |
+| `--fail-open` | off | Continue on delegated command failures (non-fatal) when possible. When set, ralph will log failures from delegated tools and continue unless the failing command's category is marked fatal (see `--fatal-cmd`). Default behaviour is fail-fast. |
+| `--retry` | 0 | Number of additional retries for delegated commands on failure. Retries occur before deciding to fail or continue. |
+| `--retry-delay` | 1.0 | Delay (seconds) between retry attempts. |
+| `--fatal-cmd` | (none) | Repeatable. Command categories to treat as fatal even when `--fail-open` is set. Examples: `merge`, `pi`, `check`, `wl`, `effort_and_risk`. Default fatal categories are `merge`, `check`, and `pi`. |
+
+### Delegated command fail-open & retry
+
+Ralph delegates many subprocess commands (worklog `wl` calls, `pi` runs, `git` operations, shell `bash` checks, and skill orchestrators such as the effort-and-risk orchestrator). Transient failures (network blips, temporary permission errors, flaky tooling) can cause the loop to abort. The new fail-open & retry flags allow opt-in, configurable behaviour to make automation more resilient.
+
+Key flags
+
+- `--fail-open` — opt-in; when set, ralph will log delegated command failures and continue the loop where safe instead of raising immediately. Default is fail-fast.
+- `--retry N` — number of additional retry attempts for delegated commands on failure (default: `0`). Retries are attempted before deciding to fail or continue.
+- `--retry-delay S` — delay in seconds between retry attempts (default: `1.0`).
+- `--fatal-cmd` — repeatable; mark a command category as *fatal* even when `--fail-open` is set. Example categories: `merge`, `pi`, `check`, `wl`, `effort_and_risk`.
+
+Behaviour
+
+- Fail-fast by default: without `--fail-open`, ralph preserves previous behaviour and raises on delegated command failures.
+- When `--fail-open` is enabled, ralph will only treat failures as non-fatal for categories *not* marked fatal. The default fatal categories are `merge`, `check`, and `pi` — these remain fatal to avoid unsafe merges and surface real problems.
+- `wl` (worklog) calls are non-fatal by default to tolerate transient worklog or network errors; you can make them fatal via `--fatal-cmd wl`.
+- The `effort_and_risk` orchestrator is treated specially: it is non-fatal by default and, on failure, Ralph defaults to invoking `/plan` (safety-first). This preserves existing autoplan behaviour.
+- Retries: when a delegated command fails, ralph will re-run it up to `--retry` times (i.e., initial attempt + `--retry` additional attempts) with `--retry-delay` seconds between attempts. If retries are exhausted, the usual fail-open/fatal decision is applied.
+
+Examples
+
+- Continue on transient failures and retry twice with a 2-second delay:
+
+```bash
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --fail-open --retry 2 --retry-delay 2
+```
+
+- Treat `wl` as fatal even when using `--fail-open`:
+
+```bash
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --fail-open --fatal-cmd wl
+```
+
+Guidance
+
+- Use `--fail-open` for long-running automation where occasional delegated command failures are expected (CI flakiness, occasional network hiccups). Keep `merge` and `check` fatal unless you explicitly want to allow merges to proceed even when checks fail.
+- Use `--retry` conservatively (1-3) to avoid long delays; combine with a moderate `--retry-delay` for transient external errors.
+
+Testing
+
+- Unit and integration tests were added under `skill/ralph/tests/` to validate retry and fail-open semantics.
 
 ### Preconditions
 
