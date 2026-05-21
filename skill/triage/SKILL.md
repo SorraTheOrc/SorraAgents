@@ -49,6 +49,7 @@ Behavior
 --------
 - Prefer conservative matches: if any incomplete (open or in_progress) `test-failure` issue matches via the heuristics above, return the existing issue id.
 - If no match is found, create a new `critical` work item using the template (with all required sections), infer the suspected owner via the owner-inference skill, and return the new id.
+- When reproducing a failure locally, prefer the quiet project command or the shared quiet test helper (for example `pytest -q -r a --disable-warnings` or `npm --silent test`) so passing output stays minimal.
 - When enhancing an existing issue, do not overwrite existing fields — add a comment with new evidence instead.
 
 Telemetry

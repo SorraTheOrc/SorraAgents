@@ -131,10 +131,11 @@ The command implements the procedural workflow below. Each numbered step is part
 
 8. Discover and run the repository test suite (agent responsibility)
 
-  - Read the README to establish the test commands used in the project
-    - If necessary detect common test commands 
+  - Read the README to establish the test commands used in the project.
+    - Prefer the project's shared quiet test helper or quiet project commands when constructing the test command.
+    - If necessary detect common test commands, then normalize them to quiet mode before execution.
   - Run tests inside the claimed container, capturing full output and a short pass/fail summary (do not use --login.-l):
-    - `test_output=$(distrobox enter "$container" -- bash -c 'cd /workdir/project && . /etc/ampa_bashrc && <test-command>' 2>&1)`
+    - `test_output=$(distrobox enter "$container" -- bash -c 'cd /workdir/project && . /etc/ampa_bashrc && <quiet-test-command>' 2>&1)`
   - If tests are long-running or flaky, consider running them with a timeout and capturing only the failing tests for the summary.
   - Do not post any details of the test output in comments, we will only summarize the outcome in the final review comment and the Worklog item.
   - Capture any critical test failures as structured data for the final summary, but do not post them directly in comments.

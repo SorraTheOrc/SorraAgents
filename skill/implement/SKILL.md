@@ -133,7 +133,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - If additional work is discovered, create linked work items: `wl create "<title>" --deps discovered-from:<work-item-id> --json`
 - Once all acceptance criteria for the primary work item and all blockers and dependents are met:
   - Build the project and verify the build completes without errors.
-  - Run the entire test suite.
+  - Run the entire test suite using the shared quiet test helper or the project's quiet test command.
     - Report the reults
     - Fix any failing tests before continuing.
     - If the test run discovers failing tests that appear to be outside the scope or ownership of the current work item (e.g., failures in files not modified by this branch), invoke the triage helper to search or create a critical test-failure issue:
@@ -147,12 +147,12 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 4. Automated self-review
 
 - Build and lint the code to catch basic issues, fix any issues raised before proceeding.
-- Run all tests again to ensure nothing is broken, fix any failing tests before proceeding.
+- Run all tests again using quiet test commands to ensure nothing is broken, fix any failing tests before proceeding.
 - Audit the work item to confirm all acceptance criteria are met: `audit <work-item-id> using the audit skill`.
   - If the audit reveals any unmet acceptance criteria, inform the user of the findings and return to step 3 to address them.
 - Perform sequential self-review passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff.
 - For each pass, produce a short note and limit edits to small, goal-aligned changes. If intent changes are discovered, create an Open Question and stop automated edits.
-- Run the entire test suite.
+- Run the entire test suite using the shared quiet test helper or quiet project commands.
   - Fix any failing tests before continuing.
 
 5. Commit, Push and create PR

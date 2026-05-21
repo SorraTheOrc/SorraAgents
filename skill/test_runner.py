@@ -92,8 +92,8 @@ def canonicalize_quiet_test_command(command: str, *, show_locals: bool = False) 
     If ``show_locals`` is true, ``--showlocals`` is added as an additional
     debugging aid.
 
-    Non-pytest test commands such as ``npm test`` are normalized to a quiet
-    variant when supported by the package manager.
+    Non-pytest test commands are normalized to a quiet variant when supported
+    by the package manager.
 
     Non-test commands are returned unchanged.
     """

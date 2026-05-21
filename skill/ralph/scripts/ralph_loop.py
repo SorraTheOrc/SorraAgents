@@ -1263,7 +1263,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Ralph implement→audit orchestration loop")
     parser.add_argument("work_item_id", help="Target Worklog item id")
     parser.add_argument("--max-attempts", type=int, default=10)
-    parser.add_argument("--check-cmd", action="append", default=[], help="Build/test command to run on success; pytest and npm test commands are normalized to quiet mode")
+    parser.add_argument("--check-cmd", action="append", default=[], help="Build/test command to run on success; test commands are normalized to quiet mode")
     parser.add_argument("--confirm-merge", action="store_true", help="Execute merge/push steps after successful audit")
     parser.add_argument("--cancel-file", default=None, help="Path checked each attempt; if present, stop loop")
     parser.add_argument("--quiet", action="store_true", help="Suppress console progress output and pi streaming (only print final JSON result)")

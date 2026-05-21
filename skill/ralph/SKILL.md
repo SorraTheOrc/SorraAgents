@@ -62,7 +62,7 @@ Use `--autoplan-effort-skip` and `--autoplan-risk-skip` to customize the thresho
 When you supply `--check-cmd`, use quiet test mode by default:
 `pytest -q -r a --disable-warnings`
 
-Non-pytest test runners such as `npm test` are normalized to a quiet variant (`npm --silent test`).
+Non-pytest test runners should be invoked in quiet form, for example `npm --silent test`.
 
 For deeper debugging, the shared test-runner helper can add `--showlocals`.
 

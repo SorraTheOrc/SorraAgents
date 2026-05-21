@@ -34,7 +34,7 @@ You are implementing a Worklog work item identified by a provided id. You will f
 
 - Use `wl` for ALL task tracking; do not create markdown TODOs.
 - Keep changes between `git push` invocations minimal and scoped to the work item.
-- Always build the project and run all tests before committing changes. Follow the mandatory build → test → commit order: build first and verify no errors, then run all tests and verify they pass, and only then commit. Never commit before verifying that the build and tests pass.
+- Always build the project and run all tests before committing changes. Follow the mandatory build → test → commit order: build first and verify no errors, then run all tests and verify they pass, and only then commit. Use the shared quiet test helper or quiet project commands for those test runs so passing output stays minimal. Never commit before verifying that the build and tests pass.
 - Use a git branch + PR workflow (no direct-to-main changes).
 - Ensure the working branch is pushed to `origin` before finishing.
 - Do NOT close the Worklog work item until the PR is merged.
