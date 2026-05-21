@@ -1,11 +1,13 @@
 ---
 name: ralph
-description: "Run an iterative implement→audit loop for a target work item until scope reaches in_review and audit passes."
+description: "Run an iterative implement→audit loop for a target work item. Ralph is a launcher/orchestrator, not the normal Worklog implementation workflow."
 ---
 
 # Ralph
 
 Use this skill when the operator asks to run `ralph <work-item-id>` or `ralph status`.
+
+When invoked as `ralph <work-item-id>`, do not perform general Worklog discovery or planning steps before launching the Ralph loop. Only inspect work items when the operator explicitly asks for diagnostics or when the launch fails and you need to debug the failure.
 
 ## Command invocation and ID detection
 
@@ -21,12 +23,13 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 ## Behavior
 
 1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id or abort, except for `ralph status`, which intentionally runs without a work-item id.
-2. Run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`.
-3. Use `ralph status` to inspect the current background run without needing the original work-item id.
+2. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`.
+3. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
+4. Use `ralph status` to inspect the current background run without needing the original work-item id.
 
 For direct foreground debugging, run the script locally:
 
-- Use `--child <id>` when you need to focus Ralph on a single direct child work item while keeping the parent as context.
+- Use `--child <id>` only when you explicitly want to focus Ralph on a single direct child work item while keeping the parent as context.
 - Use `--debug-persist` when you need to save raw Pi payloads for `no_text_extracted` debugging.
 
 Delegated `pi` and `wl` commands are logged before execution in both normal console output and `--json` output, so operators and automation can see the exact command Ralph ran.
@@ -62,6 +65,7 @@ When the operator runs `ralph status`, keep the report brief and focused on esse
 2. Review the logs since the last status update and summarize the work completed.
 3. Count the work items and children in the Ralph scope, grouped by Worklog `status`, and report the totals plus deltas since the last status report.
 4. Include any other essential information only if it materially helps the operator understand the current run.
+5. Do not require a work-item id for status, and do not perform broader Worklog inspection unless the operator asks for it.
 
 Keep any remembered values needed for status reporting, such as issue counts and the last log cursor, in the control-loop context. Do not persist them between runs.
 
