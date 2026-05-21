@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shlex
 
-from skill.test_runner import canonicalize_quiet_pytest_command
+from skill.test_runner import canonicalize_quiet_pytest_command, canonicalize_quiet_test_command
 
 
 def test_canonicalize_quiet_pytest_command_adds_required_flags() -> None:
@@ -36,5 +36,9 @@ def test_canonicalize_quiet_pytest_command_supports_showlocals() -> None:
     ]
 
 
-def test_canonicalize_quiet_pytest_command_leaves_non_pytest_commands() -> None:
-    assert canonicalize_quiet_pytest_command("npm test") == "npm test"
+def test_canonicalize_quiet_test_command_adds_npm_silent() -> None:
+    assert canonicalize_quiet_test_command("npm test") == "npm --silent test"
+
+
+def test_canonicalize_quiet_test_command_leaves_non_test_commands() -> None:
+    assert canonicalize_quiet_test_command("npm run build") == "npm run build"

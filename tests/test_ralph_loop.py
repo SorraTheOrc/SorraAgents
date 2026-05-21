@@ -400,6 +400,22 @@ def test_check_cmds_are_canonicalized_to_quiet_pytest():
     )
 
 
+def test_check_cmds_are_canonicalized_to_quiet_npm_test():
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(
+        runner=runner,
+        stream=False,
+        check_cmds=["npm test"],
+    )
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    check_calls = [c[2] for c in runner.calls if c[:2] == ["bash", "-lc"]]
+    assert any(call == "npm --silent test" for call in check_calls)
+
+
 def test_verbose_mode_logs_pi_output_start():
     """Verbose=True causes DEBUG-level logs for pi run stdout."""
     import logging

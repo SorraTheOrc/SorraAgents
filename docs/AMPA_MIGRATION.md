@@ -79,7 +79,7 @@ If you were developing AMPA:
 3. **Test your changes**:
    ```bash
    # In the AMPA repository
-   npm test  # or equivalent test command
+   npm --silent test  # or equivalent quiet test command
    ```
 
 4. **Re-install to test locally**:
@@ -125,7 +125,7 @@ git clone https://github.com/opencode/ampa.git
 **Solution**: AMPA tests have moved to the AMPA repository. Run them there:
 ```bash
 cd ~/ampa  # or wherever you cloned it
-npm test
+npm --silent test
 ```
 
 ## For Contributors

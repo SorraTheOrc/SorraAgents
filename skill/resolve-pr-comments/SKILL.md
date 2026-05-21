@@ -173,7 +173,7 @@ Before committing, follow the mandatory build → test → commit order: build t
 npm run build  # or the project's build command
 
 # Then run all tests
-npm test  # or the project's test command
+npm --silent test  # or the project's quiet test command
 
 # Only commit after build and tests pass
 git add <modified_files>

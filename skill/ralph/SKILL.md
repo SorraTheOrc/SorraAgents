@@ -59,8 +59,10 @@ When the target work item is at stage `intake_complete`, ralph automatically run
 Use `--no-autoplan` to disable this step and proceed directly to implementation.
 Use `--autoplan-effort-skip` and `--autoplan-risk-skip` to customize the thresholds.
 
-When you supply `--check-cmd`, use quiet pytest mode by default:
+When you supply `--check-cmd`, use quiet test mode by default:
 `pytest -q -r a --disable-warnings`
+
+Non-pytest test runners such as `npm test` are normalized to a quiet variant (`npm --silent test`).
 
 For deeper debugging, the shared test-runner helper can add `--showlocals`.
 

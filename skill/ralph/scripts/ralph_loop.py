@@ -25,7 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.test_runner import canonicalize_quiet_pytest_command
+from skill.test_runner import canonicalize_quiet_test_command
 
 logger = logging.getLogger("ralph")
 
@@ -651,7 +651,7 @@ class RalphLoop:
 
     def _run_checks(self) -> None:
         for cmd in self.check_cmds:
-            quiet_cmd = canonicalize_quiet_pytest_command(cmd)
+            quiet_cmd = canonicalize_quiet_test_command(cmd)
             logger.debug("ralph.cmd.check cmd=%s quiet_cmd=%s", cmd, quiet_cmd)
             proc = self._call_with_retry(["bash", "-lc", quiet_cmd], category="check", expect_json=False)
             if self.verbose:
@@ -1263,7 +1263,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Ralph implement→audit orchestration loop")
     parser.add_argument("work_item_id", help="Target Worklog item id")
     parser.add_argument("--max-attempts", type=int, default=10)
-    parser.add_argument("--check-cmd", action="append", default=[], help="Build/test command to run on success; pytest commands are normalized to quiet mode")
+    parser.add_argument("--check-cmd", action="append", default=[], help="Build/test command to run on success; pytest and npm test commands are normalized to quiet mode")
     parser.add_argument("--confirm-merge", action="store_true", help="Execute merge/push steps after successful audit")
     parser.add_argument("--cancel-file", default=None, help="Path checked each attempt; if present, stop loop")
     parser.add_argument("--quiet", action="store_true", help="Suppress console progress output and pi streaming (only print final JSON result)")

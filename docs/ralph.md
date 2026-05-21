@@ -30,7 +30,7 @@ python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-i
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--max-attempts` | 10 | Maximum number of implement→audit cycles before giving up. |
-| `--check-cmd` | (none) | Build/test command(s) to run after a successful audit. Pytest commands are normalized to `pytest -q -r a --disable-warnings` by default. Can be specified multiple times. |
+| `--check-cmd` | (none) | Build/test command(s) to run after a successful audit. Pytest commands are normalized to `pytest -q -r a --disable-warnings` by default, and `npm test` is normalized to `npm --silent test`. Can be specified multiple times. |
 | `--confirm-merge` | off | Execute `git fetch`, `git merge --ff-only`, `git push` after successful audit and checks. **Without this flag, no merge side effects occur.** |
 | `--cancel-file` | (none) | Path checked each attempt; if the file exists, the loop stops with status `cancelled`. |
 | `--quiet` | off | Suppress all console output and pi streaming; only print the final JSON result. |
@@ -303,6 +303,12 @@ python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --ma
 
 ```bash
 python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --check-cmd "pytest -q -r a --disable-warnings" --confirm-merge
+```
+
+Quiet npm test in a sibling repo:
+
+```bash
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --check-cmd "npm test" --confirm-merge
 ```
 
 ### Run with cancellation support
