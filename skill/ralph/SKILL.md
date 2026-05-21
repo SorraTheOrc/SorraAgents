@@ -23,6 +23,8 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id (or permission to create one).
 2. Run deterministic script locally:
 
+   - Use `--child <id>` when you need to focus Ralph on a single direct child work item while keeping the parent as context.
+
 Delegated `pi` and `wl` commands are logged before execution in both normal console output and `--json` output, so operators and automation can see the exact command Ralph ran.
 
 Start-of-iteration audit skipping: When the target is already at stage `in_review`, Ralph will normally run a start-of-iteration audit. To avoid redundant audits, Ralph will skip invoking the audit skill at the start of the iteration if the most recent `# AMPA Audit Result` comment (across the target and all recursive descendants) has a `createdAt` timestamp that is equal to or newer than the most-recent `updatedAt` timestamp in the same scope. In that case Ralph will read the persisted audit from the work item and proceed without re-running the audit skill.
@@ -39,6 +41,9 @@ Accepting `in_progress`: Ralph now accepts work items in stage `in_progress` as 
 
 # Alternatively, run the script directly from the installed skill directory:
 # python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> --json
+#
+# To focus on a single direct child while keeping the parent for context:
+# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
 
 # If your skills are installed at a different location (for example a
 # project-level skills directory), run the script using the full path to

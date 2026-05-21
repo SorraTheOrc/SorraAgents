@@ -33,6 +33,7 @@ python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-i
 | `--check-cmd` | (none) | Build/test command(s) to run after a successful audit. Pytest commands are normalized to `pytest -q -r a --disable-warnings` by default, and package-manager test commands are normalized to quiet variants such as `npm --silent test`. Can be specified multiple times. |
 | `--confirm-merge` | off | Execute `git fetch`, `git merge --ff-only`, `git push` after successful audit and checks. **Without this flag, no merge side effects occur.** |
 | `--cancel-file` | (none) | Path checked each attempt; if the file exists, the loop stops with status `cancelled`. |
+| `--child` | (none) | Focus the loop on a single direct child work item. Ralph validates that the child belongs to the supplied target and then runs the loop against the child only. |
 | `--quiet` | off | Suppress all console output and pi streaming; only print the final JSON result. |
 | `--verbose` | off | Show detailed delegation commands, subprocess stdout/stderr, and raw audit output. |
 | `--no-stream` | off | Don't stream pi subprocess output to console (use buffered capture). Progress logging still shown. |

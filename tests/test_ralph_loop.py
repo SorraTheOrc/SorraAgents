@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 import json
-from skill.ralph.scripts.ralph_loop import JsonLineFormatter, RalphError, RalphLoop, parse_audit_report
+from skill.ralph.scripts.ralph_loop import JsonLineFormatter, RalphError, RalphLoop, build_parser, parse_audit_report
 
 
 @dataclass
@@ -76,18 +76,27 @@ class FakeRunner:
             # pi -p --mode json --model <model> <prompt>
             # Find the prompt: it's the last positional arg
             prompt = cmd[-1]
+
+            def prompt_target(default: str = "SA-TARGET") -> str:
+                first_line = prompt.splitlines()[0].strip() if prompt else ""
+                parts = first_line.split()
+                if len(parts) >= 2 and parts[0] in {"implement", "/skill:audit", "/skill:plan"}:
+                    return parts[1]
+                return default
+
             if prompt.startswith("/skill:audit"):
                 output = self.audit_outputs.pop(0)
+                target = prompt_target()
                 # Simulate the audit skill persisting the audit into the work item
-                self.items["SA-TARGET"]["audit"] = output
+                self.items.setdefault(target, {})["audit"] = output
                 return Result(stdout=output)
             if prompt.startswith("/skill:plan"):
                 # emulate plan moving target to plan_complete after plan call
-                self.items["SA-TARGET"]["stage"] = "plan_complete"
+                self.items.setdefault(prompt_target(), {})["stage"] = "plan_complete"
                 return Result(stdout="planned")
             if prompt.startswith("implement"):
                 # emulate implementation moving target to in_review after first implement call
-                self.items["SA-TARGET"]["stage"] = "in_review"
+                self.items.setdefault(prompt_target(), {})["stage"] = "in_review"
                 return Result(stdout="implemented")
             if prompt == "/compact":
                 if self.compact_failures_remaining > 0:
@@ -159,6 +168,23 @@ def test_happy_path_success_with_merge_offer_not_executed_without_confirm():
     assert result["merge_offered"] is True
     assert result["merge_executed"] is False
     assert not any(call[:2] == ["git", "push"] for call in runner.calls)
+
+
+def test_child_scoped_run_targets_only_requested_child():
+    runner = FakeRunner()
+    runner.items["SA-CHILD"]["stage"] = "plan_complete"
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run("SA-TARGET", child_id="SA-CHILD")
+
+    assert result["status"] == "success"
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    assert any(prompt.startswith("implement SA-CHILD") for prompt in pi_prompts)
+    assert any(prompt.startswith("/skill:audit SA-CHILD") for prompt in pi_prompts)
+    assert not any("SA-TARGET" in prompt for prompt in pi_prompts)
+    assert runner.items["SA-TARGET"]["audit"] == ""
+    assert runner.items["SA-CHILD"]["audit"] == AUDIT_PASS
 
 
 def test_pi_invocations_use_ephemeral_sessions():
@@ -325,11 +351,15 @@ def test_cli_parser_accepts_all_flags():
 
 
 def test_cli_parser_verbose_flag():
-    from skill.ralph.scripts.ralph_loop import build_parser
-
     parser = build_parser()
     args = parser.parse_args(["SA-X2", "--verbose"])
     assert args.verbose is True
+
+
+def test_cli_parser_accepts_child_flag():
+    parser = build_parser()
+    args = parser.parse_args(["SA-X3", "--child", "SA-CHILD"])
+    assert args.child == "SA-CHILD"
 
 
 def test_main_returns_error_on_precondition_failure():

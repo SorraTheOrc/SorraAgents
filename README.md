@@ -27,6 +27,17 @@ during compaction.
 Behavior, configuration options, and test references are documented in
 `docs/ralph-compaction-plugin.md`.
 
+## Ralph orchestration loop
+
+The repository also includes the Ralph implement→audit loop for Worklog items.
+See `docs/ralph.md` for the full command reference and operational guidance.
+
+A useful debugging pattern is to focus Ralph on a single direct child work item:
+
+```sh
+python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
+```
+
 ## Prerequisites
 
 The dev container commands (`wl ampa start-work`, `finish-work`, `list-containers`) require the following tools on the host:

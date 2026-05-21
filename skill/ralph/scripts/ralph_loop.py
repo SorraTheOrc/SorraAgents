@@ -1010,6 +1010,24 @@ class RalphLoop:
                 continue
         return scope
 
+    def _resolve_focus_target(self, target_id: str, child_id: str | None = None) -> str:
+        """Resolve the effective work item to run.
+
+        When `child_id` is provided, validate that it is a direct child of the
+        supplied target and then focus the loop on that child only.
+        """
+        if not child_id:
+            return target_id
+        if child_id == target_id:
+            return child_id
+
+        children = self._wl_show(target_id, children=True).get("children", [])
+        child_ids = {child.get("id") for child in children if isinstance(child, dict) and child.get("id")}
+        if child_id not in child_ids:
+            raise RalphError(f"Child {child_id} is not a direct child of {target_id}")
+        logger.info("ralph.loop.child_focus parent=%s child=%s", target_id, child_id)
+        return child_id
+
     def _parse_iso_ts(self, ts: str):
         """Parse an ISO-8601-ish timestamp into a timezone-aware datetime.
 
@@ -1180,15 +1198,16 @@ class RalphLoop:
 
         return invocations, failures
 
-    def run(self, target_id: str) -> dict:
-        self._assert_precondition(target_id)
-        scope_ids = self._scope_ids_recursive(target_id)
+    def run(self, target_id: str, child_id: str | None = None) -> dict:
+        focus_id = self._resolve_focus_target(target_id, child_id)
+        self._assert_precondition(focus_id)
+        scope_ids = self._scope_ids_recursive(focus_id)
 
         # If the target is already in_review, skip the first implement pass and
         # go straight to audit. If a persisted audit comment shows the scope is
         # up-to-date, we can skip invoking the audit skill at the start of the
         # iteration and instead rely on the persisted audit.
-        target_item = self._wl_show(target_id).get("workItem", {})
+        target_item = self._wl_show(focus_id).get("workItem", {})
         target_stage = target_item.get("stage", "unknown")
         skip_implement = target_stage == "in_review"
         remediation = ""
@@ -1196,13 +1215,13 @@ class RalphLoop:
         compact_failures = 0
 
         logger.info(
-            "ralph.loop.start target=%s scope=%s max_attempts=%d skip_implement=%s",
-            target_id, scope_ids, self.max_attempts, skip_implement,
+            "ralph.loop.start target=%s focus=%s scope=%s max_attempts=%d skip_implement=%s",
+            target_id, focus_id, scope_ids, self.max_attempts, skip_implement,
         )
 
         for attempt in range(1, self.max_attempts + 1):
             if self.cancel_file and os.path.exists(self.cancel_file):
-                logger.info("ralph.loop.cancelled target=%s attempt=%d", target_id, attempt)
+                logger.info("ralph.loop.cancelled target=%s attempt=%d", focus_id, attempt)
                 return {
                     "status": "cancelled",
                     "attempt": attempt,
@@ -1210,7 +1229,7 @@ class RalphLoop:
                     "compact": {"invocations": compact_invocations, "failures": compact_failures},
                 }
 
-            logger.info("ralph.loop.attempt.start target=%s attempt=%d", target_id, attempt)
+            logger.info("ralph.loop.attempt.start target=%s attempt=%d", focus_id, attempt)
 
             # Whether we will rely on a persisted audit without invoking the audit skill
             use_persisted_audit = False
@@ -1219,97 +1238,97 @@ class RalphLoop:
                 # Auto-plan step: evaluate effort/risk and decide whether
                 # to invoke /plan or proceed directly to implement.
                 try:
-                    do_plan, new_stage = self._run_autoplan(target_id)
+                    do_plan, new_stage = self._run_autoplan(focus_id)
                     if new_stage == "plan_complete":
                         target_stage = "plan_complete"
                 except RalphError:
                     raise
                 except Exception:
-                    logger.exception("ralph.loop.autoplan.unexpected target=%s", target_id)
+                    logger.exception("ralph.loop.autoplan.unexpected target=%s", focus_id)
                 # After autoplan (whether plan ran or not), proceed to implement
                 prompt_parts = [
-                    f"implement {target_id}",
+                    f"implement {focus_id}",
                     "Continue until the work item and all dependencies are completed, but do not merge.",
                 ]
                 # Add a short remediation instruction if an audit produced unmet criteria previously
                 if remediation:
                     prompt_parts.append(remediation)
                 try:
-                    previous_child_stages = self._child_stage_map(target_id)
+                    previous_child_stages = self._child_stage_map(focus_id)
                 except Exception as exc:
                     logger.warning(
                         "ralph.compact.pre_snapshot_failed target=%s attempt=%d error=%s",
-                        target_id,
+                        focus_id,
                         attempt,
                         exc,
                     )
                     previous_child_stages = {}
                 self._run_pi("\n".join(prompt_parts))
-                invocations, failures = self._compact_after_child_transition(target_id, previous_child_stages, attempt)
+                invocations, failures = self._compact_after_child_transition(focus_id, previous_child_stages, attempt)
                 compact_invocations += invocations
                 compact_failures += failures
                 if invocations or failures:
                     logger.info(
                         "ralph.compact.metrics target=%s attempt=%d compact.invocations=%d compact.failures=%d",
-                        target_id,
+                        focus_id,
                         attempt,
                         compact_invocations,
                         compact_failures,
                     )
             elif skip_implement and attempt == 1:
                 # Target already in_review — decide whether start-of-iteration audit is needed
-                logger.info("ralph.loop.skip_implement target=%s stage=in_review", target_id)
+                logger.info("ralph.loop.skip_implement target=%s stage=in_review", focus_id)
                 try:
                     latest_comment_ts = self._latest_audit_comment_ts_for_scope(scope_ids)
                     max_updated_at = self._max_updated_at_for_scope(scope_ids)
                     if latest_comment_ts and max_updated_at and latest_comment_ts >= max_updated_at:
                         logger.info(
                             "ralph.loop.audit.skipping_start target=%s latest_comment_ts=%s max_updated_at=%s",
-                            target_id, latest_comment_ts.isoformat(), max_updated_at.isoformat()
+                            focus_id, latest_comment_ts.isoformat(), max_updated_at.isoformat()
                         )
                         use_persisted_audit = True
                 except Exception:
-                    logger.exception("ralph.loop.pre_audit_check_failed target=%s", target_id)
+                    logger.exception("ralph.loop.pre_audit_check_failed target=%s", focus_id)
             else:
                 prompt_parts = [
-                    f"implement {target_id}",
+                    f"implement {focus_id}",
                     "Continue until the work item and all dependencies are completed, but do not merge.",
                 ]
                 if remediation:
                     prompt_parts.append(remediation)
                 try:
-                    previous_child_stages = self._child_stage_map(target_id)
+                    previous_child_stages = self._child_stage_map(focus_id)
                 except Exception as exc:
                     logger.warning(
                         "ralph.compact.pre_snapshot_failed target=%s attempt=%d error=%s",
-                        target_id,
+                        focus_id,
                         attempt,
                         exc,
                     )
                     previous_child_stages = {}
                 self._run_pi("\n".join(prompt_parts))
-                invocations, failures = self._compact_after_child_transition(target_id, previous_child_stages, attempt)
+                invocations, failures = self._compact_after_child_transition(focus_id, previous_child_stages, attempt)
                 compact_invocations += invocations
                 compact_failures += failures
                 if invocations or failures:
                     logger.info(
                         "ralph.compact.metrics target=%s attempt=%d compact.invocations=%d compact.failures=%d",
-                        target_id,
+                        focus_id,
                         attempt,
                         compact_invocations,
                         compact_failures,
                     )
 
-            logger.info("ralph.loop.audit.start target=%s attempt=%d", target_id, attempt)
+            logger.info("ralph.loop.audit.start target=%s attempt=%d", focus_id, attempt)
             # Run the audit skill unless we've determined that the persisted audit
             # is up-to-date and can be used without re-running the audit skill.
             if use_persisted_audit:
-                logger.info("ralph.loop.audit.skipped_using_persisted target=%s attempt=%d", target_id, attempt)
+                logger.info("ralph.loop.audit.skipped_using_persisted target=%s attempt=%d", focus_id, attempt)
             else:
                 # Run the audit skill; it MUST persist the structured audit to the work item.
-                self._run_pi(f"/skill:audit {target_id}")
+                self._run_pi(f"/skill:audit {focus_id}")
             # Read the persisted audit from the work item via wl show.
-            item = self._wl_show(target_id).get("workItem", {})
+            item = self._wl_show(focus_id).get("workItem", {})
             # Normalize persisted audit extraction to handle both object and string shapes.
             # - If workItem.audit is an object (dict), prefer audit.get("text")
             # - If it's a string, use it directly
@@ -1323,25 +1342,25 @@ class RalphLoop:
                 audit_text = item.get("auditText", "") or ""
 
             if not audit_text:
-                raise RalphError(f"No persisted audit found for {target_id} after running /skill:audit; expected workItem.audit to contain the structured report.")
+                raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit; expected workItem.audit to contain the structured report.")
             # Validate presence of the required header
             lines = [l.strip() for l in audit_text.splitlines() if l.strip()]
             if not any(l.lower().startswith("ready to close:") for l in lines):
                 excerpt = audit_text.strip().replace("\n", " ")[:200]
-                raise RalphError(f"No 'Ready to close:' header found in persisted audit for {target_id}. Excerpt: {excerpt}")
+                raise RalphError(f"No 'Ready to close:' header found in persisted audit for {focus_id}. Excerpt: {excerpt}")
             audit = parse_audit_report(audit_text)
             if self.verbose:
-                logger.debug("ralph.loop.audit.parsed target=%s attempt=%d ready=%s criteria_count=%d unmet=%d", target_id, attempt, audit.ready_to_close, len(audit.criteria), len(audit.unmet_or_partial))
+                logger.debug("ralph.loop.audit.parsed target=%s attempt=%d ready=%s criteria_count=%d unmet=%d", focus_id, attempt, audit.ready_to_close, len(audit.criteria), len(audit.unmet_or_partial))
 
             logger.info(
                 "ralph.loop.audit.complete target=%s attempt=%d ready=%s unmet=%d criteria=%d",
-                target_id, attempt, audit.ready_to_close, len(audit.unmet_or_partial), len(audit.criteria),
+                focus_id, attempt, audit.ready_to_close, len(audit.unmet_or_partial), len(audit.criteria),
             )
 
             if audit.ready_to_close and self._scope_in_review(scope_ids):
-                logger.info("ralph.loop.checks.start target=%s", target_id)
+                logger.info("ralph.loop.checks.start target=%s", focus_id)
                 self._run_checks()
-                logger.info("ralph.loop.merge target=%s confirm=%s", target_id, self.confirm_merge)
+                logger.info("ralph.loop.merge target=%s confirm=%s", focus_id, self.confirm_merge)
                 self._run_merge()
                 return {
                     "status": "success",
@@ -1355,10 +1374,10 @@ class RalphLoop:
             remediation = _build_remediation_prompt()
             logger.info(
                 "ralph.loop.remediate target=%s attempt=%d unmet_count=%d",
-                target_id, attempt, len(audit.unmet_or_partial),
+                focus_id, attempt, len(audit.unmet_or_partial),
             )
 
-        logger.warning("ralph.loop.max_attempts target=%s", target_id)
+        logger.warning("ralph.loop.max_attempts target=%s", focus_id)
         return {
             "status": "max_attempts",
             "attempt": self.max_attempts,
@@ -1374,6 +1393,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-cmd", action="append", default=[], help="Build/test command to run on success; test commands are normalized to quiet mode")
     parser.add_argument("--confirm-merge", action="store_true", help="Execute merge/push steps after successful audit")
     parser.add_argument("--cancel-file", default=None, help="Path checked each attempt; if present, stop loop")
+    parser.add_argument("--child", default=None, help="Run the loop focused on a direct child work-item instead of the positional target")
     parser.add_argument("--quiet", action="store_true", help="Suppress console progress output and pi streaming (only print final JSON result)")
     parser.add_argument("--verbose", action="store_true", help="Show detailed delegation commands and subprocess output")
     parser.add_argument("--no-stream", action="store_true", help="Don't stream pi subprocess output to console (use buffered capture instead)")
@@ -1440,7 +1460,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     loop.no_autoplan = args.no_autoplan
     try:
-        result = loop.run(args.work_item_id)
+        result = loop.run(args.work_item_id, child_id=args.child)
     except RalphError as exc:
         if args.json:
             # emit error as single JSON line
