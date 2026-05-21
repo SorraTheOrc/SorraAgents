@@ -76,6 +76,9 @@ class RalphStatusError(RuntimeError):
     pass
 
 
+_WORK_ITEM_ID = re.compile(r"^[A-Z][A-Z0-9]+-[A-Z0-9][A-Z0-9._-]*$")
+
+
 class _Result:
     def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
         self.returncode = returncode
@@ -194,28 +197,29 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _is_work_item_id(candidate: str | None) -> bool:
+    return bool(candidate and _WORK_ITEM_ID.match(candidate))
+
+
 def _extract_active_task(lines: Sequence[str]) -> str | None:
-    child_focus: str | None = None
-    task_from_action: str | None = None
-    target_hint: str | None = None
+    for pattern in (
+        r"child_focus\s+parent=\S+\s+child=(\S+)",
+        r"(?:^|\s)active_task=(\S+)",
+        r"(?:^|\s)child=(\S+)",
+    ):
+        for line in reversed(lines):
+            if not line:
+                continue
+            match = re.search(pattern, line)
+            if match and _is_work_item_id(match.group(1)):
+                return match.group(1)
     for line in reversed(lines):
         if not line:
             continue
-        if child_focus is None:
-            match = re.search(r"child_focus\s+parent=\S+\s+child=(\S+)", line)
-            if match:
-                child_focus = match.group(1)
-                continue
-        if task_from_action is None:
-            match = re.search(r"(?:implement|audit)\s+(\S+)", line)
-            if match:
-                task_from_action = match.group(1)
-                continue
-        if target_hint is None:
-            match = re.search(r"target=(\S+)", line)
-            if match:
-                target_hint = match.group(1)
-    return child_focus or task_from_action or target_hint
+        match = re.search(r"(?:^|\s)target=(\S+)", line)
+        if match and _is_work_item_id(match.group(1)):
+            return match.group(1)
+    return None
 
 
 def _count_scope_statuses(
