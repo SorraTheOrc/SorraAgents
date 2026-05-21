@@ -30,6 +30,7 @@ Behavior, configuration options, and test references are documented in
 ## Ralph orchestration loop
 
 The repository also includes the Ralph implement→audit loop for Worklog items.
+Use `/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id>` to launch a background run and `/home/rgardler/.pi/agent/skills/ralph/ralph status` to inspect the current process.
 See `docs/ralph.md` for the full command reference and operational guidance.
 
 A useful debugging pattern is to focus Ralph on a single direct child work item:

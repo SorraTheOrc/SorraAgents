@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Wrapper to run the ralph orchestrator from the installed skill directory.
+# Wrapper to launch Ralph in the background and inspect its runtime status.
 # This script is safe to invoke from any current working directory.
 set -euo pipefail
 # Resolve the real directory of this script (handles symlinks)
 BASEDIR=$(dirname "$(readlink -f "$0")")
-exec python3 "$BASEDIR/scripts/ralph_loop.py" "$@"
+if [[ "${1:-}" == "status" ]]; then
+  exec python3 "$BASEDIR/scripts/ralph_control.py" "$@"
+fi
+exec python3 "$BASEDIR/scripts/ralph_control.py" launch "$@"

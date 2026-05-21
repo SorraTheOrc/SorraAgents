@@ -12,18 +12,30 @@ Ralph drives an iterative cycle of:
 4. **Remediate** — if audit finds unmet or partial criteria, feed those into the next implement pass.
 5. **Repeat** until audit passes, max attempts are reached, or the operator cancels.
 
+Ralph is launched from the `skill/ralph/ralph` wrapper. The wrapper starts the deterministic loop in the background under `nohup`, writes runtime context under `.worklog/ralph/`, and exposes `ralph status` for live or post-exit inspection.
+
 ## Usage
 
 ```bash
-# Run the ralph orchestrator from the skill installation so it works
+# Launch a background Ralph run from the skill installation so it works
 # regardless of the current working directory. Use the skill-installed
 # path (expand ~ in shell):
+/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> [options]
+
+# Inspect the current run without the work item id:
+/home/rgardler/.pi/agent/skills/ralph/ralph status --json
+
+# If you need to run the foreground loop directly for debugging:
 python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> [options]
 
 # If your skills are installed at a different location, run the script
 # using the full path to that skill directory instead, e.g.:
 # python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id> [options]
 ```
+
+### Runtime files
+
+The background launcher stores the current runtime context in `.worklog/ralph/current.json` and writes the live log to a per-run log file under the same directory. `ralph status` reads that context file to report the current state, active task, recent activity, and final summary.
 
 ### Options
 

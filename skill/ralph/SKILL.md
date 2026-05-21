@@ -21,7 +21,9 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 ## Behavior
 
 1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id (or permission to create one).
-2. Run deterministic script locally:
+2. Launch the deterministic loop in the background under `nohup` so the caller is free to keep working.
+3. Use `ralph status` to inspect the current background run without needing the original work-item id.
+4. Run deterministic script locally:
 
    - Use `--child <id>` when you need to focus Ralph on a single direct child work item while keeping the parent as context.
    - Use `--debug-persist` when you need to save raw Pi payloads for `no_text_extracted` debugging.
@@ -40,7 +42,10 @@ Accepting `in_progress`: Ralph now accepts work items in stage `in_progress` as 
 # Preferred: use the executable wrapper that is safe to invoke from any CWD
 /home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --json
 
-# Alternatively, run the script directly from the installed skill directory:
+# Inspect the current background run (no work item id required):
+/home/rgardler/.pi/agent/skills/ralph/ralph status --json
+
+# If you need to run the foreground loop directly for debugging:
 # python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> --json
 #
 # To focus on a single direct child while keeping the parent for context:
