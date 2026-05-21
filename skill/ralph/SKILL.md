@@ -20,7 +20,7 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 
 ## Behavior
 
-1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id (or permission to create one), except for `ralph status`, which intentionally runs without a work-item id.
+1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id or abort, except for `ralph status`, which intentionally runs without a work-item id.
 2. Run the deterministic loop in the background under `nohup` so the caller is free to keep working.
 3. Use `ralph status` to inspect the current background run without needing the original work-item id.
 
