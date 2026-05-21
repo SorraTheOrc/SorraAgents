@@ -1,4 +1,4 @@
 {
-    "model": "Local Proxy/gpt120",
+    "model": "Local Proxy/qwen3",
     "max_attempts": 10
 }

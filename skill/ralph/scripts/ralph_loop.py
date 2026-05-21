@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 from datetime import datetime, timezone
+import time
 
 logger = logging.getLogger("ralph")
 
@@ -328,6 +329,10 @@ class RalphLoop:
         stream: bool = True,
         autoplan_effort_skip: frozenset[str] | None = None,
         autoplan_risk_skip: frozenset[str] | None = None,
+        fail_open: bool = False,
+        retry: int = 0,
+        retry_delay: float = 0.0,
+        fatal_cmds: list[str] | None = None,
     ):
         self.runner = runner or _default_runner
         self.pi_bin = pi_bin
@@ -349,23 +354,141 @@ class RalphLoop:
         # When True, disable the auto-plan step and proceed directly to implement
         # for intake_complete items.
         self.no_autoplan = False
+        # Fail-open and retry configuration for delegated subprocess calls
+        self.fail_open = fail_open
+        # Number of additional attempts (in addition to initial run) on failure
+        self.retry = int(retry or 0)
+        # Delay between retries (seconds)
+        self.retry_delay = float(retry_delay or 0.0)
+        # Command categories that are always treated as fatal even when fail-open
+        # By default, treat merge, checks, and pi runs as fatal. Worklog (wl)
+        # and other orchestration helpers are non-fatal by default but can be
+        # marked fatal via --fatal-cmd.
+        self.fatal_cmds = set(fatal_cmds) if fatal_cmds else {"merge", "check", "pi"}
+        # Certain categories are intentionally non-fatal by default (e.g.
+        # the effort-and-risk orchestrator returns None on failure rather than
+        # raising an exception).
+        self.non_fatal_by_default = {"effort_and_risk"}
+
+    def _call_runner(self, cmd: Sequence[str], input_data: str | None = None) -> subprocess.CompletedProcess:
+        """Invoke the configured runner in a consistent way.
+
+        - If the default runner is in use, call subprocess.run with text/capture.
+        - If a custom runner is provided, call it with the command list. If
+          input_data is provided and a custom runner is used, append the input
+          as a trailing argument to preserve legacy behavior used by tests.
+        """
+        if self.runner == _default_runner:
+            return subprocess.run(cmd, input=input_data, text=True, capture_output=True)
+        # Custom runner: if input_data provided, append it to the args to match
+        # previous convention where tests passed payload as a trailing argument.
+        if input_data is not None:
+            return self.runner(list(cmd) + [input_data])
+        return self.runner(list(cmd))
+
+    def _call_with_retry(self, cmd: Sequence[str], category: str | None = None, expect_json: bool = False, input_data: str | None = None):
+        """Call the given command with retry and fail-open semantics.
+
+        Returns:
+        - If expect_json=True: a parsed JSON dict on success, or an empty dict on
+          fail-open fallback.
+        - If expect_json=False: a subprocess.CompletedProcess on success, or the
+          last CompletedProcess on fail-open fallback.
+
+        Raises RalphError on fatal failures.
+        """
+        attempts = 0
+        last_proc: subprocess.CompletedProcess | None = None
+        while True:
+            proc = self._call_runner(list(cmd), input_data=input_data)
+            last_proc = proc
+            # Basic success check
+            ok = getattr(proc, "returncode", 0) == 0
+            parsed: dict | None = None
+            if expect_json and ok:
+                try:
+                    parsed = json.loads(proc.stdout)
+                except Exception:
+                    ok = False
+            # If JSON response indicates failure (worklog style), treat as error
+            if expect_json and parsed is not None and isinstance(parsed, dict) and parsed.get("success") is False:
+                ok = False
+            if ok:
+                if expect_json:
+                    return parsed if parsed is not None else {}
+                return proc
+            # Failure case
+            attempts += 1
+            if attempts <= self.retry:
+                logger.info("ralph.cmd.retry attempt=%d cmd=%s", attempts, cmd)
+                time.sleep(self.retry_delay)
+                continue
+            # Exhausted retries
+            break
+
+        # If the category is explicitly non-fatal by default, return a
+        # non-raising fallback to allow the loop to continue. This covers
+        # orchestrators like effort-and-risk which are handled specially.
+        if category and category in self.non_fatal_by_default:
+            if expect_json:
+                logger.warning(
+                    "ralph.cmd.nonfatal_by_default category=%s cmd=%s rc=%s stderr=%s",
+                    category, cmd, getattr(last_proc, "returncode", None), (getattr(last_proc, "stderr", "") or getattr(last_proc, "stdout", ""))[:1000],
+                )
+                return {}
+            logger.warning(
+                "ralph.cmd.nonfatal_by_default category=%s cmd=%s rc=%s stderr=%s",
+                category, cmd, getattr(last_proc, "returncode", None), (getattr(last_proc, "stderr", "") or getattr(last_proc, "stdout", ""))[:1000],
+            )
+            return last_proc
+
+        # If fail-open is enabled and this category is not fatal, return a
+        # non-raising fallback to allow the loop to continue.
+        if self.fail_open and (not category or category not in self.fatal_cmds):
+            if expect_json:
+                logger.warning(
+                    "ralph.cmd.failed_but_fail_open category=%s cmd=%s rc=%s stderr=%s",
+                    category, cmd, getattr(last_proc, "returncode", None), (getattr(last_proc, "stderr", "") or getattr(last_proc, "stdout", ""))[:1000],
+                )
+                return {}
+            logger.warning(
+                "ralph.cmd.failed_but_fail_open category=%s cmd=%s rc=%s stderr=%s",
+                category, cmd, getattr(last_proc, "returncode", None), (getattr(last_proc, "stderr", "") or getattr(last_proc, "stdout", ""))[:1000],
+            )
+            return last_proc
+
+        # Fatal: raise an error to preserve previous default behaviour
+        stderr = (getattr(last_proc, "stderr", None) or getattr(last_proc, "stdout", ""))
+        # Construct category-specific messages to preserve backwards-compatible
+        # error text expected by tests and callers.
+        cat = (category or "").lower()
+        if cat == "merge":
+            raise RalphError(f"Merge step failed ({' '.join(cmd)}): {str(stderr).strip()}")
+        if cat == "check":
+            raise RalphError(f"Check failed ({' '.join(cmd)}): {str(stderr).strip()}")
+        if cat == "wl":
+            raise RalphError(f"Worklog command failed ({' '.join(cmd)}): {str(stderr).strip()}")
+        if cat == "pi":
+            raise RalphError(f"pi run failed: {str(stderr).strip()}")
+        # Fallback generic message
+        raise RalphError(f"Command failed ({' '.join(cmd)}): {str(stderr).strip()}")
 
     def _wl_show(self, work_item_id: str, children: bool = False) -> dict:
         cmd = [self.wl_bin, "show", work_item_id, "--json"]
         if children:
             cmd.insert(3, "--children")
         logger.debug("ralph.cmd.wl.show cmd=%s", cmd)
-        result = _run_json(self.runner, cmd)
+        result = self._call_with_retry(cmd, category="wl", expect_json=True)
         if self.verbose:
-            item = result.get("workItem", {})
-            logger.debug("ralph.cmd.wl.show id=%s stage=%s status=%s children=%d", item.get("id"), item.get("stage"), item.get("status"), len(result.get("children", [])))
-        return result
+            item = (result or {}).get("workItem", {}) if isinstance(result, dict) else {}
+            logger.debug("ralph.cmd.wl.show id=%s stage=%s status=%s children=%d", item.get("id"), item.get("stage"), item.get("status"), len((result or {}).get("children", [])))
+        return result or {}
 
     def _wl_comment_list(self, work_item_id: str) -> list[dict]:
         cmd = [self.wl_bin, "comment", "list", work_item_id, "--json"]
         logger.debug("ralph.cmd.wl.comment_list cmd=%s", cmd)
-        data = _run_json(self.runner, cmd)
-        comments = data.get("comments", [])
+        data = self._call_with_retry(cmd, category="wl", expect_json=True)
+        comments = data.get("comments", []) if isinstance(data, dict) else []
         if self.verbose:
             logger.debug("ralph.cmd.wl.comment_list count=%d", len(comments))
         return comments
@@ -396,7 +519,8 @@ class RalphLoop:
         logger.debug("ralph.cmd.wl.comment_add target=%s comment_len=%d", work_item_id, len(comment))
         if self.verbose:
             logger.debug("ralph.cmd.wl.comment_add comment_start=%s", comment[:500])
-        _run_json(self.runner, cmd)
+        # Use wrapper to allow fail-open/retry behaviour
+        self._call_with_retry(cmd, category="wl", expect_json=True)
 
 
     def _run_pi(self, prompt: str) -> str:
@@ -408,15 +532,19 @@ class RalphLoop:
         if self.stream:
             return self._stream_pi(cmd, prompt)
 
-        proc = self.runner(cmd)
-        if proc.returncode != 0:
+        proc = self._call_with_retry(cmd, category="pi", expect_json=False)
+        if getattr(proc, "returncode", 0) != 0:
+            if self.fail_open and ("pi" not in self.fatal_cmds):
+                logger.warning("ralph.cmd.pi.failed_but_fail_open cmd=%s rc=%s stderr=%s", cmd, getattr(proc, "returncode", None), (getattr(proc, "stderr", "") or "").strip())
+                return ""
             if self.verbose:
-                logger.debug("ralph.cmd.pi.run stderr=%s", proc.stderr.strip()[:1000])
-            raise RalphError(f"pi run failed: {proc.stderr.strip()}")
-        text = _extract_text_from_json_output(proc.stdout)
+                logger.debug("ralph.cmd.pi.run stderr=%s", (getattr(proc, "stderr", "") or "").strip()[:1000])
+            raise RalphError(f"pi run failed: {(getattr(proc, 'stderr', '') or '').strip()}")
+        text = _extract_text_from_json_output(getattr(proc, "stdout", "") or "")
         if self.verbose:
             logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(text), text[:1000])
         return text
+
 
     def _stream_pi(self, cmd: list[str], prompt: str) -> str:
         """Run pi with --mode json and stream user-facing text to the console.
@@ -474,6 +602,13 @@ class RalphLoop:
         stderr = process.stderr.read()
 
         if process.returncode != 0:
+            if self.fail_open and ("pi" not in self.fatal_cmds):
+                if self.verbose:
+                    logger.debug("ralph.cmd.pi.run stderr=%s", stderr.strip()[:1000])
+                logger.warning("ralph.cmd.pi.failed_but_fail_open cmd=%s rc=%s stderr=%s", cmd, process.returncode, stderr.strip())
+                # Return whatever text we accumulated so far
+                full_text = complete_blocks[-1] if complete_blocks else "".join(text_parts)
+                return full_text
             if self.verbose:
                 logger.debug("ralph.cmd.pi.run stderr=%s", stderr.strip()[:1000])
             raise RalphError(f"pi run failed: {stderr.strip()}")
@@ -510,12 +645,15 @@ class RalphLoop:
     def _run_checks(self) -> None:
         for cmd in self.check_cmds:
             logger.debug("ralph.cmd.check cmd=%s", cmd)
-            proc = self.runner(["bash", "-lc", cmd])
+            proc = self._call_with_retry(["bash", "-lc", cmd], category="check", expect_json=False)
             if self.verbose:
-                logger.debug("ralph.cmd.check stdout=%s", proc.stdout.strip()[:1000])
-                logger.debug("ralph.cmd.check stderr=%s", proc.stderr.strip()[:1000])
-            if proc.returncode != 0:
-                raise RalphError(f"Check failed ({cmd}): {proc.stderr.strip() or proc.stdout.strip()}")
+                logger.debug("ralph.cmd.check stdout=%s", (getattr(proc, 'stdout', '') or '').strip()[:1000])
+                logger.debug("ralph.cmd.check stderr=%s", (getattr(proc, 'stderr', '') or '').strip()[:1000])
+            if getattr(proc, 'returncode', 0) != 0:
+                if self.fail_open and ("check" not in self.fatal_cmds):
+                    logger.warning("ralph.cmd.check.failed_but_fail_open cmd=%s rc=%s stderr=%s", cmd, getattr(proc, 'returncode', None), (getattr(proc, 'stderr', '') or '').strip())
+                    continue
+                raise RalphError(f"Check failed ({cmd}): {(getattr(proc, 'stderr', '') or '').strip() or (getattr(proc, 'stdout', '') or '').strip()}")
 
     def _run_merge(self) -> None:
         if not self.confirm_merge:
@@ -526,13 +664,14 @@ class RalphLoop:
             ["git", "push", "origin", "HEAD"],
         ):
             logger.debug("ralph.cmd.merge step=%s", shlex.join(cmd))
-            proc = self.runner(cmd)
+            proc = self._call_with_retry(cmd, category="merge", expect_json=False)
             if self.verbose:
-                logger.debug("ralph.cmd.merge stdout=%s", proc.stdout.strip()[:1000])
-            if proc.returncode != 0:
+                logger.debug("ralph.cmd.merge stdout=%s", (getattr(proc, 'stdout', '') or '').strip()[:1000])
+            if getattr(proc, 'returncode', 0) != 0:
                 if self.verbose:
-                    logger.debug("ralph.cmd.merge stderr=%s", proc.stderr.strip()[:1000])
-                raise RalphError(f"Merge step failed ({' '.join(cmd)}): {proc.stderr.strip()}")
+                    logger.debug("ralph.cmd.merge stderr=%s", (getattr(proc, 'stderr', '') or '').strip()[:1000])
+                # Merge is considered fatal by default
+                raise RalphError(f"Merge step failed ({' '.join(cmd)}): {(getattr(proc, 'stderr', '') or '').strip()}")
 
 
     def _is_effort_risk_computed(self, target_id: str) -> bool:
@@ -572,27 +711,21 @@ class RalphLoop:
         cmd = [py, str(orchestrate_script)]
         logger.info("ralph.autoplan.effort_risk.start target=%s", target_id)
 
-        # Use subprocess.run for the default runner (production) with stdin,
-        # or self.runner with a trailing payload argument for tests.
+        # Use wrapper to support retries and fail-open behaviour.
         if self.runner == _default_runner:
-            proc = subprocess.run(
-                cmd,
-                input=payload,
-                text=True,
-                capture_output=True,
-            )
+            proc = self._call_with_retry(cmd, category="effort_and_risk", expect_json=False, input_data=payload)
         else:
-            proc = self.runner(cmd + [payload])
+            proc = self._call_with_retry(cmd + [payload], category="effort_and_risk", expect_json=False)
 
-        if proc.returncode != 0:
+        if getattr(proc, 'returncode', 0) != 0:
             logger.warning(
                 "ralph.autoplan.effort_risk.failed target=%s rc=%s stderr=%s",
-                target_id, proc.returncode, (proc.stderr or "")[:500],
+                target_id, getattr(proc, 'returncode', None), (getattr(proc, 'stderr', '') or "")[:500],
             )
             return None
 
         try:
-            result = json.loads(proc.stdout)
+            result = json.loads(getattr(proc, 'stdout', '') or "")
             if not isinstance(result, dict):
                 logger.warning(
                     "ralph.autoplan.effort_risk.unexpected_type target=%s type=%s",
@@ -1134,6 +1267,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-autoplan", action="store_true", help="Disable the auto-plan step for intake_complete items (proceed directly to implement)")
     parser.add_argument("--autoplan-effort-skip", nargs="*", help="Effort t-shirt sizes that skip /plan (default: Extra Small Small)")
     parser.add_argument("--autoplan-risk-skip", nargs="*", help="Risk levels that skip /plan (default: Low)")
+    parser.add_argument("--fail-open", action="store_true", help="Continue on delegated command failures (non-fatal) when possible")
+    parser.add_argument("--retry", type=int, default=0, help="Number of additional retries for delegated commands (default: 0)")
+    parser.add_argument("--retry-delay", type=float, default=1.0, help="Delay in seconds between retries")
+    parser.add_argument("--fatal-cmd", action="append", default=[], help="""Command categories to treat as fatal even when --fail-open is set. Example categories: merge, pi, wl, check, effort_and_risk""")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON Lines (jsonl) for lifecycle events and final result")
     return parser
 
@@ -1187,6 +1324,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         stream=not args.quiet and not args.no_stream,
         autoplan_effort_skip=autoplan_effort_skip,
         autoplan_risk_skip=autoplan_risk_skip,
+        fail_open=args.fail_open,
+        retry=args.retry,
+        retry_delay=args.retry_delay,
+        fatal_cmds=args.fatal_cmd,
     )
     loop.no_autoplan = args.no_autoplan
     try:
