@@ -11,7 +11,7 @@ You are coordinating an intake brief for a new Worklog work item.
 ## Description
 
 You are authoring a new Worklog work item that describes a feature or a bug fix to be implemented. You will ensure that the details in the Worklog work item are sufficient to allow a developer to complete the work.
-You will follow an interview-driven approach to gather requirements, constraints, success criteria, and related work.
+You will follow an interview-driven approach to gather requirements, constraints, Acceptance Criteria (synonym: Success Criteria), and related work.
 
 ## Inputs
 
@@ -93,7 +93,7 @@ If there are no ambiguities and the seed context and previously asked questions 
 - The goal is to build a full understanding of the work, by asking clear and concise questions, and offering suggested answers and examples informed by repo context where possible.
 - If anything is ambiguous, ask for clarification rather than guessing.
 - Keep asking the user questions until all core information is captured and no important ambiguities remain.
-  - The goal is not a complete spec but a sufficient understanding to draft a problem definition with user stories, success criteria, and related work.
+  - The goal is not a complete spec but a sufficient understanding to draft a problem definition with user stories, acceptance criteria, and related work.
 - Do not proceed until you have gathered sufficient information to draft an intake brief.
 
 4. Draft intake brief (agent responsibility)
@@ -101,7 +101,7 @@ If there are no ambiguities and the seed context and previously asked questions 
 - Write a clear intake brief to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` containing the following sections:
   - Problem statement: one or two sentences summarizing the problem to be solved.
   - Users: who will benefit from or use the feature and examples of their user stories.
-  - Success criteria: 3–5 concise, measurable bullets describing how success will be evaluated.
+  - Acceptance Criteria (synonym: Success Criteria): 3–5 concise, measurable bullets describing how success will be evaluated.
   - Constraints: any known constraints (technical, business, regulatory) that must be considered.
   - Existing state: brief summary of the current state of affairs related to the problem.
   - Desired change: brief summary of the likely changes needed.
@@ -118,7 +118,7 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
 
 - The five Intake review types are:
   1. Completeness
-     - Ensure Problem, Success criteria, and Constraints are present and actionable. Add missing bullets or concise placeholders when obvious.
+     - Ensure Problem, Acceptance Criteria, and Constraints are present and actionable. Add missing bullets or concise placeholders when obvious.
   2. Capture fidelity
      - Verify the user's answers are accurately and neutrally represented. Shorten or rephrase only for clarity; do not change meaning.
   3. Related-work & traceability
