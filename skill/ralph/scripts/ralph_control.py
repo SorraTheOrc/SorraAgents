@@ -41,6 +41,7 @@ class RalphRuntimeContext:
     status_cursor: int = 0
     last_counts: dict[str, int] = field(default_factory=dict)
     last_active_task: str | None = None
+    last_recent_activity: list[str] = field(default_factory=list)
     exit_code: int | None = None
     launched_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -53,6 +54,7 @@ class RalphRuntimeContext:
             "status_cursor": self.status_cursor,
             "last_counts": self.last_counts,
             "last_active_task": self.last_active_task,
+            "last_recent_activity": self.last_recent_activity,
             "exit_code": self.exit_code,
             "launched_at": self.launched_at,
         }
@@ -67,6 +69,7 @@ class RalphRuntimeContext:
             status_cursor=int(payload.get("status_cursor") or 0),
             last_counts={str(k): int(v) for k, v in dict(payload.get("last_counts") or {}).items()},
             last_active_task=(str(payload["last_active_task"]) if payload.get("last_active_task") else None),
+            last_recent_activity=[str(line) for line in list(payload.get("last_recent_activity") or [])],
             exit_code=(int(payload["exit_code"]) if payload.get("exit_code") is not None else None),
             launched_at=str(payload.get("launched_at") or datetime.now(timezone.utc).isoformat()),
         )
@@ -317,6 +320,12 @@ def inspect_status(
     counts = _count_scope_statuses(context.target_id, runner=wl_runner)
     deltas = {key: counts.get(key, 0) - context.last_counts.get(key, 0) for key in sorted(set(counts) | set(context.last_counts))}
 
+    if recent_lines:
+        recent_activity = [*context.last_recent_activity, *recent_lines] if context.last_recent_activity else list(recent_lines)
+        context.last_recent_activity = list(recent_lines)
+    else:
+        recent_activity = ["No new log activity since the last check"]
+
     result = _extract_final_result(log_text)
     exit_code = context.exit_code
     if not running:
@@ -344,7 +353,7 @@ def inspect_status(
         "target_id": context.target_id,
         "log_path": str(context.log_path),
         "active_task": active_task,
-        "recent_activity": recent_lines,
+        "recent_activity": recent_activity,
         "status_counts": counts,
         "status_deltas": deltas,
         "exit_code": exit_code,
@@ -364,7 +373,7 @@ def format_status(snapshot: dict[str, object]) -> str:
     if snapshot.get("recent_activity"):
         lines.append("recent activity:")
         for line in snapshot["recent_activity"]:
-            lines.append(f"  {line}")
+            lines.append(f"  - {line}")
     counts = snapshot.get("status_counts") or {}
     deltas = snapshot.get("status_deltas") or {}
     if isinstance(counts, dict) and counts:
