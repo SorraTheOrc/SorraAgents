@@ -717,6 +717,7 @@ class RalphLoop:
         self._pi_process: subprocess.Popen | None = None
         self._debug_context: dict[str, object] = {}
         self._last_structured_response: StructuredResponse | None = None
+        self._last_implement_output: str = ""
 
     def _resolve_model_for_phase(self, phase: str) -> str:
         if phase not in MODEL_PHASES:
@@ -1253,19 +1254,44 @@ class RalphLoop:
 
         self._pi_process = None
 
-    def _run_checks(self) -> None:
+    def _run_checks(self) -> list[dict[str, object]]:
+        results: list[dict[str, object]] = []
         for cmd in self.check_cmds:
             quiet_cmd = canonicalize_quiet_test_command(cmd)
             logger.debug("ralph.cmd.check cmd=%s quiet_cmd=%s", cmd, quiet_cmd)
             proc = self._call_with_retry(["bash", "-lc", quiet_cmd], category="check", expect_json=False)
+            result = {
+                "cmd": cmd,
+                "stdout": (getattr(proc, 'stdout', '') or '').strip(),
+                "stderr": (getattr(proc, 'stderr', '') or '').strip(),
+                "returncode": getattr(proc, 'returncode', 0),
+            }
+            results.append(result)
             if self.verbose:
-                logger.debug("ralph.cmd.check stdout=%s", (getattr(proc, 'stdout', '') or '').strip()[:1000])
-                logger.debug("ralph.cmd.check stderr=%s", (getattr(proc, 'stderr', '') or '').strip()[:1000])
-            if getattr(proc, 'returncode', 0) != 0:
+                logger.debug("ralph.cmd.check stdout=%s", result["stdout"][:1000])
+                logger.debug("ralph.cmd.check stderr=%s", result["stderr"][:1000])
+            if result["returncode"] != 0:
                 if self.fail_open and ("check" not in self.fatal_cmds):
-                    logger.warning("ralph.cmd.check.failed_but_fail_open cmd=%s rc=%s stderr=%s", cmd, getattr(proc, 'returncode', None), (getattr(proc, 'stderr', '') or '').strip())
+                    logger.warning("ralph.cmd.check.failed_but_fail_open cmd=%s rc=%s stderr=%s", cmd, result["returncode"], result["stderr"])
                     continue
-                raise RalphError(f"Check failed ({cmd}): {(getattr(proc, 'stderr', '') or '').strip() or (getattr(proc, 'stdout', '') or '').strip()}")
+                raise RalphError(f"Check failed ({cmd}): {result['stderr'] or result['stdout']}")
+        return results
+
+    def _capture_changed_files(self) -> list[dict[str, str]]:
+        try:
+            proc = self._call_with_retry(["git", "diff", "--name-status", "HEAD"], category="summary", expect_json=False)
+            output = (getattr(proc, 'stdout', '') or '').strip()
+            if not output:
+                return []
+            files: list[dict[str, str]] = []
+            for line in output.splitlines():
+                parts = line.strip().split("\t", 1)
+                if len(parts) == 2:
+                    files.append({"status": parts[0], "file": parts[1]})
+            return files
+        except Exception:
+            logger.warning("ralph.summary.git_diff_failed", exc_info=True)
+            return []
 
     def _run_merge(self) -> None:
         if not self.confirm_merge:
@@ -1800,6 +1826,7 @@ class RalphLoop:
                     )
                     previous_child_stages = {}
                 implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation), phase="intake")
+                self._last_implement_output = implement_output
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
                 invocations, failures = self._compact_after_child_transition(focus_id, previous_child_stages, attempt)
                 compact_invocations += invocations
@@ -1853,6 +1880,7 @@ class RalphLoop:
                     )
                     previous_child_stages = {}
                 implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation), phase="implementation")
+                self._last_implement_output = implement_output
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
                 invocations, failures = self._compact_after_child_transition(focus_id, previous_child_stages, attempt)
                 compact_invocations += invocations
@@ -1929,7 +1957,8 @@ class RalphLoop:
 
             if audit.ready_to_close and self._scope_in_review(scope_ids):
                 logger.info("ralph.loop.checks.start target=%s", focus_id)
-                self._run_checks()
+                check_results = self._run_checks()
+                changed_files = self._capture_changed_files()
                 logger.info("ralph.loop.merge target=%s confirm=%s", focus_id, self.confirm_merge)
                 self._run_merge()
                 self._cleanup_pi_process()
@@ -1940,6 +1969,11 @@ class RalphLoop:
                     "merge_offered": True,
                     "merge_executed": self.confirm_merge,
                     "compact": {"invocations": compact_invocations, "failures": compact_failures},
+                    "summary": {
+                        "changed_files": changed_files,
+                        "change_descriptions": self._last_implement_output,
+                        "check_results": check_results,
+                    },
                 }
 
             remediation = _build_remediation_prompt()

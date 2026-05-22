@@ -116,6 +116,9 @@ class FakeRunner:
         if cmd[:2] == ["bash", "-lc"]:
             return Result(stdout="ok")
 
+        if cmd[:2] == ["git", "diff"] and "--name-status" in cmd:
+            return Result(stdout="M\tsrc/foo.py\nA\tsrc/bar.py\n")
+
         if cmd and cmd[0] == "git":
             return Result(stdout="ok")
 
@@ -284,6 +287,77 @@ def test_max_attempts_returns_max_attempts_status():
     result = loop.run("SA-TARGET")
 
     assert result["status"] == "max_attempts"
+
+
+def test_success_result_includes_summary():
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, check_cmds=["pytest -q"])
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    assert "summary" in result
+    summary = result["summary"]
+    assert isinstance(summary, dict)
+    assert "changed_files" in summary
+    assert "change_descriptions" in summary
+    assert "check_results" in summary
+
+
+def test_summary_changed_files_lists_git_diff():
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    changed_files = result["summary"]["changed_files"]
+    assert isinstance(changed_files, list)
+    assert len(changed_files) > 0
+    for entry in changed_files:
+        assert "status" in entry
+        assert "file" in entry
+
+
+def test_summary_change_descriptions_from_implement_output():
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    assert isinstance(result["summary"]["change_descriptions"], str)
+    assert len(result["summary"]["change_descriptions"]) > 0
+
+
+def test_summary_check_results_from_run_checks():
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, check_cmds=["pytest -q"])
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    check_results = result["summary"]["check_results"]
+    assert isinstance(check_results, list)
+    assert len(check_results) == 1
+    assert check_results[0]["cmd"] == "pytest -q"
+    assert check_results[0]["returncode"] == 0
+    assert check_results[0]["stdout"] == "ok"
+
+
+def test_non_success_results_exclude_summary():
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "max_attempts"
+    assert "summary" not in result
 
 
 def test_confirm_merge_executes_git_steps():
