@@ -87,7 +87,9 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 1. Understand the work item
 
 - If the work item is not already assigned to you, claim it by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` (omit `--assignee` if not applicable).
-- If the work item is in-progress then run the audit skill to understand what work has already been done and what remains: `audit <work-item-id> using the audit skill`.
+- After you have the work item id, first look for the most recent worklog action, comment, or audit entry associated with the work item.
+  - If the most recent action on the work item is a recent audit record, reuse that audit to understand what work has already been done and what remains.
+  - If there is no recent audit record, run a full audit using `/skill:audit <work-item-id>` to understand what work has already been done and what remains.
 - Fetch the work item JSON if not already present: `wl show <work-item-id> --json` and `wl show <work-item-id> --json`.
   - pay particular attention to the `description`, `acceptance criterria` and `comments`
 - Restate acceptance criteria and current status along with any constraints from the work item JSON.
@@ -122,10 +124,9 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Recursively implement that work item as described in this procedure.
   - When a work item is completed, follow the mandatory build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit the work. Update the stage: `wl update <work-item-id> --status in_progress --stage in_review --json`
 
-- If the work item does not have a recorded audit (see the output of wl show <work-item-id> --json) go to the next item in this step of the process, otherwise:
-  - review the audit notes and address any unmet acceptance criteria or other issues identified.
-  - once all items in the audit are addressed continue to step 4.
-- if there is no existing audit record, write tests and code to ensure all acceptance criteria defined in or related to the current work item are met:
+- If the work item has a recent audit record, review the audit notes and address any unmet acceptance criteria or other issues identified.
+- If there is no recent audit record, run `/skill:audit <work-item-id>` and use the resulting audit output to establish the work that needs to be done.
+- Once the audit selection is complete, continue to step 4 and write tests and code to ensure all acceptance criteria defined in or related to the current work item are met:
   - Make minimal, focused changes that satisfy acceptance criteria.
   - Follow a test-driven development approach where applicable.
   - Ensure code follows project style and conventions.
