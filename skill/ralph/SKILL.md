@@ -35,6 +35,19 @@ For direct foreground debugging, run the script locally:
 Delegated `pi` and `wl` commands are logged before execution in both normal console output and `--json` output, so operators and automation can see the exact command Ralph ran.
 If streamed `pi` output stops producing stdout and keeps the pipe open too long, Ralph will terminate the run with a clear stall error instead of hanging indefinitely.
 
+### Per-phase model routing
+
+Ralph supports phase-specific model selection for `intake`, `planning`, `implementation`, and `audit`.
+
+- Source toggle: `--model-source <remote|local>` (default: `remote`)
+- Per-phase CLI overrides:
+  - `--model-intake`
+  - `--model-planning`
+  - `--model-implementation`
+  - `--model-audit`
+- Config supports `model_source` plus `model.<phase>` keys (nested object or dotted keys).
+- No implicit remote↔local fallback is attempted by Ralph.
+- Backward compatibility remains: when per-phase inputs are not used, Ralph continues the legacy single-model path (`--model` / string `model` config / `DEFAULT_MODEL`).
 
 ```bash
 # Launch a background Ralph run from the skill installation.

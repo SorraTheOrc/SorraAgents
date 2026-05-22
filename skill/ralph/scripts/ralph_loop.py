@@ -34,6 +34,23 @@ from skill.test_runner import canonicalize_quiet_test_command
 logger = logging.getLogger("ralph")
 
 DEFAULT_MODEL = "opencode-go/glm-5.1"
+DEFAULT_MODEL_SOURCE = "remote"
+MODEL_SOURCES = frozenset({"remote", "local"})
+MODEL_PHASES: tuple[str, ...] = ("intake", "planning", "implementation", "audit")
+PHASE_MODEL_DEFAULTS: dict[str, dict[str, str]] = {
+    "remote": {
+        "intake": "Claude Opus 4.7",
+        "planning": "GPT 5.5",
+        "implementation": "Qwen 3.6 Plus",
+        "audit": "Claude Opus 4.7",
+    },
+    "local": {
+        "intake": "Llama-3.1 70B (Q4_K_M)",
+        "planning": "Qwen 3.x 32B",
+        "implementation": "Qwen 32B",
+        "audit": "Llama-3.1 70B (Q4_K_M)",
+    },
+}
 DEBUG_PAYLOAD_DIR_NAME = "ralph-payloads"
 DEBUG_PAYLOAD_MAX_BYTES = 1_000_000
 DEBUG_PAYLOAD_MAX_FILES = 200
@@ -185,12 +202,90 @@ def _load_config() -> dict:
 
 
 def _resolve_model(cli_model: str | None, config_model: str | None) -> str:
-    """Resolve the model to use: CLI flag > config file > default."""
+    """Resolve the legacy single model: CLI flag > config file > default."""
     if cli_model:
         return cli_model
     if config_model:
         return config_model
     return DEFAULT_MODEL
+
+
+def _normalize_model_source(source: str | None) -> str:
+    if not source:
+        return DEFAULT_MODEL_SOURCE
+    normalized = str(source).strip().lower()
+    if normalized in MODEL_SOURCES:
+        return normalized
+    return DEFAULT_MODEL_SOURCE
+
+
+def _coerce_model_str(value: object) -> str | None:
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if trimmed:
+            return trimmed
+    return None
+
+
+def _resolve_phase_model_value(value: object, model_source: str) -> str | None:
+    """Resolve a model value that may be a string or source-mapped object."""
+    direct = _coerce_model_str(value)
+    if direct:
+        return direct
+    if isinstance(value, dict):
+        source_value = _coerce_model_str(value.get(model_source))
+        if source_value:
+            return source_value
+    return None
+
+
+def _extract_phase_model_config(config: dict) -> dict[str, object]:
+    """Extract per-phase model config from nested or dotted config keys."""
+    phase_config: dict[str, object] = {}
+    model_root = config.get("model")
+
+    for phase in MODEL_PHASES:
+        dotted_key = config.get(f"model.{phase}")
+        if dotted_key is not None:
+            phase_config[phase] = dotted_key
+            continue
+
+        direct_remote = config.get(f"model.remote.{phase}")
+        direct_local = config.get(f"model.local.{phase}")
+        if direct_remote is not None or direct_local is not None:
+            source_map: dict[str, object] = {}
+            if direct_remote is not None:
+                source_map["remote"] = direct_remote
+            if direct_local is not None:
+                source_map["local"] = direct_local
+            phase_config[phase] = source_map
+            continue
+
+        if isinstance(model_root, dict):
+            if phase in model_root:
+                phase_config[phase] = model_root[phase]
+                continue
+
+            remote_map = model_root.get("remote")
+            local_map = model_root.get("local")
+            if isinstance(remote_map, dict) or isinstance(local_map, dict):
+                source_map: dict[str, object] = {}
+                if isinstance(remote_map, dict) and phase in remote_map:
+                    source_map["remote"] = remote_map[phase]
+                if isinstance(local_map, dict) and phase in local_map:
+                    source_map["local"] = local_map[phase]
+                if source_map:
+                    phase_config[phase] = source_map
+
+    return phase_config
+
+
+def _extract_legacy_model_from_config(config: dict) -> str | None:
+    model_value = config.get("model")
+    if isinstance(model_value, str):
+        trimmed = model_value.strip()
+        return trimmed or None
+    return None
 
 
 def _render_command(cmd: Sequence[str]) -> str:
@@ -542,6 +637,14 @@ class RalphLoop:
         pi_bin: str = "pi",
         wl_bin: str = "wl",
         model: str | None = None,
+        model_source: str | None = None,
+        model_intake: str | None = None,
+        model_planning: str | None = None,
+        model_implementation: str | None = None,
+        model_audit: str | None = None,
+        model_config: dict[str, object] | None = None,
+        model_source_explicit: bool | None = None,
+        legacy_model_explicit: bool | None = None,
         check_cmds: list[str] | None = None,
         max_attempts: int = 10,
         confirm_merge: bool = False,
@@ -560,6 +663,19 @@ class RalphLoop:
         self.pi_bin = pi_bin
         self.wl_bin = wl_bin
         self.model = model or DEFAULT_MODEL
+        self.legacy_model_explicit = (model is not None) if legacy_model_explicit is None else legacy_model_explicit
+        self.model_source = _normalize_model_source(model_source)
+        self.model_source_explicit = (model_source is not None) if model_source_explicit is None else model_source_explicit
+        self.model_overrides: dict[str, str | None] = {
+            "intake": model_intake,
+            "planning": model_planning,
+            "implementation": model_implementation,
+            "audit": model_audit,
+        }
+        self.model_config = model_config or {}
+        self.phase_model_mode_enabled = self.model_source_explicit or any(
+            _coerce_model_str(value) is not None for value in self.model_overrides.values()
+        ) or any(phase in self.model_config for phase in MODEL_PHASES)
         self.max_attempts = max_attempts
         self.confirm_merge = confirm_merge
         self.cancel_file = cancel_file
@@ -597,6 +713,27 @@ class RalphLoop:
         self.pi_stream_timeout_seconds = 60.0
         self._debug_context: dict[str, object] = {}
         self._last_structured_response: StructuredResponse | None = None
+
+    def _resolve_model_for_phase(self, phase: str) -> str:
+        if phase not in MODEL_PHASES:
+            raise RalphError(f"Unknown model phase: {phase}")
+
+        override_value = _coerce_model_str(self.model_overrides.get(phase))
+        if override_value:
+            return override_value
+
+        config_value = self.model_config.get(phase)
+        configured_phase_model = _resolve_phase_model_value(config_value, self.model_source)
+        if configured_phase_model:
+            return configured_phase_model
+
+        if self.legacy_model_explicit:
+            return self.model
+
+        if self.phase_model_mode_enabled:
+            return PHASE_MODEL_DEFAULTS[self.model_source][phase]
+
+        return DEFAULT_MODEL
 
     def _call_runner(self, cmd: Sequence[str], input_data: str | None = None) -> subprocess.CompletedProcess:
         """Invoke the configured runner in a consistent way.
@@ -759,17 +896,18 @@ class RalphLoop:
         self._call_with_retry(cmd, category="wl", expect_json=True)
 
 
-    def _run_pi(self, prompt: str) -> str:
+    def _run_pi(self, prompt: str, phase: str = "implementation") -> str:
         # Use an ephemeral session for each orchestration call so nested or
         # retried runs never attempt to continue a previous assistant turn.
-        cmd = [self.pi_bin, "-p", "--no-session", "--mode", "json", "--model", self.model, prompt]
-        logger.debug("ralph.cmd.pi.run model=%s prompt_len=%d", self.model, len(prompt))
+        model_for_phase = self._resolve_model_for_phase(phase)
+        cmd = [self.pi_bin, "-p", "--no-session", "--mode", "json", "--model", model_for_phase, prompt]
+        logger.debug("ralph.cmd.pi.run phase=%s model=%s prompt_len=%d", phase, model_for_phase, len(prompt))
         if self.verbose:
             logger.debug("ralph.cmd.pi.run prompt_full=\n%s", prompt)
 
         self._last_structured_response = None
         if self.stream:
-            return self._stream_pi(cmd, prompt)
+            return self._stream_pi(cmd, prompt, model_for_phase)
 
         proc = self._call_with_retry(cmd, category="pi", expect_json=False)
         if getattr(proc, "returncode", 0) != 0:
@@ -787,7 +925,7 @@ class RalphLoop:
         return text
 
 
-    def _stream_pi(self, cmd: list[str], prompt: str) -> str:
+    def _stream_pi(self, cmd: list[str], prompt: str, model_for_phase: str | None = None) -> str:
         """Run pi with --mode json and stream user-facing text to the console.
 
         Only text_delta events (the agent's actual response) are printed.
@@ -798,13 +936,15 @@ class RalphLoop:
         hanging Ralph forever when it keeps the pipe open without finishing.
         """
         self._last_structured_response = None
+        if model_for_phase is None:
+            model_for_phase = self._resolve_model_for_phase("implementation")
         rendered = _render_command(cmd)
         logger.info(
             "ralph.cmd.pi.execute cmd=%s",
             rendered,
             extra={"category": "pi", "cmd": rendered, "argv": list(cmd), "attempt": 1},
         )
-        logger.info("ralph.cmd.pi.stream_start model=%s cmd_len=%d", self.model, len(cmd))
+        logger.info("ralph.cmd.pi.stream_start model=%s cmd_len=%d", model_for_phase, len(cmd))
         try:
             process = subprocess.Popen(
                 cmd,
@@ -995,7 +1135,7 @@ class RalphLoop:
                     {
                         **self._debug_context,
                         "reason": "no_text_extracted",
-                        "model": self.model,
+                        "model": model_for_phase,
                         "command": list(cmd),
                         "returncode": process.returncode,
                         "json_lines_seen": json_lines_seen,
@@ -1194,7 +1334,7 @@ class RalphLoop:
                 logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
                 # Use pi to run the plan skill so the configured model is used.
                 try:
-                    self._run_pi(f"/skill:plan {target_id}")
+                    self._run_pi(f"/skill:plan {target_id}", phase="planning")
                 except RalphError as e:
                     raise RalphError(f"plan command failed: {e}") from e
                 logger.info("ralph.autoplan.plan_complete target=%s", target_id)
@@ -1229,7 +1369,7 @@ class RalphLoop:
             logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
             # Use pi to run the plan skill so the configured model is used.
             try:
-                self._run_pi(f"/skill:plan {target_id}")
+                self._run_pi(f"/skill:plan {target_id}", phase="planning")
             except RalphError as e:
                 raise RalphError(f"plan command failed: {e}") from e
             logger.info("ralph.autoplan.plan_complete target=%s", target_id)
@@ -1487,7 +1627,7 @@ class RalphLoop:
                 invocations,
             )
             try:
-                self._run_pi("/compact")
+                self._run_pi("/compact", phase="implementation")
             except Exception as exc:
                 failures += 1
                 logger.warning(
@@ -1565,7 +1705,7 @@ class RalphLoop:
                         exc,
                     )
                     previous_child_stages = {}
-                implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation))
+                implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation), phase="intake")
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
                 invocations, failures = self._compact_after_child_transition(focus_id, previous_child_stages, attempt)
                 compact_invocations += invocations
@@ -1617,7 +1757,7 @@ class RalphLoop:
                         exc,
                     )
                     previous_child_stages = {}
-                implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation))
+                implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation), phase="implementation")
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
                 invocations, failures = self._compact_after_child_transition(focus_id, previous_child_stages, attempt)
                 compact_invocations += invocations
@@ -1652,7 +1792,7 @@ class RalphLoop:
                 logger.info("ralph.loop.audit.skipped_using_persisted target=%s attempt=%d", focus_id, attempt)
             else:
                 # Run the audit skill; it MUST persist the structured audit to the work item.
-                self._run_pi(f"/skill:audit {focus_id}")
+                self._run_pi(f"/skill:audit {focus_id}", phase="audit")
             # Read the persisted audit from the work item via wl show.
             item = self._wl_show(focus_id).get("workItem", {})
             # Normalize persisted audit extraction to handle both object and string shapes.
@@ -1741,7 +1881,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="Suppress console progress output and pi streaming (only print final JSON result)")
     parser.add_argument("--verbose", action="store_true", help="Show detailed delegation commands and subprocess output")
     parser.add_argument("--no-stream", action="store_true", help="Don't stream pi subprocess output to console (use buffered capture instead)")
-    parser.add_argument("--model", default=None, help=f"Model to use for pi run (default: {DEFAULT_MODEL}, or 'model' key in .ralph.json)")
+    parser.add_argument("--model", default=None, help=f"Legacy single model for all phases (default: {DEFAULT_MODEL}, or string 'model' key in .ralph.json)")
+    parser.add_argument("--model-source", choices=sorted(MODEL_SOURCES), default=None, help="Model source for phase defaults/config (remote|local). Default is remote.")
+    parser.add_argument("--model-intake", default=None, help="Override intake phase model")
+    parser.add_argument("--model-planning", default=None, help="Override planning phase model")
+    parser.add_argument("--model-implementation", default=None, help="Override implementation phase model")
+    parser.add_argument("--model-audit", default=None, help="Override audit phase model")
     parser.add_argument("--pi-bin", default="pi")
     parser.add_argument("--wl-bin", default="wl")
     parser.add_argument("--no-autoplan", action="store_true", help="Disable the auto-plan step for intake_complete items (proceed directly to implement)")
@@ -1785,10 +1930,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     autoplan_effort_skip = frozenset(args.autoplan_effort_skip) if args.autoplan_effort_skip else None
     autoplan_risk_skip = frozenset(args.autoplan_risk_skip) if args.autoplan_risk_skip else None
 
+    config = _load_config()
+    legacy_config_model = _extract_legacy_model_from_config(config)
+    phase_model_config = _extract_phase_model_config(config)
+    config_model_source_raw = config.get("model_source") if isinstance(config, dict) else None
+
+    model_source_explicit = args.model_source is not None or config_model_source_raw is not None
+    legacy_model_explicit = args.model is not None or legacy_config_model is not None
+    effective_model_source = _normalize_model_source(args.model_source or config_model_source_raw)
+
     loop = RalphLoop(
         pi_bin=args.pi_bin,
         wl_bin=args.wl_bin,
-        model=_resolve_model(args.model, _load_config().get("model")),
+        model=_resolve_model(args.model, legacy_config_model),
+        model_source=effective_model_source,
+        model_intake=args.model_intake,
+        model_planning=args.model_planning,
+        model_implementation=args.model_implementation,
+        model_audit=args.model_audit,
+        model_config=phase_model_config,
+        model_source_explicit=model_source_explicit,
+        legacy_model_explicit=legacy_model_explicit,
         check_cmds=args.check_cmd,
         max_attempts=args.max_attempts,
         confirm_merge=args.confirm_merge,

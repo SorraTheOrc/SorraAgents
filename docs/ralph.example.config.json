@@ -1,0 +1,22 @@
+{
+  "model_source": "remote",
+  "model": {
+    "intake": {
+      "remote": "Claude Opus 4.7",
+      "local": "Llama-3.1 70B (Q4_K_M)"
+    },
+    "planning": {
+      "remote": "GPT 5.5",
+      "local": "Qwen 3.x 32B"
+    },
+    "implementation": {
+      "remote": "Qwen 3.6 Plus",
+      "local": "Qwen 32B"
+    },
+    "audit": {
+      "remote": "Claude Opus 4.7",
+      "local": "Llama-3.1 70B (Q4_K_M)"
+    }
+  },
+  "max_attempts": 10
+}

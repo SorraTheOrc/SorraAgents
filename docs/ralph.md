@@ -50,7 +50,12 @@ The background launcher stores the current runtime context in `.worklog/ralph/cu
 | `--quiet` | off | Suppress all console output and pi streaming; only print the final JSON result. |
 | `--verbose` | off | Show detailed delegation commands, subprocess stdout/stderr, and raw audit output. |
 | `--no-stream` | off | Don't stream pi subprocess output to console (use buffered capture). Progress logging still shown. |
-| `--model` | `opencode-go/glm-5.1` | Model ID to pass to `pi run --model`. Can also be set in `.ralph.json`. |
+| `--model` | `opencode-go/glm-5.1` | Legacy single-model override applied to all phases when per-phase mode is not enabled. |
+| `--model-source` | `remote` | Selects source-specific per-phase model defaults and source-mapped config values: `remote` or `local`. No automatic fallback between sources. |
+| `--model-intake` | (none) | Override the intake phase model for this run. |
+| `--model-planning` | (none) | Override the planning phase model for this run. |
+| `--model-implementation` | (none) | Override the implementation phase model for this run. |
+| `--model-audit` | (none) | Override the audit phase model for this run. |
 | `--pi-bin` | `pi` | Path to the `pi` binary for delegating implement and audit. |
 | `--wl-bin` | `wl` | Path to the `wl` binary for worklog operations. |
 | `--no-autoplan` | off | Disable the auto-plan step for `intake_complete` items. When set, ralph proceeds directly to implementation without running effort-and-risk evaluation. |
@@ -132,23 +137,80 @@ Key semantics:
 
 ## Configuration File
 
-Ralph reads settings from a `.ralph.json` file in the current directory (or `ralph.config.json`). The file is a simple JSON object. Values from the config file are used as defaults; CLI flags take precedence.
+Ralph reads settings from a `.ralph.json` file in the current directory (or `ralph.config.json`). The file is a simple JSON object. Values from the config file are defaults; CLI flags take precedence.
+
+### Per-phase model config
+
+Ralph supports per-phase model routing for:
+
+- `intake` (first implement pass when starting from `intake_complete`)
+- `planning` (`/skill:plan`)
+- `implementation` (normal implement passes)
+- `audit` (`/skill:audit`)
+
+Use `model_source` to choose which source-specific model to resolve (`remote` or `local`), and per-phase keys under `model`:
 
 ```json
 {
-    "model": "opencode-go/glm-5.1",
-    "max_attempts": 10
+  "model_source": "remote",
+  "model": {
+    "intake": {
+      "remote": "Claude Opus 4.7",
+      "local": "Llama-3.1 70B (Q4_K_M)"
+    },
+    "planning": {
+      "remote": "GPT 5.5",
+      "local": "Qwen 3.x 32B"
+    },
+    "implementation": {
+      "remote": "Qwen 3.6 Plus",
+      "local": "Qwen 32B"
+    },
+    "audit": {
+      "remote": "Claude Opus 4.7",
+      "local": "Llama-3.1 70B (Q4_K_M)"
+    }
+  },
+  "max_attempts": 10
 }
 ```
 
-The file supports these keys:
+A copy/pasteable example is also available at `docs/ralph.example.config.json`.
+
+Equivalent dotted keys are also supported (for example: `model.intake`, `model.planning`, `model.implementation`, `model.audit`, and optionally `model.remote.intake`/`model.local.intake`).
+
+### Supported model keys
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `model` | string | Model ID passed to `pi -p --mode json --model <model>`. Overrides the default. |
-| `max_attempts` | integer | Default maximum implement→audit cycles. Overridden by `--max-attempts` CLI flag. |
+| `model_source` | string | `remote` or `local`. Defaults to `remote`. No implicit remote↔local fallback is attempted. |
+| `model` | string | Legacy single-model config for all phases (backward compatibility path). |
+| `model.intake` | string/object | Intake phase model. String applies to both sources; object can provide `{ "remote": "...", "local": "..." }`. |
+| `model.planning` | string/object | Planning phase model. |
+| `model.implementation` | string/object | Implementation phase model. |
+| `model.audit` | string/object | Audit phase model. |
+| `max_attempts` | integer | Default maximum implement→audit cycles. Overridden by `--max-attempts`. |
 
-A config key like `"model"` sets the default model used for all `pi run` commands. Command-line `--model` overrides it.
+### Resolution precedence
+
+For each phase, Ralph resolves `--model` passed to `pi` in this order:
+
+1. CLI phase override (`--model-intake`, `--model-planning`, `--model-implementation`, `--model-audit`)
+2. Per-phase config (`model.<phase>`)
+3. Legacy single model (`--model` CLI or string `model` config)
+4. `DEFAULT_MODEL` (`opencode-go/glm-5.1`) when per-phase mode is not enabled
+5. Canonical source-specific defaults (below) when per-phase mode is enabled but no explicit per-phase value is provided
+
+Canonical defaults used by per-phase mode:
+
+- intake: remote `Claude Opus 4.7`; local `Llama-3.1 70B (Q4_K_M)`
+- planning: remote `GPT 5.5`; local `Qwen 3.x 32B`
+- implementation: remote `Qwen 3.6 Plus`; local `Qwen 32B`
+- audit: remote `Claude Opus 4.7`; local `Llama-3.1 70B (Q4_K_M)`
+
+### Migration note
+
+Existing single-model behavior is preserved when no per-phase config/flags are supplied: Ralph continues to use the legacy single model (`--model` / string `model` / `DEFAULT_MODEL`) for all phases.
 
 ## Exit Codes
 

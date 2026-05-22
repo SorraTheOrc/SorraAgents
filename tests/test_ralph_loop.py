@@ -1650,3 +1650,109 @@ def test_cli_parser_autoplan_flags():
     assert args.no_autoplan is True
     assert args.autoplan_effort_skip == ["Small", "Extra Small"]
     assert args.autoplan_risk_skip == ["Low"]
+
+
+def _extract_pi_model(call: list[str]) -> str:
+    model_idx = call.index("--model")
+    return call[model_idx + 1]
+
+
+def test_cli_parser_accepts_phase_model_flags_and_source():
+    parser = build_parser()
+    args = parser.parse_args([
+        "SA-X5",
+        "--model-source", "local",
+        "--model-intake", "intake-cli-model",
+        "--model-planning", "planning-cli-model",
+        "--model-implementation", "implementation-cli-model",
+        "--model-audit", "audit-cli-model",
+    ])
+    assert args.model_source == "local"
+    assert args.model_intake == "intake-cli-model"
+    assert args.model_planning == "planning-cli-model"
+    assert args.model_implementation == "implementation-cli-model"
+    assert args.model_audit == "audit-cli-model"
+
+
+def test_single_model_backward_compatibility_without_new_phase_inputs():
+    from skill.ralph.scripts.ralph_loop import DEFAULT_MODEL
+
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+
+    pi_calls = [c for c in runner.calls if c and c[0] == "pi" and "-p" in c]
+    assert pi_calls
+    assert all(_extract_pi_model(call) == DEFAULT_MODEL for call in pi_calls)
+
+
+@pytest.mark.parametrize(
+    ("model_source", "expected_model"),
+    [
+        ("remote", "Claude Opus 4.7"),
+        ("local", "Llama-3.1 70B (Q4_K_M)"),
+    ],
+)
+def test_intake_flow_uses_source_specific_default_model(model_source, expected_model):
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 1}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, model_source=model_source)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+
+    implement_calls = [c for c in runner.calls if c and c[0] == "pi" and "-p" in c and c[-1].startswith("implement")]
+    assert implement_calls
+    assert _extract_pi_model(implement_calls[0]) == expected_model
+
+
+@pytest.mark.parametrize(
+    ("model_source", "expected_model"),
+    [
+        ("remote", "GPT 5.5"),
+        ("local", "Qwen 3.x 32B"),
+    ],
+)
+def test_planning_flow_uses_source_specific_default_model(model_source, expected_model):
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Medium"}, "risk": {"level": "High", "score": 15}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, model_source=model_source)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+
+    plan_calls = [c for c in runner.calls if c and c[0] == "pi" and "-p" in c and c[-1].startswith("/skill:plan")]
+    assert plan_calls
+    assert _extract_pi_model(plan_calls[0]) == expected_model
+
+
+def test_phase_model_cli_override_has_highest_precedence_for_audit():
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(
+        runner=runner,
+        stream=False,
+        model="legacy-model",
+        model_source="remote",
+        model_audit="audit-cli-model",
+        model_config={
+            "audit": {
+                "remote": "audit-config-remote",
+                "local": "audit-config-local",
+            }
+        },
+    )
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+
+    audit_calls = [c for c in runner.calls if c and c[0] == "pi" and "-p" in c and c[-1].startswith("/skill:audit")]
+    assert audit_calls
+    assert _extract_pi_model(audit_calls[0]) == "audit-cli-model"
