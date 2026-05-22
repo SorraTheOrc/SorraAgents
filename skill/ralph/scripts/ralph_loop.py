@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -711,6 +712,9 @@ class RalphLoop:
         # Watchdog used by streamed pi runs so a stuck stdout pipe fails fast
         # instead of blocking the orchestration loop forever.
         self.pi_stream_timeout_seconds = 60.0
+        # Grace period (seconds) for waiting after SIGTERM before escalating to SIGKILL
+        self.pi_cleanup_timeout = 5.0
+        self._pi_process: subprocess.Popen | None = None
         self._debug_context: dict[str, object] = {}
         self._last_structured_response: StructuredResponse | None = None
 
@@ -955,6 +959,7 @@ class RalphLoop:
             )
         except FileNotFoundError:
             raise RalphError(f"pi binary not found: {self.pi_bin}")
+        self._pi_process = process
 
         text_parts: list[str] = []
         complete_blocks: list[str] = []
@@ -1075,6 +1080,7 @@ class RalphLoop:
                 except subprocess.TimeoutExpired:
                     _mark_stalled("waiting for pi to exit")
         finally:
+            self._pi_process = None
             try:
                 process.wait(timeout=1)
             except Exception:
@@ -1172,6 +1178,80 @@ class RalphLoop:
 
         logger.info("ralph.cmd.pi.stream_end returncode=%d text_len=%d", process.returncode, len(full_text))
         return full_text
+
+    def _cleanup_pi_process(self) -> None:
+        """Clean up any lingering Pi subprocess after loop completion.
+
+        Attempts graceful termination first (SIGTERM), then escalates to
+        forced termination (SIGKILL) after a configurable grace period.
+        Safe to call even if the process has already exited.
+        """
+        process = self._pi_process
+        if process is None:
+            return
+
+        pid = process.pid
+        if pid is None:
+            self._pi_process = None
+            return
+
+        poll = process.poll()
+        if poll is not None:
+            logger.info(
+                "ralph.cleanup.pi.already_exited pid=%d returncode=%s",
+                pid, poll,
+            )
+            self._pi_process = None
+            return
+
+        logger.info(
+            "ralph.cleanup.pi.sending_sigterm pid=%d timeout=%.1f",
+            pid, self.pi_cleanup_timeout,
+        )
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            logger.info("ralph.cleanup.pi.already_gone pid=%d", pid)
+            self._pi_process = None
+            return
+        except OSError as exc:
+            logger.warning(
+                "ralph.cleanup.pi.sigterm_failed pid=%d error=%s",
+                pid, exc,
+            )
+
+        try:
+            process.wait(timeout=self.pi_cleanup_timeout)
+            logger.info(
+                "ralph.cleanup.pi.graceful_exit pid=%d returncode=%s",
+                pid, process.returncode,
+            )
+            self._pi_process = None
+            return
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "ralph.cleanup.pi.graceful_timeout pid=%d escalating_to_sigkill",
+                pid,
+            )
+
+        try:
+            process.kill()
+            process.wait(timeout=1.0)
+            logger.warning(
+                "ralph.cleanup.pi.forced_kill pid=%d returncode=%s",
+                pid, process.returncode,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "ralph.cleanup.pi.sigkill_wait_timeout pid=%d", pid,
+            )
+        except OSError as exc:
+            logger.warning(
+                "ralph.cleanup.pi.kill_failed pid=%d error=%s",
+                pid, exc,
+            )
+
+        self._pi_process = None
 
     def _run_checks(self) -> None:
         for cmd in self.check_cmds:
@@ -1678,6 +1758,7 @@ class RalphLoop:
         for attempt in range(1, self.max_attempts + 1):
             if self.cancel_file and os.path.exists(self.cancel_file):
                 logger.info("ralph.loop.cancelled target=%s attempt=%d", focus_id, attempt)
+                self._cleanup_pi_process()
                 return {
                     "status": "cancelled",
                     "attempt": attempt,
@@ -1738,6 +1819,7 @@ class RalphLoop:
                         attempt,
                         no_safe_path_reason,
                     )
+                    self._cleanup_pi_process()
                     return {
                         "status": "producer_input_required",
                         "attempt": attempt,
@@ -1790,6 +1872,7 @@ class RalphLoop:
                         attempt,
                         no_safe_path_reason,
                     )
+                    self._cleanup_pi_process()
                     return {
                         "status": "producer_input_required",
                         "attempt": attempt,
@@ -1849,6 +1932,7 @@ class RalphLoop:
                 self._run_checks()
                 logger.info("ralph.loop.merge target=%s confirm=%s", focus_id, self.confirm_merge)
                 self._run_merge()
+                self._cleanup_pi_process()
                 return {
                     "status": "success",
                     "attempt": attempt,
@@ -1874,6 +1958,7 @@ class RalphLoop:
             )
 
         logger.warning("ralph.loop.max_attempts target=%s", focus_id)
+        self._cleanup_pi_process()
         return {
             "status": "max_attempts",
             "attempt": self.max_attempts,

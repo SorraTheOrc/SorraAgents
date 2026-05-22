@@ -35,6 +35,16 @@ For direct foreground debugging, run the script locally:
 Delegated `pi` and `wl` commands are logged before execution in both normal console output and `--json` output, so operators and automation can see the exact command Ralph ran.
 If streamed `pi` output stops producing stdout and keeps the pipe open too long, Ralph will terminate the run with a clear stall error instead of hanging indefinitely.
 
+## Pi subprocess cleanup at loop completion
+
+When Ralph's implement→audit loop ends (whether by success, cancellation, max attempts, or producer-input-required), it runs a deterministic cleanup step for any lingering Pi subprocess:
+
+1. **Graceful shutdown**: Sends SIGTERM to the Pi process and waits up to the configured grace period (default 5 seconds).
+2. **Escalation**: If the process has not exited within the grace period, sends SIGKILL (via `process.kill()`) and waits up to 1 second for it to drain.
+3. **Observability**: Every step is logged with distinct event names so operators can distinguish normal completion (`ralph.cleanup.pi.graceful_exit`) from forced termination (`ralph.cleanup.pi.forced_kill`) in the log output.
+
+The cleanup is safe to call even if the process has already exited — it checks `process.poll()` before sending any signals.
+
 ### Per-phase model routing
 
 Ralph supports phase-specific model selection for `intake`, `planning`, `implementation`, and `audit`.

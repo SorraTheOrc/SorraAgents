@@ -273,8 +273,28 @@ DEBUG ralph ralph.loop.audit.parsed target=SA-1234 attempt=1 ready=False criteri
 
 ## Observability
 
+## Pi process cleanup at loop completion
+
+When Ralph's implement→audit loop ends (regardless of outcome — success, cancellation, max attempts, or producer-input-required), a deterministic cleanup step ensures no orphaned Pi subprocess remains:
+
+1. **Check**: If no Pi process is tracked, or it has already exited, cleanup returns immediately.
+2. **Graceful shutdown**: Sends SIGTERM to the Pi process and waits up to `pi_cleanup_timeout` seconds (configurable, default 5.0) for it to exit.
+3. **Escalation**: If the process has not exited within the grace period, sends SIGKILL via `process.kill()` and waits up to 1 second for it to drain.
+4. **Safe to retry**: If the process was already gone (e.g., `ProcessLookupError`), cleanup handles it gracefully without raising.
+
+### Observability events
+
 Ralph emits structured log events at key lifecycle points using the `ralph` Python logger:
 
+| `ralph.cleanup.pi.already_exited` | INFO | pid, returncode |
+| `ralph.cleanup.pi.sending_sigterm` | INFO | pid, timeout |
+| `ralph.cleanup.pi.already_gone` | INFO | pid |
+| `ralph.cleanup.pi.sigterm_failed` | WARNING | pid, error |
+| `ralph.cleanup.pi.graceful_exit` | INFO | pid, returncode |
+| `ralph.cleanup.pi.graceful_timeout` | WARNING | pid, escalating_to_sigkill |
+| `ralph.cleanup.pi.forced_kill` | WARNING | pid, returncode |
+| `ralph.cleanup.pi.sigkill_wait_timeout` | WARNING | pid |
+| `ralph.cleanup.pi.kill_failed` | WARNING | pid, error |
 | Event | Level | Data |
 |-------|-------|------|
 | `ralph.loop.start` | INFO | target, scope, max_attempts |
