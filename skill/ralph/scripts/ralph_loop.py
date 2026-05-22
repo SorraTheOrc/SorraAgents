@@ -282,6 +282,24 @@ def _build_remediation_prompt() -> str:
     return "The previous audit found issues. Address all the gaps identified in the audit."
 
 
+def _build_implement_prompt(work_item_id: str, remediation: str = "") -> str:
+    """Build the non-interactive implement prompt for Ralph.
+
+    The implement step must never ask the producer questions during the
+    default loop. If the model cannot continue safely, it must return a
+    structured no_safe_path response that names the missing producer decision.
+    """
+    parts = [
+        f"implement {work_item_id}",
+        "Continue until the work item and all dependencies are completed, but do not merge.",
+        "Do not ask the producer questions or pause for interactive input.",
+        "If you cannot continue safely without explicit producer input, stop and return a structured no_safe_path response with the missing decision.",
+    ]
+    if remediation:
+        parts.append(remediation)
+    return "\n".join(parts)
+
+
 def _extract_text_from_content(content: object) -> str | None:
     """Recursively extract user-facing text from a JSON content payload."""
     if isinstance(content, str):
@@ -1399,6 +1417,39 @@ class RalphLoop:
             return ""
         return response.remediation_hint()
 
+    def _extract_no_safe_path_reason(self, implement_output: str = "") -> str:
+        """Return the missing producer decision when the model cannot proceed safely."""
+        response = self._last_structured_response
+        if response:
+            for action in response.actions:
+                if action.command == "no_safe_path":
+                    reason = " ".join(part for part in action.args if part).strip()
+                    if reason:
+                        return reason
+                    if response.summary:
+                        return response.summary.strip()
+                    if response.text:
+                        return response.text.strip()
+            for candidate in (response.summary, response.text):
+                if not candidate:
+                    continue
+                lowered = candidate.strip().lower()
+                if lowered.startswith("no safe path"):
+                    return candidate.strip()
+
+        text = implement_output.strip()
+        if not text:
+            return ""
+        lowered = text.lower()
+        for prefix in ("no safe path:", "no_safe_path:", "producer_input_required:"):
+            if lowered.startswith(prefix):
+                reason = text[len(prefix):].strip()
+                if reason:
+                    return reason
+        if lowered.startswith("no safe path"):
+            return text
+        return ""
+
     def _compact_after_child_transition(
         self,
         target_id: str,
@@ -1504,13 +1555,6 @@ class RalphLoop:
                 except Exception:
                     logger.exception("ralph.loop.autoplan.unexpected target=%s", focus_id)
                 # After autoplan (whether plan ran or not), proceed to implement
-                prompt_parts = [
-                    f"implement {focus_id}",
-                    "Continue until the work item and all dependencies are completed, but do not merge.",
-                ]
-                # Add a short remediation instruction if an audit produced unmet criteria previously
-                if remediation:
-                    prompt_parts.append(remediation)
                 try:
                     previous_child_stages = self._child_stage_map(focus_id)
                 except Exception as exc:
@@ -1521,7 +1565,8 @@ class RalphLoop:
                         exc,
                     )
                     previous_child_stages = {}
-                self._run_pi("\n".join(prompt_parts))
+                implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation))
+                no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
                 invocations, failures = self._compact_after_child_transition(focus_id, previous_child_stages, attempt)
                 compact_invocations += invocations
                 compact_failures += failures
@@ -1533,6 +1578,20 @@ class RalphLoop:
                         compact_invocations,
                         compact_failures,
                     )
+                if no_safe_path_reason:
+                    logger.warning(
+                        "ralph.loop.no_safe_path target=%s attempt=%d reason=%s",
+                        focus_id,
+                        attempt,
+                        no_safe_path_reason,
+                    )
+                    return {
+                        "status": "producer_input_required",
+                        "attempt": attempt,
+                        "scope": scope_ids,
+                        "reason": no_safe_path_reason,
+                        "compact": {"invocations": compact_invocations, "failures": compact_failures},
+                    }
             elif skip_implement and attempt == 1:
                 # Target already in_review — decide whether start-of-iteration audit is needed
                 logger.info("ralph.loop.skip_implement target=%s stage=in_review", focus_id)
@@ -1548,12 +1607,6 @@ class RalphLoop:
                 except Exception:
                     logger.exception("ralph.loop.pre_audit_check_failed target=%s", focus_id)
             else:
-                prompt_parts = [
-                    f"implement {focus_id}",
-                    "Continue until the work item and all dependencies are completed, but do not merge.",
-                ]
-                if remediation:
-                    prompt_parts.append(remediation)
                 try:
                     previous_child_stages = self._child_stage_map(focus_id)
                 except Exception as exc:
@@ -1564,7 +1617,8 @@ class RalphLoop:
                         exc,
                     )
                     previous_child_stages = {}
-                self._run_pi("\n".join(prompt_parts))
+                implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation))
+                no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
                 invocations, failures = self._compact_after_child_transition(focus_id, previous_child_stages, attempt)
                 compact_invocations += invocations
                 compact_failures += failures
@@ -1576,6 +1630,20 @@ class RalphLoop:
                         compact_invocations,
                         compact_failures,
                     )
+                if no_safe_path_reason:
+                    logger.warning(
+                        "ralph.loop.no_safe_path target=%s attempt=%d reason=%s",
+                        focus_id,
+                        attempt,
+                        no_safe_path_reason,
+                    )
+                    return {
+                        "status": "producer_input_required",
+                        "attempt": attempt,
+                        "scope": scope_ids,
+                        "reason": no_safe_path_reason,
+                        "compact": {"invocations": compact_invocations, "failures": compact_failures},
+                    }
 
             logger.info("ralph.loop.audit.start target=%s attempt=%d", focus_id, attempt)
             # Run the audit skill unless we've determined that the persisted audit
@@ -1756,6 +1824,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if result.get("status") == "cancelled":
         return 3
+    if result.get("status") == "producer_input_required":
+        return 2
     return 4
 
 

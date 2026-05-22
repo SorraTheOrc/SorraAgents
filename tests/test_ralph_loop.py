@@ -263,6 +263,19 @@ def test_cancel_file_stops_loop():
     assert result["status"] == "cancelled"
 
 
+def test_no_safe_path_response_stops_without_audit():
+    runner = NoSafePathRunner()
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "producer_input_required"
+    assert "Need producer decision" in result["reason"]
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    assert any(prompt.startswith("implement SA-TARGET") for prompt in pi_prompts)
+    assert not any(prompt.startswith("/skill:audit") for prompt in pi_prompts)
+
+
 def test_max_attempts_returns_max_attempts_status():
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL]
@@ -419,6 +432,32 @@ def test_main_returns_error_on_precondition_failure():
         loop.run("SA-TARGET")
 
 
+def test_main_returns_json_and_exit_code_for_producer_input_required(monkeypatch, capsys):
+    from skill.ralph.scripts import ralph_loop
+
+    class FakeLoop:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def run(self, *args, **kwargs):
+            return {
+                "status": "producer_input_required",
+                "attempt": 1,
+                "scope": ["SA-TARGET"],
+                "reason": "Need producer decision on whether to split the work item.",
+            }
+
+    monkeypatch.setattr(ralph_loop, "RalphLoop", FakeLoop)
+
+    exit_code = ralph_loop.main(["SA-TARGET", "--json"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert '"status": "producer_input_required"' in captured.out
+    assert "Need producer decision" in captured.out
+
+
 class FakeRunnerWithPushFailure(FakeRunner):
     def __call__(self, cmd):
         if cmd and cmd[:2] == ["git", "push"]:
@@ -439,6 +478,29 @@ class FakeRunnerWithCheckFailure(FakeRunner):
     def __call__(self, cmd):
         if cmd and cmd[:2] == ["bash", "-lc"] and "pytest" in cmd[2]:
             return Result(returncode=1, stderr="1 test failed")
+        return super().__call__(cmd)
+
+
+class NoSafePathRunner(FakeRunner):
+    def __call__(self, cmd):
+        cmd = list(cmd)
+        if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("implement"):
+            self.calls.append(cmd)
+            return Result(
+                stdout=json.dumps(
+                    {
+                        "summary": "I cannot continue safely without producer input.",
+                        "actions": [
+                            {
+                                "command": "no_safe_path",
+                                "args": [
+                                    "Need producer decision on whether to split SA-TARGET before implementation."
+                                ],
+                            }
+                        ],
+                    }
+                )
+            )
         return super().__call__(cmd)
 
 
@@ -632,6 +694,8 @@ def test_verbose_mode_logs_pi_output_start():
         assert len(prompt_msgs) >= 1
         # The prompt should contain the implement instruction in full
         assert "Continue until the work item and all dependencies are completed, but do not merge." in prompt_msgs[0].getMessage()
+        assert "If you cannot continue safely without explicit producer input" in prompt_msgs[0].getMessage()
+        assert "structured no_safe_path response" in prompt_msgs[0].getMessage()
         # text_start should be logged (the extracted text content)
         text_msgs = [r for r in pi_debug_msgs if "text_start" in r.getMessage()]
         assert len(text_msgs) >= 1

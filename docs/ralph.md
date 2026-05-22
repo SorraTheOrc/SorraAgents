@@ -10,7 +10,7 @@ Ralph drives an iterative cycle of:
 2. **Compact on child transition** — after each implement pass, detect children that moved to `in_review` and invoke `/compact` once per transition before auditing.
 3. **Audit** — run the `audit` skill and persist structured results.
 4. **Remediate** — if audit finds unmet or partial criteria, feed those into the next implement pass.
-5. **Repeat** until audit passes, max attempts are reached, or the operator cancels.
+5. **Repeat** until audit passes, max attempts are reached, the model reports no safe path without producer input, or the operator cancels.
 
 Ralph is launched from the `skill/ralph/ralph` wrapper. The wrapper starts the deterministic loop in the background under `nohup`, writes runtime context under `.worklog/ralph/`, and exposes `ralph status` for live or post-exit inspection.
 
@@ -155,7 +155,7 @@ A config key like `"model"` sets the default model used for all `pi run` command
 | Code | Meaning |
 |------|---------|
 | 0 | Success — audit passed, checks passed, merge offered |
-| 2 | Error — precondition failure or command error |
+| 2 | Error — precondition failure, command error, or producer-input-required stop |
 | 3 | Cancelled — cancel file detected |
 | 4 | Max attempts reached — loop exhausted without success |
 
@@ -223,6 +223,7 @@ Ralph emits structured log events at key lifecycle points using the `ralph` Pyth
 | `ralph.loop.checks.start` | INFO | target |
 | `ralph.loop.merge` | INFO | target, confirm flag |
 | `ralph.loop.cancelled` | INFO | target, attempt |
+| `ralph.loop.no_safe_path` | WARNING | target, attempt, reason |
 | `ralph.loop.max_attempts` | WARNING | target |
 | `ralph.compact.transition` | INFO | target, child, attempt, `compact.invocations` |
 | `ralph.compact.failed` | WARNING | target, child, attempt, `compact.failures`, error |
@@ -238,6 +239,10 @@ The final JSON result now includes a `compact` object:
   }
 }
 ```
+
+## No safe path stop condition
+
+If the implement step returns a structured `no_safe_path` response, Ralph stops immediately with `status: producer_input_required`, includes the model-provided reason in the JSON result and warning logs, and skips the audit step for that attempt. This keeps the loop non-interactive when the model cannot continue safely without producer input.
 
 ## Auto-Plan Decision
 
