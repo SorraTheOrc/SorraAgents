@@ -28,8 +28,7 @@ Worklog work item through the creation of code, tests, and documentation.
 
 ## References to Bundled Resources
 
-- Intake/interview helpers: `.opencode/command/intake.md`,
-  `.opencode/command/plan.md`.
+- Intake/interview helpers: `intake`, `plan`.
 
 Security note: Do not push or create PRs automatically unless the invoking
 agent has explicit permission to push to the repository and open pull
@@ -70,7 +69,6 @@ any sensitive values before writing them to logs or comments.
   - always reference new assets in the work item comments and PR description. Ensure that any generated assets are included in the commit and pushed to the repository.
   - when creating assets, ensure they are optimized for size and performance, and follow any project guidelines for asset creation and management.
   - you can discover assets on the web as part of your implementation, but ensure that you have the right to use and distribute any assets you include in the project. Always provide proper attribution if required by the asset's license.
-  - any
 - If the implementation requires changes to documentation, update the relevant markdown files in the `docs` directory and reference these changes in the work item comments and PR description.
   - ensure that documentation changes are clear, concise, and accurately reflect the implementation changes. Include examples or screenshots if they help clarify the documentation.
 
