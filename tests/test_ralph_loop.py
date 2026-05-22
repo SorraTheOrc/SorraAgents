@@ -1,10 +1,11 @@
+import json
 import os
 import tempfile
+import threading
 from dataclasses import dataclass
 
 import pytest
 
-import json
 from skill.ralph.scripts.ralph_loop import JsonLineFormatter, RalphError, RalphLoop, build_parser, parse_audit_report
 
 
@@ -13,6 +14,14 @@ class Result:
     returncode: int = 0
     stdout: str = ""
     stderr: str = ""
+
+
+class LineStream:
+    def __init__(self, lines):
+        self._lines = iter(lines)
+
+    def readline(self):
+        return next(self._lines, "")
 
 
 class FakeRunner:
@@ -639,7 +648,7 @@ def test_stream_pi_captures_and_returns_output():
     # Simulate a pi subprocess producing pi JSON protocol events
     fake_process = MagicMock()
     fake_process.returncode = 0
-    fake_process.stdout = iter([
+    fake_process.stdout = LineStream([
         '{"type":"agent_start"}\n',
         '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"thinking"}}\n',
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello "}}\n',
@@ -666,7 +675,7 @@ def test_stream_pi_verbose_logs_raw_json(capsys):
 
     fake_process = MagicMock()
     fake_process.returncode = 0
-    fake_process.stdout = iter([
+    fake_process.stdout = LineStream([
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello"}}\n',
         '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"internal"}}\n',
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":" World"}}\n',
@@ -704,12 +713,79 @@ def test_stream_pi_verbose_logs_raw_json(capsys):
         logger.removeHandler(handler)
 
 
+def test_stream_pi_times_out_when_stdout_stalls(capsys):
+    import subprocess
+    from unittest.mock import patch
+
+    class BlockingStdout:
+        def __init__(self, stop_event):
+            self.stop_event = stop_event
+            self.calls = 0
+
+        def readline(self):
+            self.calls += 1
+            if self.calls == 1:
+                return '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello"}}\n'
+            self.stop_event.wait()
+            return ""
+
+    class BlockingStderr:
+        def __init__(self, stop_event):
+            self.stop_event = stop_event
+            self.calls = 0
+
+        def read(self, size=-1):
+            if self.calls == 0:
+                self.calls += 1
+                return "stderr detail\n"
+            self.stop_event.wait()
+            return ""
+
+    class BlockingProcess:
+        def __init__(self):
+            self.stop_event = threading.Event()
+            self.stdout = BlockingStdout(self.stop_event)
+            self.stderr = BlockingStderr(self.stop_event)
+            self.returncode = None
+            self.killed = False
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+            self.stop_event.set()
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                if timeout is None:
+                    self.stop_event.wait()
+                elif not self.stop_event.wait(timeout):
+                    raise subprocess.TimeoutExpired(cmd=["pi"], timeout=timeout)
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    fake_process = BlockingProcess()
+    with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process):
+        loop = RalphLoop(verbose=False, stream=True)
+        loop.pi_bin = "echo"
+        loop.pi_stream_timeout_seconds = 0.01
+        with pytest.raises(RalphError, match="pi stream stalled"):
+            loop._stream_pi(["echo", "test"], "test prompt")
+
+    captured = capsys.readouterr()
+    assert "Hello" in captured.out
+    assert fake_process.killed is True
+
+
 def test_debug_persist_writes_raw_payload_for_no_text_stream(tmp_path):
     from unittest.mock import patch, MagicMock
 
     fake_process = MagicMock()
     fake_process.returncode = 0
-    fake_process.stdout = iter([
+    fake_process.stdout = LineStream([
         '{"type":"session","id":"session-123"}\n',
         '{"type":"agent_start"}\n',
         '{"type":"turn_start"}\n',
@@ -753,7 +829,7 @@ def test_run_pi_stream_mode_uses_ephemeral_sessions():
 
     fake_process = MagicMock()
     fake_process.returncode = 0
-    fake_process.stdout = iter([])
+    fake_process.stdout = LineStream([])
     fake_process.stderr = MagicMock()
     fake_process.stderr.read.return_value = ""
     fake_process.wait.return_value = None

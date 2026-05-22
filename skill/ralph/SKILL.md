@@ -33,6 +33,7 @@ For direct foreground debugging, run the script locally:
 - Use `--debug-persist` when you need to save raw Pi payloads for `no_text_extracted` debugging.
 
 Delegated `pi` and `wl` commands are logged before execution in both normal console output and `--json` output, so operators and automation can see the exact command Ralph ran.
+If streamed `pi` output stops producing stdout and keeps the pipe open too long, Ralph will terminate the run with a clear stall error instead of hanging indefinitely.
 
 
 ```bash

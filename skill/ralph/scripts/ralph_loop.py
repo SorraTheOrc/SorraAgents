@@ -20,6 +20,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Thread
 from typing import Callable, Iterable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -572,6 +574,9 @@ class RalphLoop:
         # raising an exception).
         self.non_fatal_by_default = {"effort_and_risk"}
         self.debug_persist = debug_persist
+        # Watchdog used by streamed pi runs so a stuck stdout pipe fails fast
+        # instead of blocking the orchestration loop forever.
+        self.pi_stream_timeout_seconds = 60.0
         self._debug_context: dict[str, object] = {}
         self._last_structured_response: StructuredResponse | None = None
 
@@ -771,6 +776,8 @@ class RalphLoop:
         Thinking, metadata, and structural events are suppressed.
         Non-JSON lines are printed as a fallback.
         In verbose mode, raw JSON lines are also logged at DEBUG level.
+        A stdout inactivity watchdog prevents a delegated pi process from
+        hanging Ralph forever when it keeps the pipe open without finishing.
         """
         self._last_structured_response = None
         rendered = _render_command(cmd)
@@ -794,39 +801,133 @@ class RalphLoop:
         text_parts: list[str] = []
         complete_blocks: list[str] = []
         raw_output_parts: list[str] = []
+        stderr_parts: list[str] = []
         json_lines_seen = 0
         text_lines_seen = 0
-        for line in process.stdout:
-            raw_output_parts.append(line)
-            stripped = line.rstrip("\n")
-            if not stripped:
-                continue
-            # Parse the JSON line using pi's streaming protocol
-            stream_text, should_print, complete_text = _parse_pi_json_line(stripped)
-            if stream_text is None and complete_text is None:
-                # Not valid JSON — show raw line as fallback
-                print(line, end="", flush=True)
-                text_parts.append(line)
-                text_lines_seen += 1
-                if self.verbose:
-                    logger.debug("ralph.cmd.pi.raw_line %s", stripped[:500])
-            elif stream_text is not None or complete_text is not None:
-                # Successfully parsed as JSON
-                json_lines_seen += 1
-                if should_print and stream_text:
-                    # User-facing additive text delta — show to operator
-                    print(stream_text, end="", flush=True)
-                    text_parts.append(stream_text)
-                    text_lines_seen += 1
-                if complete_text:
-                    # Complete content block — capture for return value
-                    complete_blocks.append(complete_text)
-                # In verbose mode, also log the raw JSON line
-                if self.verbose:
-                    logger.debug("ralph.cmd.pi.json_line %s", stripped[:500])
+        stdout_queue: Queue[object] = Queue()
+        eof_marker = object()
+        stream_error: BaseException | None = None
+        stalled_reason: str | None = None
 
-        process.wait()
-        stderr = process.stderr.read()
+        def _mark_stalled(reason: str) -> None:
+            nonlocal stalled_reason
+            stalled_reason = reason
+            stderr_snapshot = "".join(stderr_parts).strip()
+            logger.warning(
+                "ralph.cmd.pi.stream_stalled timeout=%.1f reason=%s cmd=%s stderr=%s",
+                self.pi_stream_timeout_seconds,
+                reason,
+                rendered,
+                stderr_snapshot[:1000],
+            )
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+        def _read_stdout() -> None:
+            try:
+                while True:
+                    line = process.stdout.readline()
+                    if line == "":
+                        break
+                    stdout_queue.put(line)
+            except BaseException as exc:
+                stdout_queue.put(exc)
+            finally:
+                stdout_queue.put(eof_marker)
+
+        def _read_stderr() -> None:
+            try:
+                while True:
+                    chunk = process.stderr.read(1024)
+                    if not chunk:
+                        break
+                    stderr_parts.append(chunk)
+            except BaseException as exc:
+                logger.debug("ralph.cmd.pi.stderr_reader_error error=%s", exc)
+
+        stdout_thread = Thread(target=_read_stdout, name="ralph-pi-stdout", daemon=True)
+        stderr_thread = Thread(target=_read_stderr, name="ralph-pi-stderr", daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        try:
+            while True:
+                try:
+                    item = stdout_queue.get(timeout=self.pi_stream_timeout_seconds)
+                except Empty:
+                    poll = getattr(process, "poll", None)
+                    if callable(poll) and poll() is None:
+                        _mark_stalled("waiting for stdout to close")
+                        break
+                    continue
+
+                if item is eof_marker:
+                    break
+                if isinstance(item, BaseException):
+                    stream_error = item
+                    break
+
+                line = item
+                raw_output_parts.append(line)
+                stripped = line.rstrip("\n")
+                if not stripped:
+                    continue
+                # Parse the JSON line using pi's streaming protocol
+                stream_text, should_print, complete_text = _parse_pi_json_line(stripped)
+                if stream_text is None and complete_text is None:
+                    # Not valid JSON — show raw line as fallback
+                    print(line, end="", flush=True)
+                    text_parts.append(line)
+                    text_lines_seen += 1
+                    if self.verbose:
+                        logger.debug("ralph.cmd.pi.raw_line %s", stripped[:500])
+                elif stream_text is not None or complete_text is not None:
+                    # Successfully parsed as JSON
+                    json_lines_seen += 1
+                    if should_print and stream_text:
+                        # User-facing additive text delta — show to operator
+                        print(stream_text, end="", flush=True)
+                        text_parts.append(stream_text)
+                        text_lines_seen += 1
+                    if complete_text:
+                        # Complete content block — capture for return value
+                        complete_blocks.append(complete_text)
+                    # In verbose mode, also log the raw JSON line
+                    if self.verbose:
+                        logger.debug("ralph.cmd.pi.json_line %s", stripped[:500])
+
+            if stream_error is None and stalled_reason is None:
+                try:
+                    process.wait(timeout=self.pi_stream_timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    _mark_stalled("waiting for pi to exit")
+        finally:
+            try:
+                process.wait(timeout=1)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    process.wait(timeout=1)
+                except Exception:
+                    pass
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
+
+        stderr = "".join(stderr_parts)
+        if stream_error is not None:
+            raise RalphError(f"pi stdout reader failed: {stream_error}") from stream_error
+        if stalled_reason is not None:
+            stderr_text = stderr.strip()
+            if stderr_text:
+                raise RalphError(
+                    f"pi stream stalled after {self.pi_stream_timeout_seconds:.0f}s {stalled_reason}: {stderr_text}"
+                )
+            raise RalphError(f"pi stream stalled after {self.pi_stream_timeout_seconds:.0f}s {stalled_reason}")
 
         if process.returncode != 0:
             if self.fail_open and ("pi" not in self.fatal_cmds):

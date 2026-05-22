@@ -183,6 +183,8 @@ Use `--quiet` to suppress all progress output and pi streaming — only the fina
 
 Use `--no-stream` to keep progress logging but disable pi output streaming (output is still captured, just not echoed to the console).
 
+When streaming is enabled, Ralph also watches for stdout inactivity and terminates a stalled `pi` subprocess with a clear error so the loop does not hang forever.
+
 Use `--verbose` to see additional delegation details in addition to the default command logs:
 
 - Raw JSON lines from pi (logged at DEBUG level)
