@@ -146,11 +146,141 @@ def test_status_snapshot_tracks_recent_activity_and_status_deltas(runtime_dir: P
     )
 
     assert snapshot2["state"] == "running"
-    assert snapshot2["recent_activity"] == ["INFO ralph.loop.attempt.start target=SA-TARGET attempt=2"]
+    assert snapshot2["recent_activity"] == [
+        "INFO ralph.loop.start target=SA-TARGET scope=SA-TARGET,SA-CHILD max_attempts=10",
+        "INFO ralph.loop.child_focus parent=SA-TARGET child=SA-CHILD",
+        "INFO ralph.loop.audit.complete target=SA-TARGET attempt=1 ready=False unmet=1 criteria=2",
+        "INFO ralph.loop.attempt.start target=SA-TARGET attempt=2",
+    ]
     assert snapshot2["status_counts"]["in-progress"] == 1
     assert snapshot2["status_counts"]["done"] == 1
     assert snapshot2["status_deltas"]["in-progress"] == 0
     assert snapshot2["status_deltas"]["done"] == 1
+
+
+def test_status_snapshot_ignores_prose_in_recent_lines_and_keeps_structured_active_task(runtime_dir: Path):
+    log_path = runtime_dir / "SA-TARGET.log"
+    log_path.write_text(
+        "INFO ralph.loop.start target=SA-TARGET scope=SA-TARGET,SA-CHILD max_attempts=10\n"
+        "INFO ralph.loop.child_focus parent=SA-TARGET child=SA-CHILD\n"
+        "INFO ralph.cmd.pi.stream_start model=Local Proxy/qwen3 cmd_len=8\n"
+        "I will implement the work item and audit the results.\n",
+        encoding="utf-8",
+    )
+    state_path = runtime_dir / "current.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "pid": 999999999,
+                "target_id": "SA-TARGET",
+                "log_path": str(log_path),
+                "status_cursor": 3,
+                "last_counts": {},
+                "last_active_task": None,
+                "exit_code": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = ralph_control.inspect_status(
+        runtime_dir=runtime_dir,
+        wl_runner=FakeWlRunner(
+            {
+                "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open", "children": ["SA-CHILD"]},
+                "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress", "children": []},
+            }
+        ),
+        pid_is_alive=lambda pid: True,
+    )
+
+    assert snapshot["active_task"] == "SA-CHILD"
+    assert snapshot["recent_activity"] == ["I will implement the work item and audit the results."]
+
+
+def test_status_snapshot_leaves_active_task_empty_when_only_prose_is_present(runtime_dir: Path):
+    log_path = runtime_dir / "SA-TARGET.log"
+    log_path.write_text(
+        "INFO ralph.cmd.pi.stream_start model=Local Proxy/qwen3 cmd_len=8\n"
+        "I will implement the work item and audit the results.\n",
+        encoding="utf-8",
+    )
+    state_path = runtime_dir / "current.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "pid": 999999999,
+                "target_id": "SA-TARGET",
+                "log_path": str(log_path),
+                "status_cursor": 0,
+                "last_counts": {},
+                "last_active_task": None,
+                "exit_code": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = ralph_control.inspect_status(
+        runtime_dir=runtime_dir,
+        wl_runner=FakeWlRunner({"SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open", "children": []}}),
+        pid_is_alive=lambda pid: True,
+    )
+
+    assert snapshot["active_task"] is None
+    assert snapshot["recent_activity"]
+
+
+def test_status_snapshot_combines_previous_recent_activity_with_new_lines_and_reports_no_new_entries(runtime_dir: Path):
+    log_path = runtime_dir / "SA-TARGET.log"
+    previous_activity = [
+        "INFO ralph.loop.start target=SA-TARGET scope=SA-TARGET,SA-CHILD max_attempts=10",
+        "INFO ralph.loop.child_focus parent=SA-TARGET child=SA-CHILD",
+        "INFO ralph.loop.audit.complete target=SA-TARGET attempt=1 ready=False unmet=1 criteria=2",
+    ]
+    new_activity = "INFO ralph.loop.attempt.start target=SA-TARGET attempt=2"
+    log_path.write_text("\n".join([*previous_activity, new_activity]) + "\n", encoding="utf-8")
+    state_path = runtime_dir / "current.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "pid": 999999999,
+                "target_id": "SA-TARGET",
+                "log_path": str(log_path),
+                "status_cursor": 3,
+                "last_counts": {},
+                "last_active_task": None,
+                "last_recent_activity": previous_activity,
+                "exit_code": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    items = {
+        "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open", "children": ["SA-CHILD"]},
+        "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress", "children": []},
+    }
+    wl_runner = FakeWlRunner(items)
+
+    snapshot = ralph_control.inspect_status(
+        runtime_dir=runtime_dir,
+        wl_runner=wl_runner,
+        pid_is_alive=lambda pid: True,
+    )
+
+    assert snapshot["recent_activity"] == [*previous_activity, new_activity]
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["last_recent_activity"] == [new_activity]
+
+    snapshot2 = ralph_control.inspect_status(
+        runtime_dir=runtime_dir,
+        wl_runner=wl_runner,
+        pid_is_alive=lambda pid: True,
+    )
+
+    assert snapshot2["recent_activity"] == ["No new log activity since the last check"]
+    assert "No new log activity since the last check" in ralph_control.format_status(snapshot2)
 
 
 def test_status_snapshot_reports_final_exit_code_when_process_is_gone(runtime_dir: Path):
@@ -181,5 +311,5 @@ def test_status_snapshot_reports_final_exit_code_when_process_is_gone(runtime_di
 
     assert snapshot["state"] == "stopped"
     assert snapshot["exit_code"] == 0
-    assert snapshot["recent_activity"] == []
+    assert snapshot["recent_activity"] == ["No new log activity since the last check"]
     assert snapshot["final_summary"]
