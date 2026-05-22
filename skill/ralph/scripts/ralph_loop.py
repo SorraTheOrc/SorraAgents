@@ -962,6 +962,7 @@ class RalphLoop:
         stderr_parts: list[str] = []
         json_lines_seen = 0
         text_lines_seen = 0
+        needs_newline_sep = False
         stdout_queue: Queue[object] = Queue()
         eof_marker = object()
         stream_error: BaseException | None = None
@@ -1036,6 +1037,9 @@ class RalphLoop:
                 stream_text, should_print, complete_text = _parse_pi_json_line(stripped)
                 if stream_text is None and complete_text is None:
                     # Not valid JSON — show raw line as fallback
+                    if needs_newline_sep:
+                        print()
+                        needs_newline_sep = False
                     print(line, end="", flush=True)
                     text_parts.append(line)
                     text_lines_seen += 1
@@ -1046,12 +1050,21 @@ class RalphLoop:
                     json_lines_seen += 1
                     if should_print and stream_text:
                         # User-facing additive text delta — show to operator
+                        if needs_newline_sep:
+                            print()
+                            needs_newline_sep = False
                         print(stream_text, end="", flush=True)
                         text_parts.append(stream_text)
                         text_lines_seen += 1
                     if complete_text:
                         # Complete content block — capture for return value
                         complete_blocks.append(complete_text)
+                        if text_lines_seen > 0:
+                            needs_newline_sep = True
+                    elif not should_print and text_lines_seen > 0:
+                        # Suppressed JSON event (thinking, tool, structural, etc.)
+                        # — flag that the next printable text needs a newline separator
+                        needs_newline_sep = True
                     # In verbose mode, also log the raw JSON line
                     if self.verbose:
                         logger.debug("ralph.cmd.pi.json_line %s", stripped[:500])
