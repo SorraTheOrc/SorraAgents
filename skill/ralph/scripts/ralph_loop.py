@@ -34,24 +34,11 @@ from skill.test_runner import canonicalize_quiet_test_command
 
 logger = logging.getLogger("ralph")
 
+ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent / "assets" / ".ralph.json"
 DEFAULT_MODEL = "opencode-go/glm-5.1"
 DEFAULT_MODEL_SOURCE = "remote"
 MODEL_SOURCES = frozenset({"remote", "local"})
 MODEL_PHASES: tuple[str, ...] = ("intake", "planning", "implementation", "audit")
-PHASE_MODEL_DEFAULTS: dict[str, dict[str, str]] = {
-    "remote": {
-        "intake": "Claude Opus 4.7",
-        "planning": "GPT 5.5",
-        "implementation": "Qwen 3.6 Plus",
-        "audit": "Claude Opus 4.7",
-    },
-    "local": {
-        "intake": "Llama-3.1 70B (Q4_K_M)",
-        "planning": "Qwen 3.x 32B",
-        "implementation": "Qwen 32B",
-        "audit": "Llama-3.1 70B (Q4_K_M)",
-    },
-}
 DEBUG_PAYLOAD_DIR_NAME = "ralph-payloads"
 DEBUG_PAYLOAD_MAX_BYTES = 1_000_000
 DEBUG_PAYLOAD_MAX_FILES = 200
@@ -181,13 +168,38 @@ def parse_audit_report(report_text: str) -> AuditParseResult:
 # Ralph will read that persisted audit and fail if it is missing or invalid.
 
 
-def _load_config() -> dict:
-    """Load config from the first found config file in the list.
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Deep-merge override into base, returning a new dict."""
+    result = dict(base)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
 
-    Supports JSON files only. TOML support can be added when tomllib is
-    available (Python 3.11+ stdlib). For now, .ralph.json and
-    ralph.config.json are the supported config files.
+
+def _load_asset_config() -> dict:
+    """Load the shipped default config from skill/ralph/assets/.ralph.json."""
+    try:
+        with open(ASSET_CONFIG_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, OSError):
+        logger.debug("ralph.config: failed to load asset config from %s", ASSET_CONFIG_PATH)
+    return {}
+
+
+def _load_config() -> dict:
+    """Load config merging asset defaults with CWD config file.
+
+    Asset defaults from skill/ralph/assets/.ralph.json are the base.
+    A .ralph.json (or ralph.config.json) in the current working directory
+    overrides those values. CLI flags take highest precedence downstream.
     """
+    config = _load_asset_config()
+
     for path in RALPH_CONFIG_FILES:
         if not path.exists():
             continue
@@ -196,10 +208,11 @@ def _load_config() -> dict:
                 with open(path) as f:
                     data = json.load(f)
                 if isinstance(data, dict):
-                    return data
+                    config = _deep_merge(config, data)
             except (json.JSONDecodeError, OSError):
                 logger.debug("ralph.config: failed to load %s", path)
-    return {}
+
+    return config
 
 
 def _resolve_model(cli_model: str | None, config_model: str | None) -> str:
@@ -735,9 +748,6 @@ class RalphLoop:
         if self.legacy_model_explicit:
             return self.model
 
-        if self.phase_model_mode_enabled:
-            return PHASE_MODEL_DEFAULTS[self.model_source][phase]
-
         return DEFAULT_MODEL
 
     def _call_runner(self, cmd: Sequence[str], input_data: str | None = None) -> subprocess.CompletedProcess:
@@ -925,6 +935,12 @@ class RalphLoop:
         self._last_structured_response = None
         text, structured = _extract_text_and_structured_response_from_json_output(getattr(proc, "stdout", "") or "")
         self._last_structured_response = structured
+        logger.info(
+            "ralph.cmd.pi.non_streaming_end returncode=%d text_len=%d",
+            getattr(proc, "returncode", 0),
+            len(text),
+            extra={"text": text},
+        )
         if self.verbose:
             logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(text), text[:1000])
         return text
@@ -1140,6 +1156,11 @@ class RalphLoop:
                     "ralph.cmd.pi.structured_response actions=%d summary_len=%d",
                     len(structured_response.actions),
                     len(structured_response.summary),
+                    extra={
+                        "actions": [str(a) for a in structured_response.actions],
+                        "summary": structured_response.summary,
+                        "text": structured_response.text,
+                    },
                 )
 
         # If JSON lines were seen but no text extracted, warn
@@ -1177,7 +1198,12 @@ class RalphLoop:
         if self.verbose:
             logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(full_text), full_text[:1000])
 
-        logger.info("ralph.cmd.pi.stream_end returncode=%d text_len=%d", process.returncode, len(full_text))
+        logger.info(
+            "ralph.cmd.pi.stream_end returncode=%d text_len=%d",
+            process.returncode,
+            len(full_text),
+            extra={"text": full_text},
+        )
         return full_text
 
     def _cleanup_pi_process(self) -> None:
@@ -2013,7 +2039,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="Suppress console progress output and pi streaming (only print final JSON result)")
     parser.add_argument("--verbose", action="store_true", help="Show detailed delegation commands and subprocess output")
     parser.add_argument("--no-stream", action="store_true", help="Don't stream pi subprocess output to console (use buffered capture instead)")
-    parser.add_argument("--model", default=None, help=f"Legacy single model for all phases (default: {DEFAULT_MODEL}, or string 'model' key in .ralph.json)")
+    parser.add_argument("--model", default=None, help=f"Legacy single model for all phases (default from skill/ralph/assets/.ralph.json, or string 'model' key in .ralph.json)")
     parser.add_argument("--model-source", choices=sorted(MODEL_SOURCES), default=None, help="Model source for phase defaults/config (remote|local). Default is remote.")
     parser.add_argument("--model-intake", default=None, help="Override intake phase model")
     parser.add_argument("--model-planning", default=None, help="Override planning phase model")

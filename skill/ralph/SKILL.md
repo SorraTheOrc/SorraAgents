@@ -57,7 +57,8 @@ Ralph supports phase-specific model selection for `intake`, `planning`, `impleme
   - `--model-audit`
 - Config supports `model_source` plus `model.<phase>` keys (nested object or dotted keys).
 - No implicit remote↔local fallback is attempted by Ralph.
-- Backward compatibility remains: when per-phase inputs are not used, Ralph continues the legacy single-model path (`--model` / string `model` config / `DEFAULT_MODEL`).
+- Backward compatibility remains: when per-phase inputs are not used, Ralph continues the legacy single-model path (`--model` / string `model` config / `skill/ralph/assets/.ralph.json` defaults).
+- Default per-phase models are shipped in `skill/ralph/assets/.ralph.json`. Values in that file are overridden by a `.ralph.json` in the current working directory, which in turn are overridden by CLI flags.
 
 ```bash
 # Launch a background Ralph run from the skill installation.
