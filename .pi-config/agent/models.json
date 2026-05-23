@@ -4,10 +4,36 @@
       "api": "openai-completions",
       "baseUrl": "http://192.168.0.199:8000/v1",
       "apiKey": "not_needed",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsUsageInStreaming": true,
+        "sendSessionAffinityHeaders": true
+      },
       "models": [
-        { "id": "qwen3" },
-        { "id": "gemma4" },
-        { "id": "gpt120" }
+        {
+          "id": "qwen3",
+          "name": "Qwen3 Coder Next",
+          "reasoning": true,
+          "contextWindow": 131072,
+          "maxTokens": 32768,
+          "compat": {
+            "thinkingFormat": "qwen"
+          }
+        },
+        {
+          "id": "gemma4",
+          "name": "Gemma 4",
+          "reasoning": true,
+          "contextWindow": 262144,
+          "maxTokens": 32768
+        },
+        {
+          "id": "gpt120",
+          "name": "GPT-OSS 120B (Casey)",
+          "reasoning": true,
+          "contextWindow": 131072,
+          "maxTokens": 32768
+        }
       ]
     }
   }
