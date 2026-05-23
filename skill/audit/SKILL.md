@@ -44,6 +44,7 @@ Skip to step 6.
 - Run `wl show <work-item-id> --children --json` to fetch work item details (with all comments and children).
 - Extract the acceptance criteria from the description (they are usually in a markdown section starting with `## Acceptance Criteria` or `### Acceptance Criteria` and formatted as a numbered or bulleted list).
   - If no acceptance criteria section is found, note: "No acceptance criteria defined."
+- Note: "Acceptance Criteria" and "Success Criteria" are synonyms. Look for either `## Acceptance Criteria` or `## Success Criteria` (synonym: Acceptance Criteria) as the section heading.
 - Walk through all dependencies (`wl dep list <work-item-id> --json`) and list each dependent work-item's status, title (using strike through if the item has a "completed" status), id, and stage.
 
 4. **Deep code review of acceptance criteria (parent work item):**
@@ -103,6 +104,10 @@ Ready to close: Yes/No
 
 <Repeat for each direct child. If a child has no acceptance criteria, write: "No acceptance criteria defined.">
 <If there are no children, write: "No children.">
+
+## Success Criteria
+
+"Success Criteria" is a synonym for "Acceptance Criteria". Both terms are treated equivalently in audit reports. Use **Acceptance Criteria** as the canonical heading; document **Success Criteria** as an accepted synonym where relevant.
 
 -CRITICAL rules for the structured report:
 - The first line must be `Ready to close: Yes` or `Ready to close: No` based on whether all acceptance criteria (parent and children) are met.

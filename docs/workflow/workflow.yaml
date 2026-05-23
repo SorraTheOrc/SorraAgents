@@ -138,7 +138,7 @@ invariants:
       Work item must contain acceptance criteria (checkbox list or explicit
       section) so the audit can verify completion.
     when: pre
-    logic: 'regex(description, "(?i)(acceptance criteria|\\- \\[[ x]\\])")'
+    logic: 'regex(description, "(?i)(acceptance criteria|success criteria|\\- \\[[ x]\\])")'
 
   - name: requires_stage_for_delegation
     description: >-

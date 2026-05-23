@@ -6,6 +6,10 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 - Centralize documentation and reusable "skills" for agent development and operational workflows.
 - Provide templates and checklists to guide feature implementation, testing, and release.
 
+## Terminology Policy
+
+"Acceptance Criteria" is the canonical term for work-item requirements. "Success Criteria" is an accepted synonym and may be used interchangeably. Both terms are recognized by validation logic in the workflow invariants (`docs/workflow/workflow.json`, `docs/workflow/workflow.yaml`). When defining work items, prefer the heading **Acceptance Criteria** (synonym: Success Criteria) for consistency.
+
 ## Repository structure
 - agent/: workflow and agent-focused reference guides (e.g., [agent/forge.md](agent/forge.md)).
 - command/: design, intake, implementation and review process documents (see [command/implement.md](command/implement.md)).
