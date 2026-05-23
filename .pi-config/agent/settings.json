@@ -10,7 +10,7 @@
     "maxRetries": 3,
     "baseDelayMs": 2000,
     "provider": {
-      "timeoutMs": 30000,
+      "timeoutMs": 300000,
       "maxRetries": 0,
       "maxRetryDelayMs": 60000
     }
