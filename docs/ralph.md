@@ -65,6 +65,47 @@ The background launcher stores the current runtime context in `.worklog/ralph/cu
 | `--retry` | 0 | Number of additional retries for delegated commands on failure. Retries occur before deciding to fail or continue. |
 | `--retry-delay` | 1.0 | Delay (seconds) between retry attempts. |
 | `--fatal-cmd` | (none) | Repeatable. Command categories to treat as fatal even when `--fail-open` is set. Examples: `merge`, `pi`, `check`, `wl`, `effort_and_risk`. Default fatal categories are `merge`, `check`, and `pi`. |
+| `--pi-stream-timeout` | (source-specific) | Override the pi stdout stream watchdog timeout in seconds. When not specified, defaults are read from `.ralph.json` (60s for local models, 300s for remote models). |
+
+### Stream timeout configuration
+
+Ralph monitors the stdout pipe of the delegated `pi` process with a watchdog timeout. If the stream becomes idle for longer than the timeout, Ralph terminates the subprocess with a clear `stream_stalled` error. This prevents the orchestration loop from hanging indefinitely when `pi` keeps the pipe open.
+
+**Default timeouts:**
+- **Local models**: 60 seconds — suitable for fast, low-latency local inference.
+- **Remote models**: 300 seconds — accommodates higher network latency and variable response times from cloud providers.
+
+**Configuration in `.ralph.json`:**
+
+```json
+{
+  "timeout": {
+    "pi_stream": {
+      "remote": 300,
+      "local": 60
+    }
+  }
+}
+```
+
+A global numeric override (applies to both sources):
+
+```json
+{
+  "timeout": {
+    "pi_stream": 120
+  }
+}
+```
+
+**CLI override:**
+
+```bash
+# Set a custom timeout for this run (overrides config and source defaults)
+ralph SA-1234 --pi-stream-timeout 180
+```
+
+The resolution order is: **CLI flag > config > source-specific default > global default**.
 
 ### Delegated command fail-open & retry
 

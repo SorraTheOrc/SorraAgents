@@ -38,6 +38,8 @@ ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent / "assets" / ".ralph.
 DEFAULT_MODEL = "opencode-go/glm-5.1"
 DEFAULT_MODEL_SOURCE = "remote"
 MODEL_SOURCES = frozenset({"remote", "local"})
+DEFAULT_PI_STREAM_TIMEOUT_SECONDS = 60.0
+REMOTE_PI_STREAM_TIMEOUT_SECONDS = 300.0
 MODEL_PHASES: tuple[str, ...] = ("intake", "planning", "implementation", "audit")
 DEBUG_PAYLOAD_DIR_NAME = "ralph-payloads"
 DEBUG_PAYLOAD_MAX_BYTES = 1_000_000
@@ -222,6 +224,31 @@ def _resolve_model(cli_model: str | None, config_model: str | None) -> str:
     if config_model:
         return config_model
     return DEFAULT_MODEL
+
+
+def _resolve_stream_timeout(config: dict, model_source: str) -> float:
+    """Resolve the pi stream timeout: config > source-specific default > global default.
+
+    Config may specify:
+      - "timeout": {"pi_stream": 120}  (global override)
+      - "timeout": {"pi_stream": {"remote": 300, "local": 60}}  (source-mapped)
+    """
+    timeout_config = config.get("timeout", {})
+    if not isinstance(timeout_config, dict):
+        return DEFAULT_PI_STREAM_TIMEOUT_SECONDS
+
+    pi_stream = timeout_config.get("pi_stream")
+    if isinstance(pi_stream, (int, float)):
+        return float(pi_stream)
+    if isinstance(pi_stream, dict):
+        source_value = pi_stream.get(model_source)
+        if isinstance(source_value, (int, float)):
+            return float(source_value)
+
+    # Fall back to source-specific defaults
+    if model_source == "remote":
+        return REMOTE_PI_STREAM_TIMEOUT_SECONDS
+    return DEFAULT_PI_STREAM_TIMEOUT_SECONDS
 
 
 def _normalize_model_source(source: str | None) -> str:
@@ -672,6 +699,7 @@ class RalphLoop:
         retry_delay: float = 0.0,
         fatal_cmds: list[str] | None = None,
         debug_persist: bool = False,
+        pi_stream_timeout: float | None = None,
     ):
         self.runner = runner or _default_runner
         self.pi_bin = pi_bin
@@ -724,7 +752,7 @@ class RalphLoop:
         self.debug_persist = debug_persist
         # Watchdog used by streamed pi runs so a stuck stdout pipe fails fast
         # instead of blocking the orchestration loop forever.
-        self.pi_stream_timeout_seconds = 60.0
+        self.pi_stream_timeout_seconds = pi_stream_timeout if pi_stream_timeout is not None else DEFAULT_PI_STREAM_TIMEOUT_SECONDS
         # Grace period (seconds) for waiting after SIGTERM before escalating to SIGKILL
         self.pi_cleanup_timeout = 5.0
         self._pi_process: subprocess.Popen | None = None
@@ -2054,6 +2082,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry", type=int, default=0, help="Number of additional retries for delegated commands (default: 0)")
     parser.add_argument("--retry-delay", type=float, default=1.0, help="Delay in seconds between retries")
     parser.add_argument("--fatal-cmd", action="append", default=[], help="""Command categories to treat as fatal even when --fail-open is set. Example categories: merge, pi, wl, check, effort_and_risk""")
+    parser.add_argument("--pi-stream-timeout", type=float, default=None, help="Timeout in seconds for pi stdout stream watchdog (default: source-specific from .ralph.json or 60s local / 300s remote)")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON Lines (jsonl) for lifecycle events and final result")
     return parser
 
@@ -2097,6 +2126,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     legacy_model_explicit = args.model is not None or legacy_config_model is not None
     effective_model_source = _normalize_model_source(args.model_source or config_model_source_raw)
 
+    # Resolve pi stream timeout: CLI > config > source-specific defaults
+    if args.pi_stream_timeout is not None:
+        effective_timeout = args.pi_stream_timeout
+    else:
+        effective_timeout = _resolve_stream_timeout(config, effective_model_source)
+
     loop = RalphLoop(
         pi_bin=args.pi_bin,
         wl_bin=args.wl_bin,
@@ -2122,6 +2157,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         retry_delay=args.retry_delay,
         fatal_cmds=args.fatal_cmd,
         debug_persist=args.debug_persist,
+        pi_stream_timeout=effective_timeout,
     )
     loop.no_autoplan = args.no_autoplan
     try:

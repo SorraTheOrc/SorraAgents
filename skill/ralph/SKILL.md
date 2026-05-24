@@ -35,6 +35,12 @@ For direct foreground debugging, run the script locally:
 Delegated `pi` and `wl` commands are logged before execution in both normal console output and `--json` output, so operators and automation can see the exact command Ralph ran.
 If streamed `pi` output stops producing stdout and keeps the pipe open too long, Ralph will terminate the run with a clear stall error instead of hanging indefinitely.
 
+**Stream timeout defaults:**
+- **Local models** (`--model-source local`): 60 seconds
+- **Remote models** (`--model-source remote`): 300 seconds
+
+The timeout is configurable via `.ralph.json` (see `docs/ralph.md`) or the `--pi-stream-timeout` CLI flag.
+
 ## Pi subprocess cleanup at loop completion
 
 When Ralph's implement→audit loop ends (whether by success, cancellation, max attempts, or producer-input-required), it runs a deterministic cleanup step for any lingering Pi subprocess:

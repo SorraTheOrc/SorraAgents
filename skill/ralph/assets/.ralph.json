@@ -13,5 +13,11 @@
       "implementation": "Qwen 32B",
       "audit": "Llama-3.1 70B (Q4_K_M)"
     }
+  },
+  "timeout": {
+    "pi_stream": {
+      "remote": 300,
+      "local": 60
+    }
   }
 }

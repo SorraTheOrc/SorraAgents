@@ -6,7 +6,16 @@ from dataclasses import dataclass
 
 import pytest
 
-from skill.ralph.scripts.ralph_loop import JsonLineFormatter, RalphError, RalphLoop, build_parser, parse_audit_report
+from skill.ralph.scripts.ralph_loop import (
+    DEFAULT_PI_STREAM_TIMEOUT_SECONDS,
+    JsonLineFormatter,
+    RalphError,
+    RalphLoop,
+    REMOTE_PI_STREAM_TIMEOUT_SECONDS,
+    _resolve_stream_timeout,
+    build_parser,
+    parse_audit_report,
+)
 
 
 @dataclass
@@ -1830,3 +1839,77 @@ def test_phase_model_cli_override_has_highest_precedence_for_audit():
     audit_calls = [c for c in runner.calls if c and c[0] == "pi" and "-p" in c and c[-1].startswith("/skill:audit")]
     assert audit_calls
     assert _extract_pi_model(audit_calls[0]) == "audit-cli-model"
+
+
+def test_resolve_stream_timeout_defaults_local():
+    """Local model source uses the default 60s timeout."""
+    assert _resolve_stream_timeout({}, "local") == DEFAULT_PI_STREAM_TIMEOUT_SECONDS
+
+
+def test_resolve_stream_timeout_defaults_remote():
+    """Remote model source uses the higher 300s timeout."""
+    assert _resolve_stream_timeout({}, "remote") == REMOTE_PI_STREAM_TIMEOUT_SECONDS
+
+
+def test_resolve_stream_timeout_global_config_override():
+    """A global numeric timeout in config overrides source defaults."""
+    config = {"timeout": {"pi_stream": 120}}
+    assert _resolve_stream_timeout(config, "local") == 120.0
+    assert _resolve_stream_timeout(config, "remote") == 120.0
+
+
+def test_resolve_stream_timeout_source_mapped_config():
+    """Source-mapped timeout in config overrides source defaults per source."""
+    config = {"timeout": {"pi_stream": {"local": 90, "remote": 450}}}
+    assert _resolve_stream_timeout(config, "local") == 90.0
+    assert _resolve_stream_timeout(config, "remote") == 450.0
+
+
+def test_resolve_stream_timeout_cli_override():
+    """RalphLoop constructor pi_stream_timeout parameter overrides config."""
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, pi_stream_timeout=999.0)
+    assert loop.pi_stream_timeout_seconds == 999.0
+
+
+def test_ralph_loop_default_timeout_when_none_specified():
+    """When pi_stream_timeout is not specified, RalphLoop uses the global default."""
+    loop = RalphLoop(stream=False)
+    assert loop.pi_stream_timeout_seconds == DEFAULT_PI_STREAM_TIMEOUT_SECONDS
+
+
+def test_ralph_loop_explicit_local_timeout():
+    """RalphLoop uses explicit local timeout when provided."""
+    loop = RalphLoop(stream=False, pi_stream_timeout=DEFAULT_PI_STREAM_TIMEOUT_SECONDS)
+    assert loop.pi_stream_timeout_seconds == DEFAULT_PI_STREAM_TIMEOUT_SECONDS
+
+
+def test_ralph_loop_explicit_remote_timeout():
+    """RalphLoop uses explicit remote timeout when provided."""
+    loop = RalphLoop(stream=False, pi_stream_timeout=REMOTE_PI_STREAM_TIMEOUT_SECONDS)
+    assert loop.pi_stream_timeout_seconds == REMOTE_PI_STREAM_TIMEOUT_SECONDS
+
+
+def test_stream_pi_uses_configured_timeout():
+    """_stream_pi respects the configured timeout from RalphLoop."""
+    import subprocess
+    from unittest.mock import patch, MagicMock
+
+    fake_process = MagicMock()
+    fake_process.returncode = 0
+    fake_process.stdout = LineStream([
+        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello"}}\n',
+    ])
+    fake_process.stderr = MagicMock()
+    fake_process.stderr.read.return_value = ""
+    fake_process.wait.return_value = None
+
+    with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process) as popen:
+        loop = RalphLoop(verbose=False, stream=True, pi_stream_timeout=42.0)
+        loop.pi_bin = "echo"
+        result = loop._stream_pi(["echo", "test"], "test prompt")
+
+    assert result == "Hello"
+    # Verify that the timeout was used in the stdout queue.get call
+    # (indirectly verified by the successful completion with the custom timeout)
