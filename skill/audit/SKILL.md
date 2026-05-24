@@ -25,6 +25,8 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 ## Steps
 
+> ⚠️ **CRITICAL RULE:** The audit is NOT recorded until you execute `wl update <id> --audit-text` and confirm success. Never claim the audit was persisted without running this command first. This is the most common failure mode in the audit skill.
+
 1. Detect whether the user provided a work item id in the request.
 
 2. If no work item id is provided complete this step, otherwise skip to step 3:
@@ -116,16 +118,33 @@ Ready to close: Yes/No
 - For project-level audits (no work item id), omit the `## Acceptance Criteria Status` and `## Children Status` sections. Include only `## Summary` and `## Recommendation`.
 - Review only direct children, never grandchildren. If there are many children (>10), note in the report that only the first 10 were reviewed and the rest were omitted for brevity.
 
-7. **Record the audit using the CLI structured write path:**
+7. **PERSIST THE AUDIT BEFORE ANY USER OUTPUT (CRITICAL GATE):**
 
-   - Run: `wl update <work-item-id> --audit-text "<complete-report-content>" --json`
-    - This stores the audit as structured metadata, making it machine-readable and queryable via `wl show --json`.
+   > ⚠️ **DO NOT PROCEED TO STEP 8 UNTIL THIS STEP COMPLETES SUCCESSFULLY**
+   >
+   > This is the most common failure point in the audit skill. The audit is NOT recorded until this command executes successfully.
+   >
+   > **HISTORICAL NOTE:** Agents frequently skip this step and incorrectly claim "This audit has been recorded in the system" without running the persistence command. This is a critical error.
 
-8. **Output the same structured report content to the user in markdown format.**
+   - **REQUIRED:** Run the persistence command and wait for successful completion:
+     ```bash
+     wl update <work-item-id> --audit-text "<complete-report-content>" --json
+     ```
+   - **VERIFY:** Confirm the command returned `{"success": true}` with an `audit` object in the response.
+   - **IF IT FAILS:** Do NOT claim the audit was recorded. Report the error explicitly and offer to retry. Example: "Audit persistence failed: <error>. Would you like me to retry?"
+   - **IF IT SUCCEEDS:** Only then proceed to step 8.
 
-  - Do NOT include any additional text, explanations, or next steps in the output (other than the information in the next bullets). The output should be the structured report content only.
-  - After the structured report content, you should include a final line: "This audit has been recorded in the system." to confirm to the user that the audit was saved. If it as not been saved yet, then run the CLI command to save it before confirming (see previous step).
-  - If any of the acceptance criteria were unmet or partially met, include a final note: "Note: Some acceptance criteria were not fully met. Please review the evidence for details." and offer to address the gamps in the audit if the user wants to follow up.
+8. **OUTPUT THE REPORT TO THE USER:**
+
+   > ✅ **ONLY REACH THIS STEP IF STEP 7 RETURNED SUCCESS**
+
+   - Output the structured report content to the user in markdown format.
+   - **REQUIRED CONFIRMATION LINE:** After the structured report, include exactly this line:
+     ```
+     This audit has been recorded in the system.
+     ```
+   - **DO NOT output this confirmation line unless step 7 succeeded.** If persistence failed or was skipped, omit this line and report the actual status (e.g., "Audit NOT recorded — persistence command failed").
+   - If any acceptance criteria were unmet or partially met, include a final note: "Note: Some acceptance criteria were not fully met. Please review the evidence for details." and offer to address the gaps in the audit if the user wants to follow up.
 
 ## Notes
 
@@ -147,3 +166,14 @@ Notes:
 - The script calls: `wl update <issue-id> --audit-text "<report>" --json` and returns a non-zero exit code on failure.
 - The audit skill must produce structured audit text that begins with the header `Ready to close: Yes` or `Ready to close: No` on the very first non-empty line. Ralph and other orchestrators rely on this canonical header when reading the persisted audit from the work item.
 - Do not include any wrapper markers or surrounding fences when passing the text to `wl update --audit-text`.
+
+## Common Failure Mode: Unpersisted Audits
+
+**SYMPTOM:** The audit report is displayed to the user but `wl show <id> --json` shows no `audit` field.
+
+**CAUSE:** Step 7 (persistence) was skipped or failed, but step 8 (user output) was executed anyway.
+
+**PREVENTION:**
+- Never output "This audit has been recorded in the system" unless you have confirmed `wl update --audit-text` returned success.
+- The persistence command (step 7) is a **hard gate** — do not proceed to user output without it.
+- If the `wl` command fails, report the error explicitly. Do not claim success.

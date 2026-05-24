@@ -1,5 +1,5 @@
 {
-  "model_source": "remote",
+  "model_source": "local",
   "model": {
     "remote": {
       "intake": "Claude Opus 4.7",

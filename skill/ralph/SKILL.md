@@ -49,7 +49,8 @@ The cleanup is safe to call even if the process has already exited — it checks
 
 Ralph supports phase-specific model selection for `intake`, `planning`, `implementation`, and `audit`.
 
-- Source toggle: `--model-source <remote|local>` (default: `remote`)
+- Source toggle: `--model-source <remote|local>` (default: `local`)
+- Shorthand: `ralph <id> remote` or `ralph <id> local` (equivalent to `--model-source`)
 - Per-phase CLI overrides:
   - `--model-intake`
   - `--model-planning`

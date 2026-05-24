@@ -36,7 +36,7 @@ logger = logging.getLogger("ralph")
 
 ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent / "assets" / ".ralph.json"
 DEFAULT_MODEL = "opencode-go/glm-5.1"
-DEFAULT_MODEL_SOURCE = "remote"
+DEFAULT_MODEL_SOURCE = "local"
 MODEL_SOURCES = frozenset({"remote", "local"})
 MODEL_PHASES: tuple[str, ...] = ("intake", "planning", "implementation", "audit")
 DEBUG_PAYLOAD_DIR_NAME = "ralph-payloads"
@@ -2027,6 +2027,46 @@ class RalphLoop:
         }
 
 
+def _preprocess_args(argv: Sequence[str] | None) -> list[str]:
+    """Pre-process command-line arguments to support shorthand model source syntax.
+
+    Supports:
+      ralph <work_item_id> [remote|local] [options]
+
+    The positional model source argument is converted to --model-source.
+    """
+    if argv is None:
+        return []
+
+    args = list(argv)
+    if not args:
+        return args
+
+    # Skip if --model-source is already provided
+    if "--model-source" in args:
+        return args
+
+    # Find the work_item_id (first positional argument that doesn't start with -)
+    work_item_idx = None
+    for i, arg in enumerate(args):
+        if not arg.startswith("-"):
+            work_item_idx = i
+            break
+
+    if work_item_idx is None:
+        return args
+
+    # Check if the next argument after work_item_id is a model source shorthand
+    next_idx = work_item_idx + 1
+    if next_idx < len(args):
+        next_arg = args[next_idx]
+        if next_arg in MODEL_SOURCES and not next_arg.startswith("-"):
+            # Convert shorthand to --model-source flag
+            args = args[:next_idx] + ["--model-source", next_arg] + args[next_idx + 1:]
+
+    return args
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Ralph implement→audit orchestration loop")
     parser.add_argument("work_item_id", help="Target Worklog item id")
@@ -2040,7 +2080,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true", help="Show detailed delegation commands and subprocess output")
     parser.add_argument("--no-stream", action="store_true", help="Don't stream pi subprocess output to console (use buffered capture instead)")
     parser.add_argument("--model", default=None, help=f"Legacy single model for all phases (default from skill/ralph/assets/.ralph.json, or string 'model' key in .ralph.json)")
-    parser.add_argument("--model-source", choices=sorted(MODEL_SOURCES), default=None, help="Model source for phase defaults/config (remote|local). Default is remote.")
+    parser.add_argument("--model-source", choices=sorted(MODEL_SOURCES), default=None, help="Model source for phase defaults/config (remote|local). Default is local.")
     parser.add_argument("--model-intake", default=None, help="Override intake phase model")
     parser.add_argument("--model-planning", default=None, help="Override planning phase model")
     parser.add_argument("--model-implementation", default=None, help="Override implementation phase model")
@@ -2060,7 +2100,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    preprocessed_args = _preprocess_args(argv)
+    args = parser.parse_args(preprocessed_args)
 
     # Configure console logging based on verbosity or json mode.
     #   --quiet    : WARNING only, no progress, no pi streaming
