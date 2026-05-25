@@ -2030,6 +2030,22 @@ class RalphLoop:
                     },
                 }
 
+            # If we skipped implement because the target was in_review, but the
+            # audit found unmet criteria, move the target to in_progress so
+            # subsequent attempts can implement fixes and the stage accurately
+            # reflects the work state if Ralph is re-run later.
+            if skip_implement and not audit.ready_to_close:
+                logger.info(
+                    "ralph.loop.skip_implement_to_in_progress target=%s attempt=%d",
+                    focus_id, attempt,
+                )
+                self._call_with_retry(
+                    [self.wl_bin, "update", focus_id, "--stage", "in_progress", "--json"],
+                    category="wl", expect_json=True,
+                )
+                target_stage = "in_progress"
+                skip_implement = False
+
             remediation = _build_remediation_prompt()
             structured_hint = self._structured_remediation_hint()
             if structured_hint:

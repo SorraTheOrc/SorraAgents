@@ -17,15 +17,20 @@ The skill accepts a work-item id provided inline in the user's command. Supporte
 - `ralph <WORKITEM>`
 - `run ralph <WORKITEM>`
 - `ralph loop <WORKITEM>`
+- `ralph <WORKITEM> remote` — delegates to `--model-source remote`
+- `ralph <WORKITEM> local` — delegates to `--model-source local`
 
 A work-item id is any short token matching the Worklog id pattern used in your environment (for example `WL-1234`, `CG-0MP12H40Q003Y7OU`, or an 8+ char identifier). When an id is present in the command the skill will use it and will not prompt for an id. If no id is detected, the skill will ask the operator to provide one or abort, except for `ralph status`, which is an intentional no-id exception.
+
+The operator may also supply `remote` or `local` after the work-item id as a shorthand for `--model-source <remote|local>`. If provided, the agent must forward this flag when launching Ralph. If omitted, the agent should check whether the operator's prompt implies a model source and, if unclear, rely on the default from the skill config (see Per-phase model routing).
 
 ## Behavior
 
 1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id or abort, except for `ralph status`, which intentionally runs without a work-item id.
-2. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`.
-3. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
-4. Use `ralph status` to inspect the current background run without needing the original work-item id.
+2. Detect whether the operator also supplied `remote` or `local` after the work-item id. If present, forward it as `--model-source <value>` when launching the wrapper.
+3. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`. Pass any detected `--model-source` (or other explicit model flags) through to the wrapper.
+4. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
+5. Use `ralph status` to inspect the current background run without needing the original work-item id.
 
 For direct foreground debugging, run the script locally:
 
@@ -69,21 +74,24 @@ Ralph supports phase-specific model selection for `intake`, `planning`, `impleme
 ```bash
 # Launch a background Ralph run from the skill installation.
 # The wrapper handles nohup plus PID/start-time capture for status reporting.
-/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --json
+# Use --model-source to select remote (default) or local models:
+/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --model-source remote --json
+/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --model-source local --json
 
 # Inspect the current background run (no work item id required):
 /home/rgardler/.pi/agent/skills/ralph/ralph status --json
 
 # If you need to run the foreground loop directly for debugging:
-# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> --json
+# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> --model-source remote --json
+# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> --model-source local --json
 #
 # To focus on a single direct child while keeping the parent for context:
-# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
+# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --model-source remote --json
 
 # If your skills are installed at a different location (for example a
 # project-level skills directory), run the script using the full path to
 # that skill directory instead, e.g.:
-# python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id> --json
+# python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id> --model-source remote --json
 ```
 
 See `docs/ralph.md` and `ralph --help` for full details of the features available.
