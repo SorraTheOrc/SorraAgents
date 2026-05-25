@@ -12,6 +12,8 @@ from skill.ralph.scripts.ralph_loop import (
     RalphError,
     RalphLoop,
     REMOTE_PI_STREAM_TIMEOUT_SECONDS,
+    _extract_phase_model_config,
+    _load_asset_config,
     _resolve_stream_timeout,
     build_parser,
     parse_audit_report,
@@ -953,9 +955,9 @@ def test_debug_persist_writes_raw_payload_for_no_text_stream(tmp_path):
                 "child_id": "SA-CHILD",
                 "attempt": 4,
             }
-            result = loop._run_pi("implement SA-CHILD")
-
-    assert result == ""
+            with pytest.raises(RalphError, match="Pi produced invalid output"):
+                loop._run_pi("implement SA-CHILD")
+    # Debug payload should still be persisted even though empty output raises
     payload_dir = tmp_path / "ralph-payloads"
     files = list(payload_dir.glob("*.json"))
     assert len(files) == 1
@@ -984,9 +986,8 @@ def test_run_pi_stream_mode_uses_ephemeral_sessions():
     with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process) as popen:
         loop = RalphLoop(verbose=False, stream=True)
         loop.pi_bin = "pi"
-        result = loop._run_pi("test prompt")
-
-    assert result == ""
+        with pytest.raises(RalphError, match="Pi produced invalid output"):
+            loop._run_pi("test prompt")
     cmd = popen.call_args.args[0]
     assert "--no-session" in cmd
     assert cmd.index("--no-session") < cmd.index("test prompt")
@@ -1775,8 +1776,8 @@ def test_single_model_backward_compatibility_without_new_phase_inputs():
 @pytest.mark.parametrize(
     ("model_source", "expected_model"),
     [
-        ("remote", "Claude Opus 4.7"),
-        ("local", "Llama-3.1 70B (Q4_K_M)"),
+        ("remote", "opencode-go/qwen3.6-plus"),
+        ("local", "Qwen 32B"),
     ],
 )
 def test_intake_flow_uses_source_specific_default_model(model_source, expected_model):
@@ -1784,7 +1785,12 @@ def test_intake_flow_uses_source_specific_default_model(model_source, expected_m
     runner.items["SA-TARGET"]["stage"] = "intake_complete"
     runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 1}})]
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, model_source=model_source)
+    loop = RalphLoop(
+        runner=runner,
+        stream=False,
+        model_source=model_source,
+        model_config=_extract_phase_model_config(_load_asset_config()),
+    )
 
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"
@@ -1797,7 +1803,7 @@ def test_intake_flow_uses_source_specific_default_model(model_source, expected_m
 @pytest.mark.parametrize(
     ("model_source", "expected_model"),
     [
-        ("remote", "GPT 5.5"),
+        ("remote", "opencode/gpt-5.5"),
         ("local", "Qwen 3.x 32B"),
     ],
 )
@@ -1806,7 +1812,12 @@ def test_planning_flow_uses_source_specific_default_model(model_source, expected
     runner.items["SA-TARGET"]["stage"] = "intake_complete"
     runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Medium"}, "risk": {"level": "High", "score": 15}})]
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, model_source=model_source)
+    loop = RalphLoop(
+        runner=runner,
+        stream=False,
+        model_source=model_source,
+        model_config=_extract_phase_model_config(_load_asset_config()),
+    )
 
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"

@@ -2009,7 +2009,7 @@ class RalphLoop:
                         exc,
                     )
                     previous_child_stages = {}
-                implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation), phase="intake")
+                implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation), phase="implementation")
                 self._last_implement_output = implement_output
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
                 invocations, failures = self._compact_after_child_transition(focus_id, previous_child_stages, attempt)
