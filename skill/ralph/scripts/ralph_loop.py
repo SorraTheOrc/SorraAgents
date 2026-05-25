@@ -2087,9 +2087,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _preprocess_args(argv):
+    """Convert shorthand model source to explicit flag.
+    
+    Converts: ralph WL-123 remote -> ralph WL-123 --model-source remote
+    Converts: ralph WL-123 local -> ralph WL-123 --model-source local
+    """
+    if not argv or len(argv) < 2:
+        return argv
+    
+    # Check if second arg is "remote" or "local" and looks like a model source shorthand
+    # We'll be conservative and only do this if it's exactly the second arg and 
+    # there are no other positional args that could be confused
+    if len(argv) >= 2 and argv[1] in ("remote", "local"):
+        # Check if the rest of the args don't look like they contain another work-item ID
+        # (which would be ambiguous)
+        remaining = argv[2:]
+        # If remaining args start with a flag or are empty, it's safe to convert
+        if not remaining or remaining[0].startswith("-"):
+            return [argv[0], "--model-source", argv[1]] + remaining
+    
+    return argv
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    # Preprocess args to handle shorthand model source
+    processed_argv = _preprocess_args(sys.argv[1:] if argv is None else argv)
+    
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(processed_argv)
 
     # Configure console logging based on verbosity or json mode.
     #   --quiet    : WARNING only, no progress, no pi streaming
