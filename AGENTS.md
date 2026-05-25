@@ -110,6 +110,7 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - When using backticks in arguments to shell commands, ALWAYS escape them properly to avoid errors
 - Do not escape content in the commit comments, PR body, or work-item description or comment body; use markdown formatting as needed for clarity and readability.
 - Never close an work item without ensuring all acceptance criteria are met, all child items are closed, all blockers resolved, and a Producer has reviewed and approved the work and any associated PRs have been merged.
+- Whenever displaying a work-item ID in any output (report, comment, summary, commit message, status update, etc.), always include the item title alongside the ID using the format `Title Text (ID)`. For example: `Per-project isolation for .env and scheduler_store.json with global installs (SA-0MLU57S7D1KX8CU7)`. This ensures every reference to a work item is self-describing and immediately understandable without requiring the reader to look up the ID.
 
 ## Important Rules
 
