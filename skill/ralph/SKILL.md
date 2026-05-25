@@ -28,9 +28,12 @@ The operator may also supply `remote` or `local` after the work-item id as a sho
 
 1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id or abort, except for `ralph status`, which intentionally runs without a work-item id.
 2. Detect whether the operator also supplied `remote` or `local` after the work-item id. If present, forward it as `--model-source <value>` when launching the wrapper.
-3. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`. Pass any detected `--model-source` (or other explicit model flags) through to the wrapper.
-4. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
-5. Use `ralph status` to inspect the current background run without needing the original work-item id.
+3. **Gate: Check the work-item stage.** Retrieve the work item with `wl show <id> --json` and inspect the `workItem.stage` field.
+   - If the stage is `idea`, report that the work item is still in the **idea** stage and must be progressed to at least **intake_complete** before Ralph can run. Instruct the operator to run `/intake <id>` first. Stop and do not proceed to launch Ralph.
+   - For any other stage (including `intake_complete`, `plan_complete`, `in_progress`, etc.), proceed to the next step.
+4. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`. Pass any detected `--model-source` (or other explicit model flags) through to the wrapper.
+5. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
+6. Use `ralph status` to inspect the current background run without needing the original work-item id.
 
 For direct foreground debugging, run the script locally:
 
