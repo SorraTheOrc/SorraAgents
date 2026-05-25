@@ -43,6 +43,16 @@ For direct foreground debugging, run the script locally:
 Delegated `pi` and `wl` commands are logged before execution in both normal console output and `--json` output, so operators and automation can see the exact command Ralph ran.
 If streamed `pi` output stops producing stdout and keeps the pipe open too long, Ralph will terminate the run with a clear stall error instead of hanging indefinitely.
 
+### Output validation
+
+Ralph validates Pi output after every delegation to detect silent failures:
+- **Empty output** raises a clear error instead of false success.
+- **Input echo** (Pi returning the prompt back) is detected and reported.
+- **Raw skill content** (SKILL.md text instead of results) is rejected.
+- **Short audit output** without expected markers is flagged.
+
+These checks prevent the common failure mode where a misconfigured model causes Pi to echo the user prompt as the assistant response.
+
 **Stream timeout defaults:**
 - **Local models** (`--model-source local`): 60 seconds
 - **Remote models** (`--model-source remote`): 300 seconds

@@ -363,6 +363,18 @@ The final JSON result now includes a `compact` object:
 }
 ```
 
+## Pi output validation
+
+Ralph validates the output returned from every Pi delegation (implement and audit phases) to detect silent failures:
+
+- **Empty output**: If Pi returns no user-facing text (e.g., all assistant messages have empty content), Ralph raises a clear `RalphError` instead of treating it as success.
+- **Input echo**: If Pi echoes back the input prompt (e.g., when a local model endpoint is unavailable and falls back to returning the prompt), Ralph detects the echo and raises a `RalphError` with a message identifying the issue.
+- **Raw skill content**: If Pi returns raw SKILL.md file content instead of execution results, Ralph detects this pattern and raises a `RalphError`.
+- **Short implementation output**: For implementation phases, if the output is very short and contains no structured actions, Ralph treats it as invalid.
+- **Audit markers**: For audit phases, Ralph checks for expected audit markers (e.g., "Ready to close:") in short outputs.
+
+This prevents the common failure mode where a down or misconfigured model provider causes Pi to return the user prompt as the assistant response, leading Ralph to falsely believe work was completed.
+
 ## No safe path stop condition
 
 If the implement step returns a structured `no_safe_path` response, Ralph stops immediately with `status: producer_input_required`, includes the model-provided reason in the JSON result and warning logs, and skips the audit step for that attempt. This keeps the loop non-interactive when the model cannot continue safely without producer input.
