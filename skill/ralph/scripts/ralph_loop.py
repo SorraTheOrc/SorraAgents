@@ -662,6 +662,117 @@ def _extract_text_and_structured_response_from_json_output(raw: str) -> tuple[st
     return text, None
 
 
+# Minimum length for output text to be considered a valid response (not an echo).
+_MIN_VALID_OUTPUT_LENGTH = 50
+
+# Patterns that indicate raw skill file content was returned instead of
+# execution results.
+_RAW_SKILL_CONTENT_PATTERNS = [
+    r"^\s*<skill\s+name=",
+    r"^\s*<skill\s+location=",
+    r"^\s*#\s+Audit\s*$",
+    r"^\s*#\s+Overview\s*$",
+    r"^\s*##\s+Overview\s*$",
+    r"^\s*References\s+are\s+relative\s+to",
+]
+
+
+def _normalize_text_for_comparison(text: str) -> str:
+    """Normalize text for comparison by stripping whitespace and lowercasing."""
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _detect_input_echo(input_text: str, output_text: str) -> bool:
+    """Detect if the output is an echo of the input prompt.
+
+    Returns True if the output is identical or nearly identical to the input.
+    """
+    if not input_text or not output_text:
+        return False
+
+    normalized_input = _normalize_text_for_comparison(input_text)
+    normalized_output = _normalize_text_for_comparison(output_text)
+
+    # Exact match after normalization
+    if normalized_input == normalized_output:
+        return True
+
+    # Output is a prefix of input (truncated echo)
+    if len(normalized_output) > 20 and normalized_input.startswith(normalized_output):
+        return True
+
+    # Input is a prefix of output (output includes input plus minimal content)
+    # Only if output is very close in length to input
+    if len(normalized_output) > 20 and normalized_output.startswith(normalized_input):
+        similarity = len(normalized_input) / max(len(normalized_output), 1)
+        if similarity > 0.9:
+            return True
+
+    return False
+
+
+def _detect_raw_skill_content(output_text: str) -> bool:
+    """Detect if the output contains raw skill file content.
+
+    Returns True if the output looks like raw SKILL.md content instead of
+    execution results.
+    """
+    if not output_text:
+        return False
+
+    stripped = output_text.strip()
+    if not stripped:
+        return False
+
+    for pattern in _RAW_SKILL_CONTENT_PATTERNS:
+        if re.search(pattern, stripped, re.MULTILINE):
+            return True
+
+    return False
+
+
+def _validate_pi_output(
+    input_text: str,
+    output_text: str,
+    phase: str,
+    structured_response: StructuredResponse | None = None,
+) -> tuple[bool, str]:
+    """Validate Pi output to detect silent failures.
+
+    Returns (is_valid, reason) where:
+    - is_valid: True if output appears valid, False if it looks like an echo
+      or raw content
+    - reason: Description of the validation failure (empty if valid)
+    """
+    # Empty output
+    if not output_text or not output_text.strip():
+        return False, "Pi returned no output"
+
+    # Check for raw skill content
+    if _detect_raw_skill_content(output_text):
+        return False, "Output contains raw skill file content instead of execution results"
+
+    # Check for input echo
+    if _detect_input_echo(input_text, output_text):
+        return False, "Output is an echo of the input prompt — the model did not execute the task"
+
+    # For implementation phase, check for very short output with no actions
+    if phase == "implementation":
+        if structured_response is not None and len(structured_response.actions) == 0:
+            if len(output_text.strip()) < _MIN_VALID_OUTPUT_LENGTH:
+                return False, f"Output too short ({len(output_text.strip())} chars) with no actions for implementation phase"
+
+    # For audit phase, check for missing audit markers
+    if phase == "audit":
+        output_lower = output_text.lower()
+        has_ready_to_close = "ready to close:" in output_lower
+        has_audit_markers = has_ready_to_close or "audit result" in output_lower or "acceptance criteria" in output_lower
+        if not has_audit_markers and len(output_text.strip()) < 100:
+            return False, "Audit output missing expected markers (Ready to close:)"
+
+    return True, ""
+
+
 # Default thresholds for auto-plan decision
 # If effort t-shirt is in this set AND risk level is in the risk set,
 # skip /plan and proceed directly to implement.
@@ -950,7 +1061,7 @@ class RalphLoop:
 
         self._last_structured_response = None
         if self.stream:
-            return self._stream_pi(cmd, prompt, model_for_phase)
+            return self._stream_pi(cmd, prompt, model_for_phase, phase)
 
         proc = self._call_with_retry(cmd, category="pi", expect_json=False)
         if getattr(proc, "returncode", 0) != 0:
@@ -963,6 +1074,16 @@ class RalphLoop:
         self._last_structured_response = None
         text, structured = _extract_text_and_structured_response_from_json_output(getattr(proc, "stdout", "") or "")
         self._last_structured_response = structured
+
+        # Validate output to detect silent failures (echo, empty, raw skill content)
+        is_valid, reason = _validate_pi_output(prompt, text, phase, structured)
+        if not is_valid:
+            logger.warning(
+                "ralph.cmd.pi.invalid_output phase=%s reason=%s text_len=%d",
+                phase, reason, len(text),
+            )
+            raise RalphError(f"Pi produced invalid output for {phase} phase: {reason}")
+
         logger.info(
             "ralph.cmd.pi.non_streaming_end returncode=%d text_len=%d",
             getattr(proc, "returncode", 0),
@@ -974,7 +1095,7 @@ class RalphLoop:
         return text
 
 
-    def _stream_pi(self, cmd: list[str], prompt: str, model_for_phase: str | None = None) -> str:
+    def _stream_pi(self, cmd: list[str], prompt: str, model_for_phase: str | None = None, phase: str = "implementation") -> str:
         """Run pi with --mode json and stream user-facing text to the console.
 
         Only text_delta events (the agent's actual response) are printed.
@@ -1222,6 +1343,15 @@ class RalphLoop:
             )
 
         self._last_structured_response = structured_response
+
+        # Validate output to detect silent failures (echo, empty, raw skill content)
+        is_valid, reason = _validate_pi_output(prompt, full_text, phase, structured_response)
+        if not is_valid:
+            logger.warning(
+                "ralph.cmd.pi.invalid_output phase=%s reason=%s text_len=%d",
+                phase, reason, len(full_text),
+            )
+            raise RalphError(f"Pi produced invalid output for {phase} phase: {reason}")
 
         if self.verbose:
             logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(full_text), full_text[:1000])

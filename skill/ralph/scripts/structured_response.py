@@ -137,23 +137,38 @@ def _coerce_action(item: Any) -> StructuredAction | None:
     return StructuredAction(command=command.strip(), args=_normalize_args(args_value), raw=item)
 
 
+def _is_user_message(node: Any) -> bool:
+    """Return True if *node* looks like a user message that should be skipped."""
+    if not isinstance(node, dict):
+        return False
+    return node.get("role") == "user"
+
+
 def _extract_text_candidates(node: Any) -> list[str]:
+    """Extract text/content strings from *node*, skipping user messages."""
     candidates: list[str] = []
-    if isinstance(node, dict):
-        for key in ("text", "content"):
-            value = node.get(key)
-            if isinstance(value, str) and value.strip():
-                candidates.append(value.strip())
+    if not isinstance(node, dict):
+        return candidates
+    if _is_user_message(node):
+        return candidates
+    for key in ("text", "content"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
     return candidates
 
 
 def _extract_summary_candidates(node: Any) -> list[str]:
+    """Extract summary/message strings from *node*, skipping user messages."""
     candidates: list[str] = []
-    if isinstance(node, dict):
-        for key in ("summary", "message"):
-            value = node.get(key)
-            if isinstance(value, str) and value.strip():
-                candidates.append(value.strip())
+    if not isinstance(node, dict):
+        return candidates
+    if _is_user_message(node):
+        return candidates
+    for key in ("summary", "message"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
     return candidates
 
 
