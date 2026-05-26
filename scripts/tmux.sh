@@ -231,7 +231,7 @@ if [[ ${#windows[@]} -eq 0 ]]; then
   top_cmds=("wl tui")
 fi
 
-# Ensure the first window (Agents) uses the user's opencode config dir.
+# Ensure the first window (Agents) uses the user's agent framework config dir.
 # If the first window is the default "Agents" window and no explicit dir
 # was provided in the config, make it work in $HOME/.config/opencode.
 if [[ "${windows[0]:-}" == "$DEFAULT_WINDOW" ]]; then
