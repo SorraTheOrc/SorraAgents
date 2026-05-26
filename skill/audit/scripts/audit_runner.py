@@ -427,6 +427,10 @@ def cmd_issue(issue_id: str, persist: bool = False,
     if acs and acs[0] != "No acceptance criteria defined.":
         ac_list_json = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(acs)])
         prompt = (
+            f"[READ-ONLY AUDIT] You are performing a read-only audit. "
+            f"Do NOT close, modify, create, or delete any work items. "
+            f"Do NOT execute any wl, git, or other state-modifying commands. "
+            f"Return ONLY a structured JSON array.\n\n"
             f"Review the following acceptance criteria against the codebase. "
             f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
             f"'verdict' (one of: met, unmet, partial) and 'evidence' "
@@ -477,6 +481,10 @@ def cmd_issue(issue_id: str, persist: bool = False,
             # Batch child ACs into a single pi call
             child_ac_list = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(child_acs)])
             prompt = (
+                f"[READ-ONLY AUDIT] You are performing a read-only audit. "
+                f"Do NOT close, modify, create, or delete any work items. "
+                f"Do NOT execute any wl, git, or other state-modifying commands. "
+                f"Return ONLY a structured JSON array.\n\n"
                 f"Review the following acceptance criteria for child work item '{child.get('title', '')}' "
                 f"against the codebase. "
                 f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
@@ -575,6 +583,10 @@ def cmd_project(pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
 
     # Optional: call Pi for project-level summary
     prompt = (
+        f"[READ-ONLY AUDIT] You are performing a read-only audit. "
+        f"Do NOT close, modify, create, or delete any work items. "
+        f"Do NOT execute any wl, git, or other state-modifying commands. "
+        f"Return ONLY a structured JSON object.\n\n"
         f"Provide a brief project status summary based on: {summary}. "
         f"Then provide a recommendation. "
         f"Return ONLY a JSON object with keys 'summary' and 'recommendation'."
