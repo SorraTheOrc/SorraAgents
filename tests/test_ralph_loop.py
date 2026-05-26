@@ -1858,7 +1858,7 @@ def test_resolve_stream_timeout_defaults_local():
 
 
 def test_resolve_stream_timeout_defaults_remote():
-    """Remote model source uses the higher 300s timeout."""
+    """Remote model source uses the higher 900s (15 min) timeout."""
     assert _resolve_stream_timeout({}, "remote") == REMOTE_PI_STREAM_TIMEOUT_SECONDS
 
 

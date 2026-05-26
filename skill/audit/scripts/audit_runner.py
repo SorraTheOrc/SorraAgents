@@ -93,7 +93,7 @@ def _call_pi(prompt: str, model: str = "opencode-go/glm-5.1",
         raise RuntimeError(f"pi binary not found: {pi_bin}")
 
     try:
-        stdout, stderr = process.communicate(timeout=300)
+        stdout, stderr = process.communicate(timeout=900)
     except subprocess.TimeoutExpired:
         process.kill()
         stdout, stderr = process.communicate()
