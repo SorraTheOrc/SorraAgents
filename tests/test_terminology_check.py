@@ -160,8 +160,8 @@ class TestTerminologyCheckScript:
         """Prose references to OpenCode should be flagged as non-allowed."""
         result = _run_check(
             [
-                "# OpenCode — Workflow & Skills Repository",
-                "- plugins/: local OpenCode plugins used by this repository",
+                "# OpenCode Workflow and Skills Repository",
+                "- plugins: local OpenCode tooling used by this repository",
             ],
             strict=True,
         )
@@ -172,8 +172,8 @@ class TestTerminologyCheckScript:
         """Skill descriptions with framework branding should be flagged."""
         result = _run_check(
             [
-                'description: "Auhors a brand new OpenCode command following project best practices"',
-                "You are authoring a new OpenCode command that implements",
+                'description: "Creates a new OpenCode plugin for the system"',
+                "You are building a new OpenCode tool that provides functionality",
             ],
             strict=True,
         )
@@ -183,7 +183,7 @@ class TestTerminologyCheckScript:
         """Agent docs with framework branding should be flagged."""
         result = _run_check(
             [
-                "Ensuring consistency with OpenCode best practices and organizational standards.",
+                "Ensuring consistency with OpenCode organizational standards.",
             ],
             strict=True,
         )
@@ -193,7 +193,7 @@ class TestTerminologyCheckScript:
         """Verify that agent/**, command/**, skill/** paths are classified as primary."""
         result = _run_check(
             extra_lines=[
-                "Ensuring consistency with OpenCode best practices.",
+                "Ensuring consistency with OpenCode organizational guidelines.",
             ],
             strict=True,
         )

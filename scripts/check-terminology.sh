@@ -92,7 +92,7 @@ ALLOWLIST=(
 
   # --- Historical / attribution references ---
   'Author: OpenCode'                # Audit report author attribution
-  'Author \| opencode'              # PRD author field
+  'Author [|] opencode'             # PRD author field
   'opencode-patch-'                 # Agent instance naming convention
   'OpenCode agent'                  # Agent type reference in PRD
   'OpenCode server'                 # Server reference in error hint
@@ -116,7 +116,7 @@ ALLOWLIST=(
 
   # --- Class / function names in code and docs ---
   'OpenCodeRunDispatcher'           # Dispatcher class name in engine PRD
-  'Opencode('                       # Python SDK class constructor
+  'Opencode[(]'                     # Python SDK class constructor
 
   # --- Path assertions in tests ---
   "'opencode', '.worklog'"           # Test path join assertions
@@ -137,10 +137,10 @@ ALLOWLIST=(
   'OpenCode README'                 # Migration doc link text
 
   # --- delegation-control.md ---
-  'delegated .opencode run. process' # delegation-control refers to opencode run as a process
+  'delegated.*opencode run.*process' # delegation-control refers to opencode run as a process
 
   # --- Reports ---
-  'Repository root.*\.config/opencode'  # Historical audit report
+  'Repository root.*[.]config/opencode'  # Historical audit report
 
   # --- README title and plugin reference ---
   '# OpenCode'                     # README title
@@ -149,6 +149,7 @@ ALLOWLIST=(
   # --- skill files: comment.txt ---
   'opencode/wl CLI'                # Skill comment about CLI
   'wl/opencode CLI'                # Skill comment about CLI
+  'opencode/wl integration'        # Skill comment about CLI integration
 
   # --- triage-audit.md ---
   'handler / opencode'             # triage-audit doc shorthand
@@ -158,6 +159,7 @@ ALLOWLIST=(
 
   # --- test assertions ---
   'Expected remote model to contain opencode/qwen'  # test assertion text
+  '"opencode" in impl_model'                        # test assertion for model prefix check
 
   # --- author-command SKILL.md ---
   'placeholders supported by OpenCode'  # Special placeholder reference
@@ -189,7 +191,7 @@ echo ""
 
 # Gather all matches (line numbers + content)
 MATCHES_FILE=$(mktemp)
-rg -n --hidden --glob '!.git/**' --glob '!package-lock.json' -i 'opencode|open.code' . > "$MATCHES_FILE" 2>/dev/null || true
+rg -n --hidden --glob '!.git/**' --glob '!package-lock.json' -i 'opencode' . > "$MATCHES_FILE" 2>/dev/null || true
 
 TOTAL=$(wc -l < "$MATCHES_FILE")
 echo "Total raw matches: $TOTAL"

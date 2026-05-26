@@ -40,7 +40,7 @@ Hard requirements
   - Ask concise, high-signal questions in iterations.
   - Soft-maximum of **three questions per iteration**.
 - Do not invent commitments (dates) or owners.
-- Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or any OpenCode ignore rules.
+- Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or the agent framework's ignore rules.
 
 Temp draft requirement (must do)
 
