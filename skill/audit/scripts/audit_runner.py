@@ -385,9 +385,28 @@ def _assemble_project_report(summary: str, recommendation: str) -> str:
 # Subcommand: issue
 # ---------------------------------------------------------------------------
 
+def _build_issue_json(issue: dict, ac_results: list[dict],
+                      child_results: list[dict]) -> dict:
+    """Build structured JSON payload for issue-mode audit."""
+    all_met = all(
+        r["verdict"] == "met"
+        for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
+    )
+    return {
+        "ready_to_close": all_met,
+        "summary": (
+            f"All {len(ac_results)} acceptance criteria met."
+            if all_met else
+            f"{sum(1 for r in ac_results if r['verdict'] != 'met')} of {len(ac_results)} acceptance criteria not met."
+        ),
+        "acceptance_criteria": ac_results,
+        "children": child_results,
+    }
+
+
 def cmd_issue(issue_id: str, persist: bool = False,
               pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
-              runner: Runner | None = None) -> int:
+              runner: Runner | None = None, json_mode: bool = False) -> int:
     """Audit a single work item."""
     if runner is None:
         runner = _default_runner
@@ -498,8 +517,13 @@ def cmd_issue(issue_id: str, persist: bool = False,
         })
 
     # Assemble report
-    report = _assemble_issue_report(work_item, ac_results, child_results)
-    print(report, end="")
+    if json_mode:
+        payload = _build_issue_json(work_item, ac_results, child_results)
+        print(json.dumps(payload, indent=2))
+        report = _assemble_issue_report(work_item, ac_results, child_results)
+    else:
+        report = _assemble_issue_report(work_item, ac_results, child_results)
+        print(report, end="")
 
     if persist:
         return persist_audit(issue_id, report)
@@ -510,8 +534,17 @@ def cmd_issue(issue_id: str, persist: bool = False,
 # Subcommand: project
 # ---------------------------------------------------------------------------
 
+def _build_project_json(summary: str, recommendation: str) -> dict:
+    """Build structured JSON payload for project-mode audit."""
+    return {
+        "ready_to_close": False,
+        "summary": summary,
+        "recommendation": recommendation,
+    }
+
+
 def cmd_project(pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
-                runner: Runner | None = None) -> int:
+                runner: Runner | None = None, json_mode: bool = False) -> int:
     """Audit the overall project."""
     if runner is None:
         runner = _default_runner
@@ -554,8 +587,12 @@ def cmd_project(pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
     except RuntimeError:
         pass  # Pi failure is non-fatal for project mode
 
-    report = _assemble_project_report(summary, recommendation)
-    print(report, end="")
+    if json_mode:
+        payload = _build_project_json(summary, recommendation)
+        print(json.dumps(payload, indent=2))
+    else:
+        report = _assemble_project_report(summary, recommendation)
+        print(report, end="")
     return 0
 
 
@@ -574,11 +611,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
     p_issue.add_argument("--model", default="opencode-go/glm-5.1",
                          help="Pi model to use for review")
+    p_issue.add_argument("--json", action="store_true",
+                         help="Emit machine-readable JSON output instead of markdown")
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
     p_project.add_argument("--model", default="opencode-go/glm-5.1",
                            help="Pi model to use for review")
+    p_project.add_argument("--json", action="store_true",
+                           help="Emit machine-readable JSON output instead of markdown")
 
     return p
 
@@ -593,9 +634,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "issue":
         return cmd_issue(args.issue_id, persist=args.persist,
-                         pi_bin=args.pi_bin, model=args.model)
+                         pi_bin=args.pi_bin, model=args.model, json_mode=args.json)
     elif args.command == "project":
-        return cmd_project(pi_bin=args.pi_bin, model=args.model)
+        return cmd_project(pi_bin=args.pi_bin, model=args.model, json_mode=args.json)
 
     return 2
 

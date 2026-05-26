@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from skill.audit.scripts.audit_runner import (
+    build_parser,
     cmd_issue,
     cmd_project,
     _call_pi,
@@ -511,3 +512,156 @@ class TestChildrenReview:
         captured = capsys.readouterr()
         # Should mention the cap in the explicit note
         assert "omitted for brevity" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# --json flag tests
+# ---------------------------------------------------------------------------
+
+class TestBuildParserJsonFlag:
+    """Verify --json is accepted by both subcommands."""
+
+    def test_issue_parses_json_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--json"])
+        assert args.json is True
+
+    def test_project_parses_json_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["project", "--json"])
+        assert args.json is True
+
+    def test_issue_defaults_json_false(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123"])
+        assert args.json is False
+
+
+class TestCmdIssueJsonMode:
+    """Verify cmd_issue emits structured JSON when json_mode=True."""
+
+    def test_json_output_has_expected_keys(self, monkeypatch, capsys):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+            return {
+                "verdict": "met",
+                "evidence": json.dumps([
+                    {"index": 0, "verdict": "met", "evidence": "x:1 — ok"},
+                ]),
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(
+                stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
+            )
+
+        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True)
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert "ready_to_close" in payload
+        assert "summary" in payload
+        assert "acceptance_criteria" in payload
+        assert "children" in payload
+        assert isinstance(payload["ready_to_close"], bool)
+
+    def test_json_output_ready_to_close_true_when_all_met(self, monkeypatch, capsys):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+            return {
+                "verdict": "met",
+                "evidence": json.dumps([
+                    {"index": 0, "verdict": "met", "evidence": "x:1 — ok"},
+                    {"index": 1, "verdict": "met", "evidence": "y:2 — ok"},
+                    {"index": 2, "verdict": "met", "evidence": "z:3 — ok"},
+                ]),
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(
+                stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
+            )
+
+        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True)
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert payload["ready_to_close"] is True
+
+    def test_json_output_ac_results_present(self, monkeypatch, capsys):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+            return {
+                "verdict": "met",
+                "evidence": json.dumps([
+                    {"index": 0, "verdict": "partial", "evidence": "a.py:1 — partial"},
+                ]),
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(
+                stdout=json.dumps(_load_fixture("wi_with_bulleted_ac.json")),
+            )
+
+        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True)
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert len(payload["acceptance_criteria"]) == 3
+        assert payload["acceptance_criteria"][0]["verdict"] == "partial"
+        assert payload["acceptance_criteria"][0]["evidence"] == "a.py:1 — partial"
+
+    def test_default_mode_still_emits_markdown(self, monkeypatch, capsys):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+            return {"verdict": "met", "evidence": "x:1 — ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(
+                stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
+            )
+
+        cmd_issue("SA-MD", runner=fake_runner, json_mode=False)
+        captured = capsys.readouterr()
+        assert captured.out.startswith("Ready to close:")
+
+
+class TestCmdProjectJsonMode:
+    """Verify cmd_project emits structured JSON when json_mode=True."""
+
+    def test_json_output_has_expected_keys(self, monkeypatch, capsys):
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(
+                stdout=json.dumps({"success": True, "workItems": []}),
+            )
+
+        cmd_project(runner=fake_runner, json_mode=True)
+        captured = capsys.readouterr()
+        payload = json.loads(captured.out)
+        assert "ready_to_close" in payload
+        assert "summary" in payload
+        assert "recommendation" in payload
+        assert payload["ready_to_close"] is False
+
+    def test_default_mode_still_emits_markdown(self, monkeypatch, capsys):
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(
+                stdout=json.dumps({"success": True, "workItems": []}),
+            )
+
+        cmd_project(runner=fake_runner, json_mode=False)
+        captured = capsys.readouterr()
+        assert captured.out.startswith("Ready to close:")
