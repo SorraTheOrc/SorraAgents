@@ -25,6 +25,10 @@ from skill.audit.scripts.audit_runner import (
     _run_wl,
 )
 
+
+# Path to the audit_runner.py source file
+AUDIT_RUNNER_PY = Path(__file__).resolve().parent.parent / "skill" / "audit" / "scripts" / "audit_runner.py"
+
 # ---------------------------------------------------------------------------
 # Fixtures directory
 # ---------------------------------------------------------------------------
@@ -413,3 +417,45 @@ class TestExitCodes:
 
     def test_no_subcommand_returns_2(self):
         assert main([]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Pi prompt safety instruction tests
+# ---------------------------------------------------------------------------
+
+class TestPiPromptSafetyInstructions:
+    """Assert that all Pi invocation prompts in audit_runner.py contain
+    safety instructions to prevent models from modifying work items."""
+
+    SOURCE = AUDIT_RUNNER_PY.read_text(encoding="utf-8")
+
+    def test_parent_ac_prompt_has_read_only_designation(self):
+        """Parent AC review prompt must contain [READ-ONLY AUDIT]."""
+        assert "[READ-ONLY AUDIT]" in self.SOURCE
+
+    def test_parent_ac_prompt_has_prohibition(self):
+        """Parent AC review prompt must prohibit modifying work items."""
+        assert "Do NOT close, modify, create, or delete any work items" in self.SOURCE
+
+    def test_parent_ac_prompt_has_no_wl_git_commands(self):
+        """Parent AC review prompt must prohibit wl/git state-modifying commands."""
+        assert "Do NOT execute any wl, git, or other state-modifying commands" in self.SOURCE
+
+    def test_child_ac_prompt_has_read_only_designation(self):
+        """Child AC review prompt must contain [READ-ONLY AUDIT]."""
+        # Count occurrences: at least 2 (parent + child) or all 3 prompts
+        count = self.SOURCE.count("[READ-ONLY AUDIT]")
+        assert count >= 2, f"Expected at least 2 [READ-ONLY AUDIT] occurrences, found {count}"
+
+    def test_child_ac_prompt_has_structured_array_instruction(self):
+        """Child AC review prompt must instruct to return structured JSON array."""
+        assert "Return ONLY a structured JSON array" in self.SOURCE
+
+    def test_project_prompt_has_read_only_designation(self):
+        """Project summary prompt must contain [READ-ONLY AUDIT]."""
+        count = self.SOURCE.count("[READ-ONLY AUDIT]")
+        assert count >= 3, f"Expected at least 3 [READ-ONLY AUDIT] occurrences (parent, child, project), found {count}"
+
+    def test_project_prompt_has_structured_object_instruction(self):
+        """Project summary prompt must instruct to return structured JSON object."""
+        assert "Return ONLY a structured JSON object" in self.SOURCE

@@ -71,3 +71,40 @@ class TestAuditSkillDoc:
         text = _skill_md_text()
         assert "audit_runner.py" in text
         assert "persist_audit.py" in text
+
+
+class TestAuditSkillSafetyInstructions:
+    """Assert that SKILL.md contains critical safety instructions that
+    prevent models from modifying work items during audit evaluation."""
+
+    def test_read_only_designation_present(self):
+        """SKILL.md must include a READ-ONLY designation."""
+        text = _skill_md_text()
+        assert "READ-ONLY" in text
+
+    def test_no_close_modify_create_delete_prohibition(self):
+        """SKILL.md must prohibit closing, modifying, creating, or deleting work items."""
+        text = _skill_md_text()
+        assert "Do NOT close" in text or "Do NOT modify" in text or "Do NOT create" in text or "Do NOT delete" in text
+
+    def test_no_wl_state_commands_prohibition(self):
+        """SKILL.md must prohibit executing wl commands that change state."""
+        text = _skill_md_text()
+        assert "wl" in text and "change state" in text
+
+    def test_structured_markdown_report_instruction(self):
+        """SKILL.md must instruct the model to produce only a structured markdown report."""
+        text = _skill_md_text()
+        assert "structured markdown report" in text or "structured evaluation report" in text
+
+    def test_ambiguity_return_instruction(self):
+        """SKILL.md must instruct the model to return immediately if ambiguity is detected."""
+        text = _skill_md_text()
+        assert "ambiguity" in text.lower()
+        assert "return immediately" in text.lower()
+
+    def test_refuse_state_modifying_commands(self):
+        """SKILL.md must instruct the model to refuse state-modifying wl commands."""
+        text = _skill_md_text()
+        assert "refuse" in text.lower()
+        assert "wl" in text
