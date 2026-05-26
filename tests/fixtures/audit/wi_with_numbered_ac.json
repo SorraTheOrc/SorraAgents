@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "workItem": {
+    "id": "SA-FIXTURE-001",
+    "title": "Fixture: numbered acceptance criteria",
+    "description": "## Summary\nA test work item with numbered acceptance criteria.\n\n## Acceptance Criteria\n1. The system must handle user authentication.\n2. The system must log all access attempts.\n3. The system must support role-based access control.\n\n## Implementation notes\nUse OAuth2 for authentication.",
+    "status": "open",
+    "priority": "high"
+  },
+  "comments": []
+}

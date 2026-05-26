@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "workItem": {
+    "id": "SA-FIXTURE-002",
+    "title": "Fixture: bulleted acceptance criteria",
+    "description": "## Summary\nA test work item with bulleted acceptance criteria.\n\n## Acceptance Criteria\n- The API must return 200 for valid requests.\n- The API must return 400 for malformed input.\n- The API must return 500 for internal errors.\n\n## Implementation notes\nUse FastAPI for the API layer.",
+    "status": "open",
+    "priority": "medium"
+  },
+  "comments": []
+}

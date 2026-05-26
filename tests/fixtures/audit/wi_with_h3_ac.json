@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "workItem": {
+    "id": "SA-FIXTURE-003",
+    "title": "Fixture: h3 acceptance criteria heading",
+    "description": "## Summary\nA test work item with ### Acceptance Criteria heading.\n\n### Acceptance Criteria\n1. The cache must invalidate after TTL expiry.\n2. The cache must support distributed locking.\n\n## Implementation notes\nUse Redis as the cache backend.",
+    "status": "open",
+    "priority": "low"
+  },
+  "comments": []
+}

@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "workItem": {
+    "id": "SA-FIXTURE-004",
+    "title": "Fixture: no acceptance criteria",
+    "description": "## Summary\nA test work item with no acceptance criteria section.\n\n## Implementation notes\nThis is a placeholder item without defined acceptance criteria.",
+    "status": "open",
+    "priority": "low"
+  },
+  "comments": []
+}
