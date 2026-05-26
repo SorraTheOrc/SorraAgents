@@ -1,13 +1,13 @@
 ---
 name: author-command
-description: "Auhors a brand new OpenCode command following project best practices and conventions. Trigger on user queries such as: 'Create a new command to <do something>', 'Author a command that <does something>', 'I need a command that <does something>'."
+description: "Authors a brand new command for the agent framework following project best practices and conventions. Trigger on user queries such as: 'Create a new command to <do something>', 'Author a command that <does something>', 'I need a command that <does something>'."
 ---
 
 # Author Command
 
 ## Overview
 
-You are authoring a new OpenCode command that implements a specific functionality as requested by the user. You will ensure that the command follows project best practices and conventions, and that it is well-documented and tested.
+You are authoring a new command for the agent framework that implements a specific functionality as requested by the user. You will ensure that the command follows project best practices and conventions, and that it is well-documented and tested.
 
 ## When To Use
 
@@ -24,7 +24,7 @@ You are authoring a new OpenCode command that implements a specific functionalit
 7. Document the command in the README.md file and any other relevant documentation.
 
 
-## Special placeholders supported by OpenCode:
+## Special placeholders supported by the agent framework:
 
 - `$ARGUMENTS` — the full argument string passed to the command.
 - `$1`, `$2`, ... — individual positional arguments.

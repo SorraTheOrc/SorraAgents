@@ -31,7 +31,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 - Where possible identify existing features or tasks that can be reused instead of creating duplicates.
 - Use an interview style: concise, high-signal questions grouped to a soft-maximum of three per iteration.
 - Do not invent requirements, commitments (dates), or owners — propose options and ask the user to confirm.
-- Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or any OpenCode ignore rules.
+- Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or the agent framework's ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
 - If the user indicates uncertainty, add clarifying questions rather than guessing.
 - **Test-first ordering**: When creating child work items, test/verification work items must always be created before implementation work items. This ensures a test-driven development approach is followed — tests are defined first and implementation follows. The feature plan must list test features before implementation features, and the `wl create` commands for test items must be issued before those for implementation items.
@@ -219,7 +219,7 @@ Keep asking questions until the breakdown into features is clear.
   - The agent MUST append the complete Appendix to any temporary draft file used for the plan and include it in the parent work item's description or as a `wl comment` when calling `wl update` or `wl comment add`.
   - Preserve idempotence: re-running `/plan` MUST NOT create duplicate Appendix entries. If a Q/A pair exists, either skip re-recording it or append a short revision note rather than duplicating the original entry.
   - Open questions that remain unanswered must be included and clearly labelled as "OPEN QUESTION" with brief context (who it was directed to and why it matters).
-  - Do not include or quote content from files excluded by `.gitignore` or other OpenCode ignore rules as part of the Appendix.
+  - Do not include or quote content from files excluded by `.gitignore` or other the agent framework's ignore rules as part of the Appendix.
 
 - Privacy & scope:
   - Only record information provided by authorized participants. Redact any inadvertent secrets and note the redaction.

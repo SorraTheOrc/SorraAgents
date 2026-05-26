@@ -1,6 +1,6 @@
 # Ralph Compaction Plugin
 
-The `ralph` plugin customizes OpenCode compaction to preserve the original
+The `ralph` plugin customizes the agent framework's session compaction to preserve the original
 session intent.
 
 ## Behavior

@@ -37,7 +37,7 @@ The command implements the procedural workflow below. Each numbered step is part
 - Do not ask leading questions that bias the user towards a particular answer.
 - Do not ask unnecessary questions, if an obvious answer exists, use it.
 - If a response is unclear or ambiguous, ask for clarification rather than guessing or asking a largely similar question.
-- Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or OpenCode ignore rules.
+- Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or the agent framework's ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
 - All work‑item descriptions and comments **must be written in Markdown** format.
 - The goal is not to capture an exhaustive spec, but to gather sufficient detail to create a clear Worklog work item that will be used to either seed a PRD, update an existing one, or if the work is small and well-defined, be implemented directly from the Worklog work item.
@@ -202,7 +202,7 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
   - When updating the Worklog work item with `wl update --description-file`, ensure the Appendix is included in the description content pushed to the work item (so the full Q&A and any summarized research is archived with the work item).
   - Maintain idempotence: re-running `/intake` MUST NOT duplicate earlier Appendix entries. If a question/answer pair already exists, update its record (for example, add a short revision note) rather than creating a duplicate entry.
   - If a clarifying question was asked but never answered (open question), include it in the Appendix marked as "OPEN QUESTION" with brief context (who it was directed to and why it matters).
-  - Do not include or quote content from files excluded by `.gitignore` or other OpenCode ignore rules as part of the Appendix.
+  - Do not include or quote content from files excluded by `.gitignore` or other the agent framework's ignore rules as part of the Appendix.
 
 - Privacy & scope:
   - Only record information that the user or an authorized stakeholder provided during the intake. Do not record secrets or sensitive data.

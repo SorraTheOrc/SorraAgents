@@ -32,7 +32,7 @@ Describe the command's canonical execution flow and responsibilities. Use number
 - Use an iterative, conversational style when user input is required; prefer short, high-signal questions.
 - Never take irreversible actions without explicit confirmation from the user (unless `--auto-approve` is provided and documented).
 - Do not invent facts or credentials; ask for missing values when necessary.
-- Respect repository and system ignore rules (e.g. `.gitignore`, OpenCode ignore policies).
+- Respect repository and system ignore rules (e.g. `.gitignore`, the agent framework's ignore policies).
 - Preserve author intent: where uncertain, ask a clarifying question rather than making an assumption.
 - When recommending next steps, always make the first recommendation the immediate next procedural step and briefly describe it.
 - Provide copy-paste ready shell commands when the agent asks the user to run CLI steps.
@@ -102,7 +102,7 @@ Record provenance in any created artifacts (seed intent, user who ran the comman
 - Make minimal, conservative edits to user-provided content; surface clarifying questions for ambiguous intent.
 - Do not include or quote content from files excluded by ignore rules.
 - Avoid exposing secrets: never echo contents of files that match common secret patterns (e.g. `.env`, `credentials.json`) unless explicitly allowed.
-- Respect OpenCode file-include rules: do not include binary files or very large files inline.
+- Respect the agent framework's file-include rules: do not include binary files or very large files inline.
 - If automated steps fail, stop and present a clear Open Question with suggested remedial actions.
 
 ## Example invocation
@@ -117,7 +117,7 @@ Record provenance in any created artifacts (seed intent, user who ran the comman
 - Keep the command's process narrowly scoped: prefer multiple focused commands over one large, monolithic agent.
 - Add domain-specific hard requirements where needed (privacy, compliance, license constraints).
 
-- Frontmatter keys supported by OpenCode command markdown: `description` (shown in TUI), `agent`, `model`, `subtask`. The file content is used as the `template`.
+- Frontmatter keys supported by the agent framework's command markdown: `description` (shown in TUI), `agent`, `model`, `subtask`. The file content is used as the `template`.
 - Use `--dry-run` behavior to preview changes; implementors should honor that flag in the command's logic.
 
 (End of template)
