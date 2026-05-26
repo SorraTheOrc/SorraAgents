@@ -5,7 +5,7 @@
       "intake": "opencode/claude-opus-4.7",
       "planning": "opencode/gpt-5.5",
       "implementation": "opencode-go/qwen3.6-plus",
-      "audit": "opencode-go/kimi-k2.5"
+      "audit": "opencode-go/glm-5.1"
     },
     "local": {
       "intake": "Llama-3.1 70B (Q4_K_M)",
