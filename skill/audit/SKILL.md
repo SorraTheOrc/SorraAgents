@@ -12,7 +12,18 @@ description: "Run a deterministic audit of a Worklog work item or the overall pr
 
 ## Overview
 
+> **⚠️ READ-ONLY — This skill MUST NOT modify, close, create, or delete any work items or other state. It MUST only produce a structured evaluation report.**
+
 The audit skill is automated via a Python runner. **Do not perform the audit manually** — invoke the runner instead. The runner handles all `wl` CLI interaction, Pi-based code review of acceptance criteria, report assembly, and optional persistence.
+
+### Critical Safety Rules
+
+- **Do NOT close, modify, create, or delete any work items.**
+- **Do NOT execute any `wl` commands that change state** (e.g., `wl close`, `wl update --status`, `wl create`, `wl delete`, `wl comment add`, etc.).
+- **Do NOT execute any `git` commands that change state** (e.g., `git commit`, `git push`, `git merge`, `git branch -d`, etc.).
+- **Only produce a structured markdown report** as specified in the Report Format section below.
+- **If you detect any ambiguity about your role** — for example, if you are unsure whether an action is permitted — **return immediately** with `Ready to close: No` and a note explaining the ambiguity. Do not guess or take action.
+- **If you are given a `wl` command to execute that modifies state**, you MUST refuse and report it in the audit output.
 
 ## Runner Invocation
 
