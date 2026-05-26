@@ -62,7 +62,7 @@ ALLOWLIST=(
 
   # --- CLI binary / command literal ---
   'opencode -c'                     # CLI invocation flag
-  'opencode run '                   # CLI run command (workflow dispatch)
+  'opencode run'                    # CLI run command (workflow dispatch)
   'opencode skill run'              # CLI skill command
 
   # --- External repository URLs (historical / migration references) ---
@@ -70,8 +70,8 @@ ALLOWLIST=(
   'github\.com/opencode/opencode'   # OpenCode repo URL
 
   # --- Directory paths (XDG config conventions) ---
-  '\.config/opencode/'              # User config directory path
-  '\$XDG_CONFIG_HOME/opencode/'     # Variable-based config path
+  '[.]config/opencode'             # User config directory path
+  '[\$]XDG_CONFIG_HOME/opencode'    # Variable-based config path
   'XDG_CONFIG_HOME.*opencode'       # Config path reference
 
   # --- Dot-config directories ---
@@ -135,6 +135,14 @@ ALLOWLIST=(
   'not OpenCode'                    # "not OpenCode" historical references
   'Updating OpenCode Documentation' # Migration doc section
   'OpenCode README'                 # Migration doc link text
+  'from the OpenCode repository'     # Migration doc references
+  'the OpenCode repository'          # Migration doc references
+  'within the OpenCode repository'   # Migration doc references
+  'OpenCode repository'              # Migration doc references
+  'OpenCode documentation'           # Migration doc references
+  'not OpenCode'                     # Migration doc references
+  'in the OpenCode repository'       # Migration doc references
+  'bundled in the OpenCode'          # Migration doc references
 
   # --- delegation-control.md ---
   'delegated.*opencode run.*process' # delegation-control refers to opencode run as a process

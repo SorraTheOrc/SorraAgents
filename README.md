@@ -1,4 +1,4 @@
-# OpenCode — Workflow & Skills Repository
+# Workflow & Skills Repository
 
 A lightweight collection of workflow guides, command patterns, and skill templates for building and operating small automation agents.
 
@@ -14,7 +14,7 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 - agent/: workflow and agent-focused reference guides (e.g., [agent/forge.md](agent/forge.md)).
 - command/: design, intake, implementation and review process documents (see [command/implement.md](command/implement.md)).
 - skill/: skill templates and utilities to scaffold and package agent skills (see [skill/skill-creator/SKILL.md](skill/skill-creator/SKILL.md)).
-- plugins/: local OpenCode plugins used by this repository (includes `ralph` compaction plugin).
+- plugins/: local agent framework plugins used by this repository (includes `ralph` compaction plugin).
 - Workflow.md: high-level workflow for using this repository.
 - package.json: basic metadata used by tooling.
 

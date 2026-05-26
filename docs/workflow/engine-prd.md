@@ -143,10 +143,10 @@ Roles are declared in `docs/workflow/workflow.yaml` under `metadata.roles` and l
 |---|---|---|---|
 | **Producer** | `human` | Sets `needs_producer_review: true`, sends Discord notification. Engine exits; human action is async. | Human operator |
 | **PM** | `either` | AMPA scheduler agent. Handles intake, planning, delegation coordination. | AMPA scheduler (`AMPA scheduler module (https://github.com/opencode/ampa/tree/main/src/ampa)`) |
-| **Patch** | `agent` | Spawns independent `opencode run` session via `Dispatcher`. Session is detached from engine process. | OpenCode agent |
+| **Patch** | `agent` | Spawns independent `opencode run` session via `Dispatcher`. Session is detached from engine process. | the agent framework's agent |
 | **QA** | `agent` | Audit flow agent executing the `audit` skill. Out of engine scope (SA-0MLWQI6DC09TF7IY). | Audit flow agent |
 | **DevOps** | `either` | CI/CD systems or human operators. | CI/CD + human |
-| **TechnicalWriter** | `either` | Agent or human. Produces documentation. | OpenCode agent or human |
+| **TechnicalWriter** | `either` | Agent or human. Produces documentation. | the agent framework's agent or human |
 
 ### 3.2 Actor Resolution Policy
 
