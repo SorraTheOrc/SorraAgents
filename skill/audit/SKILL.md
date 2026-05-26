@@ -72,6 +72,8 @@ Ready to close: No
 
    If no acceptance criteria are defined, the section body is: `No acceptance criteria defined.`
 
+   > **Synonym:** `## Success Criteria` is also accepted as a valid heading when parsing work-item descriptions.
+
 4. **`## Children Status`** — Per-child subsection with the same table format. Only direct children are reviewed (depth 1). Completed/deleted children are skipped. If more than 10 children exist, only the first 10 are reviewed and a note is appended: *`10 children reviewed; N omitted for brevity.`* If there are no children, the section body is: `No children.`
 
 ### Project-mode report sections (in order)
