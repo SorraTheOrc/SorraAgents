@@ -1944,30 +1944,47 @@ class RalphLoop:
 
         return invocations, failures
 
-    def run(self, target_id: str, child_id: str | None = None) -> dict:
-        focus_id = self._resolve_focus_target(target_id, child_id)
-        self._assert_precondition(focus_id)
-        scope_ids = self._scope_ids_recursive(focus_id)
+    # ------------------------------------------------------------------
+    # Per-child iteration helpers
+    # ------------------------------------------------------------------
 
-        # If the target is already in_review, skip the first implement pass and
-        # go straight to audit. If a persisted audit comment shows the scope is
-        # up-to-date, we can skip invoking the audit skill at the start of the
-        # iteration and instead rely on the persisted audit.
-        target_item = self._wl_show(focus_id).get("workItem", {})
-        target_stage = target_item.get("stage", "unknown")
-        skip_implement = target_stage == "in_review"
-        remediation = ""
+    def _get_children(self, target_id: str) -> list[dict]:
+        """Return direct children of *target_id* from ``wl show --children``."""
+        data = self._wl_show(target_id, children=True)
+        return data.get("children", [])
+
+    def run_single_item(self, item_id: str, remediation: str = "", skip_implement: bool = False, no_autoplan: bool = False) -> dict:
+        """Run the implement → audit → remediate loop for a single work item.
+
+        This is the former body of :meth:`run`, extracted so that the
+        per-child iteration in :meth:`run` can invoke it independently for
+        each child and then perform a final parent integration audit.
+
+        Returns a dict with at least ``status`` and ``scope`` keys.
+        """
+        self._assert_precondition(item_id)
+        scope_ids = self._scope_ids_recursive(item_id)
+
+        item = self._wl_show(item_id).get("workItem", {})
+        target_stage = item.get("stage", "unknown")
+
+        if skip_implement:
+            target_stage = "in_review"  # force the skip_implement branch on attempt 1
+        elif target_stage == "in_review":
+            skip_implement = True
+
+        remediation = remediation or ""
         compact_invocations = 0
         compact_failures = 0
 
         logger.info(
-            "ralph.loop.start target=%s focus=%s scope=%s max_attempts=%d skip_implement=%s",
-            target_id, focus_id, scope_ids, self.max_attempts, skip_implement,
+            "ralph.loop.single.start item=%s stage=%s max_attempts=%d skip_implement=%s",
+            item_id, target_stage, self.max_attempts, skip_implement,
         )
 
         for attempt in range(1, self.max_attempts + 1):
             if self.cancel_file and os.path.exists(self.cancel_file):
-                logger.info("ralph.loop.cancelled target=%s attempt=%d", focus_id, attempt)
+                logger.info("ralph.loop.cancelled item=%s attempt=%d", item_id, attempt)
                 self._cleanup_pi_process()
                 return {
                     "status": "cancelled",
@@ -1976,59 +1993,41 @@ class RalphLoop:
                     "compact": {"invocations": compact_invocations, "failures": compact_failures},
                 }
 
-            logger.info("ralph.loop.attempt.start target=%s attempt=%d", focus_id, attempt)
-            self._debug_context = {
-                "target_id": target_id,
-                "focus_id": focus_id,
-                "child_id": child_id,
-                "attempt": attempt,
-            }
+            logger.info("ralph.loop.single.attempt.start item=%s attempt=%d", item_id, attempt)
 
             # Whether we will rely on a persisted audit without invoking the audit skill
             use_persisted_audit = False
 
-            if target_stage == "intake_complete" and attempt == 1 and not self.no_autoplan:
+            if target_stage == "intake_complete" and attempt == 1 and not no_autoplan:
                 # Auto-plan step: evaluate effort/risk and decide whether
                 # to invoke /plan or proceed directly to implement.
                 try:
-                    do_plan, new_stage = self._run_autoplan(focus_id)
+                    do_plan, new_stage = self._run_autoplan(item_id)
                     if new_stage == "plan_complete":
                         target_stage = "plan_complete"
                 except RalphError:
                     raise
                 except Exception:
-                    logger.exception("ralph.loop.autoplan.unexpected target=%s", focus_id)
+                    logger.exception("ralph.loop.autoplan.unexpected item=%s", item_id)
                 # After autoplan (whether plan ran or not), proceed to implement
                 try:
-                    previous_child_stages = self._child_stage_map(focus_id)
+                    previous_child_stages = self._child_stage_map(item_id)
                 except Exception as exc:
                     logger.warning(
-                        "ralph.compact.pre_snapshot_failed target=%s attempt=%d error=%s",
-                        focus_id,
-                        attempt,
-                        exc,
+                        "ralph.compact.pre_snapshot_failed item=%s attempt=%d error=%s",
+                        item_id, attempt, exc,
                     )
                     previous_child_stages = {}
-                implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation), phase="implementation")
+                implement_output = self._run_pi(_build_implement_prompt(item_id, remediation), phase="implementation")
                 self._last_implement_output = implement_output
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
-                invocations, failures = self._compact_after_child_transition(focus_id, previous_child_stages, attempt)
+                invocations, failures = self._compact_after_child_transition(item_id, previous_child_stages, attempt)
                 compact_invocations += invocations
                 compact_failures += failures
-                if invocations or failures:
-                    logger.info(
-                        "ralph.compact.metrics target=%s attempt=%d compact.invocations=%d compact.failures=%d",
-                        focus_id,
-                        attempt,
-                        compact_invocations,
-                        compact_failures,
-                    )
                 if no_safe_path_reason:
                     logger.warning(
-                        "ralph.loop.no_safe_path target=%s attempt=%d reason=%s",
-                        focus_id,
-                        attempt,
-                        no_safe_path_reason,
+                        "ralph.loop.no_safe_path item=%s attempt=%d reason=%s",
+                        item_id, attempt, no_safe_path_reason,
                     )
                     self._cleanup_pi_process()
                     return {
@@ -2040,49 +2039,37 @@ class RalphLoop:
                     }
             elif skip_implement and attempt == 1:
                 # Target already in_review — decide whether start-of-iteration audit is needed
-                logger.info("ralph.loop.skip_implement target=%s stage=in_review", focus_id)
+                logger.info("ralph.loop.single.skip_implement item=%s stage=in_review", item_id)
                 try:
                     latest_comment_ts = self._latest_audit_comment_ts_for_scope(scope_ids)
                     max_updated_at = self._max_updated_at_for_scope(scope_ids)
                     if latest_comment_ts and max_updated_at and latest_comment_ts >= max_updated_at:
                         logger.info(
-                            "ralph.loop.audit.skipping_start target=%s latest_comment_ts=%s max_updated_at=%s",
-                            focus_id, latest_comment_ts.isoformat(), max_updated_at.isoformat()
+                            "ralph.loop.single.audit.skipping_start item=%s latest_comment_ts=%s max_updated_at=%s",
+                            item_id, latest_comment_ts.isoformat(), max_updated_at.isoformat()
                         )
                         use_persisted_audit = True
                 except Exception:
-                    logger.exception("ralph.loop.pre_audit_check_failed target=%s", focus_id)
+                    logger.exception("ralph.loop.single.pre_audit_check_failed item=%s", item_id)
             else:
                 try:
-                    previous_child_stages = self._child_stage_map(focus_id)
+                    previous_child_stages = self._child_stage_map(item_id)
                 except Exception as exc:
                     logger.warning(
-                        "ralph.compact.pre_snapshot_failed target=%s attempt=%d error=%s",
-                        focus_id,
-                        attempt,
-                        exc,
+                        "ralph.compact.pre_snapshot_failed item=%s attempt=%d error=%s",
+                        item_id, attempt, exc,
                     )
                     previous_child_stages = {}
-                implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation), phase="implementation")
+                implement_output = self._run_pi(_build_implement_prompt(item_id, remediation), phase="implementation")
                 self._last_implement_output = implement_output
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
-                invocations, failures = self._compact_after_child_transition(focus_id, previous_child_stages, attempt)
+                invocations, failures = self._compact_after_child_transition(item_id, previous_child_stages, attempt)
                 compact_invocations += invocations
                 compact_failures += failures
-                if invocations or failures:
-                    logger.info(
-                        "ralph.compact.metrics target=%s attempt=%d compact.invocations=%d compact.failures=%d",
-                        focus_id,
-                        attempt,
-                        compact_invocations,
-                        compact_failures,
-                    )
                 if no_safe_path_reason:
                     logger.warning(
-                        "ralph.loop.no_safe_path target=%s attempt=%d reason=%s",
-                        focus_id,
-                        attempt,
-                        no_safe_path_reason,
+                        "ralph.loop.no_safe_path item=%s attempt=%d reason=%s",
+                        item_id, attempt, no_safe_path_reason,
                     )
                     self._cleanup_pi_process()
                     return {
@@ -2093,30 +2080,26 @@ class RalphLoop:
                         "compact": {"invocations": compact_invocations, "failures": compact_failures},
                     }
 
-            logger.info("ralph.loop.audit.start target=%s attempt=%d", focus_id, attempt)
+            logger.info("ralph.loop.single.audit.start item=%s attempt=%d", item_id, attempt)
             # Run the audit skill unless we've determined that the persisted audit
             # is up-to-date and can be used without re-running the audit skill.
             if use_persisted_audit:
-                logger.info("ralph.loop.audit.skipped_using_persisted target=%s attempt=%d", focus_id, attempt)
+                logger.info("ralph.loop.single.audit.skipped_using_persisted item=%s attempt=%d", item_id, attempt)
             else:
                 # Run the audit skill; it MUST persist the structured audit to the work item.
-                self._run_pi(f"/skill:audit {focus_id}", phase="audit")
+                self._run_pi(f"/skill:audit {item_id}", phase="audit")
             # Read the persisted audit from the work item via wl show.
-            item = self._wl_show(focus_id).get("workItem", {})
-            # Normalize persisted audit extraction to handle both object and string shapes.
-            # - If workItem.audit is an object (dict), prefer audit.get("text")
-            # - If it's a string, use it directly
-            # - Otherwise fall back to workItem.auditText
-            audit_field = item.get("audit")
+            item_data = self._wl_show(item_id).get("workItem", {})
+            audit_field = item_data.get("audit")
             if isinstance(audit_field, dict):
-                audit_text = audit_field.get("text", "") or item.get("auditText", "") or ""
+                audit_text = audit_field.get("text", "") or item_data.get("auditText", "") or ""
             elif isinstance(audit_field, str):
                 audit_text = audit_field
             else:
-                audit_text = item.get("auditText", "") or ""
+                audit_text = item_data.get("auditText", "") or ""
 
             if not audit_text:
-                raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit; expected workItem.audit to contain the structured report.")
+                raise RalphError(f"No persisted audit found for {item_id} after running /skill:audit; expected workItem.audit to contain the structured report.")
 
             structured_audit = None
             lines = [l.strip() for l in audit_text.splitlines() if l.strip()]
@@ -2129,21 +2112,29 @@ class RalphLoop:
 
             if not any(l.lower().startswith("ready to close:") for l in lines):
                 excerpt = audit_text.strip().replace("\n", " ")[:200]
-                raise RalphError(f"No 'Ready to close:' header found in persisted audit for {focus_id}. Excerpt: {excerpt}")
+                raise RalphError(f"No 'Ready to close:' header found in persisted audit for {item_id}. Excerpt: {excerpt}")
             audit = parse_audit_report(audit_text)
             if self.verbose:
-                logger.debug("ralph.loop.audit.parsed target=%s attempt=%d ready=%s criteria_count=%d unmet=%d", focus_id, attempt, audit.ready_to_close, len(audit.criteria), len(audit.unmet_or_partial))
+                logger.debug("ralph.loop.single.audit.parsed item=%s attempt=%d ready=%s criteria_count=%d unmet=%d", item_id, attempt, audit.ready_to_close, len(audit.criteria), len(audit.unmet_or_partial))
 
             logger.info(
-                "ralph.loop.audit.complete target=%s attempt=%d ready=%s unmet=%d criteria=%d",
-                focus_id, attempt, audit.ready_to_close, len(audit.unmet_or_partial), len(audit.criteria),
+                "ralph.loop.single.audit.complete item=%s attempt=%d ready=%s unmet=%d criteria=%d",
+                item_id, attempt, audit.ready_to_close, len(audit.unmet_or_partial), len(audit.criteria),
             )
 
-            if audit.ready_to_close and self._scope_in_review(scope_ids):
-                logger.info("ralph.loop.checks.start target=%s", focus_id)
+            # --- Child-level / integration success check ---
+            # For runs where we skipped implement (for example the parent-level
+            # integration audit), the top-level target may not itself be in
+            # `in_review`. In that case only verify that the *descendants*
+            # (children) are in_review. Use a scoped view for the check so we
+            # don't gate success on the target's own stage when it's expected to
+            # remain `plan_complete` until merge time.
+            scope_to_check = scope_ids[1:] if skip_implement and len(scope_ids) > 1 else scope_ids
+            if audit.ready_to_close and self._scope_in_review(scope_to_check):
+                logger.info("ralph.loop.single.checks.start item=%s", item_id)
                 check_results = self._run_checks()
                 changed_files = self._capture_changed_files()
-                logger.info("ralph.loop.merge target=%s confirm=%s", focus_id, self.confirm_merge)
+                logger.info("ralph.loop.single.merge item=%s confirm=%s", item_id, self.confirm_merge)
                 self._run_merge()
                 self._cleanup_pi_process()
                 return {
@@ -2166,11 +2157,11 @@ class RalphLoop:
             # reflects the work state if Ralph is re-run later.
             if skip_implement and not audit.ready_to_close:
                 logger.info(
-                    "ralph.loop.skip_implement_to_in_progress target=%s attempt=%d",
-                    focus_id, attempt,
+                    "ralph.loop.single.skip_implement_to_in_progress item=%s attempt=%d",
+                    item_id, attempt,
                 )
                 self._call_with_retry(
-                    [self.wl_bin, "update", focus_id, "--stage", "in_progress", "--json"],
+                    [self.wl_bin, "update", item_id, "--stage", "in_progress", "--json"],
                     category="wl", expect_json=True,
                 )
                 target_stage = "in_progress"
@@ -2181,22 +2172,189 @@ class RalphLoop:
             if structured_hint:
                 remediation = "\n\n".join([remediation, structured_hint])
                 logger.info(
-                    "ralph.loop.remediate.structured target=%s attempt=%d actions=%d",
-                    focus_id,
-                    attempt,
+                    "ralph.loop.single.remediate.structured item=%s attempt=%d actions=%d",
+                    item_id, attempt,
                     len(self._last_structured_response.actions) if self._last_structured_response else 0,
                 )
             logger.info(
-                "ralph.loop.remediate target=%s attempt=%d unmet_count=%d",
-                focus_id, attempt, len(audit.unmet_or_partial),
+                "ralph.loop.single.remediate item=%s attempt=%d unmet_count=%d",
+                item_id, attempt, len(audit.unmet_or_partial),
             )
 
-        logger.warning("ralph.loop.max_attempts target=%s", focus_id)
+        logger.warning("ralph.loop.single.max_attempts item=%s", item_id)
         self._cleanup_pi_process()
         return {
             "status": "max_attempts",
             "attempt": self.max_attempts,
             "scope": scope_ids,
+            "compact": {"invocations": compact_invocations, "failures": compact_failures},
+        }
+
+    def run(self, target_id: str, child_id: str | None = None) -> dict:
+        """Run Ralph's implement → audit loop.
+
+        **Per-child iteration model** (primary path when children exist):
+
+        1. Fetch direct children of *target_id*.
+        2. For each child that is not already ``in_review``, run the
+           implement → audit → remediate loop via
+           :meth:`run_single_item`.
+        3. After all children have passed their individual audits, run a final
+           parent-level integration audit to verify the aggregate work meets
+           the parent's acceptance criteria.
+
+        **Backward compatibility** (single-work-item run):
+
+        When no children exist, or when the operator has explicitly scoped the
+        run to a single child via the ``--child`` flag, the method delegates
+        to :meth:`run_single_item` and behaves exactly as before (batch-at-end
+        audit).
+
+        :param target_id: The top-level work-item id.
+        :param child_id: Optional direct child to focus on. When provided, the
+                         loop targets only this child without iterating siblings.
+        """
+        # --- Resolve effective focus ---
+        focus_id = self._resolve_focus_target(target_id, child_id)
+
+        # When the operator explicitly scoped to a single child, use the legacy
+        # single-item path for backward compatibility.
+        if child_id is not None:
+            logger.info(
+                "ralph.loop.child_scoped target=%s focus=%s (single-item path)",
+                target_id, focus_id,
+            )
+            return self.run_single_item(focus_id, no_autoplan=self.no_autoplan)
+
+        # --- Fetch children ---
+        children = self._get_children(target_id)
+        has_children = bool(children)
+
+        logger.info(
+            "ralph.loop.start target=%s children=%d",
+            target_id, len(children),
+        )
+
+        if not has_children:
+            # --- Backward-compatible single-item path ---
+            return self.run_single_item(focus_id, no_autoplan=self.no_autoplan)
+
+        # --- Per-child iteration ---
+        all_child_results: dict[str, dict] = {}
+        child_ids_to_audit: list[str] = []
+        compact_invocations = 0
+        compact_failures = 0
+        parent_child_stages: dict[str, str] = {}
+
+        for child in children:
+            cid = child.get("id")
+            if not cid:
+                continue
+            cstage = child.get("stage", "")
+            logger.info(
+                "ralph.loop.iterate.child target=%s child=%s stage=%s",
+                target_id, cid, cstage,
+            )
+            # Skip children that are already in_review — they've been audited.
+            if cstage in ("in_review", "done", "completed", "closed"):
+                logger.info(
+                    "ralph.loop.iterate.child_skipped target=%s child=%s reason=already_reviewed",
+                    target_id, cid,
+                )
+                all_child_results[cid] = {"status": "skipped", "reason": "already in_review"}
+                child_ids_to_audit.append(cid)
+                continue
+
+            # Capture child stage snapshot before processing
+            try:
+                previous_child_stages = self._child_stage_map(target_id)
+            except Exception:
+                previous_child_stages = {}
+
+            result = self.run_single_item(cid, no_autoplan=self.no_autoplan)
+            all_child_results[cid] = result
+
+            # Run compact for children that newly transitioned to in_review
+            try:
+                invocations, failures = self._compact_after_child_transition(
+                    target_id, previous_child_stages, result.get("attempt", 1),
+                )
+                compact_invocations += invocations
+                compact_failures += failures
+            except Exception:
+                logger.exception("ralph.compact.failed_after_child target=%s child=%s", target_id, cid)
+
+            if result.get("status") not in ("success",):
+                logger.warning(
+                    "ralph.loop.iterate.child_failed target=%s child=%s status=%s",
+                    target_id, cid, result.get("status"),
+                )
+                self._cleanup_pi_process()
+                return {
+                    "status": f"child_{result.get('status', 'unknown')}",
+                    "child_results": all_child_results,
+                    "failed_child": cid,
+                    "compact": {"invocations": compact_invocations, "failures": compact_failures},
+                }
+
+            logger.info(
+                "ralph.loop.iterate.child_passed target=%s child=%s attempt=%d",
+                target_id, cid, result.get("attempt", ""),
+            )
+            child_ids_to_audit.append(cid)
+
+        # --- Final parent integration audit ---
+        logger.info(
+            "ralph.loop.integration_audit.start target=%s children_passed=%d",
+            target_id, len(child_ids_to_audit),
+        )
+
+        integration_result = self.run_single_item(
+            target_id,
+            skip_implement=True,
+            no_autoplan=True,
+        )
+
+        if integration_result.get("status") == "success":
+            logger.info("ralph.loop.integration_audit.passed target=%s", target_id)
+            # Run checks and merge at the parent level
+            check_results = self._run_checks()
+            changed_files = self._capture_changed_files()
+            logger.info("ralph.loop.merge target=%s confirm=%s", target_id, self.confirm_merge)
+            self._run_merge()
+            self._cleanup_pi_process()
+            # Determine overall attempt as the max of child attempts and the integration attempt
+            integration_attempt = integration_result.get("attempt", 1)
+            child_attempt_max = 1
+            if all_child_results:
+                child_attempt_max = max((r.get("attempt", 1) for r in all_child_results.values() if isinstance(r, dict)), default=1)
+            overall_attempt = max(integration_attempt, child_attempt_max)
+
+            return {
+                "status": "success",
+                "attempt": overall_attempt,
+                "scope": self._scope_ids_recursive(target_id),
+                "merge_offered": True,
+                "merge_executed": self.confirm_merge,
+                "child_results": all_child_results,
+                "integration_audit": integration_result,
+                "compact": {"invocations": compact_invocations, "failures": compact_failures},
+                "summary": {
+                    "changed_files": changed_files,
+                    "change_descriptions": self._last_implement_output,
+                    "check_results": check_results,
+                },
+            }
+
+        logger.info(
+            "ralph.loop.integration_audit.failed target=%s status=%s",
+            target_id, integration_result.get("status"),
+        )
+        self._cleanup_pi_process()
+        return {
+            "status": f"integration_{integration_result.get('status', 'unknown')}",
+            "child_results": all_child_results,
+            "integration_audit": integration_result,
             "compact": {"invocations": compact_invocations, "failures": compact_failures},
         }
 

@@ -8,10 +8,10 @@
       "audit": "opencode-go/glm-5.1"
     },
     "local": {
-      "intake": "Llama-3.1 70B (Q4_K_M)",
+      "intake": "Qwen 32B",
       "planning": "Qwen 3.x 32B",
       "implementation": "Qwen 32B",
-      "audit": "Llama-3.1 70B (Q4_K_M)"
+      "audit": "Qwen 32B"
     }
   },
   "timeout": {

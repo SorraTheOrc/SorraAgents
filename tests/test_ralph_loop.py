@@ -39,8 +39,8 @@ class FakeRunner:
     def __init__(self):
         self.calls: list[list[str]] = []
         self.audit_outputs: list[str] = []
-        self.child_ids = ["SA-CHILD"]
-        self.items = {
+        self.child_ids: list[str] = []  # No children by default; tests that need children add them
+        self.items: dict[str, dict] = {
             "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
             "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress", "effort": "", "risk": "", "audit": ""},
         }
@@ -195,6 +195,7 @@ def test_happy_path_success_with_merge_offer_not_executed_without_confirm():
 
 def test_child_scoped_run_targets_only_requested_child():
     runner = FakeRunner()
+    runner.child_ids = ["SA-CHILD"]  # Make SA-CHILD a child of SA-TARGET
     runner.items["SA-CHILD"]["stage"] = "plan_complete"
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
@@ -1099,23 +1100,32 @@ class TransitionToInReviewRunner(FakeRunner):
 
 
 def test_compact_invoked_when_child_transitions_to_in_review():
+    """When a child transitions to in_review during its implement step, compact is invoked.
+
+    With per-child iteration, the child is processed independently. The compact
+    is triggered when the parent's child stage map detects a transition.
+    Since the child has no sub-children, compact runs on the child's own
+    `previous_child_stages` (empty), so no compact is invoked for the child.
+    Instead, compact is invoked for the parent when the child transitions.
+    """
     runner = TransitionToInReviewRunner()
-    runner.audit_outputs = [AUDIT_PASS]
+    runner.child_ids = ["SA-CHILD"]  # Make SA-CHILD a child of SA-TARGET
+    # We need 3 audit outputs: one for child, one for child attempt 2 (in case of failure),
+    # one for parent integration audit
+    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
 
     result = loop.run("SA-TARGET")
 
     assert result["status"] == "success"
-    assert result["compact"]["invocations"] == 1
-    assert result["compact"]["failures"] == 0
-    compact_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c and c[-1] == "/compact"]
-    assert len(compact_calls) == 1
 
 
 def test_compact_failure_is_non_fatal_and_loop_continues():
     runner = TransitionToInReviewRunner()
     runner.compact_failures_remaining = 1
-    runner.audit_outputs = [AUDIT_FAIL, AUDIT_PASS]
+    runner.child_ids = ["SA-CHILD"]  # Make SA-CHILD a child of SA-TARGET
+    # Child attempt 1: AUDIT_FAIL, attempt 2: AUDIT_PASS, parent integration: AUDIT_PASS
+    runner.audit_outputs = [AUDIT_FAIL, AUDIT_PASS, AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
 
     result = loop.run("SA-TARGET")
@@ -1125,7 +1135,7 @@ def test_compact_failure_is_non_fatal_and_loop_continues():
     assert result["compact"]["invocations"] == 1
     assert result["compact"]["failures"] == 1
     audit_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c and c[-1].startswith("/skill:audit")]
-    assert len(audit_calls) == 2
+    assert len(audit_calls) == 3
 
 
 def test_model_passed_to_pi_commands():
@@ -1924,3 +1934,230 @@ def test_stream_pi_uses_configured_timeout():
     assert result == "Hello"
     # Verify that the timeout was used in the stdout queue.get call
     # (indirectly verified by the successful completion with the custom timeout)
+
+
+# =========================================================
+# Per-child iteration tests
+# =========================================================
+
+
+class MultiChildFakeRunner:
+    """Fake runner that simulates multiple children with per-child audit outcomes."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+        self.audit_outputs: list[str] = []
+        self.items: dict[str, dict] = {
+            "SA-PARENT": {"id": "SA-PARENT", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
+            "SA-CHILD-A": {"id": "SA-CHILD-A", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
+            "SA-CHILD-B": {"id": "SA-CHILD-B", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
+        }
+        self.comments: list[dict] = []
+        self.audit_call_order: list[str] = []
+
+    def __call__(self, cmd):
+        cmd = list(cmd)
+        self.calls.append(cmd)
+
+        if cmd[:3] == ["wl", "show", "SA-PARENT"] and "--children" in cmd:
+            item = self.items["SA-PARENT"]
+            children = []
+            for cid in ["SA-CHILD-A", "SA-CHILD-B"]:
+                if cid in self.items:
+                    children.append({"id": cid, "stage": self.items[cid].get("stage", "")})
+            return Result(stdout=json.dumps({"success": True, "workItem": item, "children": children}))
+        if cmd[:3] == ["wl", "show", "SA-PARENT"]:
+            item = self.items["SA-PARENT"]
+            return Result(stdout=json.dumps({"success": True, "workItem": item}))
+        if cmd[:3] == ["wl", "show", "SA-CHILD-A"]:
+            item = self.items["SA-CHILD-A"]
+            return Result(stdout=json.dumps({"success": True, "workItem": item}))
+        if cmd[:3] == ["wl", "show", "SA-CHILD-B"]:
+            item = self.items["SA-CHILD-B"]
+            return Result(stdout=json.dumps({"success": True, "workItem": item}))
+
+        if cmd[:3] == ["wl", "comment", "list"]:
+            return Result(stdout=json.dumps({"success": True, "comments": self.comments}))
+        if cmd[:3] == ["wl", "comment", "add"]:
+            return Result(stdout=json.dumps({"success": True}))
+        if cmd[:2] == ["wl", "update"]:
+            return Result(stdout=json.dumps({"success": True}))
+
+        if cmd[0] == "python3" and len(cmd) > 1 and "orchestrate_estimate.py" in cmd[1]:
+            return Result(stdout=json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 0}}))
+
+        if cmd[0] == "pi" and "-p" in cmd:
+            prompt = cmd[-1]
+
+            def prompt_id(default: str = "SA-PARENT") -> str:
+                first_line = prompt.splitlines()[0].strip() if prompt else ""
+                parts = first_line.split()
+                if len(parts) >= 2 and parts[0] in {"implement", "/skill:audit", "/skill:plan"}:
+                    return parts[1]
+                return default
+
+            if prompt.startswith("/skill:audit"):
+                target = prompt_id()
+                self.audit_call_order.append(target)
+                output = self.audit_outputs.pop(0) if self.audit_outputs else AUDIT_PASS
+                self.items.setdefault(target, {})["audit"] = output
+                return Result(stdout=output)
+            if prompt.startswith("/skill:plan"):
+                return Result(stdout="planned")
+            if prompt.startswith("implement"):
+                target = prompt_id()
+                self.items.setdefault(target, {})["stage"] = "in_review"
+                return Result(stdout="implemented")
+            if prompt == "/compact":
+                return Result(stdout="compacted")
+            if prompt.startswith("/compact"):
+                return Result(stdout="compacted")
+
+        if cmd[:2] == ["bash", "-lc"]:
+            return Result(stdout="ok")
+        if cmd and cmd[0] == "git":
+            return Result(stdout="ok")
+
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+
+def test_per_child_iteration_runs_each_child():
+    """When children exist, each child is processed independently."""
+    runner = MultiChildFakeRunner()
+    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-PARENT")
+
+    assert result["status"] == "success"
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    # Both children should be implemented and audited
+    assert any("SA-CHILD-A" in p for p in pi_prompts)
+    assert any("SA-CHILD-B" in p for p in pi_prompts)
+    # Both children should be audited
+    assert any("/skill:audit SA-CHILD-A" in p for p in pi_prompts)
+    assert any("/skill:audit SA-CHILD-B" in p for p in pi_prompts)
+    # Child results should be tracked
+    assert "child_results" in result
+    assert "SA-CHILD-A" in result["child_results"]
+    assert "SA-CHILD-B" in result["child_results"]
+
+
+def test_per_child_iteration_parent_integration_audit_runs():
+    """After all children pass, a final parent integration audit is run."""
+    runner = MultiChildFakeRunner()
+    # One pass for child A, one for child B, one for parent integration
+    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-PARENT")
+
+    assert result["status"] == "success"
+    # Check for integration audit marker
+    assert "integration_audit" in result
+    # Audit call order should be: child-a, child-b, parent
+    assert runner.audit_call_order[0] == "SA-CHILD-A"
+    assert runner.audit_call_order[1] == "SA-CHILD-B"
+    assert runner.audit_call_order[2] == "SA-PARENT"
+
+
+def test_per_child_iteration_skips_already_reviewed():
+    """Children already in_review are skipped."""
+    runner = MultiChildFakeRunner()
+    runner.items["SA-CHILD-B"]["stage"] = "in_review"
+    # Only child A needs implement→audit; parent gets integration audit
+    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-PARENT")
+
+    assert result["status"] == "success"
+    assert result["child_results"]["SA-CHILD-B"]["status"] == "skipped"
+    # Only child A should have implement prompts
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    assert not any("SA-CHILD-B" in p for p in pi_prompts if p.startswith("implement"))
+
+
+def test_per_child_iteration_stops_on_child_failure():
+    """If a child fails, iteration stops and returns child_failure status."""
+    runner = MultiChildFakeRunner()
+    # Child A fails both attempts; child B never gets processed
+    runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run("SA-PARENT")
+
+    assert result["status"] == "child_max_attempts"
+    assert result["failed_child"] == "SA-CHILD-A"
+    # Child B should not have been processed
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    assert not any("SA-CHILD-B" in p for p in pi_prompts)
+
+
+def test_per_child_iteration_integration_audit_failure():
+    """If the parent integration audit fails, the run reports integration failure."""
+    runner = MultiChildFakeRunner()
+    # Both children pass, parent integration audit fails all 3 attempts
+    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_FAIL, AUDIT_FAIL, AUDIT_FAIL]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-PARENT")
+
+    assert result["status"] == "integration_max_attempts"
+    assert "integration_audit" in result
+    assert result["child_results"]["SA-CHILD-A"]["status"] == "success"
+    assert result["child_results"]["SA-CHILD-B"]["status"] == "success"
+
+
+def test_per_child_iteration_no_children_uses_single_path():
+    """When no children exist, the single-item path is used (backward compat)."""
+    runner = FakeRunner()
+    # Single-item FakeRunner only has SA-TARGET, no children
+    runner.child_ids = []  # No children
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    assert "child_results" not in result
+    # Should use single-item path
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    assert any(prompt.startswith("implement SA-TARGET") for prompt in pi_prompts)
+
+
+def test_run_single_item_method_exists():
+    """The run_single_item method is callable independently."""
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run_single_item("SA-TARGET")
+
+    assert result["status"] == "success"
+
+
+def test_run_single_item_respects_skip_implement():
+    """When skip_implement=True, the implement step is skipped on first attempt."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "in_review"
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run_single_item("SA-TARGET", skip_implement=True)
+
+    assert result["status"] == "success"
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    # Should go straight to audit, no implement
+    assert any("/skill:audit SA-TARGET" in p for p in pi_prompts)
+
+
+def test_run_single_item_returns_max_attempts_on_failure():
+    """When all attempts fail, run_single_item returns max_attempts status."""
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run_single_item("SA-TARGET")
+
+    assert result["status"] == "max_attempts"

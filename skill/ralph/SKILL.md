@@ -22,7 +22,7 @@ The skill accepts a work-item id provided inline in the user's command. Supporte
 
 A work-item id is any short token matching the Worklog id pattern used in your environment (for example `WL-1234`, `CG-0MP12H40Q003Y7OU`, or an 8+ char identifier). When an id is present in the command the skill will use it and will not prompt for an id. If no id is detected, the skill will ask the operator to provide one or abort, except for `ralph status`, which is an intentional no-id exception.
 
-The operator may also supply `remote` or `local` after the work-item id as a shorthand for `--model-source <remote|local>`. If provided, the agent must forward this flag when launching Ralph. If omitted, the agent should check whether the operator's prompt implies a model source and, if unclear, rely on the default from the skill config (see Per-phase model routing).
+The operator may also supply `remote` or `local` after the work-item id as a shorthand for `--model-source <remote|local>`. If provided, the agent must forward this flag when launching Ralph. If omitted, the agent must read the `.ralph.json` config to determine the default `model_source` value. Check `<project>/.ralph.json` first, then fall back to `skill/ralph/assets/.ralph.json`. Extract the `model_source` field and use that as the `--model-source` value. Do not assume a hardcoded default.
 
 ## Behavior
 
@@ -73,7 +73,7 @@ The cleanup is safe to call even if the process has already exited — it checks
 
 Ralph supports phase-specific model selection for `intake`, `planning`, `implementation`, and `audit`.
 
-- Source toggle: `--model-source <remote|local>` (default: `remote`)
+- Source toggle: `--model-source <remote|local>` (default: read from `.ralph.json` config — see Behavior step 2)
 - Per-phase CLI overrides:
   - `--model-intake`
   - `--model-planning`
@@ -87,7 +87,7 @@ Ralph supports phase-specific model selection for `intake`, `planning`, `impleme
 ```bash
 # Launch a background Ralph run from the skill installation.
 # The wrapper handles nohup plus PID/start-time capture for status reporting.
-# Use --model-source to select remote (default) or local models:
+# Use --model-source to select remote or local models (default from .ralph.json config):
 /home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --model-source remote --json
 /home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --model-source local --json
 
