@@ -1,0 +1,119 @@
+---
+name: implement-single
+description: |
+  Write tests, docs and code for a single, specific Worklog work item.
+  Unlike the `implement` skill, this skill operates on exactly one work-item
+  without using `wl next` for recursive dependency resolution or sub-task
+  discovery. It is designed to be invoked by Ralph's per-child loop so that
+  each child is implemented, audited, and remediated independently.
+  Trigger on user queries such as: 'implement-single <work-item-id>',
+  'complete <work-item-id> (single)', or when Ralph delegates a single-child
+  implement step.
+---
+
+## Purpose
+
+Provide a deterministic, step-by-step implementation workflow for completing
+a single Worklog work item. This skill does **not** use `wl next` for
+recursive dependency resolution — it operates on exactly the work-item id
+provided. Any blockers or dependencies must be resolved before this skill
+is invoked.
+
+## Inputs
+
+- work-item id: **required**. Must be a single, explicit Worklog id (e.g.
+  `SA-0MPFD4SPC000MXWH`). No sub-task discovery or `wl next` invocation.
+
+## Outputs
+
+- Tests and implementation code meeting acceptance criteria (committed to a
+  branch and pushed to origin).
+- Work item comment summarising work done.
+- Work item marked as `in_review` when complete.
+
+## Constraints
+
+- **No `wl next` invocation.** This skill works on exactly the work-item id
+  provided. Do not attempt to discover or implement child items, dependencies,
+  or related work items.
+- **No interactive questions.** The implementing agent must never ask the
+  producer questions or pause for interactive input. If it cannot continue
+  safely without explicit producer input, it must return a structured
+  `no_safe_path` response with the missing decision.
+- **No merge.** Do not merge changes into main. Only commit to a feature branch.
+
+## Best Practices
+
+- Follow the steps in order and do not skip steps.
+- Keep implementation focused on meeting acceptance criteria with minimal changes.
+- Never edit code outside of `src/`, `tests/` and `docs/` for this project unless
+  they are essential configuration files.
+- Never edit code in bundled libraries such as `dist/` and `node_modules/`.
+- When implementing a CLI or API always provide a way to obtain a JSON
+  formatted output for agents to consume.
+- Use work item comments to document your process, decisions, and next steps.
+- If the work item is not well-defined, do not proceed with implementation.
+  Instead, return a `no_safe_path` response describing the missing information.
+- Never commit directly to `main`. Always create a feature or bug branch for
+  implementation.
+- The required order of operations before any commit is always:
+  **build → test → commit**. First build the project and verify no errors, then
+  run all tests and verify they pass, and only then commit.
+- When creating branches, include the work item id in the branch name for
+  traceability (e.g., `feature/WL-123-add-auth`).
+- When creating a commit message, review the diff and write a concise message
+  summarizing the changes made and the reason for the change, referencing the
+  work item id.
+- When committing add a comment to the work item with the commit message and hash.
+- Only create a PR when all acceptance criteria have been met, all tests have
+  passed and the implementation is ready for review. Do not create PRs for
+  work in progress.
+- Do not escape content in the PR or work-item description; use markdown
+  formatting as needed for clarity and readability.
+
+## Steps
+
+Execute the following steps in order. Do not skip steps.
+
+### Step 0 — Safety gate
+
+- Inspect `git status --porcelain=v1 -b`.
+- If uncommitted changes exist, either carry them into the work item branch
+  (if limited to `.worklog/`) or abort with a `no_safe_path` response.
+
+### Step 1 — Understand the work item
+
+- Fetch the work item details: `wl show <work-item-id> --json --children`
+- Restate acceptance criteria and current status along with any constraints.
+- Surface blockers, dependencies and missing requirements.
+- Inspect linked PRDs, plans or docs referenced in the work item.
+
+### Step 2 — Create a working branch
+
+- Inspect the current branch name via `git rev-parse --abbrev-ref HEAD`.
+- If the current branch was created for this work item, continue on it.
+- Otherwise create or switch to a branch named
+  `feature/<work-item-id>-<short>` or `bug/<work-item-id>-<short>`.
+- Never commit directly to `main`.
+
+### Step 3 — Implement
+
+- Write tests first (test-driven development approach).
+- Write implementation code to meet acceptance criteria.
+- Make minimal, focused changes.
+- Follow project style and conventions.
+- Add comments to the work item describing any significant design decisions.
+
+### Step 4 — Build, test and commit
+
+- Build the project and verify no errors.
+- Run the entire test suite. Fix any failing tests.
+- Commit changes with a message referencing the work item id.
+- Add a comment to the work item with the commit hash.
+
+### Step 5 — Push and mark in-review
+
+- Push the branch to `origin`.
+- Mark the work item as in-review:
+  `wl update <work-item-id> --status completed --stage in_review --json`
+- Do not create a PR or merge. Ralph will handle PR/merge externally.
