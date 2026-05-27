@@ -262,6 +262,37 @@ class TestPlanProposeFeaturePlanForTestFirst:
         )
 
 
+class TestPlanChildWorkItemStage:
+    """Verify that the wl create command in the Update work items step
+    uses `--stage intake_complete` for child work items."""
+
+    def test_child_create_command_has_intake_complete_stage(self, plan_content: str) -> None:
+        """The wl create example command must use --stage intake_complete."""
+        # Look for the wl create command in the Update work items step
+        create_match = re.search(
+            r"wl create.*--parent.*--priority.*--stage (\S+)",
+            plan_content,
+        )
+        assert create_match is not None, (
+            "Could not find wl create command with --stage flag in plan.md"
+        )
+        stage_value = create_match.group(1)
+        assert stage_value == "intake_complete", (
+            f"Expected --stage intake_complete but found --stage {stage_value}"
+        )
+
+    def test_child_create_command_not_using_idea_stage(self, plan_content: str) -> None:
+        """The wl create example command must NOT use --stage idea."""
+        # Verify there is no wl create command with --stage idea in the update section
+        idea_match = re.search(
+            r"wl create.*--parent.*--priority.*--stage idea\b",
+            plan_content,
+        )
+        assert idea_match is None, (
+            "Found wl create command with --stage idea; it should use --stage intake_complete instead"
+        )
+
+
 class TestPlanNegativeRegression:
     """Negative tests: ensure the plan.md content cannot be incorrectly
     modified to remove test-first ordering without tests catching it."""

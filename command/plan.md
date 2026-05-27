@@ -143,7 +143,7 @@ Keep asking questions until the breakdown into features is clear.
 
 - **Test-first creation**: When creating child work items, always create test/verification work items before implementation work items. This ensures that test tasks are available first, enabling a test-driven development workflow where tests define the validation criteria before implementation begins.
 - Create child work items for each feature with a parent link to the original work item:
-- `wl create --title "<Short Title>" --description "<Full feature description>" --parent <work-item-id> --priority P2 --stage idea --json`
+- `wl create --title "<Short Title>" --description "<Full feature description>" --parent <work-item-id> --priority P2 --stage intake_complete --json`
 - Create dependency edges between feature work items where the plan specifies dependencies:
   - `wl dep add <DependentFeatureId> <PrereqFeatureId>`
   - Specifically: when creating implementation/code work items, add a dependency from the implementation work item to its corresponding test authoring work item so the implementation depends on the test. Example:
