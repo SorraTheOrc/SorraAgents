@@ -33,6 +33,41 @@ Focus on:
 - Ensure `main` is always releasable; avoid direct-to-main changes.
 - Use a git branch + PR workflow; do not push directly to `main`.
 - Ensure the working branch is pushed to `origin` before you finish.
+
+## Branch Naming Policy
+
+All agent-created branches MUST follow the canonical pattern:
+
+    wl-<work-item-id>-<short-desc>
+
+where:
+- `wl-` is a literal prefix
+- `<work-item-id>` is the Worklog identifier (e.g. `SA-0MPDZDPZB00121IE`)
+- `<short-desc>` is a lowercase, hyphen-separated slug describing the work
+
+Examples:
+- `wl-SA-0MPDZDPZB00121IE-branch-naming-policy`
+- `wl-SA-001-fix-login-bug`
+
+Use the `makeBranchName(workItemId, shortDesc)` function from
+`agent/git-helpers.js` to generate compliant branch names. Always validate
+branch names with `validateBranchName(name)` before creating or pushing.
+
+## Push Policy
+
+Agents MUST NOT push directly to protected branches. The following branches
+are blocked for agent pushes:
+
+- `main`
+- `master`
+- `HEAD`
+
+Use `isBranchBlocked(branch)` from `agent/git-helpers.js` to check before any
+push operation. If a push to a blocked branch is attempted, the operation
+must be rejected with a clear error message.
+
+Force-push (`git push --force` / `git push -f`) is prohibited. Agents must
+never rewrite history on shared branches.
 - Do NOT close the Worklog work-item until the PR is merged.
 
 Boundaries:
