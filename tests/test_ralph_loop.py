@@ -12,6 +12,7 @@ from skill.ralph.scripts.ralph_loop import (
     RalphError,
     RalphLoop,
     REMOTE_PI_STREAM_TIMEOUT_SECONDS,
+    _build_implement_single_prompt,
     _extract_phase_model_config,
     _load_asset_config,
     _resolve_stream_timeout,
@@ -2161,3 +2162,158 @@ def test_run_single_item_returns_max_attempts_on_failure():
     result = loop.run_single_item("SA-TARGET")
 
     assert result["status"] == "max_attempts"
+
+
+# =============================================================================
+# Per-child implement-single verification tests
+# =============================================================================
+
+
+def test_build_implement_single_prompt_generates_scoped_prompt():
+    """_build_implement_single_prompt generates a scoped prompt that uses the
+    implement-single skill instead of implement."""
+    prompt = _build_implement_single_prompt("SA-CHILD-1")
+    assert prompt.startswith("implement-single SA-CHILD-1")
+    assert "Continue until the work item is completed, but do not merge." in prompt
+    assert "Do not ask the producer questions" in prompt
+    assert "no_safe_path response" in prompt
+
+
+def test_build_implement_single_prompt_includes_remediation():
+    """_build_implement_single_prompt appends remediation text when provided."""
+    prompt = _build_implement_single_prompt("SA-CHILD-1", remediation="Fix the failing tests.")
+    assert prompt.startswith("implement-single SA-CHILD-1")
+    assert "Fix the failing tests." in prompt
+
+
+def test_per_child_iteration_uses_implement_single_not_implement():
+    """Per-child iteration must use implement-single (not implement) to avoid
+    wl next dependency traversal that could pick up sibling work items."""
+    runner = MultiChildFakeRunner()
+    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-PARENT")
+
+    assert result["status"] == "success"
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    implement_prompts = [p for p in pi_prompts if p.startswith("implement")]
+    # All implement prompts should use implement-single, not implement
+    for p in implement_prompts:
+        assert p.startswith("implement-single"), (
+            f"Expected implement-single prompt, got: {p[:60]}"
+        )
+    # At least child A and child B should have implement-single prompts
+    assert any("SA-CHILD-A" in p for p in implement_prompts), (
+        "SA-CHILD-A should have an implement-single prompt"
+    )
+    assert any("SA-CHILD-B" in p for p in implement_prompts), (
+        "SA-CHILD-B should have an implement-single prompt"
+    )
+
+
+def test_single_item_path_uses_implement_not_implement_single():
+    """Single-work-item path (no children) must use implement (not implement-single)
+    for backward compatibility."""
+    runner = FakeRunner()
+    runner.child_ids = []
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run("SA-TARGET")
+
+    assert result["status"] == "success"
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    implement_prompts = [p for p in pi_prompts if p.startswith("implement")]
+    # Should use implement, NOT implement-single
+    for p in implement_prompts:
+        assert p.startswith("implement "), (
+            f"Expected implement prompt (not implement-single), got: {p[:60]}"
+        )
+    # None should start with implement-single
+    assert not any(p.startswith("implement-single") for p in implement_prompts), (
+        "Single-item path should NOT use implement-single"
+    )
+
+
+def test_child_scoped_run_uses_implement_not_implement_single():
+    """When --child flag is used, the single-item path uses implement (not
+    implement-single) for backward compatibility with existing --child behavior."""
+    runner = FakeRunner()
+    runner.child_ids = ["SA-CHILD"]
+    runner.items["SA-CHILD"]["stage"] = "plan_complete"
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run("SA-TARGET", child_id="SA-CHILD")
+
+    assert result["status"] == "success"
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    implement_prompts = [p for p in pi_prompts if p.startswith("implement")]
+    # --child path should use implement, not implement-single
+    for p in implement_prompts:
+        assert p.startswith("implement "), (
+            f"Expected implement prompt for --child path, got: {p[:60]}"
+        )
+    assert not any(p.startswith("implement-single") for p in implement_prompts), (
+        "--child path should NOT use implement-single"
+    )
+
+
+def test_per_child_remediation_uses_implement_single():
+    """When a child audit fails, remediation must re-implement using
+    implement-single (not implement) to stay scoped to the failing child."""
+    runner = MultiChildFakeRunner()
+    # Child A fails first attempt, passes second; child B passes; parent passes
+    runner.audit_outputs = [AUDIT_FAIL, AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-PARENT")
+
+    assert result["status"] == "success"
+    assert result["attempt"] == 2
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    implement_prompts = [p for p in pi_prompts if p.startswith("implement")]
+    # All implement prompts should use implement-single
+    for p in implement_prompts:
+        assert p.startswith("implement-single"), (
+            f"Expected implement-single for child remediation, got: {p[:60]}"
+        )
+    # Remediation prompt should address audit gaps
+    remediation_prompts = [p for p in implement_prompts if "Address all the gaps" in p]
+    assert len(remediation_prompts) >= 1, (
+        "At least one remediation prompt should address audit gaps"
+    )
+
+
+def test_per_child_iteration_independent_audits_per_child():
+    """Each child must be independently audited against its own acceptance
+    criteria before the next child is started."""
+    runner = MultiChildFakeRunner()
+    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    result = loop.run("SA-PARENT")
+
+    assert result["status"] == "success"
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    audit_prompts = [p for p in pi_prompts if p.startswith("/skill:audit")]
+    # Each child should be audited independently
+    assert any("SA-CHILD-A" in p for p in audit_prompts), (
+        "SA-CHILD-A should be independently audited"
+    )
+    assert any("SA-CHILD-B" in p for p in audit_prompts), (
+        "SA-CHILD-B should be independently audited"
+    )
+    # Parent should also be audited (integration audit)
+    assert any("SA-PARENT" in p for p in audit_prompts), (
+        "SA-PARENT should have an integration audit"
+    )
+    # Audit order should be: child A, child B, parent (not batch)
+    audit_order = runner.audit_call_order
+    assert audit_order.index("SA-CHILD-A") < audit_order.index("SA-PARENT"), (
+        "Child A audit must happen before parent integration audit"
+    )
+    assert audit_order.index("SA-CHILD-B") < audit_order.index("SA-PARENT"), (
+        "Child B audit must happen before parent integration audit"
+    )
