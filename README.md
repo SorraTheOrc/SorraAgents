@@ -35,6 +35,7 @@ Behavior, configuration options, and test references are documented in
 
 The repository also includes the Ralph implement→audit loop for Worklog items.
 Use `/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id>` to launch a background run and `/home/rgardler/.pi/agent/skills/ralph/ralph status` to inspect the current process.
+When the target has children, Ralph runs a per-child implement→audit loop using `implement-single` for each child and finishes with a parent-level integration audit.
 Ralph runs non-interactively by default, includes a stream watchdog so a delegated `pi` process that keeps stdout open too long fails with a clear error instead of hanging forever, and can stop early with a structured `producer_input_required` result when the model cannot safely continue without producer input.
 See `docs/ralph.md` for the full command reference and operational guidance.
 

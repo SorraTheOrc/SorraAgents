@@ -6,11 +6,11 @@
 
 Ralph drives an iterative cycle of:
 
-1. **Implement** — delegate implementation of the target work item (+ direct children) via the `implement` skill.
+1. **Implement (per child)** — if the target has children, Ralph delegates each child individually via `implement-single` (single-work-item runs still use `implement`).
 2. **Compact on child transition** — after each implement pass, detect children that moved to `in_review` and invoke `/compact` once per transition before auditing.
-3. **Audit** — run the `audit` skill and persist structured results.
-4. **Remediate** — if audit finds unmet or partial criteria, feed those into the next implement pass.
-5. **Repeat** until audit passes, max attempts are reached, the model reports no safe path without producer input, or the operator cancels.
+3. **Audit** — run the `audit` skill after each child implementation and run a final parent-level audit once all children pass.
+4. **Remediate** — if a child audit finds unmet or partial criteria, Ralph re-runs only that child before moving on.
+5. **Repeat** until audits pass, max attempts are reached, the model reports no safe path without producer input, or the operator cancels.
 
 Ralph is launched from the `skill/ralph/ralph` wrapper. The wrapper starts the deterministic loop in the background under `nohup`, writes runtime context under `.worklog/ralph/`, and exposes `ralph status` for live or post-exit inspection.
 

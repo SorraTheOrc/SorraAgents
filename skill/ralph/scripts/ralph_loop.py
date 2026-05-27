@@ -418,16 +418,27 @@ def _build_remediation_prompt() -> str:
     return "The previous audit found issues. Address all the gaps identified in the audit."
 
 
-def _build_implement_prompt(work_item_id: str, remediation: str = "") -> str:
+def _build_implement_prompt(work_item_id: str, remediation: str = "", command: str = "implement") -> str:
     """Build the non-interactive implement prompt for Ralph.
 
     The implement step must never ask the producer questions during the
     default loop. If the model cannot continue safely, it must return a
     structured no_safe_path response that names the missing producer decision.
+
+    :param command: The implement command to invoke (for example "implement"
+        or "implement-single").
     """
+    if command == "implement-single":
+        scope_line = (
+            "Complete only this work item. Do not traverse to dependencies or other work items, "
+            "and do not merge."
+        )
+    else:
+        scope_line = "Continue until the work item and all dependencies are completed, but do not merge."
+
     parts = [
-        f"implement {work_item_id}",
-        "Continue until the work item and all dependencies are completed, but do not merge.",
+        f"{command} {work_item_id}",
+        scope_line,
         "Do not ask the producer questions or pause for interactive input.",
         "If you cannot continue safely without explicit producer input, stop and return a structured no_safe_path response with the missing decision.",
     ]
@@ -1953,7 +1964,14 @@ class RalphLoop:
         data = self._wl_show(target_id, children=True)
         return data.get("children", [])
 
-    def run_single_item(self, item_id: str, remediation: str = "", skip_implement: bool = False, no_autoplan: bool = False) -> dict:
+    def run_single_item(
+        self,
+        item_id: str,
+        remediation: str = "",
+        skip_implement: bool = False,
+        no_autoplan: bool = False,
+        implement_command: str = "implement",
+    ) -> dict:
         """Run the implement → audit → remediate loop for a single work item.
 
         This is the former body of :meth:`run`, extracted so that the
@@ -2018,7 +2036,10 @@ class RalphLoop:
                         item_id, attempt, exc,
                     )
                     previous_child_stages = {}
-                implement_output = self._run_pi(_build_implement_prompt(item_id, remediation), phase="implementation")
+                implement_output = self._run_pi(
+                    _build_implement_prompt(item_id, remediation, command=implement_command),
+                    phase="implementation",
+                )
                 self._last_implement_output = implement_output
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
                 invocations, failures = self._compact_after_child_transition(item_id, previous_child_stages, attempt)
@@ -2060,7 +2081,10 @@ class RalphLoop:
                         item_id, attempt, exc,
                     )
                     previous_child_stages = {}
-                implement_output = self._run_pi(_build_implement_prompt(item_id, remediation), phase="implementation")
+                implement_output = self._run_pi(
+                    _build_implement_prompt(item_id, remediation, command=implement_command),
+                    phase="implementation",
+                )
                 self._last_implement_output = implement_output
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
                 invocations, failures = self._compact_after_child_transition(item_id, previous_child_stages, attempt)
@@ -2198,17 +2222,19 @@ class RalphLoop:
         1. Fetch direct children of *target_id*.
         2. For each child that is not already ``in_review``, run the
            implement → audit → remediate loop via
-           :meth:`run_single_item`.
+           :meth:`run_single_item`, delegating implementation to the
+           ``implement-single`` skill so each child is handled independently.
         3. After all children have passed their individual audits, run a final
            parent-level integration audit to verify the aggregate work meets
            the parent's acceptance criteria.
 
         **Backward compatibility** (single-work-item run):
 
-        When no children exist, or when the operator has explicitly scoped the
-        run to a single child via the ``--child`` flag, the method delegates
-        to :meth:`run_single_item` and behaves exactly as before (batch-at-end
-        audit).
+        When no children exist, the method delegates to :meth:`run_single_item`
+        and behaves exactly as before (batch-at-end audit). When the operator
+        scopes to a single child via the ``--child`` flag, Ralph still uses
+        the single-item path but invokes ``implement-single`` to keep the
+        session focused on that child.
 
         :param target_id: The top-level work-item id.
         :param child_id: Optional direct child to focus on. When provided, the
@@ -2224,7 +2250,11 @@ class RalphLoop:
                 "ralph.loop.child_scoped target=%s focus=%s (single-item path)",
                 target_id, focus_id,
             )
-            return self.run_single_item(focus_id, no_autoplan=self.no_autoplan)
+            return self.run_single_item(
+                focus_id,
+                no_autoplan=self.no_autoplan,
+                implement_command="implement-single",
+            )
 
         # --- Fetch children ---
         children = self._get_children(target_id)
@@ -2271,7 +2301,11 @@ class RalphLoop:
             except Exception:
                 previous_child_stages = {}
 
-            result = self.run_single_item(cid, no_autoplan=self.no_autoplan)
+            result = self.run_single_item(
+                cid,
+                no_autoplan=self.no_autoplan,
+                implement_command="implement-single",
+            )
             all_child_results[cid] = result
 
             # Run compact for children that newly transitioned to in_review
