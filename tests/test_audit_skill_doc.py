@@ -54,6 +54,11 @@ class TestAuditSkillDoc:
         text = _skill_md_text()
         assert "--model" in text
 
+    def test_debug_log_flag_documented(self):
+        """SKILL.md must document the --debug-log flag."""
+        text = _skill_md_text()
+        assert "--debug-log" in text
+
     def test_exit_codes_documented(self):
         """SKILL.md must document exit code semantics."""
         text = _skill_md_text()

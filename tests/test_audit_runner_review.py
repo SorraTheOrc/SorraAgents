@@ -297,7 +297,7 @@ class TestCmdIssueWithPi:
         """Assert at least one Pi call is made for the batched AC review."""
         pi_calls = []
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             pi_calls.append(prompt)
             return {"verdict": "met", "evidence": "test.py:1 — covered"}
 
@@ -317,7 +317,7 @@ class TestCmdIssueWithPi:
 
     def test_issue_report_reflects_pi_verdicts(self, monkeypatch, capsys):
         """Assert batched verdicts from Pi flow into the report table."""
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             # Return a batched JSON array matching the bulleted fixture's 3 ACs
             return {
                 "verdict": "met",
@@ -347,7 +347,7 @@ class TestCmdIssueWithPi:
     def test_issue_ready_to_close_yes_when_all_met(self, monkeypatch, capsys):
         """Ready to close: Yes when all AC verdicts are met."""
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             # Return a batched JSON array with all met verdicts for the 3 numbered ACs
             return {
                 "verdict": "met",
@@ -383,7 +383,7 @@ class TestCmdProjectWithPi:
     def test_project_report_structure(self, monkeypatch, capsys):
         """Project mode: only Summary and Recommendation sections."""
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "summary:0 — ok"}
 
         monkeypatch.setattr(
@@ -425,7 +425,7 @@ class TestChildrenReview:
     def test_skips_completed_children(self, monkeypatch, capsys):
         """Children with completed/done status are skipped from review."""
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
@@ -461,7 +461,7 @@ class TestChildrenReview:
     def test_ignores_deleted_children(self, monkeypatch, capsys):
         """Deleted children are completely ignored."""
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
@@ -488,7 +488,7 @@ class TestChildrenReview:
     def test_caps_children_at_10(self, monkeypatch, capsys):
         """Only the first 10 children are reviewed; an explicit note is emitted."""
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
@@ -541,7 +541,7 @@ class TestCmdIssueJsonMode:
     """Verify cmd_issue emits structured JSON when json_mode=True."""
 
     def test_json_output_has_expected_keys(self, monkeypatch, capsys):
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {
                 "verdict": "met",
                 "evidence": json.dumps([
@@ -569,7 +569,7 @@ class TestCmdIssueJsonMode:
         assert isinstance(payload["ready_to_close"], bool)
 
     def test_json_output_ready_to_close_true_when_all_met(self, monkeypatch, capsys):
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {
                 "verdict": "met",
                 "evidence": json.dumps([
@@ -595,7 +595,7 @@ class TestCmdIssueJsonMode:
         assert payload["ready_to_close"] is True
 
     def test_json_output_ac_results_present(self, monkeypatch, capsys):
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {
                 "verdict": "met",
                 "evidence": json.dumps([
@@ -621,7 +621,7 @@ class TestCmdIssueJsonMode:
         assert payload["acceptance_criteria"][0]["evidence"] == "a.py:1 — partial"
 
     def test_default_mode_still_emits_markdown(self, monkeypatch, capsys):
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
