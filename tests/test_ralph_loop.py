@@ -2079,20 +2079,44 @@ def test_per_child_iteration_skips_already_reviewed():
     assert not any("SA-CHILD-B" in p for p in pi_prompts if p.startswith("implement"))
 
 
-def test_per_child_iteration_stops_on_child_failure():
-    """If a child fails, iteration stops and returns child_failure status."""
+def test_per_child_iteration_continues_on_child_failure():
+    """If a child fails, iteration continues to remaining siblings."""
     runner = MultiChildFakeRunner()
-    # Child A fails both attempts; child B never gets processed
-    runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL]
+    # Child A fails both attempts; child B passes
+    runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL, AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
 
     result = loop.run("SA-PARENT")
 
-    assert result["status"] == "child_max_attempts"
-    assert result["failed_child"] == "SA-CHILD-A"
-    # Child B should not have been processed
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    assert not any("SA-CHILD-B" in p for p in pi_prompts)
+    assert result["status"].startswith("child_")
+    assert "failed_children" in result
+    assert "SA-CHILD-A" in result["failed_children"]
+    # Child B should have been processed despite child A failing
+    assert "SA-CHILD-B" in result["child_results"]
+    assert result["child_results"]["SA-CHILD-B"]["status"] == "success"
+    # Integration audit should NOT have been run when children failed
+    assert "integration_audit" not in result
+    # Both children should have audit calls (A failed twice, B once)
+    audit_calls = [c for c in runner.audit_call_order]
+    assert "SA-CHILD-A" in audit_calls
+    assert "SA-CHILD-B" in audit_calls
+
+
+def test_per_child_iteration_all_children_fail():
+    """If all children fail, all are reported in failed_children."""
+    runner = MultiChildFakeRunner()
+    # Both children fail all attempts
+    runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL, AUDIT_FAIL, AUDIT_FAIL]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run("SA-PARENT")
+
+    assert result["status"].startswith("child_")
+    assert "failed_children" in result
+    assert "SA-CHILD-A" in result["failed_children"]
+    assert "SA-CHILD-B" in result["failed_children"]
+    # Integration audit should NOT have been run
+    assert "integration_audit" not in result
 
 
 def test_per_child_iteration_integration_audit_failure():
@@ -2150,6 +2174,28 @@ def test_run_single_item_respects_skip_implement():
     assert result["status"] == "success"
     pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
     # Should go straight to audit, no implement
+    assert any("/skill:audit SA-TARGET" in p for p in pi_prompts)
+
+
+def test_run_single_item_force_fresh_audit_always_runs_audit():
+    """When force_fresh_audit=True with skip_implement, /skill:audit is always
+    invoked even if a recent persisted audit would otherwise be reused."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "in_review"
+    # Simulate a recent audit comment that would normally trigger the
+    # persisted-audit shortcut (comment ts >= updatedAt).
+    from datetime import datetime, timezone
+    recent_ts = datetime.now(timezone.utc).isoformat()
+    runner.items["SA-TARGET"]["updatedAt"] = recent_ts
+    runner.comments = [{"comment": "audit result", "createdAt": recent_ts}]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
+
+    result = loop.run_single_item("SA-TARGET", skip_implement=True, force_fresh_audit=True)
+
+    assert result["status"] == "success"
+    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    # Even with a recent persisted audit, force_fresh_audit ensures audit runs
     assert any("/skill:audit SA-TARGET" in p for p in pi_prompts)
 
 

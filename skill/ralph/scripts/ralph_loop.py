@@ -153,14 +153,33 @@ def parse_audit_report(report_text: str) -> AuditParseResult:
         if not striped.startswith("|"):
             continue
         parts = [p.strip() for p in striped.strip("|").split("|")]
-        if len(parts) != 4:
+        # Skip header and separator rows
+        if not parts or parts[0] in {"#", "---"}:
             continue
-        if parts[0] in {"#", "---"}:
+        # Try to detect if the first column is a number (criterion index).
+        # If not, this is not a data row.
+        try:
+            int(parts[0])
+        except (ValueError, IndexError):
+            # Not a numeric index — could be a section header or stray table row
             continue
-        verdict = parts[2].lower()
+        # Handle 4-column format: | # | Criterion | Verdict | Evidence |
+        if len(parts) >= 4:
+            text = parts[1]
+            verdict_raw = parts[2]
+            evidence = parts[3]
+        # Handle 3-column format: | # | Criterion | Verdict |
+        elif len(parts) == 3:
+            text = parts[1]
+            verdict_raw = parts[2]
+            evidence = ""
+        else:
+            continue
+        # Strip bold/italic markers from verdict (e.g. **unmet**)
+        verdict = verdict_raw.lower().strip("*_")
         if verdict not in {"met", "unmet", "partial"}:
             continue
-        criteria.append(CriterionResult(text=parts[1], verdict=verdict, evidence=parts[3]))
+        criteria.append(CriterionResult(text=text, verdict=verdict, evidence=evidence))
     return AuditParseResult(ready_to_close=ready, criteria=criteria)
 
 
@@ -1976,7 +1995,7 @@ class RalphLoop:
         data = self._wl_show(target_id, children=True)
         return data.get("children", [])
 
-    def run_single_item(self, item_id: str, remediation: str = "", skip_implement: bool = False, no_autoplan: bool = False, use_implement_single: bool = False) -> dict:
+    def run_single_item(self, item_id: str, remediation: str = "", skip_implement: bool = False, no_autoplan: bool = False, use_implement_single: bool = False, force_fresh_audit: bool = False) -> dict:
         """Run the implement → audit → remediate loop for a single work item.
 
         This is the former body of :meth:`run`, extracted so that the
@@ -1987,6 +2006,11 @@ class RalphLoop:
         the ``implement-single`` skill is used instead of ``implement`` to
         avoid ``wl next`` dependency traversal that could pick up sibling
         work items outside the current child's scope.
+
+        When *force_fresh_audit* is True, the persisted-audit shortcut is
+        bypassed on the first attempt, guaranteeing that ``/skill:audit`` is
+        invoked even if the target already has a recent audit result. This is
+        used for the parent-level integration audit after all children pass.
 
         Returns a dict with at least ``status`` and ``scope`` keys.
         """
@@ -2070,7 +2094,7 @@ class RalphLoop:
                         "reason": no_safe_path_reason,
                         "compact": {"invocations": compact_invocations, "failures": compact_failures},
                     }
-            elif skip_implement and attempt == 1:
+            elif skip_implement and attempt == 1 and not force_fresh_audit:
                 # Target already in_review — decide whether start-of-iteration audit is needed
                 logger.info("ralph.loop.single.skip_implement item=%s stage=in_review", item_id)
                 try:
@@ -2084,6 +2108,9 @@ class RalphLoop:
                         use_persisted_audit = True
                 except Exception:
                     logger.exception("ralph.loop.single.pre_audit_check_failed item=%s", item_id)
+            elif skip_implement and attempt == 1 and force_fresh_audit:
+                # Integration audit — always force a fresh audit invocation
+                logger.info("ralph.loop.single.skip_implement.fresh_audit item=%s", item_id)
             else:
                 try:
                     previous_child_stages = self._child_stage_map(item_id)
@@ -2324,23 +2351,38 @@ class RalphLoop:
                 logger.exception("ralph.compact.failed_after_child target=%s child=%s", target_id, cid)
 
             if result.get("status") not in ("success",):
+                # Record the failure but continue processing remaining siblings.
+                # The integration audit will be skipped if any child failed.
                 logger.warning(
                     "ralph.loop.iterate.child_failed target=%s child=%s status=%s",
                     target_id, cid, result.get("status"),
                 )
-                self._cleanup_pi_process()
-                return {
-                    "status": f"child_{result.get('status', 'unknown')}",
-                    "child_results": all_child_results,
-                    "failed_child": cid,
-                    "compact": {"invocations": compact_invocations, "failures": compact_failures},
-                }
+                continue
 
             logger.info(
                 "ralph.loop.iterate.child_passed target=%s child=%s attempt=%d",
                 target_id, cid, result.get("attempt", ""),
             )
             child_ids_to_audit.append(cid)
+
+        # --- Check for any child failures before running integration audit ---
+        failed_children = [
+            cid for cid, r in all_child_results.items()
+            if isinstance(r, dict) and r.get("status") not in ("success", "skipped")
+        ]
+
+        if failed_children:
+            logger.warning(
+                "ralph.loop.children_failed target=%s failed=%s",
+                target_id, failed_children,
+            )
+            self._cleanup_pi_process()
+            return {
+                "status": f"child_{all_child_results[failed_children[0]].get('status', 'unknown')}",
+                "child_results": all_child_results,
+                "failed_children": failed_children,
+                "compact": {"invocations": compact_invocations, "failures": compact_failures},
+            }
 
         # --- Final parent integration audit ---
         logger.info(
@@ -2352,6 +2394,7 @@ class RalphLoop:
             target_id,
             skip_implement=True,
             no_autoplan=True,
+            force_fresh_audit=True,
         )
 
         if integration_result.get("status") == "success":
