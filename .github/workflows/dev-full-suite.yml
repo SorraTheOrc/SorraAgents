@@ -1,0 +1,73 @@
+# dev-full-suite — Pre-merge full test-suite gating job
+#
+# Triggers:
+#   - Manual dispatch via the GitHub Actions UI (workflow_dispatch)
+#   - Push of a release-candidate tag matching pattern rc-*
+#   - Pull requests targeting main (as a required status check)
+#
+# Purpose:
+#   This job runs the project's full test suite and is intended to be the
+#   gating step before merging dev → main. Release managers trigger a
+#   release-candidate tag or use the manual "Run workflow" button. The
+#   merge to main should only proceed when this job reports success.
+#
+# Re-running:
+#   - Via GitHub Actions UI: Actions → dev-full-suite → "Run workflow"
+#   - Via CLI: gh workflow run dev-full-suite.yml --ref <branch-or-tag>
+#   - Pushing a tag matching rc-* to origin also triggers it automatically.
+
+name: dev-full-suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for running the full suite (e.g. pre-merge gate, release candidate)"
+        required: false
+        default: "pre-merge gate"
+  push:
+    tags:
+      - "rc-*"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  full-suite:
+    name: Full test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run full test suite
+        run: pytest --tb=short --junitxml=test-results.xml -v
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-suite-test-results
+          path: test-results.xml
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## dev-full-suite result" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ Full test suite **passed**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Full test suite **failed** — review logs before merging" >> $GITHUB_STEP_SUMMARY
+          fi
