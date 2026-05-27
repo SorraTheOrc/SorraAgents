@@ -6,7 +6,7 @@ Provides two subcommands:
   project      – audit the overall project
 
 Usage:
-  audit_runner.py issue <id> [--persist] [--pi-bin pi] [--model <name>]
+  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>]
   audit_runner.py project [--pi-bin pi] [--model <name>]
 
 Exit codes:
@@ -404,7 +404,7 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     }
 
 
-def cmd_issue(issue_id: str, persist: bool = False,
+def cmd_issue(issue_id: str, persist: bool = True,
               pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
               runner: Runner | None = None, json_mode: bool = False) -> int:
     """Audit a single work item."""
@@ -618,8 +618,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_issue = sub.add_parser("issue", help="Audit a single work item")
     p_issue.add_argument("issue_id", help="Work item id to audit")
-    p_issue.add_argument("--persist", action="store_true",
-                         help="Persist the audit report via wl update")
+    p_issue.add_argument("--do-not-persist", action="store_true",
+                         help="Do not persist the audit report via wl update")
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
     p_issue.add_argument("--model", default="opencode-go/glm-5.1",
                          help="Pi model to use for review")
@@ -645,7 +645,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "issue":
-        return cmd_issue(args.issue_id, persist=args.persist,
+        return cmd_issue(args.issue_id, persist=not args.do_not_persist,
                          pi_bin=args.pi_bin, model=args.model, json_mode=args.json)
     elif args.command == "project":
         return cmd_project(pi_bin=args.pi_bin, model=args.model, json_mode=args.json)

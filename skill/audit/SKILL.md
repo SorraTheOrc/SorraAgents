@@ -30,7 +30,7 @@ The audit skill is automated via a Python runner. **Do not perform the audit man
 ### Audit a single work item
 
 ```bash
-python3 skill/audit/scripts/audit_runner.py issue <id> [--persist] [--pi-bin <path>] [--model <name>]
+python3 skill/audit/scripts/audit_runner.py issue <id> [--do-not-persist] [--pi-bin <path>] [--model <name>]
 ```
 
 ### Audit the project
@@ -43,7 +43,7 @@ python3 skill/audit/scripts/audit_runner.py project [--pi-bin <path>] [--model <
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--persist` | (off) | Persist the audit report to Worklog via `wl update <id> --audit-text`. Only valid for `issue` mode. |
+| `--do-not-persist` | (off) | Do not persist the audit report. By default issue audits are saved to Worklog via `wl update <id> --audit-text`. |
 | `--pi-bin` | `pi` | Path to the Pi binary. |
 | `--model` | `opencode-go/glm-5.1` | Pi model to use for per-criterion review. |
 
@@ -57,7 +57,9 @@ python3 skill/audit/scripts/audit_runner.py project [--pi-bin <path>] [--model <
 
 ## Persistence
 
-When `--persist` is supplied in `issue` mode, the runner delegates to `skill/audit/scripts/persist_audit.py`, which runs `wl update <issue-id> --audit-text "<report>" --json`. The runner propagates the exit code of the persistence step unchanged.
+Issue-mode audits are persisted by default. The runner delegates to `skill/audit/scripts/persist_audit.py`, which runs `wl update <issue-id> --audit-text "<report>" --json`.
+
+To skip persistence, pass `--do-not-persist`. The runner propagates the exit code of the persistence step unchanged.
 
 ## Report Format
 
