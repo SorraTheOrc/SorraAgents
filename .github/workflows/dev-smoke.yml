@@ -1,10 +1,11 @@
-# dev-smoke — fast sanity checks on every push to the dev branch.
+# dev-smoke — fast sanity and critical checks on every push to the dev branch.
 #
 # These tests are designed to catch critical problems early and provide
 # a clear pass/fail signal in the PR/commit checks UI.
 #
 # Local equivalent:
 #   node --test tests/dev/smoke.mjs
+#   node --test tests/dev/critical.mjs
 
 name: dev-smoke
 
@@ -43,3 +44,6 @@ jobs:
 
       - name: Run smoke tests
         run: node --test tests/dev/smoke.mjs
+
+      - name: Run critical tests
+        run: node --test tests/dev/critical.mjs
