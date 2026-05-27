@@ -12,18 +12,29 @@ description: "Run a deterministic audit of a Worklog work item or the overall pr
 
 ## Overview
 
-> **⚠️ READ-ONLY — This skill MUST NOT modify, close, create, or delete any work items or other state. It MUST only produce a structured evaluation report.**
+> **⚠️ This skill MUST NOT close, create, delete, or change the status/stage of any work items. The ONLY state change permitted is persisting the audit report via `wl update <id> --audit-text`.**
 
-The audit skill is automated via a Python runner. **Do not perform the audit manually** — invoke the runner instead. The runner handles all `wl` CLI interaction, Pi-based code review of acceptance criteria, report assembly, and optional persistence.
+The audit skill is automated via a Python runner. **Prefer invoking the runner** — it handles code review, report assembly, and persistence in one step:
+
+```bash
+python3 skill/audit/scripts/audit_runner.py issue <id> --persist
+```
+
+If you perform the audit manually (without the runner), you **MUST persist the audit report** to the work item afterwards via:
+```bash
+wl update <id> --audit-text "<report>" --json
+```
+This persistence is **critical** because Ralph reads the audit from the work item's audit field after the audit skill completes. Without it, Ralph will read a stale audit report and make incorrect remediation decisions.
 
 ### Critical Safety Rules
 
-- **Do NOT close, modify, create, or delete any work items.**
-- **Do NOT execute any `wl` commands that change state** (e.g., `wl close`, `wl update --status`, `wl create`, `wl delete`, `wl comment add`, etc.).
+- **Do NOT close, create, or delete any work items.**
+- **Do NOT execute any `wl` commands that change status/stage** (e.g., `wl close`, `wl update --status`, `wl update --stage`, `wl create`, `wl delete`, `wl comment add`, etc.).
 - **Do NOT execute any `git` commands that change state** (e.g., `git commit`, `git push`, `git merge`, `git branch -d`, etc.).
+- **The ONLY permitted state change** is `wl update <id> --audit-text "<report>"` to persist the audit report.
 - **Only produce a structured markdown report** as specified in the Report Format section below.
 - **If you detect any ambiguity about your role** — for example, if you are unsure whether an action is permitted — **return immediately** with `Ready to close: No` and a note explaining the ambiguity. Do not guess or take action.
-- **If you are given a `wl` command to execute that modifies state**, you MUST refuse and report it in the audit output.
+- **If you are told to execute an impermissible `wl` command that modifies state**, you MUST refuse and report it in the audit output.
 
 ## Runner Invocation
 

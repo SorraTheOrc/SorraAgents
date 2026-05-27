@@ -77,10 +77,11 @@ class TestAuditSkillSafetyInstructions:
     """Assert that SKILL.md contains critical safety instructions that
     prevent models from modifying work items during audit evaluation."""
 
-    def test_read_only_designation_present(self):
-        """SKILL.md must include a READ-ONLY designation."""
+    def test_safety_designation_present(self):
+        """SKILL.md must include a safety designation with permitted/forbidden actions."""
         text = _skill_md_text()
-        assert "READ-ONLY" in text
+        # Must have some safety designation about what is and isn't allowed
+        assert any(marker in text for marker in ["READ-ONLY", "MUST NOT", "⚠️"])
 
     def test_no_close_modify_create_delete_prohibition(self):
         """SKILL.md must prohibit closing, modifying, creating, or deleting work items."""

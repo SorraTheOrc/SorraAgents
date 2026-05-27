@@ -107,19 +107,35 @@ def _call_pi(prompt: str, model: str = "opencode-go/glm-5.1",
     if not text:
         return {"verdict": "unmet", "evidence": ""}
 
+    # Strip markdown code fences before JSON parsing
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        # Remove opening fence (```json, ```, etc.)
+        first_newline = cleaned.find("\n")
+        if first_newline != -1:
+            cleaned = cleaned[first_newline + 1 :]
+        # Remove closing fence
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
+        elif "\n```" in cleaned:
+            cleaned = cleaned[: cleaned.rindex("\n```")].strip()
+
     # Try to parse the text as JSON with verdict/evidence
     try:
-        obj = json.loads(text)
+        obj = json.loads(cleaned)
         if isinstance(obj, dict):
             return {
                 "verdict": obj.get("verdict", "unmet").lower(),
                 "evidence": obj.get("evidence", ""),
             }
+        if isinstance(obj, list):
+            # Return the raw JSON array as evidence so callers can parse it
+            return {"verdict": "met", "evidence": cleaned}
     except json.JSONDecodeError:
         pass
 
     # If Pi returned free-form text, use it as evidence and default to met
-    return {"verdict": "met", "evidence": text.strip()[:200]}
+    return {"verdict": "met", "evidence": cleaned}
 
 
 def _extract_pi_text(raw: str) -> str:
