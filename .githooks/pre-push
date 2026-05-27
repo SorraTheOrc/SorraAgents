@@ -1,8 +1,29 @@
 #!/bin/sh
-# worklog:pre-push-hook:v1
-# Auto-sync Worklog data before pushing (committed hooks).
-# Set WORKLOG_SKIP_PRE_PUSH=1 to bypass.
+# worklog:pre-push-hook:v2
+# 1. Auto-sync Worklog data before pushing (committed hooks).
+# 2. Enforce branch naming policy: block pushes to protected branches.
+#
+# Set WORKLOG_SKIP_PRE_PUSH=1 to bypass worklog sync.
+# Set BRANCH_POLICY_SKIP=1 to bypass branch policy check (not recommended).
 set -e
+
+# ── Branch policy enforcement ────────────────────────────────────────────────
+# Check that the current branch is not a protected branch.
+if [ "$BRANCH_POLICY_SKIP" != "1" ]; then
+  current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  # Protected branches that agents must never push to.
+  blocked_branches="main master HEAD"
+  for blocked in $blocked_branches; do
+    if [ "$current_branch" = "$blocked" ]; then
+      echo "ERROR: Push to '$current_branch' is blocked by branch policy." >&2
+      echo "  Agents must work in feature branches (wl-<id>-<desc>) and push" >&2
+      echo "  those branches instead. See agent/ship.md for details." >&2
+      exit 1
+    fi
+  done
+fi
+
+# ── Worklog sync ─────────────────────────────────────────────────────────────
 if [ "$WORKLOG_SKIP_PRE_PUSH" = "1" ]; then
   exit 0
 fi

@@ -66,6 +66,18 @@ Use `isBranchBlocked(branch)` from `agent/git-helpers.js` to check before any
 push operation. If a push to a blocked branch is attempted, the operation
 must be rejected with a clear error message.
 
+### Pre-push Hook Enforcement
+
+A pre-push hook at `.githooks/pre-push` enforces this policy automatically.
+Before any `git push`, the hook checks the current branch against the blocked
+list and rejects the push with an error if the branch is protected. To enable
+the hook, configure it with:
+
+    git config core.hooksPath .githooks
+
+The hook can be bypassed with `BRANCH_POLICY_SKIP=1` (not recommended; use
+only for administrative operations).
+
 Force-push (`git push --force` / `git push -f`) is prohibited. Agents must
 never rewrite history on shared branches.
 - Do NOT close the Worklog work-item until the PR is merged.
