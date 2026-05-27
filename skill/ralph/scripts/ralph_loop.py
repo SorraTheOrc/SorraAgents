@@ -436,6 +436,29 @@ def _build_implement_prompt(work_item_id: str, remediation: str = "") -> str:
     return "\n".join(parts)
 
 
+def _build_implement_single_prompt(work_item_id: str, remediation: str = "") -> str:
+    """Build a scoped implement-single prompt for per-child Ralph runs.
+
+    Uses the ``implement-single`` skill which works on exactly the given
+    work-item id without traversing dependencies via ``wl next``.  This is
+    critical for per-child iteration so that implementing one child cannot
+    accidentally pick up or modify sibling work items.
+
+    The implement step must never ask the producer questions during the
+    default loop. If the model cannot continue safely, it must return a
+    structured no_safe_path response that names the missing producer decision.
+    """
+    parts = [
+        f"implement-single {work_item_id}",
+        "Continue until the work item is completed, but do not merge.",
+        "Do not ask the producer questions or pause for interactive input.",
+        "If you cannot continue safely without explicit producer input, stop and return a structured no_safe_path response with the missing decision.",
+    ]
+    if remediation:
+        parts.append(remediation)
+    return "\n".join(parts)
+
+
 def _extract_text_from_content(content: object) -> str | None:
     """Recursively extract user-facing text from a JSON content payload."""
     if isinstance(content, str):
@@ -1953,12 +1976,17 @@ class RalphLoop:
         data = self._wl_show(target_id, children=True)
         return data.get("children", [])
 
-    def run_single_item(self, item_id: str, remediation: str = "", skip_implement: bool = False, no_autoplan: bool = False) -> dict:
+    def run_single_item(self, item_id: str, remediation: str = "", skip_implement: bool = False, no_autoplan: bool = False, use_implement_single: bool = False) -> dict:
         """Run the implement → audit → remediate loop for a single work item.
 
         This is the former body of :meth:`run`, extracted so that the
         per-child iteration in :meth:`run` can invoke it independently for
         each child and then perform a final parent integration audit.
+
+        When *use_implement_single* is True (default for per-child runs),
+        the ``implement-single`` skill is used instead of ``implement`` to
+        avoid ``wl next`` dependency traversal that could pick up sibling
+        work items outside the current child's scope.
 
         Returns a dict with at least ``status`` and ``scope`` keys.
         """
@@ -2018,7 +2046,12 @@ class RalphLoop:
                         item_id, attempt, exc,
                     )
                     previous_child_stages = {}
-                implement_output = self._run_pi(_build_implement_prompt(item_id, remediation), phase="implementation")
+                implement_output = self._run_pi(
+                    _build_implement_single_prompt(item_id, remediation)
+                    if use_implement_single
+                    else _build_implement_prompt(item_id, remediation),
+                    phase="implementation",
+                )
                 self._last_implement_output = implement_output
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
                 invocations, failures = self._compact_after_child_transition(item_id, previous_child_stages, attempt)
@@ -2060,7 +2093,12 @@ class RalphLoop:
                         item_id, attempt, exc,
                     )
                     previous_child_stages = {}
-                implement_output = self._run_pi(_build_implement_prompt(item_id, remediation), phase="implementation")
+                implement_output = self._run_pi(
+                    _build_implement_single_prompt(item_id, remediation)
+                    if use_implement_single
+                    else _build_implement_prompt(item_id, remediation),
+                    phase="implementation",
+                )
                 self._last_implement_output = implement_output
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
                 invocations, failures = self._compact_after_child_transition(item_id, previous_child_stages, attempt)
@@ -2198,7 +2236,8 @@ class RalphLoop:
         1. Fetch direct children of *target_id*.
         2. For each child that is not already ``in_review``, run the
            implement → audit → remediate loop via
-           :meth:`run_single_item`.
+           :meth:`run_single_item` using ``implement-single`` (avoids
+           ``wl next`` dependency traversal).
         3. After all children have passed their individual audits, run a final
            parent-level integration audit to verify the aggregate work meets
            the parent's acceptance criteria.
@@ -2207,8 +2246,8 @@ class RalphLoop:
 
         When no children exist, or when the operator has explicitly scoped the
         run to a single child via the ``--child`` flag, the method delegates
-        to :meth:`run_single_item` and behaves exactly as before (batch-at-end
-        audit).
+        to :meth:`run_single_item` with the classic ``implement`` skill
+        (batch-at-end audit).
 
         :param target_id: The top-level work-item id.
         :param child_id: Optional direct child to focus on. When provided, the
@@ -2271,7 +2310,7 @@ class RalphLoop:
             except Exception:
                 previous_child_stages = {}
 
-            result = self.run_single_item(cid, no_autoplan=self.no_autoplan)
+            result = self.run_single_item(cid, no_autoplan=self.no_autoplan, use_implement_single=True)
             all_child_results[cid] = result
 
             # Run compact for children that newly transitioned to in_review

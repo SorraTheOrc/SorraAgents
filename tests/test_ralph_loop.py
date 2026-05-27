@@ -100,7 +100,7 @@ class FakeRunner:
             def prompt_target(default: str = "SA-TARGET") -> str:
                 first_line = prompt.splitlines()[0].strip() if prompt else ""
                 parts = first_line.split()
-                if len(parts) >= 2 and parts[0] in {"implement", "/skill:audit", "/skill:plan"}:
+                if len(parts) >= 2 and parts[0] in {"implement", "implement-single", "/skill:audit", "/skill:plan"}:
                     return parts[1]
                 return default
 
@@ -1992,7 +1992,7 @@ class MultiChildFakeRunner:
             def prompt_id(default: str = "SA-PARENT") -> str:
                 first_line = prompt.splitlines()[0].strip() if prompt else ""
                 parts = first_line.split()
-                if len(parts) >= 2 and parts[0] in {"implement", "/skill:audit", "/skill:plan"}:
+                if len(parts) >= 2 and parts[0] in {"implement", "implement-single", "/skill:audit", "/skill:plan"}:
                     return parts[1]
                 return default
 
