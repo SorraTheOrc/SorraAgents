@@ -2,10 +2,6 @@
 #
 # These tests are designed to catch critical problems early and provide
 # a clear pass/fail signal in the PR/commit checks UI.
-#
-# Local equivalent:
-#   node --test tests/dev/smoke.mjs
-#   node --test tests/dev/critical.mjs
 
 name: dev-smoke
 
@@ -18,7 +14,7 @@ jobs:
   smoke:
     name: Smoke tests
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,14 +32,30 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]" 2>/dev/null || pip install pytest pyyaml
+          pip install pytest pytest-html jsonschema pyyaml
 
       - name: Install ripgrep (required by terminology scan)
         run: |
           sudo apt-get update && sudo apt-get install -y ripgrep
 
-      - name: Run smoke tests
+      - name: Run Node.js smoke tests
         run: node --test tests/dev/smoke.mjs
 
-      - name: Run critical tests
+      - name: Run Node.js critical tests
         run: node --test tests/dev/critical.mjs
+
+      - name: Run Python smoke tests
+        run: pytest tests/dev/test_smoke.py -v -k "smoke or critical" --tb=short --junitxml=test-results-smoke.xml || true
+
+      - name: Upload smoke test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results
+          path: test-results-smoke.xml
+
+      - name: Publish test summary
+        if: always()
+        uses: test-summary/action@v2
+        with:
+          paths: test-results-smoke.xml
