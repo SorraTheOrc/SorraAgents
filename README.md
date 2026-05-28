@@ -158,10 +158,15 @@ bash scripts/release/merge-dev-to-main.sh --dry-run
 
 # Execute the merge (after confirming CI is green)
 bash scripts/release/merge-dev-to-main.sh [--work-item-id <id>]
+
+# Override CI gate in exceptional circumstances (--force logs a warning)
+bash scripts/release/merge-dev-to-main.sh --force [--work-item-id <id>]
 ```
 
-The script verifies the `dev-full-suite` CI job is green, merges `dev` into
-`main`, pushes the result, and records an audit comment in the worklog.
+The script enforces a **hard gate** on the `dev-full-suite` CI job — it will
+abort if CI is not green. Use `--force` to bypass in exceptional circumstances.
+After the gate passes, the script merges `dev` into `main`, pushes the result,
+and records an audit comment in the worklog.
 
 ## Getting started
 1. Read the main workflow: [Workflow.md](Workflow.md).

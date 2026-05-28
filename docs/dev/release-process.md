@@ -68,7 +68,9 @@ bash scripts/release/merge-dev-to-main.sh
 
 The script will:
 
-1. Verify the `dev-full-suite` CI job is green (via GitHub Actions API).
+1. Verify the `dev-full-suite` CI job is green (via GitHub Actions API). This
+   is a **hard gate** — the script will abort if CI is not green. Use
+   `--force` to bypass (only in exceptional circumstances).
 2. Fetch the latest `dev` and `main` from origin.
 3. Perform a merge commit `dev` → `main` (or fast-forward if possible).
 4. Push `main` to origin.
@@ -109,10 +111,13 @@ and CI run details.
 
 ### `dev-full-suite` is red
 
-- Do **not** proceed with the merge.
+- The merge script enforces a **hard gate** and will abort if CI is not green.
 - Identify the failing tests from the CI artifacts.
 - Create a work item for the failure using the triage skill.
 - Notify the operator / Producer.
+- If you must proceed despite red CI (exceptional circumstances), use the
+  `--force` flag. This bypasses the gate and records the override in the
+  audit log with a warning.
 
 ### Merge conflicts between `dev` and `main`
 
@@ -138,3 +143,9 @@ Every merge must be recorded in the worklog with:
 
 The merge script automatically records this information. For manual merges,
 the Release Manager is responsible for adding the audit comment.
+
+### Override Auditing
+
+When the `--force` flag is used to bypass the CI gate, the script emits a
+warning in the audit log indicating that the gate was bypassed. This provides
+a clear audit trail for any merges that did not have green CI.

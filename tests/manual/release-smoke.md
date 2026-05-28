@@ -44,8 +44,8 @@ test -x scripts/release/merge-dev-to-main.sh && echo "PASS: merge script exists 
 bash scripts/release/merge-dev-to-main.sh --help
 ```
 
-Expected output: usage information with `--dry-run`, `--work-item-id`, and
-`--approver` options.
+Expected output: usage information with `--dry-run`, `--force`,
+`--work-item-id`, and `--approver` options.
 
 ### Step 4 — Run a dry-run merge
 
@@ -60,6 +60,8 @@ bash scripts/release/merge-dev-to-main.sh --dry-run
 Expected behaviour:
 - The script runs pre-flight checks (gh auth, wl availability, clean tree).
 - It checks CI status for `dev-full-suite` on `dev`.
+  - If CI is not green, the script will **abort** (hard gate). In dry-run
+    mode it reports what it would have done.
 - It shows what the merge diff would look like.
 - It prints the audit comment that would be recorded.
 - **No changes are made** to any branch.

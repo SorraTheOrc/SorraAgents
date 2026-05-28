@@ -48,3 +48,4 @@ tmp/
 .env
 ampa/.env
 ampa/scheduler_store.json
+.venv/

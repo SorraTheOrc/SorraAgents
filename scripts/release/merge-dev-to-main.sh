@@ -7,12 +7,17 @@
 # worklog with the merge commit hash, CI run IDs, and approver identity.
 #
 # Usage:
-#   bash scripts/release/merge-dev-to-main.sh [--dry-run] [--work-item-id <id>]
+#   bash scripts/release/merge-dev-to-main.sh [--dry-run] [--force] [--work-item-id <id>] [--approver <name>]
 #
 # Options:
 #   --dry-run         Show what would be done without making changes.
+#   --force           Bypass the CI-green gate. The release manager must
+#                     explicitly accept responsibility for merging without
+#                     green CI.
 #   --work-item-id    Associate this merge with a specific work item for
 #                     audit logging (optional; defaults to searching recent).
+#   --approver        Override the approver identity in the audit record
+#                     (defaults to the authenticated gh user).
 #
 # Requirements:
 #   - gh CLI authenticated with repo access and Actions read permissions.
@@ -37,6 +42,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 DRY_RUN=false
+FORCE=false
 WORK_ITEM_ID=""
 APPROVER=""
 
@@ -44,6 +50,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)
       DRY_RUN=true
+      shift
+      ;;
+    --force)
+      FORCE=true
       shift
       ;;
     --work-item-id)
@@ -55,7 +65,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --help|-h)
-      echo "Usage: $0 [--dry-run] [--work-item-id <id>] [--approver <name>]"
+      echo "Usage: $0 [--dry-run] [--force] [--work-item-id <id>] [--approver <name>]"
       exit 0
       ;;
     *)
@@ -119,27 +129,24 @@ check_ci_green() {
     2>/dev/null)" || true
 
   if [[ -z "$run_json" || "$run_json" == "[]" ]]; then
-    warn "No '$REQUIRED_WORKFLOW' runs found on '$DEV_BRANCH'."
-    warn "You may need to trigger it manually via:"
-    warn "  gh workflow run '$REQUIRED_WORKFLOW' --ref $DEV_BRANCH"
-    warn "Or confirm manually that the full suite is green before proceeding."
+    err "No '$REQUIRED_WORKFLOW' runs found on '$DEV_BRANCH'."
+    err "Trigger the workflow before merging:"
+    err "  gh workflow run '$REQUIRED_WORKFLOW' --ref $DEV_BRANCH"
 
-    if [[ "$DRY_RUN" == "true" ]]; then
-      log "[DRY-RUN] Would proceed despite no CI runs found."
+    if [[ "$FORCE" == "true" ]]; then
+      warn "--force: bypassing CI check despite no runs found."
+      RUN_ID="N/A"
+      RUN_SHA="N/A"
       return 0
     fi
 
-    echo ""
-    echo "No CI runs found for '$REQUIRED_WORKFLOW' on '$DEV_BRANCH'."
-    echo "Do you want to proceed anyway? (yes/no)"
-    read -r response
-    if [[ "$response" != "yes" ]]; then
-      err "Aborted by user."
-      exit 1
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log "[DRY-RUN] Would abort due to no CI runs found."
+      return 1
     fi
-    RUN_ID="N/A"
-    RUN_SHA="N/A"
-    return 0
+
+    err "Run again with --force to bypass this gate (not recommended)."
+    exit 1
   fi
 
   # Check the most recent run
@@ -163,21 +170,20 @@ check_ci_green() {
   err "  Conclusion: $latest_conclusion"
   err "  Run URL:    https://github.com/$REPO/actions/runs/$latest_id"
 
+  if [[ "$FORCE" == "true" ]]; then
+    warn "--force: bypassing CI check despite non-green conclusion."
+    RUN_ID="$latest_id"
+    RUN_SHA="$latest_sha"
+    return 0
+  fi
+
   if [[ "$DRY_RUN" == "true" ]]; then
     log "[DRY-RUN] Would abort due to CI not green."
     return 1
   fi
 
-  echo ""
-  echo "CI is not green. Do you want to proceed anyway? (yes/no)"
-  read -r response
-  if [[ "$response" != "yes" ]]; then
-    err "Aborted by user."
-    exit 1
-  fi
-  RUN_ID="$latest_id"
-  RUN_SHA="$latest_sha"
-  return 0
+  err "Run again with --force to bypass this gate (not recommended)."
+  exit 1
 }
 
 # ── Merge ────────────────────────────────────────────────────────────────────
