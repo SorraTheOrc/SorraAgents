@@ -11,10 +11,11 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 "Acceptance Criteria" is the canonical term for work-item requirements. "Success Criteria" is an accepted synonym and may be used interchangeably. Both terms are recognized by validation logic in the workflow invariants (`docs/workflow/workflow.json`, `docs/workflow/workflow.yaml`). When defining work items, prefer the heading **Acceptance Criteria** (synonym: Success Criteria) for consistency.
 
 ## Repository structure
-- agent/: workflow and agent-focused reference guides (e.g., [agent/forge.md](agent/forge.md)).
+- agent/: workflow and agent-focused reference guides (e.g., [agent/forge.md](agent/forge.md), [agent/ship.md](agent/ship.md)).
 - command/: design, intake, implementation and review process documents (see [command/implement.md](command/implement.md)).
 - skill/: skill templates and utilities to scaffold and package agent skills (see [skill/skill-creator/SKILL.md](skill/skill-creator/SKILL.md)).
 - plugins/: local agent framework plugins used by this repository (includes `ralph` compaction plugin).
+- docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)).
 - Workflow.md: high-level workflow for using this repository.
 - package.json: basic metadata used by tooling.
 

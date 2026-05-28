@@ -1,4 +1,4 @@
-# Dev Branch Smoke & Critical Tests
+# Dev Branch Smoke & Critical Tests (and Release Tests)
 
 Fast, high-value tests that run on every push to the `dev` branch to catch critical problems before they reach reviewers.
 
@@ -8,6 +8,7 @@ Fast, high-value tests that run on every push to the `dev` branch to catch criti
 |---|---|---|---|
 | Smoke | `tests/dev/smoke.mjs` | < 5 min | Fast sanity checks — repo structure, lint, tooling |
 | Critical | `tests/dev/critical.mjs` | < 10 min | Deeper checks — pytest pass, skill integrity, YAML validity |
+| Full suite | `npm test` | varies | Complete regression suite run before merges |
 
 ## Smoke Tests
 
@@ -39,6 +40,37 @@ Smoke tests are designed to be **fast** (under 5 minutes) and exercise the highe
 6. **Worklog CLI functional** — `wl list` returns structured, valid JSON
 7. **Essential scripts present** — Key scripts exist and shell scripts are executable
 
+## Test Levels for Release
+
+### 1. Smoke Tests (local)
+
+Quick sanity checks to verify the project builds and core functionality works. Run these locally before pushing to `dev`.
+
+```sh
+node --test tests/dev/smoke.mjs
+```
+
+### 2. Critical Tests (local)
+
+Tests for high-priority features and known failure points. These must pass on `dev` before a release can be triggered.
+
+```sh
+node --test tests/dev/critical.mjs
+# or run all tests
+npm test
+```
+
+### 3. Full Test Suite
+
+The complete test suite must pass before the `dev` → `main` merge.
+
+```sh
+# Full test suite
+npm test
+# or with coverage
+npm test -- --coverage
+```
+
 ### Running locally
 
 From the repository root:
@@ -67,7 +99,7 @@ To verify the CI workflow file itself is valid YAML:
 python3 -c "import yaml; yaml.safe_load(open('.github/workflows/dev-smoke.yml'))"
 ```
 
-## Running inside the dev container
+## Testing inside the dev container
 
 If you are working inside the AMPA dev container (via `wl ampa start-work`):
 
@@ -89,4 +121,20 @@ If you are working inside the AMPA dev container (via `wl ampa start-work`):
 
 - Smoke tests **must pass** on every push to `dev`.
 - If a smoke test fails, the push is considered **broken** and should be fixed before further integration work.
-- Smoke tests are **not** a substitute for the full test suite — they are a first-line sanity check. Run `pytest` for comprehensive testing.
+- Smoke tests are **not** a substitute for the full test suite — they are a first-line sanity check. Run `pytest` or `npm test` for comprehensive testing.
+- Before the `dev` → `main` merge, CI (or a local run) must confirm the **full test suite** passes.
+
+## Troubleshooting
+
+### Failing Tests
+
+1. Identify the failing test(s) from the CI or local output.
+2. Check if the failure is related to recent changes on `dev`.
+3. If the test appears unrelated to your changes, create a test-failure work-item using the triage process.
+4. Do not merge to `main` while tests are failing.
+
+### Flaky Tests
+
+- Document flaky tests in a work-item with the `flaky-test` tag.
+- Do not disable tests without creating a work-item and getting reviewer approval.
+- If a flaky test blocks a release, note it in the release checklist and proceed only if the reviewer agrees the failure is unrelated to the release.

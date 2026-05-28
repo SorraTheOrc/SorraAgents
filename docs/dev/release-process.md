@@ -29,6 +29,13 @@ recorded in this document.
 Agents work in feature branches, push to `dev`, and the Release Manager
 promotes `dev` → `main` after review.
 
+## Overview
+
+- Agents work in feature branches and push completed work to `dev` as the integration step.
+- CI validates `dev` on every change.
+- A human reviewer inspects CI results and triggers the merge from `dev` → `main`.
+- `main` must always be releasable.
+
 ## Pre-merge Checklist
 
 Before merging `dev` into `main`, the Release Manager **must** verify:
@@ -40,21 +47,40 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
      latest `dev-full-suite` run.
    - Confirm the `full-suite` job shows a green checkmark.
 
-2. **CI — `ci` workflow is green**
-   - The standard `ci` workflow (unit tests + integration tests) must also
+2. **CI — `dev-smoke` is green**
+   - The `dev-smoke` workflow (smoke + critical tests) must also
      be green on `dev`.
 
-3. **No open merge conflicts**
+3. **Test suite results**
+   - Smoke tests have passed.
+   - Critical tests have passed.
+   - The full test suite has passed (run locally or via CI if not already run on `dev`).
+
+4. **No open merge conflicts**
    - Ensure `dev` has no unresolved conflicts with `main`.
    - Run `git diff main...dev --name-only` to inspect divergent files.
 
-4. **Review outstanding worklog items**
+5. **Review outstanding worklog items**
    - Run `wl list --status open --priority high --json` to check for any
      critical or high-priority items that may block the release.
 
-5. **Verify changelog / release notes**
+6. **No open blockers**
+   - All blocking work-items related to the release are closed.
+   - No unresolved merge conflicts exist on `dev`.
+
+7. **Verify changelog / release notes**
    - Confirm that any user-facing changes have been documented.
    - Use the changelog generator skill if needed.
+
+## CI Jobs
+
+The CI pipeline for `dev` is expected to run:
+
+- **Smoke tests**: Quick sanity checks that core functionality works.
+- **Critical tests**: Tests for high-priority features and known failure points.
+- **Full test suite**: Run before the `dev` → `main` merge to catch regressions.
+
+See [Release Tests](./release-tests.md) for commands to run these locally.
 
 ## Merge Procedure
 
@@ -107,6 +133,19 @@ and CI run details.
 3. Push the tag: `git push origin v<version>`
 4. Update any downstream consumers or deployment targets.
 
+## Rollback
+
+If a release introduces a critical issue:
+
+1. Revert the merge commit on `main`:
+   ```sh
+   git checkout main
+   git revert -m 1 <merge-commit-hash>
+   git push origin main
+   ```
+2. Create a bug work-item documenting the issue.
+3. Fix the issue on a feature branch, push to `dev`, and follow the release process again.
+
 ## Troubleshooting
 
 ### `dev-full-suite` is red
@@ -137,7 +176,7 @@ and CI run details.
 Every merge must be recorded in the worklog with:
 
 - The merge commit hash.
-- The CI run IDs for `dev-full-suite` and `ci`.
+- The CI run IDs for `dev-full-suite` and `dev-smoke`.
 - The identity of the Release Manager who approved the merge.
 - A brief summary of what was released.
 

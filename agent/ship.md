@@ -111,6 +111,57 @@ Force-push (`git push --force` / `git push -f`) is prohibited. Agents must
 never rewrite history on shared branches.
 - Do NOT close the Worklog work-item until the PR is merged.
 
+## Branch Policy
+
+### Branch naming
+
+All feature branches must follow the canonical naming pattern:
+
+```
+wl-<work-item-id>-<short-description>
+```
+
+Examples:
+- `wl-SA-0MLU57S7D1KX8CU7-add-auth`
+- `wl-SA-0MP1TP1QM009M34K-fix-ci-pipeline`
+
+The `<short-description>` portion should be lowercase, hyphen-separated, and concise (no more than ~40 characters). If a work item has children, child branches may use a more descriptive suffix but must still begin with the parent work-item id.
+
+### Integration workflow: push to `dev`
+
+1. Agents work in local feature branches created per the naming pattern above.
+2. When a feature branch is complete and all tests pass, push the branch to `origin`.
+3. Push the feature branch into the shared `dev` branch as the integration step. This is done either by:
+   - Opening a PR targeting `dev`, or
+   - Pushing a merge commit directly to `dev` (agents with trusted push access).
+4. **Never push directly to `main`.** The `main` branch is protected and only receives changes via the gated release process (see [Release Process](../docs/dev/release-process.md)).
+
+### Conflict handling
+
+- If a push to `dev` results in a merge conflict, the agent must:
+  1. Create a new work-item documenting the conflict (type: `bug` or `task`, priority: `high`).
+  2. Record the conflict details in the work-item description.
+  3. Fail the push and report the conflict to the operator.
+  4. Do not attempt force-push or history rewriting.
+
+## Release Process
+
+The release process promotes tested, reviewed changes from `dev` to `main`. Key points:
+
+- CI runs validation on `dev` on every change.
+- A human reviewer inspects CI results and triggers the merge from `dev` → `main`.
+- The full checklist and test commands are documented in [docs/dev/release-process.md](../docs/dev/release-process.md) and [docs/dev/release-tests.md](../docs/dev/release-tests.md).
+
+## Test Expectations
+
+Before pushing to `dev` or opening a PR:
+- Build the project and verify no errors (`npm run build`).
+- Run the full test suite and verify all tests pass.
+- Run lint checks if available (`npm run lint`).
+- Follow the mandatory **build → test → commit** order. Never commit before verifying that the build and tests pass.
+
+CI on `dev` will run at minimum smoke + critical tests. A full test-suite run is required before the `dev` → `main` merge. See [docs/dev/release-tests.md](../docs/dev/release-tests.md) for details.
+
 Boundaries:
 - Ask first:
   - Adding new infrastructure, cloud services, or external dependencies.
