@@ -53,7 +53,25 @@ Use the `makeBranchName(workItemId, shortDesc)` function from
 `agent/git-helpers.js` to generate compliant branch names. Always validate
 branch names with `validateBranchName(name)` before creating or pushing.
 
-## Push Policy
+## Push-to-Dev Policy
+
+Agents work in feature branches and push completed work into the `dev`
+integration branch. This is the canonical integration action.
+
+### Push Target
+
+- Agents push feature branch heads into `dev` using the command:
+
+      git push origin HEAD:refs/heads/dev
+
+- Use `pushToDev()` from `agent/ship.js` as the canonical helper. It
+  validates the current branch name, blocks push to protected branches,
+  rejects force-push, and handles non-fast-forward errors gracefully.
+
+- Alternative: use `pushToBranch(targetBranch)` to push a feature branch
+  to its own remote ref (e.g., pushing `wl-SA-001-fix-bug` to origin).
+
+### Protected Branches
 
 Agents MUST NOT push directly to protected branches. The following branches
 are blocked for agent pushes:
@@ -62,9 +80,20 @@ are blocked for agent pushes:
 - `master`
 - `HEAD`
 
-Use `isBranchBlocked(branch)` from `agent/git-helpers.js` to check before any
+Use `isBranchBlocked(branch)` from `agent/git-helpers.js` or
+`validatePushTarget(targetBranch)` from `agent/ship.js` to check before any
 push operation. If a push to a blocked branch is attempted, the operation
 must be rejected with a clear error message.
+
+### Conflict Handling
+
+When a push to `dev` is rejected (e.g., non-fast-forward due to conflicts):
+
+1. The agent returns a non-zero exit status.
+2. The agent does NOT force-push or attempt to rewrite history.
+3. The agent creates a merge-conflict work item via `wl create` describing
+   the conflict and linking to the parent work item.
+4. The agent reports the failure to the operator.
 
 ### Pre-push Hook Enforcement
 
