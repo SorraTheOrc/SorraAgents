@@ -144,6 +144,30 @@ WL_AMPA_POOL_SIZE=4 skill/install-ampa/scripts/install-worklog-plugin.sh --yes
 wl ampa warm-pool --non-interactive --size 3
 ```
 
+## Release Process
+
+Promoting changes from `dev` to `main` requires a human-reviewed merge.
+See the full [release process documentation](docs/dev/release-process.md) for
+the checklist and role definition.
+
+### For Release Managers
+
+```sh
+# Run a dry-run to preview the merge
+bash scripts/release/merge-dev-to-main.sh --dry-run
+
+# Execute the merge (after confirming CI is green)
+bash scripts/release/merge-dev-to-main.sh [--work-item-id <id>]
+
+# Override CI gate in exceptional circumstances (--force logs a warning)
+bash scripts/release/merge-dev-to-main.sh --force [--work-item-id <id>]
+```
+
+The script enforces a **hard gate** on the `dev-full-suite` CI job — it will
+abort if CI is not green. Use `--force` to bypass in exceptional circumstances.
+After the gate passes, the script merges `dev` into `main`, pushes the result,
+and records an audit comment in the worklog.
+
 ## Getting started
 1. Read the main workflow: [Workflow.md](Workflow.md).
 2. Pick a folder to work in (e.g., `skill/` or `agent/`).
