@@ -1,33 +1,44 @@
 #!/usr/bin/env bash
 #
-# merge-dev-to-main.sh — Release Manager merge workflow
+# merge-dev-to-main.sh — Release Manager merge workflow (PR-based)
 #
-# Merges the dev integration branch into main after verifying that required
-# CI jobs (dev-full-suite) are green. Records an audit comment in the
-# worklog with the merge commit hash, CI run IDs, and approver identity.
+# Merges the dev integration branch into main via a GitHub pull request.
+# This approach works with server-side branch protection on `main` that
+# requires pull requests, status checks, or restricts direct pushes.
+#
+# The script:
+#   1. Verifies CI (dev-full-suite) is green on `dev`.
+#   2. Creates a merge commit locally (dev → main).
+#   3. Pushes the merge commit to a temporary `release/` branch.
+#   4. Creates a GitHub PR from the temporary branch to `main`.
+#   5. Waits for required status checks to pass on the PR.
+#   6. Merges the PR using `gh pr merge --merge`.
+#   7. Records an audit comment in the worklog.
 #
 # Usage:
-#   bash scripts/release/merge-dev-to-main.sh [--dry-run] [--force] [--work-item-id <id>] [--approver <name>]
+#   bash scripts/release/merge-dev-to-main.sh [--dry-run] [--force]
+#       [--work-item-id <id>] [--approver <name>] [--watch-timeout <seconds>]
 #
 # Options:
-#   --dry-run         Show what would be done without making changes.
-#   --force           Bypass the CI-green gate. The release manager must
-#                     explicitly accept responsibility for merging without
-#                     green CI.
-#   --work-item-id    Associate this merge with a specific work item for
-#                     audit logging (optional; defaults to searching recent).
-#   --approver        Override the approver identity in the audit record
-#                     (defaults to the authenticated gh user).
+#   --dry-run            Show what would be done without making changes.
+#   --force              Bypass the CI-green gate and status-check wait.
+#   --work-item-id       Associate this merge with a specific work item for
+#                        audit logging (optional; defaults to searching).
+#   --approver           Override the approver identity in the audit record
+#                        (defaults to the authenticated gh user).
+#   --watch-timeout      Max seconds to wait for PR checks to pass
+#                        (default: 600, i.e. 10 minutes).
 #
 # Requirements:
-#   - gh CLI authenticated with repo access and Actions read permissions.
+#   - gh CLI authenticated with repo access and Actions read/write.
 #   - wl CLI available for audit logging.
 #   - Clean working tree (no uncommitted changes).
 #
 # Exit codes:
 #   0 — Merge completed successfully.
 #   1 — Pre-flight check failed (CI not green, dirty tree, etc.).
-#   2 — Merge or push failed.
+#   2 — Merge, PR creation, or PR merge failed.
+#   3 — PR checks timed out without passing.
 #
 
 set -euo pipefail
@@ -45,6 +56,7 @@ DRY_RUN=false
 FORCE=false
 WORK_ITEM_ID=""
 APPROVER=""
+WATCH_TIMEOUT=600
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -64,8 +76,12 @@ while [[ $# -gt 0 ]]; do
       APPROVER="$2"
       shift 2
       ;;
+    --watch-timeout)
+      WATCH_TIMEOUT="$2"
+      shift 2
+      ;;
     --help|-h)
-      echo "Usage: $0 [--dry-run] [--force] [--work-item-id <id>] [--approver <name>]"
+      echo "Usage: $0 [--dry-run] [--force] [--work-item-id <id>] [--approver <name>] [--watch-timeout <seconds>]"
       exit 0
       ;;
     *)
@@ -102,14 +118,6 @@ preflight() {
     exit 1
   fi
 
-  # Verify we are on main branch
-  local current_branch
-  current_branch="$(git rev-parse --abbrev-ref HEAD)"
-  if [[ "$current_branch" != "$MAIN_BRANCH" ]]; then
-    err "Must be on '$MAIN_BRANCH' branch to merge. Currently on '$current_branch'."
-    exit 1
-  fi
-
   log "Pre-flight checks passed."
 }
 
@@ -118,7 +126,6 @@ preflight() {
 check_ci_green() {
   log "Checking CI status for '$REQUIRED_WORKFLOW' on '$DEV_BRANCH'..."
 
-  # Fetch recent workflow runs for dev-full-suite on the dev branch
   local run_json
   run_json="$(gh run list \
     --repo "$REPO" \
@@ -149,7 +156,6 @@ check_ci_green() {
     exit 1
   fi
 
-  # Check the most recent run
   local latest_status latest_conclusion latest_id latest_sha
   latest_status="$(echo "$run_json" | jq -r '.[0].status')"
   latest_conclusion="$(echo "$run_json" | jq -r '.[0].conclusion')"
@@ -186,52 +192,149 @@ check_ci_green() {
   exit 1
 }
 
-# ── Merge ────────────────────────────────────────────────────────────────────
+# ── Create merge commit on main ──────────────────────────────────────────────
 
-do_merge() {
+create_merge_commit() {
   log "Fetching latest '$DEV_BRANCH' and '$MAIN_BRANCH' from origin..."
 
   git fetch origin "$DEV_BRANCH"
   git fetch origin "$MAIN_BRANCH"
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    log "[DRY-RUN] Would merge origin/$DEV_BRANCH into $MAIN_BRANCH."
+    log "[DRY-RUN] Would create merge commit (origin/$DEV_BRANCH into $MAIN_BRANCH)."
     log "[DRY-RUN] diff summary:"
-    git diff --stat "$MAIN_BRANCH".."origin/$DEV_BRANCH" 2>/dev/null || true
+    git diff --stat "origin/$MAIN_BRANCH".."origin/$DEV_BRANCH" 2>/dev/null || true
     return 0
   fi
 
-  log "Merging origin/$DEV_BRANCH into $MAIN_BRANCH..."
+  # Create the merge commit on origin/main without switching branches
+  log "Creating merge commit (origin/$DEV_BRANCH into origin/$MAIN_BRANCH)..."
 
+  # Use a temporary graft to compute the merge tree, then commit
   local merge_result
-  merge_result="$(git merge "origin/$DEV_BRANCH" --no-ff -m "Release: merge dev into main" 2>&1)" || {
-    err "Merge failed. Resolve conflicts manually and re-run."
+  merge_result="$( \
+    git checkout -q "origin/$MAIN_BRANCH" && \
+    git merge "origin/$DEV_BRANCH" --no-ff -m "Release: merge dev into main" 2>&1 \
+  )" || {
+    err "Merge failed. Resolve conflicts manually."
     err "$merge_result"
+    # Switch back to original branch
+    git checkout -q "$CURRENT_BRANCH" 2>/dev/null || true
     exit 2
   }
   echo "$merge_result"
 
-  # Get the merge commit hash
   MERGE_COMMIT="$(git rev-parse HEAD)"
-  log "Merge commit: $MERGE_COMMIT"
+  log "Merge commit created: $MERGE_COMMIT"
 }
 
-# ── Push ─────────────────────────────────────────────────────────────────────
+# ── Push temp branch + create PR ─────────────────────────────────────────────
 
-do_push() {
+create_pr_and_merge() {
+  local timestamp
+  timestamp="$(date +%Y%m%d%H%M%S)"
+  local temp_branch="release/dev-to-main-${timestamp}"
+
   if [[ "$DRY_RUN" == "true" ]]; then
-    log "[DRY-RUN] Would push $MAIN_BRANCH to origin."
+    log "[DRY-RUN] Would create temp branch '${temp_branch}' at merge commit ${MERGE_COMMIT}."
+    log "[DRY-RUN] Would push '${temp_branch}' to origin."
+    log "[DRY-RUN] Would create PR: ${temp_branch} → ${MAIN_BRANCH}"
+    log "[DRY-RUN] Would wait for status checks (timeout: ${WATCH_TIMEOUT}s)."
+    log "[DRY-RUN] Would merge PR via 'gh pr merge --merge --delete-branch'."
+
+    # Restore original branch in dry-run mode
+    git checkout -q "$CURRENT_BRANCH" 2>/dev/null || true
     return 0
   fi
 
-  log "Pushing $MAIN_BRANCH to origin..."
+  # Create the temp branch at the merge commit and push it
+  log "Creating temp branch '${temp_branch}'..."
+  git branch "$temp_branch" "$MERGE_COMMIT"
 
-  if ! git push origin "$MAIN_BRANCH"; then
-    err "Push to origin/$MAIN_BRANCH failed."
+  log "Pushing '${temp_branch}' to origin..."
+  git push origin "$temp_branch"
+
+  # Restore original branch so we're not left on a detached/merge state
+  git checkout -q "$CURRENT_BRANCH" 2>/dev/null || true
+
+  # Build PR body
+  local pr_body
+  pr_body="## Release: merge dev into main
+
+This PR was created automatically by the release merge script.
+
+### Changes included
+
+\`\`\`
+$(git log --oneline "origin/${DEV_BRANCH}" --not "origin/${MAIN_BRANCH}" 2>/dev/null | head -30 || echo '(unable to list changes)')
+\`\`\`
+
+### CI Verification
+
+- **dev-full-suite**: [Run ${RUN_ID}](https://github.com/${REPO}/actions/runs/${RUN_ID})
+
+> _Generated by \`scripts/release/merge-dev-to-main.sh\`_
+"
+
+  log "Creating PR: ${temp_branch} → ${MAIN_BRANCH}..."
+  local pr_url pr_number
+  pr_url="$(gh pr create \
+    --repo "$REPO" \
+    --base "$MAIN_BRANCH" \
+    --head "$temp_branch" \
+    --title "Release: merge dev into main" \
+    --body "$pr_body" \
+    2>&1)" || {
+    err "Failed to create PR."
+    err "$pr_url"
     exit 2
+  }
+  echo "$pr_url"
+  pr_number="$(echo "$pr_url" | grep -oE '[0-9]+$' || true)"
+
+  if [[ -z "$pr_number" ]]; then
+    warn "Could not extract PR number from URL: $pr_url"
+    PR_URL="$pr_url"
+  else
+    PR_URL="$pr_url"
+    PR_NUMBER="$pr_number"
+    log "PR #${PR_NUMBER} created: ${PR_URL}"
   fi
 
-  log "Push successful."
+  # Wait for required status checks, unless --force
+  if [[ "$FORCE" != "true" ]]; then
+    log "Waiting for required status checks on PR #${PR_NUMBER} (timeout: ${WATCH_TIMEOUT}s)..."
+    if ! gh pr checks "$PR_NUMBER" --repo "$REPO" --watch --interval 30 --required 2>&1; then
+      if [[ "$WATCH_TIMEOUT" -gt 0 ]]; then
+        err "PR checks did not all pass within ${WATCH_TIMEOUT}s timeout."
+        err "PR is still open at ${PR_URL}"
+        err "Manually review and merge when checks pass, or re-run with --force."
+        exit 3
+      fi
+    fi
+    log "All required checks passed."
+  else
+    warn "--force: skipping PR status check wait."
+  fi
+
+  # Merge the PR
+  log "Merging PR #${PR_NUMBER}..."
+  local merge_output
+  merge_output="$(gh pr merge "$PR_NUMBER" --repo "$REPO" --merge --delete-branch 2>&1)" || {
+    err "Failed to merge PR #${PR_NUMBER}."
+    err "$merge_output"
+    err "PR is still open at ${PR_URL}"
+    exit 2
+  }
+  echo "$merge_output"
+
+  # Delete the local temp branch
+  git branch -D "$temp_branch" 2>/dev/null || true
+
+  # Update main locally to reflect the merge
+  git fetch origin "$MAIN_BRANCH" 2>/dev/null || true
+
+  log "PR #${PR_NUMBER} merged successfully. Remote temp branch deleted."
 }
 
 # ── Audit logging ────────────────────────────────────────────────────────────
@@ -242,6 +345,8 @@ record_audit() {
   local ci_run_id="${RUN_ID:-N/A}"
   local ci_sha="${RUN_SHA:-N/A}"
   local ci_url="https://github.com/${REPO}/actions/runs/${ci_run_id}"
+  local pr_url="${PR_URL:-N/A}"
+  local pr_number="${PR_NUMBER:-N/A}"
   local timestamp
   timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
@@ -251,6 +356,7 @@ record_audit() {
 - **Merge commit**: \`${merge_commit}\`
 - **Source branch**: \`${DEV_BRANCH}\`
 - **Target branch**: \`${MAIN_BRANCH}\`
+- **PR**: [#${pr_number}](${pr_url})
 - **Approver**: ${approver}
 - **Timestamp**: ${timestamp}
 
@@ -263,7 +369,7 @@ record_audit() {
 ### Changes Released
 
 \`\`\`
-$(git log --oneline "origin/${DEV_BRANCH}" --not "$(git merge-base HEAD~1 HEAD)" 2>/dev/null | head -20 || echo '(unable to list)')
+$(git log --oneline "origin/${DEV_BRANCH}" --not "$(git merge-base "origin/${MAIN_BRANCH}" "origin/${DEV_BRANCH}" 2>/dev/null)" 2>/dev/null | head -20 || echo '(unable to list)')
 \`\`\`
 "
 
@@ -307,14 +413,18 @@ $(git log --oneline "origin/${DEV_BRANCH}" --not "$(git merge-base HEAD~1 HEAD)"
 main() {
   cd "$REPO_ROOT"
 
+  # Save the branch we started from so we can restore it later
+  CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+  export CURRENT_BRANCH
+
   if [[ "$DRY_RUN" == "true" ]]; then
     log "=== DRY RUN MODE — No changes will be made ==="
   fi
 
   preflight
   check_ci_green
-  do_merge
-  do_push
+  create_merge_commit
+  create_pr_and_merge
   record_audit
 
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -322,6 +432,7 @@ main() {
   else
     log "Release merge dev → main completed successfully."
     log "Merge commit: ${MERGE_COMMIT}"
+    log "PR: ${PR_URL}"
   fi
 }
 

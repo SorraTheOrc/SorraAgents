@@ -98,14 +98,21 @@ The script will:
    is a **hard gate** — the script will abort if CI is not green. Use
    `--force` to bypass (only in exceptional circumstances).
 2. Fetch the latest `dev` and `main` from origin.
-3. Perform a merge commit `dev` → `main` (or fast-forward if possible).
-4. Push `main` to origin.
-5. Record an audit comment in the worklog with the merge commit hash,
-   CI run IDs, and approver identity.
+3. Create a merge commit locally (`dev` → `main`).
+4. Push the merge commit to a temporary `release/dev-to-main-<timestamp>` branch.
+5. Create a **GitHub Pull Request** from the temp branch to `main`.
+6. Wait for required status checks to pass on the PR.
+7. Merge the PR using `gh pr merge --merge --delete-branch`.
+8. Record an audit comment in the worklog with the merge commit hash,
+   CI run IDs, PR number, and approver identity.
 
-### Option B — Manual merge
+The PR-based approach works with **server-side branch protection** on `main`
+that requires pull requests or status checks. The script uses the `gh` CLI to
+create and merge the PR, so branch protection rules are satisfied.
 
-If the script is unavailable or fails:
+### Option B — Manual merge (without branch protection)
+
+If `main` does not have branch protection and you prefer a direct merge:
 
 ```bash
 # Fetch latest
@@ -124,6 +131,21 @@ git push origin main
 
 Then manually record the audit in the worklog with the merge commit hash
 and CI run details.
+
+### Option C — Manual PR (for review)
+
+If you want human review of the merge before it lands:
+
+```bash
+# Create a temp branch with the merge result
+git fetch origin
+git checkout origin/main -b release/dev-to-manual-$(date +%Y%m%d%H%M%S)
+git merge origin/dev --no-ff -m "Release: merge dev into main"
+git push origin HEAD
+
+# Create the PR manually
+gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Release: merge dev into main"
+```
 
 ## Post-merge Steps
 
