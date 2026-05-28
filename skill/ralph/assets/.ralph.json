@@ -8,16 +8,16 @@
       "audit": "opencode-go/glm-5.1"
     },
     "local": {
-      "intake": "Qwen 32B",
-      "planning": "Qwen 3.x 32B",
-      "implementation": "Qwen 32B",
-      "audit": "Qwen 32B"
+      "intake": "Local Proxy/qwen3",
+      "planning": "Local Proxy/qwen3",
+      "implementation": "Local Proxy/qwen3",
+      "audit": "Local Proxy/qwen3"
     }
   },
   "timeout": {
     "pi_stream": {
       "remote": 900,
-      "local": 60
+      "local": 600
     }
   }
 }

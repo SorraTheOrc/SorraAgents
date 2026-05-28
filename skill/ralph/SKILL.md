@@ -22,16 +22,23 @@ The skill accepts a work-item id provided inline in the user's command. Supporte
 
 A work-item id is any short token matching the Worklog id pattern used in your environment (for example `WL-1234`, `CG-0MP12H40Q003Y7OU`, or an 8+ char identifier). When an id is present in the command the skill will use it and will not prompt for an id. If no id is detected, the skill will ask the operator to provide one or abort, except for `ralph status`, which is an intentional no-id exception.
 
-The operator may also supply `remote` or `local` after the work-item id as a shorthand for `--model-source <remote|local>`. If provided, the agent must forward this flag when launching Ralph. If omitted, the agent must read the `.ralph.json` config to determine the default `model_source` value. Check `<project>/.ralph.json` first, then fall back to `skill/ralph/assets/.ralph.json`. Extract the `model_source` field and use that as the `--model-source` value. Do not assume a hardcoded default.
+The operator may also supply `remote` or `local` after the work-item id as a shorthand for `--model-source <remote|local>`. If provided, the agent must forward this flag when launching Ralph.
+
+**If the operator does NOT supply a model-source flag, the agent MUST always read the `.ralph.json` config file to determine the default `model_source` value — never assume a hardcoded default.** The lookup order is:
+
+1. `<project>/.ralph.json` — project-level config (highest priority)
+2. `skill/ralph/assets/.ralph.json` — skill's default config (fallback)
+
+Extract the `model_source` field and use that as the `--model-source` value. Do not infer from previous launches, conversation history, or any other context — always read the file.
 
 ## Behavior
 
 1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id or abort, except for `ralph status`, which intentionally runs without a work-item id.
-2. Detect whether the operator also supplied `remote` or `local` after the work-item id. If present, forward it as `--model-source <value>` when launching the wrapper.
+2. **Determine model source.** If the operator supplied `remote` or `local` inline after the work-item id, use that value as `--model-source`. Otherwise, read the `.ralph.json` config (project level first, skill default as fallback) and extract the `model_source` field — never hardcode or assume a default.
 3. **Gate: Check the work-item stage.** Retrieve the work item with `wl show <id> --json` and inspect the `workItem.stage` field.
    - If the stage is `idea`, report that the work item is still in the **idea** stage and must be progressed to at least **intake_complete** before Ralph can run. Instruct the operator to run `/intake <id>` first. Stop and do not proceed to launch Ralph.
    - For any other stage (including `intake_complete`, `plan_complete`, `in_progress`, etc.), proceed to the next step.
-4. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`. Pass any detected `--model-source` (or other explicit model flags) through to the wrapper.
+4. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`. Always pass a `--model-source` flag to the wrapper (determined in step 2). Also forward any other explicit model flags if provided.
 5. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
 6. Use `ralph status` to inspect the current background run without needing the original work-item id.
 
@@ -54,7 +61,7 @@ Ralph validates Pi output after every delegation to detect silent failures:
 These checks prevent the common failure mode where a misconfigured model causes Pi to echo the user prompt as the assistant response.
 
 **Stream timeout defaults:**
-- **Local models** (`--model-source local`): 60 seconds
+- **Local models** (`--model-source local`): 600 seconds
 - **Remote models** (`--model-source remote`): 300 seconds
 
 The timeout is configurable via `.ralph.json` (see `docs/ralph.md`) or the `--pi-stream-timeout` CLI flag.
