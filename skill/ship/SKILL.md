@@ -5,13 +5,23 @@ description: "Canonical push-to-dev and branch-policy enforcement for agents. Pr
 
 # Ship Skill
 
-Canonical agent-side push-to-dev behaviour and branch-policy enforcement.
+Canonical agent-side push-to-dev behaviour and branch-policy enforcement, with
+automated dev-to-main release execution via the Ship subagent.
 
 ## When To Use
 
 - An agent needs to push completed feature branch work into the `dev` integration branch.
 - An agent needs to generate a canonical branch name for a work item.
 - An agent needs to validate a branch name or check whether a branch is protected.
+- An agent or operator needs to execute a release (dev → main merge) via the Ship subagent.
+
+Triggers
+
+- "release"
+- "merge dev to main"
+- "ship it"
+- "promote dev"
+- "release the changes"
 
 ## How Agents Invoke This Skill
 
@@ -29,7 +39,22 @@ Where `<action>` is one of:
 | `validate-branch <name>` | Validate a branch name against the canonical pattern |
 | `generate-name <work-item-id> <short-desc>` | Generate a canonical branch name |
 | `check-blocked <branch>` | Check whether a branch is protected |
+| `release` | Execute the automated dev → main release (via Ship subagent) |
 | `help` | Print the ship skill documentation |
+
+## Prerequisites
+
+- **Node.js** 18+ (for running the JavaScript modules)
+- **git** CLI installed and configured
+- **gh** CLI (for PR-based workflows — see [Release Process](#release-process))
+- **wl** CLI (Worklog — for creating merge-conflict work items and audit logging)
+- **jq** CLI (for JSON parsing in the release script)
+
+## Scripts and Modules
+
+- `scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, and re-exports from `git-helpers.js`)
+- `scripts/git-helpers.js` — Branch naming and policy helpers (exports: `makeBranchName`, `validateBranchName`, `isBranchBlocked`, `BLOCKED_BRANCHS`, `BRANCH_NAME_PATTERN`)
+- `scripts/release/merge-dev-to-main.sh` — the canonical release merge script
 
 ## Usage
 
@@ -54,13 +79,6 @@ const validation = validateBranchName('wl-SA-001-fix-login-bug');
 const blocked = isBranchBlocked('main');
 // Returns: true
 ```
-
-## Prerequisites
-
-- **Node.js** 18+ (for running the JavaScript modules)
-- **git** CLI installed and configured
-- **gh** CLI (for PR-based workflows — see [Release Process](#release-process))
-- **wl** CLI (Worklog — for creating merge-conflict work items)
 
 ## Push-to-Dev Workflow
 
@@ -125,15 +143,93 @@ Force-push (`git push --force` / `git push -f`) is prohibited.
 
 ## Release Process
 
-The release process promotes tested, reviewed changes from `dev` to `main`:
+The Ship skill supports two release execution modes. The **Ship subagent** is
+the primary executor; the **human Release Manager** is the fallback.
 
-1. CI runs validation on `dev` on every change (smoke + critical tests).
-2. A human reviewer (Release Manager) inspects CI results.
-3. The Release Manager triggers the merge from `dev` → `main` using:
-   - `scripts/release/merge-dev-to-main.sh` (PR-based, recommended for protected branches), or
-   - Direct merge (for repos without branch protection on main)
+### Primary executor: Ship subagent
 
-See [docs/dev/release-process.md](../docs/dev/release-process.md) and [docs/dev/release-tests.md](../docs/dev/release-tests.md) for details.
+The Ship subagent (configured in [`agent/ship.md`](../agent/ship.md)) executes
+the release using the canonical merge script:
+
+```bash
+bash scripts/release/merge-dev-to-main.sh
+```
+
+The script performs the following steps:
+
+1. **Pre-flight checks**: Verifies `gh` authentication, `wl` availability,
+   and a clean working tree.
+2. **CI verification**: Checks that the `dev-full-suite` workflow is green
+   on the `dev` branch via the GitHub Actions API. This is a **hard gate**
+   — the script aborts if CI is not green (use `--force` to bypass in
+   exceptional circumstances).
+3. **Merge commit creation**: Fetches latest `dev` and `main`, creates a
+   merge commit locally (`dev` → `main` with `--no-ff`).
+4. **PR creation**: Pushes the merge commit to a temporary
+   `release/dev-to-main-<timestamp>` branch and creates a GitHub Pull
+   Request targeting `main`.
+5. **Status check wait**: Waits for required status checks to pass on the PR
+   (configurable timeout, default 10 minutes).
+6. **PR merge**: Merges the PR using `gh pr merge --merge --delete-branch`,
+   which satisfies server-side branch protection on `main`.
+7. **Audit logging**: Records the merge commit hash, CI run IDs, PR URL,
+   and approver identity in the worklog.
+
+### Fallback: Human Release Manager
+
+For repositories where the Ship subagent is not configured or the automated
+merge is not suitable, a **human Release Manager** can perform the release
+manually. The Release Manager must follow the checklist and procedures in
+[`docs/dev/release-process.md`](../docs/dev/release-process.md).
+
+The human fallback supports three approaches:
+
+| Approach | Description | When to use |
+|----------|-------------|-------------|
+| **Automated script** | Run `bash scripts/release/merge-dev-to-main.sh` manually | Ship subagent unavailable but script is available |
+| **Direct merge** | `git checkout main && git merge origin/dev --no-ff` | No branch protection on main |
+| **Manual PR** | Create a temp branch with merge result and open a PR | Want human review before merge |
+
+### Pre-merge checklist
+
+Whether using the Ship subagent or the human fallback, the following must be
+verified before merging `dev` into `main`:
+
+1. **CI — `dev-full-suite` is green** on the current `dev` HEAD.
+2. **CI — `dev-smoke` is green** on the current `dev` HEAD.
+3. **No open merge conflicts** between `dev` and `main`.
+4. **No open critical work items** that would block the release.
+5. **Changelog / release notes** are updated for user-facing changes.
+
+See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md) for the
+test commands to run locally.
+
+## Preferred execution behaviour (policy)
+
+- When the Ship subagent is available, it MUST serve as the primary release
+  executor. The agent should invoke `scripts/release/merge-dev-to-main.sh`
+  to perform the dev → main merge.
+- The agent MUST NOT perform the merge by substituting its own ad-hoc git
+  commands for the canonical script during normal operation.
+- The agent may fall back to manual git commands ONLY in narrowly defined
+  edge cases:
+  - the merge script is missing or not executable,
+  - the script fails with an unexpected error and the operator explicitly
+    instructs the agent to fall back,
+  - the Ship subagent is not configured and a human has explicitly requested
+    manual steps.
+- If the Ship subagent is not configured, the agent MUST refuse to perform
+  the release automatically and instead direct the operator to the human
+  Release Manager fallback procedures in `docs/dev/release-process.md`.
+
+## Preconditions & safety
+
+- Never force-push or rewrite history on `main` or `dev`.
+- Never bypass the CI-green gate unless explicitly instructed with `--force`.
+- Always log the merge audit to the worklog using `wl comment add`.
+- The `main` branch is protected: agents must never push directly to `main`.
+- All merges must go through a GitHub Pull Request that satisfies branch
+  protection rules, or follow the documented manual fallback exactly.
 
 ## Integration with AGENTS.md
 
@@ -142,9 +238,12 @@ The per-work-item merge workflow in AGENTS.md (step 6) describes PR-based mergin
 1. Agent implements work on a feature branch → commits → builds → tests
 2. Agent calls `pushToDev()` to integrate into `dev`
 3. CI runs on `dev`
-4. Release Manager merges `dev` → `main` via PR (see AGENTS.md step 6)
+4. Ship subagent or Release Manager merges `dev` → `main` via PR (see AGENTS.md step 6)
 
-## Files
+## Outputs
 
-- `scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, and re-exports from `git-helpers.js`)
-- `scripts/git-helpers.js` — Branch naming and policy helpers (exports: `makeBranchName`, `validateBranchName`, `isBranchBlocked`, `BLOCKED_BRANCHS`, `BRANCH_NAME_PATTERN`)
+- A GitHub Pull Request from `release/dev-to-main-<timestamp>` to `main`
+  (created and merged by the script).
+- An audit comment in the worklog with merge commit hash, CI run IDs,
+  PR URL, and approver identity.
+- A notification to the operator summarising the merge result.
