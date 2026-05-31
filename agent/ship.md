@@ -33,6 +33,7 @@ Focus on:
 - Ensure `main` is always releasable; avoid direct-to-main changes.
 - Use a git branch + PR workflow; do not push directly to `main`.
 - Ensure the working branch is pushed to `origin` before you finish.
+- When performing a release (dev → main merge), follow the **Ship skill** ([skill/ship/SKILL.md](../skill/ship/SKILL.md)) which defines the automated release process.
 
 ## Branch Naming Policy
 
@@ -146,11 +147,26 @@ The `<short-description>` portion should be lowercase, hyphen-separated, and con
 
 ## Release Process
 
-The release process promotes tested, reviewed changes from `dev` to `main`. Key points:
+The release process promotes tested, reviewed changes from `dev` to `main`. See the **Ship skill** ([skill/ship/SKILL.md](../skill/ship/SKILL.md)) for the canonical release procedure.
 
-- CI runs validation on `dev` on every change.
-- A human reviewer inspects CI results and triggers the merge from `dev` → `main`.
-- The full checklist and test commands are documented in [docs/dev/release-process.md](../docs/dev/release-process.md) and [docs/dev/release-tests.md](../docs/dev/release-tests.md).
+### Primary executor: Ship subagent
+
+The Ship subagent acts as the primary release executor using the merge script:
+
+```bash
+bash scripts/release/merge-dev-to-main.sh
+```
+
+The script automates CI verification, merge commit creation, PR creation, status check
+waiting, PR merge, and audit logging. See [skill/ship/SKILL.md](../skill/ship/SKILL.md) for
+the full release process.
+
+### Fallback: Human Release Manager
+
+For repositories where the Ship subagent is not configured, a human Release Manager
+can perform the release manually. The full checklist and test commands are documented
+in [docs/dev/release-process.md](../docs/dev/release-process.md) and
+[docs/dev/release-tests.md](../docs/dev/release-tests.md).
 
 ## Test Expectations
 
