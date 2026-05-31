@@ -16,9 +16,9 @@
     }
   },
   "enabledModels": [
-    "Local Proxy/gemma4",
-    "Local Proxy/qwen3",
-    "Local Proxy/gpt120",
+    "Proxy/gemma4",
+    "Proxy/qwen3",
+    "Proxy/gpt120",
     "github-copilot/claude-sonnet-4.6",
     "github-copilot/gpt-5.3-codex",
     "github-copilot/claude-opus-4.6",

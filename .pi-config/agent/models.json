@@ -1,6 +1,6 @@
 {
   "providers": {
-    "Local Proxy": {
+    "Proxy": {
       "api": "openai-completions",
       "baseUrl": "http://192.168.0.199:8000/v1",
       "apiKey": "not_needed",

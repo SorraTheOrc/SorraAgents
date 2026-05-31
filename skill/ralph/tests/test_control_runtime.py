@@ -163,7 +163,7 @@ def test_status_snapshot_ignores_prose_in_recent_lines_and_keeps_structured_acti
     log_path.write_text(
         "INFO ralph.loop.start target=SA-TARGET scope=SA-TARGET,SA-CHILD max_attempts=10\n"
         "INFO ralph.loop.child_focus parent=SA-TARGET child=SA-CHILD\n"
-        "INFO ralph.cmd.pi.stream_start model=Local Proxy/qwen3 cmd_len=8\n"
+        "INFO ralph.cmd.pi.stream_start model=Proxy/qwen3 cmd_len=8\n"
         "I will implement the work item and audit the results.\n",
         encoding="utf-8",
     )
@@ -201,7 +201,7 @@ def test_status_snapshot_ignores_prose_in_recent_lines_and_keeps_structured_acti
 def test_status_snapshot_leaves_active_task_empty_when_only_prose_is_present(runtime_dir: Path):
     log_path = runtime_dir / "SA-TARGET.log"
     log_path.write_text(
-        "INFO ralph.cmd.pi.stream_start model=Local Proxy/qwen3 cmd_len=8\n"
+        "INFO ralph.cmd.pi.stream_start model=Proxy/qwen3 cmd_len=8\n"
         "I will implement the work item and audit the results.\n",
         encoding="utf-8",
     )

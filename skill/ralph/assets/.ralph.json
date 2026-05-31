@@ -8,10 +8,10 @@
       "audit": "opencode-go/glm-5.1"
     },
     "local": {
-      "intake": "Local Proxy/qwen3",
-      "planning": "Local Proxy/qwen3",
-      "implementation": "Local Proxy/qwen3",
-      "audit": "Local Proxy/qwen3"
+      "intake": "Proxy/qwen3",
+      "planning": "Proxy/qwen3",
+      "implementation": "Proxy/qwen3",
+      "audit": "Proxy/qwen3"
     }
   },
   "timeout": {
