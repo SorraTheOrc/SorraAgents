@@ -37,8 +37,12 @@ async function run() {
 
   await hook(input, output);
 
-  // Expect output.prompt to include the original user prompt
-  assert.ok(typeof output.prompt === 'string' && output.prompt.includes('This is the original user prompt'), 'output.prompt must contain the original prompt');
+  // When no override matches, the original prompt should be appended to output.context
+  assert.ok(
+    Array.isArray(output.context) &&
+    output.context.some(c => typeof c === 'string' && c.includes('This is the original user prompt')),
+    'output.context must contain the original user prompt when no override matches'
+  );
 
   console.log('Ralph compaction test: OK');
 }

@@ -19,8 +19,8 @@ import {
   validateForcePush,
   DEV_BRANCH,
   PROTECTED_BRANCHES,
-} from '../../agent/ship.js';
-import { validateBranchName } from '../../agent/git-helpers.js';
+} from '../../skill/ship/scripts/ship.js';
+import { validateBranchName } from '../../skill/ship/scripts/git-helpers.js';
 import { createBareRemote, createSimRepo } from '../helpers/git-sim.js';
 
 // ---------------------------------------------------------------------------

@@ -29,128 +29,78 @@ Focus on:
 - Surfacing operational risks (missing smoke tests, versioning gaps, flaky builds) with actionable mitigation plans
 - Inspect current build/test config via `git diff`, package scripts, and npm configs before proposing changes.
 - Implement or update CI/build scripts one slice at a time, validating locally with `npm run build`, the shared quiet test helper or quiet project commands (for example `npm --silent test` or `pytest -q -r a --disable-warnings`), and `npm run lint` as needed. Always follow the mandatory build → test → commit order: build first and verify no errors, then run all tests and verify they pass, and only then commit. Never commit before verifying that the build and tests pass.
- - Record validation steps, commands run, files/docs touched (including any `history/` planning artifacts), outcomes, and recommended follow-ups in the Worklog so operators know what’s covered and what remains.
+ - Record validation steps, commands run, files/docs touched (including any `history/` planning artifacts), outcomes, and recommended follow-ups in the Worklog so operators know what's covered and what remains.
 - Ensure `main` is always releasable; avoid direct-to-main changes.
 - Use a git branch + PR workflow; do not push directly to `main`.
 - Ensure the working branch is pushed to `origin` before you finish.
+- When performing a release (dev → main merge), follow the **Ship skill** ([skill/ship/SKILL.md](../skill/ship/SKILL.md)) which defines the automated release process.
 
-## Branch Naming Policy
+## Ship Skill
 
-All agent-created branches MUST follow the canonical pattern:
+The canonical push-to-dev and branch-policy enforcement functionality has been
+moved to the **Ship skill** at [skill/ship/](skill/ship/). Use this skill for:
+- Branch naming and validation (`makeBranchName`, `validateBranchName`)
+- Push-to-dev integration (`pushToDev`, `pushToBranch`)
+- Protected branch checking (`isBranchBlocked`, `validatePushTarget`)
 
-    wl-<work-item-id>-<short-desc>
+### How to invoke
 
-where:
-- `wl-` is a literal prefix
-- `<work-item-id>` is the Worklog identifier (e.g. `SA-0MPDZDPZB00121IE`)
-- `<short-desc>` is a lowercase, hyphen-separated slug describing the work
+Agents invoke the skill in their prompts:
 
-Examples:
-- `wl-SA-0MPDZDPZB00121IE-branch-naming-policy`
-- `wl-SA-001-fix-login-bug`
+> Use \`/skill:ship push-to-dev\` to push the completed feature branch into \`dev\`.
 
-Use the `makeBranchName(workItemId, shortDesc)` function from
-`agent/git-helpers.js` to generate compliant branch names. Always validate
-branch names with `validateBranchName(name)` before creating or pushing.
+Or import the modules directly:
 
-## Push-to-Dev Policy
-
-Agents work in feature branches and push completed work into the `dev`
-integration branch. This is the canonical integration action.
-
-### Push Target
-
-- Agents push feature branch heads into `dev` using the command:
-
-      git push origin HEAD:refs/heads/dev
-
-- Use `pushToDev()` from `agent/ship.js` as the canonical helper. It
-  validates the current branch name, blocks push to protected branches,
-  rejects force-push, and handles non-fast-forward errors gracefully.
-
-- Alternative: use `pushToBranch(targetBranch)` to push a feature branch
-  to its own remote ref (e.g., pushing `wl-SA-001-fix-bug` to origin).
-
-### Protected Branches
-
-Agents MUST NOT push directly to protected branches. The following branches
-are blocked for agent pushes:
-
-- `main`
-- `master`
-- `HEAD`
-
-Use `isBranchBlocked(branch)` from `agent/git-helpers.js` or
-`validatePushTarget(targetBranch)` from `agent/ship.js` to check before any
-push operation. If a push to a blocked branch is attempted, the operation
-must be rejected with a clear error message.
-
-### Conflict Handling
-
-When a push to `dev` is rejected (e.g., non-fast-forward due to conflicts):
-
-1. The agent returns a non-zero exit status.
-2. The agent does NOT force-push or attempt to rewrite history.
-3. The agent creates a merge-conflict work item via `wl create` describing
-   the conflict and linking to the parent work item.
-4. The agent reports the failure to the operator.
-
-### Pre-push Hook Enforcement
-
-A pre-push hook at `.githooks/pre-push` enforces this policy automatically.
-Before any `git push`, the hook checks the current branch against the blocked
-list and rejects the push with an error if the branch is protected. To enable
-the hook, configure it with:
-
-    git config core.hooksPath .githooks
-
-The hook can be bypassed with `BRANCH_POLICY_SKIP=1` (not recommended; use
-only for administrative operations).
-
-Force-push (`git push --force` / `git push -f`) is prohibited. Agents must
-never rewrite history on shared branches.
-- Do NOT close the Worklog work-item until the PR is merged.
-
-## Branch Policy
-
-### Branch naming
-
-All feature branches must follow the canonical naming pattern:
-
-```
-wl-<work-item-id>-<short-description>
+```javascript
+import { pushToDev } from '../skill/ship/scripts/ship.js';
+import { makeBranchName, validateBranchName } from '../skill/ship/scripts/git-helpers.js';
 ```
 
-Examples:
-- `wl-SA-0MLU57S7D1KX8CU7-add-auth`
-- `wl-SA-0MP1TP1QM009M34K-fix-ci-pipeline`
+### What's available
 
-The `<short-description>` portion should be lowercase, hyphen-separated, and concise (no more than ~40 characters). If a work item has children, child branches may use a more descriptive suffix but must still begin with the parent work-item id.
+| Function | Source | Description |
+|----------|--------|-------------|
+| `pushToDev()` | `skill/ship/scripts/ship.js` | Push feature branch into `dev` |
+| `validatePushTarget()` | `skill/ship/scripts/ship.js` | Validate push target branch |
+| `validateForcePush()` | `skill/ship/scripts/ship.js` | Reject force-push |
+| `makeBranchName()` | `skill/ship/scripts/git-helpers.js` | Generate canonical branch name |
+| `validateBranchName()` | `skill/ship/scripts/git-helpers.js` | Validate branch name pattern |
+| `isBranchBlocked()` | `skill/ship/scripts/git-helpers.js` | Check if branch is protected |
 
-### Integration workflow: push to `dev`
+### Legacy files
 
-1. Agents work in local feature branches created per the naming pattern above.
-2. When a feature branch is complete and all tests pass, push the branch to `origin`.
-3. Push the feature branch into the shared `dev` branch as the integration step. This is done either by:
-   - Opening a PR targeting `dev`, or
-   - Pushing a merge commit directly to `dev` (agents with trusted push access).
-4. **Never push directly to `main`.** The `main` branch is protected and only receives changes via the gated release process (see [Release Process](../docs/dev/release-process.md)).
+The original files at `agent/ship.js` and `agent/git-helpers.js` are retained
+for backward compatibility but are thin wrappers re-exporting from the skill.
+New code should import directly from `skill/ship/scripts/`.
 
-### Conflict handling
+### Full documentation
 
-- If a push to `dev` results in a merge conflict, the agent must:
-  1. Create a new work-item documenting the conflict (type: `bug` or `task`, priority: `high`).
-  2. Record the conflict details in the work-item description.
-  3. Fail the push and report the conflict to the operator.
-  4. Do not attempt force-push or history rewriting.
+See [skill/ship/SKILL.md](../skill/ship/SKILL.md) for complete documentation
+including the push-to-dev workflow, branch naming policy, conflict handling,
+and release process.
 
 ## Release Process
 
-The release process promotes tested, reviewed changes from `dev` to `main`. Key points:
+The release process promotes tested, reviewed changes from `dev` to `main`. See the **Ship skill** ([skill/ship/SKILL.md](../skill/ship/SKILL.md)) for the canonical release procedure.
 
-- CI runs validation on `dev` on every change.
-- A human reviewer inspects CI results and triggers the merge from `dev` → `main`.
-- The full checklist and test commands are documented in [docs/dev/release-process.md](../docs/dev/release-process.md) and [docs/dev/release-tests.md](../docs/dev/release-tests.md).
+### Primary executor: Ship subagent
+
+The Ship subagent acts as the primary release executor using the merge script:
+
+```bash
+bash scripts/release/merge-dev-to-main.sh
+```
+
+The script automates CI verification, merge commit creation, PR creation, status check
+waiting, PR merge, and audit logging. See [skill/ship/SKILL.md](../skill/ship/SKILL.md) for
+the full release process.
+
+### Fallback: Human Release Manager
+
+For repositories where the Ship subagent is not configured, a human Release Manager
+can perform the release manually. The full checklist and test commands are documented
+in [docs/dev/release-process.md](../docs/dev/release-process.md) and
+[docs/dev/release-tests.md](../docs/dev/release-tests.md).
 
 ## Test Expectations
 

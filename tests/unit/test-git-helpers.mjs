@@ -12,7 +12,7 @@ import {
   BLOCKED_BRANCHS,
   isBranchBlocked,
   BRANCH_NAME_PATTERN,
-} from '../../agent/git-helpers.js';
+} from '../../skill/ship/scripts/git-helpers.js';
 
 // ── makeBranchName ──────────────────────────────────────────────────────────
 

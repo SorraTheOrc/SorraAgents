@@ -166,43 +166,100 @@ test('critical: AGENTS.md and Workflow.md reference consistent terminology', () 
 });
 
 // ---------------------------------------------------------------------------
-// 6. AGENTS.md merge workflow describes PR-based flow
+// 6. AGENTS.md workflow: agents push to dev, ship handles release to main
 // ---------------------------------------------------------------------------
-test('critical: AGENTS.md merge workflow describes PR-based merge flow', () => {
+test('critical: AGENTS.md workflow pushes to dev; ship handles release to main', () => {
   const agentsMd = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf-8');
 
-  // Step 6 (Merge work into main) should describe a PR-based flow
-  // compatible with server-side branch protection on main.
+  // Step 5 should describe pushing into dev as the integration step
   assert.ok(
-    agentsMd.includes('PR') || agentsMd.includes('gh pr merge'),
-    'AGENTS.md step 6 should mention PR-based merge flow',
-  );
-  assert.ok(
-    agentsMd.includes('temp branch') || agentsMd.includes('temporary branch'),
-    'AGENTS.md step 6 should mention creating a temp branch',
+    agentsMd.includes('push into dev') || agentsMd.includes('push.*dev') ||
+    (agentsMd.includes('git push') && agentsMd.includes('refs/heads/dev')),
+    'AGENTS.md step 5 should describe pushing into dev',
   );
 
-  // Should describe a fallback option for repos without branch protection
+  // Step 6 should state that regular agents do NOT merge to main
   assert.ok(
-    agentsMd.includes('direct push') || agentsMd.includes('without branch protection') || agentsMd.includes('branch protection is not enabled') || agentsMd.includes('not have branch protection') || agentsMd.includes('not** have'),
-    'AGENTS.md step 6 should describe a fallback for repos without branch protection',
+    agentsMd.includes('do NOT merge') || agentsMd.includes('not merge to main') ||
+    agentsMd.includes('agents does not merge'),
+    'AGENTS.md should state regular agents do not merge to main',
   );
 
-  // Should reference gh CLI for merging
+  // Should reference the pre-push hook for enforcement
   assert.ok(
-    agentsMd.includes('gh pr merge') || agentsMd.includes('gh pr'),
-    'AGENTS.md step 6 should reference gh CLI for PR merge',
+    agentsMd.includes('pre-push hook') || agentsMd.includes('.githooks/pre-push'),
+    'AGENTS.md should reference the pre-push hook',
   );
 
-  // Should mention waiting for status checks
+  // Should reference the ship skill for the dev→main release process
   assert.ok(
-    agentsMd.includes('checks') || agentsMd.includes('status'),
-    'AGENTS.md step 6 should mention waiting for checks',
+    agentsMd.includes('ship agent') || agentsMd.includes('ship/skill') ||
+    agentsMd.includes('skill/ship/SKILL.md'),
+    'AGENTS.md should reference the ship skill',
+  );
+
+  // Should reference the release merge script for dev→main
+  assert.ok(
+    agentsMd.includes('merge-dev-to-main.sh') || agentsMd.includes('scripts/release'),
+    'AGENTS.md should reference the release merge script',
   );
 });
 
 // ---------------------------------------------------------------------------
-// 7. docs/ralph.md merge safety documents branch protection interaction
+// 7. skill/implement/SKILL.md step 5 describes dev-push workflow
+// ---------------------------------------------------------------------------
+test('critical: implement skill step 5 describes dev-push workflow, not PR creation', () => {
+  const skillMd = readFileSync(join(REPO_ROOT, 'skill/implement/SKILL.md'), 'utf-8');
+
+  // The Outputs section should mention dev push and in_review, not PR URL
+  assert.ok(
+    !skillMd.includes('Pull Request URL'),
+    'Outputs section should NOT reference Pull Request URL creation',
+  );
+  assert.ok(
+    skillMd.includes('pushed to dev') || skillMd.includes('push to dev'),
+    'Outputs section should mention pushing to dev',
+  );
+
+  // Step 5 should describe dev push
+  assert.ok(
+    skillMd.includes('Push to dev') || skillMd.includes('push to dev') || skillMd.includes('pushToDev'),
+    'Step 5 should describe pushing to dev',
+  );
+
+  // Step 5 should NOT instruct agents to create a PR (it may say "do NOT create" but
+  // must NOT contain an affirmative instruction to create a PR)
+  const step5Section = skillMd.split(/5\.\s*Commit, Push/)?.[1] || '';
+  const affirmativePR = /(?<!NOT\s)create a Pull Request\b/i;
+  // Also check that the old affirmative PR creation pattern is gone
+  assert.ok(
+    !step5Section.includes('Create a PR') &&
+    !step5Section.includes('Push the branch to `origin`') &&
+    !step5Section.includes('PR against the repository'),
+    'Step 5 should NOT contain affirmative PR creation instructions',
+  );
+  // The do-NOT-create mention IS expected — verify it says "Do NOT create"
+  assert.ok(
+    step5Section.includes('NOT create a Pull Request') ||
+    step5Section.includes('NOT create a PR'),
+    'Step 5 should warn agents NOT to create a PR to main',
+  );
+
+  // Step 5 should warn that work-items stay open
+  assert.ok(
+    skillMd.includes('NOT close') || skillMd.includes('not close') || skillMd.includes('stays open') || skillMd.includes('stay open'),
+    'Step 5 should warn that work-items are NOT closed at this stage',
+  );
+
+  // Should reference the ship skill for push-to-dev mechanism
+  assert.ok(
+    skillMd.includes('ship skill') || skillMd.includes('pushToDev'),
+    'Step 5 should reference the ship skill or pushToDev()',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 8. docs/ralph.md merge safety documents branch protection interaction
 // ---------------------------------------------------------------------------
 test('critical: ralph.md merge safety documents branch protection interaction', () => {
   const ralphMd = readFileSync(join(REPO_ROOT, 'docs/ralph.md'), 'utf-8');
