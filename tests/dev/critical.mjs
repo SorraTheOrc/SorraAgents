@@ -202,7 +202,34 @@ test('critical: AGENTS.md merge workflow describes PR-based merge flow', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. Worklog data integrity (basic)
+// 7. docs/ralph.md merge safety documents branch protection interaction
+// ---------------------------------------------------------------------------
+test('critical: ralph.md merge safety documents branch protection interaction', () => {
+  const ralphMd = readFileSync(join(REPO_ROOT, 'docs/ralph.md'), 'utf-8');
+
+  // Should document that --confirm-merge uses direct push which may fail
+  // with branch protection on main
+  assert.ok(
+    ralphMd.includes('branch protection') || ralphMd.includes('direct push'),
+    'docs/ralph.md should mention branch protection or direct-push limitation',
+  );
+
+  // Should document a PR-based merge alternative for protected branches
+  assert.ok(
+    ralphMd.includes('PR-based') || ralphMd.includes('pull request') || ralphMd.includes('gh pr'),
+    'docs/ralph.md should document a PR-based merge alternative',
+  );
+
+  // Should reference the release merge script as recommended approach
+  // for protected branches
+  assert.ok(
+    ralphMd.includes('merge-dev-to-main.sh') || ralphMd.includes('scripts/release'),
+    'docs/ralph.md should reference the release merge script',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 8. Worklog data integrity (basic)
 // ---------------------------------------------------------------------------
 test('critical: wl CLI is functional and returns data', () => {
   // Verify the worklog system is operational by running a simple query
@@ -226,7 +253,7 @@ test('critical: wl CLI is functional and returns data', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 8. Scripts directory integrity
+// 9. Scripts directory integrity
 // ---------------------------------------------------------------------------
 test('critical: essential scripts are present and executable', () => {
   const scripts = [
