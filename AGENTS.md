@@ -73,21 +73,19 @@ Follow thhe steps below when completing tasks. If you are already working on a s
    - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
    - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
    - Report back to the operator summarising the work completed and proceed to the next step.
-6. **Integrate into dev**:
-   - Changes are already in `dev` (pushed in step 5). No further git operations
-     are required from the implementing agent.
+6. **Remain in review (do NOT close)**:
+   - The work-item was moved to `in_review` in step 5. No further action from
+     the implementing agent is required.
    - The pre-push hook at `.githooks/pre-push` enforces that **no agent (except
      the ship agent via the release script) can push directly to `main`**.
      Attempts to push to `main`, `master`, or `HEAD` are blocked with an error.
-   - Close the work-item with a comment summarising the changes made and the
-     reason for them, including the commit hash. Reference the `dev` branch
-     where the changes now live:
-     `wl close <WIP-id> --reason "Changes pushed to dev. See commit <commit-hash>." --json`
-   - Proceed to the next step.
 
-   > ⚠️ **Regular agents do NOT merge to `main`.**
-   > The `dev`→`main` release is performed exclusively by the **ship agent**
-   > (via `scripts/release/merge-dev-to-main.sh`) or a designated **Release
+   > ⚠️ **Do NOT close the work-item at this stage.**
+   > Work-items are closed only after the `dev`→`main` release is complete.
+   >
+   > **Regular agents do NOT merge to `main`.** The `dev`→`main` release is
+   > performed exclusively by the **ship agent** (via
+   > `scripts/release/merge-dev-to-main.sh`) or a designated **Release
    > Manager**. That process creates a PR, waits for CI, and merges via
    > `gh pr merge`. See [skill/ship/SKILL.md](skill/ship/SKILL.md) and
    > [docs/dev/release-process.md](docs/dev/release-process.md) for details.
