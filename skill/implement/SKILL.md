@@ -22,9 +22,9 @@ Worklog work item through the creation of code, tests, and documentation.
 ## Outputs
 
 - Tests and implementation code meeting acceptance criteria (committed to a
-  branch and pushed to origin).
-- Pull Request URL and work item comments referencing the PR and summarising
-  work.
+  branch and pushed to `dev`).
+- Work item updated to `in_review` stage (work item is NOT closed; it stays
+  open until the release process promotes the changes to `main`).
 
 ## References to Bundled Resources
 
@@ -58,10 +58,10 @@ any sensitive values before writing them to logs or comments.
 - When creating branches, include the work item id in the branch name for traceability (e.g., `feature/WL-123-add-auth`).
 - When creating a commit message, review the diff and write a concise message summarizing the changes made and the reason for the change, referencing the work item id.
 - When committing add a comment to the work item with the commit message and hash.
-- Only create a PR when all acceptance criteria have been met, all tests have passed and the implementation is ready for review. Do not create PRs for work in progress.
-- When writing the PR body, include a concise summary of the goal, work done, and clear instructions for reviewers on what to focus on in the review. Also include instructions on how to experience the any new/changed user experiences.
-- Do not escape content in the PR or work-item description; use markdown formatting as needed for clarity and readability.
-- After implementation, use the cleanup skill to tidy up branches and local state, but only after the PR is merged to avoid disrupting the review process.
+- Do NOT create a Pull Request to `main`. Work is integrated into `dev`; the `dev`→`main` promotion is handled separately by the release process.
+- When writing work-item comments or commit messages, include a concise summary of the goal, work done, and any important review notes.
+- Do not escape content in commit messages or work-item descriptions; use markdown formatting as needed for clarity and readability.
+- After implementation is complete and the work-item is in `in_review`, use the cleanup skill to tidy up local feature branches. Do not clean up `dev` or `main`.
 
 ## Handling Assets
 
@@ -154,23 +154,24 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 - Run the entire test suite using the shared quiet test helper or quiet project commands.
   - Fix any failing tests before continuing.
 
-5. Commit, Push and create PR
+5. Commit, Push to dev and mark in_review
 
 - Before committing, follow the mandatory build → test → commit order: build the project and verify no errors, then run all tests and verify they pass, and only then commit changes.
-- Ensure all work has been committed
-- Push the branch to `origin`.
-- Create a Pull Request (PR) against the repository's default branch.
-  - Use a title in the form of a summary of the goal and a body that contains
-    - a summary of the goal
-    - a summary of the work done
-    - instructions on how to test manually (where relevant)
-    - instructions on what to focus on in the review (e.g., "focus on the new authentication flow and any potential edge cases").
-    - reference the work item id(s) and link to any relevant documentation or PRDs.
-    - Ensure that the desciption covers all commits and work items involved in the implementation
-  - Do not escape the PR body; use markdown formatting as needed.
-- Link the PR to the work-item in a work-item comment to the work item as follows `wl comment <work-item-id> --body "PR created: <URL>\nReady for review and merge." --author "<AGENT>" --json`.
-- Mark the work item to completed/in-review with `wl update <work-item-id> --status completed --stage in_review --json`
+- Ensure all work has been committed on the feature branch.
+- Do NOT create a Pull Request to `main`. Work is integrated into `dev`; the `dev`→`main` promotion is handled separately by the release process.
+- Push the feature branch into `dev` using one of the following:
+  - Using the ship skill: `pushToDev()` from `skill/ship/scripts/ship.js` (preferred)
+  - Direct git command: `git push origin HEAD:refs/heads/dev`
+  - The push target `dev` is **not** a protected branch; the `.githooks/pre-push` hook only blocks `main`, `master`, and `HEAD`.
+- Add a work-item comment recording the commit hash and that the work has been pushed to dev:
+  `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>. The work-item stays open until the release process merges dev to main." --author "<AGENT>" --json`
+- Mark the work item as `in_review` (do **NOT** close it):
+  `wl update <work-item-id> --stage in_review --json`
 
-Pre-PR blocking check
----------------------
-- Before creating a PR, inspect the agent-run local state for any NEW critical test-failure issues created during this run. If any exist and remain open, the agent MUST not create a PR for the current work item unless the PR explicitly references and closes the created critical issue(s). Pre-existing critical issues (created prior to this agent run) are informational and do not block PR creation.
+  > **Important:** The work-item is **not closed** at this stage. It remains `in_review` until the release process (
+  > ship agent or Release Manager) promotes `dev` to `main`. Agents must **never** push to `main` directly.
+  > See `skill/ship/SKILL.md` for the push-to-dev workflow and `scripts/release/merge-dev-to-main.sh` for the release process.
+
+Pre-push blocking check
+-----------------------
+- Before pushing to `dev`, inspect the agent-run local state for any NEW critical test-failure issues created during this run. If any exist and remain open, the agent MUST not push to `dev` for the current work item unless the push explicitly references and closes the created critical issue(s). Pre-existing critical issues (created prior to this agent run) are informational and do not block pushes.

@@ -202,7 +202,60 @@ test('critical: AGENTS.md merge workflow describes PR-based merge flow', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. docs/ralph.md merge safety documents branch protection interaction
+// 7. skill/implement/SKILL.md step 5 describes dev-push workflow
+// ---------------------------------------------------------------------------
+test('critical: implement skill step 5 describes dev-push workflow, not PR creation', () => {
+  const skillMd = readFileSync(join(REPO_ROOT, 'skill/implement/SKILL.md'), 'utf-8');
+
+  // The Outputs section should mention dev push and in_review, not PR URL
+  assert.ok(
+    !skillMd.includes('Pull Request URL'),
+    'Outputs section should NOT reference Pull Request URL creation',
+  );
+  assert.ok(
+    skillMd.includes('pushed to dev') || skillMd.includes('push to dev'),
+    'Outputs section should mention pushing to dev',
+  );
+
+  // Step 5 should describe dev push
+  assert.ok(
+    skillMd.includes('Push to dev') || skillMd.includes('push to dev') || skillMd.includes('pushToDev'),
+    'Step 5 should describe pushing to dev',
+  );
+
+  // Step 5 should NOT instruct agents to create a PR (it may say "do NOT create" but
+  // must NOT contain an affirmative instruction to create a PR)
+  const step5Section = skillMd.split(/5\.\s*Commit, Push/)?.[1] || '';
+  const affirmativePR = /(?<!NOT\s)create a Pull Request\b/i;
+  // Also check that the old affirmative PR creation pattern is gone
+  assert.ok(
+    !step5Section.includes('Create a PR') &&
+    !step5Section.includes('Push the branch to `origin`') &&
+    !step5Section.includes('PR against the repository'),
+    'Step 5 should NOT contain affirmative PR creation instructions',
+  );
+  // The do-NOT-create mention IS expected — verify it says "Do NOT create"
+  assert.ok(
+    step5Section.includes('NOT create a Pull Request') ||
+    step5Section.includes('NOT create a PR'),
+    'Step 5 should warn agents NOT to create a PR to main',
+  );
+
+  // Step 5 should warn that work-items stay open
+  assert.ok(
+    skillMd.includes('NOT close') || skillMd.includes('not close') || skillMd.includes('stays open') || skillMd.includes('stay open'),
+    'Step 5 should warn that work-items are NOT closed at this stage',
+  );
+
+  // Should reference the ship skill for push-to-dev mechanism
+  assert.ok(
+    skillMd.includes('ship skill') || skillMd.includes('pushToDev'),
+    'Step 5 should reference the ship skill or pushToDev()',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 8. docs/ralph.md merge safety documents branch protection interaction
 // ---------------------------------------------------------------------------
 test('critical: ralph.md merge safety documents branch protection interaction', () => {
   const ralphMd = readFileSync(join(REPO_ROOT, 'docs/ralph.md'), 'utf-8');
