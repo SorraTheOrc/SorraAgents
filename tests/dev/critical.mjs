@@ -166,7 +166,43 @@ test('critical: AGENTS.md and Workflow.md reference consistent terminology', () 
 });
 
 // ---------------------------------------------------------------------------
-// 6. Worklog data integrity (basic)
+// 6. AGENTS.md merge workflow describes PR-based flow
+// ---------------------------------------------------------------------------
+test('critical: AGENTS.md merge workflow describes PR-based merge flow', () => {
+  const agentsMd = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf-8');
+
+  // Step 6 (Merge work into main) should describe a PR-based flow
+  // compatible with server-side branch protection on main.
+  assert.ok(
+    agentsMd.includes('PR') || agentsMd.includes('gh pr merge'),
+    'AGENTS.md step 6 should mention PR-based merge flow',
+  );
+  assert.ok(
+    agentsMd.includes('temp branch') || agentsMd.includes('temporary branch'),
+    'AGENTS.md step 6 should mention creating a temp branch',
+  );
+
+  // Should describe a fallback option for repos without branch protection
+  assert.ok(
+    agentsMd.includes('direct push') || agentsMd.includes('without branch protection') || agentsMd.includes('branch protection is not enabled') || agentsMd.includes('not have branch protection') || agentsMd.includes('not** have'),
+    'AGENTS.md step 6 should describe a fallback for repos without branch protection',
+  );
+
+  // Should reference gh CLI for merging
+  assert.ok(
+    agentsMd.includes('gh pr merge') || agentsMd.includes('gh pr'),
+    'AGENTS.md step 6 should reference gh CLI for PR merge',
+  );
+
+  // Should mention waiting for status checks
+  assert.ok(
+    agentsMd.includes('checks') || agentsMd.includes('status'),
+    'AGENTS.md step 6 should mention waiting for checks',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 7. Worklog data integrity (basic)
 // ---------------------------------------------------------------------------
 test('critical: wl CLI is functional and returns data', () => {
   // Verify the worklog system is operational by running a simple query
@@ -190,7 +226,7 @@ test('critical: wl CLI is functional and returns data', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. Scripts directory integrity
+// 8. Scripts directory integrity
 // ---------------------------------------------------------------------------
 test('critical: essential scripts are present and executable', () => {
   const scripts = [

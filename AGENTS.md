@@ -70,8 +70,24 @@ Follow thhe steps below when completing tasks. If you are already working on a s
    - Update the branch to bring it into line with main
      - resolve any conflicts that arise
    - Build the project and run all tests and checks to ensure nothing is broken. Only proceed with merging after the build succeeds without error and all tests pass.
-   - Push the branch to the remote repository
-   - Switch back to main, merge the branch and push the updated main branch to the remote repository
+
+   If the repository has branch protection on main requiring pull requests (recommended):
+
+   - Create a temporary branch from your feature work and push it to the remote:
+     `git push origin <feature-branch>:merge/<feature-branch>-$(date +%s)`
+   - Create a pull request from the temporary branch to `main` using the gh CLI:
+     `gh pr create --base main --head merge/<feature-branch>-<timestamp> --title "Merge: <description>" --body "Work item: <WIP-id>"`
+   - Wait for required status checks to pass on the PR:
+     `gh pr checks <pr-number> --watch --interval 30 --required`
+   - Merge the PR via `gh pr merge <pr-number> --merge --delete-branch`
+   - Delete the local temporary branch:
+     `git branch -D merge/<feature-branch>-<timestamp>`
+
+   If the repository does **not** have branch protection on main, the following direct-push approach can be used instead:
+
+   - Switch back to main, merge the branch and push the updated main branch to the remote repository:
+     `git checkout main && git merge <feature-branch> --ff-only && git push origin main`
+
    - Close the work-item with a comment summarising the changes made and the reason for them, including the commit hash using `wl close <WIP-id> --reason "Completed work, see merge commit <merge-commit-hash> for details." --json`
    - Proceed to the next step.
 7. **Update the operator**:
