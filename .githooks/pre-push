@@ -16,8 +16,9 @@ if [ "$BRANCH_POLICY_SKIP" != "1" ]; then
   for blocked in $blocked_branches; do
     if [ "$current_branch" = "$blocked" ]; then
       echo "ERROR: Push to '$current_branch' is blocked by branch policy." >&2
-      echo "  Agents must work in feature branches (wl-<id>-<desc>) and push" >&2
-      echo "  those branches instead. See agent/ship.md for details." >&2
+      echo "  Regular agents must NOT push directly to main." >&2
+      echo "  Work in feature branches (wl-<id>-<desc>) and push into dev." >&2
+      echo "  See skill/ship/SKILL.md for the push-to-dev workflow." >&2
       exit 1
     fi
   done
