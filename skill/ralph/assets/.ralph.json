@@ -17,7 +17,7 @@
   "timeout": {
     "pi_stream": {
       "remote": 900,
-      "local": 600
+      "local": 900
     }
   }
 }
