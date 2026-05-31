@@ -72,29 +72,26 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      the dev→main release process.
    - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
    - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
-   - Report back to the operator summarising the work completed and proceed to the next step.
-6. **Remain in review (do NOT close)**:
-   - The work-item was moved to `in_review` in step 5. No further action from
-     the implementing agent is required.
-   - The pre-push hook at `.githooks/pre-push` enforces that **no agent (except
-     the ship agent via the release script) can push directly to `main`**.
-     Attempts to push to `main`, `master`, or `HEAD` are blocked with an error.
 
-   > ⚠️ **Do NOT close the work-item at this stage.**
-   > Work-items are closed only after the `dev`→`main` release is complete.
-   >
-   > **Regular agents do NOT merge to `main`.** The `dev`→`main` release is
-   > performed exclusively by the **ship agent** (via
-   > `scripts/release/merge-dev-to-main.sh`) or a designated **Release
-   > Manager**. That process creates a PR, waits for CI, and merges via
-   > `gh pr merge`. See [skill/ship/SKILL.md](skill/ship/SKILL.md) and
-   > [docs/dev/release-process.md](docs/dev/release-process.md) for details.
-7. **Update the operator**:
+     > ⚠️ **Do NOT close the work-item at this stage.**
+     > Work-items are closed only after the `dev`→`main` release is complete.
+     >
+     > **Regular agents do NOT merge to `main`.** The pre-push hook at
+     > `.githooks/pre-push` blocks direct pushes to `main`, `master`, and
+     > `HEAD`. The `dev`→`main` release is performed exclusively by the
+     > **ship agent** (via `scripts/release/merge-dev-to-main.sh`) or a
+     > designated **Release Manager**. That process creates a PR, waits for
+     > CI, and merges via `gh pr merge`. See
+     > [skill/ship/SKILL.md](skill/ship/SKILL.md) and
+     > [docs/dev/release-process.md](docs/dev/release-process.md) for details.
+
+   - Report back to the operator summarising the work completed and proceed to the next step.
+6. **Update the operator**:
    - Provide the operator a summary of the work completed, including any relevant links (work-item id, commit hashes, PR links, etc.)
    - Do not suggest next steps at this point, simply report what has been done and proceed to the next step.
-8. **Repeat**:
+7. **Repeat**:
    - Go back to the `Decide what to work on next` step.
-9. **End session**:
+8. **End session**:
    - When there are no descendents of <base-item-id> left to work on, inform the operator that all required work is complete and summarize any discovered tasks, or pre-existing tasks in the worklog (`wl list --json`).
    - Ask the operator if they would like to address any of these remaining tasks now or if they would like to end the session.
    - If the operator wishes to address any remaining tasks, return to the `Claim the work-item` with the selected work-item id as the new <base-item-id>.
