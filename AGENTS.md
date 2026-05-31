@@ -63,33 +63,34 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      - Commit changes only after the build completes without errors and all tests pass. Before committing, always run the build first, then the test suite, and only commit if both succeed. Never commit before verifying that the build and tests pass. When committing, use clear commit messages that reference the WIP id and summarise the changes made.
    - If a particularly complex issue is identified or a significant design decisions or assumption is made record this in a comment on the work-item using `wl comment add <WIP-id> --comment "<detailed-comment>" --author <your-agent-name> --json`
    - Once the acceptance criteria of <WIP-id> has been satisfied, follow the mandatory build → test → commit order: first build the project (verify no errors), then run all tests (verify all pass), and only then commit final changes to the branch with a message such as `<WIP-id>: Completed work to satisfy acceptance criteria: <acceptance-criteria-summary>`
+   - Push the feature branch into `dev` as the integration step:
+     `git push origin HEAD:refs/heads/dev`
+     This makes your changes available in `dev` — the primary working branch.
+     Only the release process (ship agent / release manager) promotes changes
+     from `dev` to `main`. See [skill/ship/SKILL.md](skill/ship/SKILL.md) for
+     the push-to-dev workflow and `scripts/release/merge-dev-to-main.sh` for
+     the dev→main release process.
    - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
    - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
    - Report back to the operator summarising the work completed and proceed to the next step.
-6. **Merge work into main**:
-   - Update the branch to bring it into line with main
-     - resolve any conflicts that arise
-   - Build the project and run all tests and checks to ensure nothing is broken. Only proceed with merging after the build succeeds without error and all tests pass.
-
-   If the repository has branch protection on main requiring pull requests (recommended):
-
-   - Create a temporary branch from your feature work and push it to the remote:
-     `git push origin <feature-branch>:merge/<feature-branch>-$(date +%s)`
-   - Create a pull request from the temporary branch to `main` using the gh CLI:
-     `gh pr create --base main --head merge/<feature-branch>-<timestamp> --title "Merge: <description>" --body "Work item: <WIP-id>"`
-   - Wait for required status checks to pass on the PR:
-     `gh pr checks <pr-number> --watch --interval 30 --required`
-   - Merge the PR via `gh pr merge <pr-number> --merge --delete-branch`
-   - Delete the local temporary branch:
-     `git branch -D merge/<feature-branch>-<timestamp>`
-
-   If the repository does **not** have branch protection on main, the following direct-push approach can be used instead:
-
-   - Switch back to main, merge the branch and push the updated main branch to the remote repository:
-     `git checkout main && git merge <feature-branch> --ff-only && git push origin main`
-
-   - Close the work-item with a comment summarising the changes made and the reason for them, including the commit hash using `wl close <WIP-id> --reason "Completed work, see merge commit <merge-commit-hash> for details." --json`
+6. **Integrate into dev**:
+   - Changes are already in `dev` (pushed in step 5). No further git operations
+     are required from the implementing agent.
+   - The pre-push hook at `.githooks/pre-push` enforces that **no agent (except
+     the ship agent via the release script) can push directly to `main`**.
+     Attempts to push to `main`, `master`, or `HEAD` are blocked with an error.
+   - Close the work-item with a comment summarising the changes made and the
+     reason for them, including the commit hash. Reference the `dev` branch
+     where the changes now live:
+     `wl close <WIP-id> --reason "Changes pushed to dev. See commit <commit-hash>." --json`
    - Proceed to the next step.
+
+   > ⚠️ **Regular agents do NOT merge to `main`.**
+   > The `dev`→`main` release is performed exclusively by the **ship agent**
+   > (via `scripts/release/merge-dev-to-main.sh`) or a designated **Release
+   > Manager**. That process creates a PR, waits for CI, and merges via
+   > `gh pr merge`. See [skill/ship/SKILL.md](skill/ship/SKILL.md) and
+   > [docs/dev/release-process.md](docs/dev/release-process.md) for details.
 7. **Update the operator**:
    - Provide the operator a summary of the work completed, including any relevant links (work-item id, commit hashes, PR links, etc.)
    - Do not suggest next steps at this point, simply report what has been done and proceed to the next step.
