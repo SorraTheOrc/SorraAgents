@@ -8,6 +8,13 @@ description: "Canonical push-to-dev and branch-policy enforcement for agents. Pr
 Canonical agent-side push-to-dev behaviour and branch-policy enforcement, with
 automated dev-to-main release execution via the Ship subagent.
 
+## Purpose
+
+Provide a deterministic, automated push-to-dev and release workflow for agents:
+agents push completed feature branches into `dev`, and the Ship subagent (or a
+human Release Manager) promotes tested changes from `dev` to `main` via a
+gated, PR-based merge process.
+
 ## When To Use
 
 - An agent needs to push completed feature branch work into the `dev` integration branch.
