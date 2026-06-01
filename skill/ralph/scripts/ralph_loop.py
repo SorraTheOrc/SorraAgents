@@ -867,7 +867,14 @@ class RalphLoop:
             "implementation": model_implementation,
             "audit": model_audit,
         }
-        self.model_config = model_config or {}
+        self.model_config = model_config if model_config is not None else {}
+        # When model_source is explicitly set but model_config was not provided
+        # at all (None), auto-load the default config and extract phase model
+        # mappings so that _resolve_model_for_phase can resolve the correct
+        # source-specific model.  Explicitly passing model_config={} is left
+        # intact so that callers (including tests) can opt out of auto-loading.
+        if self.model_source_explicit and model_config is None:
+            self.model_config = _extract_phase_model_config(_load_asset_config())
         self.phase_model_mode_enabled = self.model_source_explicit or any(
             _coerce_model_str(value) is not None for value in self.model_overrides.values()
         ) or any(phase in self.model_config for phase in MODEL_PHASES)
