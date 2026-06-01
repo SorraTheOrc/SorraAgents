@@ -38,6 +38,8 @@ ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent / "assets" / ".ralph.
 DEFAULT_MODEL = "opencode-go/glm-5.1"
 DEFAULT_MODEL_SOURCE = "local"
 MODEL_SOURCES = frozenset({"remote", "local"})
+DEFAULT_PI_STREAM_TIMEOUT_SECONDS = 60.0
+REMOTE_PI_STREAM_TIMEOUT_SECONDS = 900.0
 MODEL_PHASES: tuple[str, ...] = ("intake", "planning", "implementation", "audit")
 DEBUG_PAYLOAD_DIR_NAME = "ralph-payloads"
 DEBUG_PAYLOAD_MAX_BYTES = 1_000_000
@@ -233,6 +235,31 @@ def _resolve_model(cli_model: str | None, config_model: str | None) -> str:
     return DEFAULT_MODEL
 
 
+def _resolve_stream_timeout(config: dict, model_source: str) -> float:
+    """Resolve the pi stream timeout: config > source-specific default > global default.
+
+    Config may specify:
+      - "timeout": {"pi_stream": 120}  (global override)
+      - "timeout": {"pi_stream": {"remote": 300, "local": 60}}  (source-mapped)
+    """
+    timeout_config = config.get("timeout", {})
+    if not isinstance(timeout_config, dict):
+        return DEFAULT_PI_STREAM_TIMEOUT_SECONDS
+
+    pi_stream = timeout_config.get("pi_stream")
+    if isinstance(pi_stream, (int, float)):
+        return float(pi_stream)
+    if isinstance(pi_stream, dict):
+        source_value = pi_stream.get(model_source)
+        if isinstance(source_value, (int, float)):
+            return float(source_value)
+
+    # Fall back to source-specific defaults
+    if model_source == "remote":
+        return REMOTE_PI_STREAM_TIMEOUT_SECONDS
+    return DEFAULT_PI_STREAM_TIMEOUT_SECONDS
+
+
 def _normalize_model_source(source: str | None) -> str:
     if not source:
         return DEFAULT_MODEL_SOURCE
@@ -410,6 +437,29 @@ def _build_implement_prompt(work_item_id: str, remediation: str = "") -> str:
     parts = [
         f"implement {work_item_id}",
         "Continue until the work item and all dependencies are completed, but do not merge.",
+        "Do not ask the producer questions or pause for interactive input.",
+        "If you cannot continue safely without explicit producer input, stop and return a structured no_safe_path response with the missing decision.",
+    ]
+    if remediation:
+        parts.append(remediation)
+    return "\n".join(parts)
+
+
+def _build_implement_single_prompt(work_item_id: str, remediation: str = "") -> str:
+    """Build a scoped implement-single prompt for per-child Ralph runs.
+
+    Uses the ``implement-single`` skill which works on exactly the given
+    work-item id without traversing dependencies via ``wl next``.  This is
+    critical for per-child iteration so that implementing one child cannot
+    accidentally pick up or modify sibling work items.
+
+    The implement step must never ask the producer questions during the
+    default loop. If the model cannot continue safely, it must return a
+    structured no_safe_path response that names the missing producer decision.
+    """
+    parts = [
+        f"implement-single {work_item_id}",
+        "Continue until the work item is completed, but do not merge.",
         "Do not ask the producer questions or pause for interactive input.",
         "If you cannot continue safely without explicit producer input, stop and return a structured no_safe_path response with the missing decision.",
     ]
@@ -759,6 +809,11 @@ DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
 
 
 
+def _comment_hash(audit_text: str) -> str:
+    """Return a 16-char hex digest of audit_text for comment deduplication."""
+    return hashlib.sha256(audit_text.encode("utf-8")).hexdigest()[:16]
+
+
 class RalphLoop:
     def __init__(
         self,
@@ -787,6 +842,7 @@ class RalphLoop:
         retry_delay: float = 0.0,
         fatal_cmds: list[str] | None = None,
         debug_persist: bool = False,
+        pi_stream_timeout: float | None = None,
     ):
         self.runner = runner or _default_runner
         self.pi_bin = pi_bin
@@ -839,7 +895,10 @@ class RalphLoop:
         self.debug_persist = debug_persist
         # Watchdog used by streamed pi runs so a stuck stdout pipe fails fast
         # instead of blocking the orchestration loop forever.
-        self.pi_stream_timeout_seconds = 60.0
+        if pi_stream_timeout is not None:
+            self.pi_stream_timeout_seconds = float(pi_stream_timeout)
+        else:
+            self.pi_stream_timeout_seconds = _resolve_stream_timeout(self.model_config, self.model_source)
         # Grace period (seconds) for waiting after SIGTERM before escalating to SIGKILL
         self.pi_cleanup_timeout = 5.0
         self._pi_process: subprocess.Popen | None = None
