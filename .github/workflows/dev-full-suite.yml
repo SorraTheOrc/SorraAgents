@@ -35,7 +35,7 @@ jobs:
         # WL_REPO (owner/repo format). If not present, it falls back to pip and
         # finally creates a minimal stub to avoid FileNotFoundError in CI.
         env:
-          WL_REPO: ${{ secrets.WL_REPO }}
+          WL_REPO: "TheWizardsCode/ContextHub"
         run: |
           set -euo pipefail
           echo "Ensuring 'wl' CLI is available..."
