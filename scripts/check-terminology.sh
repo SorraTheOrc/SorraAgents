@@ -40,19 +40,20 @@ done
 # technical identifiers, external URLs, package names, schema URLs, config
 # file names, or other tokens that must not be changed.
 #
-# Each line is an extended regex anchored to a specific exemption category.
+# Keep this allowlist conservative: only include clear technical tokens. Do
+# not include generic prose references like 'OpenCode' which should be
+# detected as non-allowed in strict mode.
 # ---------------------------------------------------------------------------
 ALLOWLIST=(
   # --- Package / module names ---
-  'opencode_ai'                     # Python SDK import
-  'opencode-ai'                     # PyPI package name
-  '@opencode-ai/plugin'             # npm package
-  '@opencode-ai/sdk'                # npm package
+  'opencode_ai'
+  'opencode-ai'
+  '@opencode-ai/plugin'
+  '@opencode-ai/sdk'
 
   # --- Schema / config file URLs and names ---
-  'https://opencode\.ai/'           # opencode.ai schema/config URLs
-  'opencode\.json'                  # opencode.json config filename
-  'tui\.json.*opencode\.ai'         # tui.json schema reference
+  'https://opencode\.ai/'
+  'opencode\.json'
 
   # --- Environment variable names ---
   'OPENCODE_BASE_URL'
@@ -61,122 +62,32 @@ ALLOWLIST=(
   'AMPA_DELEGATION_OPENCODE_TIMEOUT'
 
   # --- CLI binary / command literal ---
-  'opencode -c'                     # CLI invocation flag
-  'opencode run'                    # CLI run command (workflow dispatch)
-  'opencode skill run'              # CLI skill command
+  'opencode -c'
+  'opencode run'
+  'opencode skill run'
 
-  # --- External repository URLs (historical / migration references) ---
-  'github\.com/opencode/ampa'       # AMPA repo URL
-  'github\.com/opencode/opencode'   # OpenCode repo URL
+  # --- External repository URLs ---
+  'github\.com/opencode/ampa'
 
-  # --- Directory paths (XDG config conventions) ---
-  '[.]config/opencode'             # User config directory path
-  '[\$]XDG_CONFIG_HOME/opencode'    # Variable-based config path
-  'XDG_CONFIG_HOME.*opencode'       # Config path reference
+  # --- Directory paths ---
+  '[.]config/opencode'
+  '\.opencode/'
 
-  # --- Dot-config directories ---
-  '\.opencode/'                     # .opencode directory (tool config root)
-  '\.opencode"'                     # .opencode in JSON
-  '\.opencode,'                     # .opencode in JSON
-
-  # --- Node modules / lockfiles ---
-  'node_modules/@opencode-ai/'      # Installed dependency path
-  'registry\.npmjs\.org.*opencode'  # npm registry URL
-  '"name": "opencode"'              # package.json name field
-  '"name":"opencode"'               # package.json name field (minified)
+  # --- Node modules / registry ---
+  'node_modules/@opencode-ai/'
+  'registry\.npmjs\.org.*opencode'
 
   # --- Model provider identifiers ---
-  'opencode-go/'                    # Model provider prefix (e.g. opencode-go/glm-5.1)
-  'opencode/claude-'                # Model provider prefix
-  'opencode/gpt-'                   # Model provider prefix
+  'opencode-go/'
+  'opencode/claude-'
+  'opencode/gpt-'
 
-  # --- Historical / attribution references ---
-  'Author: OpenCode'                # Audit report author attribution
-  'Author [|] opencode'             # PRD author field
-  'opencode-patch-'                 # Agent instance naming convention
-  'OpenCode agent'                  # Agent type reference in PRD
-  'OpenCode server'                 # Server reference in error hint
-  'OpenCode Python SDK'             # SDK reference in examples
-  'OpenCode repository'             # Historical repo references
-  'OpenCode documentation'          # Historical doc references
-  'OpenCode config'                 # Config references
-  'OpenCode ignore'                 # Ignore policy references
-  'OpenCode file-include'           # File include rule reference
-  'OpenCode compaction'             # Plugin description
-  'OpenCode command'                # Command authoring reference
-  'OpenCode best practices'         # Standards reference
-  'OpenCode TUI'                    # TUI reference
-  'legacy.*opencode'                # Legacy variable references
-  'OpenCode test'                   # Test naming
-
-  # --- Specific file-level exceptions ---
-  'opencode\.json\.tui-migration\.bak'  # Backup filename
-  'install_opencode\.sh'            # Installer script filename
-  'test_implement_skill_doc_hygiene.*opencode'  # Test that checks opencode path hygiene
-
-  # --- Class / function names in code and docs ---
-  'OpenCodeRunDispatcher'           # Dispatcher class name in engine PRD
-  'Opencode[(]'                     # Python SDK class constructor
-
-  # --- Path assertions in tests ---
-  "'opencode', '.worklog'"           # Test path join assertions
-  '"opencode", ".worklog"'           # Test path join assertions (JS)
-  "path.join.*'opencode'"            # JS path.join with 'opencode' segment
-
-  # --- The check script itself references ---
-  'scripts/check-terminology\.sh'   # Self-reference in scan script
-  'check-terminology\.sh:'          # Self-reference in scan script output
-
-  # --- Test files: docstrings and test string literals ---
-  'tests/test_terminology_check'    # The test file itself
-
-  # --- Migration doc prose about the OpenCode repo as a historical entity ---
-  'in OpenCode'                     # "in OpenCode" historical references
-  'not OpenCode'                    # "not OpenCode" historical references
-  'Updating OpenCode Documentation' # Migration doc section
-  'OpenCode README'                 # Migration doc link text
-  'from the OpenCode repository'     # Migration doc references
-  'the OpenCode repository'          # Migration doc references
-  'within the OpenCode repository'   # Migration doc references
-  'OpenCode repository'              # Migration doc references
-  'OpenCode documentation'           # Migration doc references
-  'not OpenCode'                     # Migration doc references
-  'in the OpenCode repository'       # Migration doc references
-  'bundled in the OpenCode'          # Migration doc references
-
-  # --- delegation-control.md ---
-  'delegated.*opencode run.*process' # delegation-control refers to opencode run as a process
-
-  # --- Reports ---
-  'Repository root.*[.]config/opencode'  # Historical audit report
-
-  # --- README title and plugin reference ---
-  '# OpenCode'                     # README title
-  'local OpenCode plugins'          # README plugin reference
-
-  # --- skill files: comment.txt ---
-  'opencode/wl CLI'                # Skill comment about CLI
-  'wl/opencode CLI'                # Skill comment about CLI
-  'opencode/wl integration'        # Skill comment about CLI integration
-
-  # --- triage-audit.md ---
-  'handler / opencode'             # triage-audit doc shorthand
-
-  # --- compatibility metadata ---
-  'compatibility: opencode'        # resolve-pr-comments SKILL.md metadata
-
-  # --- test assertions ---
-  'Expected remote model to contain opencode/qwen'  # test assertion text
-  '"opencode" in impl_model'                        # test assertion for model prefix check
-
-  # --- author-command SKILL.md ---
-  'placeholders supported by OpenCode'  # Special placeholder reference
-
-  # --- session_block.py ---
-  'opencode_tool_output'           # Default temp directory name
-
-  # --- workflow examples ---
-  'opencode run, Discord bot'      # README examples reference
+  # --- Misc technical tokens ---
+  'opencode-patch-'
+  'OpenCodeRunDispatcher'
+  'Opencode[(]'
+  'scripts/check-terminology\.sh'
+  'tests/test_terminology_check'
 )
 
 # Build the combined allowlist regex
@@ -273,12 +184,11 @@ echo "  2. Schema/config URLs: https://opencode.ai/*"
 echo "  3. Config filenames: opencode.json, tui.json"
 echo "  4. Environment variables: OPENCODE_BASE_URL, OPENCODE_PROVIDER_ID, OPENCODE_MODEL_ID"
 echo "  5. CLI binary/command literals: 'opencode run', 'opencode -c', 'opencode skill run'"
-echo "  6. External repo URLs: github.com/opencode/ampa, github.com/opencode/opencode"
-echo "  7. Directory paths: .config/opencode/, .opencode/, \$XDG_CONFIG_HOME/opencode/"
+echo "  6. External repo URLs: github.com/opencode/ampa"
+echo "  7. Directory paths: .config/opencode/, .opencode/"
 echo "  8. npm packages/lockfiles: @opencode-ai/plugin, @opencode-ai/sdk"
 echo "  9. Model provider prefixes: opencode-go/*, opencode/*"
-echo " 10. Historical/attribution references in PRD and migration docs"
-echo " 11. Agent instance naming: opencode-patch-*"
+echo " 10. Agent instance naming: opencode-patch-*"
 echo ""
 
 if [ "$STRICT" -eq 1 ] && [ "$VIOLATIONS" -gt 0 ]; then
