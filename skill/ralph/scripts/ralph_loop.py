@@ -2078,11 +2078,21 @@ class RalphLoop:
                 continue
 
             parsed = parse_audit_report(audit_text)
+            # Debug logging: capture parsed audit summary for triage
+            logger.debug(
+                "ralph.run_single_item.audit_parsed target=%s ready=%s criteria=%d unmet=%d",
+                item_id,
+                getattr(parsed, 'ready_to_close', False),
+                len(getattr(parsed, 'criteria', [])),
+                len(getattr(parsed, 'unmet_or_partial', [])),
+            )
             if parsed.ready_to_close:
+                logger.debug("ralph.run_single_item.success target=%s attempt=%d", item_id, attempt)
                 return {"status": "success", "attempt": attempt}
 
             # Audit reported unmet criteria — decide whether to retry
             unmet = [c.text for c in parsed.unmet_or_partial]
+            logger.debug("ralph.run_single_item.unmet target=%s attempt=%d unmet_count=%d", item_id, attempt, len(unmet))
             if attempt >= max_attempts:
                 return {"status": "max_attempts", "attempt": attempt, "unmet": unmet}
 
@@ -2134,7 +2144,7 @@ class RalphLoop:
                     if c.get("id") == cid:
                         stage = c.get("stage")
                         break
-                if stage == "in_review":
+                if stage in {"in_review", "done", "completed", "closed"}:
                     child_results[cid] = {"status": "skipped"}
                     continue
 
