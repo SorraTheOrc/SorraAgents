@@ -74,24 +74,9 @@ jobs:
           # to PATH for subsequent steps. Use a small Python writer to avoid
           # complex shell quoting issues inside YAML.
           echo "Creating minimal wl stub (temporary fallback)"
-          python - <<'PY'
-import os
-s = '''#!/usr/bin/env bash
-# Minimal wl stub for CI test runs — implements a tiny subset needed by tests.
-if [ "$1" = "show" ]; then
-  # Return a minimal, plausible workItem JSON to avoid parse errors in tests.
-  echo '{"workItem":{"id":"WL-STUB","stage":"plan_complete","status":"open"}}'
-  exit 0
-fi
-# Default: print an empty JSON object
-echo "{}"
-exit 0
-'''
-path = os.path.join(os.environ.get('GITHUB_WORKSPACE','.'),'wl')
-with open(path,'w',newline='\n') as fh:
-    fh.write(s)
-print('wrote',path)
-PY
+          # Write a base64-encoded minimal wl stub and decode it to avoid
+          # any YAML quoting/indentation pitfalls in workflow files.
+          echo "IyEvdXNyL2Jpbi9lbnYgYmFzaAojIE1pbmltYWwgd2wgc3R1YiBmb3IgQ0kgdGVzdCBydW5zIOKAlCBpbXBsZW1lbnRzIGEgdGlueSBzdWJzZXQgbmVlZGVkIGJ5IHRlc3RzLgppZiBbICIkMSIgPSAic2hvdyIgXTsgdGhlbgogICMgUmV0dXJuIGEgbWluaW1hbCwgcGxhdXNpYmxlIHdvcmtJdGVtIEpTT04gdG8gYXZvaWQgcGFyc2UgZXJyb3JzIGluIHRlc3RzLgogIGVjaG8gJ3sid29ya0l0ZW0iOnsiaWQiOiJXTC1TVFVCIiwic3RhZ2UiOiJwbGFuX2NvbXBsZXRlIiwic3RhdHVzIjoib3BlbiJ9fScKICBleGl0IDAKZmkKIyBEZWZhdWx0OiBwcmludCBhbiBlbXB0eSBKU09OIG9iamVjdAplY2hvICJ7fSIKZXhpdCAwCg==" | base64 --decode > "$GITHUB_WORKSPACE/wl"
 
           chmod +x "$GITHUB_WORKSPACE/wl"
           # Persist PATH update for subsequent steps
