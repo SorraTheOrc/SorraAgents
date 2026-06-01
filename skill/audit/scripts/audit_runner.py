@@ -6,7 +6,7 @@ Provides two subcommands:
   project      – audit the overall project
 
 Usage:
-  audit_runner.py issue <id> [--persist] [--pi-bin pi] [--model <name>]
+  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>]
   audit_runner.py project [--pi-bin pi] [--model <name>]
 
 Exit codes:
@@ -75,7 +75,10 @@ def _call_pi(prompt: str, model: str = "opencode-go/glm-5.1",
     """Call Pi via subprocess and parse the JSON-stream response.
 
     Returns a dict with keys ``verdict`` and ``evidence``.
-    Defaults to ``{"verdict": "unmet", "evidence": ""}`` on parse failure.
+    On success, implementations may also include additional diagnostic keys
+    such as ``raw_stdout``, ``raw_stderr`` and ``extracted_text`` which are
+    useful for debugging. This function returns at minimum
+    ``{"verdict": <met|unmet|partial>, "evidence": <text>}``.
 
     Uses the same JSON-stream protocol as ralph (``pi -p --mode json``).
     Uses ``communicate()`` to avoid pipe-buffer deadlocks.
@@ -100,42 +103,29 @@ def _call_pi(prompt: str, model: str = "opencode-go/glm-5.1",
 
     raw = stdout or ""
     if not raw:
-        return {"verdict": "unmet", "evidence": ""}
+        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr}
 
     # Parse JSON lines looking for the final agent_end message
     text = _extract_pi_text(raw)
     if not text:
-        return {"verdict": "unmet", "evidence": ""}
-
-    # Strip markdown code fences before JSON parsing
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        # Remove opening fence (```json, ```, etc.)
-        first_newline = cleaned.find("\n")
-        if first_newline != -1:
-            cleaned = cleaned[first_newline + 1 :]
-        # Remove closing fence
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3].strip()
-        elif "\n```" in cleaned:
-            cleaned = cleaned[: cleaned.rindex("\n```")].strip()
+        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr}
 
     # Try to parse the text as JSON with verdict/evidence
     try:
-        obj = json.loads(cleaned)
+        obj = json.loads(text)
         if isinstance(obj, dict):
             return {
                 "verdict": obj.get("verdict", "unmet").lower(),
                 "evidence": obj.get("evidence", ""),
+                "raw_stdout": stdout,
+                "raw_stderr": stderr,
+                "extracted_text": text,
             }
-        if isinstance(obj, list):
-            # Return the raw JSON array as evidence so callers can parse it
-            return {"verdict": "met", "evidence": cleaned}
     except json.JSONDecodeError:
         pass
 
     # If Pi returned free-form text, use it as evidence and default to met
-    return {"verdict": "met", "evidence": cleaned}
+    return {"verdict": "met", "evidence": text.strip()[:200], "raw_stdout": stdout, "raw_stderr": stderr, "extracted_text": text}
 
 
 def _extract_pi_text(raw: str) -> str:
@@ -398,6 +388,69 @@ def _assemble_project_report(summary: str, recommendation: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Debug / debug-log helpers
+# ---------------------------------------------------------------------------
+
+def _default_debug_log_path(issue_id: str, context: str) -> Path:
+    """Return a sensible default path for debug logs.
+
+    Tests monkeypatch this helper so callers should use it rather than
+    hard-coding a path.
+    """
+    p = REPO_ROOT / ".worklog" / f"audit_debug_{issue_id}.jsonl"
+    return p
+
+
+def _write_debug_log(path: Path, entry: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
+                           model: str = "opencode-go/glm-5.1",
+                           pi_bin: str = "pi", debug_log: str | None = None) -> dict:
+    """Call _call_pi and optionally write debug information to a log.
+
+    If *debug_log* is provided the entry reason will be "debug_log" and the
+    provided path will be used. If *debug_log* is not provided but the pi
+    result contains diagnostic fields (``raw_stdout``/``raw_stderr``), a
+    default path from ``_default_debug_log_path`` will be used and the reason
+    will be "parse_failure".
+    """
+    result = _call_pi(prompt, model=model, pi_bin=pi_bin)
+
+    # Decide whether to write a debug line
+    reason = None
+    target = None
+    if debug_log:
+        reason = "debug_log"
+        target = Path(debug_log)
+    elif isinstance(result, dict) and (result.get("raw_stdout") or result.get("raw_stderr")):
+        reason = "parse_failure"
+        target = _default_debug_log_path(issue_id, context)
+
+    if reason and target:
+        entry = {
+            "issue_id": issue_id,
+            "context": context,
+            "reason": reason,
+            "raw_stdout": result.get("raw_stdout"),
+            "raw_stderr": result.get("raw_stderr"),
+            "extracted_text": result.get("extracted_text"),
+            "evidence": result.get("evidence"),
+            "prompt": prompt[:1000],
+        }
+        try:
+            _write_debug_log(target, entry)
+        except Exception:
+            # Debug logging must not break audit execution
+            pass
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: issue
 # ---------------------------------------------------------------------------
 
@@ -420,9 +473,10 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     }
 
 
-def cmd_issue(issue_id: str, persist: bool = False,
+def cmd_issue(issue_id: str, persist: bool = True,
               pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
-              runner: Runner | None = None, json_mode: bool = False) -> int:
+              runner: Runner | None = None, json_mode: bool = False,
+              debug_log: str | None = None) -> int:
     """Audit a single work item."""
     if runner is None:
         runner = _default_runner
@@ -454,7 +508,7 @@ def cmd_issue(issue_id: str, persist: bool = False,
             f"Criteria: {ac_list_json}"
         )
         try:
-            result = _call_pi(prompt, model=model, pi_bin=pi_bin)
+            result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=model, pi_bin=pi_bin, debug_log=debug_log)
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -509,7 +563,7 @@ def cmd_issue(issue_id: str, persist: bool = False,
                 f"Criteria: {child_ac_list}"
             )
             try:
-                result = _call_pi(prompt, model=model, pi_bin=pi_bin)
+                result = _call_pi_and_maybe_log(issue_id, f"child:{child.get('id', '')}", prompt, model=model, pi_bin=pi_bin, debug_log=debug_log)
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -568,7 +622,8 @@ def _build_project_json(summary: str, recommendation: str) -> dict:
 
 
 def cmd_project(pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
-                runner: Runner | None = None, json_mode: bool = False) -> int:
+                runner: Runner | None = None, json_mode: bool = False,
+                debug_log: str | None = None) -> int:
     """Audit the overall project."""
     if runner is None:
         runner = _default_runner
@@ -608,7 +663,7 @@ def cmd_project(pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
         f"Return ONLY a JSON object with keys 'summary' and 'recommendation'."
     )
     try:
-        pi_result = _call_pi(prompt, model=model, pi_bin=pi_bin)
+        pi_result = _call_pi_and_maybe_log("project", "project", prompt, model=model, pi_bin=pi_bin, debug_log=debug_log)
         if pi_result.get("verdict") == "met" and pi_result.get("evidence"):
             # Use Pi's response if parseable
             pass  # Could enhance this in future
@@ -634,13 +689,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_issue = sub.add_parser("issue", help="Audit a single work item")
     p_issue.add_argument("issue_id", help="Work item id to audit")
-    p_issue.add_argument("--persist", action="store_true",
-                         help="Persist the audit report via wl update")
+    p_issue.add_argument("--do-not-persist", action="store_true",
+                         help="Do not persist the audit report via wl update")
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
     p_issue.add_argument("--model", default="opencode-go/glm-5.1",
                          help="Pi model to use for review")
     p_issue.add_argument("--json", action="store_true",
                          help="Emit machine-readable JSON output instead of markdown")
+    p_issue.add_argument("--debug-log", default=None,
+                         help="Append Pi debug output to this file (JSONL)")
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
@@ -648,6 +705,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Pi model to use for review")
     p_project.add_argument("--json", action="store_true",
                            help="Emit machine-readable JSON output instead of markdown")
+    p_project.add_argument("--debug-log", default=None,
+                           help="Append Pi debug output to this file (JSONL)")
 
     return p
 
@@ -661,10 +720,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "issue":
-        return cmd_issue(args.issue_id, persist=args.persist,
-                         pi_bin=args.pi_bin, model=args.model, json_mode=args.json)
+        return cmd_issue(args.issue_id, persist=not args.do_not_persist,
+                         pi_bin=args.pi_bin, model=args.model, json_mode=args.json,
+                         debug_log=args.debug_log)
     elif args.command == "project":
-        return cmd_project(pi_bin=args.pi_bin, model=args.model, json_mode=args.json)
+        return cmd_project(pi_bin=args.pi_bin, model=args.model, json_mode=args.json,
+                           debug_log=args.debug_log)
 
     return 2
 

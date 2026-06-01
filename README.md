@@ -36,6 +36,7 @@ Behavior, configuration options, and test references are documented in
 
 The repository also includes the Ralph implement→audit loop for Worklog items.
 Use `/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id>` to launch a background run and `/home/rgardler/.pi/agent/skills/ralph/ralph status` to inspect the current process.
+When the target has children, Ralph runs a per-child implement→audit loop using `implement-single` for each child and finishes with a parent-level integration audit.
 Ralph runs non-interactively by default, includes a stream watchdog so a delegated `pi` process that keeps stdout open too long fails with a clear error instead of hanging forever, and can stop early with a structured `producer_input_required` result when the model cannot safely continue without producer input.
 
 When the target work item has children, Ralph iterates over each child independently: implementing, auditing, and remediating each child before moving to the next, followed by a final parent-level integration audit. For single work items (no children), Ralph uses the classic implement→audit→remediate loop.
@@ -47,6 +48,30 @@ A useful debugging pattern is to focus Ralph on a single direct child work item:
 ```sh
 python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
 ```
+
+## CI Workflows
+
+This repository uses GitHub Actions to validate changes. The following workflows are available:
+
+| Workflow | File | Trigger | Description |
+|---|---|---|---|
+| CI | `.github/workflows/ci.yml` | push, pull_request | Full unit test suite on every push and PR. Required status check for `main`. |
+| Cleanup dry-run | `.github/workflows/cleanup.yml` | pull_request, workflow_dispatch | Validates cleanup scripts in dry-run mode. |
+| Dev smoke | `.github/workflows/dev-smoke.yml` | push to `dev` | Runs smoke and critical tests on the `dev` branch. Results appear in commit checks. |
+| Dev full suite | `.github/workflows/dev-full-suite.yml` | workflow_dispatch, push to `release-candidate/**` | Runs the full test suite. Artifacts (JUnit XML, HTML report, logs) are uploaded for reviewer use. |
+
+### Re-running jobs
+
+- **Dev smoke**: Pushes to `dev` trigger automatically. Results are visible in the Actions tab and on commit check pages.
+- **Dev full suite**: Go to **Actions → dev-full-suite → Run workflow** and select the branch. Optionally provide a reason. This is intended for release managers to run before merging `dev` → `main`.
+
+### Release process
+
+The `dev-full-suite` workflow result is used as a gate in the release process:
+1. Changes are integrated into `dev` via feature branch pushes.
+2. The release manager triggers `dev-full-suite` manually on the release candidate.
+3. If the full suite passes, the release manager reviews uploaded artifacts and proceeds with the `dev` → `main` merge.
+4. If the full suite fails, the release is blocked until failures are resolved.
 
 ## Prerequisites
 
@@ -182,6 +207,15 @@ and records an audit comment in the worklog.
 1. Read the main workflow: [Workflow.md](Workflow.md).
 2. Pick a folder to work in (e.g., `skill/` or `agent/`).
 3. Follow the appropriate guide (see files inside each folder) to implement, test, and package your work.
+
+## PR-based audit flow (Pi)
+
+The audit helper supports PR mode in addition to work-item mode:
+
+- Input can be a WL id (`SA-...`) or GitHub PR reference (`https://github.com/<owner>/<repo>/pull/<n>` or `<owner>/<repo>#<n>`).
+- In PR mode, the helper resolves the related WL item from PR title/body (or uses explicit `--wl-id`, or optionally `--allow-create-wl`).
+- The helper can prepare an ephemeral checkout, run autodetected build/tests, run audit via `pi run "/audit <wl-id>"`, and record audit text using `wl update --audit-text`.
+- If build/tests and audit pass, it can present a merge offer and only merges when explicitly confirmed.
 
 Daemon / scheduler note
 

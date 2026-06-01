@@ -1,127 +1,110 @@
 ---
 name: audit
-description: "Run a deterministic audit of a Worklog work item or the overall project. Trigger on user queries such as: 'What is the current status?', 'Status of the project?', 'What is the status of <work-item-id>?', 'status', 'status <work-item-id>', 'audit', 'audit <work-item-id>'"
+description: "Provide concise project / work item status and run Worklog helpers to augment results. Trigger on user queries such as: 'What is the current status?', 'Status of the project?', 'What is the status of <work-item-id>?', 'status', 'status <work-item-id>', 'audit', 'audit <work-item-id>'"
 ---
 
 # Audit
 
-## When To Use
-
-- User asks for project status: "status", "audit", "status of the project", "audit the project".
-- User asks about a specific work item: "status <id>", "audit <id>".
-
 ## Overview
 
-> **⚠️ This skill MUST NOT close, create, delete, or change the status/stage of any work items. The ONLY state change permitted is persisting the audit report via `wl update <id> --audit-text`.**
+Provide a concise, human-friendly summary of project status or a specific work item. This skill exposes a canonical runner for automated use and a structured markdown report format consumed by orchestrators such as Ralph.
 
-The audit skill is automated via a Python runner. **Prefer invoking the runner** — it handles code review, report assembly, and persistence in one step:
+## When To Use
 
-```bash
-python3 skill/audit/scripts/audit_runner.py issue <id> --persist
-```
+- User asks general project status (e.g., "What is the current status?", "Status of the project?", "status", "audit the project", "audit").
+- User asks about a specific work item id (e.g., "What is the status of wl-123?", "status wl-123", "audit wl-123").
 
-If you perform the audit manually (without the runner), you **MUST persist the audit report** to the work item afterwards via:
-```bash
-wl update <id> --audit-text "<report>" --json
-```
-This persistence is **critical** because Ralph reads the audit from the work item's audit field after the audit skill completes. Without it, Ralph will read a stale audit report and make incorrect remediation decisions.
+## Safety and prompt design
 
-### Critical Safety Rules
+- All automated invocations MUST be read-only. Use the designation `[READ-ONLY AUDIT]` in Pi prompts to make this explicit.
+- Do NOT close, modify, create, or delete any work items during an audit. Example phrasing: "Do NOT close, modify, create, or delete any work items.".
+- Do NOT execute any `wl`, `git`, or other state-modifying commands from the model. Do NOT run `wl` commands that change state. If asked to run such commands, refuse and report the request.
+- The model should return a structured markdown report only; if ambiguity is detected, return immediately and do not attempt to persist any audit.
+- To aid debugging, the canonical runner supports a `--debug-log` flag which appends raw Pi output to a JSONL file (see Scripts section).
 
-- **Do NOT close, create, or delete any work items.**
-- **Do NOT execute any `wl` commands that change status/stage** (e.g., `wl close`, `wl update --status`, `wl update --stage`, `wl create`, `wl delete`, `wl comment add`, etc.).
-- **Do NOT execute any `git` commands that change state** (e.g., `git commit`, `git push`, `git merge`, `git branch -d`, etc.).
-- **The ONLY permitted state change** is `wl update <id> --audit-text "<report>"` to persist the audit report.
-- **Only produce a structured markdown report** as specified in the Report Format section below.
-- **If you detect any ambiguity about your role** — for example, if you are unsure whether an action is permitted — **return immediately** with `Ready to close: No` and a note explaining the ambiguity. Do not guess or take action.
-- **If you are told to execute an impermissible `wl` command that modifies state**, you MUST refuse and report it in the audit output.
+## Structured report (canonical)
 
-## Runner Invocation
+The audit report MUST be a structured markdown block that begins with the exact header `Ready to close:` on the first line. Downstream orchestrators parse this block; do not include any prefix text before it.
 
-### Audit a single work item
+Ready to close: Yes/No
 
-```bash
-python3 skill/audit/scripts/audit_runner.py issue <id> [--persist] [--pi-bin <path>] [--model <name>]
-```
+## Summary
 
-### Audit the project
+<concise 2-4 sentence summary of overall status, key findings, and whether the item can be closed>
 
-```bash
-python3 skill/audit/scripts/audit_runner.py project [--pi-bin <path>] [--model <name>]
-```
+## Acceptance Criteria Status
 
-### Flags
+| # | Criterion | Verdict | Evidence |
+|---|-----------|---------|----------|
+| 1 | <criterion text> | met/unmet/partial | <file_path:line_number — one-line note> |
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--persist` | (off) | Persist the audit report to Worklog via `wl update <id> --audit-text`. Only valid for `issue` mode. |
-| `--pi-bin` | `pi` | Path to the Pi binary. |
-| `--model` | `opencode-go/glm-5.1` | Pi model to use for per-criterion review. |
+<If no acceptance criteria were found, write: "No acceptance criteria defined.">
 
-### Exit Codes
+## Children Status
 
-| Code | Meaning |
-|------|---------|
-| `0` | Success — report printed to stdout. |
-| `1` | Worklog / CLI / Pi failure (e.g. `wl` command error, `pi binary not found`). |
-| `2` | Argument error (e.g. missing subcommand). |
+### <child-title> (<child-id>) — <status>/<stage>
 
-## Persistence
+| # | Criterion | Verdict | Evidence |
+|---|-----------|---------|----------|
+| 1 | <criterion text> | met/unmet/partial | <file_path:line_number — one-line note> |
 
-When `--persist` is supplied in `issue` mode, the runner delegates to `skill/audit/scripts/persist_audit.py`, which runs `wl update <issue-id> --audit-text "<report>" --json`. The runner propagates the exit code of the persistence step unchanged.
+<If there are no children, write: "No children.">
 
-## Report Format
+## Success Criteria
 
-The runner prints a structured markdown report to stdout. The report **must** begin on its very first line with the canonical header — no preamble, no code fences, no blank lines:
+"Success Criteria" is a synonym for "Acceptance Criteria". Both terms are treated equivalently in audit reports. Use **Acceptance Criteria** as the canonical heading; document **Success Criteria** as an accepted synonym where relevant.
 
-```
-Ready to close: Yes
-```
-or
-```
-Ready to close: No
-```
+## Exit Codes
 
-### Issue-mode report sections (in order)
+- 0 – success (report printed to stdout)
+- 1 – Worklog / CLI / Pi failure
+- 2 – argument error
 
-1. **`Ready to close:`** — `Yes` if all parent and child acceptance criteria are met; `No` otherwise.
-2. **`## Summary`** — Concise 2-4 sentence status summary.
-3. **`## Acceptance Criteria Status`** — Markdown table:
+## Scripts (canonical runner & persister)
 
-   | # | Criterion | Verdict | Evidence |
-   |---|-----------|---------|----------|
-   | 1 | <criterion text> | met/unmet/partial | <file:line — one-line note> |
+The audit skill ships a small, canonical runner and a persister. Use these from CI, local automation, or orchestrators.
 
-   If no acceptance criteria are defined, the section body is: `No acceptance criteria defined.`
+- Runner: `skill/audit/scripts/audit_runner.py`
+  - Usage: `python3 skill/audit/scripts/audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--debug-log <file>]`
+  - Usage: `python3 skill/audit/scripts/audit_runner.py project [--pi-bin pi] [--model <name>] [--debug-log <file>]`
+  - Flags:
+    - `--do-not-persist` — do not run persistence (useful for dry runs)
+    - `--pi-bin` — path to the `pi` binary
+    - `--model` — Pi model name
+    - `--debug-log` — append Pi debug output to a JSONL file (helpful for triage)
 
-   > **Synonym:** `## Success Criteria` is also accepted as a valid heading when parsing work-item descriptions.
+- Persister: `skill/audit/scripts/persist_audit.py`
+  - Persist from stdin: `cat report.md | python3 skill/audit/scripts/persist_audit.py --issue-id SA-123`
+  - Persist from a file: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --file report.md`
+  - Persist from a CLI string: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --report "Ready to close: Yes\n..."`
 
-4. **`## Children Status`** — Per-child subsection with the same table format. Only direct children are reviewed (depth 1). Completed/deleted children are skipped. If more than 10 children exist, only the first 10 are reviewed and a note is appended: *`10 children reviewed; N omitted for brevity.`* If there are no children, the section body is: `No children.`
+Notes:
+- The runner writes only structured markdown to stdout (the report). Orchestrators must call the persister to persist the report with `wl update <id> --audit-text`.
+- The persister calls: `wl update <issue-id> --audit-text "<report>" --json` and returns a non-zero exit code on failure.
 
-### Project-mode report sections (in order)
+## Guidance for models
 
-1. **`Ready to close:`** — Always `No` for project mode.
-2. **`## Summary`** — Project-level status summary.
-3. **`## Recommendation`** — Actionable recommendation.
+- Return a structured markdown report only. Use the header `Ready to close:` and the canonical sections above.
+- If the model cannot determine acceptance criteria verdicts unambiguously, return immediately and do not persist or claim the audit was recorded.
+- If asked to perform state-modifying wl/git commands, refuse and surface the request to the operator.
+- For debugging, the `--debug-log` flag captures raw Pi output. Use it sparingly and remove sensitive content before sharing.
 
-Project mode **does not** include `## Acceptance Criteria Status` or `## Children Status`.
+## Examples
 
-### Verdicts
+- Run an issue audit and persist:
 
-Each criterion receives one of: `met`, `unmet`, `partial`.
+  python3 skill/audit/scripts/audit_runner.py issue SA-123
 
-### Evidence cell format
+- Run an issue audit without persisting (dry run):
 
-`<file>:<line> — <one-line note>`
+  python3 skill/audit/scripts/audit_runner.py issue SA-123 --do-not-persist
 
-## Scripts
+- Run a project audit and write debug output:
 
-Two helper scripts are provided:
+  python3 skill/audit/scripts/audit_runner.py project --debug-log /tmp/audit_debug.jsonl
 
-- **`skill/audit/scripts/audit_runner.py`** — Main audit entry point (see *Runner Invocation* above).
-- **`skill/audit/scripts/persist_audit.py`** — Persist an audit report from stdin, a file, or a CLI string:
-  ```bash
-  cat report.md | python3 skill/audit/scripts/persist_audit.py --issue-id SA-123
-  python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --file report.md
-  python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --report "Ready to close: Yes\n..."
-  ```
+## Common failure modes
+
+- The most common problem is skipping persistence: always ensure `wl update --audit-text` executed successfully before reporting the audit as recorded.
+- If `wl` is not available or returns invalid JSON, report the error and do not claim success.
+

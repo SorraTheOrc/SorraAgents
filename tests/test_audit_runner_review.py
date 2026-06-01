@@ -297,7 +297,7 @@ class TestCmdIssueWithPi:
         """Assert at least one Pi call is made for the batched AC review."""
         pi_calls = []
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             pi_calls.append(prompt)
             return {"verdict": "met", "evidence": "test.py:1 — covered"}
 
@@ -311,13 +311,13 @@ class TestCmdIssueWithPi:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-INTEGRATION", runner=fake_runner, model="test/model")
+        cmd_issue("SA-INTEGRATION", runner=fake_runner, model="test/model", persist=False)
         # ACs are batched into a single Pi call, so expect at least 1 call
         assert len(pi_calls) >= 1
 
     def test_issue_report_reflects_pi_verdicts(self, monkeypatch, capsys):
         """Assert batched verdicts from Pi flow into the report table."""
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             # Return a batched JSON array matching the bulleted fixture's 3 ACs
             return {
                 "verdict": "met",
@@ -338,7 +338,7 @@ class TestCmdIssueWithPi:
                 stdout=json.dumps(_load_fixture("wi_with_bulleted_ac.json")),
             )
 
-        cmd_issue("SA-VERDICTS", runner=fake_runner)
+        cmd_issue("SA-VERDICTS", runner=fake_runner, persist=False)
         captured = capsys.readouterr()
         assert "partial" in captured.out
         assert "handler.py:22" in captured.out
@@ -347,7 +347,7 @@ class TestCmdIssueWithPi:
     def test_issue_ready_to_close_yes_when_all_met(self, monkeypatch, capsys):
         """Ready to close: Yes when all AC verdicts are met."""
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             # Return a batched JSON array with all met verdicts for the 3 numbered ACs
             return {
                 "verdict": "met",
@@ -368,7 +368,7 @@ class TestCmdIssueWithPi:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-YES", runner=fake_runner)
+        cmd_issue("SA-YES", runner=fake_runner, persist=False)
         captured = capsys.readouterr()
         assert captured.out.startswith("Ready to close: Yes")
 
@@ -383,7 +383,7 @@ class TestCmdProjectWithPi:
     def test_project_report_structure(self, monkeypatch, capsys):
         """Project mode: only Summary and Recommendation sections."""
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "summary:0 — ok"}
 
         monkeypatch.setattr(
@@ -425,7 +425,7 @@ class TestChildrenReview:
     def test_skips_completed_children(self, monkeypatch, capsys):
         """Children with completed/done status are skipped from review."""
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
@@ -451,7 +451,7 @@ class TestChildrenReview:
         ]
 
         runner = self._make_child_runner(children)
-        cmd_issue("SA-CHILDREN", runner=runner)
+        cmd_issue("SA-CHILDREN", runner=runner, persist=False)
         captured = capsys.readouterr()
         # Completed child should NOT appear in the review (skipped)
         assert "Completed child" not in captured.out
@@ -461,7 +461,7 @@ class TestChildrenReview:
     def test_ignores_deleted_children(self, monkeypatch, capsys):
         """Deleted children are completely ignored."""
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
@@ -481,14 +481,14 @@ class TestChildrenReview:
         ]
 
         runner = self._make_child_runner(children)
-        cmd_issue("SA-CHILDREN", runner=runner)
+        cmd_issue("SA-CHILDREN", runner=runner, persist=False)
         captured = capsys.readouterr()
         assert "Deleted child" not in captured.out
 
     def test_caps_children_at_10(self, monkeypatch, capsys):
         """Only the first 10 children are reviewed; an explicit note is emitted."""
 
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
@@ -508,7 +508,7 @@ class TestChildrenReview:
         ]
 
         runner = self._make_child_runner(children)
-        cmd_issue("SA-CHILDREN", runner=runner)
+        cmd_issue("SA-CHILDREN", runner=runner, persist=False)
         captured = capsys.readouterr()
         # Should mention the cap in the explicit note
         assert "omitted for brevity" in captured.out
@@ -541,7 +541,7 @@ class TestCmdIssueJsonMode:
     """Verify cmd_issue emits structured JSON when json_mode=True."""
 
     def test_json_output_has_expected_keys(self, monkeypatch, capsys):
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {
                 "verdict": "met",
                 "evidence": json.dumps([
@@ -559,7 +559,7 @@ class TestCmdIssueJsonMode:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True)
+        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True, persist=False)
         captured = capsys.readouterr()
         payload = json.loads(captured.out)
         assert "ready_to_close" in payload
@@ -569,7 +569,7 @@ class TestCmdIssueJsonMode:
         assert isinstance(payload["ready_to_close"], bool)
 
     def test_json_output_ready_to_close_true_when_all_met(self, monkeypatch, capsys):
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {
                 "verdict": "met",
                 "evidence": json.dumps([
@@ -589,13 +589,13 @@ class TestCmdIssueJsonMode:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True)
+        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True, persist=False)
         captured = capsys.readouterr()
         payload = json.loads(captured.out)
         assert payload["ready_to_close"] is True
 
     def test_json_output_ac_results_present(self, monkeypatch, capsys):
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {
                 "verdict": "met",
                 "evidence": json.dumps([
@@ -613,7 +613,7 @@ class TestCmdIssueJsonMode:
                 stdout=json.dumps(_load_fixture("wi_with_bulleted_ac.json")),
             )
 
-        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True)
+        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True, persist=False)
         captured = capsys.readouterr()
         payload = json.loads(captured.out)
         assert len(payload["acceptance_criteria"]) == 3
@@ -621,7 +621,7 @@ class TestCmdIssueJsonMode:
         assert payload["acceptance_criteria"][0]["evidence"] == "a.py:1 — partial"
 
     def test_default_mode_still_emits_markdown(self, monkeypatch, capsys):
-        def fake_call_pi(prompt, model="test/model", pi_bin="pi"):
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "x:1 — ok"}
 
         monkeypatch.setattr(
@@ -634,7 +634,7 @@ class TestCmdIssueJsonMode:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-MD", runner=fake_runner, json_mode=False)
+        cmd_issue("SA-MD", runner=fake_runner, json_mode=False, persist=False)
         captured = capsys.readouterr()
         assert captured.out.startswith("Ready to close:")
 

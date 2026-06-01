@@ -30,8 +30,8 @@ The scheduler's `start_command()` routes `wl-audit` commands through `poll_and_h
    - Select the first eligible candidate and persist `last_audit_at_by_item[selected_id] = now` to the store BEFORE calling the handler to avoid re-selection during long-running audits.
    - Hand off the selected work item dict to the handler.
 
-2. Run the audit (handler / opencode)
-   - The handler executes `opencode run "/audit <work_id>"` (via the injected `run_shell` / `opencode` adapter).
+2. Run the audit (handler / pi)
+   - The handler executes `pi run "/audit <work_id>"` (via the injected `run_shell` / Pi adapter).
    - Capture stdout and stderr into a single audit output string.
    - The audit agent is expected to produce a **structured report** bounded by delimiter markers (see below).
 
@@ -128,7 +128,7 @@ Per-command metadata (scheduler command spec):
 ## Notes
 
 - The audit flow is post-processing only. The scheduler still records the command run normally before executing this logic.
-- The `/audit` command is a separate command definition; the audit poller invokes it. The audit agent is instructed to produce structured output using the marker format above.
+- The `/audit` command is a separate command definition; the audit poller invokes it (for example via `pi run`). The audit agent is instructed to produce structured output using the marker format above.
 - AMPA audit handlers expect a work item dict (with at least `id` and `title`) when invoked by the scheduler poller.
 
 (End of file)

@@ -170,7 +170,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
   > **Important:** The work-item is **not closed** at this stage. It remains `in_review` until the release process (
   > ship agent or Release Manager) promotes `dev` to `main`. Agents must **never** push to `main` directly.
-  > See `skill/ship/SKILL.md` for the push-to-dev workflow and `scripts/release/merge-dev-to-main.sh` for the release process.
+  > See `skill/ship/SKILL.md` for the push-to-dev workflow and `skill/ship/scripts/run-release.js` (safe wrapper) for the release process. The wrapper detects when a repository lacks `scripts/release/merge-dev-to-main.sh` and prints a clear human fallback message.
 
 Pre-push blocking check
 -----------------------
