@@ -145,6 +145,15 @@ WL_AMPA_POOL_SIZE=4 skill/install-ampa/scripts/install-worklog-plugin.sh --yes
 wl ampa warm-pool --non-interactive --size 3
 ```
 
+## CI Workflows
+
+Two CI workflows validate changes on the `dev` branch:
+
+- **`dev-smoke`** — runs smoke and critical tests on every push to `dev`, providing fast pass/fail feedback in the commit checks UI.
+- **`dev-full-suite`** — runs the full test suite, triggered manually via `workflow_dispatch` or on release-candidate tags. This workflow acts as a gating check before merging to `main`.
+
+See [release-tests.md](docs/dev/release-tests.md) for test commands and CI configuration details.
+
 ## Release Process
 
 Promoting changes from `dev` to `main` requires a human-reviewed merge.
