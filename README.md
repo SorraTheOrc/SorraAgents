@@ -184,6 +184,15 @@ and records an audit comment in the worklog.
 2. Pick a folder to work in (e.g., `skill/` or `agent/`).
 3. Follow the appropriate guide (see files inside each folder) to implement, test, and package your work.
 
+## PR-based audit flow (Pi)
+
+The audit helper supports PR mode in addition to work-item mode:
+
+- Input can be a WL id (`SA-...`) or GitHub PR reference (`https://github.com/<owner>/<repo>/pull/<n>` or `<owner>/<repo>#<n>`).
+- In PR mode, the helper resolves the related WL item from PR title/body (or uses explicit `--wl-id`, or optionally `--allow-create-wl`).
+- The helper can prepare an ephemeral checkout, run autodetected build/tests, run audit via `pi run "/audit <wl-id>"`, and record audit text using `wl update --audit-text`.
+- If build/tests and audit pass, it can present a merge offer and only merges when explicitly confirmed.
+
 Daemon / scheduler note
 
 - The AMPA Worklog plugin provides a long-running "daemon" that can either
