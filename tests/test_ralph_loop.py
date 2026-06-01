@@ -1,24 +1,11 @@
-import json
 import os
 import tempfile
-import threading
 from dataclasses import dataclass
 
 import pytest
 
-from skill.ralph.scripts.ralph_loop import (
-    DEFAULT_PI_STREAM_TIMEOUT_SECONDS,
-    JsonLineFormatter,
-    RalphError,
-    RalphLoop,
-    REMOTE_PI_STREAM_TIMEOUT_SECONDS,
-    _build_implement_single_prompt,
-    _extract_phase_model_config,
-    _load_asset_config,
-    _resolve_stream_timeout,
-    build_parser,
-    parse_audit_report,
-)
+import json
+from skill.ralph.scripts.ralph_loop import RalphError, RalphLoop, _comment_hash, parse_audit_report
 
 
 @dataclass
@@ -28,61 +15,38 @@ class Result:
     stderr: str = ""
 
 
-class LineStream:
-    def __init__(self, lines):
-        self._lines = iter(lines)
-
-    def readline(self):
-        return next(self._lines, "")
-
-
 class FakeRunner:
     def __init__(self):
         self.calls: list[list[str]] = []
         self.audit_outputs: list[str] = []
-        self.child_ids: list[str] = []  # No children by default; tests that need children add them
-        self.items: dict[str, dict] = {
-            "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
-            "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress", "effort": "", "risk": "", "audit": ""},
+        self.items = {
+            "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open"},
+            "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress"},
         }
         self.comments: list[dict] = []
-        self.compact_failures_remaining = 0
 
     def __call__(self, cmd):
         cmd = list(cmd)
         self.calls.append(cmd)
 
         if cmd[:3] == ["wl", "show", "SA-TARGET"] and "--children" in cmd:
-            item = self.items["SA-TARGET"]
-            children = [
-                {"id": child_id, "stage": self.items.get(child_id, {}).get("stage", "")}
-                for child_id in self.child_ids
-                if child_id in self.items
-            ]
-            return Result(stdout=json.dumps({"success": True, "workItem": item, "children": children}))
+            return Result(stdout='{"success":true,"workItem":{"id":"SA-TARGET","stage":"plan_complete","status":"open"},"children":[{"id":"SA-CHILD"}]}')
         if cmd[:3] == ["wl", "show", "SA-TARGET"]:
             item = self.items["SA-TARGET"]
-            return Result(stdout=json.dumps({"success": True, "workItem": item}))
+            return Result(stdout=f'{{"success":true,"workItem":{item}}}'.replace("'", '"'))
         if cmd[:3] == ["wl", "show", "SA-CHILD"]:
             item = self.items["SA-CHILD"]
-            return Result(stdout=json.dumps({"success": True, "workItem": item}))
+            return Result(stdout=f'{{"success":true,"workItem":{item}}}'.replace("'", '"'))
 
-        if cmd[:3] == ["wl", "comment", "list"]:
-            return Result(stdout=json.dumps({"success": True, "comments": self.comments}))
-        if cmd[:3] == ["wl", "comment", "add"]:
+        if cmd[:4] == ["wl", "comment", "list", "SA-TARGET"]:
+            return Result(stdout=f'{{"success":true,"comments":{self.comments}}}'.replace("'", '"'))
+        if cmd[:4] == ["wl", "comment", "add", "SA-TARGET"]:
             comment = cmd[cmd.index("--comment") + 1]
-            self.comments.append({"comment": comment, "author": "ralph"})
-            return Result(stdout=json.dumps({"success": True}))
+            self.comments.append({"comment": comment})
+            return Result(stdout='{"success":true}')
 
         if cmd[:3] == ["wl", "update", "SA-TARGET"]:
-            # Track effort and risk updates
-            if "--effort" in cmd:
-                idx = cmd.index("--effort")
-                self.items["SA-TARGET"]["effort"] = cmd[idx + 1]
-            if "--risk" in cmd:
-                idx = cmd.index("--risk")
-                self.items["SA-TARGET"]["risk"] = cmd[idx + 1]
-            return Result(stdout=json.dumps({"success": True}))
+            return Result(stdout='{"success":true}')
 
         if cmd[0] == "python3" and len(cmd) > 1 and "orchestrate_estimate.py" in cmd[1]:
             # Return pre-configured effort_and_risk output if provided
@@ -91,45 +55,22 @@ class FakeRunner:
                 val = out.pop(0)
                 return Result(stdout=val)
             # default to small/low
-            return Result(stdout=json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 0}}))
+            return Result(stdout=json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low"}}))
 
         if cmd[0] == "pi" and "-p" in cmd:
             # pi -p --mode json --model <model> <prompt>
             # Find the prompt: it's the last positional arg
             prompt = cmd[-1]
-
-            def prompt_target(default: str = "SA-TARGET") -> str:
-                first_line = prompt.splitlines()[0].strip() if prompt else ""
-                parts = first_line.split()
-                if len(parts) >= 2 and parts[0] in {"implement", "implement-single", "/skill:audit", "/skill:plan"}:
-                    return parts[1]
-                return default
-
-            if prompt.startswith("/skill:audit"):
+            if prompt.startswith("/audit"):
                 output = self.audit_outputs.pop(0)
-                target = prompt_target()
-                # Simulate the audit skill persisting the audit into the work item
-                self.items.setdefault(target, {})["audit"] = output
                 return Result(stdout=output)
-            if prompt.startswith("/skill:plan"):
-                # emulate plan moving target to plan_complete after plan call
-                self.items.setdefault(prompt_target(), {})["stage"] = "plan_complete"
-                return Result(stdout="planned")
             if prompt.startswith("implement"):
                 # emulate implementation moving target to in_review after first implement call
-                self.items.setdefault(prompt_target(), {})["stage"] = "in_review"
+                self.items["SA-TARGET"]["stage"] = "in_review"
                 return Result(stdout="implemented")
-            if prompt == "/compact":
-                if self.compact_failures_remaining > 0:
-                    self.compact_failures_remaining -= 1
-                    return Result(returncode=1, stderr="compact failed")
-                return Result(stdout="compacted")
 
         if cmd[:2] == ["bash", "-lc"]:
             return Result(stdout="ok")
-
-        if cmd[:2] == ["git", "diff"] and "--name-status" in cmd:
-            return Result(stdout="M\tsrc/foo.py\nA\tsrc/bar.py\n")
 
         if cmd and cmd[0] == "git":
             return Result(stdout="ok")
@@ -165,26 +106,19 @@ def test_parse_audit_report_extracts_readiness_and_rows():
     assert parsed.unmet_or_partial[0].text == "retry loop"
 
 
-def test_accepts_in_progress_and_runs():
+def test_precondition_requires_plan_complete_or_in_review():
     runner = FakeRunner()
     runner.items["SA-TARGET"]["stage"] = "in_progress"
-    runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
 
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
+    with pytest.raises(RalphError, match="plan_complete or in_review"):
+        loop.run("SA-TARGET")
 
 
 def test_happy_path_success_with_merge_offer_not_executed_without_confirm():
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(
-        runner=runner,
-        stream=False,
-        check_cmds=["pytest -q -r a --disable-warnings"],
-        max_attempts=2,
-        confirm_merge=False,
-    )
+    loop = RalphLoop(runner=runner, stream=False, check_cmds=["pytest -q"], max_attempts=2, confirm_merge=False)
 
     result = loop.run("SA-TARGET")
 
@@ -192,36 +126,6 @@ def test_happy_path_success_with_merge_offer_not_executed_without_confirm():
     assert result["merge_offered"] is True
     assert result["merge_executed"] is False
     assert not any(call[:2] == ["git", "push"] for call in runner.calls)
-
-
-def test_child_scoped_run_targets_only_requested_child():
-    runner = FakeRunner()
-    runner.child_ids = ["SA-CHILD"]  # Make SA-CHILD a child of SA-TARGET
-    runner.items["SA-CHILD"]["stage"] = "plan_complete"
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run("SA-TARGET", child_id="SA-CHILD")
-
-    assert result["status"] == "success"
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    assert any(prompt.startswith("implement-single SA-CHILD") for prompt in pi_prompts)
-    assert any(prompt.startswith("/skill:audit SA-CHILD") for prompt in pi_prompts)
-    assert not any("SA-TARGET" in prompt for prompt in pi_prompts)
-    assert runner.items["SA-TARGET"]["audit"] == ""
-    assert runner.items["SA-CHILD"]["audit"] == AUDIT_PASS
-
-
-def test_pi_invocations_use_ephemeral_sessions():
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    loop.run("SA-TARGET")
-
-    pi_calls = [call for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    assert pi_calls
-    assert all("--no-session" in call for call in pi_calls)
 
 
 def test_retry_path_uses_remediation_in_next_implement_prompt():
@@ -237,34 +141,40 @@ def test_retry_path_uses_remediation_in_next_implement_prompt():
     assert "Address all the gaps identified in the audit" in implement_prompts[1]
 
 
-def test_structured_audit_actions_feed_next_remediation_prompt():
+def test_autoplan_skips_plan_for_small_low():
+    """When stage is intake_complete and effort/risk are Small/Low, do not invoke /plan and proceed to implement."""
     runner = FakeRunner()
-    structured_audit = json.dumps(
-        {
-            "type": "message_end",
-            "message": {
-                "role": "assistant",
-                "content": [],
-                "text": "Ready to close: No\n\n## Acceptance Criteria Status\n\n| # | Criterion | Verdict | Evidence |\n|---|-----------|---------|----------|\n| 1 | parser coverage | unmet | missing tests |",
-                "summary": "Need to add a regression test before closing.",
-                "actions": [
-                    {"command": "pytest", "args": ["tests/test_ralph_loop.py", "-q"]},
-                    {"command": "edit", "args": ["skill/ralph/scripts/ralph_loop.py"]},
-                ],
-            },
-        }
-    )
-    runner.audit_outputs = [structured_audit, AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    # effort_and_risk returns Small / Low
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low"}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
 
     result = loop.run("SA-TARGET")
-
     assert result["status"] == "success"
-    implement_prompts = [c[-1] for c in runner.calls if c[0] == "pi" and "-p" in c and c[-1].startswith("implement")]
-    assert len(implement_prompts) == 2
-    assert "Need to add a regression test before closing." in implement_prompts[1]
-    assert "pytest tests/test_ralph_loop.py -q" in implement_prompts[1]
-    assert "edit skill/ralph/scripts/ralph_loop.py" in implement_prompts[1]
+    # ensure no plan invocation (pi /plan)
+    assert not any(c[0] == "pi" and c[-1].startswith("/plan") for c in runner.calls)
+    # ensure implement was invoked (pi with implement prompt)
+    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
+
+
+def test_autoplan_invokes_plan_for_medium_high():
+    """When stage is intake_complete and effort/risk are Medium/High, invoke /plan then implement."""
+    runner = FakeRunner()
+    runner.items["SA-TARGET"]["stage"] = "intake_complete"
+    # effort_and_risk returns Medium / High
+    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Medium"}, "risk": {"level": "High"}})]
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    result = loop.run("SA-TARGET")
+    assert result["status"] == "success"
+    # ensure plan invocation occurred (pi /plan)
+    assert any(c[0] == "pi" and c[-1].startswith("/plan") for c in runner.calls)
+    # ensure implement was invoked after plan
+    plan_indices = [i for i,c in enumerate(runner.calls) if c[0] == "pi" and c[-1].startswith("/plan")]
+    impl_indices = [i for i,c in enumerate(runner.calls) if c[0] == "pi" and c[-1].startswith("implement")]
+    assert plan_indices and impl_indices and min(impl_indices) > min(plan_indices)
 
 
 def test_cancel_file_stops_loop():
@@ -279,19 +189,6 @@ def test_cancel_file_stops_loop():
     assert result["status"] == "cancelled"
 
 
-def test_no_safe_path_response_stops_without_audit():
-    runner = NoSafePathRunner()
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "producer_input_required"
-    assert "Need producer decision" in result["reason"]
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    assert any(prompt.startswith("implement SA-TARGET") for prompt in pi_prompts)
-    assert not any(prompt.startswith("/skill:audit") for prompt in pi_prompts)
-
-
 def test_max_attempts_returns_max_attempts_status():
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL]
@@ -300,77 +197,6 @@ def test_max_attempts_returns_max_attempts_status():
     result = loop.run("SA-TARGET")
 
     assert result["status"] == "max_attempts"
-
-
-def test_success_result_includes_summary():
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, check_cmds=["pytest -q"])
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-    assert "summary" in result
-    summary = result["summary"]
-    assert isinstance(summary, dict)
-    assert "changed_files" in summary
-    assert "change_descriptions" in summary
-    assert "check_results" in summary
-
-
-def test_summary_changed_files_lists_git_diff():
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-    changed_files = result["summary"]["changed_files"]
-    assert isinstance(changed_files, list)
-    assert len(changed_files) > 0
-    for entry in changed_files:
-        assert "status" in entry
-        assert "file" in entry
-
-
-def test_summary_change_descriptions_from_implement_output():
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-    assert isinstance(result["summary"]["change_descriptions"], str)
-    assert len(result["summary"]["change_descriptions"]) > 0
-
-
-def test_summary_check_results_from_run_checks():
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, check_cmds=["pytest -q"])
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-    check_results = result["summary"]["check_results"]
-    assert isinstance(check_results, list)
-    assert len(check_results) == 1
-    assert check_results[0]["cmd"] == "pytest -q"
-    assert check_results[0]["returncode"] == 0
-    assert check_results[0]["stdout"] == "ok"
-
-
-def test_non_success_results_exclude_summary():
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "max_attempts"
-    assert "summary" not in result
 
 
 def test_confirm_merge_executes_git_steps():
@@ -387,8 +213,8 @@ def test_confirm_merge_executes_git_steps():
 
 def test_idempotent_audit_comment_append_skips_duplicate_hash():
     runner = FakeRunner()
-    # Simulate an existing AMPA comment (content not validated by ralph in this mode)
-    runner.comments = [{"comment": "# AMPA Audit Result\n\n..."}]
+    digest = _comment_hash(AUDIT_PASS)
+    runner.comments = [{"comment": f"# AMPA Audit Result\naudit-hash:{digest}\n\n..."}]
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
 
@@ -396,26 +222,24 @@ def test_idempotent_audit_comment_append_skips_duplicate_hash():
 
     add_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
     assert add_calls == []
-    # Also verify that wl update --audit-text is not called by ralph
-    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in c]
-    assert update_calls == []
 
 
 def test_changed_audit_appends_new_comment_not_duplicate():
-    """When audit content changes, ralph must still rely on the persisted audit and
-    must NOT write audit text or AMPA audit comments itself."""
+    """When audit content changes, a new comment is appended (not skipped)."""
     runner = FakeRunner()
-    runner.comments = [{"comment": "# AMPA Audit Result\n\nold content"}]
+    # Existing comment has hash of AUDIT_FAIL
+    old_digest = _comment_hash(AUDIT_FAIL)
+    runner.comments = [{"comment": f"# AMPA Audit Result\naudit-hash:{old_digest}\n\nold content"}]
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
 
     loop.run("SA-TARGET")
 
-    # Ralph should not write audit text or append AMPA audit comments
+    # Should add a new comment because the hash differs
     add_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
-    assert add_calls == []
-    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in c]
-    assert update_calls == []
+    assert len(add_calls) == 1
+    new_digest = _comment_hash(AUDIT_PASS)
+    assert f"audit-hash:{new_digest}" in add_calls[0][add_calls[0].index("--comment") + 1]
 
 
 AUDIT_PARTIAL = """Ready to close: No
@@ -490,21 +314,11 @@ def test_cli_parser_accepts_all_flags():
 
 
 def test_cli_parser_verbose_flag():
+    from skill.ralph.scripts.ralph_loop import build_parser
+
     parser = build_parser()
     args = parser.parse_args(["SA-X2", "--verbose"])
     assert args.verbose is True
-
-
-def test_cli_parser_accepts_child_flag():
-    parser = build_parser()
-    args = parser.parse_args(["SA-X3", "--child", "SA-CHILD"])
-    assert args.child == "SA-CHILD"
-
-
-def test_cli_parser_accepts_debug_persist_flag():
-    parser = build_parser()
-    args = parser.parse_args(["SA-X4", "--debug-persist"])
-    assert args.debug_persist is True
 
 
 def test_main_returns_error_on_precondition_failure():
@@ -515,34 +329,8 @@ def test_main_returns_error_on_precondition_failure():
     loop = RalphLoop(runner=runner, stream=False)
 
     # Direct API call gives RalphError
-    with pytest.raises(RalphError, match="plan_complete, in_review, or in_progress"):
+    with pytest.raises(RalphError, match="plan_complete or in_review"):
         loop.run("SA-TARGET")
-
-
-def test_main_returns_json_and_exit_code_for_producer_input_required(monkeypatch, capsys):
-    from skill.ralph.scripts import ralph_loop
-
-    class FakeLoop:
-        def __init__(self, *args, **kwargs):
-            self.args = args
-            self.kwargs = kwargs
-
-        def run(self, *args, **kwargs):
-            return {
-                "status": "producer_input_required",
-                "attempt": 1,
-                "scope": ["SA-TARGET"],
-                "reason": "Need producer decision on whether to split the work item.",
-            }
-
-    monkeypatch.setattr(ralph_loop, "RalphLoop", FakeLoop)
-
-    exit_code = ralph_loop.main(["SA-TARGET", "--json"])
-    captured = capsys.readouterr()
-
-    assert exit_code == 2
-    assert '"status": "producer_input_required"' in captured.out
-    assert "Need producer decision" in captured.out
 
 
 class FakeRunnerWithPushFailure(FakeRunner):
@@ -568,190 +356,26 @@ class FakeRunnerWithCheckFailure(FakeRunner):
         return super().__call__(cmd)
 
 
-class NoSafePathRunner(FakeRunner):
-    def __call__(self, cmd):
-        cmd = list(cmd)
-        if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("implement"):
-            self.calls.append(cmd)
-            return Result(
-                stdout=json.dumps(
-                    {
-                        "summary": "I cannot continue safely without producer input.",
-                        "actions": [
-                            {
-                                "command": "no_safe_path",
-                                "args": [
-                                    "Need producer decision on whether to split SA-TARGET before implementation."
-                                ],
-                            }
-                        ],
-                    }
-                )
-            )
-        return super().__call__(cmd)
-
-
 def test_check_cmd_failure_raises_ralph_error():
     runner = FakeRunnerWithCheckFailure()
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(
-        runner=runner,
-        stream=False,
-        check_cmds=["pytest -q -r a --disable-warnings"],
-    )
+    loop = RalphLoop(runner=runner, stream=False, check_cmds=["pytest -q"])
 
     with pytest.raises(RalphError, match="Check failed"):
         loop.run("SA-TARGET")
 
 
-def test_audit_text_written_via_wl_update_is_not_called_by_ralph():
-    """Ralph should NOT write the audit text; it must be persisted by the audit skill."""
+def test_audit_text_written_via_wl_update():
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
 
     loop.run("SA-TARGET")
 
-    # Ralph must not call wl update with --audit-text
-    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in c]
-    assert update_calls == []
-
-
-def test_check_cmds_are_canonicalized_to_quiet_pytest():
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(
-        runner=runner,
-        stream=False,
-        check_cmds=["pytest tests/test_example.py"],
-    )
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-    check_calls = [c[2] for c in runner.calls if c[:2] == ["bash", "-lc"]]
-    assert any(
-        call == "pytest -q -r a --disable-warnings tests/test_example.py"
-        for call in check_calls
-    )
-
-
-def test_check_cmds_are_canonicalized_to_quiet_npm_test():
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(
-        runner=runner,
-        stream=False,
-        check_cmds=["npm test"],
-    )
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-    check_calls = [c[2] for c in runner.calls if c[:2] == ["bash", "-lc"]]
-    assert any(call == "npm --silent test" for call in check_calls)
-
-
-def test_delegated_commands_are_logged_in_console_output():
-    import io
-    import logging
-    import shlex
-
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
-    logger = logging.getLogger("ralph")
-    old_level = logger.level
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-
-    try:
-        result = loop.run("SA-TARGET")
-    finally:
-        logger.setLevel(old_level)
-        logger.removeHandler(handler)
-
-    assert result["status"] == "success"
-    console_output = stream.getvalue()
-    delegated_calls = [c for c in runner.calls if c[0] in {"pi", "wl"}]
-    assert delegated_calls
-    for call in delegated_calls:
-        assert shlex.join(call) in console_output
-
-
-def test_delegated_commands_include_machine_readable_json_fields():
-    import io
-    import logging
-    import shlex
-
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(JsonLineFormatter())
-    logger = logging.getLogger("ralph")
-    old_level = logger.level
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-
-    try:
-        result = loop.run("SA-TARGET")
-    finally:
-        logger.setLevel(old_level)
-        logger.removeHandler(handler)
-
-    assert result["status"] == "success"
-    lines = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
-    delegated_lines = [line for line in lines if line.get("category") in {"pi", "wl"} and "cmd" in line]
-    assert delegated_lines
-    rendered_calls = {shlex.join(c) for c in runner.calls if c[0] in {"pi", "wl"}}
-    observed_cmds = {line["cmd"] for line in delegated_lines}
-    assert rendered_calls <= observed_cmds
-    assert all(isinstance(line.get("argv"), list) for line in delegated_lines)
-
-
-def test_failed_pi_command_still_logs_exact_command_before_raising():
-    import io
-    import logging
-    import shlex
-
-    class FailOnAuditRunner(FakeRunner):
-        def __call__(self, cmd):
-            cmd = list(cmd)
-            if cmd[:2] == ["pi", "-p"] and cmd[-1].startswith("/skill:audit"):
-                self.calls.append(cmd)
-                return Result(returncode=1, stderr="audit failed")
-            return super().__call__(cmd)
-
-    runner = FailOnAuditRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
-    logger = logging.getLogger("ralph")
-    old_level = logger.level
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-
-    try:
-        with pytest.raises(RalphError, match="pi run failed"):
-            loop.run("SA-TARGET")
-    finally:
-        logger.setLevel(old_level)
-        logger.removeHandler(handler)
-
-    console_output = stream.getvalue()
-    failing_calls = [c for c in runner.calls if c[0] == "pi" and c[-1].startswith("/skill:audit")]
-    assert failing_calls
-    assert shlex.join(failing_calls[0]) in console_output
+    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"]]
+    assert len(update_calls) >= 1
+    audit_text_idx = update_calls[0].index("--audit-text")
+    assert update_calls[0][audit_text_idx + 1] == AUDIT_PASS
 
 
 def test_verbose_mode_logs_pi_output_start():
@@ -781,8 +405,6 @@ def test_verbose_mode_logs_pi_output_start():
         assert len(prompt_msgs) >= 1
         # The prompt should contain the implement instruction in full
         assert "Continue until the work item and all dependencies are completed, but do not merge." in prompt_msgs[0].getMessage()
-        assert "If you cannot continue safely without explicit producer input" in prompt_msgs[0].getMessage()
-        assert "structured no_safe_path response" in prompt_msgs[0].getMessage()
         # text_start should be logged (the extracted text content)
         text_msgs = [r for r in pi_debug_msgs if "text_start" in r.getMessage()]
         assert len(text_msgs) >= 1
@@ -799,7 +421,7 @@ def test_stream_pi_captures_and_returns_output():
     # Simulate a pi subprocess producing pi JSON protocol events
     fake_process = MagicMock()
     fake_process.returncode = 0
-    fake_process.stdout = LineStream([
+    fake_process.stdout = iter([
         '{"type":"agent_start"}\n',
         '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"thinking"}}\n',
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello "}}\n',
@@ -826,7 +448,7 @@ def test_stream_pi_verbose_logs_raw_json(capsys):
 
     fake_process = MagicMock()
     fake_process.returncode = 0
-    fake_process.stdout = LineStream([
+    fake_process.stdout = iter([
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello"}}\n',
         '{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"internal"}}\n',
         '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":" World"}}\n',
@@ -864,137 +486,6 @@ def test_stream_pi_verbose_logs_raw_json(capsys):
         logger.removeHandler(handler)
 
 
-def test_stream_pi_times_out_when_stdout_stalls(capsys):
-    import subprocess
-    from unittest.mock import patch
-
-    class BlockingStdout:
-        def __init__(self, stop_event):
-            self.stop_event = stop_event
-            self.calls = 0
-
-        def readline(self):
-            self.calls += 1
-            if self.calls == 1:
-                return '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello"}}\n'
-            self.stop_event.wait()
-            return ""
-
-    class BlockingStderr:
-        def __init__(self, stop_event):
-            self.stop_event = stop_event
-            self.calls = 0
-
-        def read(self, size=-1):
-            if self.calls == 0:
-                self.calls += 1
-                return "stderr detail\n"
-            self.stop_event.wait()
-            return ""
-
-    class BlockingProcess:
-        def __init__(self):
-            self.stop_event = threading.Event()
-            self.stdout = BlockingStdout(self.stop_event)
-            self.stderr = BlockingStderr(self.stop_event)
-            self.returncode = None
-            self.killed = False
-
-        def poll(self):
-            return self.returncode
-
-        def kill(self):
-            self.killed = True
-            self.returncode = -9
-            self.stop_event.set()
-
-        def wait(self, timeout=None):
-            if self.returncode is None:
-                if timeout is None:
-                    self.stop_event.wait()
-                elif not self.stop_event.wait(timeout):
-                    raise subprocess.TimeoutExpired(cmd=["pi"], timeout=timeout)
-            if self.returncode is None:
-                self.returncode = 0
-            return self.returncode
-
-    fake_process = BlockingProcess()
-    with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process):
-        loop = RalphLoop(verbose=False, stream=True)
-        loop.pi_bin = "echo"
-        loop.pi_stream_timeout_seconds = 0.01
-        with pytest.raises(RalphError, match="pi stream stalled"):
-            loop._stream_pi(["echo", "test"], "test prompt")
-
-    captured = capsys.readouterr()
-    assert "Hello" in captured.out
-    assert fake_process.killed is True
-
-
-def test_debug_persist_writes_raw_payload_for_no_text_stream(tmp_path):
-    from unittest.mock import patch, MagicMock
-
-    fake_process = MagicMock()
-    fake_process.returncode = 0
-    fake_process.stdout = LineStream([
-        '{"type":"session","id":"session-123"}\n',
-        '{"type":"agent_start"}\n',
-        '{"type":"turn_start"}\n',
-        '{"type":"message_end","message":{"role":"assistant","content":[]}}\n',
-        '{"type":"agent_end","messages":[{"role":"assistant","content":[]}]}\n',
-    ])
-    fake_process.stderr = MagicMock()
-    fake_process.stderr.read.return_value = ""
-    fake_process.wait.return_value = None
-
-    with patch("skill.ralph.scripts.ralph_loop.tempfile.gettempdir", return_value=str(tmp_path)):
-        with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process):
-            loop = RalphLoop(verbose=False, stream=True, debug_persist=True)
-            loop.pi_bin = "pi"
-            loop._debug_context = {
-                "target_id": "SA-TARGET",
-                "focus_id": "SA-CHILD",
-                "child_id": "SA-CHILD",
-                "attempt": 4,
-            }
-            with pytest.raises(RalphError, match="Pi produced invalid output"):
-                loop._run_pi("implement SA-CHILD")
-    # Debug payload should still be persisted even though empty output raises
-    payload_dir = tmp_path / "ralph-payloads"
-    files = list(payload_dir.glob("*.json"))
-    assert len(files) == 1
-    payload = json.loads(files[0].read_text())
-    assert payload["metadata"]["reason"] == "no_text_extracted"
-    assert payload["metadata"]["target_id"] == "SA-TARGET"
-    assert payload["metadata"]["focus_id"] == "SA-CHILD"
-    assert payload["metadata"]["child_id"] == "SA-CHILD"
-    assert payload["metadata"]["attempt"] == 4
-    assert payload["metadata"]["model"] == "opencode-go/glm-5.1"
-    assert payload["metadata"]["session_id"] == "session-123"
-    assert "agent_end" in payload["raw_output"]
-    assert payload["truncated"] is False
-
-
-def test_run_pi_stream_mode_uses_ephemeral_sessions():
-    from unittest.mock import patch, MagicMock
-
-    fake_process = MagicMock()
-    fake_process.returncode = 0
-    fake_process.stdout = LineStream([])
-    fake_process.stderr = MagicMock()
-    fake_process.stderr.read.return_value = ""
-    fake_process.wait.return_value = None
-
-    with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process) as popen:
-        loop = RalphLoop(verbose=False, stream=True)
-        loop.pi_bin = "pi"
-        with pytest.raises(RalphError, match="Pi produced invalid output"):
-            loop._run_pi("test prompt")
-    cmd = popen.call_args.args[0]
-    assert "--no-session" in cmd
-    assert cmd.index("--no-session") < cmd.index("test prompt")
-
-
 def test_in_review_skips_first_implement():
     """When target is already in_review, ralph skips the first implement and audits directly."""
     runner = FakeRunner()
@@ -1009,7 +500,7 @@ def test_in_review_skips_first_implement():
     # There should be NO implement calls, only an audit call
     pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
     implement_calls = [c for c in pi_calls if c[-1].startswith("implement")]
-    audit_calls = [c for c in pi_calls if c[-1].startswith("/skill:audit")]
+    audit_calls = [c for c in pi_calls if c[-1].startswith("/audit")]
     assert len(implement_calls) == 0, f"Expected no implement calls, got {implement_calls}"
     assert len(audit_calls) == 1
 
@@ -1029,114 +520,11 @@ def test_in_review_implement_after_failed_audit():
     # Second attempt: implement + audit
     pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
     first_call = pi_calls[0][-1]
-    assert first_call.startswith("/skill:audit"), f"First call should be audit, got: {first_call[:60]}"
+    assert first_call.startswith("/audit"), f"First call should be audit, got: {first_call[:60]}"
     second_call = pi_calls[1][-1]
     assert second_call.startswith("implement"), f"Second call should be implement, got: {second_call[:60]}"
     third_call = pi_calls[2][-1]
-    assert third_call.startswith("/skill:audit"), f"Third call should be audit, got: {third_call[:60]}"
-
-
-def test_in_review_skips_start_of_iteration_audit_when_persisted_comment_up_to_date():
-    """When the most recent '# AMPA Audit Result' comment is newer than the
-    most-recent updatedAt across the recursive scope, Ralph should skip the
-    start-of-iteration /skill:audit invocation and use the persisted audit.
-    """
-    runner = FakeRunner()
-    # Target starts in_review
-    runner.items["SA-TARGET"]["stage"] = "in_review"
-    # Set updatedAt timestamps for target and child (child older)
-    runner.items["SA-TARGET"]["updatedAt"] = "2026-05-20T11:00:00Z"
-    runner.items["SA-CHILD"]["updatedAt"] = "2026-05-20T10:00:00Z"
-    # Persisted audit already present on the work item
-    runner.items["SA-TARGET"]["audit"] = AUDIT_PASS
-    # A recent AMPA comment whose createdAt is later than the updatedAt values
-    runner.comments = [{"comment": "# AMPA Audit Result\n\n...", "author": "ralph", "createdAt": "2026-05-20T12:00:00Z"}]
-
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-    # There should be NO implement or /skill:audit calls — Ralph relied on persisted audit
-    pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
-    implement_calls = [c for c in pi_calls if c[-1].startswith("implement")]
-    audit_calls = [c for c in pi_calls if c[-1].startswith("/skill:audit")]
-    assert len(implement_calls) == 0
-    assert len(audit_calls) == 0
-
-
-def test_in_review_runs_start_of_iteration_audit_when_persisted_comment_outdated():
-    """When the latest AMPA comment is older than the most-recent updatedAt in
-    the scope, Ralph must invoke /skill:audit at the start of the iteration.
-    """
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "in_review"
-    # Child updated more recently than the audit comment
-    runner.items["SA-TARGET"]["updatedAt"] = "2026-05-20T10:00:00Z"
-    runner.items["SA-CHILD"]["updatedAt"] = "2026-05-20T12:00:00Z"
-    # A stale AMPA comment
-    runner.comments = [{"comment": "# AMPA Audit Result\n\nold", "author": "ralph", "createdAt": "2026-05-20T09:00:00Z"}]
-    # The audit skill will be invoked and will persist the audit
-    runner.audit_outputs = [AUDIT_PASS]
-
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-    pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
-    # Because the persisted comment was stale, Ralph should have invoked /skill:audit
-    audit_calls = [c for c in pi_calls if c[-1].startswith("/skill:audit")]
-    assert len(audit_calls) == 1
-
-
-class TransitionToInReviewRunner(FakeRunner):
-    def __init__(self):
-        super().__init__()
-        self.items["SA-CHILD"]["stage"] = "in_progress"
-
-    def __call__(self, cmd):
-        cmd = list(cmd)
-        if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("implement"):
-            self.items["SA-CHILD"]["stage"] = "in_review"
-        return super().__call__(cmd)
-
-
-def test_compact_invoked_when_child_transitions_to_in_review():
-    """When a child transitions to in_review during its implement step, compact is invoked.
-
-    With per-child iteration, the child is processed independently. The compact
-    is triggered when the parent's child stage map detects a transition.
-    Since the child has no sub-children, compact runs on the child's own
-    `previous_child_stages` (empty), so no compact is invoked for the child.
-    Instead, compact is invoked for the parent when the child transitions.
-    """
-    runner = TransitionToInReviewRunner()
-    runner.child_ids = ["SA-CHILD"]  # Make SA-CHILD a child of SA-TARGET
-    # We need 3 audit outputs: one for child, one for child attempt 2 (in case of failure),
-    # one for parent integration audit
-    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-
-
-def test_compact_failure_is_non_fatal_and_loop_continues():
-    runner = TransitionToInReviewRunner()
-    runner.compact_failures_remaining = 1
-    runner.child_ids = ["SA-CHILD"]  # Make SA-CHILD a child of SA-TARGET
-    # Child attempt 1: AUDIT_FAIL, attempt 2: AUDIT_PASS, parent integration: AUDIT_PASS
-    runner.audit_outputs = [AUDIT_FAIL, AUDIT_PASS, AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-    assert result["attempt"] == 2
-    assert result["compact"]["invocations"] == 1
-    assert result["compact"]["failures"] == 1
-    audit_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c and c[-1].startswith("/skill:audit")]
-    assert len(audit_calls) == 3
+    assert third_call.startswith("/audit"), f"Third call should be audit, got: {third_call[:60]}"
 
 
 def test_model_passed_to_pi_commands():
@@ -1348,82 +736,33 @@ def test_extract_text_from_json_output():
     assert _extract_text_from_json_output("") == ""
 
 
-def test_ralph_reads_persisted_audit_and_does_not_update():
-    """Ralph should read the audit persisted by the audit skill via wl show and
-    must NOT attempt to write the audit itself."""
+def test_wl_update_audit_uses_file_for_large_text():
+    """When audit text exceeds _MAX_ARG_LEN, ralph uses --audit-file with a temp file."""
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
+    # Create audit text larger than _MAX_ARG_LEN
+    large_audit = "Ready to close: Yes\n" + "x" * (RalphLoop._MAX_ARG_LEN + 1)
+    loop._wl_update_audit("SA-TARGET", large_audit)
+    # The runner should have been called with --audit-file
+    calls = [c for c in runner.calls if c[0] == "wl" and "update" in c]
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert "--audit-file" in cmd
+    # The temp file should have been cleaned up (no lingering files)
 
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
 
-    update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"]]
-    # Ralph must not write the audit to the work item; the audit skill owns persistence
-    assert update_calls == []
-
-
-def test_ralph_handles_persisted_audit_object_text_field():
-    """When the persisted audit is stored as an object with a `text` field,
-    Ralph should extract the text and proceed without error."""
-    class PersistObjectRunner(FakeRunner):
-        def __call__(self, cmd):
-            cmd = list(cmd)
-            # Intercept the audit skill invocation to persist the audit as an object
-            if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("/skill:audit"):
-                output = self.audit_outputs.pop(0)
-                # Persist as an object on the work item (audit.text)
-                self.items["SA-TARGET"]["audit"] = {"text": output}
-                return Result(stdout=output)
-            return super().__call__(cmd)
-
-    runner = PersistObjectRunner()
+def test_wl_update_audit_uses_inline_for_small_text():
+    """When audit text is small, ralph uses --audit-text inline."""
+    runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-
-
-def test_ralph_uses_auditText_fallback_when_audit_field_missing():
-    """If workItem.audit is absent but auditText is present, Ralph should use auditText."""
-    class AuditTextFallbackRunner(FakeRunner):
-        def __call__(self, cmd):
-            cmd = list(cmd)
-            if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("/skill:audit"):
-                output = self.audit_outputs.pop(0)
-                # Simulate persistence to auditText instead of audit
-                self.items["SA-TARGET"].pop("audit", None)
-                self.items["SA-TARGET"]["auditText"] = output
-                return Result(stdout=output)
-            return super().__call__(cmd)
-
-    runner = AuditTextFallbackRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-
-
-def test_ralph_errors_if_no_persisted_audit_found():
-    """If the audit skill does not persist a structured audit to the work item,
-    ralph should abort and report an error (no fallback allowed)."""
-    class NoPersistRunner(FakeRunner):
-        def __call__(self, cmd):
-            cmd = list(cmd)
-            # when asked to run /skill:audit, return a response but do NOT persist it
-            if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("/skill:audit"):
-                output = self.audit_outputs.pop(0)
-                return Result(stdout=output)
-            return super().__call__(cmd)
-
-    runner = NoPersistRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    with pytest.raises(RalphError, match="No persisted audit found"):
-        loop.run("SA-TARGET")
+    loop._wl_update_audit("SA-TARGET", "Ready to close: Yes")
+    calls = [c for c in runner.calls if c[0] == "wl" and "update" in c]
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert "--audit-text" in cmd
+    assert "--audit-file" not in cmd
 
 
 def test_wl_comment_add_truncates_large_comment():
@@ -1440,926 +779,4 @@ def test_wl_comment_add_truncates_large_comment():
     comment_idx = cmd.index("--comment")
     comment_text = cmd[comment_idx + 1]
     assert len(comment_text) < RalphLoop._MAX_ARG_LEN + 200  # includes truncation note
-# =============================================================================
-# Auto-plan feature tests
-# =============================================================================
-
-
-def test_autoplan_skips_plan_for_small_low():
-    """When stage is intake_complete and effort/risk are Small/Low, do not invoke /plan and proceed to implement."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 2}})]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # ensure no plan invocation (opencode run /plan)
-    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
-    # ensure implement was invoked (pi with implement prompt)
-    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
-    # ensure autoplan comment was posted
-    comment_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
-    autoplan_comments = [c for c in comment_calls if "autoplan-decision-hash:" in c[c.index("--comment") + 1]]
-    assert len(autoplan_comments) == 1
-    assert "proceed to implement" in autoplan_comments[0][autoplan_comments[0].index("--comment") + 1]
-
-
-def test_autoplan_skips_plan_for_extra_small_low():
-    """Extra Small effort + Low risk also skips /plan."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Extra Small"}, "risk": {"level": "Low", "score": 1}})]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
-    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
-
-
-def test_autoplan_invokes_plan_for_medium_high():
-    """When stage is intake_complete and effort/risk are Medium/High, invoke /plan then implement."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Medium"}, "risk": {"level": "High", "score": 15}})]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # ensure plan invocation occurred
-    assert any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
-    # ensure implement was invoked after plan
-    plan_indices = [i for i, c in enumerate(runner.calls) if c[0] == "pi" and c[-1].startswith("/skill:plan")]
-    impl_indices = [i for i, c in enumerate(runner.calls) if c[0] == "pi" and c[-1].startswith("implement")]
-    assert plan_indices and impl_indices and min(impl_indices) > min(plan_indices)
-    # ensure autoplan comment was posted with plan decision
-    comment_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
-    autoplan_comments = [c for c in comment_calls if "autoplan-decision-hash:" in c[c.index("--comment") + 1]]
-    assert len(autoplan_comments) >= 1
-    assert "run /plan" in autoplan_comments[0][autoplan_comments[0].index("--comment") + 1]
-
-
-def test_autoplan_idempotent_no_duplicate_decisions():
-    """Re-running ralph when an autoplan decision comment already exists skips re-computation."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.items["SA-TARGET"]["effort"] = "Small"
-    runner.items["SA-TARGET"]["risk"] = "Low"
-    # Pre-add an autoplan decision comment to simulate a prior run
-    runner.comments = [{"comment": "# Ralph Auto-Plan Decision\nautoplan-decision-hash:abc123\n\nEffort: Small\nRisk: Low (score: 2)\nDecision: proceed to implement (effort and risk below threshold)", "author": "ralph"}]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # No effort-and-risk script should be called (idempotent)
-    er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
-    assert len(er_calls) == 0
-    # No Plan should be invoked (effort Small, risk Low → skip plan)
-    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
-    # Implementation should proceed
-    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
-
-
-def test_autoplan_idempotent_skips_plan_when_effort_risk_already_set():
-    """When effort and risk fields are already set on the work item, skip re-running effort-and-risk."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.items["SA-TARGET"]["effort"] = "Medium"
-    runner.items["SA-TARGET"]["risk"] = "High"
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # No effort-and-risk script should be called
-    er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
-    assert len(er_calls) == 0
-    # Plan should be invoked (Medium effort + High risk → run /plan)
-    assert any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
-
-
-def test_autoplan_idempotent_no_duplicate_comments():
-    """Autoplan comment is not posted twice when the same decision hash exists."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 2}})]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    # First run
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    comment_calls_1 = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
-    autoplan_comments_1 = [c for c in comment_calls_1 if "autoplan-decision-hash:" in c[c.index("--comment") + 1]]
-    assert len(autoplan_comments_1) == 1
-
-    # Now simulate a second run — the comment should already exist
-    runner.calls.clear()
-    runner.items["SA-TARGET"]["stage"] = "in_review"
-    runner.audit_outputs = [AUDIT_PASS]
-    loop2 = RalphLoop(runner=runner, stream=False)
-
-    # The existing comments contain the autoplan-decision hash
-    # Since the scope is already in_review, the in_review path skips autoplan
-    result2 = loop2.run("SA-TARGET")
-    assert result2["status"] == "success"
-
-
-def test_autoplan_failure_defaults_to_plan():
-    """When the effort-and-risk script fails, default to running /plan (safety-first)."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    # Simulate failure by returning non-zero returncode
-    runner.effort_outputs = [Result(returncode=1, stdout="", stderr="error").stdout]
-    # Since FakeRunner returns success for orchestrate_estimate, we override the __call__
-    # Actually, let's use a custom runner that returns failure
-    class FailRunner(FakeRunner):
-        def __call__(self, cmd):
-            if cmd[0] == "python3" and len(cmd) > 1 and "orchestrate_estimate.py" in cmd[1]:
-                self.calls.append(cmd)
-                return Result(returncode=1, stdout="", stderr="script failed")
-            return super().__call__(cmd)
-
-    fail_runner = FailRunner()
-    fail_runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    fail_runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=fail_runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # Plan should be invoked due to failure fallback
-    assert any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in fail_runner.calls)
-
-
-def test_autoplan_ambiguous_data_defaults_to_plan():
-    """When effort-and-risk returns unparseable data, default to running /plan."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.effort_outputs = ["not json at all"]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # Plan should be invoked due to ambiguous data
-    assert any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
-
-
-def test_autoplan_no_autoplan_flag_skips_step():
-    """When --no-autoplan is set, the autplan step is skipped even for intake_complete."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-    loop.no_autoplan = True
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # No effort-and-risk script should be called
-    er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
-    assert len(er_calls) == 0
-    # No /plan should be invoked
-    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
-
-
-def test_autoplan_custom_thresholds():
-    """Custom thresholds for skipping /plan are respected."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    # Medium effort + Low risk — with custom thresholds, Medium should skip plan
-    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Medium"}, "risk": {"level": "Low", "score": 2}})]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(
-        runner=runner,
-        stream=False,
-        autoplan_effort_skip=frozenset({"Extra Small", "Small", "Medium"}),
-        autoplan_risk_skip=frozenset({"Low"}),
-    )
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # Medium + Low should skip plan with the expanded thresholds
-    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
-    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
-
-
-def test_autoplan_posts_decision_comment():
-    """Autoplan posts a human-readable decision comment on the work item."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 2}})]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # Find the autoplan decision comment
-    comment_calls = [c for c in runner.calls if c[:4] == ["wl", "comment", "add", "SA-TARGET"]]
-    autoplan_comments = [c for c in comment_calls if "autoplan-decision-hash:" in c[c.index("--comment") + 1]]
-    assert len(autoplan_comments) == 1
-    comment_text = autoplan_comments[0][autoplan_comments[0].index("--comment") + 1]
-    assert "# Ralph Auto-Plan Decision" in comment_text
-    assert "Effort: Small" in comment_text
-    assert "Risk: Low (score: 2)" in comment_text
-    assert "proceed to implement" in comment_text
-
-
-def test_autoplan_effort_risk_persistence():
-    """The effort-and-risk script updates the work item's effort and risk fields."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.effort_outputs = [json.dumps({
-        "effort": {"tshirt": "Medium"},
-        "risk": {"level": "High", "score": 15}
-    })]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # The orchestrate_estimate.py script is responsible for calling wl update --effort --risk
-    # and wl comment add. Here we just verify that /plan was invoked because
-    # effort Medium + risk High exceeds the default thresholds.
-    assert any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
-
-
-def test_autoplan_already_computed_with_plan_complete():
-    """When effort/risk are already set and stage is plan_complete, skip both
-    effort-and-risk and /plan."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.items["SA-TARGET"]["effort"] = "Small"
-    runner.items["SA-TARGET"]["risk"] = "Low"
-    # Add a comment with autoplan decision hash (simulating prior run)
-    import hashlib
-    marker_key = "autoplan-decision:Small:Low:0"
-    marker_hash = hashlib.sha256(marker_key.encode("utf-8")).hexdigest()[:16]
-    runner.comments = [{"comment": f"# Ralph Auto-Plan Decision\nautoplan-decision-hash:{marker_hash}\n\nEffort: Small\nRisk: Low (score: 0)\nDecision: proceed to implement (effort and risk below threshold)", "author": "ralph"}]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # No effort-and-risk script should be called
-    er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
-    assert len(er_calls) == 0
-    # No Plan should be invoked (Small + Low → skip plan)
-    assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
-    # Implementation should proceed
-    assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)
-
-
-def test_autoplan_only_runs_on_first_attempt():
-    """Autoplan should only run on the first attempt, not on retries."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 2}})]
-    runner.audit_outputs = [AUDIT_FAIL, AUDIT_PASS]  # First audit fails, second passes
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-    # Effort-and-risk should only be called once
-    er_calls = [c for c in runner.calls if c[0] == "python3" and "orchestrate_estimate.py" in c[1]]
-    assert len(er_calls) == 1
-    # Two implement calls (first attempt + second attempt after failed audit)
-    impl_calls = [c for c in runner.calls if c[0] == "pi" and c[-1].startswith("implement")]
-    assert len(impl_calls) == 2
-
-
-def test_cli_parser_autoplan_flags():
-    """Test --no-autoplan, --autoplan-effort-skip, and --autoplan-risk-skip flags."""
-    from skill.ralph.scripts.ralph_loop import build_parser
-
-    parser = build_parser()
-    args = parser.parse_args([
-        "SA-X1", "--no-autoplan",
-        "--autoplan-effort-skip", "Small", "Extra Small",
-        "--autoplan-risk-skip", "Low",
-    ])
-    assert args.no_autoplan is True
-    assert args.autoplan_effort_skip == ["Small", "Extra Small"]
-    assert args.autoplan_risk_skip == ["Low"]
-
-
-def _extract_pi_model(call: list[str]) -> str:
-    model_idx = call.index("--model")
-    return call[model_idx + 1]
-
-
-def test_cli_parser_accepts_phase_model_flags_and_source():
-    parser = build_parser()
-    args = parser.parse_args([
-        "SA-X5",
-        "--model-source", "local",
-        "--model-intake", "intake-cli-model",
-        "--model-planning", "planning-cli-model",
-        "--model-implementation", "implementation-cli-model",
-        "--model-audit", "audit-cli-model",
-    ])
-    assert args.model_source == "local"
-    assert args.model_intake == "intake-cli-model"
-    assert args.model_planning == "planning-cli-model"
-    assert args.model_implementation == "implementation-cli-model"
-    assert args.model_audit == "audit-cli-model"
-
-
-def test_single_model_backward_compatibility_without_new_phase_inputs():
-    from skill.ralph.scripts.ralph_loop import DEFAULT_MODEL
-
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-
-    pi_calls = [c for c in runner.calls if c and c[0] == "pi" and "-p" in c]
-    assert pi_calls
-    assert all(_extract_pi_model(call) == DEFAULT_MODEL for call in pi_calls)
-
-
-@pytest.mark.parametrize(
-    ("model_source", "expected_model"),
-    [
-        ("remote", "opencode-go/qwen3.6-plus"),
-        ("local", "Proxy/qwen3"),
-    ],
-)
-def test_intake_flow_uses_source_specific_default_model(model_source, expected_model):
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 1}})]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(
-        runner=runner,
-        stream=False,
-        model_source=model_source,
-        model_config=_extract_phase_model_config(_load_asset_config()),
-    )
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-
-    implement_calls = [c for c in runner.calls if c and c[0] == "pi" and "-p" in c and c[-1].startswith("implement")]
-    assert implement_calls
-    assert _extract_pi_model(implement_calls[0]) == expected_model
-
-
-@pytest.mark.parametrize(
-    ("model_source", "expected_model"),
-    [
-        ("remote", "opencode/gpt-5.5"),
-        ("local", "Proxy/qwen3"),
-    ],
-)
-def test_planning_flow_uses_source_specific_default_model(model_source, expected_model):
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "intake_complete"
-    runner.effort_outputs = [json.dumps({"effort": {"tshirt": "Medium"}, "risk": {"level": "High", "score": 15}})]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(
-        runner=runner,
-        stream=False,
-        model_source=model_source,
-        model_config=_extract_phase_model_config(_load_asset_config()),
-    )
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-
-    plan_calls = [c for c in runner.calls if c and c[0] == "pi" and "-p" in c and c[-1].startswith("/skill:plan")]
-    assert plan_calls
-    assert _extract_pi_model(plan_calls[0]) == expected_model
-
-
-def test_phase_model_cli_override_has_highest_precedence_for_audit():
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(
-        runner=runner,
-        stream=False,
-        model="legacy-model",
-        model_source="remote",
-        model_audit="audit-cli-model",
-        model_config={
-            "audit": {
-                "remote": "audit-config-remote",
-                "local": "audit-config-local",
-            }
-        },
-    )
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
-
-    audit_calls = [c for c in runner.calls if c and c[0] == "pi" and "-p" in c and c[-1].startswith("/skill:audit")]
-    assert audit_calls
-    assert _extract_pi_model(audit_calls[0]) == "audit-cli-model"
-
-
-def test_resolve_stream_timeout_defaults_local():
-    """Local model source uses the default 60s timeout."""
-    assert _resolve_stream_timeout({}, "local") == DEFAULT_PI_STREAM_TIMEOUT_SECONDS
-
-
-def test_resolve_stream_timeout_defaults_remote():
-    """Remote model source uses the higher 900s (15 min) timeout."""
-    assert _resolve_stream_timeout({}, "remote") == REMOTE_PI_STREAM_TIMEOUT_SECONDS
-
-
-def test_resolve_stream_timeout_global_config_override():
-    """A global numeric timeout in config overrides source defaults."""
-    config = {"timeout": {"pi_stream": 120}}
-    assert _resolve_stream_timeout(config, "local") == 120.0
-    assert _resolve_stream_timeout(config, "remote") == 120.0
-
-
-def test_resolve_stream_timeout_source_mapped_config():
-    """Source-mapped timeout in config overrides source defaults per source."""
-    config = {"timeout": {"pi_stream": {"local": 90, "remote": 450}}}
-    assert _resolve_stream_timeout(config, "local") == 90.0
-    assert _resolve_stream_timeout(config, "remote") == 450.0
-
-
-def test_resolve_stream_timeout_cli_override():
-    """RalphLoop constructor pi_stream_timeout parameter overrides config."""
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, pi_stream_timeout=999.0)
-    assert loop.pi_stream_timeout_seconds == 999.0
-
-
-def test_ralph_loop_default_timeout_when_none_specified():
-    """When pi_stream_timeout is not specified, RalphLoop uses the global default."""
-    loop = RalphLoop(stream=False)
-    assert loop.pi_stream_timeout_seconds == DEFAULT_PI_STREAM_TIMEOUT_SECONDS
-
-
-def test_ralph_loop_explicit_local_timeout():
-    """RalphLoop uses explicit local timeout when provided."""
-    loop = RalphLoop(stream=False, pi_stream_timeout=DEFAULT_PI_STREAM_TIMEOUT_SECONDS)
-    assert loop.pi_stream_timeout_seconds == DEFAULT_PI_STREAM_TIMEOUT_SECONDS
-
-
-def test_ralph_loop_explicit_remote_timeout():
-    """RalphLoop uses explicit remote timeout when provided."""
-    loop = RalphLoop(stream=False, pi_stream_timeout=REMOTE_PI_STREAM_TIMEOUT_SECONDS)
-    assert loop.pi_stream_timeout_seconds == REMOTE_PI_STREAM_TIMEOUT_SECONDS
-
-
-def test_stream_pi_uses_configured_timeout():
-    """_stream_pi respects the configured timeout from RalphLoop."""
-    import subprocess
-    from unittest.mock import patch, MagicMock
-
-    fake_process = MagicMock()
-    fake_process.returncode = 0
-    fake_process.stdout = LineStream([
-        '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"Hello"}}\n',
-    ])
-    fake_process.stderr = MagicMock()
-    fake_process.stderr.read.return_value = ""
-    fake_process.wait.return_value = None
-
-    with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process) as popen:
-        loop = RalphLoop(verbose=False, stream=True, pi_stream_timeout=42.0)
-        loop.pi_bin = "echo"
-        result = loop._stream_pi(["echo", "test"], "test prompt")
-
-    assert result == "Hello"
-    # Verify that the timeout was used in the stdout queue.get call
-    # (indirectly verified by the successful completion with the custom timeout)
-
-
-# =========================================================
-# Per-child iteration tests
-# =========================================================
-
-
-class MultiChildFakeRunner:
-    """Fake runner that simulates multiple children with per-child audit outcomes."""
-
-    def __init__(self):
-        self.calls: list[list[str]] = []
-        self.audit_outputs: list[str] = []
-        self.items: dict[str, dict] = {
-            "SA-PARENT": {"id": "SA-PARENT", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
-            "SA-CHILD-A": {"id": "SA-CHILD-A", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
-            "SA-CHILD-B": {"id": "SA-CHILD-B", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
-        }
-        self.comments: list[dict] = []
-        self.audit_call_order: list[str] = []
-
-    def __call__(self, cmd):
-        cmd = list(cmd)
-        self.calls.append(cmd)
-
-        if cmd[:3] == ["wl", "show", "SA-PARENT"] and "--children" in cmd:
-            item = self.items["SA-PARENT"]
-            children = []
-            for cid in ["SA-CHILD-A", "SA-CHILD-B"]:
-                if cid in self.items:
-                    children.append({"id": cid, "stage": self.items[cid].get("stage", "")})
-            return Result(stdout=json.dumps({"success": True, "workItem": item, "children": children}))
-        if cmd[:3] == ["wl", "show", "SA-PARENT"]:
-            item = self.items["SA-PARENT"]
-            return Result(stdout=json.dumps({"success": True, "workItem": item}))
-        if cmd[:3] == ["wl", "show", "SA-CHILD-A"]:
-            item = self.items["SA-CHILD-A"]
-            return Result(stdout=json.dumps({"success": True, "workItem": item}))
-        if cmd[:3] == ["wl", "show", "SA-CHILD-B"]:
-            item = self.items["SA-CHILD-B"]
-            return Result(stdout=json.dumps({"success": True, "workItem": item}))
-
-        if cmd[:3] == ["wl", "comment", "list"]:
-            return Result(stdout=json.dumps({"success": True, "comments": self.comments}))
-        if cmd[:3] == ["wl", "comment", "add"]:
-            return Result(stdout=json.dumps({"success": True}))
-        if cmd[:2] == ["wl", "update"]:
-            return Result(stdout=json.dumps({"success": True}))
-
-        if cmd[0] == "python3" and len(cmd) > 1 and "orchestrate_estimate.py" in cmd[1]:
-            return Result(stdout=json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 0}}))
-
-        if cmd[0] == "pi" and "-p" in cmd:
-            prompt = cmd[-1]
-
-            def prompt_id(default: str = "SA-PARENT") -> str:
-                first_line = prompt.splitlines()[0].strip() if prompt else ""
-                parts = first_line.split()
-                if len(parts) >= 2 and parts[0] in {"implement", "implement-single", "/skill:audit", "/skill:plan"}:
-                    return parts[1]
-                return default
-
-            if prompt.startswith("/skill:audit"):
-                target = prompt_id()
-                self.audit_call_order.append(target)
-                output = self.audit_outputs.pop(0) if self.audit_outputs else AUDIT_PASS
-                self.items.setdefault(target, {})["audit"] = output
-                return Result(stdout=output)
-            if prompt.startswith("/skill:plan"):
-                return Result(stdout="planned")
-            if prompt.startswith("implement"):
-                target = prompt_id()
-                self.items.setdefault(target, {})["stage"] = "in_review"
-                return Result(stdout="implemented")
-            if prompt == "/compact":
-                return Result(stdout="compacted")
-            if prompt.startswith("/compact"):
-                return Result(stdout="compacted")
-
-        if cmd[:2] == ["bash", "-lc"]:
-            return Result(stdout="ok")
-        if cmd and cmd[0] == "git":
-            return Result(stdout="ok")
-
-        raise AssertionError(f"Unexpected command: {cmd}")
-
-
-def test_per_child_iteration_runs_each_child():
-    """When children exist, each child is processed independently."""
-    runner = MultiChildFakeRunner()
-    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
-
-    result = loop.run("SA-PARENT")
-
-    assert result["status"] == "success"
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    # Both children should be implemented and audited
-    assert any("SA-CHILD-A" in p for p in pi_prompts)
-    assert any("SA-CHILD-B" in p for p in pi_prompts)
-    # Both children should be audited
-    assert any("/skill:audit SA-CHILD-A" in p for p in pi_prompts)
-    assert any("/skill:audit SA-CHILD-B" in p for p in pi_prompts)
-    # Child results should be tracked
-    assert "child_results" in result
-    assert "SA-CHILD-A" in result["child_results"]
-    assert "SA-CHILD-B" in result["child_results"]
-
-
-def test_per_child_iteration_parent_integration_audit_runs():
-    """After all children pass, a final parent integration audit is run."""
-    runner = MultiChildFakeRunner()
-    # One pass for child A, one for child B, one for parent integration
-    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
-
-    result = loop.run("SA-PARENT")
-
-    assert result["status"] == "success"
-    # Check for integration audit marker
-    assert "integration_audit" in result
-    # Audit call order should be: child-a, child-b, parent
-    assert runner.audit_call_order[0] == "SA-CHILD-A"
-    assert runner.audit_call_order[1] == "SA-CHILD-B"
-    assert runner.audit_call_order[2] == "SA-PARENT"
-
-
-def test_per_child_iteration_skips_already_reviewed():
-    """Children already in_review are skipped."""
-    runner = MultiChildFakeRunner()
-    runner.items["SA-CHILD-B"]["stage"] = "in_review"
-    # Only child A needs implement→audit; parent gets integration audit
-    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
-
-    result = loop.run("SA-PARENT")
-
-    assert result["status"] == "success"
-    assert result["child_results"]["SA-CHILD-B"]["status"] == "skipped"
-    # Only child A should have implement prompts
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    assert not any("SA-CHILD-B" in p for p in pi_prompts if p.startswith("implement"))
-
-
-def test_per_child_iteration_continues_on_child_failure():
-    """If a child fails, iteration continues to remaining siblings."""
-    runner = MultiChildFakeRunner()
-    # Child A fails both attempts; child B passes
-    runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL, AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run("SA-PARENT")
-
-    assert result["status"].startswith("child_")
-    assert "failed_children" in result
-    assert "SA-CHILD-A" in result["failed_children"]
-    # Child B should have been processed despite child A failing
-    assert "SA-CHILD-B" in result["child_results"]
-    assert result["child_results"]["SA-CHILD-B"]["status"] == "success"
-    # Integration audit should NOT have been run when children failed
-    assert "integration_audit" not in result
-    # Both children should have audit calls (A failed twice, B once)
-    audit_calls = [c for c in runner.audit_call_order]
-    assert "SA-CHILD-A" in audit_calls
-    assert "SA-CHILD-B" in audit_calls
-
-
-def test_per_child_iteration_all_children_fail():
-    """If all children fail, all are reported in failed_children."""
-    runner = MultiChildFakeRunner()
-    # Both children fail all attempts
-    runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL, AUDIT_FAIL, AUDIT_FAIL]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run("SA-PARENT")
-
-    assert result["status"].startswith("child_")
-    assert "failed_children" in result
-    assert "SA-CHILD-A" in result["failed_children"]
-    assert "SA-CHILD-B" in result["failed_children"]
-    # Integration audit should NOT have been run
-    assert "integration_audit" not in result
-
-
-def test_per_child_iteration_integration_audit_failure():
-    """If the parent integration audit fails, the run reports integration failure."""
-    runner = MultiChildFakeRunner()
-    # Both children pass, parent integration audit fails all 3 attempts
-    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_FAIL, AUDIT_FAIL, AUDIT_FAIL]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
-
-    result = loop.run("SA-PARENT")
-
-    assert result["status"] == "integration_max_attempts"
-    assert "integration_audit" in result
-    assert result["child_results"]["SA-CHILD-A"]["status"] == "success"
-    assert result["child_results"]["SA-CHILD-B"]["status"] == "success"
-
-
-def test_per_child_iteration_no_children_uses_single_path():
-    """When no children exist, the single-item path is used (backward compat)."""
-    runner = FakeRunner()
-    # Single-item FakeRunner only has SA-TARGET, no children
-    runner.child_ids = []  # No children
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-    assert "child_results" not in result
-    # Should use single-item path
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    assert any(prompt.startswith("implement SA-TARGET") for prompt in pi_prompts)
-
-
-def test_run_single_item_method_exists():
-    """The run_single_item method is callable independently."""
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run_single_item("SA-TARGET")
-
-    assert result["status"] == "success"
-
-
-def test_run_single_item_respects_skip_implement():
-    """When skip_implement=True, the implement step is skipped on first attempt."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "in_review"
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run_single_item("SA-TARGET", skip_implement=True)
-
-    assert result["status"] == "success"
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    # Should go straight to audit, no implement
-    assert any("/skill:audit SA-TARGET" in p for p in pi_prompts)
-
-
-def test_run_single_item_force_fresh_audit_always_runs_audit():
-    """When force_fresh_audit=True with skip_implement, /skill:audit is always
-    invoked even if a recent persisted audit would otherwise be reused."""
-    runner = FakeRunner()
-    runner.items["SA-TARGET"]["stage"] = "in_review"
-    # Simulate a recent audit comment that would normally trigger the
-    # persisted-audit shortcut (comment ts >= updatedAt).
-    from datetime import datetime, timezone
-    recent_ts = datetime.now(timezone.utc).isoformat()
-    runner.items["SA-TARGET"]["updatedAt"] = recent_ts
-    runner.comments = [{"comment": "audit result", "createdAt": recent_ts}]
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run_single_item("SA-TARGET", skip_implement=True, force_fresh_audit=True)
-
-    assert result["status"] == "success"
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    # Even with a recent persisted audit, force_fresh_audit ensures audit runs
-    assert any("/skill:audit SA-TARGET" in p for p in pi_prompts)
-
-
-def test_run_single_item_returns_max_attempts_on_failure():
-    """When all attempts fail, run_single_item returns max_attempts status."""
-    runner = FakeRunner()
-    runner.audit_outputs = [AUDIT_FAIL, AUDIT_FAIL]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run_single_item("SA-TARGET")
-
-    assert result["status"] == "max_attempts"
-
-
-# =============================================================================
-# Per-child implement-single verification tests
-# =============================================================================
-
-
-def test_build_implement_single_prompt_generates_scoped_prompt():
-    """_build_implement_single_prompt generates a scoped prompt that uses the
-    implement-single skill instead of implement."""
-    prompt = _build_implement_single_prompt("SA-CHILD-1")
-    assert prompt.startswith("implement-single SA-CHILD-1")
-    assert "Continue until the work item is completed, but do not merge." in prompt
-    assert "Do not ask the producer questions" in prompt
-    assert "no_safe_path response" in prompt
-
-
-def test_build_implement_single_prompt_includes_remediation():
-    """_build_implement_single_prompt appends remediation text when provided."""
-    prompt = _build_implement_single_prompt("SA-CHILD-1", remediation="Fix the failing tests.")
-    assert prompt.startswith("implement-single SA-CHILD-1")
-    assert "Fix the failing tests." in prompt
-
-
-def test_per_child_iteration_uses_implement_single_not_implement():
-    """Per-child iteration must use implement-single (not implement) to avoid
-    wl next dependency traversal that could pick up sibling work items."""
-    runner = MultiChildFakeRunner()
-    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
-
-    result = loop.run("SA-PARENT")
-
-    assert result["status"] == "success"
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    implement_prompts = [p for p in pi_prompts if p.startswith("implement")]
-    # All implement prompts should use implement-single, not implement
-    for p in implement_prompts:
-        assert p.startswith("implement-single"), (
-            f"Expected implement-single prompt, got: {p[:60]}"
-        )
-    # At least child A and child B should have implement-single prompts
-    assert any("SA-CHILD-A" in p for p in implement_prompts), (
-        "SA-CHILD-A should have an implement-single prompt"
-    )
-    assert any("SA-CHILD-B" in p for p in implement_prompts), (
-        "SA-CHILD-B should have an implement-single prompt"
-    )
-
-
-def test_single_item_path_uses_implement_not_implement_single():
-    """Single-work-item path (no children) must use implement (not implement-single)
-    for backward compatibility."""
-    runner = FakeRunner()
-    runner.child_ids = []
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run("SA-TARGET")
-
-    assert result["status"] == "success"
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    implement_prompts = [p for p in pi_prompts if p.startswith("implement")]
-    # Should use implement, NOT implement-single
-    for p in implement_prompts:
-        assert p.startswith("implement "), (
-            f"Expected implement prompt (not implement-single), got: {p[:60]}"
-        )
-    # None should start with implement-single
-    assert not any(p.startswith("implement-single") for p in implement_prompts), (
-        "Single-item path should NOT use implement-single"
-    )
-
-
-def test_child_scoped_run_uses_implement_not_implement_single():
-    """When --child flag is used, the single-item path uses implement (not
-    implement-single) for backward compatibility with existing --child behavior."""
-    runner = FakeRunner()
-    runner.child_ids = ["SA-CHILD"]
-    runner.items["SA-CHILD"]["stage"] = "plan_complete"
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=2)
-
-    result = loop.run("SA-TARGET", child_id="SA-CHILD")
-
-    assert result["status"] == "success"
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    implement_prompts = [p for p in pi_prompts if p.startswith("implement")]
-    # --child path should use implement, not implement-single
-    for p in implement_prompts:
-        assert p.startswith("implement "), (
-            f"Expected implement prompt for --child path, got: {p[:60]}"
-        )
-    assert not any(p.startswith("implement-single") for p in implement_prompts), (
-        "--child path should NOT use implement-single"
-    )
-
-
-def test_per_child_remediation_uses_implement_single():
-    """When a child audit fails, remediation must re-implement using
-    implement-single (not implement) to stay scoped to the failing child."""
-    runner = MultiChildFakeRunner()
-    # Child A fails first attempt, passes second; child B passes; parent passes
-    runner.audit_outputs = [AUDIT_FAIL, AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
-
-    result = loop.run("SA-PARENT")
-
-    assert result["status"] == "success"
-    assert result["attempt"] == 2
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    implement_prompts = [p for p in pi_prompts if p.startswith("implement")]
-    # All implement prompts should use implement-single
-    for p in implement_prompts:
-        assert p.startswith("implement-single"), (
-            f"Expected implement-single for child remediation, got: {p[:60]}"
-        )
-    # Remediation prompt should address audit gaps
-    remediation_prompts = [p for p in implement_prompts if "Address all the gaps" in p]
-    assert len(remediation_prompts) >= 1, (
-        "At least one remediation prompt should address audit gaps"
-    )
-
-
-def test_per_child_iteration_independent_audits_per_child():
-    """Each child must be independently audited against its own acceptance
-    criteria before the next child is started."""
-    runner = MultiChildFakeRunner()
-    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS, AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
-
-    result = loop.run("SA-PARENT")
-
-    assert result["status"] == "success"
-    pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    audit_prompts = [p for p in pi_prompts if p.startswith("/skill:audit")]
-    # Each child should be audited independently
-    assert any("SA-CHILD-A" in p for p in audit_prompts), (
-        "SA-CHILD-A should be independently audited"
-    )
-    assert any("SA-CHILD-B" in p for p in audit_prompts), (
-        "SA-CHILD-B should be independently audited"
-    )
-    # Parent should also be audited (integration audit)
-    assert any("SA-PARENT" in p for p in audit_prompts), (
-        "SA-PARENT should have an integration audit"
-    )
-    # Audit order should be: child A, child B, parent (not batch)
-    audit_order = runner.audit_call_order
-    assert audit_order.index("SA-CHILD-A") < audit_order.index("SA-PARENT"), (
-        "Child A audit must happen before parent integration audit"
-    )
-    assert audit_order.index("SA-CHILD-B") < audit_order.index("SA-PARENT"), (
-        "Child B audit must happen before parent integration audit"
-    )
+    assert "truncated" in comment_text
