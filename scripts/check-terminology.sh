@@ -110,7 +110,13 @@ echo ""
 
 # Gather all matches (line numbers + content)
 MATCHES_FILE=$(mktemp)
-rg -n --hidden --glob '!.git/**' --glob '!package-lock.json' -i 'opencode' . > "$MATCHES_FILE" 2>/dev/null || true
+# Prefer ripgrep (rg) for speed and hidden file support; fall back to grep
+if command -v rg >/dev/null 2>&1; then
+  rg -n --hidden --glob '!.git/**' --glob '!package-lock.json' -i 'opencode' . > "$MATCHES_FILE" 2>/dev/null || true
+else
+  # Grep fallback that mirrors the intent of the rg invocation
+  grep -Rni --exclude-dir=.git --exclude=package-lock.json -e 'opencode' . > "$MATCHES_FILE" 2>/dev/null || true
+fi
 
 TOTAL=$(wc -l < "$MATCHES_FILE")
 echo "Total raw matches: $TOTAL"
