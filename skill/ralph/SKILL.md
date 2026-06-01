@@ -64,16 +64,17 @@ Ralph supports phase-specific model selection for `intake`, `planning`, `impleme
 ```bash
 # Launch a background Ralph run from the skill installation.
 # The wrapper handles nohup plus PID/start-time capture for status reporting.
-/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --json
+# Preferred (skill-relative):
+skill/ralph/ralph <work-item-id> --json
 
 # Inspect the current background run (no work item id required):
-/home/rgardler/.pi/agent/skills/ralph/ralph status --json
+skill/ralph/ralph status --json
 
 # If you need to run the foreground loop directly for debugging:
-# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> --json
+# python3 skill/ralph/scripts/ralph_loop.py <work-item-id> --json
 #
 # To focus on a single direct child while keeping the parent for context:
-# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
+# python3 skill/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
 
 # If your skills are installed at a different location (for example a
 # project-level skills directory), run the script using the full path to
