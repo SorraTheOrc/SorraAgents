@@ -7,79 +7,24 @@ description: "Provide concise project / work item status and run Worklog helpers
 
 ## Overview
 
-Provide a concise, human-friendly summary of project status or a specific work item. When no work item id is provided, run `wl` CLI tool to summarize recent work and current work in progress.
+Provide a concise, human-friendly summary of project status or a specific work item. This skill exposes a canonical runner for automated use and a structured markdown report format consumed by orchestrators such as Ralph.
 
 ## When To Use
 
 - User asks general project status (e.g., "What is the current status?", "Status of the project?", "status", "audit the project", "audit").
 - User asks about a specific work item id (e.g., "What is the status of wl-123?", "status wl-123", "audit wl-123").
 
-## Best Practices
+## Safety and prompt design
 
-- Output should be formatted as markdown for readability.
-- When summarizing work items, focus on actionable information: current status, blockers, dependencies.
-- When a work item id is provided, ensure to include all relevant details and related work items including dependencies (`wl dep list <work-item-id> --json`) and subtasks (`wl show <work-item-id> --json`) in the summary.
-- Always conclude with a clear summary of the status.
-  - For individual work items, the last line of the summary should be a clear statement about whether the work item can be closed or not.
-- Do not recommend next steps or actions; this skill focuses on reporting only.
+- All automated invocations MUST be read-only. Use the designation `[READ-ONLY AUDIT]` in Pi prompts to make this explicit.
+- Do NOT close, modify, create, or delete any work items during an audit. Example phrasing: "Do NOT close, modify, create, or delete any work items.".
+- Do NOT execute any `wl`, `git`, or other state-modifying commands from the model. Do NOT run `wl` commands that change state. If asked to run such commands, refuse and report the request.
+- The model should return a structured markdown report only; if ambiguity is detected, return immediately and do not attempt to persist any audit.
+- To aid debugging, the canonical runner supports a `--debug-log` flag which appends raw Pi output to a JSONL file (see Scripts section).
 
-## Steps
+## Structured report (canonical)
 
-> ⚠️ **CRITICAL RULE:** The audit is NOT recorded until you execute `wl update <id> --audit-text` and confirm success. Never claim the audit was persisted without running this command first. This is the most common failure mode in the audit skill.
-
-1. Detect whether the user provided a work item id in the request.
-
-2. If no work item id is provided complete this step, otherwise skip to step 3:
-
-- Run `wl list --json` to fetch work items in JSON format to get more information, but do not display it.
-- Present a one line summary of the overall project status based on the JSON data. Including:
-  - Total number of critical and high priority work items.
-  - Total number of open work items.
-  - Total number of in_progress work items.
-  - Total number of blocked work items.
-- Present a summary of actively in_progress work items (`wl in-progress --json`). For each in_progress item, include: title, id, assignee, priority, and a one line summary of the description.
-
-Skip to step 6.
-
-3. If a work item id is provided:
-
-- Run `wl show <work-item-id> --children --json` to fetch work item details (with all comments and children).
-- Extract the acceptance criteria from the description (they are usually in a markdown section starting with `## Acceptance Criteria` or `### Acceptance Criteria` and formatted as a numbered or bulleted list).
-  - If no acceptance criteria section is found, note: "No acceptance criteria defined."
-- Note: "Acceptance Criteria" and "Success Criteria" are synonyms. Look for either `## Acceptance Criteria` or `## Success Criteria` (synonym: Acceptance Criteria) as the section heading.
-- Walk through all dependencies (`wl dep list <work-item-id> --json`) and list each dependent work-item's status, title (using strike through if the item has a "completed" status), id, and stage.
-
-4. **Deep code review of acceptance criteria (parent work item):**
-
-For each acceptance criterion found in step 3, perform a thorough code review:
-- Read the actual implementation files referenced in the work item description, comments, or discoverable from the codebase.
-- Assess correctness: does the code implement what the criterion requires?
-- Assess completeness: are edge cases handled? Are there missing branches or error paths?
-- Check for test coverage: are there tests that validate this criterion?
-- Assign a verdict to each criterion:
-  - `met` — the criterion is fully satisfied by the implementation
-  - `unmet` — the criterion is not satisfied or the implementation is missing
-  - `partial` — the criterion is partially satisfied but incomplete
-- For each verdict, provide a one-line evidence note referencing the relevant file and line number (e.g., `src/handler.ts:42 — rate limiter middleware correctly intercepts requests`).
-- Do NOT rely solely on work item descriptions and comments. You MUST read the actual code to verify.
-
-5. **Deep code review of children's acceptance criteria:**
-
-For each direct child work item (do NOT recurse into grandchildren):
-- If the Status/Stage of the child is completed/done, mark the child as "met" without review.
-- If the child item is marked as deleted ignore the item.
-- For all other child items:
-  - Run `wl show <child-id> --json` to fetch the child's details.
-  - Extract the child's acceptance criteria from its description.
-    - If no acceptance criteria section is found, note: "No acceptance criteria defined."
-  - Perform the same deep code review as described in step 4 for each of the child's acceptance criteria.
-  - Assign per-criterion verdicts (`met`/`unmet`/`partial`) with file:line evidence.
-
-6. **Produce the structured audit report:**
-
-Produce the structured audit report content only. The report MUST follow this exact structure. IMPORTANT: the very first character of the report MUST be the "R" of `Ready to close:` — there must be no backticks, code fences, or any other characters or text before the first line.
-
-> **Note for ralph orchestrator users:** Ralph sanitises audit output before persisting it. If a preamble (introductory text) appears before the `Ready to close:` header, ralph strips it automatically so that only the structured block is persisted. However, the audit skill itself should produce output that starts directly with `Ready to close:` to avoid ambiguity.
+The audit report MUST be a structured markdown block that begins with the exact header `Ready to close:` on the first line. Downstream orchestrators parse this block; do not include any prefix text before it.
 
 Ready to close: Yes/No
 
@@ -92,7 +37,6 @@ Ready to close: Yes/No
 | # | Criterion | Verdict | Evidence |
 |---|-----------|---------|----------|
 | 1 | <criterion text> | met/unmet/partial | <file_path:line_number — one-line note> |
-| 2 | ... | ... | ... |
 
 <If no acceptance criteria were found, write: "No acceptance criteria defined.">
 
@@ -104,76 +48,63 @@ Ready to close: Yes/No
 |---|-----------|---------|----------|
 | 1 | <criterion text> | met/unmet/partial | <file_path:line_number — one-line note> |
 
-<Repeat for each direct child. If a child has no acceptance criteria, write: "No acceptance criteria defined.">
 <If there are no children, write: "No children.">
 
 ## Success Criteria
 
 "Success Criteria" is a synonym for "Acceptance Criteria". Both terms are treated equivalently in audit reports. Use **Acceptance Criteria** as the canonical heading; document **Success Criteria** as an accepted synonym where relevant.
 
--CRITICAL rules for the structured report:
-- The first line must be `Ready to close: Yes` or `Ready to close: No` based on whether all acceptance criteria (parent and children) are met.
-- Do NOT include wrapper or surrounding markers in the text passed to `wl update --audit-text`. The audit handlers expect the report content only; including markers (any of the forms shown above or similar) will cause the CLI/handler to reject the audit.
-- Keep the report concise despite the deep analysis. Each evidence note should be ONE line.
-- For project-level audits (no work item id), omit the `## Acceptance Criteria Status` and `## Children Status` sections. Include only `## Summary` and `## Recommendation`.
-- Review only direct children, never grandchildren. If there are many children (>10), note in the report that only the first 10 were reviewed and the rest were omitted for brevity.
+## Exit Codes
 
-7. **PERSIST THE AUDIT BEFORE ANY USER OUTPUT (CRITICAL GATE):**
+- 0 – success (report printed to stdout)
+- 1 – Worklog / CLI / Pi failure
+- 2 – argument error
 
-   > ⚠️ **DO NOT PROCEED TO STEP 8 UNTIL THIS STEP COMPLETES SUCCESSFULLY**
-   >
-   > This is the most common failure point in the audit skill. The audit is NOT recorded until this command executes successfully.
-   >
-   > **HISTORICAL NOTE:** Agents frequently skip this step and incorrectly claim "This audit has been recorded in the system" without running the persistence command. This is a critical error.
+## Scripts (canonical runner & persister)
 
-   - **REQUIRED:** Run the persistence command and wait for successful completion:
-     ```bash
-     wl update <work-item-id> --audit-text "<complete-report-content>" --json
-     ```
-   - **VERIFY:** Confirm the command returned `{"success": true}` with an `audit` object in the response.
-   - **IF IT FAILS:** Do NOT claim the audit was recorded. Report the error explicitly and offer to retry. Example: "Audit persistence failed: <error>. Would you like me to retry?"
-   - **IF IT SUCCEEDS:** Only then proceed to step 8.
+The audit skill ships a small, canonical runner and a persister. Use these from CI, local automation, or orchestrators.
 
-8. **OUTPUT THE REPORT TO THE USER:**
+- Runner: `skill/audit/scripts/audit_runner.py`
+  - Usage: `python3 skill/audit/scripts/audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--debug-log <file>]`
+  - Usage: `python3 skill/audit/scripts/audit_runner.py project [--pi-bin pi] [--model <name>] [--debug-log <file>]`
+  - Flags:
+    - `--do-not-persist` — do not run persistence (useful for dry runs)
+    - `--pi-bin` — path to the `pi` binary
+    - `--model` — Pi model name
+    - `--debug-log` — append Pi debug output to a JSONL file (helpful for triage)
 
-   > ✅ **ONLY REACH THIS STEP IF STEP 7 RETURNED SUCCESS**
-
-   - Output the structured report content to the user in markdown format.
-   - **REQUIRED CONFIRMATION LINE:** After the structured report, include exactly this line:
-     ```
-     This audit has been recorded in the system.
-     ```
-   - **DO NOT output this confirmation line unless step 7 succeeded.** If persistence failed or was skipped, omit this line and report the actual status (e.g., "Audit NOT recorded — persistence command failed").
-   - If any acceptance criteria were unmet or partially met, include a final note: "Note: Some acceptance criteria were not fully met. Please review the evidence for details." and offer to address the gaps in the audit if the user wants to follow up.
-
-## Notes
-
-- Keep the output concise and actionable for quick human consumption.
-- Handle errors gracefully: if `wl` or any other command is not available or return invalid JSON, present a helpful error and possible remediation steps.
-- The depth of code review is critical: read implementation files, check function signatures, verify test coverage, and assess edge cases. Do not just check that files exist.
-
-## Scripts
-
-The audit skill provides a small helper script to persist the structured audit report to Worklog using the `wl` CLI:
-
-- Path: `skill/audit/scripts/persist_audit.py`
-- Usage:
-  - Persist from stdin: `cat report.md | python3 skill/audit/scripts/persist_audit.py --issue-id SA-123` 
+- Persister: `skill/audit/scripts/persist_audit.py`
+  - Persist from stdin: `cat report.md | python3 skill/audit/scripts/persist_audit.py --issue-id SA-123`
   - Persist from a file: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --file report.md`
   - Persist from a CLI string: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --report "Ready to close: Yes\n..."`
 
 Notes:
-- The script calls: `wl update <issue-id> --audit-text "<report>" --json` and returns a non-zero exit code on failure.
-- The audit skill must produce structured audit text that begins with the header `Ready to close: Yes` or `Ready to close: No` on the very first non-empty line. Ralph and other orchestrators rely on this canonical header when reading the persisted audit from the work item.
-- Do not include any wrapper markers or surrounding fences when passing the text to `wl update --audit-text`.
+- The runner writes only structured markdown to stdout (the report). Orchestrators must call the persister to persist the report with `wl update <id> --audit-text`.
+- The persister calls: `wl update <issue-id> --audit-text "<report>" --json` and returns a non-zero exit code on failure.
 
-## Common Failure Mode: Unpersisted Audits
+## Guidance for models
 
-**SYMPTOM:** The audit report is displayed to the user but `wl show <id> --json` shows no `audit` field.
+- Return a structured markdown report only. Use the header `Ready to close:` and the canonical sections above.
+- If the model cannot determine acceptance criteria verdicts unambiguously, return immediately and do not persist or claim the audit was recorded.
+- If asked to perform state-modifying wl/git commands, refuse and surface the request to the operator.
+- For debugging, the `--debug-log` flag captures raw Pi output. Use it sparingly and remove sensitive content before sharing.
 
-**CAUSE:** Step 7 (persistence) was skipped or failed, but step 8 (user output) was executed anyway.
+## Examples
 
-**PREVENTION:**
-- Never output "This audit has been recorded in the system" unless you have confirmed `wl update --audit-text` returned success.
-- The persistence command (step 7) is a **hard gate** — do not proceed to user output without it.
-- If the `wl` command fails, report the error explicitly. Do not claim success.
+- Run an issue audit and persist:
+
+  python3 skill/audit/scripts/audit_runner.py issue SA-123
+
+- Run an issue audit without persisting (dry run):
+
+  python3 skill/audit/scripts/audit_runner.py issue SA-123 --do-not-persist
+
+- Run a project audit and write debug output:
+
+  python3 skill/audit/scripts/audit_runner.py project --debug-log /tmp/audit_debug.jsonl
+
+## Common failure modes
+
+- The most common problem is skipping persistence: always ensure `wl update --audit-text` executed successfully before reporting the audit as recorded.
+- If `wl` is not available or returns invalid JSON, report the error and do not claim success.
+
