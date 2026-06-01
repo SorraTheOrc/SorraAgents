@@ -39,10 +39,10 @@ class TestAuditSkillDoc:
         assert "Deep code review of acceptance criteria (parent work item)" not in text
         assert "Deep code review of children" not in text
 
-    def test_persist_flag_documented(self):
-        """SKILL.md must document the --persist flag."""
+    def test_do_not_persist_flag_documented(self):
+        """SKILL.md must document the --do-not-persist flag."""
         text = _skill_md_text()
-        assert "--persist" in text
+        assert "--do-not-persist" in text
 
     def test_pi_bin_flag_documented(self):
         """SKILL.md must document the --pi-bin flag."""
@@ -53,6 +53,11 @@ class TestAuditSkillDoc:
         """SKILL.md must document the --model flag."""
         text = _skill_md_text()
         assert "--model" in text
+
+    def test_debug_log_flag_documented(self):
+        """SKILL.md must document the --debug-log flag."""
+        text = _skill_md_text()
+        assert "--debug-log" in text
 
     def test_exit_codes_documented(self):
         """SKILL.md must document exit code semantics."""

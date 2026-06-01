@@ -34,7 +34,7 @@ References
 
 Scripts
 -------
-- `scripts/check_or_create.py` — implementation using `wl` CLI.
+- `skill/triage/scripts/check_or_create.py` — implementation using `wl` CLI.
 
 Matching Heuristics
 -------------------

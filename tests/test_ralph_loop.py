@@ -1788,7 +1788,7 @@ def test_single_model_backward_compatibility_without_new_phase_inputs():
     ("model_source", "expected_model"),
     [
         ("remote", "opencode-go/qwen3.6-plus"),
-        ("local", "Qwen 32B"),
+        ("local", "Proxy/qwen3"),
     ],
 )
 def test_intake_flow_uses_source_specific_default_model(model_source, expected_model):
@@ -1815,7 +1815,7 @@ def test_intake_flow_uses_source_specific_default_model(model_source, expected_m
     ("model_source", "expected_model"),
     [
         ("remote", "opencode/gpt-5.5"),
-        ("local", "Qwen 3.x 32B"),
+        ("local", "Proxy/qwen3"),
     ],
 )
 def test_planning_flow_uses_source_specific_default_model(model_source, expected_model):

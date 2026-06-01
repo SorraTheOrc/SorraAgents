@@ -159,7 +159,11 @@ The Ship subagent (configured in [`agent/ship.md`](../agent/ship.md)) executes
 the release using the canonical merge script:
 
 ```bash
-bash scripts/release/merge-dev-to-main.sh
+# Preferred safe wrapper (will detect missing release script and present a clear human fallback):
+node skill/ship/scripts/run-release.js
+
+# Legacy/direct invocation of the canonical script (use only when you know it exists and is executable):
+# bash scripts/release/merge-dev-to-main.sh
 ```
 
 The script performs the following steps:

@@ -61,14 +61,14 @@ class TestCLIParsing:
     def test_issue_defaults(self):
         parser = build_parser()
         args = parser.parse_args(["issue", "SA-123"])
-        assert args.persist is False
+        assert args.do_not_persist is False
         assert args.pi_bin == "pi"
         assert args.model == "opencode-go/glm-5.1"
 
-    def test_issue_persist_flag(self):
+    def test_issue_do_not_persist_flag(self):
         parser = build_parser()
-        args = parser.parse_args(["issue", "SA-123", "--persist"])
-        assert args.persist is True
+        args = parser.parse_args(["issue", "SA-123", "--do-not-persist"])
+        assert args.do_not_persist is True
 
     def test_issue_pi_bin_flag(self):
         parser = build_parser()
@@ -79,6 +79,11 @@ class TestCLIParsing:
         parser = build_parser()
         args = parser.parse_args(["issue", "SA-123", "--model", "custom/model"])
         assert args.model == "custom/model"
+
+    def test_issue_debug_log_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--debug-log", "/tmp/audit.log"])
+        assert args.debug_log == "/tmp/audit.log"
 
     def test_project_subcommand_exists(self):
         parser = build_parser()
@@ -100,6 +105,11 @@ class TestCLIParsing:
         parser = build_parser()
         args = parser.parse_args(["project", "--model", "other/model"])
         assert args.model == "other/model"
+
+    def test_project_debug_log_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["project", "--debug-log", "/tmp/audit.log"])
+        assert args.debug_log == "/tmp/audit.log"
 
     def test_no_subcommand_returns_2(self):
         rc = main([])
@@ -226,10 +236,10 @@ class TestExtractACs:
 # ---------------------------------------------------------------------------
 
 class TestPersistenceDelegation:
-    """Assert that ``--persist`` delegates to ``persist_audit`` rather than
+    """Assert default persistence delegates to ``persist_audit`` rather than
     duplicating the ``wl update --audit-text`` call."""
 
-    def test_persist_delegates_to_persist_audit(self, monkeypatch):
+    def test_default_persist_delegates_to_persist_audit(self, monkeypatch):
         persisted = {}
 
         def fake_persist(issue_id, report_text, **kwargs):
@@ -243,7 +253,7 @@ class TestPersistenceDelegation:
         )
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "unmet", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -251,16 +261,26 @@ class TestPersistenceDelegation:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        rc = cmd_issue("SA-TEST-001", persist=True, runner=fake_runner)
+        rc = cmd_issue("SA-TEST-001", runner=fake_runner)
         assert rc == 0
         assert persisted["issue_id"] == "SA-TEST-001"
         assert "Ready to close:" in persisted["report_text"]
         assert "## Acceptance Criteria Status" in persisted["report_text"]
 
-    def test_no_persist_returns_zero(self, monkeypatch):
+    def test_do_not_persist_returns_zero(self, monkeypatch):
+        called = {"persist": False}
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            called["persist"] = True
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "met", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -270,6 +290,7 @@ class TestPersistenceDelegation:
 
         rc = cmd_issue("SA-TEST-002", persist=False, runner=fake_runner)
         assert rc == 0
+        assert called["persist"] is False
 
     def test_persist_propagates_nonzero_from_persist_audit(self, monkeypatch):
         def fake_persist(issue_id, report_text, **kwargs):
@@ -299,7 +320,7 @@ class TestReportStructure:
     def test_report_starts_with_ready_to_close(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "unmet", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -307,14 +328,14 @@ class TestReportStructure:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-STRUCT", runner=fake_runner)
+        cmd_issue("SA-STRUCT", runner=fake_runner, persist=False)
         captured = capsys.readouterr()
         assert captured.out.startswith("Ready to close:")
 
     def test_report_contains_section_headings(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "unmet", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -322,7 +343,7 @@ class TestReportStructure:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-STRUCT", runner=fake_runner)
+        cmd_issue("SA-STRUCT", runner=fake_runner, persist=False)
         captured = capsys.readouterr()
         assert "## Summary" in captured.out
         assert "## Acceptance Criteria Status" in captured.out
@@ -331,7 +352,7 @@ class TestReportStructure:
     def test_report_contains_ac_table(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "unmet", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -339,7 +360,7 @@ class TestReportStructure:
                 stdout=json.dumps(_load_fixture("wi_with_bulleted_ac.json")),
             )
 
-        cmd_issue("SA-STRUCT", runner=fake_runner)
+        cmd_issue("SA-STRUCT", runner=fake_runner, persist=False)
         captured = capsys.readouterr()
         assert "| # | Criterion | Verdict | Evidence |" in captured.out
         assert "The API must return 200 for valid requests." in captured.out
@@ -351,9 +372,84 @@ class TestReportStructure:
                 stdout=json.dumps(_load_fixture("wi_without_ac.json")),
             )
 
-        cmd_issue("SA-STRUCT", runner=fake_runner)
+        cmd_issue("SA-STRUCT", runner=fake_runner, persist=False)
         captured = capsys.readouterr()
         assert "No acceptance criteria defined." in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Debug logging tests
+# ---------------------------------------------------------------------------
+
+class TestDebugLogging:
+    """Verify audit runner debug log behavior."""
+
+    def test_parse_failure_writes_default_debug_log(self, monkeypatch, tmp_path):
+        log_path = tmp_path / "audit_debug.jsonl"
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            return {
+                "verdict": "met",
+                "evidence": "not-json",
+                "raw_stdout": "RAW",
+                "raw_stderr": "ERR",
+                "extracted_text": "not-json",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._default_debug_log_path",
+            lambda issue_id, context: log_path,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(
+                stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
+            )
+
+        cmd_issue("SA-DEBUG", runner=fake_runner)
+        assert log_path.exists()
+        entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+        assert entry["reason"] == "parse_failure"
+        assert entry["raw_stdout"] == "RAW"
+        assert entry["raw_stderr"] == "ERR"
+        assert entry["context"].startswith("parent")
+
+    def test_debug_log_flag_writes_output(self, monkeypatch, tmp_path):
+        log_path = tmp_path / "audit_debug.jsonl"
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            return {
+                "verdict": "met",
+                "evidence": json.dumps([
+                    {"index": 0, "verdict": "met", "evidence": "x:1 — ok"},
+                    {"index": 1, "verdict": "met", "evidence": "y:2 — ok"},
+                    {"index": 2, "verdict": "met", "evidence": "z:3 — ok"},
+                ]),
+                "raw_stdout": "RAW",
+                "raw_stderr": "",
+                "extracted_text": "[]",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(
+                stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
+            )
+
+        cmd_issue("SA-DEBUG", runner=fake_runner, debug_log=str(log_path))
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        assert lines
+        entry = json.loads(lines[0])
+        assert entry["reason"] == "debug_log"
+        assert entry["raw_stdout"] == "RAW"
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +462,7 @@ class TestProjectMode:
     def test_project_report_starts_with_ready_to_close(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "met", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -379,7 +475,7 @@ class TestProjectMode:
     def test_project_report_has_summary_and_recommendation(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "met", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
