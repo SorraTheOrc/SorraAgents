@@ -17,30 +17,15 @@ The skill accepts a work-item id provided inline in the user's command. Supporte
 - `ralph <WORKITEM>`
 - `run ralph <WORKITEM>`
 - `ralph loop <WORKITEM>`
-- `ralph <WORKITEM> remote` — delegates to `--model-source remote`
-- `ralph <WORKITEM> local` — delegates to `--model-source local`
 
 A work-item id is any short token matching the Worklog id pattern used in your environment (for example `WL-1234`, `CG-0MP12H40Q003Y7OU`, or an 8+ char identifier). When an id is present in the command the skill will use it and will not prompt for an id. If no id is detected, the skill will ask the operator to provide one or abort, except for `ralph status`, which is an intentional no-id exception.
-
-The operator may also supply `remote` or `local` after the work-item id as a shorthand for `--model-source <remote|local>`. If provided, the agent must forward this flag when launching Ralph.
-
-**If the operator does NOT supply a model-source flag, the agent MUST always read the `.ralph.json` config file to determine the default `model_source` value — never assume a hardcoded default.** The lookup order is:
-
-1. `<project>/.ralph.json` — project-level config (highest priority)
-2. `skill/ralph/assets/.ralph.json` — skill's default config (fallback)
-
-Extract the `model_source` field and use that as the `--model-source` value. Do not infer from previous launches, conversation history, or any other context — always read the file.
 
 ## Behavior
 
 1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id or abort, except for `ralph status`, which intentionally runs without a work-item id.
-2. **Determine model source.** If the operator supplied `remote` or `local` inline after the work-item id, use that value as `--model-source`. Otherwise, read the `.ralph.json` config (project level first, skill default as fallback) and extract the `model_source` field — never hardcode or assume a default.
-3. **Gate: Check the work-item stage.** Retrieve the work item with `wl show <id> --json` and inspect the `workItem.stage` field.
-   - If the stage is `idea`, report that the work item is still in the **idea** stage and must be progressed to at least **intake_complete** before Ralph can run. Instruct the operator to run `/intake <id>` first. Stop and do not proceed to launch Ralph.
-   - For any other stage (including `intake_complete`, `plan_complete`, `in_progress`, etc.), proceed to the next step.
-4. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`. Always pass a `--model-source` flag to the wrapper (determined in step 2). Also forward any other explicit model flags if provided.
-5. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
-6. Use `ralph status` to inspect the current background run without needing the original work-item id.
+2. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`.
+3. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
+4. Use `ralph status` to inspect the current background run without needing the original work-item id.
 
 For direct foreground debugging, run the script locally:
 
@@ -49,22 +34,6 @@ For direct foreground debugging, run the script locally:
 
 Delegated `pi` and `wl` commands are logged before execution in both normal console output and `--json` output, so operators and automation can see the exact command Ralph ran.
 If streamed `pi` output stops producing stdout and keeps the pipe open too long, Ralph will terminate the run with a clear stall error instead of hanging indefinitely.
-
-### Output validation
-
-Ralph validates Pi output after every delegation to detect silent failures:
-- **Empty output** raises a clear error instead of false success.
-- **Input echo** (Pi returning the prompt back) is detected and reported.
-- **Raw skill content** (SKILL.md text instead of results) is rejected.
-- **Short audit output** without expected markers is flagged.
-
-These checks prevent the common failure mode where a misconfigured model causes Pi to echo the user prompt as the assistant response.
-
-**Stream timeout defaults:**
-- **Local models** (`--model-source local`): 600 seconds
-- **Remote models** (`--model-source remote`): 300 seconds
-
-The timeout is configurable via `.ralph.json` (see `docs/ralph.md`) or the `--pi-stream-timeout` CLI flag.
 
 ## Pi subprocess cleanup at loop completion
 
@@ -80,7 +49,8 @@ The cleanup is safe to call even if the process has already exited — it checks
 
 Ralph supports phase-specific model selection for `intake`, `planning`, `implementation`, and `audit`.
 
-- Source toggle: `--model-source <remote|local>` (default: read from `.ralph.json` config — see Behavior step 2)
+- Source toggle: `--model-source <remote|local>` (default: `local`)
+- Shorthand: `ralph <id> remote` or `ralph <id> local` (equivalent to `--model-source`)
 - Per-phase CLI overrides:
   - `--model-intake`
   - `--model-planning`
@@ -94,24 +64,21 @@ Ralph supports phase-specific model selection for `intake`, `planning`, `impleme
 ```bash
 # Launch a background Ralph run from the skill installation.
 # The wrapper handles nohup plus PID/start-time capture for status reporting.
-# Use --model-source to select remote or local models (default from .ralph.json config):
-/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --model-source remote --json
-/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --model-source local --json
+/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --json
 
 # Inspect the current background run (no work item id required):
 /home/rgardler/.pi/agent/skills/ralph/ralph status --json
 
 # If you need to run the foreground loop directly for debugging:
-# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> --model-source remote --json
-# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> --model-source local --json
+# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> --json
 #
 # To focus on a single direct child while keeping the parent for context:
-# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --model-source remote --json
+# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
 
 # If your skills are installed at a different location (for example a
 # project-level skills directory), run the script using the full path to
 # that skill directory instead, e.g.:
-# python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id> --model-source remote --json
+# python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id> --json
 ```
 
 See `docs/ralph.md` and `ralph --help` for full details of the features available.

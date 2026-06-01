@@ -22,6 +22,15 @@ Ralph is launched from the `skill/ralph/ralph` wrapper. The wrapper starts the d
 # path (expand ~ in shell):
 /home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> [options]
 
+# Use local models (default):
+/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id>
+
+# Use remote models with shorthand syntax:
+/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> remote
+
+# Use remote models with explicit flag:
+/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id> --model-source remote
+
 # Inspect the current run without the work item id:
 /home/rgardler/.pi/agent/skills/ralph/ralph status --json
 
@@ -51,7 +60,7 @@ The background launcher stores the current runtime context in `.worklog/ralph/cu
 | `--verbose` | off | Show detailed delegation commands, subprocess stdout/stderr, and raw audit output. |
 | `--no-stream` | off | Don't stream pi subprocess output to console (use buffered capture). Progress logging still shown. |
 | `--model` | `opencode-go/glm-5.1` | Legacy single-model override applied to all phases when per-phase mode is not enabled. |
-| `--model-source` | `remote` | Selects source-specific per-phase model defaults and source-mapped config values: `remote` or `local`. No automatic fallback between sources. |
+| `--model-source` | `local` | Selects source-specific per-phase model defaults and source-mapped config values: `remote` or `local`. No automatic fallback between sources. |
 | `--model-intake` | (none) | Override the intake phase model for this run. |
 | `--model-planning` | (none) | Override the planning phase model for this run. |
 | `--model-implementation` | (none) | Override the implementation phase model for this run. |

@@ -13,7 +13,6 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 - User asks general project status (e.g., "What is the current status?", "Status of the project?", "status", "audit the project", "audit").
 - User asks about a specific work item id (e.g., "What is the status of wl-123?", "status wl-123", "audit wl-123").
-- User asks to audit a GitHub PR (URL or owner/repo#number). In PR mode, resolve the related work item from PR title/body or prompt/offer creation, check out the PR branch, run build/tests and audit there, then offer merge only when everything passes.
 
 ## Best Practices
 
@@ -26,9 +25,11 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 ## Steps
 
-1. Detect whether the user provided a work item id or a GitHub PR reference in the request.
+> ⚠️ **CRITICAL RULE:** The audit is NOT recorded until you execute `wl update <id> --audit-text` and confirm success. Never claim the audit was persisted without running this command first. This is the most common failure mode in the audit skill.
 
-2. If neither a work item id nor a PR reference is provided complete this step, otherwise skip to step 3:
+1. Detect whether the user provided a work item id in the request.
+
+2. If no work item id is provided complete this step, otherwise skip to step 3:
 
 - Run `wl list --json` to fetch work items in JSON format to get more information, but do not display it.
 - Present a one line summary of the overall project status based on the JSON data. Including:
@@ -40,11 +41,12 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 Skip to step 6.
 
-3. If a work item id is provided (or resolved from PR metadata):
+3. If a work item id is provided:
 
 - Run `wl show <work-item-id> --children --json` to fetch work item details (with all comments and children).
 - Extract the acceptance criteria from the description (they are usually in a markdown section starting with `## Acceptance Criteria` or `### Acceptance Criteria` and formatted as a numbered or bulleted list).
   - If no acceptance criteria section is found, note: "No acceptance criteria defined."
+- Note: "Acceptance Criteria" and "Success Criteria" are synonyms. Look for either `## Acceptance Criteria` or `## Success Criteria` (synonym: Acceptance Criteria) as the section heading.
 - Walk through all dependencies (`wl dep list <work-item-id> --json`) and list each dependent work-item's status, title (using strike through if the item has a "completed" status), id, and stage.
 
 4. **Deep code review of acceptance criteria (parent work item):**
@@ -77,6 +79,8 @@ For each direct child work item (do NOT recurse into grandchildren):
 
 Produce the structured audit report content only. The report MUST follow this exact structure. IMPORTANT: the very first character of the report MUST be the "R" of `Ready to close:` — there must be no backticks, code fences, or any other characters or text before the first line.
 
+> **Note for ralph orchestrator users:** Ralph sanitises audit output before persisting it. If a preamble (introductory text) appears before the `Ready to close:` header, ralph strips it automatically so that only the structured block is persisted. However, the audit skill itself should produce output that starts directly with `Ready to close:` to avoid ambiguity.
+
 Ready to close: Yes/No
 
 ## Summary
@@ -103,6 +107,10 @@ Ready to close: Yes/No
 <Repeat for each direct child. If a child has no acceptance criteria, write: "No acceptance criteria defined.">
 <If there are no children, write: "No children.">
 
+## Success Criteria
+
+"Success Criteria" is a synonym for "Acceptance Criteria". Both terms are treated equivalently in audit reports. Use **Acceptance Criteria** as the canonical heading; document **Success Criteria** as an accepted synonym where relevant.
+
 -CRITICAL rules for the structured report:
 - The first line must be `Ready to close: Yes` or `Ready to close: No` based on whether all acceptance criteria (parent and children) are met.
 - Do NOT include wrapper or surrounding markers in the text passed to `wl update --audit-text`. The audit handlers expect the report content only; including markers (any of the forms shown above or similar) will cause the CLI/handler to reject the audit.
@@ -110,22 +118,62 @@ Ready to close: Yes/No
 - For project-level audits (no work item id), omit the `## Acceptance Criteria Status` and `## Children Status` sections. Include only `## Summary` and `## Recommendation`.
 - Review only direct children, never grandchildren. If there are many children (>10), note in the report that only the first 10 were reviewed and the rest were omitted for brevity.
 
-7. **Record the audit using the CLI structured write path:**
+7. **PERSIST THE AUDIT BEFORE ANY USER OUTPUT (CRITICAL GATE):**
 
-   - Run: `wl update <work-item-id> --audit-text "<complete-report-content>" --json`
-    - This stores the audit as structured metadata, making it machine-readable and queryable via `wl show --json`.
+   > ⚠️ **DO NOT PROCEED TO STEP 8 UNTIL THIS STEP COMPLETES SUCCESSFULLY**
+   >
+   > This is the most common failure point in the audit skill. The audit is NOT recorded until this command executes successfully.
+   >
+   > **HISTORICAL NOTE:** Agents frequently skip this step and incorrectly claim "This audit has been recorded in the system" without running the persistence command. This is a critical error.
 
-8. **Output the same structured report content to the user in markdown format.**
+   - **REQUIRED:** Run the persistence command and wait for successful completion:
+     ```bash
+     wl update <work-item-id> --audit-text "<complete-report-content>" --json
+     ```
+   - **VERIFY:** Confirm the command returned `{"success": true}` with an `audit` object in the response.
+   - **IF IT FAILS:** Do NOT claim the audit was recorded. Report the error explicitly and offer to retry. Example: "Audit persistence failed: <error>. Would you like me to retry?"
+   - **IF IT SUCCEEDS:** Only then proceed to step 8.
 
-  - Do NOT include any additional text, explanations, or next steps in the output (other than the information in the next bullets). The output should be the structured report content only.
-  - After the structured report content, you should include a final line: "This audit has been recorded in the system." to confirm to the user that the audit was saved. If it as not been saved yet, then run the CLI command to save it before confirming (see previous step).
-  - If any of the acceptance criteria were unmet or partially met, include a final note: "Note: Some acceptance criteria were not fully met. Please review the evidence for details." and offer to address the gamps in the audit if the user wants to follow up.
+8. **OUTPUT THE REPORT TO THE USER:**
+
+   > ✅ **ONLY REACH THIS STEP IF STEP 7 RETURNED SUCCESS**
+
+   - Output the structured report content to the user in markdown format.
+   - **REQUIRED CONFIRMATION LINE:** After the structured report, include exactly this line:
+     ```
+     This audit has been recorded in the system.
+     ```
+   - **DO NOT output this confirmation line unless step 7 succeeded.** If persistence failed or was skipped, omit this line and report the actual status (e.g., "Audit NOT recorded — persistence command failed").
+   - If any acceptance criteria were unmet or partially met, include a final note: "Note: Some acceptance criteria were not fully met. Please review the evidence for details." and offer to address the gaps in the audit if the user wants to follow up.
 
 ## Notes
 
-- In PR mode, run commands from the checked-out PR worktree and use `pi run "/audit <work-item-id>"` for audit invocation.
-- If audit fails in PR mode, explicitly state that you are still on the PR branch/worktree and ask for next steps.
-- If build/tests and audit pass in PR mode, offer merge into main and push, but require explicit confirmation before executing merge.
 - Keep the output concise and actionable for quick human consumption.
 - Handle errors gracefully: if `wl` or any other command is not available or return invalid JSON, present a helpful error and possible remediation steps.
 - The depth of code review is critical: read implementation files, check function signatures, verify test coverage, and assess edge cases. Do not just check that files exist.
+
+## Scripts
+
+The audit skill provides a small helper script to persist the structured audit report to Worklog using the `wl` CLI:
+
+- Path: `skill/audit/scripts/persist_audit.py`
+- Usage:
+  - Persist from stdin: `cat report.md | python3 skill/audit/scripts/persist_audit.py --issue-id SA-123` 
+  - Persist from a file: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --file report.md`
+  - Persist from a CLI string: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --report "Ready to close: Yes\n..."`
+
+Notes:
+- The script calls: `wl update <issue-id> --audit-text "<report>" --json` and returns a non-zero exit code on failure.
+- The audit skill must produce structured audit text that begins with the header `Ready to close: Yes` or `Ready to close: No` on the very first non-empty line. Ralph and other orchestrators rely on this canonical header when reading the persisted audit from the work item.
+- Do not include any wrapper markers or surrounding fences when passing the text to `wl update --audit-text`.
+
+## Common Failure Mode: Unpersisted Audits
+
+**SYMPTOM:** The audit report is displayed to the user but `wl show <id> --json` shows no `audit` field.
+
+**CAUSE:** Step 7 (persistence) was skipped or failed, but step 8 (user output) was executed anyway.
+
+**PREVENTION:**
+- Never output "This audit has been recorded in the system" unless you have confirmed `wl update --audit-text` returned success.
+- The persistence command (step 7) is a **hard gate** — do not proceed to user output without it.
+- If the `wl` command fails, report the error explicitly. Do not claim success.
