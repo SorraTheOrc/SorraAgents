@@ -6,8 +6,8 @@ Provides two subcommands:
   project      – audit the overall project
 
 Usage:
-  audit_runner.py issue <id> [--persist] [--pi-bin pi] [--model <name>]
-  audit_runner.py project [--pi-bin pi] [--model <name>]
+  audit_runner.py issue <id> [--persist] [--pi-bin pi] [--model <name>] [--debug-log <path>]
+  audit_runner.py project [--pi-bin pi] [--model <name>] [--debug-log <path>]
 
 Exit codes:
   0 – success (report printed to stdout)
@@ -21,6 +21,8 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -66,6 +68,58 @@ def _run_wl(runner: Runner, cmd: Sequence[str]) -> dict:
     return data
 
 
+def _sanitize_debug_context(context: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", context).strip("._-")
+    return cleaned or "context"
+
+
+def _default_debug_log_path(issue_id: str, context: str) -> Path:
+    safe_context = _sanitize_debug_context(context)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    filename = f"audit_runner_debug_{issue_id}_{safe_context}_{timestamp}.jsonl"
+    return Path(tempfile.gettempdir()) / filename
+
+
+def _write_debug_log(log_path: Path, payload: dict) -> None:
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False))
+            handle.write("\n")
+    except OSError as exc:
+        print(f"audit_runner: failed to write debug log to {log_path}: {exc}", file=sys.stderr)
+
+
+def _log_pi_output(
+    *,
+    log_path: Path,
+    reason: str,
+    issue_id: str,
+    context: str,
+    prompt: str,
+    model: str,
+    pi_bin: str,
+    result: dict,
+    parse_error: str | None = None,
+) -> None:
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+        "issue_id": issue_id,
+        "context": context,
+        "prompt": prompt,
+        "model": model,
+        "pi_bin": pi_bin,
+        "verdict": result.get("verdict", ""),
+        "evidence": result.get("evidence", ""),
+        "raw_stdout": result.get("raw_stdout", ""),
+        "raw_stderr": result.get("raw_stderr", ""),
+        "extracted_text": result.get("extracted_text", ""),
+        "parse_error": parse_error or "",
+    }
+    _write_debug_log(log_path, payload)
+
+
 # ---------------------------------------------------------------------------
 # Pi integration (duplicated from ralph for now – see OQ-1)
 # ---------------------------------------------------------------------------
@@ -99,43 +153,31 @@ def _call_pi(prompt: str, model: str = "opencode-go/glm-5.1",
         stdout, stderr = process.communicate()
 
     raw = stdout or ""
-    if not raw:
-        return {"verdict": "unmet", "evidence": ""}
+    base = {
+        "raw_stdout": raw,
+        "raw_stderr": stderr or "",
+    }
 
     # Parse JSON lines looking for the final agent_end message
-    text = _extract_pi_text(raw)
-    if not text:
-        return {"verdict": "unmet", "evidence": ""}
-
-    # Strip markdown code fences before JSON parsing
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        # Remove opening fence (```json, ```, etc.)
-        first_newline = cleaned.find("\n")
-        if first_newline != -1:
-            cleaned = cleaned[first_newline + 1 :]
-        # Remove closing fence
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3].strip()
-        elif "\n```" in cleaned:
-            cleaned = cleaned[: cleaned.rindex("\n```")].strip()
+    text = _extract_pi_text(raw) if raw else ""
+    base["extracted_text"] = text
+    if not raw or not text:
+        return {**base, "verdict": "unmet", "evidence": ""}
 
     # Try to parse the text as JSON with verdict/evidence
     try:
-        obj = json.loads(cleaned)
+        obj = json.loads(text)
         if isinstance(obj, dict):
             return {
+                **base,
                 "verdict": obj.get("verdict", "unmet").lower(),
                 "evidence": obj.get("evidence", ""),
             }
-        if isinstance(obj, list):
-            # Return the raw JSON array as evidence so callers can parse it
-            return {"verdict": "met", "evidence": cleaned}
     except json.JSONDecodeError:
         pass
 
     # If Pi returned free-form text, use it as evidence and default to met
-    return {"verdict": "met", "evidence": cleaned}
+    return {**base, "verdict": "met", "evidence": text.strip()[:200]}
 
 
 def _extract_pi_text(raw: str) -> str:
@@ -420,12 +462,37 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     }
 
 
-def cmd_issue(issue_id: str, persist: bool = False,
-              pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
-              runner: Runner | None = None, json_mode: bool = False) -> int:
+def cmd_issue(
+    issue_id: str,
+    persist: bool = False,
+    pi_bin: str = "pi",
+    model: str = "opencode-go/glm-5.1",
+    runner: Runner | None = None,
+    json_mode: bool = False,
+    debug_log: str | None = None,
+) -> int:
     """Audit a single work item."""
     if runner is None:
         runner = _default_runner
+
+    debug_log_path = Path(debug_log).expanduser() if debug_log else None
+
+    def log_pi_result(result: dict, context: str, prompt: str, parse_error: str | None = None) -> None:
+        if not debug_log_path and not parse_error:
+            return
+        log_path = debug_log_path or _default_debug_log_path(issue_id, context)
+        reason = "debug_log" if debug_log_path else "parse_failure"
+        _log_pi_output(
+            log_path=log_path,
+            reason=reason,
+            issue_id=issue_id,
+            context=context,
+            prompt=prompt,
+            model=model,
+            pi_bin=pi_bin,
+            result=result,
+            parse_error=parse_error,
+        )
 
     try:
         data = _run_wl(runner, ["wl", "show", issue_id, "--children", "--json"])
@@ -453,17 +520,24 @@ def cmd_issue(issue_id: str, persist: bool = False,
             f"(a one-line note with file:line reference).\n\n"
             f"Criteria: {ac_list_json}"
         )
+        context = "parent_ac_review"
         try:
             result = _call_pi(prompt, model=model, pi_bin=pi_bin)
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
         # Parse the batched result
-        raw_text = result.get("evidence", "") or result.get("text", "")
-        try:
-            batch = json.loads(raw_text)
-        except json.JSONDecodeError:
+        raw_text = result.get("evidence", "") or result.get("text", "") or result.get("extracted_text", "")
+        parse_error = None
+        if not raw_text:
+            parse_error = "empty_pi_response"
             batch = []
+        else:
+            try:
+                batch = json.loads(raw_text)
+            except json.JSONDecodeError as exc:
+                parse_error = f"json_decode_error: {exc}"
+                batch = []
         if isinstance(batch, list):
             reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
             for i, ac in enumerate(acs):
@@ -474,11 +548,14 @@ def cmd_issue(issue_id: str, persist: bool = False,
                     "evidence": item.get("evidence", ""),
                 })
         else:
+            if parse_error is None:
+                parse_error = f"unexpected_batch_type: {type(batch).__name__}"
             # Fallback: treat single result as covering all ACs equally
             verdict = result.get("verdict", "unmet")
             evidence = result.get("evidence", "")
             for ac in acs:
                 ac_results.append({"text": ac, "verdict": verdict, "evidence": evidence})
+        log_pi_result(result, context, prompt, parse_error)
     else:
         ac_results = [{"text": "No acceptance criteria defined.", "verdict": "unmet", "evidence": ""}]
 
@@ -508,16 +585,23 @@ def cmd_issue(issue_id: str, persist: bool = False,
                 f"(a one-line note with file:line reference).\n\n"
                 f"Criteria: {child_ac_list}"
             )
+            context = f"child_ac_review_{child.get('id', 'unknown') or 'unknown'}"
             try:
                 result = _call_pi(prompt, model=model, pi_bin=pi_bin)
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
-            raw_text = result.get("evidence", "") or result.get("text", "")
-            try:
-                batch = json.loads(raw_text)
-            except json.JSONDecodeError:
+            raw_text = result.get("evidence", "") or result.get("text", "") or result.get("extracted_text", "")
+            parse_error = None
+            if not raw_text:
+                parse_error = "empty_pi_response"
                 batch = []
+            else:
+                try:
+                    batch = json.loads(raw_text)
+                except json.JSONDecodeError as exc:
+                    parse_error = f"json_decode_error: {exc}"
+                    batch = []
             if isinstance(batch, list):
                 reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
                 for i, ac in enumerate(child_acs):
@@ -528,10 +612,13 @@ def cmd_issue(issue_id: str, persist: bool = False,
                         "evidence": item.get("evidence", ""),
                     })
             else:
+                if parse_error is None:
+                    parse_error = f"unexpected_batch_type: {type(batch).__name__}"
                 verdict = result.get("verdict", "unmet")
                 evidence = result.get("evidence", "")
                 for ac in child_acs:
                     child_ac_results.append({"text": ac, "verdict": verdict, "evidence": evidence})
+            log_pi_result(result, context, prompt, parse_error)
         child_results.append({
             "title": child.get("title", ""),
             "id": child.get("id", ""),
@@ -567,11 +654,35 @@ def _build_project_json(summary: str, recommendation: str) -> dict:
     }
 
 
-def cmd_project(pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
-                runner: Runner | None = None, json_mode: bool = False) -> int:
+def cmd_project(
+    pi_bin: str = "pi",
+    model: str = "opencode-go/glm-5.1",
+    runner: Runner | None = None,
+    json_mode: bool = False,
+    debug_log: str | None = None,
+) -> int:
     """Audit the overall project."""
     if runner is None:
         runner = _default_runner
+
+    debug_log_path = Path(debug_log).expanduser() if debug_log else None
+
+    def log_pi_result(result: dict, context: str, prompt: str, parse_error: str | None = None) -> None:
+        if not debug_log_path and not parse_error:
+            return
+        log_path = debug_log_path or _default_debug_log_path("project", context)
+        reason = "debug_log" if debug_log_path else "parse_failure"
+        _log_pi_output(
+            log_path=log_path,
+            reason=reason,
+            issue_id="project",
+            context=context,
+            prompt=prompt,
+            model=model,
+            pi_bin=pi_bin,
+            result=result,
+            parse_error=parse_error,
+        )
 
     try:
         data = _run_wl(runner, ["wl", "list", "--json"])
@@ -609,6 +720,7 @@ def cmd_project(pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
     )
     try:
         pi_result = _call_pi(prompt, model=model, pi_bin=pi_bin)
+        log_pi_result(pi_result, "project_summary", prompt)
         if pi_result.get("verdict") == "met" and pi_result.get("evidence"):
             # Use Pi's response if parseable
             pass  # Could enhance this in future
@@ -641,6 +753,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Pi model to use for review")
     p_issue.add_argument("--json", action="store_true",
                          help="Emit machine-readable JSON output instead of markdown")
+    p_issue.add_argument("--debug-log", default=None,
+                         help="Write raw Pi output and parsing metadata to a log file")
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
@@ -648,6 +762,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Pi model to use for review")
     p_project.add_argument("--json", action="store_true",
                            help="Emit machine-readable JSON output instead of markdown")
+    p_project.add_argument("--debug-log", default=None,
+                           help="Write raw Pi output and parsing metadata to a log file")
 
     return p
 
@@ -661,10 +777,21 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "issue":
-        return cmd_issue(args.issue_id, persist=args.persist,
-                         pi_bin=args.pi_bin, model=args.model, json_mode=args.json)
+        return cmd_issue(
+            args.issue_id,
+            persist=args.persist,
+            pi_bin=args.pi_bin,
+            model=args.model,
+            json_mode=args.json,
+            debug_log=args.debug_log,
+        )
     elif args.command == "project":
-        return cmd_project(pi_bin=args.pi_bin, model=args.model, json_mode=args.json)
+        return cmd_project(
+            pi_bin=args.pi_bin,
+            model=args.model,
+            json_mode=args.json,
+            debug_log=args.debug_log,
+        )
 
     return 2
 

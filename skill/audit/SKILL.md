@@ -41,13 +41,13 @@ This persistence is **critical** because Ralph reads the audit from the work ite
 ### Audit a single work item
 
 ```bash
-python3 skill/audit/scripts/audit_runner.py issue <id> [--persist] [--pi-bin <path>] [--model <name>]
+python3 skill/audit/scripts/audit_runner.py issue <id> [--persist] [--pi-bin <path>] [--model <name>] [--debug-log <path>]
 ```
 
 ### Audit the project
 
 ```bash
-python3 skill/audit/scripts/audit_runner.py project [--pi-bin <path>] [--model <name>]
+python3 skill/audit/scripts/audit_runner.py project [--pi-bin <path>] [--model <name>] [--debug-log <path>]
 ```
 
 ### Flags
@@ -57,6 +57,7 @@ python3 skill/audit/scripts/audit_runner.py project [--pi-bin <path>] [--model <
 | `--persist` | (off) | Persist the audit report to Worklog via `wl update <id> --audit-text`. Only valid for `issue` mode. |
 | `--pi-bin` | `pi` | Path to the Pi binary. |
 | `--model` | `opencode-go/glm-5.1` | Pi model to use for per-criterion review. |
+| `--debug-log` | (off) | Write raw Pi output and parsing metadata to the specified log file. If omitted, parse failures generate a timestamped log under the system temp directory. |
 
 ### Exit Codes
 

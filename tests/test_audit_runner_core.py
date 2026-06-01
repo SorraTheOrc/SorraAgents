@@ -80,6 +80,11 @@ class TestCLIParsing:
         args = parser.parse_args(["issue", "SA-123", "--model", "custom/model"])
         assert args.model == "custom/model"
 
+    def test_issue_debug_log_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--debug-log", "/tmp/audit.log"])
+        assert args.debug_log == "/tmp/audit.log"
+
     def test_project_subcommand_exists(self):
         parser = build_parser()
         args = parser.parse_args(["project"])
@@ -100,6 +105,11 @@ class TestCLIParsing:
         parser = build_parser()
         args = parser.parse_args(["project", "--model", "other/model"])
         assert args.model == "other/model"
+
+    def test_project_debug_log_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["project", "--debug-log", "/tmp/audit.log"])
+        assert args.debug_log == "/tmp/audit.log"
 
     def test_no_subcommand_returns_2(self):
         rc = main([])
@@ -243,7 +253,7 @@ class TestPersistenceDelegation:
         )
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "unmet", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -260,7 +270,7 @@ class TestPersistenceDelegation:
     def test_no_persist_returns_zero(self, monkeypatch):
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "met", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -299,7 +309,7 @@ class TestReportStructure:
     def test_report_starts_with_ready_to_close(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "unmet", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -314,7 +324,7 @@ class TestReportStructure:
     def test_report_contains_section_headings(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "unmet", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -331,7 +341,7 @@ class TestReportStructure:
     def test_report_contains_ac_table(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "unmet", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -357,6 +367,81 @@ class TestReportStructure:
 
 
 # ---------------------------------------------------------------------------
+# Debug logging tests
+# ---------------------------------------------------------------------------
+
+class TestDebugLogging:
+    """Verify audit runner debug log behavior."""
+
+    def test_parse_failure_writes_default_debug_log(self, monkeypatch, tmp_path):
+        log_path = tmp_path / "audit_debug.jsonl"
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            return {
+                "verdict": "met",
+                "evidence": "not-json",
+                "raw_stdout": "RAW",
+                "raw_stderr": "ERR",
+                "extracted_text": "not-json",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._default_debug_log_path",
+            lambda issue_id, context: log_path,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(
+                stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
+            )
+
+        cmd_issue("SA-DEBUG", runner=fake_runner)
+        assert log_path.exists()
+        entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+        assert entry["reason"] == "parse_failure"
+        assert entry["raw_stdout"] == "RAW"
+        assert entry["raw_stderr"] == "ERR"
+        assert entry["context"].startswith("parent")
+
+    def test_debug_log_flag_writes_output(self, monkeypatch, tmp_path):
+        log_path = tmp_path / "audit_debug.jsonl"
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            return {
+                "verdict": "met",
+                "evidence": json.dumps([
+                    {"index": 0, "verdict": "met", "evidence": "x:1 — ok"},
+                    {"index": 1, "verdict": "met", "evidence": "y:2 — ok"},
+                    {"index": 2, "verdict": "met", "evidence": "z:3 — ok"},
+                ]),
+                "raw_stdout": "RAW",
+                "raw_stderr": "",
+                "extracted_text": "[]",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(
+                stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
+            )
+
+        cmd_issue("SA-DEBUG", runner=fake_runner, debug_log=str(log_path))
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        assert lines
+        entry = json.loads(lines[0])
+        assert entry["reason"] == "debug_log"
+        assert entry["raw_stdout"] == "RAW"
+
+
+# ---------------------------------------------------------------------------
 # Project-mode report tests
 # ---------------------------------------------------------------------------
 
@@ -366,7 +451,7 @@ class TestProjectMode:
     def test_project_report_starts_with_ready_to_close(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "met", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
@@ -379,7 +464,7 @@ class TestProjectMode:
     def test_project_report_has_summary_and_recommendation(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x": {"verdict": "met", "evidence": ""},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
         )
 
         def fake_runner(cmd, **kwargs):
