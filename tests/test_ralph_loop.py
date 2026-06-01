@@ -205,7 +205,7 @@ def test_child_scoped_run_targets_only_requested_child():
 
     assert result["status"] == "success"
     pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
-    assert any(prompt.startswith("implement SA-CHILD") for prompt in pi_prompts)
+    assert any(prompt.startswith("implement-single SA-CHILD") for prompt in pi_prompts)
     assert any(prompt.startswith("/skill:audit SA-CHILD") for prompt in pi_prompts)
     assert not any("SA-TARGET" in prompt for prompt in pi_prompts)
     assert runner.items["SA-TARGET"]["audit"] == ""

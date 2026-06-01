@@ -4,26 +4,13 @@
 
 ## Overview
 
-Ralph drives an iterative implement→audit→remediate cycle. When the target work item has children, Ralph operates in **per-child iteration mode**: each child is independently implemented, audited, and remediated before moving to the next child. After all children pass, a final **parent-level integration audit** verifies the aggregate work meets the parent's acceptance criteria.
+Ralph drives an iterative cycle of:
 
-### Per-child iteration (work items with children)
-
-1. **Iterate children** — for each direct child not already `in_review`:
-   1. **Implement** — delegate implementation of that single child via the `implement-single` skill (avoids global `wl next` traversal).
-   2. **Audit** — run `/skill:audit <child-id>` independently against the child's acceptance criteria.
-   3. **Remediate** — if the child audit fails, re-implement only that child (not all children).
-   4. **Compact on transition** — detect children that moved to `in_review` and invoke `/compact` once per transition.
-2. **Integration audit** — after all children pass their individual audits, run a final parent-level audit to verify the aggregate work meets the parent's acceptance criteria.
-3. **Checks and merge** — if the integration audit passes, run build/test checks and optionally merge.
-
-### Single-work-item path (no children)
-
-When the target work item has no children (or the operator uses `--child` to focus on a single child), Ralph uses the classic single-item loop:
-
-1. **Implement** — delegate implementation via the `implement` skill.
-2. **Audit** — run the `audit` skill and persist structured results.
-3. **Remediate** — if audit finds unmet or partial criteria, feed those into the next implement pass.
-4. **Repeat** until audit passes, max attempts are reached, the model reports no safe path without producer input, or the operator cancels.
+1. **Implement (per child)** — if the target has children, Ralph delegates each child individually via `implement-single` (single-work-item runs still use `implement`).
+2. **Compact on child transition** — after each implement pass, detect children that moved to `in_review` and invoke `/compact` once per transition before auditing.
+3. **Audit** — run the `audit` skill after each child implementation and run a final parent-level audit once all children pass.
+4. **Remediate** — if a child audit finds unmet or partial criteria, Ralph re-runs only that child before moving on.
+5. **Repeat** until audits pass, max attempts are reached, the model reports no safe path without producer input, or the operator cancels.
 
 Ralph is launched from the `skill/ralph/ralph` wrapper. The wrapper starts the deterministic loop in the background under `nohup`, writes runtime context under `.worklog/ralph/`, and exposes `ralph status` for live or post-exit inspection.
 
@@ -56,7 +43,7 @@ The background launcher stores the current runtime context in `.worklog/ralph/cu
 |------|---------|-------------|
 | `--max-attempts` | 10 | Maximum number of implement→audit cycles before giving up. |
 | `--check-cmd` | (none) | Build/test command(s) to run after a successful audit. Pytest commands are normalized to `pytest -q -r a --disable-warnings` by default, and package-manager test commands are normalized to quiet variants such as `npm --silent test`. Can be specified multiple times. |
-| `--confirm-merge` | off | Execute `git fetch`, `git merge --ff-only`, `git push` after successful audit and checks. **Without this flag, no merge side effects occur.**  Note: This direct push to main may fail if server-side branch protection requiring pull requests is enabled. See [Merge Safety Model](#merge-safety-model) for PR-based alternatives. |
+| `--confirm-merge` | off | Execute `git fetch`, `git merge --ff-only`, `git push` after successful audit and checks. **Without this flag, no merge side effects occur.** |
 | `--cancel-file` | (none) | Path checked each attempt; if the file exists, the loop stops with status `cancelled`. |
 | `--child` | (none) | Focus the loop on a single direct child work item. Ralph validates that the child belongs to the supplied target and then runs the loop against the child only. |
 | `--debug-persist` | off | Persist raw Pi payloads to `/tmp/ralph-payloads/` when a streamed run produces no user-facing text. |
@@ -282,15 +269,6 @@ Ralph will **never** merge or push without explicit operator confirmation:
 - Without `--confirm-merge`: ralph reports success and notes that merge is available, but performs **no git operations**.
 - With `--confirm-merge`: ralph executes `git fetch origin main`, `git merge --ff-only origin/main`, and `git push origin HEAD`.
 - If any git step fails (e.g., permission denied, push rejected), ralph raises a clear error.
-
-### Branch protection on main
-
-The `--confirm-merge` direct-push approach will **fail** if server-side branch protection requiring pull requests is enabled on `main`. For repositories with branch protection, use one of these alternatives:
-
-1. **Release merge script** (recommended): Use `scripts/release/merge-dev-to-main.sh` which creates a temporary release branch, opens a PR, waits for status checks, and merges via `gh pr merge`. See the [script documentation](../scripts/release/merge-dev-to-main.sh) for usage details.
-2. **Manual PR workflow**: Manually create a PR from your feature branch to `main` using the `gh` CLI, wait for checks to pass, and merge via `gh pr merge --merge --delete-branch`.
-
-The `--confirm-merge` flag is safe to use in repositories **without** branch protection on main, or when the operator has bypass permissions to push directly.
 
 ## Console Output
 

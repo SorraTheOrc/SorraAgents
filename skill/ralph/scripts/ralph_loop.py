@@ -153,33 +153,14 @@ def parse_audit_report(report_text: str) -> AuditParseResult:
         if not striped.startswith("|"):
             continue
         parts = [p.strip() for p in striped.strip("|").split("|")]
-        # Skip header and separator rows
-        if not parts or parts[0] in {"#", "---"}:
+        if len(parts) != 4:
             continue
-        # Try to detect if the first column is a number (criterion index).
-        # If not, this is not a data row.
-        try:
-            int(parts[0])
-        except (ValueError, IndexError):
-            # Not a numeric index — could be a section header or stray table row
+        if parts[0] in {"#", "---"}:
             continue
-        # Handle 4-column format: | # | Criterion | Verdict | Evidence |
-        if len(parts) >= 4:
-            text = parts[1]
-            verdict_raw = parts[2]
-            evidence = parts[3]
-        # Handle 3-column format: | # | Criterion | Verdict |
-        elif len(parts) == 3:
-            text = parts[1]
-            verdict_raw = parts[2]
-            evidence = ""
-        else:
-            continue
-        # Strip bold/italic markers from verdict (e.g. **unmet**)
-        verdict = verdict_raw.lower().strip("*_")
+        verdict = parts[2].lower()
         if verdict not in {"met", "unmet", "partial"}:
             continue
-        criteria.append(CriterionResult(text=text, verdict=verdict, evidence=evidence))
+        criteria.append(CriterionResult(text=parts[1], verdict=verdict, evidence=parts[3]))
     return AuditParseResult(ready_to_close=ready, criteria=criteria)
 
 
@@ -437,39 +418,27 @@ def _build_remediation_prompt() -> str:
     return "The previous audit found issues. Address all the gaps identified in the audit."
 
 
-def _build_implement_prompt(work_item_id: str, remediation: str = "") -> str:
+def _build_implement_prompt(work_item_id: str, remediation: str = "", command: str = "implement") -> str:
     """Build the non-interactive implement prompt for Ralph.
 
     The implement step must never ask the producer questions during the
     default loop. If the model cannot continue safely, it must return a
     structured no_safe_path response that names the missing producer decision.
+
+    :param command: The implement command to invoke (for example "implement"
+        or "implement-single").
     """
+    if command == "implement-single":
+        scope_line = (
+            "Complete only this work item. Do not traverse to dependencies or other work items, "
+            "and do not merge."
+        )
+    else:
+        scope_line = "Continue until the work item and all dependencies are completed, but do not merge."
+
     parts = [
-        f"implement {work_item_id}",
-        "Continue until the work item and all dependencies are completed, but do not merge.",
-        "Do not ask the producer questions or pause for interactive input.",
-        "If you cannot continue safely without explicit producer input, stop and return a structured no_safe_path response with the missing decision.",
-    ]
-    if remediation:
-        parts.append(remediation)
-    return "\n".join(parts)
-
-
-def _build_implement_single_prompt(work_item_id: str, remediation: str = "") -> str:
-    """Build a scoped implement-single prompt for per-child Ralph runs.
-
-    Uses the ``implement-single`` skill which works on exactly the given
-    work-item id without traversing dependencies via ``wl next``.  This is
-    critical for per-child iteration so that implementing one child cannot
-    accidentally pick up or modify sibling work items.
-
-    The implement step must never ask the producer questions during the
-    default loop. If the model cannot continue safely, it must return a
-    structured no_safe_path response that names the missing producer decision.
-    """
-    parts = [
-        f"implement-single {work_item_id}",
-        "Continue until the work item is completed, but do not merge.",
+        f"{command} {work_item_id}",
+        scope_line,
         "Do not ask the producer questions or pause for interactive input.",
         "If you cannot continue safely without explicit producer input, stop and return a structured no_safe_path response with the missing decision.",
     ]
@@ -867,14 +836,7 @@ class RalphLoop:
             "implementation": model_implementation,
             "audit": model_audit,
         }
-        self.model_config = model_config if model_config is not None else {}
-        # When model_source is explicitly set but model_config was not provided
-        # at all (None), auto-load the default config and extract phase model
-        # mappings so that _resolve_model_for_phase can resolve the correct
-        # source-specific model.  Explicitly passing model_config={} is left
-        # intact so that callers (including tests) can opt out of auto-loading.
-        if self.model_source_explicit and model_config is None:
-            self.model_config = _extract_phase_model_config(_load_asset_config())
+        self.model_config = model_config or {}
         self.phase_model_mode_enabled = self.model_source_explicit or any(
             _coerce_model_str(value) is not None for value in self.model_overrides.values()
         ) or any(phase in self.model_config for phase in MODEL_PHASES)
@@ -2002,22 +1964,19 @@ class RalphLoop:
         data = self._wl_show(target_id, children=True)
         return data.get("children", [])
 
-    def run_single_item(self, item_id: str, remediation: str = "", skip_implement: bool = False, no_autoplan: bool = False, use_implement_single: bool = False, force_fresh_audit: bool = False) -> dict:
+    def run_single_item(
+        self,
+        item_id: str,
+        remediation: str = "",
+        skip_implement: bool = False,
+        no_autoplan: bool = False,
+        implement_command: str = "implement",
+    ) -> dict:
         """Run the implement → audit → remediate loop for a single work item.
 
         This is the former body of :meth:`run`, extracted so that the
         per-child iteration in :meth:`run` can invoke it independently for
         each child and then perform a final parent integration audit.
-
-        When *use_implement_single* is True (default for per-child runs),
-        the ``implement-single`` skill is used instead of ``implement`` to
-        avoid ``wl next`` dependency traversal that could pick up sibling
-        work items outside the current child's scope.
-
-        When *force_fresh_audit* is True, the persisted-audit shortcut is
-        bypassed on the first attempt, guaranteeing that ``/skill:audit`` is
-        invoked even if the target already has a recent audit result. This is
-        used for the parent-level integration audit after all children pass.
 
         Returns a dict with at least ``status`` and ``scope`` keys.
         """
@@ -2078,9 +2037,7 @@ class RalphLoop:
                     )
                     previous_child_stages = {}
                 implement_output = self._run_pi(
-                    _build_implement_single_prompt(item_id, remediation)
-                    if use_implement_single
-                    else _build_implement_prompt(item_id, remediation),
+                    _build_implement_prompt(item_id, remediation, command=implement_command),
                     phase="implementation",
                 )
                 self._last_implement_output = implement_output
@@ -2101,7 +2058,7 @@ class RalphLoop:
                         "reason": no_safe_path_reason,
                         "compact": {"invocations": compact_invocations, "failures": compact_failures},
                     }
-            elif skip_implement and attempt == 1 and not force_fresh_audit:
+            elif skip_implement and attempt == 1:
                 # Target already in_review — decide whether start-of-iteration audit is needed
                 logger.info("ralph.loop.single.skip_implement item=%s stage=in_review", item_id)
                 try:
@@ -2115,9 +2072,6 @@ class RalphLoop:
                         use_persisted_audit = True
                 except Exception:
                     logger.exception("ralph.loop.single.pre_audit_check_failed item=%s", item_id)
-            elif skip_implement and attempt == 1 and force_fresh_audit:
-                # Integration audit — always force a fresh audit invocation
-                logger.info("ralph.loop.single.skip_implement.fresh_audit item=%s", item_id)
             else:
                 try:
                     previous_child_stages = self._child_stage_map(item_id)
@@ -2128,9 +2082,7 @@ class RalphLoop:
                     )
                     previous_child_stages = {}
                 implement_output = self._run_pi(
-                    _build_implement_single_prompt(item_id, remediation)
-                    if use_implement_single
-                    else _build_implement_prompt(item_id, remediation),
+                    _build_implement_prompt(item_id, remediation, command=implement_command),
                     phase="implementation",
                 )
                 self._last_implement_output = implement_output
@@ -2270,18 +2222,19 @@ class RalphLoop:
         1. Fetch direct children of *target_id*.
         2. For each child that is not already ``in_review``, run the
            implement → audit → remediate loop via
-           :meth:`run_single_item` using ``implement-single`` (avoids
-           ``wl next`` dependency traversal).
+           :meth:`run_single_item`, delegating implementation to the
+           ``implement-single`` skill so each child is handled independently.
         3. After all children have passed their individual audits, run a final
            parent-level integration audit to verify the aggregate work meets
            the parent's acceptance criteria.
 
         **Backward compatibility** (single-work-item run):
 
-        When no children exist, or when the operator has explicitly scoped the
-        run to a single child via the ``--child`` flag, the method delegates
-        to :meth:`run_single_item` with the classic ``implement`` skill
-        (batch-at-end audit).
+        When no children exist, the method delegates to :meth:`run_single_item`
+        and behaves exactly as before (batch-at-end audit). When the operator
+        scopes to a single child via the ``--child`` flag, Ralph still uses
+        the single-item path but invokes ``implement-single`` to keep the
+        session focused on that child.
 
         :param target_id: The top-level work-item id.
         :param child_id: Optional direct child to focus on. When provided, the
@@ -2297,7 +2250,11 @@ class RalphLoop:
                 "ralph.loop.child_scoped target=%s focus=%s (single-item path)",
                 target_id, focus_id,
             )
-            return self.run_single_item(focus_id, no_autoplan=self.no_autoplan)
+            return self.run_single_item(
+                focus_id,
+                no_autoplan=self.no_autoplan,
+                implement_command="implement-single",
+            )
 
         # --- Fetch children ---
         children = self._get_children(target_id)
@@ -2344,7 +2301,11 @@ class RalphLoop:
             except Exception:
                 previous_child_stages = {}
 
-            result = self.run_single_item(cid, no_autoplan=self.no_autoplan, use_implement_single=True)
+            result = self.run_single_item(
+                cid,
+                no_autoplan=self.no_autoplan,
+                implement_command="implement-single",
+            )
             all_child_results[cid] = result
 
             # Run compact for children that newly transitioned to in_review
@@ -2358,38 +2319,23 @@ class RalphLoop:
                 logger.exception("ralph.compact.failed_after_child target=%s child=%s", target_id, cid)
 
             if result.get("status") not in ("success",):
-                # Record the failure but continue processing remaining siblings.
-                # The integration audit will be skipped if any child failed.
                 logger.warning(
                     "ralph.loop.iterate.child_failed target=%s child=%s status=%s",
                     target_id, cid, result.get("status"),
                 )
-                continue
+                self._cleanup_pi_process()
+                return {
+                    "status": f"child_{result.get('status', 'unknown')}",
+                    "child_results": all_child_results,
+                    "failed_child": cid,
+                    "compact": {"invocations": compact_invocations, "failures": compact_failures},
+                }
 
             logger.info(
                 "ralph.loop.iterate.child_passed target=%s child=%s attempt=%d",
                 target_id, cid, result.get("attempt", ""),
             )
             child_ids_to_audit.append(cid)
-
-        # --- Check for any child failures before running integration audit ---
-        failed_children = [
-            cid for cid, r in all_child_results.items()
-            if isinstance(r, dict) and r.get("status") not in ("success", "skipped")
-        ]
-
-        if failed_children:
-            logger.warning(
-                "ralph.loop.children_failed target=%s failed=%s",
-                target_id, failed_children,
-            )
-            self._cleanup_pi_process()
-            return {
-                "status": f"child_{all_child_results[failed_children[0]].get('status', 'unknown')}",
-                "child_results": all_child_results,
-                "failed_children": failed_children,
-                "compact": {"invocations": compact_invocations, "failures": compact_failures},
-            }
 
         # --- Final parent integration audit ---
         logger.info(
@@ -2401,7 +2347,6 @@ class RalphLoop:
             target_id,
             skip_implement=True,
             no_autoplan=True,
-            force_fresh_audit=True,
         )
 
         if integration_result.get("status") == "success":
