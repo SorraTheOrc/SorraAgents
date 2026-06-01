@@ -37,7 +37,7 @@ field in new critical issues.
 
 ## Scripts
 
-- `scripts/infer_owner.py` — CLI entrypoint and library functions.
+- `skill/owner-inference/scripts/infer_owner.py` — CLI entrypoint and library functions.
 
 ## Configuration
 

@@ -70,7 +70,7 @@ Follow these steps from the project root (run commands from the repository root,
 3) Run the orchestrator. Prefer capturing output to a filename derived from the work-item id (avoid fixed names):
 
        ```sh
-       python3 scripts/run_skill.py --issue <issue-id> <<'JSON' > final-<issue-id>.json
+       python3 skill/effort-and-risk/scripts/run_skill.py --issue <issue-id> <<'JSON' > final-<issue-id>.json
        { ... }
        JSON
        ```
@@ -90,10 +90,10 @@ Outputs
 References (bundled)
 --------------------
 - references/t-shirt_sizes.json — T-shirt thresholds used by scripts
-- scripts/calc_effort.py
-- scripts/calc_risk.py
-- scripts/calc_effort_with_risk.py
-- scripts/assemble_json.py
-- scripts/json_to_human.py
-- scripts/orchestrate_estimate.py
+- skill/effort-and-risk/scripts/calc_effort.py
+- skill/effort-and-risk/scripts/calc_risk.py
+- skill/effort-and-risk/scripts/calc_effort_with_risk.py
+- skill/effort-and-risk/scripts/assemble_json.py
+- skill/effort-and-risk/scripts/json_to_human.py
+- skill/effort-and-risk/scripts/orchestrate_estimate.py
 
