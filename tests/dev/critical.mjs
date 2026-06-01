@@ -203,6 +203,12 @@ test('critical: AGENTS.md workflow pushes to dev; ship handles release to main',
     agentsMd.includes('merge-dev-to-main.sh') || agentsMd.includes('scripts/release'),
     'AGENTS.md should reference the release merge script',
   );
+
+  // After pushing to dev, agent should switch to dev locally
+  assert.ok(
+    agentsMd.includes('git checkout dev'),
+    'AGENTS.md should instruct switching to dev branch after push',
+  );
 });
 
 // ---------------------------------------------------------------------------
