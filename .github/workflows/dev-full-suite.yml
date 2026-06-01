@@ -1,43 +1,20 @@
-# dev-full-suite — Pre-merge full test-suite gating job
-#
-# Triggers:
-#   - Manual dispatch via the GitHub Actions UI (workflow_dispatch)
-#   - Push of a release-candidate tag matching pattern rc-*
-#   - Pull requests targeting main (as a required status check)
-#
-# Purpose:
-#   This job runs the project's full test suite and is intended to be the
-#   gating step before merging dev → main. Release managers trigger a
-#   release-candidate tag or use the manual "Run workflow" button. The
-#   merge to main should only proceed when this job reports success.
-#
-# Re-running:
-#   - Via GitHub Actions UI: Actions → dev-full-suite → "Run workflow"
-#   - Via CLI: gh workflow run dev-full-suite.yml --ref <branch-or-tag>
-#   - Pushing a tag matching rc-* to origin also triggers it automatically.
-
 name: dev-full-suite
 
 on:
   workflow_dispatch:
     inputs:
       reason:
-        description: "Reason for running the full suite (e.g. pre-merge gate, release candidate)"
+        description: "Reason for running the full suite"
         required: false
-        default: "pre-merge gate"
+        default: "Pre-merge release candidate"
   push:
-    tags:
-      - "rc-*"
-  pull_request:
     branches:
-      - main
+      - 'release-candidate/**'
 
 jobs:
   full-suite:
-    name: Full test suite
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,24 +27,31 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install pytest pytest-html jsonschema pyyaml
 
       - name: Run full test suite
-        run: pytest --tb=short --junitxml=test-results.xml -v
+        run: pytest --tb=short --junitxml=test-results-full.xml --html=test-report.html --self-contained-html
 
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: full-suite-test-results
-          path: test-results.xml
+          name: full-test-results
+          path: |
+            test-results-full.xml
+            test-report.html
 
-      - name: Summary
+      - name: Publish test summary
         if: always()
-        run: |
-          echo "## dev-full-suite result" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ job.status }}" = "success" ]; then
-            echo "✅ Full test suite **passed**" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ Full test suite **failed** — review logs before merging" >> $GITHUB_STEP_SUMMARY
-          fi
+        uses: test-summary/action@v2
+        with:
+          paths: test-results-full.xml
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-test-logs
+          path: |
+            .pytest_cache/
+            tests/__pycache__/

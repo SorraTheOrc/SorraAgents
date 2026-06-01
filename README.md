@@ -49,6 +49,30 @@ A useful debugging pattern is to focus Ralph on a single direct child work item:
 python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
 ```
 
+## CI Workflows
+
+This repository uses GitHub Actions to validate changes. The following workflows are available:
+
+| Workflow | File | Trigger | Description |
+|---|---|---|---|
+| CI | `.github/workflows/ci.yml` | push, pull_request | Full unit test suite on every push and PR. Required status check for `main`. |
+| Cleanup dry-run | `.github/workflows/cleanup.yml` | pull_request, workflow_dispatch | Validates cleanup scripts in dry-run mode. |
+| Dev smoke | `.github/workflows/dev-smoke.yml` | push to `dev` | Runs smoke and critical tests on the `dev` branch. Results appear in commit checks. |
+| Dev full suite | `.github/workflows/dev-full-suite.yml` | workflow_dispatch, push to `release-candidate/**` | Runs the full test suite. Artifacts (JUnit XML, HTML report, logs) are uploaded for reviewer use. |
+
+### Re-running jobs
+
+- **Dev smoke**: Pushes to `dev` trigger automatically. Results are visible in the Actions tab and on commit check pages.
+- **Dev full suite**: Go to **Actions → dev-full-suite → Run workflow** and select the branch. Optionally provide a reason. This is intended for release managers to run before merging `dev` → `main`.
+
+### Release process
+
+The `dev-full-suite` workflow result is used as a gate in the release process:
+1. Changes are integrated into `dev` via feature branch pushes.
+2. The release manager triggers `dev-full-suite` manually on the release candidate.
+3. If the full suite passes, the release manager reviews uploaded artifacts and proceeds with the `dev` → `main` merge.
+4. If the full suite fails, the release is blocked until failures are resolved.
+
 ## Prerequisites
 
 The dev container commands (`wl ampa start-work`, `finish-work`, `list-containers`) require the following tools on the host:
