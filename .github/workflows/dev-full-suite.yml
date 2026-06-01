@@ -31,9 +31,10 @@ jobs:
 
       - name: Install Worklog CLI (wl)
         # This step attempts to install the 'wl' CLI used across tests. By default
-        # it will try to clone from a repository specified in the secret
-        # WL_REPO (owner/repo format). If not present, it falls back to pip and
-        # finally creates a minimal stub to avoid FileNotFoundError in CI.
+        # it will try to clone from a repository specified in WL_REPO (owner/repo
+        # format). We hard-code ContextHub here as the canonical source. If the
+        # repository cannot be installed, fall back to pip and finally create a
+        # minimal stub to avoid FileNotFoundError in CI.
         env:
           WL_REPO: "TheWizardsCode/ContextHub"
         run: |
@@ -70,12 +71,12 @@ jobs:
           fi
 
           # Last resort: create a minimal wl stub in the workspace and add it
-          # to PATH for subsequent steps. This is intentionally conservative
-          # and only intended as a temporary CI shim until a proper install is
-          # available from WL_REPO.
+          # to PATH for subsequent steps. Use a small Python writer to avoid
+          # complex shell quoting issues inside YAML.
           echo "Creating minimal wl stub (temporary fallback)"
-          cat > "$GITHUB_WORKSPACE/wl" <<'WLSTUB'
-#!/usr/bin/env bash
+          python - <<'PY'
+import os
+s = '''#!/usr/bin/env bash
 # Minimal wl stub for CI test runs — implements a tiny subset needed by tests.
 if [ "$1" = "show" ]; then
   # Return a minimal, plausible workItem JSON to avoid parse errors in tests.
@@ -85,7 +86,13 @@ fi
 # Default: print an empty JSON object
 echo "{}"
 exit 0
-WLSTUB
+'''
+path = os.path.join(os.environ.get('GITHUB_WORKSPACE','.'),'wl')
+with open(path,'w',newline='\n') as fh:
+    fh.write(s)
+print('wrote',path)
+PY
+
           chmod +x "$GITHUB_WORKSPACE/wl"
           # Persist PATH update for subsequent steps
           echo "PATH=$GITHUB_WORKSPACE:$PATH" >> "$GITHUB_ENV"
