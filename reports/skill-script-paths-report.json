@@ -1,0 +1,445 @@
+{
+  "__pycache__": {
+    "path": "skill/__pycache__",
+    "hits": [],
+    "pass": true
+  },
+  "audit": {
+    "path": "skill/audit",
+    "hits": [
+      {
+        "file": "skill/audit/SKILL.md",
+        "line": 159,
+        "text": "- Path: `skill/audit/scripts/persist_audit.py`",
+        "match": "scripts/persist_audit.py"
+      },
+      {
+        "file": "skill/audit/SKILL.md",
+        "line": 161,
+        "text": "- Persist from stdin: `cat report.md | python3 skill/audit/scripts/persist_audit.py --issue-id SA-123`",
+        "match": "scripts/persist_audit.py"
+      },
+      {
+        "file": "skill/audit/SKILL.md",
+        "line": 162,
+        "text": "- Persist from a file: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --file report.md`",
+        "match": "scripts/persist_audit.py"
+      },
+      {
+        "file": "skill/audit/SKILL.md",
+        "line": 163,
+        "text": "- Persist from a CLI string: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --report \"Ready to close: Yes\\n...\"`",
+        "match": "scripts/persist_audit.py"
+      }
+    ],
+    "pass": false
+  },
+  "author-command": {
+    "path": "skill/author-command",
+    "hits": [],
+    "pass": true
+  },
+  "changelog-generator": {
+    "path": "skill/changelog-generator",
+    "hits": [],
+    "pass": true
+  },
+  "cleanup": {
+    "path": "skill/cleanup",
+    "hits": [
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 26,
+        "text": "- The skill ships a set of deterministic scripts under `./scripts/` that implement the non-interactive behaviour described below. Each script supports `--dry-run`, `--yes`, `--report <path>`, `--quiet`, and `--verbose`.",
+        "match": "scripts/"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 47,
+        "text": "Use `skill/cleanup/scripts/inspect_current_branch.py` to inspect the current branch, detect the default branch, fetch `origin --prune` when needed, determine merge status, last commit, unpushed commits, and parse work item token. The agent MUST run this script by default and only perform inline git inspections if an edge case (see \"Preferred execution behaviour\") applies and the operator approves.",
+        "match": "scripts/inspect_current_branch.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 74,
+        "text": "python skill/cleanup/scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json",
+        "match": "scripts/inspect_current_branch.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 74,
+        "text": "python skill/cleanup/scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json",
+        "match": "python skill/cleanup/scripts/inspect_current_branch.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 89,
+        "text": "Run `skill/cleanup/scripts/switch_to_default_and_update.py` to fetch, check out the default branch, and perform a fast-forward pull. The agent MUST run this script by default (see Preferred execution behaviour) and only attempt manual git switch/pull sequences when explicitly instructed by the human in an allowed edge case.",
+        "match": "scripts/switch_to_default_and_update.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 96,
+        "text": "python skill/cleanup/scripts/switch_to_default_and_update.py --report /tmp/cleanup/switch_default.json",
+        "match": "scripts/switch_to_default_and_update.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 96,
+        "text": "python skill/cleanup/scripts/switch_to_default_and_update.py --report /tmp/cleanup/switch_default.json",
+        "match": "python skill/cleanup/scripts/switch_to_default_and_update.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 101,
+        "text": "Run `skill/cleanup/scripts/summarize_branches.py` to list local branches and include any open PRs targeting the default branch. The agent MUST run this script by default and present the script-generated report, in markdown format, for any deletion decisions.",
+        "match": "scripts/summarize_branches.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 110,
+        "text": "python skill/cleanup/scripts/summarize_branches.py --report /tmp/cleanup/branches.json",
+        "match": "scripts/summarize_branches.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 110,
+        "text": "python skill/cleanup/scripts/summarize_branches.py --report /tmp/cleanup/branches.json",
+        "match": "python skill/cleanup/scripts/summarize_branches.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 115,
+        "text": "Use `skill/cleanup/scripts/prune_local_branches.py` with an explicit branch list derived from the summarize report and user input. The summarize report and user choice are the authoritative source; the prune script only deletes branches you pass in. The agent MUST NOT delete branches outside of the explicit branch list produced by the script and approved by the human.",
+        "match": "scripts/prune_local_branches.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 121,
+        "text": "python skill/cleanup/scripts/prune_local_branches.py \\",
+        "match": "scripts/prune_local_branches.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 121,
+        "text": "python skill/cleanup/scripts/prune_local_branches.py \\",
+        "match": "python skill/cleanup/scripts/prune_local_branches.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 126,
+        "text": "python ./scripts/prune_local_branches.py --dry-run \\",
+        "match": "scripts/prune_local_branches.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 133,
+        "text": "Run `skill/cleanup/scripts/delete_remote_branches.py` \u2014 deletes remote branches that are merged into default and older than a threshold (default 14 days). Report on branches deleted, skipped (e.g., due to open PRs), and any errors.",
+        "match": "scripts/delete_remote_branches.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 139,
+        "text": "python skill/cleanup/scripts/delete_remote_branches.py --days 14 --report /tmp/cleanup/delete_remote.json",
+        "match": "scripts/delete_remote_branches.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 139,
+        "text": "python skill/cleanup/scripts/delete_remote_branches.py --days 14 --report /tmp/cleanup/delete_remote.json",
+        "match": "python skill/cleanup/scripts/delete_remote_branches.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 142,
+        "text": "python skill/cleanup/scripts/delete_remote_branches.py --days 14 --dry-run --report /tmp/cleanup/delete_remote.json",
+        "match": "scripts/delete_remote_branches.py"
+      },
+      {
+        "file": "skill/cleanup/SKILL.md",
+        "line": 142,
+        "text": "python skill/cleanup/scripts/delete_remote_branches.py --days 14 --dry-run --report /tmp/cleanup/delete_remote.json",
+        "match": "python skill/cleanup/scripts/delete_remote_branches.py"
+      }
+    ],
+    "pass": false
+  },
+  "code-review": {
+    "path": "skill/code-review",
+    "hits": [],
+    "pass": true
+  },
+  "effort-and-risk": {
+    "path": "skill/effort-and-risk",
+    "hits": [
+      {
+        "file": "skill/effort-and-risk/SKILL.md",
+        "line": 73,
+        "text": "python3 scripts/run_skill.py --issue <issue-id> <<'JSON' > final-<issue-id>.json",
+        "match": "scripts/run_skill.py"
+      },
+      {
+        "file": "skill/effort-and-risk/SKILL.md",
+        "line": 93,
+        "text": "- scripts/calc_effort.py",
+        "match": "scripts/calc_effort.py"
+      },
+      {
+        "file": "skill/effort-and-risk/SKILL.md",
+        "line": 94,
+        "text": "- scripts/calc_risk.py",
+        "match": "scripts/calc_risk.py"
+      },
+      {
+        "file": "skill/effort-and-risk/SKILL.md",
+        "line": 95,
+        "text": "- scripts/calc_effort_with_risk.py",
+        "match": "scripts/calc_effort_with_risk.py"
+      },
+      {
+        "file": "skill/effort-and-risk/SKILL.md",
+        "line": 96,
+        "text": "- scripts/assemble_json.py",
+        "match": "scripts/assemble_json.py"
+      },
+      {
+        "file": "skill/effort-and-risk/SKILL.md",
+        "line": 97,
+        "text": "- scripts/json_to_human.py",
+        "match": "scripts/json_to_human.py"
+      },
+      {
+        "file": "skill/effort-and-risk/SKILL.md",
+        "line": 98,
+        "text": "- scripts/orchestrate_estimate.py",
+        "match": "scripts/orchestrate_estimate.py"
+      }
+    ],
+    "pass": false
+  },
+  "find-related": {
+    "path": "skill/find-related",
+    "hits": [],
+    "pass": true
+  },
+  "implement": {
+    "path": "skill/implement",
+    "hits": [
+      {
+        "file": "skill/implement/SKILL.md",
+        "line": 139,
+        "text": "- Example: `python3 skill/triage/scripts/check_or_create.py '{\"test_name\":\"<name>\", \"stdout_excerpt\":\"...\", \"stack_trace\":\"...\"}'`",
+        "match": "scripts/check_or_create.py"
+      },
+      {
+        "file": "skill/implement/SKILL.md",
+        "line": 163,
+        "text": "- Using the ship skill: `pushToDev()` from `skill/ship/scripts/ship.js` (preferred)",
+        "match": "scripts/ship.js"
+      },
+      {
+        "file": "skill/implement/SKILL.md",
+        "line": 173,
+        "text": "> See `skill/ship/SKILL.md` for the push-to-dev workflow and `scripts/release/merge-dev-to-main.sh` for the release process.",
+        "match": "scripts/release/merge-dev-to-main.sh"
+      }
+    ],
+    "pass": false
+  },
+  "implement-single": {
+    "path": "skill/implement-single",
+    "hits": [],
+    "pass": true
+  },
+  "owner-inference": {
+    "path": "skill/owner-inference",
+    "hits": [
+      {
+        "file": "skill/owner-inference/SKILL.md",
+        "line": 40,
+        "text": "- `scripts/infer_owner.py` \u2014 CLI entrypoint and library functions.",
+        "match": "scripts/infer_owner.py"
+      }
+    ],
+    "pass": false
+  },
+  "owner_inference": {
+    "path": "skill/owner_inference",
+    "hits": [
+      {
+        "file": "skill/owner_inference/scripts/infer_owner.py",
+        "line": 1,
+        "text": "# Compatibility shim: delegate to the implementation in skill/owner-inference/scripts/infer_owner.py",
+        "match": "scripts/infer_owner.py"
+      }
+    ],
+    "pass": false
+  },
+  "ralph": {
+    "path": "skill/ralph",
+    "hits": [
+      {
+        "file": "skill/ralph/ralph",
+        "line": 8,
+        "text": "exec python3 \"$BASEDIR/scripts/ralph_control.py\" \"$@\"",
+        "match": "scripts/ralph_control.py"
+      },
+      {
+        "file": "skill/ralph/ralph",
+        "line": 10,
+        "text": "exec python3 \"$BASEDIR/scripts/ralph_control.py\" launch \"$@\"",
+        "match": "scripts/ralph_control.py"
+      },
+      {
+        "file": "skill/ralph/SKILL.md",
+        "line": 73,
+        "text": "# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <work-item-id> --json",
+        "match": "scripts/ralph_loop.py"
+      },
+      {
+        "file": "skill/ralph/SKILL.md",
+        "line": 76,
+        "text": "# python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json",
+        "match": "scripts/ralph_loop.py"
+      },
+      {
+        "file": "skill/ralph/SKILL.md",
+        "line": 81,
+        "text": "# python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id> --json",
+        "match": "scripts/ralph_loop.py"
+      },
+      {
+        "file": "skill/ralph/tests/test_structured_response.py",
+        "line": 39,
+        "text": "{\"command\": \"edit\", \"args\": [\"skill/ralph/scripts/ralph_loop.py\"]},",
+        "match": "scripts/ralph_loop.py"
+      },
+      {
+        "file": "skill/ralph/tests/test_structured_response.py",
+        "line": 47,
+        "text": "assert parsed.text == \"edit skill/ralph/scripts/ralph_loop.py\"",
+        "match": "scripts/ralph_loop.py"
+      },
+      {
+        "file": "skill/ralph/tests/test_structured_response.py",
+        "line": 48,
+        "text": "assert parsed.summary == \"edit skill/ralph/scripts/ralph_loop.py\"",
+        "match": "scripts/ralph_loop.py"
+      },
+      {
+        "file": "skill/ralph/tests/test_structured_response.py",
+        "line": 49,
+        "text": "assert parsed.actions[0].render() == \"edit skill/ralph/scripts/ralph_loop.py\"",
+        "match": "scripts/ralph_loop.py"
+      }
+    ],
+    "pass": false
+  },
+  "resolve-pr-comments": {
+    "path": "skill/resolve-pr-comments",
+    "hits": [],
+    "pass": true
+  },
+  "ship": {
+    "path": "skill/ship",
+    "hits": [
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 62,
+        "text": "- `scripts/ship.js` \u2014 Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, and re-exports from `git-helpers.js`)",
+        "match": "scripts/ship.js"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 63,
+        "text": "- `scripts/git-helpers.js` \u2014 Branch naming and policy helpers (exports: `makeBranchName`, `validateBranchName`, `isBranchBlocked`, `BLOCKED_BRANCHS`, `BRANCH_NAME_PATTERN`)",
+        "match": "scripts/git-helpers.js"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 64,
+        "text": "- `scripts/release/merge-dev-to-main.sh` \u2014 the canonical release merge script",
+        "match": "scripts/release/merge-dev-to-main.sh"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 70,
+        "text": "import { pushToDev } from './scripts/ship.js';",
+        "match": "scripts/ship.js"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 70,
+        "text": "import { pushToDev } from './scripts/ship.js';",
+        "match": "import { pushToDev } from './scripts/ship.js'"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 78,
+        "text": "import { makeBranchName, validateBranchName, isBranchBlocked } from './scripts/git-helpers.js';",
+        "match": "scripts/git-helpers.js"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 78,
+        "text": "import { makeBranchName, validateBranchName, isBranchBlocked } from './scripts/git-helpers.js';",
+        "match": "import { makeBranchName, validateBranchName, isBranchBlocked } from './scripts/git-helpers.js'"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 94,
+        "text": "1. **Create a feature branch** using `makeBranchName(workItemId, shortDesc)` from `scripts/git-helpers.js`.",
+        "match": "scripts/git-helpers.js"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 97,
+        "text": "4. **Push to dev** using `pushToDev()` from `scripts/ship.js`. This:",
+        "match": "scripts/ship.js"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 162,
+        "text": "bash scripts/release/merge-dev-to-main.sh",
+        "match": "scripts/release/merge-dev-to-main.sh"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 162,
+        "text": "bash scripts/release/merge-dev-to-main.sh",
+        "match": "bash scripts/release/merge-dev-to-main.sh"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 196,
+        "text": "| **Automated script** | Run `bash scripts/release/merge-dev-to-main.sh` manually | Ship subagent unavailable but script is available |",
+        "match": "scripts/release/merge-dev-to-main.sh"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 196,
+        "text": "| **Automated script** | Run `bash scripts/release/merge-dev-to-main.sh` manually | Ship subagent unavailable but script is available |",
+        "match": "bash scripts/release/merge-dev-to-main.sh"
+      },
+      {
+        "file": "skill/ship/SKILL.md",
+        "line": 217,
+        "text": "executor. The agent should invoke `scripts/release/merge-dev-to-main.sh`",
+        "match": "scripts/release/merge-dev-to-main.sh"
+      }
+    ],
+    "pass": false
+  },
+  "triage": {
+    "path": "skill/triage",
+    "hits": [
+      {
+        "file": "skill/triage/SKILL.md",
+        "line": 37,
+        "text": "- `scripts/check_or_create.py` \u2014 implementation using `wl` CLI.",
+        "match": "scripts/check_or_create.py"
+      }
+    ],
+    "pass": false
+  }
+}
