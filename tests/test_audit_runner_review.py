@@ -311,7 +311,7 @@ class TestCmdIssueWithPi:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-INTEGRATION", runner=fake_runner, model="test/model")
+        cmd_issue("SA-INTEGRATION", runner=fake_runner, model="test/model", persist=False)
         # ACs are batched into a single Pi call, so expect at least 1 call
         assert len(pi_calls) >= 1
 
@@ -338,7 +338,7 @@ class TestCmdIssueWithPi:
                 stdout=json.dumps(_load_fixture("wi_with_bulleted_ac.json")),
             )
 
-        cmd_issue("SA-VERDICTS", runner=fake_runner)
+        cmd_issue("SA-VERDICTS", runner=fake_runner, persist=False)
         captured = capsys.readouterr()
         assert "partial" in captured.out
         assert "handler.py:22" in captured.out
@@ -368,7 +368,7 @@ class TestCmdIssueWithPi:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-YES", runner=fake_runner)
+        cmd_issue("SA-YES", runner=fake_runner, persist=False)
         captured = capsys.readouterr()
         assert captured.out.startswith("Ready to close: Yes")
 
@@ -451,7 +451,7 @@ class TestChildrenReview:
         ]
 
         runner = self._make_child_runner(children)
-        cmd_issue("SA-CHILDREN", runner=runner)
+        cmd_issue("SA-CHILDREN", runner=runner, persist=False)
         captured = capsys.readouterr()
         # Completed child should NOT appear in the review (skipped)
         assert "Completed child" not in captured.out
@@ -481,7 +481,7 @@ class TestChildrenReview:
         ]
 
         runner = self._make_child_runner(children)
-        cmd_issue("SA-CHILDREN", runner=runner)
+        cmd_issue("SA-CHILDREN", runner=runner, persist=False)
         captured = capsys.readouterr()
         assert "Deleted child" not in captured.out
 
@@ -508,7 +508,7 @@ class TestChildrenReview:
         ]
 
         runner = self._make_child_runner(children)
-        cmd_issue("SA-CHILDREN", runner=runner)
+        cmd_issue("SA-CHILDREN", runner=runner, persist=False)
         captured = capsys.readouterr()
         # Should mention the cap in the explicit note
         assert "omitted for brevity" in captured.out
@@ -559,7 +559,7 @@ class TestCmdIssueJsonMode:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True)
+        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True, persist=False)
         captured = capsys.readouterr()
         payload = json.loads(captured.out)
         assert "ready_to_close" in payload
@@ -589,7 +589,7 @@ class TestCmdIssueJsonMode:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True)
+        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True, persist=False)
         captured = capsys.readouterr()
         payload = json.loads(captured.out)
         assert payload["ready_to_close"] is True
@@ -613,7 +613,7 @@ class TestCmdIssueJsonMode:
                 stdout=json.dumps(_load_fixture("wi_with_bulleted_ac.json")),
             )
 
-        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True)
+        cmd_issue("SA-JSON", runner=fake_runner, json_mode=True, persist=False)
         captured = capsys.readouterr()
         payload = json.loads(captured.out)
         assert len(payload["acceptance_criteria"]) == 3
@@ -634,7 +634,7 @@ class TestCmdIssueJsonMode:
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-MD", runner=fake_runner, json_mode=False)
+        cmd_issue("SA-MD", runner=fake_runner, json_mode=False, persist=False)
         captured = capsys.readouterr()
         assert captured.out.startswith("Ready to close:")
 
