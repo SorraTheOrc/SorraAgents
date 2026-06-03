@@ -48,7 +48,7 @@ is invoked.
 - Keep implementation focused on meeting acceptance criteria with minimal changes.
 - Never edit code outside of `src/`, `tests/` and `docs/` for this project unless
   they are essential configuration files.
-- Never edit code in bundled libraries such as `dist/` and `node_modules/`.
+- Never edit code in bundled libraries such as `dist/` and `node_modules`.
 - When implementing a CLI or API always provide a way to obtain a JSON
   formatted output for agents to consume.
 - Use work item comments to document your process, decisions, and next steps.
@@ -117,3 +117,20 @@ Execute the following steps in order. Do not skip steps.
 - Mark the work item as in-review:
   `wl update <work-item-id> --status completed --stage in_review --json`
 - Do not create a PR or merge. Ralph will handle PR/merge externally.
+
+## Scripts (canonical runner & modules)
+
+This skill does not ship a canonical CLI runner. When present, prefer any
+repository-provided implement helper script to ensure deterministic behavior.
+
+Usage (work-item example):
+
+```bash
+# Fetch the single work item for context
+wl show SA-0MPYMFZXO0004ZU4 --json --children
+
+# After completing implementation, mark the item in_review
+wl update SA-0MPYMFZXO0004ZU4 --stage in_review --json
+```
+
+End.

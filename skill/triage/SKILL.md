@@ -59,3 +59,33 @@ Telemetry
 Examples
 --------
 Calling the script with a JSON payload should return the structured result and print JSON to stdout.
+
+Example invocation (documentation):
+
+```bash
+# Example payload saved to payload.json
+cat <<'JSON' > payload.json
+{
+  "test_name": "tests/test_example.py::test_failure",
+  "stdout_excerpt": "AssertionError: expected 1 but got 0",
+  "stack_trace": "...",
+  "commit_hash": "abc123",
+  "repo_path": ".",
+  "file_path": "tests/test_example.py"
+}
+
+# Run the triage helper (prints JSON to stdout)
+python3 skill/triage/scripts/check_or_create.py payload.json
+```
+
+Possible script output when a new critical issue is created:
+
+```json
+{ "issueId": "SA-0MPYMFZXO0004ZU4", "created": true, "reason": "No matching incomplete test-failure issue found; created new." }
+```
+
+Or, when matching an existing issue:
+
+```json
+{ "issueId": "SA-EXISTING", "created": false, "matchedId": "SA-EXISTING", "reason": "Matched existing test-failure issue by test name." }
+```
