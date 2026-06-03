@@ -52,7 +52,7 @@ The background launcher stores the current runtime context in `.worklog/ralph/cu
 |------|---------|-------------|
 | `--max-attempts` | 10 | Maximum number of implement→audit cycles before giving up. |
 | `--check-cmd` | (none) | Build/test command(s) to run after a successful audit. Pytest commands are normalized to `pytest -q -r a --disable-warnings` by default, and package-manager test commands are normalized to quiet variants such as `npm --silent test`. Can be specified multiple times. |
-| `--confirm-merge` | off | Execute `git fetch`, `git merge --ff-only`, `git push` after successful audit and checks. **Without this flag, no merge side effects occur.** |
+| `--confirm-merge` | off | Execute `git fetch`, `git merge --ff-only`, `git push` after successful audit and checks. **Without this flag, no merge side effects occur.**  Note: This direct push to main may fail if server-side branch protection requiring pull requests is enabled. See [Merge Safety Model](#merge-safety-model) for PR-based alternatives. |
 | `--cancel-file` | (none) | Path checked each attempt; if the file exists, the loop stops with status `cancelled`. |
 | `--child` | (none) | Focus the loop on a single direct child work item. Ralph validates that the child belongs to the supplied target and then runs the loop against the child only. |
 | `--debug-persist` | off | Persist raw Pi payloads to `/tmp/ralph-payloads/` when a streamed run produces no user-facing text. |
@@ -278,6 +278,15 @@ Ralph will **never** merge or push without explicit operator confirmation:
 - Without `--confirm-merge`: ralph reports success and notes that merge is available, but performs **no git operations**.
 - With `--confirm-merge`: ralph executes `git fetch origin main`, `git merge --ff-only origin/main`, and `git push origin HEAD`.
 - If any git step fails (e.g., permission denied, push rejected), ralph raises a clear error.
+
+### Branch protection on main
+
+The `--confirm-merge` direct-push approach will **fail** if server-side branch protection requiring pull requests is enabled on `main`. For repositories with branch protection, use one of these alternatives:
+
+1. **Release merge script** (recommended): Use `scripts/release/merge-dev-to-main.sh` which creates a temporary release branch, opens a PR, waits for status checks, and merges via `gh pr merge`. See the [script documentation](../scripts/release/merge-dev-to-main.sh) for usage details.
+2. **Manual PR workflow**: Manually create a PR from your feature branch to `main` using the `gh` CLI, wait for checks to pass, and merge via `gh pr merge --merge --delete-branch`.
+
+The `--confirm-merge` flag is safe to use in repositories **without** branch protection on main, or when the operator has bypass permissions to push directly.
 
 ## Console Output
 
