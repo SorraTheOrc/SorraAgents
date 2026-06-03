@@ -163,6 +163,12 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Using the ship skill: `pushToDev()` from `skill/ship/scripts/ship.js` (preferred)
   - Direct git command: `git push origin HEAD:refs/heads/dev`
   - The push target `dev` is **not** a protected branch; the `.githooks/pre-push` hook only blocks `main`, `master`, and `HEAD`.
+- After pushing, switch to the `dev` branch locally and pull the latest:
+  ```bash
+  git checkout dev
+  git pull origin dev
+  ```
+  This ensures subsequent operations begin from the current HEAD of the integration branch.
 - Add a work-item comment recording the commit hash and that the work has been pushed to dev:
   `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>. The work-item stays open until the release process merges dev to main." --author "<AGENT>" --json`
 - Mark the work item as `in_review` (do **NOT** close it):

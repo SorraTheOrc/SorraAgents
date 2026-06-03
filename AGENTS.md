@@ -70,10 +70,13 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      from `dev` to `main`. See [skill/ship/SKILL.md](skill/ship/SKILL.md) for
      the push-to-dev workflow and `scripts/release/merge-dev-to-main.sh` for
      the dev→main release process.
-   - After pushing, switch to the `dev` branch locally:
-     `git checkout dev`
+   - After pushing, switch to the `dev` branch locally and pull the latest:
+     ```bash
+     git checkout dev
+     git pull origin dev
+     ```
      This ensures subsequent operations (e.g., starting the next work-item)
-     begin from the current state of the integration branch.
+     begin from the current HEAD of the integration branch.
    - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
    - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
 
