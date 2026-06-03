@@ -817,12 +817,24 @@ def _validate_pi_output(
 DEFAULT_AUTOPLAN_EFFORT_SKIP: frozenset[str] = frozenset({"Extra Small", "Small"})
 DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
 
+# Maximum consecutive attempts on unchanged code before reporting a stall
+DEFAULT_MAX_CYCLES_NO_CHANGE: int = 3
+
 
 
 
 def _comment_hash(audit_text: str) -> str:
     """Return a 16-char hex digest of audit_text for comment deduplication."""
     return hashlib.sha256(audit_text.encode("utf-8")).hexdigest()[:16]
+
+
+def _has_ready_to_close_marker(text: str) -> bool:
+    """Check if text contains a valid 'Ready to close:' marker."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("ready to close:"):
+            return True
+    return False
 
 
 class RalphLoop:
@@ -842,6 +854,7 @@ class RalphLoop:
         legacy_model_explicit: bool | None = None,
         check_cmds: list[str] | None = None,
         max_attempts: int = 10,
+        max_cycles_no_change: int | None = None,
         confirm_merge: bool = False,
         cancel_file: str | None = None,
         verbose: bool = False,
@@ -916,6 +929,10 @@ class RalphLoop:
         self._debug_context: dict[str, object] = {}
         self._last_structured_response: StructuredResponse | None = None
         self._last_implement_output: str = ""
+        # Cycle detection state
+        self._no_change_cycle_count: int = 0
+        self._last_known_head: str | None = None
+        self._max_cycles_no_change: int = max_cycles_no_change if max_cycles_no_change is not None else DEFAULT_MAX_CYCLES_NO_CHANGE
 
     def _resolve_model_for_phase(self, phase: str) -> str:
         if phase not in MODEL_PHASES:
@@ -1571,6 +1588,127 @@ class RalphLoop:
                 raise RalphError(f"Merge step failed ({' '.join(cmd)}): {(getattr(proc, 'stderr', '') or '').strip()}")
 
 
+    def _try_fallback_persist(self, issue_id: str, audit_output: str) -> bool:
+        """Attempt to persist an audit report from captured Pi output.
+
+        Checks if ``audit_output`` contains a valid 'Ready to close:' marker.
+        If found, persists the entire audit output as the work item's audit
+        text via ``wl update --audit-text``.
+
+        Returns True if the audit was successfully persisted, False if the
+        output lacks the required marker or persistence fails.
+        """
+        if not audit_output or not audit_output.strip():
+            logger.debug(
+                "ralph.fallback_persist.skipped reason=empty_output issue=%s",
+                issue_id,
+            )
+            return False
+
+        if not _has_ready_to_close_marker(audit_output):
+            logger.debug(
+                "ralph.fallback_persist.skipped reason=no_ready_to_close_marker issue=%s output_len=%d",
+                issue_id,
+                len(audit_output),
+            )
+            return False
+
+        logger.info(
+            "ralph.fallback_persist.start issue=%s output_len=%d",
+            issue_id,
+            len(audit_output),
+        )
+
+        try:
+            cmd = [
+                self.wl_bin,
+                "update",
+                issue_id,
+                "--audit-text",
+                audit_output,
+                "--json",
+            ]
+            self._call_with_retry(cmd, category="wl", expect_json=True)
+            logger.info(
+                "ralph.fallback_persist.success issue=%s",
+                issue_id,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "ralph.fallback_persist.failed issue=%s error=%s",
+                issue_id,
+                exc,
+            )
+            return False
+
+    def _detect_no_change_cycle(self, attempt: int) -> bool:
+        """Detect repeated cycles on unchanged code.
+
+        Compares the current git HEAD with the last known HEAD. If they match
+        and we are on at least the Nth attempt, increment the no-change
+        counter. Returns True when the counter exceeds the configured maximum.
+
+        The cycle state is reset when HEAD changes (code has moved forward).
+        """
+        current_head: str | None = None
+        try:
+            proc = self._call_with_retry(
+                ["git", "rev-parse", "HEAD"],
+                category="summary",
+                expect_json=False,
+            )
+            output = (getattr(proc, 'stdout', '') or '').strip()
+            if output:
+                current_head = output
+        except Exception:
+            logger.debug("ralph.cycle_detection.git_rev_parse_failed", exc_info=True)
+            return False
+
+        if current_head is None:
+            return False
+
+        if self._last_known_head is not None and self._last_known_head == current_head:
+            self._no_change_cycle_count += 1
+            logger.info(
+                "ralph.cycle_detection.no_change attempt=%d count=%d max=%d head=%s",
+                attempt,
+                self._no_change_cycle_count,
+                self._max_cycles_no_change,
+                current_head[:12],
+            )
+            if self._no_change_cycle_count >= self._max_cycles_no_change:
+                logger.warning(
+                    "ralph.cycle_detection.stalled attempt=%d count=%d max=%d head=%s",
+                    attempt,
+                    self._no_change_cycle_count,
+                    self._max_cycles_no_change,
+                    current_head[:12],
+                )
+                return True
+        else:
+            # HEAD changed (or first call) — reset counter
+            if self._last_known_head is not None and self._last_known_head != current_head:
+                logger.info(
+                    "ralph.cycle_detection.head_changed old=%s new=%s resetting_count",
+                    self._last_known_head[:12],
+                    current_head[:12],
+                )
+            self._no_change_cycle_count = 0
+            self._last_known_head = current_head
+
+        return False
+
+    def _extract_audit_text_from_item(self, item: dict) -> str:
+        """Extract the persisted audit text from a wl show workItem dict."""
+        audit_field = item.get("audit")
+        if isinstance(audit_field, dict):
+            return audit_field.get("text", "") or item.get("auditText", "") or ""
+        elif isinstance(audit_field, str):
+            return audit_field
+        else:
+            return item.get("auditText", "") or ""
+
     def _is_effort_risk_computed(self, target_id: str) -> bool:
         """Check whether effort and risk have already been set on the work item."""
         item = self._wl_show(target_id).get("workItem", {})
@@ -2049,10 +2187,9 @@ class RalphLoop:
                 impl_output = self._run_pi(prompt, phase="implementation")
                 self._last_implement_output = impl_output
 
-            # Audit step — always invoke the audit skill unless caller explicitly
-            # instructs otherwise (force_fresh_audit only affects persisted-audit logic).
+            # Audit step — capture output for fallback persistence if needed
             try:
-                self._run_pi(f"/skill:audit {item_id}", phase="audit")
+                audit_output = self._run_pi(f"/skill:audit {item_id}", phase="audit")
             except Exception:
                 # Treat audit invocation failures as a failed attempt and retry
                 if attempt >= max_attempts:
@@ -2062,16 +2199,38 @@ class RalphLoop:
 
             # Read persisted audit
             item = self._wl_show(item_id).get("workItem", {})
-            audit_field = item.get("audit")
-            if isinstance(audit_field, dict):
-                audit_text = audit_field.get("text", "") or item.get("auditText", "") or ""
-            elif isinstance(audit_field, str):
-                audit_text = audit_field
-            else:
-                audit_text = item.get("auditText", "") or ""
+            audit_text = self._extract_audit_text_from_item(item)
 
             if not audit_text:
-                # No persisted audit — treat as failed attempt
+                # Audit model did NOT persist — try fallback from captured output
+                fallback_ok = self._try_fallback_persist(item_id, audit_output)
+                if fallback_ok:
+                    # Fallback persisted successfully — re-read and evaluate
+                    item = self._wl_show(item_id).get("workItem", {})
+                    audit_text = self._extract_audit_text_from_item(item)
+
+            if not audit_text:
+                # Still no audit text — this is a genuine failure (output lacked
+                # marker, or wl update failed). Not the same as "gaps found."
+                logger.warning(
+                    "ralph.run_single_item.audit_missing_after_fallback target=%s attempt=%d",
+                    item_id,
+                    attempt,
+                )
+                # Check for cycle detection (no code changes across attempts)
+                if self._detect_no_change_cycle(attempt):
+                    logger.error(
+                        "ralph.run_single_item.stalled target=%s attempt=%d cycles_no_change=%d",
+                        item_id,
+                        attempt,
+                        self._no_change_cycle_count,
+                    )
+                    return {
+                        "status": "stalled",
+                        "attempt": attempt,
+                        "reason": "audit_persistence_failure_stalled",
+                        "no_change_cycles": self._no_change_cycle_count,
+                    }
                 if attempt >= max_attempts:
                     return {"status": "max_attempts", "attempt": attempt, "reason": "no_persisted_audit"}
                 remediation = _build_remediation_prompt()
@@ -2093,6 +2252,21 @@ class RalphLoop:
             # Audit reported unmet criteria — decide whether to retry
             unmet = [c.text for c in parsed.unmet_or_partial]
             logger.debug("ralph.run_single_item.unmet target=%s attempt=%d unmet_count=%d", item_id, attempt, len(unmet))
+            # Check for cycle detection (no code changes across attempts)
+            if self._detect_no_change_cycle(attempt):
+                logger.error(
+                    "ralph.run_single_item.stalled target=%s attempt=%d cycles_no_change=%d",
+                    item_id,
+                    attempt,
+                    self._no_change_cycle_count,
+                )
+                return {
+                    "status": "stalled",
+                    "attempt": attempt,
+                    "reason": "unmet_criteria_stalled",
+                    "no_change_cycles": self._no_change_cycle_count,
+                    "unmet": unmet,
+                }
             if attempt >= max_attempts:
                 return {"status": "max_attempts", "attempt": attempt, "unmet": unmet}
 
@@ -2333,27 +2507,26 @@ class RalphLoop:
             logger.info("ralph.loop.audit.start target=%s attempt=%d", focus_id, attempt)
             # Run the audit skill unless we've determined that the persisted audit
             # is up-to-date and can be used without re-running the audit skill.
+            audit_output = ""
             if use_persisted_audit:
                 logger.info("ralph.loop.audit.skipped_using_persisted target=%s attempt=%d", focus_id, attempt)
             else:
-                # Run the audit skill; it MUST persist the structured audit to the work item.
-                self._run_pi(f"/skill:audit {focus_id}", phase="audit")
+                # Run the audit skill; capture output for fallback persistence if needed.
+                audit_output = self._run_pi(f"/skill:audit {focus_id}", phase="audit")
             # Read the persisted audit from the work item via wl show.
             item = self._wl_show(focus_id).get("workItem", {})
-            # Normalize persisted audit extraction to handle both object and string shapes.
-            # - If workItem.audit is an object (dict), prefer audit.get("text")
-            # - If it's a string, use it directly
-            # - Otherwise fall back to workItem.auditText
-            audit_field = item.get("audit")
-            if isinstance(audit_field, dict):
-                audit_text = audit_field.get("text", "") or item.get("auditText", "") or ""
-            elif isinstance(audit_field, str):
-                audit_text = audit_field
-            else:
-                audit_text = item.get("auditText", "") or ""
+            audit_text = self._extract_audit_text_from_item(item)
 
             if not audit_text:
-                raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit; expected workItem.audit to contain the structured report.")
+                # Audit model did NOT persist — try fallback from captured output
+                fallback_ok = self._try_fallback_persist(focus_id, audit_output)
+                if fallback_ok:
+                    # Fallback persisted successfully — re-read
+                    item = self._wl_show(focus_id).get("workItem", {})
+                    audit_text = self._extract_audit_text_from_item(item)
+
+            if not audit_text:
+                raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit and fallback persistence; expected workItem.audit to contain the structured report.")
 
             structured_audit = None
             lines = [l.strip() for l in audit_text.splitlines() if l.strip()]
@@ -2395,6 +2568,25 @@ class RalphLoop:
                         "change_descriptions": self._last_implement_output,
                         "check_results": check_results,
                     },
+                }
+
+            # Check for cycle detection (no code changes across attempts)
+            if self._detect_no_change_cycle(attempt):
+                logger.error(
+                    "ralph.loop.stalled target=%s attempt=%d cycles_no_change=%d",
+                    focus_id,
+                    attempt,
+                    self._no_change_cycle_count,
+                )
+                self._cleanup_pi_process()
+                return {
+                    "status": "stalled",
+                    "attempt": attempt,
+                    "scope": scope_ids,
+                    "reason": "unmet_criteria_stalled",
+                    "no_change_cycles": self._no_change_cycle_count,
+                    "unmet": [c.text for c in audit.unmet_or_partial],
+                    "compact": {"invocations": compact_invocations, "failures": compact_failures},
                 }
 
             remediation = _build_remediation_prompt()
