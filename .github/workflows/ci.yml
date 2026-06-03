@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install pytest pytest-html jsonschema pyyaml
 
       - name: Run tests
         run: pytest --tb=short --junitxml=test-results.xml
@@ -53,7 +53,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install pytest pytest-html jsonschema pyyaml
 
       - name: Run per-project isolation integration tests
         run: pytest tests/test_per_project_isolation.py -v
