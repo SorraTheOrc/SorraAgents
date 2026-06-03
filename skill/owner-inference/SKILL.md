@@ -44,6 +44,15 @@ field in new critical issues.
 - Override map: `.opencode/triage/owner-map.yaml`
 - Confidence threshold: configurable via `confidence_threshold` in the JSON payload (default 0.3).
 
+## Example invocation
+
+```bash
+python3 skill/owner-inference/scripts/infer_owner.py --repo . --file tests/test_foo.py --commit abc123
+
+# Worklog / triage context (documentation example):
+wl show SA-0MPYMFZXO0004ZU4 --json
+```
+
 ## References
 
 - Triage skill: `skill/triage/SKILL.md`

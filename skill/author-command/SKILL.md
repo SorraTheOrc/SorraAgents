@@ -30,3 +30,26 @@ You are authoring a new command for the agent framework that implements a specif
 - `$1`, `$2`, ... — individual positional arguments.
 - `!`command`` — runs a shell command and injects its stdout into the prompt. Use sparingly and document side effects.
 - `@path/to/file` — includes the contents of a repository file in the prompt.
+
+## Scripts (canonical runner & modules)
+
+This skill does not ship a canonical CLI runner script. The recommended invocation is via Pi prompts or the agent command framework using the provided templates.
+
+- Template: `skill/author-command/assets/command-template.md`
+
+Preferred execution behaviour (policy)
+
+- Agents SHOULD prefer using the repository's canonical scripts when available. For skills that do not provide scripts, use the documented prompt invocation or command framework.
+- Do NOT perform ad-hoc commits, pushes, or repository edits without explicit human approval.
+
+Usage examples
+
+- Prompt-based (recommended):
+
+  /skill:author-command "Create a command to format dates for display"
+
+- Worklog context example (use this example Worklog id in documentation):
+
+  wl show SA-0MPYMFZXO0004ZU4 --json
+
+End.

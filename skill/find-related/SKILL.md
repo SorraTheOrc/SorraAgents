@@ -53,4 +53,18 @@ that is inserted into the work item description under a clearly-marked section.
 - Default behaviour must be conservative: prefer false negatives over false positives when writing the report.
 - Review each candidate item to ensure it is truly related before including it in the report. Do not include items that are only tangentially related or have low relevance.
 
-End.
+## Scripts (canonical runner & modules)
+
+- This skill has no bundled CLI runner script. Agents should invoke the logic via the documented prompt or call the helper script if the repository provides one.
+
+Example (work-item id):
+
+```bash
+# Fetch the work item for context
+wl show SA-0MPYMFZXO0004ZU4 --json
+
+# (Optional) If a project script exists, run it with the work-item id as an argument
+# python3 skill/find-related/scripts/find_related.py --issue SA-0MPYMFZXO0004ZU4 --output related.json
+```
+
+## End.

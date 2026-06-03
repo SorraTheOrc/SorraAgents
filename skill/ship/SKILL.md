@@ -6,13 +6,13 @@ description: "Canonical push-to-dev and branch-policy enforcement for agents. Pr
 # Ship Skill
 
 Canonical agent-side push-to-dev behaviour and branch-policy enforcement, with
-automated dev-to-main release execution via the Ship subagent.
+automated dev-to-main release execution.
 
 ## Purpose
 
 Provide a deterministic, automated push-to-dev and release workflow for agents:
-agents push completed feature branches into `dev`, and the Ship subagent (or a
-human Release Manager) promotes tested changes from `dev` to `main` via a
+agents push completed feature branches into `dev`, and the release process
+promotes tested changes from `dev` to `main` via a
 gated, PR-based merge process.
 
 ## When To Use
@@ -20,7 +20,7 @@ gated, PR-based merge process.
 - An agent needs to push completed feature branch work into the `dev` integration branch.
 - An agent needs to generate a canonical branch name for a work item.
 - An agent needs to validate a branch name or check whether a branch is protected.
-- An agent or operator needs to execute a release (dev → main merge) via the Ship subagent.
+- An agent or operator needs to execute a release (dev → main merge).
 
 Triggers
 
@@ -46,7 +46,7 @@ Where `<action>` is one of:
 | `validate-branch <name>` | Validate a branch name against the canonical pattern |
 | `generate-name <work-item-id> <short-desc>` | Generate a canonical branch name |
 | `check-blocked <branch>` | Check whether a branch is protected |
-| `release` | Execute the automated dev → main release (via Ship subagent) |
+| `release` | Execute the automated dev → main release |
 | `help` | Print the ship skill documentation |
 
 ## Prerequisites
@@ -59,15 +59,16 @@ Where `<action>` is one of:
 
 ## Scripts and Modules
 
-- `scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, and re-exports from `git-helpers.js`)
-- `scripts/git-helpers.js` — Branch naming and policy helpers (exports: `makeBranchName`, `validateBranchName`, `isBranchBlocked`, `BLOCKED_BRANCHS`, `BRANCH_NAME_PATTERN`)
-- `scripts/release/merge-dev-to-main.sh` — the canonical release merge script
+- `skill/ship/scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, and re-exports from `git-helpers.js`)
+- `skill/ship/scripts/git-helpers.js` — Branch naming and policy helpers (exports: `makeBranchName`, `validateBranchName`, `isBranchBlocked`, `BLOCKED_BRANCHS`, `BRANCH_NAME_PATTERN`)
+- `skill/ship/scripts/run-release.js` — Safe wrapper to invoke the release process
+- `skill/ship/scripts/release/merge-dev-to-main.sh` — Canonical release merge script (installed in the skill directory)
 
 ## Usage
 
 ```javascript
 // Push completed work into dev
-import { pushToDev } from './scripts/ship.js';
+import { pushToDev } from 'skill/ship/scripts/ship.js';
 
 const result = pushToDev('origin');
 if (!result.success) {
@@ -75,7 +76,7 @@ if (!result.success) {
 }
 
 // Generate a canonical branch name
-import { makeBranchName, validateBranchName, isBranchBlocked } from './scripts/git-helpers.js';
+import { makeBranchName, validateBranchName, isBranchBlocked } from 'skill/ship/scripts/git-helpers.js';
 
 const branchName = makeBranchName('SA-001', 'fix-login-bug');
 // Returns: 'wl-SA-001-fix-login-bug'
@@ -91,10 +92,10 @@ const blocked = isBranchBlocked('main');
 
 Agents work in feature branches and push completed work into the `dev` integration branch. This is the canonical integration action.
 
-1. **Create a feature branch** using `makeBranchName(workItemId, shortDesc)` from `scripts/git-helpers.js`.
+1. **Create a feature branch** using `makeBranchName(workItemId, shortDesc)` from `skill/ship/scripts/git-helpers.js`. 
 2. **Make changes and commit** on the feature branch.
 3. **Validate** the current branch name with `validateBranchName(name)`.
-4. **Push to dev** using `pushToDev()` from `scripts/ship.js`. This:
+4. **Push to dev** using `pushToDev()` from `skill/ship/scripts/ship.js`. This:
    - Validates the push target is not a protected branch
    - Rejects force-push
    - Executes `git push origin HEAD:refs/heads/dev`
@@ -150,20 +151,10 @@ Force-push (`git push --force` / `git push -f`) is prohibited.
 
 ## Release Process
 
-The Ship skill supports two release execution modes. The **Ship subagent** is
-the primary executor; the **human Release Manager** is the fallback.
-
-### Primary executor: Ship subagent
-
-The Ship subagent (configured in [`agent/ship.md`](../agent/ship.md)) executes
-the release using the canonical merge script:
+Execute the release using the canonical merge script:
 
 ```bash
-# Preferred safe wrapper (will detect missing release script and present a clear human fallback):
 node skill/ship/scripts/run-release.js
-
-# Legacy/direct invocation of the canonical script (use only when you know it exists and is executable):
-# bash scripts/release/merge-dev-to-main.sh
 ```
 
 The script performs the following steps:
@@ -188,8 +179,7 @@ The script performs the following steps:
 
 ### Fallback: Human Release Manager
 
-For repositories where the Ship subagent is not configured or the automated
-merge is not suitable, a **human Release Manager** can perform the release
+For repositories where the automated merge is not suitable, a **human Release Manager** can perform the release
 manually. The Release Manager must follow the checklist and procedures in
 [`docs/dev/release-process.md`](../docs/dev/release-process.md).
 
@@ -197,14 +187,13 @@ The human fallback supports three approaches:
 
 | Approach | Description | When to use |
 |----------|-------------|-------------|
-| **Automated script** | Run `bash scripts/release/merge-dev-to-main.sh` manually | Ship subagent unavailable but script is available |
+| **Automated script** | Run `node skill/ship/scripts/run-release.js` manually | Script is available in the skill directory |
 | **Direct merge** | `git checkout main && git merge origin/dev --no-ff` | No branch protection on main |
 | **Manual PR** | Create a temp branch with merge result and open a PR | Want human review before merge |
 
 ### Pre-merge checklist
 
-Whether using the Ship subagent or the human fallback, the following must be
-verified before merging `dev` into `main`:
+The following must be verified before merging `dev` into `main`:
 
 1. **CI — `dev-full-suite` is green** on the current `dev` HEAD.
 2. **CI — `dev-smoke` is green** on the current `dev` HEAD.
@@ -217,8 +206,7 @@ test commands to run locally.
 
 ## Preferred execution behaviour (policy)
 
-- When the Ship subagent is available, it MUST serve as the primary release
-  executor. The agent should invoke `scripts/release/merge-dev-to-main.sh`
+- The agent should invoke `skill/ship/scripts/run-release.js`
   to perform the dev → main merge.
 - The agent MUST NOT perform the merge by substituting its own ad-hoc git
   commands for the canonical script during normal operation.
@@ -227,9 +215,8 @@ test commands to run locally.
   - the merge script is missing or not executable,
   - the script fails with an unexpected error and the operator explicitly
     instructs the agent to fall back,
-  - the Ship subagent is not configured and a human has explicitly requested
-    manual steps.
-- If the Ship subagent is not configured, the agent MUST refuse to perform
+  - a human has explicitly requested manual steps.
+- If the release script is not available, the agent MUST refuse to perform
   the release automatically and instead direct the operator to the human
   Release Manager fallback procedures in `docs/dev/release-process.md`.
 
@@ -249,7 +236,7 @@ The per-work-item merge workflow in AGENTS.md (step 6) describes PR-based mergin
 1. Agent implements work on a feature branch → commits → builds → tests
 2. Agent calls `pushToDev()` to integrate into `dev`
 3. CI runs on `dev`
-4. Ship subagent or Release Manager merges `dev` → `main` via PR (see AGENTS.md step 6)
+4. Release Manager merges `dev` → `main` via PR (see AGENTS.md step 6)
 
 ## Outputs
 

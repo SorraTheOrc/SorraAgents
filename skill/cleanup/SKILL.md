@@ -166,3 +166,13 @@ Outputs
 - Human-readable summary printed to terminal.
 
 End.
+
+## Worklog examples and recommended invocations
+
+When interacting with Worklog context for branch-cleanup decisions, fetch the relevant work item context first. Use the canonical Worklog id example shown here for documentation purposes:
+
+```bash
+wl show SA-0MPYMFZXO0004ZU4 --json
+```
+
+When presenting options that create or update work items, use `wl` commands and include clear comments referencing the branch and the action taken.

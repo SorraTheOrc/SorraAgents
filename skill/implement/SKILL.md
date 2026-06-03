@@ -54,7 +54,7 @@ any sensitive values before writing them to logs or comments.
 - If the work item is not well-defined, do not proceed with implementation. Instead, run the intake interview to clarify and update the work item before implementing.
 - If the work item has blockers or dependencies, implement those first before proceeding with the main work item.
 - Never commit directly to `main`. Always create a feature or bug branch for implementation.
-- The required order of operations before any commit is always: **build → test → commit**. First build the project and verify no errors, then run all tests and verify they pass, and only then commit. Never commit before verifying that the build and tests pass.
+- When implementing a CLI or API always provide a way to obtain a JSON formatted output for agents to consume.
 - When creating branches, include the work item id in the branch name for traceability (e.g., `feature/WL-123-add-auth`).
 - When creating a commit message, review the diff and write a concise message summarizing the changes made and the reason for the change, referencing the work item id.
 - When committing add a comment to the work item with the commit message and hash.
@@ -65,7 +65,7 @@ any sensitive values before writing them to logs or comments.
 
 ## Handling Assets
 
-- If the implementation requires the creation of assets such as graphics or audio files, create these assets in an appropriate subfolder of the `assets` directory (e.g., `assets/images/`, `assets/audio/`) and use a name that has the prefix "placeholder\_" followed by a descriptive name (e.g., `placeholder_player_explosion_spritesheet.png` or `placeholder_player_jump.wav`).
+- If the implementation requires the creation of assets such as graphics or audio files, create these assets in an appropriate subfolder of the `assets` directory (e.g., `assets/images/`, `assets/audio/`) and use a name that has the prefix "placeholder_" followed by a descriptive name (e.g., `placeholder_player_explosion_spritesheet.png` or `placeholder_player_jump.wav`).
   - always reference new assets in the work item comments and PR description. Ensure that any generated assets are included in the commit and pushed to the repository.
   - when creating assets, ensure they are optimized for size and performance, and follow any project guidelines for asset creation and management.
   - you can discover assets on the web as part of your implementation, but ensure that you have the right to use and distribute any assets you include in the project. Always provide proper attribution if required by the asset's license.
@@ -106,6 +106,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 - If the work item is too large to implement in one pass, run plan interview (see `command/plan.md`) to break it into smaller work items, create those work items, link them as blockers/dependencies, and pick the highest-priority work item to implement next.
 - If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
 - If you ran the plan interview, convert this work item to an epic and inform the user that implementation should move to the first child work item created.
+- If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
 
 2. Create a working branch
 
@@ -174,10 +175,30 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 - Mark the work item as `in_review` (do **NOT** close it):
   `wl update <work-item-id> --stage in_review --json`
 
-  > **Important:** The work-item is **not closed** at this stage. It remains `in_review` until the release process (
-  > ship agent or Release Manager) promotes `dev` to `main`. Agents must **never** push to `main` directly.
+  > **Important:** The work-item is **not closed** at this stage. It remains `in_review` until the release process promotes `dev` to `main`. Agents may perform the release by invoking the Ship skill's release command (`skill/ship/scripts/run-release.js`), or a Release Manager may perform it manually. Agents should not push directly to `main` unless explicitly authorized.
   > See `skill/ship/SKILL.md` for the push-to-dev workflow and `skill/ship/scripts/run-release.js` (safe wrapper) for the release process. The wrapper detects when a repository lacks `scripts/release/merge-dev-to-main.sh` and prints a clear human fallback message.
 
 Pre-push blocking check
 -----------------------
 - Before pushing to `dev`, inspect the agent-run local state for any NEW critical test-failure issues created during this run. If any exist and remain open, the agent MUST not push to `dev` for the current work item unless the push explicitly references and closes the created critical issue(s). Pre-existing critical issues (created prior to this agent run) are informational and do not block pushes.
+
+## Scripts (canonical runner & modules)
+
+This skill does not ship a single orchestrator script. Implementation is carried out by following the steps above and invoking project-local build/test and linters. When a repository provides an "implement" helper script, prefer that script for deterministic behavior.
+
+Example Worklog-oriented commands using SA-0MPYMFZXO0004ZU4 (documentation example):
+
+```bash
+# Fetch the work item
+wl show SA-0MPYMFZXO0004ZU4 --json
+
+# After implementing locally, push to dev (preferred via ship skill):
+# (JS example) node -e "require('./skill/ship/scripts/ship.js').pushToDev('origin')"
+# or direct push
+git push origin HEAD:refs/heads/dev
+
+# Mark in_review
+wl update SA-0MPYMFZXO0004ZU4 --stage in_review --json
+```
+
+End.
