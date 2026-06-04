@@ -102,3 +102,23 @@ guidelines from CHANGELOG_STYLE.md
 - Generating email updates for users
 - Creating social media announcement posts
 
+## Scripts (canonical runner & modules)
+
+This skill does not ship a canonical in-repo CLI script. Agents and operators should run changelog generation using the project's tooling or via the prompt interface.
+
+Preferred execution behaviour (policy)
+
+- Agents SHOULD prefer running an in-repo script if one is provided by the project. When no script exists prefer a documented prompt invocation and show the commands to be run rather than executing them automatically.
+- Do NOT perform ad-hoc pushes or releases without explicit human approval.
+
+Usage example (worklog reference)
+
+- Fetch work item context before preparing release notes:
+
+  wl show SA-0MPYMFZXO0004ZU4 --json
+
+- Generate a changelog (human-driven example):
+
+  "Create a changelog for commits since `v2.4.0` and format for CHANGELOG.md"
+
+End.

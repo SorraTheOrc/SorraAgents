@@ -84,6 +84,25 @@ skill/ralph/ralph status --json
 
 See `docs/ralph.md` and `ralph --help` for full details of the features available.
 
+## Scripts (canonical runner & modules)
+
+- Launcher wrapper: `skill/ralph/ralph` (preferred wrapper that records PID/start-time and handles background runs)
+- Foreground loop: `skill/ralph/scripts/ralph_loop.py` (python3)
+- Helpers and control: `skill/ralph/scripts/ralph_control.py`, `skill/ralph/scripts/structured_response.py`
+
+Example (documentation):
+
+```bash
+# Start a background Ralph run for work item SA-0MPYMFZXO0004ZU4
+skill/ralph/ralph SA-0MPYMFZXO0004ZU4 --json
+
+# For direct debugging (foreground)
+python3 skill/ralph/scripts/ralph_loop.py SA-0MPYMFZXO0004ZU4 --json
+
+# Inspect status (no work item id required)
+skill/ralph/ralph status --json
+```
+
 ## Ralph Status
 
 When the operator runs `ralph status`, keep the report brief and focused on essentials:
@@ -95,4 +114,3 @@ When the operator runs `ralph status`, keep the report brief and focused on esse
 5. Do not require a work-item id for status, and do not perform broader Worklog inspection unless the operator asks for it.
 
 Keep any remembered values needed for status reporting, such as issue counts and the last log cursor, in the control-loop context. Do not persist them between runs.
-

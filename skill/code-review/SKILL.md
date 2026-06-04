@@ -43,3 +43,20 @@ Structure:
 #### Tone
 *   Be constructive, professional, and friendly.
 *   Explain *why* a change is requested.
+
+## Scripts (canonical runner & modules)
+
+This skill does not ship a canonical in-repo CLI script. Agents should perform code review analysis using local git commands and project tooling. When automating reviews prefer the project's linters, test runners, and pre-existing CI scripts.
+
+Preferred execution behaviour (policy)
+
+- Agents SHOULD prefer running the repository's canonical linters and test scripts rather than issuing ad-hoc checks.
+- Do NOT make automatic commits or push changes without explicit human approval.
+
+Usage example (worklog context)
+
+- To fetch the work item context before a review:
+
+  wl show SA-0MPYMFZXO0004ZU4 --json
+
+End.

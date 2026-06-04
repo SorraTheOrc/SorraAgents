@@ -83,12 +83,14 @@ and release process.
 
 The release process promotes tested, reviewed changes from `dev` to `main`. See the **Ship skill** ([skill/ship/SKILL.md](../skill/ship/SKILL.md)) for the canonical release procedure.
 
-### Primary executor: Ship subagent
+### Automated executor: Ship skill
 
-The Ship subagent acts as the primary release executor using the merge script:
+The Ship skill provides the automated release procedure and exposes a safe wrapper
+that invokes the canonical merge script. Agents may invoke the Ship skill to
+perform the `dev` → `main` release using the wrapper:
 
 ```bash
-bash scripts/release/merge-dev-to-main.sh
+node skill/ship/scripts/run-release.js
 ```
 
 The script automates CI verification, merge commit creation, PR creation, status check
@@ -97,7 +99,7 @@ the full release process.
 
 ### Fallback: Human Release Manager
 
-For repositories where the Ship subagent is not configured, a human Release Manager
+For repositories where the automated merge is not suitable, a human Release Manager
 can perform the release manually. The full checklist and test commands are documented
 in [docs/dev/release-process.md](../docs/dev/release-process.md) and
 [docs/dev/release-tests.md](../docs/dev/release-tests.md).

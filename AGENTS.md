@@ -83,12 +83,12 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      > ⚠️ **Do NOT close the work-item at this stage.**
      > Work-items are closed only after the `dev`→`main` release is complete.
      >
-     > **Regular agents do NOT merge to `main`.** The pre-push hook at
-     > `.githooks/pre-push` blocks direct pushes to `main`, `master`, and
-     > `HEAD`. The `dev`→`main` release is performed exclusively by the
-     > **ship agent** (via `scripts/release/merge-dev-to-main.sh`) or a
-     > designated **Release Manager**. That process creates a PR, waits for
-     > CI, and merges via `gh pr merge`. See
+     > Agents SHOULD NOT push directly to `main` unless explicitly authorized.
+     > The canonical `dev`→`main` release process is implemented by
+     > `scripts/release/merge-dev-to-main.sh` (invoked via the Ship skill). Any
+     > agent may perform the release by invoking the Ship skill's release command,
+     > or a designated Release Manager may perform it manually. The process creates
+     > a PR, waits for CI, and merges via `gh pr merge`. See
      > [skill/ship/SKILL.md](skill/ship/SKILL.md) and
      > [docs/dev/release-process.md](docs/dev/release-process.md) for details.
 

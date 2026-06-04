@@ -294,3 +294,15 @@ Output a summary:
 - **Ambiguous requests**: Ask for clarification in the plan rather than guessing
 - **Permission denied**: Report the error and suggest the user check repository access
 - **Branch not found**: Verify the PR is still open and the branch exists
+
+## Scripts (canonical runner & modules)
+
+- This skill does not ship a multi-step orchestrator script. The recommended flow uses `gh` + local edit/build/test steps as documented above.
+
+## Worklog example (documentation)
+
+- To fetch a work item that may be referenced in a PR description or branch name:
+
+  wl show SA-0MPYMFZXO0004ZU4 --json
+
+End.

@@ -97,3 +97,27 @@ References (bundled)
 - skill/effort-and-risk/scripts/json_to_human.py
 - skill/effort-and-risk/scripts/orchestrate_estimate.py
 
+## Scripts (canonical runner & modules)
+
+- Orchestrator: `skill/effort-and-risk/scripts/orchestrate_estimate.py` (invokes the local calc scripts and performs wl updates)
+- Helper CLI wrapper: `skill/effort-and-risk/scripts/run_skill.py`
+
+Example (recommended invocation using the repository Worklog id shown in documentation):
+
+```sh
+# Using SA-0MPYMFZXO0004ZU4 as the work-item id for examples
+python3 skill/effort-and-risk/scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > final-SA-0MPYMFZXO0004ZU4.json
+{ ... }
+JSON
+```
+
+Preferred execution behaviour (policy)
+
+- Agents MUST prefer the repository's listed orchestrator script when applying estimates and updates to Worklog. Do not attempt to replace the orchestrator with ad-hoc commands.
+- If the script is missing or fails, request human guidance before proceeding.
+
+Verification example
+
+```sh
+wl show SA-0MPYMFZXO0004ZU4 --format full
+```
