@@ -172,6 +172,8 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   This ensures subsequent operations begin from the current HEAD of the integration branch.
 - Add a work-item comment recording the commit hash and that the work has been pushed to dev:
   `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>. The work-item stays open until the release process merges dev to main." --author "<AGENT>" --json`
+- Close your response to the operator with a suggested commit message:
+  `If you want to commit this work now I suggest the following commit message:\n\n<work-item-id>: <concise-summary-of-changes>`
 - Mark the work item as `in_review` (do **NOT** close it):
   `wl update <work-item-id> --stage in_review --json`
 
