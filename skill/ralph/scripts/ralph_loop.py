@@ -1120,6 +1120,11 @@ class RalphLoop:
         # Use wrapper to allow fail-open/retry behaviour
         self._call_with_retry(cmd, category="wl", expect_json=True)
 
+    def _wl_update_stage(self, work_item_id: str, stage: str) -> None:
+        """Update the work item's stage via wl update."""
+        cmd = [self.wl_bin, "update", work_item_id, "--stage", stage]
+        logger.info("ralph.cmd.wl.update_stage target=%s stage=%s", work_item_id, stage)
+        self._call_with_retry(cmd, category="wl", expect_json=False)
 
     def _run_pi(self, prompt: str, phase: str = "implementation") -> str:
         # Use an ephemeral session for each orchestration call so nested or
@@ -2555,6 +2560,9 @@ class RalphLoop:
                 changed_files = self._capture_changed_files()
                 logger.info("ralph.loop.merge target=%s confirm=%s", focus_id, self.confirm_merge)
                 self._run_merge()
+                # Mark the work item as in_review now that the audit passed
+                self._wl_update_stage(focus_id, "in_review")
+                logger.info("ralph.loop.stage_update target=%s stage=in_review audit=pass", focus_id)
                 self._cleanup_pi_process()
                 return {
                     "status": "success",
@@ -2569,6 +2577,19 @@ class RalphLoop:
                         "check_results": check_results,
                     },
                 }
+
+            # Safeguard: if audit failed, ensure the item is not left in in_review.
+            # The implement skill (when running under Ralph) should not mark as
+            # in_review, but if it was previously in in_review (e.g., from a
+            # prior manual update or a previous run), restore it.
+            item_now = self._wl_show(focus_id).get("workItem", {})
+            current_stage = item_now.get("stage", "")
+            if current_stage == "in_review" and not audit.ready_to_close:
+                logger.info(
+                    "ralph.loop.audit.failed.stage_restore target=%s current_stage=in_review restoring_to=%s",
+                    focus_id, target_stage,
+                )
+                self._wl_update_stage(focus_id, target_stage)
 
             # Check for cycle detection (no code changes across attempts)
             if self._detect_no_change_cycle(attempt):

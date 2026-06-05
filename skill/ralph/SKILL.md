@@ -105,12 +105,59 @@ skill/ralph/ralph status --json
 
 ## Ralph Status
 
-When the operator runs `ralph status`, keep the report brief and focused on essentials:
+When the operator runs `ralph status`, the script produces a **structured markdown report** that must be emitted **directly to the operator without reinterpretation or reformatting**. Do NOT summarize, rephrase, or re-interpret the output.
 
-1. Check whether the PID is still active and report how long the run has been operating.
-2. Review the logs since the last status update and summarize the work completed.
-3. Count the work items and children in the Ralph scope, grouped by Worklog `status`, and report the totals plus deltas since the last status report.
-4. Include any other essential information only if it materially helps the operator understand the current run.
-5. Do not require a work-item id for status, and do not perform broader Worklog inspection unless the operator asks for it.
+### How to run
+
+```bash
+# Human-readable markdown output (recommended):
+skill/ralph/ralph status
+
+# JSON output for programmatic use:
+skill/ralph/ralph status --json
+```
+
+### What the script reports
+
+The `ralph status` command produces a markdown report with the following consistent sections:
+
+1. **Header**: State (running/stopped), PID, and target work-item id
+2. **Active Task**: The current child work item being processed (if any)
+3. **Status Counts**: A table showing work item counts grouped by Worklog `status`, with deltas since the last status check
+4. **Recent Activity**: Up to the last 20 log lines from the Ralph run
+5. **Exit Code**: If the run has stopped, the exit code
+6. **Final Summary**: Status and summary from the loop's final result (if available)
+
+### Critical instructions
+
+- **Output the script's markdown report verbatim**. Do NOT add your own summaries, interpretations, or reformatting.
+- The script's `format_status()` function produces the canonical markdown output. Forward it directly.
+- Do NOT use phrases like "I have reviewed the logs" or "Summary of work completed" – the markdown report itself is the summary.
+- Keep any remembered values needed for status reporting (log cursor, status counts) in the control-loop context. Do not persist them between runs.
+- Do not require a work-item id for status, and do not perform broader Worklog inspection unless the operator asks for it.
+
+### Example output
+
+```
+# Ralph Status
+
+**State**: `running` | **PID**: `12345` | **Target**: `SA-0MPYMFZXO0004ZU4`
+
+**Active Task**: `SA-0MPYMFZXO0004ZU5`
+
+## Status Counts
+
+| Status | Count | Delta |
+|--------|-------|-------|
+| `completed` | 3 | +1 |
+| `open` | 5 | -1 |
+
+## Recent Activity
+
+- child_focus parent=SA-0MPYMFZXO0004ZU4 child=SA-0MPYMFZXO0004ZU5
+- implementing work item SA-0MPYMFZXO0004ZU5
+
+**Exit Code**: `0`
+```
 
 Keep any remembered values needed for status reporting, such as issue counts and the last log cursor, in the control-loop context. Do not persist them between runs.

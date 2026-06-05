@@ -84,6 +84,13 @@ class FakeRunner:
                 self.items["SA-TARGET"]["risk"] = cmd[idx + 1]
             return Result(stdout=json.dumps({"success": True}))
 
+        if cmd[:3] == ["wl", "update", "SA-CHILD"]:
+            # Handle stage updates for SA-CHILD
+            if "--stage" in cmd:
+                idx = cmd.index("--stage")
+                self.items["SA-CHILD"]["stage"] = cmd[idx + 1]
+            return Result(stdout=json.dumps({"success": True}))
+
         if cmd[0] == "python3" and len(cmd) > 1 and "orchestrate_estimate.py" in cmd[1]:
             # Return pre-configured effort_and_risk output if provided
             out = getattr(self, "effort_outputs", None)
@@ -1359,8 +1366,12 @@ def test_ralph_reads_persisted_audit_and_does_not_update():
     assert result["status"] == "success"
 
     update_calls = [c for c in runner.calls if c[:3] == ["wl", "update", "SA-TARGET"]]
-    # Ralph must not write the audit to the work item; the audit skill owns persistence
-    assert update_calls == []
+    # Ralph must not write the audit to the work item; the audit skill owns persistence.
+    # Stage updates (--stage in_review) are allowed; only audit-text writes are forbidden.
+    audit_writes = [
+        c for c in update_calls if any(flag.startswith("--audit") for flag in c)
+    ]
+    assert audit_writes == []
 
 
 def test_ralph_handles_persisted_audit_object_text_field():

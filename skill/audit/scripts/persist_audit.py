@@ -22,11 +22,23 @@ from pathlib import Path
 from typing import Callable
 
 
-def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl", runner: Callable = None) -> int:
+def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
+                  runner: Callable = None, _fail: bool = False) -> int:
     """Persist the given report_text to the work item using wl update.
 
     Returns the wl subprocess return code (0 on success).
+
+    * _fail (internal/testing only): when True, skip the wl call, print the
+      report to stdout as a fallback, and return 1 to simulate a persistence
+      failure.  This allows tests to verify the fallback behaviour of
+      callers (e.g. audit_runner.py).
     """
+    if _fail:
+        # Simulate failure: print report to stdout (fallback for operator)
+        # and return 1.
+        print(report_text, end="")
+        return 1
+
     if runner is None:
         runner = subprocess.run
 

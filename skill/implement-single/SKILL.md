@@ -114,6 +114,8 @@ Execute the following steps in order. Do not skip steps.
 ### Step 5 — Push and mark in-review
 
 - Push the branch to `origin`.
+- Close your response to the operator with a suggested commit message:
+  `If you want to commit this work now I suggest the following commit message:\n\n<work-item-id>: <concise-summary-of-changes>`
 - Mark the work item as in-review:
   `wl update <work-item-id> --status completed --stage in_review --json`
 - Do not create a PR or merge. Ralph will handle PR/merge externally.
