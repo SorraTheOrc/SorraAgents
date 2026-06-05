@@ -364,25 +364,66 @@ def inspect_status(
 
 
 def format_status(snapshot: dict[str, object]) -> str:
-    lines = [
-        f"ralph: {snapshot.get('state')} pid={snapshot.get('pid')} target={snapshot.get('target_id')}",
-    ]
+    """Produce a structured markdown report with consistent section ordering.
+
+    This output is designed to be emitted directly to the operator by the
+    SKILL.md instructions – the LLM should NOT re-interpret or re-format it.
+    """
+    lines = []
+
+    # --- Header ---
+    state = snapshot.get("state") or "unknown"
+    pid = snapshot.get("pid", 0)
+    target = snapshot.get("target_id", "unknown")
+    lines.append(f"# Ralph Status")
+    lines.append("")
+    lines.append(f"**State**: `{state}` | **PID**: `{pid}` | **Target**: `{target}`")
+
+    # --- Active Task ---
     active = snapshot.get("active_task")
     if active:
-        lines.append(f"active task: {active}")
-    if snapshot.get("recent_activity"):
-        lines.append("recent activity:")
-        for line in snapshot["recent_activity"]:
-            lines.append(f"  - {line}")
+        lines.append(f"**Active Task**: `{active}`")
+    lines.append("")
+
+    # --- Status Counts ---
     counts = snapshot.get("status_counts") or {}
     deltas = snapshot.get("status_deltas") or {}
     if isinstance(counts, dict) and counts:
-        summary = ", ".join(
-            f"{key}={counts[key]} ({deltas.get(key, 0):+d})" for key in sorted(counts)
-        )
-        lines.append(f"worklog status counts: {summary}")
-    if snapshot.get("exit_code") is not None:
-        lines.append(f"exit code: {snapshot['exit_code']}")
+        lines.append("## Status Counts")
+        lines.append("")
+        lines.append("| Status | Count | Delta |")
+        lines.append("|--------|-------|-------|")
+        for key in sorted(counts):
+            delta = deltas.get(key, 0)
+            lines.append(f"| `{key}` | {counts[key]} | {delta:+d} |")
+        lines.append("")
+
+    # --- Recent Activity ---
+    recent = snapshot.get("recent_activity")
+    if recent:
+        lines.append("## Recent Activity")
+        lines.append("")
+        # Limit to last 20 lines for readability
+        for line in recent[-20:]:
+            lines.append(f"- {line}")
+        lines.append("")
+
+    # --- Exit Code ---
+    exit_code = snapshot.get("exit_code")
+    if exit_code is not None:
+        lines.append(f"**Exit Code**: `{exit_code}`")
+        lines.append("")
+
+    # --- Final Summary ---
+    final = snapshot.get("final_summary")
+    if final and isinstance(final, dict):
+        status = final.get("status", "")
+        summary = final.get("summary", "")
+        lines.append(f"**Final Status**: `{status}`")
+        if summary:
+            lines.append(f"**Summary**: {summary}")
+        lines.append("")
+
     return "\n".join(lines)
 
 
