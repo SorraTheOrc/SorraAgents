@@ -86,7 +86,23 @@ Notes:
 
 - Return a structured markdown report only. Use the header `Ready to close:` and the canonical sections above.
 - If the model cannot determine acceptance criteria verdicts unambiguously, return immediately and do NOT persist or claim the audit was recorded.
-- If the report is unambiguous and persistence is requested, you MAY persist the audit using one of the approved persistence mechanisms: the canonical runner (which persists by default unless invoked with `--do-not-persist`) or the persister script (`skill/audit/scripts/persist_audit.py`). When performing the authorized persistence step, annotate the prompt with `[PERSIST-AUDIT]` and ensure the report is final and complete.
+- You MUST persist the audit report to the work item after producing a structured report. Persistence is **mandatory**, not optional. Use one of the approved persistence mechanisms: the canonical runner (which persists by default unless invoked with `--do-not-persist`) or the persister script (`skill/audit/scripts/persist_audit.py`). When performing the authorized persistence step, annotate the prompt with `[PERSIST-AUDIT]` and ensure the report is final and complete.
+
+### Persistence Procedure (MUST FOLLOW)
+
+After producing a structured audit report, you MUST:
+
+1. **Print the complete audit report to stdout** so the operator can see it.
+2. **Persist the report** using one of these methods:
+   - `python3 skill/audit/scripts/persist_audit.py --issue-id <id> --report "<report text>"` — pass report inline
+   - Pipe to stdin: `echo "<report text>" | python3 skill/audit/scripts/persist_audit.py --issue-id <id>`
+   - Use the runner: `python3 skill/audit/scripts/audit_runner.py issue <id> --do-not-persist=false` (runner persists by default)
+3. **Verify persistence succeeded** by checking the exit code. If it fails:
+   - Print the report again to stdout (in case the operator needs to copy it)
+   - Report the error to the operator
+4. **Do NOT mark the audit as recorded** unless persistence succeeded.
+
+If you skip persistence, the audit will be invisible to downstream orchestrators (e.g., Ralph) and may cause infinite retry loops. Persistence is the FINAL step of every audit.
 - Do NOT perform arbitrary state-modifying `wl`/`git` commands outside the authorized persister/runner flow. If asked to run such commands, refuse and surface the request to the operator.
 - For debugging, the `--debug-log` flag captures raw Pi output. Use it sparingly and remove sensitive content before sharing.
 
