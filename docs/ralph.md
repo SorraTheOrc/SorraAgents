@@ -491,3 +491,29 @@ python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --ch
 python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --cancel-file /tmp/ralph-cancel
 # To cancel: touch /tmp/ralph-cancel
 ```
+
+## Signal & Notification System
+
+Ralph writes a JSON signal file and optionally sends a Discord webhook notification when major events occur during the loop lifecycle. See [docs/ralph-signal.md](ralph-signal.md) for:
+
+- Signal file format (JSON schema, event types, file behaviour)
+- Discord webhook payload format and configuration
+- Pi integration specification for consuming signals
+- Signal file path configuration via `.ralph.json`
+
+### Configuration Example
+
+The signal file path and Discord webhook URL are configured in `.ralph.json`:
+
+```json
+{
+  "signal": {
+    "file_path": ".ralph/event.pending"
+  },
+  "discord": {
+    "webhook_url": "https://discord.com/api/webhooks/your-webhook-url"
+  }
+}
+```
+
+When the webhook URL is omitted or empty, no webhook notifications are sent.
