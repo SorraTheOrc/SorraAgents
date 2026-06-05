@@ -1186,6 +1186,18 @@ class RalphLoop:
         # Use wrapper to allow fail-open/retry behaviour
         self._call_with_retry(cmd, category="wl", expect_json=True)
 
+    def _wl_comment_delete(self, comment_id: str) -> None:
+        """Delete a work item comment by its ID."""
+        cmd = [
+            self.wl_bin,
+            "comment",
+            "delete",
+            comment_id,
+            "--json",
+        ]
+        logger.debug("ralph.cmd.wl.comment_delete id=%s", comment_id)
+        self._call_with_retry(cmd, category="wl", expect_json=True)
+
     def _wl_update_stage(self, work_item_id: str, stage: str) -> None:
         """Update the work item's stage via wl update."""
         cmd = [self.wl_bin, "update", work_item_id, "--stage", stage]
@@ -2091,6 +2103,75 @@ class RalphLoop:
                 latest = ts
         return latest
 
+    def _latest_audit_comment_id(self, work_item_id: str) -> str | None:
+        """Return the comment ID of the most-recent audit comment on a work item.
+
+        Matches comments whose first non-empty line starts with
+        '# AMPA Audit Result'. Returns None if no such comment exists.
+        """
+        comments = self._wl_comment_list(work_item_id)
+        latest_id: str | None = None
+        latest_ts = None
+        for c in comments:
+            comment_text = (c.get("comment") or "")
+            first = None
+            for line in comment_text.splitlines():
+                if line.strip():
+                    first = line.strip()
+                    break
+            if not first:
+                continue
+            if not first.startswith("# AMPA Audit Result"):
+                continue
+            created = c.get("createdAt") or c.get("created_at") or c.get("created") or c.get("postedAt")
+            ts = self._parse_iso_ts(created)
+            if ts and (latest_ts is None or ts > latest_ts):
+                latest_ts = ts
+                latest_id = c.get("id")
+        return latest_id
+
+    @staticmethod
+    def _is_stall_error(exc: BaseException) -> bool:
+        """Check if an exception indicates a pi stream stall/timeout."""
+        if not isinstance(exc, RalphError):
+            return False
+        return "pi stream stalled" in str(exc)
+
+    def _handle_audit_timeout(self, work_item_id: str) -> None:
+        """Handle an audit pi stream timeout.
+
+        Removes any existing audit comment and adds a timeout comment
+        so the work item does not retain stale audit results.
+        """
+        timeout_display = (
+            int(self.pi_stream_timeout_seconds)
+            if self.pi_stream_timeout_seconds == int(self.pi_stream_timeout_seconds)
+            else self.pi_stream_timeout_seconds
+        )
+        # Remove existing audit comment if present
+        audit_comment_id = self._latest_audit_comment_id(work_item_id)
+        if audit_comment_id:
+            logger.info(
+                "ralph.audit_timeout.remove_comment target=%s comment_id=%s",
+                work_item_id, audit_comment_id,
+            )
+            self._wl_comment_delete(audit_comment_id)
+        else:
+            logger.info(
+                "ralph.audit_timeout.no_existing_comment target=%s",
+                work_item_id,
+            )
+        # Add timeout comment
+        timeout_comment = (
+            f"No audit completed: Pi stream timed out after {timeout_display} seconds. "
+            "The work item needs a fresh audit."
+        )
+        logger.info(
+            "ralph.audit_timeout.add_comment target=%s timeout=%ds",
+            work_item_id, timeout_display,
+        )
+        self._wl_comment_add(work_item_id, timeout_comment)
+
     def _max_updated_at_for_scope(self, scope_ids):
         """Return the most-recent updatedAt timestamp (as datetime) across the scope.
         Returns None if no updatedAt values are available.
@@ -2272,7 +2353,13 @@ class RalphLoop:
             # Audit step — capture output for fallback persistence if needed
             try:
                 audit_output = self._run_pi(f"/skill:audit {item_id}", phase="audit")
-            except Exception:
+            except Exception as exc:
+                if self._is_stall_error(exc):
+                    logger.warning(
+                        "ralph.run_single_item.audit_stalled target=%s attempt=%d",
+                        item_id, attempt,
+                    )
+                    self._handle_audit_timeout(item_id)
                 # Treat audit invocation failures as a failed attempt and retry
                 if attempt >= max_attempts:
                     return {"status": "max_attempts", "attempt": attempt}
@@ -2665,15 +2752,28 @@ class RalphLoop:
             # Run the audit skill unless we've determined that the persisted audit
             # is up-to-date and can be used without re-running the audit skill.
             audit_output = ""
+            audit_stalled = False
             if use_persisted_audit:
                 logger.info("ralph.loop.audit.skipped_using_persisted target=%s attempt=%d", focus_id, attempt)
             else:
                 # Run the audit skill; capture output for fallback persistence if needed.
-                audit_output = self._run_pi(f"/skill:audit {focus_id}", phase="audit")
+                try:
+                    audit_output = self._run_pi(f"/skill:audit {focus_id}", phase="audit")
+                except Exception as exc:
+                    if self._is_stall_error(exc):
+                        logger.warning(
+                            "ralph.loop.audit.stalled target=%s attempt=%d",
+                            focus_id, attempt,
+                        )
+                        self._handle_audit_timeout(focus_id)
+                        audit_output = ""
+                        audit_stalled = True
+                    else:
+                        raise
             # Read the persisted audit via wl audit-show
             audit_text = self._read_persisted_audit_text(focus_id)
 
-            if not audit_text:
+            if not audit_text and not audit_stalled:
                 # Audit model did NOT persist — try fallback from captured output
                 fallback_ok = self._try_fallback_persist(focus_id, audit_output)
                 if fallback_ok:
@@ -2681,6 +2781,10 @@ class RalphLoop:
                     audit_text = self._read_persisted_audit_text(focus_id)
 
             if not audit_text:
+                if audit_stalled:
+                    # Stall was already handled above; treat as failed attempt
+                    remediation = _build_remediation_prompt()
+                    continue
                 raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit and fallback persistence; expected an audit_results row for the work item.")
 
             structured_audit = None
