@@ -42,9 +42,11 @@ class FakeRunner:
         self.audit_outputs: list[str] = []
         self.child_ids: list[str] = []  # No children by default; tests that need children add them
         self.items: dict[str, dict] = {
-            "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
-            "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress", "effort": "", "risk": "", "audit": ""},
+            "SA-TARGET": {"id": "SA-TARGET", "stage": "plan_complete", "status": "open", "effort": "", "risk": ""},
+            "SA-CHILD": {"id": "SA-CHILD", "stage": "in_review", "status": "in-progress", "effort": "", "risk": ""},
         }
+        # audit_results table simulation: maps work_item_id -> audit text
+        self.audit_results: dict[str, str] = {}
         self.comments: list[dict] = []
         self.compact_failures_remaining = 0
 
@@ -67,6 +69,34 @@ class FakeRunner:
             item = self.items["SA-CHILD"]
             return Result(stdout=json.dumps({"success": True, "workItem": item}))
 
+        if cmd[:3] == ["wl", "audit-show", "SA-TARGET"]:
+            wid = cmd[2]
+            audit_text = self.audit_results.get(wid)
+            audit = None
+            if audit_text is not None:
+                audit = {
+                    "workItemId": wid,
+                    "readyToClose": "Ready to close: Yes" in audit_text,
+                    "auditedAt": "2026-06-05T12:00:00Z",
+                    "summary": "Audit result",
+                    "rawOutput": audit_text,
+                    "author": "audit-agent",
+                }
+            return Result(stdout=json.dumps({"success": True, "workItemId": wid, "audit": audit}))
+        if cmd[:3] == ["wl", "audit-show", "SA-CHILD"]:
+            wid = cmd[2]
+            audit_text = self.audit_results.get(wid)
+            audit = None
+            if audit_text is not None:
+                audit = {
+                    "workItemId": wid,
+                    "readyToClose": "Ready to close: Yes" in audit_text,
+                    "auditedAt": "2026-06-05T12:00:00Z",
+                    "summary": "Audit result",
+                    "rawOutput": audit_text,
+                    "author": "audit-agent",
+                }
+            return Result(stdout=json.dumps({"success": True, "workItemId": wid, "audit": audit}))
         if cmd[:3] == ["wl", "comment", "list"]:
             return Result(stdout=json.dumps({"success": True, "comments": self.comments}))
         if cmd[:3] == ["wl", "comment", "add"]:
@@ -82,6 +112,10 @@ class FakeRunner:
             if "--risk" in cmd:
                 idx = cmd.index("--risk")
                 self.items["SA-TARGET"]["risk"] = cmd[idx + 1]
+            # Track audit-text updates (fallback persistence)
+            if "--audit-text" in cmd:
+                idx = cmd.index("--audit-text")
+                self.audit_results["SA-TARGET"] = cmd[idx + 1]
             return Result(stdout=json.dumps({"success": True}))
 
         if cmd[:3] == ["wl", "update", "SA-CHILD"]:
@@ -89,6 +123,9 @@ class FakeRunner:
             if "--stage" in cmd:
                 idx = cmd.index("--stage")
                 self.items["SA-CHILD"]["stage"] = cmd[idx + 1]
+            if "--audit-text" in cmd:
+                idx = cmd.index("--audit-text")
+                self.audit_results["SA-CHILD"] = cmd[idx + 1]
             return Result(stdout=json.dumps({"success": True}))
 
         if cmd[0] == "python3" and len(cmd) > 1 and "orchestrate_estimate.py" in cmd[1]:
@@ -115,8 +152,8 @@ class FakeRunner:
             if prompt.startswith("/skill:audit"):
                 output = self.audit_outputs.pop(0)
                 target = prompt_target()
-                # Simulate the audit skill persisting the audit into the work item
-                self.items.setdefault(target, {})["audit"] = output
+                # Simulate the audit skill persisting the audit into audit_results table
+                self.audit_results[target] = output
                 return Result(stdout=output)
             if prompt.startswith("/skill:plan"):
                 # emulate plan moving target to plan_complete after plan call
@@ -215,8 +252,8 @@ def test_child_scoped_run_targets_only_requested_child():
     assert any(prompt.startswith("implement SA-CHILD") for prompt in pi_prompts)
     assert any(prompt.startswith("/skill:audit SA-CHILD") for prompt in pi_prompts)
     assert not any("SA-TARGET" in prompt for prompt in pi_prompts)
-    assert runner.items["SA-TARGET"]["audit"] == ""
-    assert runner.items["SA-CHILD"]["audit"] == AUDIT_PASS
+    assert runner.audit_results.get("SA-TARGET") is None
+    assert runner.audit_results.get("SA-CHILD") == AUDIT_PASS
 
 
 def test_pi_invocations_use_ephemeral_sessions():
@@ -1054,8 +1091,8 @@ def test_in_review_skips_start_of_iteration_audit_when_persisted_comment_up_to_d
     # Set updatedAt timestamps for target and child (child older)
     runner.items["SA-TARGET"]["updatedAt"] = "2026-05-20T11:00:00Z"
     runner.items["SA-CHILD"]["updatedAt"] = "2026-05-20T10:00:00Z"
-    # Persisted audit already present on the work item
-    runner.items["SA-TARGET"]["audit"] = AUDIT_PASS
+    # Persisted audit already present in the audit_results table
+    runner.audit_results["SA-TARGET"] = AUDIT_PASS
     # A recent AMPA comment whose createdAt is later than the updatedAt values
     runner.comments = [{"comment": "# AMPA Audit Result\n\n...", "author": "ralph", "createdAt": "2026-05-20T12:00:00Z"}]
 
@@ -1374,47 +1411,20 @@ def test_ralph_reads_persisted_audit_and_does_not_update():
     assert audit_writes == []
 
 
-def test_ralph_handles_persisted_audit_object_text_field():
-    """When the persisted audit is stored as an object with a `text` field,
-    Ralph should extract the text and proceed without error."""
-    class PersistObjectRunner(FakeRunner):
-        def __call__(self, cmd):
-            cmd = list(cmd)
-            # Intercept the audit skill invocation to persist the audit as an object
-            if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("/skill:audit"):
-                output = self.audit_outputs.pop(0)
-                # Persist as an object on the work item (audit.text)
-                self.items["SA-TARGET"]["audit"] = {"text": output}
-                return Result(stdout=output)
-            return super().__call__(cmd)
-
-    runner = PersistObjectRunner()
+def test_ralph_reads_audit_via_audit_show_command():
+    """Ralph calls `wl audit-show <id> --json` to read the persisted audit
+    instead of reading from the deprecated workItem.audit field."""
+    runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
 
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"
-
-
-def test_ralph_uses_auditText_fallback_when_audit_field_missing():
-    """If workItem.audit is absent but auditText is present, Ralph should use auditText."""
-    class AuditTextFallbackRunner(FakeRunner):
-        def __call__(self, cmd):
-            cmd = list(cmd)
-            if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("/skill:audit"):
-                output = self.audit_outputs.pop(0)
-                # Simulate persistence to auditText instead of audit
-                self.items["SA-TARGET"].pop("audit", None)
-                self.items["SA-TARGET"]["auditText"] = output
-                return Result(stdout=output)
-            return super().__call__(cmd)
-
-    runner = AuditTextFallbackRunner()
-    runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False)
-
-    result = loop.run("SA-TARGET")
-    assert result["status"] == "success"
+    # Verify wl audit-show was called
+    audit_show_calls = [c for c in runner.calls if c[:3] == ["wl", "audit-show", "SA-TARGET"]]
+    assert len(audit_show_calls) >= 1, "wl audit-show should have been called"
+    # Verify the audit was stored in audit_results (simulating audit_results table)
+    assert runner.audit_results.get("SA-TARGET") == AUDIT_PASS
 
 
 def test_ralph_errors_if_no_persisted_audit_found():
@@ -1427,6 +1437,9 @@ def test_ralph_errors_if_no_persisted_audit_found():
             if cmd and cmd[0] == "pi" and "-p" in cmd and cmd[-1].startswith("/skill:audit"):
                 output = self.audit_outputs.pop(0)
                 return Result(stdout=output)
+            # Also block the fallback persistence so audit is never stored
+            if cmd[:3] == ["wl", "update", "SA-TARGET"] and "--audit-text" in cmd:
+                return Result(stdout=json.dumps({"success": False, "error": "persist blocked"}))
             return super().__call__(cmd)
 
     runner = NoPersistRunner()
@@ -1960,17 +1973,39 @@ class MultiChildFakeRunner:
         self.calls: list[list[str]] = []
         self.audit_outputs: list[str] = []
         self.items: dict[str, dict] = {
-            "SA-PARENT": {"id": "SA-PARENT", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
-            "SA-CHILD-A": {"id": "SA-CHILD-A", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
-            "SA-CHILD-B": {"id": "SA-CHILD-B", "stage": "plan_complete", "status": "open", "effort": "", "risk": "", "audit": ""},
+            "SA-PARENT": {"id": "SA-PARENT", "stage": "plan_complete", "status": "open", "effort": "", "risk": ""},
+            "SA-CHILD-A": {"id": "SA-CHILD-A", "stage": "plan_complete", "status": "open", "effort": "", "risk": ""},
+            "SA-CHILD-B": {"id": "SA-CHILD-B", "stage": "plan_complete", "status": "open", "effort": "", "risk": ""},
         }
+        # audit_results table simulation
+        self.audit_results: dict[str, str] = {}
         self.comments: list[dict] = []
         self.audit_call_order: list[str] = []
+
+    def _audit_show_response(self, wid: str) -> str:
+        audit_text = self.audit_results.get(wid)
+        audit = None
+        if audit_text is not None:
+            audit = {
+                "workItemId": wid,
+                "readyToClose": "Ready to close: Yes" in audit_text,
+                "auditedAt": "2026-06-05T12:00:00Z",
+                "summary": "Audit result",
+                "rawOutput": audit_text,
+                "author": "audit-agent",
+            }
+        return json.dumps({"success": True, "workItemId": wid, "audit": audit})
 
     def __call__(self, cmd):
         cmd = list(cmd)
         self.calls.append(cmd)
 
+        if cmd[:3] == ["wl", "audit-show", "SA-PARENT"]:
+            return Result(stdout=self._audit_show_response("SA-PARENT"))
+        if cmd[:3] == ["wl", "audit-show", "SA-CHILD-A"]:
+            return Result(stdout=self._audit_show_response("SA-CHILD-A"))
+        if cmd[:3] == ["wl", "audit-show", "SA-CHILD-B"]:
+            return Result(stdout=self._audit_show_response("SA-CHILD-B"))
         if cmd[:3] == ["wl", "show", "SA-PARENT"] and "--children" in cmd:
             item = self.items["SA-PARENT"]
             children = []
@@ -1993,6 +2028,11 @@ class MultiChildFakeRunner:
         if cmd[:3] == ["wl", "comment", "add"]:
             return Result(stdout=json.dumps({"success": True}))
         if cmd[:2] == ["wl", "update"]:
+            # Track audit-text updates
+            if "--audit-text" in cmd:
+                wid = cmd[2]
+                idx = cmd.index("--audit-text")
+                self.audit_results[wid] = cmd[idx + 1]
             return Result(stdout=json.dumps({"success": True}))
 
         if cmd[0] == "python3" and len(cmd) > 1 and "orchestrate_estimate.py" in cmd[1]:
@@ -2012,7 +2052,7 @@ class MultiChildFakeRunner:
                 target = prompt_id()
                 self.audit_call_order.append(target)
                 output = self.audit_outputs.pop(0) if self.audit_outputs else AUDIT_PASS
-                self.items.setdefault(target, {})["audit"] = output
+                self.audit_results[target] = output
                 return Result(stdout=output)
             if prompt.startswith("/skill:plan"):
                 return Result(stdout="planned")

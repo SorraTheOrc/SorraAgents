@@ -1135,6 +1135,19 @@ class RalphLoop:
             logger.debug("ralph.cmd.wl.show id=%s stage=%s status=%s children=%d", item.get("id"), item.get("stage"), item.get("status"), len((result or {}).get("children", [])))
         return result or {}
 
+    def _wl_audit_show(self, work_item_id: str) -> dict:
+        """Call `wl audit-show <id> --json` and return the parsed result.
+
+        Returns a dict with keys: success, workItemId, audit.
+        When no audit exists, audit is None.
+        When an audit exists, audit contains {workItemId, readyToClose,
+        auditedAt, summary, rawOutput, author}.
+        """
+        cmd = [self.wl_bin, "audit-show", work_item_id, "--json"]
+        logger.debug("ralph.cmd.wl.audit_show cmd=%s", cmd)
+        result = self._call_with_retry(cmd, category="wl", expect_json=True)
+        return result or {}
+
     def _wl_comment_list(self, work_item_id: str) -> list[dict]:
         cmd = [self.wl_bin, "comment", "list", work_item_id, "--json"]
         logger.debug("ralph.cmd.wl.comment_list cmd=%s", cmd)
@@ -1757,15 +1770,26 @@ class RalphLoop:
 
         return False
 
-    def _extract_audit_text_from_item(self, item: dict) -> str:
-        """Extract the persisted audit text from a wl show workItem dict."""
-        audit_field = item.get("audit")
-        if isinstance(audit_field, dict):
-            return audit_field.get("text", "") or item.get("auditText", "") or ""
-        elif isinstance(audit_field, str):
-            return audit_field
-        else:
-            return item.get("auditText", "") or ""
+    def _read_persisted_audit_text(self, work_item_id: str) -> str:
+        """Read the persisted audit text via `wl audit-show <id> --json`.
+
+        Returns the raw audit text from the audit_results table, or an empty
+        string if no audit record exists for the work item.
+        """
+        try:
+            result = self._wl_audit_show(work_item_id)
+        except Exception:
+            logger.debug("ralph.audit_show_failed target=%s", work_item_id, exc_info=True)
+            return ""
+        audit = result.get("audit")
+        if not audit:
+            return ""
+        # rawOutput holds the full audit text
+        raw = audit.get("rawOutput") or ""
+        # Also check legacy text field for backwards compatibility
+        if isinstance(audit, dict) and not raw:
+            raw = audit.get("text", "") or ""
+        return raw
 
     def _is_effort_risk_computed(self, target_id: str) -> bool:
         """Check whether effort and risk have already been set on the work item."""
@@ -2255,17 +2279,15 @@ class RalphLoop:
                 remediation = _build_remediation_prompt()
                 continue
 
-            # Read persisted audit
-            item = self._wl_show(item_id).get("workItem", {})
-            audit_text = self._extract_audit_text_from_item(item)
+            # Read persisted audit via wl audit-show
+            audit_text = self._read_persisted_audit_text(item_id)
 
             if not audit_text:
                 # Audit model did NOT persist — try fallback from captured output
                 fallback_ok = self._try_fallback_persist(item_id, audit_output)
                 if fallback_ok:
                     # Fallback persisted successfully — re-read and evaluate
-                    item = self._wl_show(item_id).get("workItem", {})
-                    audit_text = self._extract_audit_text_from_item(item)
+                    audit_text = self._read_persisted_audit_text(item_id)
 
             if not audit_text:
                 # Still no audit text — this is a genuine failure (output lacked
@@ -2634,20 +2656,18 @@ class RalphLoop:
             else:
                 # Run the audit skill; capture output for fallback persistence if needed.
                 audit_output = self._run_pi(f"/skill:audit {focus_id}", phase="audit")
-            # Read the persisted audit from the work item via wl show.
-            item = self._wl_show(focus_id).get("workItem", {})
-            audit_text = self._extract_audit_text_from_item(item)
+            # Read the persisted audit via wl audit-show
+            audit_text = self._read_persisted_audit_text(focus_id)
 
             if not audit_text:
                 # Audit model did NOT persist — try fallback from captured output
                 fallback_ok = self._try_fallback_persist(focus_id, audit_output)
                 if fallback_ok:
                     # Fallback persisted successfully — re-read
-                    item = self._wl_show(focus_id).get("workItem", {})
-                    audit_text = self._extract_audit_text_from_item(item)
+                    audit_text = self._read_persisted_audit_text(focus_id)
 
             if not audit_text:
-                raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit and fallback persistence; expected workItem.audit to contain the structured report.")
+                raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit and fallback persistence; expected an audit_results row for the work item.")
 
             structured_audit = None
             lines = [l.strip() for l in audit_text.splitlines() if l.strip()]

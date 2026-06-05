@@ -121,15 +121,30 @@ def test_extract_text_from_json_output_handles_structured_message_events():
 
 
 def test_loop_with_failing_check_and_fail_open():
+    audit_text = "Ready to close: Yes\n| # | Criterion | Verdict | Evidence |"
+
     def runner(cmd):
+        if cmd and cmd[:3] == ['wl', 'audit-show', 'WI']:
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({
+                "success": True,
+                "workItemId": "WI",
+                "audit": {
+                    "workItemId": "WI",
+                    "readyToClose": True,
+                    "auditedAt": "2026-06-05T12:00:00Z",
+                    "summary": "Audit result",
+                    "rawOutput": audit_text,
+                    "author": "audit-agent",
+                },
+            }))
         if cmd and cmd[0] == 'wl':
-            ws = {"workItem": {"id": "WI", "stage": "in_review", "audit": "Ready to close: Yes\n| # | Criterion | Verdict | Evidence |"}, "children": []}
+            ws = {"workItem": {"id": "WI", "stage": "in_review"}, "children": []}
             return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(ws))
         if cmd and cmd[0] == 'bash':
             # Simulate failing check
             return subprocess.CompletedProcess(cmd, 1, stdout='', stderr='fail check')
         if cmd and cmd[0] == 'pi':
-            pi_json = json.dumps({"type": "agent_end", "messages": [{"role": "assistant", "content": [{"type": "text", "text": "Ready to close: Yes\n| # | Criterion | Verdict | Evidence |"}]}]})
+            pi_json = json.dumps({"type": "agent_end", "messages": [{"role": "assistant", "content": [{"type": "text", "text": audit_text}]}]})
             return subprocess.CompletedProcess(cmd, 0, stdout=pi_json)
         return subprocess.CompletedProcess(cmd, 0, stdout='')
 
