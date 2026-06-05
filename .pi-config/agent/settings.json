@@ -10,11 +10,12 @@
     "maxRetries": 3,
     "baseDelayMs": 2000,
     "provider": {
-      "timeoutMs": 900000,
+      "timeoutMs": 10800000,
       "maxRetries": 0,
       "maxRetryDelayMs": 60000
     }
   },
+  "httpIdleTimeoutMs": 600000,
   "enabledModels": [
     "Proxy/gemma4",
     "Proxy/qwen3",

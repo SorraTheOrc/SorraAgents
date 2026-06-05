@@ -29,7 +29,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from skill.ralph.scripts.signal_system import EventType, SignalWriter, resolve_signal_path
 from skill.ralph.scripts.structured_response import StructuredResponse, parse_structured_response
+from skill.ralph.scripts.webhook_notifier import WebhookNotifier, resolve_webhook_url
 from skill.test_runner import canonicalize_quiet_test_command
 
 logger = logging.getLogger("ralph")
@@ -867,6 +869,8 @@ class RalphLoop:
         fatal_cmds: list[str] | None = None,
         debug_persist: bool = False,
         pi_stream_timeout: float | None = None,
+        signal_file_path: str | None = None,
+        webhook_url: str | None = None,
     ):
         self.runner = runner or _default_runner
         self.pi_bin = pi_bin
@@ -933,6 +937,55 @@ class RalphLoop:
         self._no_change_cycle_count: int = 0
         self._last_known_head: str | None = None
         self._max_cycles_no_change: int = max_cycles_no_change if max_cycles_no_change is not None else DEFAULT_MAX_CYCLES_NO_CHANGE
+
+        # Signal file and webhook notification infrastructure
+        self._signal_file_path: str | None = signal_file_path
+        if signal_file_path:
+            self._signal_writer: SignalWriter | None = SignalWriter(Path(signal_file_path))
+        else:
+            self._signal_writer = None
+        self._webhook_url: str | None = webhook_url
+        if webhook_url:
+            self._webhook_notifier: WebhookNotifier | None = WebhookNotifier(webhook_url)
+        else:
+            self._webhook_notifier = None
+
+    def _notify_event(
+        self,
+        event_type: EventType,
+        work_item_ids: list[str] | None = None,
+        description: str | None = None,
+    ) -> None:
+        """Write a signal file and optionally send a webhook notification.
+
+        This is fire-and-forget: errors from either channel are logged at
+        WARNING level and never propagated to the caller.
+        """
+        if self._signal_writer is not None:
+            try:
+                self._signal_writer.write_event(
+                    event_type,
+                    work_item_ids=work_item_ids,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ralph.notify.signal_write_failed event=%s error=%s",
+                    event_type.value,
+                    exc,
+                )
+        if self._webhook_notifier is not None:
+            try:
+                self._webhook_notifier.send_event(
+                    event_type,
+                    work_item_ids=work_item_ids,
+                    description=description,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ralph.notify.webhook_failed event=%s error=%s",
+                    event_type.value,
+                    exc,
+                )
 
     def _resolve_model_for_phase(self, phase: str) -> str:
         if phase not in MODEL_PHASES:
@@ -2230,6 +2283,11 @@ class RalphLoop:
                         attempt,
                         self._no_change_cycle_count,
                     )
+                    self._notify_event(
+                        EventType.ERROR,
+                        work_item_ids=[item_id],
+                        description="Ralph single item stalled due to audit persistence failure",
+                    )
                     return {
                         "status": "stalled",
                         "attempt": attempt,
@@ -2237,6 +2295,11 @@ class RalphLoop:
                         "no_change_cycles": self._no_change_cycle_count,
                     }
                 if attempt >= max_attempts:
+                    self._notify_event(
+                        EventType.MAX_ATTEMPTS,
+                        work_item_ids=[item_id],
+                        description="Ralph single item exhausted attempts with no persisted audit",
+                    )
                     return {"status": "max_attempts", "attempt": attempt, "reason": "no_persisted_audit"}
                 remediation = _build_remediation_prompt()
                 continue
@@ -2252,6 +2315,11 @@ class RalphLoop:
             )
             if parsed.ready_to_close:
                 logger.debug("ralph.run_single_item.success target=%s attempt=%d", item_id, attempt)
+                self._notify_event(
+                    EventType.STATUS_TRANSITION,
+                    work_item_ids=[item_id],
+                    description="Work item passed audit and is ready for review",
+                )
                 return {"status": "success", "attempt": attempt}
 
             # Audit reported unmet criteria — decide whether to retry
@@ -2265,6 +2333,11 @@ class RalphLoop:
                     attempt,
                     self._no_change_cycle_count,
                 )
+                self._notify_event(
+                    EventType.ERROR,
+                    work_item_ids=[item_id],
+                    description="Ralph single item stalled with unmet audit criteria",
+                )
                 return {
                     "status": "stalled",
                     "attempt": attempt,
@@ -2273,6 +2346,11 @@ class RalphLoop:
                     "unmet": unmet,
                 }
             if attempt >= max_attempts:
+                self._notify_event(
+                    EventType.MAX_ATTEMPTS,
+                    work_item_ids=[item_id],
+                    description="Ralph single item exhausted maximum attempts",
+                )
                 return {"status": "max_attempts", "attempt": attempt, "unmet": unmet}
 
             # Build a remediation hint for the next attempt and retry
@@ -2280,12 +2358,20 @@ class RalphLoop:
             continue
 
         # Should not reach here
+        self._notify_event(
+            EventType.MAX_ATTEMPTS,
+            work_item_ids=[item_id],
+            description="Ralph single item exhausted attempts (unreachable fallback)",
+        )
         return {"status": "max_attempts", "attempt": max_attempts}
 
     def run(self, target_id: str, child_id: str | None = None) -> dict:
         focus_id = self._resolve_focus_target(target_id, child_id)
         self._assert_precondition(focus_id)
         scope_ids = self._scope_ids_recursive(focus_id)
+
+        # Notify: loop starting
+        self._notify_event(EventType.STARTED, work_item_ids=scope_ids)
 
         # If the target is already in_review, skip the first implement pass and
         # go straight to audit. If a persisted audit comment shows the scope is
@@ -2342,6 +2428,11 @@ class RalphLoop:
 
             if failed_children:
                 # All children attempted — report failures
+                self._notify_event(
+                    EventType.MAX_ATTEMPTS,
+                    work_item_ids=scope_ids,
+                    description="Ralph child iteration exhausted all attempts",
+                )
                 return {
                     "status": "child_max_attempts",
                     "attempt": attempts_used,
@@ -2356,8 +2447,18 @@ class RalphLoop:
             parent_attempts = int(parent_res.get("attempt", 1)) if isinstance(parent_res.get("attempt", 1), int) else 1
             total_attempts = max(attempts_used, parent_attempts)
             if parent_res.get("status") == "success":
+                self._notify_event(
+                    EventType.COMPLETED,
+                    work_item_ids=scope_ids,
+                    description="Ralph loop completed successfully with all children",
+                )
                 return {"status": "success", "attempt": total_attempts, "scope": scope_ids, "child_results": child_results, "integration_audit": True, "compact": {"invocations": invocations, "failures": failures}}
             else:
+                self._notify_event(
+                    EventType.MAX_ATTEMPTS,
+                    work_item_ids=scope_ids,
+                    description="Ralph integration audit exhausted all attempts",
+                )
                 return {"status": "integration_max_attempts", "attempt": total_attempts, "scope": scope_ids, "child_results": child_results, "integration_audit": True, "compact": {"invocations": invocations, "failures": failures}}
 
         target_item = self._wl_show(focus_id).get("workItem", {})
@@ -2376,6 +2477,11 @@ class RalphLoop:
             if self.cancel_file and os.path.exists(self.cancel_file):
                 logger.info("ralph.loop.cancelled target=%s attempt=%d", focus_id, attempt)
                 self._cleanup_pi_process()
+                self._notify_event(
+                    EventType.CANCELLED,
+                    work_item_ids=scope_ids,
+                    description="Ralph loop cancelled by operator",
+                )
                 return {
                     "status": "cancelled",
                     "attempt": attempt,
@@ -2447,6 +2553,11 @@ class RalphLoop:
                         no_safe_path_reason,
                     )
                     self._cleanup_pi_process()
+                    self._notify_event(
+                        EventType.ERROR,
+                        work_item_ids=scope_ids,
+                        description=f"Ralph loop requires producer input: {no_safe_path_reason}",
+                    )
                     return {
                         "status": "producer_input_required",
                         "attempt": attempt,
@@ -2501,6 +2612,11 @@ class RalphLoop:
                         no_safe_path_reason,
                     )
                     self._cleanup_pi_process()
+                    self._notify_event(
+                        EventType.ERROR,
+                        work_item_ids=scope_ids,
+                        description=f"Ralph loop requires producer input: {no_safe_path_reason}",
+                    )
                     return {
                         "status": "producer_input_required",
                         "attempt": attempt,
@@ -2564,6 +2680,11 @@ class RalphLoop:
                 self._wl_update_stage(focus_id, "in_review")
                 logger.info("ralph.loop.stage_update target=%s stage=in_review audit=pass", focus_id)
                 self._cleanup_pi_process()
+                self._notify_event(
+                    EventType.COMPLETED,
+                    work_item_ids=scope_ids,
+                    description="Ralph loop completed successfully after passing audit",
+                )
                 return {
                     "status": "success",
                     "attempt": attempt,
@@ -2600,6 +2721,11 @@ class RalphLoop:
                     self._no_change_cycle_count,
                 )
                 self._cleanup_pi_process()
+                self._notify_event(
+                    EventType.ERROR,
+                    work_item_ids=scope_ids,
+                    description="Ralph loop stalled due to no code changes across attempts",
+                )
                 return {
                     "status": "stalled",
                     "attempt": attempt,
@@ -2627,6 +2753,11 @@ class RalphLoop:
 
         logger.warning("ralph.loop.max_attempts target=%s", focus_id)
         self._cleanup_pi_process()
+        self._notify_event(
+            EventType.MAX_ATTEMPTS,
+            work_item_ids=scope_ids,
+            description="Ralph loop exhausted maximum attempts",
+        )
         return {
             "status": "max_attempts",
             "attempt": self.max_attempts,
@@ -2744,6 +2875,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     phase_model_config = _extract_phase_model_config(config)
     config_model_source_raw = config.get("model_source") if isinstance(config, dict) else None
 
+    # Resolve signal file path and webhook URL from config
+    signal_file_path = str(resolve_signal_path(config))
+    webhook_url = resolve_webhook_url(config)
+
     model_source_explicit = args.model_source is not None or config_model_source_raw is not None
     legacy_model_explicit = args.model is not None or legacy_config_model is not None
     effective_model_source = _normalize_model_source(args.model_source or config_model_source_raw)
@@ -2773,6 +2908,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         retry_delay=args.retry_delay,
         fatal_cmds=args.fatal_cmd,
         debug_persist=args.debug_persist,
+        signal_file_path=signal_file_path,
+        webhook_url=webhook_url,
     )
     loop.no_autoplan = args.no_autoplan
     try:
