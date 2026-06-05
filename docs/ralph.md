@@ -167,6 +167,11 @@ Testing
   - At `in_review`: ralph **skips the first implement pass** and audits immediately. If audit passes, ralph proceeds to checks/merge without any implement step. If audit fails, ralph falls into the normal implement\u2192audit loop with remediation.
   - At any other stage: ralph exits with an error.
 - **Scope**: Only the target item and its direct children are processed.
+- **Child skip logic**: When iterating through children in per-child mode, Ralph decides whether to skip a child based on its stage and most recent audit result:
+  - Children in terminal stages (`done`, `completed`, `closed`) are **always skipped**.
+  - Children in `in_review` stage are **skipped only if** their most recent persisted audit result says "Ready to close: Yes".
+  - Children in `in_review` whose most recent audit says "Ready to close: No" (or have no persisted audit) are **re-processed** (re-implemented and re-audited).
+  - All other stages (e.g., `in_progress`, `plan_complete`) are processed normally.
 
 ## Compaction trigger behavior
 

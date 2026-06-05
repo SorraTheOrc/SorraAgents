@@ -2114,20 +2114,36 @@ def test_per_child_iteration_parent_integration_audit_runs():
 
 
 def test_per_child_iteration_skips_already_reviewed():
-    """Children already in_review are skipped."""
+    """Children in terminal stages are always skipped.
+    Children in_review are skipped only if they have a passing persisted audit.
+    """
     runner = MultiChildFakeRunner()
+    
+    # SA-CHILD-A: in_review with FAIL -> should NOT be skipped
+    runner.items["SA-CHILD-A"]["stage"] = "in_review"
+    runner.audit_results["SA-CHILD-A"] = AUDIT_FAIL
+    
+    # SA-CHILD-B: in_review with PASS -> should be skipped
     runner.items["SA-CHILD-B"]["stage"] = "in_review"
-    # Only child A needs implement→audit; parent gets integration audit
-    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS]
+    runner.audit_results["SA-CHILD-B"] = AUDIT_PASS
+    
+    # Parent needs integration audit
+    runner.audit_outputs = [AUDIT_PASS, AUDIT_PASS] # 1 for A (passed on retry), 1 for parent
     loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
 
     result = loop.run("SA-PARENT")
 
     assert result["status"] == "success"
     assert result["child_results"]["SA-CHILD-B"]["status"] == "skipped"
-    # Only child A should have implement prompts
+    assert result["child_results"]["SA-CHILD-A"]["status"] == "success"
+    
+    # SA-CHILD-A should have implement/audit calls, SA-CHILD-B should not
     pi_prompts = [call[-1] for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    assert any("SA-CHILD-A" in p for p in pi_prompts)
     assert not any("SA-CHILD-B" in p for p in pi_prompts if p.startswith("implement"))
+    
+    assert "SA-CHILD-A" in runner.audit_call_order
+    assert "SA-CHILD-B" not in runner.audit_call_order
 
 
 def test_per_child_iteration_continues_on_child_failure():

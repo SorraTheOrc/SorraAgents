@@ -2431,9 +2431,23 @@ class RalphLoop:
                     if c.get("id") == cid:
                         stage = c.get("stage")
                         break
-                if stage in {"in_review", "done", "completed", "closed"}:
+                if stage in {"done", "completed", "closed"}:
                     child_results[cid] = {"status": "skipped"}
                     continue
+                
+                if stage == "in_review":
+                    # For in_review, check the most recent persisted audit result.
+                    # If it says "Ready to close: Yes", we skip it.
+                    # Otherwise (failed or no audit), we treat it as needing work.
+                    audit_text = self._read_persisted_audit_text(cid)
+                    if audit_text:
+                        parsed = parse_audit_report(audit_text)
+                        if parsed.ready_to_close:
+                            child_results[cid] = {"status": "skipped"}
+                            continue
+                        logger.info("ralph.run.child_in_review_audit_fail target=%s child=%s", focus_id, cid)
+                    else:
+                        logger.info("ralph.run.child_in_review_no_audit target=%s child=%s", focus_id, cid)
 
                 # Delegate to run_single_item which performs retries internally
                 res = self.run_single_item(cid, implement_command="implement-single")
