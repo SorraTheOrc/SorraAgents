@@ -182,8 +182,8 @@ If a release introduces a critical issue:
 
 ### Merge conflicts between `dev` and `main`
 
-- Create a merge-conflict work item via `wl create`.
-- Resolve conflicts on a temporary branch.
+- Resolve conflicts manually on the feature branch.
+- Record conflict details and resolution steps in a comment on the owning work item.
 - Push the resolved branch to `dev` after review.
 - Re-run the pre-merge checklist.
 
