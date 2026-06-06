@@ -1,0 +1,8 @@
+{
+  "httpIdleTimeoutMs": 1800000,
+  "retry": {
+    "provider": {
+      "timeoutMs": 1800000
+    }
+  }
+}

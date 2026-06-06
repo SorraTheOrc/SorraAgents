@@ -67,10 +67,12 @@ class TestLoadAssetConfig:
     def test_asset_config_has_all_phases(self):
         data = _load_asset_config()
         for source in ("remote", "local"):
-            for phase in MODEL_PHASES:
-                assert phase in data["model"][source], (
-                    f"Missing {source}.{phase} in asset config"
-                )
+            model_source = data["model"][source]
+            for priority in model_source:
+                for phase in MODEL_PHASES:
+                    assert phase in model_source[priority], (
+                        f"Missing {source}.{priority}.{phase} in asset config"
+                    )
 
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from skill.ralph.scripts.signal_system import EventType, SignalWriter, resolve_signal_path
 from skill.ralph.scripts.structured_response import StructuredResponse, parse_structured_response
+from skill.ralph.scripts.webhook_notifier import WebhookNotifier, resolve_webhook_url
 from skill.test_runner import canonicalize_quiet_test_command
 
 logger = logging.getLogger("ralph")
@@ -190,6 +192,56 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _resolve_complexity_tier(config: dict, item: dict) -> str:
+    """Resolve the complexity tier (low, medium, high) for a work item.
+
+    Mapping:
+    - Low: Effort XS or S AND risk Low
+    - Medium: Effort M OR risk Medium
+    - High: Effort L or XL OR risk High
+
+    Thresholds are configurable via config["complexity_tier"].
+    Defaults to 'medium' if mapping cannot be determined.
+    """
+    effort = item.get("effort")
+    risk = item.get("risk")
+
+    # Load thresholds from config
+    tier_cfg = config.get("complexity_tier", {})
+    low_cfg = tier_cfg.get("low", {})
+    high_cfg = tier_cfg.get("high", {})
+
+    low_max_effort = low_cfg.get("max_effort", "Small")
+    low_max_risk = low_cfg.get("max_risk", "Low")
+    high_min_effort = high_cfg.get("min_effort", "Large")
+    high_min_risk = high_cfg.get("min_risk", "High")
+
+    # T-shirt size order for comparison
+    effort_order = {"Extra Small": 0, "Small": 1, "Medium": 2, "Large": 3, "Extra Large": 4}
+    risk_order = {"Low": 0, "Medium": 1, "High": 2}
+
+    item_effort_val = effort_order.get(effort)
+    item_risk_val = risk_order.get(risk)
+
+    # Fallback for missing values: treat as Medium (safe middle ground)
+    if item_effort_val is None:
+        item_effort_val = effort_order["Medium"]
+    if item_risk_val is None:
+        item_risk_val = risk_order["Medium"]
+
+    # High tier check (OR)
+    if item_effort_val >= effort_order.get(high_min_effort, 3) or \
+       item_risk_val >= risk_order.get(high_min_risk, 2):
+        return "high"
+
+    # Low tier check (AND)
+    if item_effort_val <= effort_order.get(low_max_effort, 1) and \
+       item_risk_val <= risk_order.get(low_max_risk, 0):
+        return "low"
+
+    return "medium"
+
+
 def _load_asset_config() -> dict:
     """Load the shipped default config from skill/ralph/assets/.ralph.json."""
     try:
@@ -277,29 +329,85 @@ def _coerce_model_str(value: object) -> str | None:
     return None
 
 
-def _resolve_phase_model_value(value: object, model_source: str) -> str | None:
-    """Resolve a model value that may be a string or source-mapped object."""
+def _resolve_phase_model_value(value: object, model_source: str, tier: str | None = None) -> str | None:
+    """Resolve a model value that may be a string, source-mapped object, or tiered object.
+
+    Handles these structures:
+    - String: "Proxy/qwen3"
+    - Source-mapped: {"remote": "opencode/claude-4.7", "local": "Proxy/qwen3"}
+    - Tiered per source: {"remote": {"low": "...", "medium": "...", "high": "..."}}
+
+    When tier is None, defaults to "medium" (the default complexity tier).
+    """
+    effective_tier = tier if tier else "medium"
     direct = _coerce_model_str(value)
     if direct:
         return direct
-    if isinstance(value, dict):
-        source_value = _coerce_model_str(value.get(model_source))
+
+    if not isinstance(value, dict):
+        return None
+
+    # Check source -> tier -> phase (nested tiered structure)
+    # e.g., {"remote": {"low": "...", "medium": "...", "high": "..."}}
+    source_data = value.get(model_source)
+    if isinstance(source_data, dict):
+        # Try tiered lookup first: source -> tier
+        tier_model = _coerce_model_str(source_data.get(effective_tier))
+        if tier_model:
+            return tier_model
+        # If the source_data itself contains the model string directly (legacy flat)
+        source_value = _coerce_model_str(source_data)
         if source_value:
             return source_value
+
+    # Fallback to source-mapped string: {"remote": "...", "local": "..."}
+    source_value = _coerce_model_str(value.get(model_source))
+    if source_value:
+        return source_value
+
     return None
 
 
-def _extract_phase_model_config(config: dict) -> dict[str, object]:
-    """Extract per-phase model config from nested or dotted config keys."""
+def _extract_phase_model_config(config: dict, tier: str | None = None) -> dict[str, object]:
+    """Extract per-phase model config from nested or dotted config keys.
+
+    If a specific tier is provided, extracts only that tier's values.
+    When tier is None, extracts all tiers (low/medium/high) so runtime
+    resolution can pick the correct one based on the item's complexity.
+    Also supports legacy flat keys (model.<phase>, model.remote.<phase>)
+    for backwards compatibility.
+    """
     phase_config: dict[str, object] = {}
     model_root = config.get("model")
 
+    # Determine which tiers to extract
+    if tier:
+        tiers_to_extract = [tier]
+    else:
+        tiers_to_extract = ["low", "medium", "high"]
+
     for phase in MODEL_PHASES:
+        # 1. Tiered dotted keys: model.<source>.<tier>.<phase>
+        source_tier_map: dict[str, object] = {}
+        for source in MODEL_SOURCES:
+            for t in tiers_to_extract:
+                tiered_key = config.get(f"model.{source}.{t}.{phase}")
+                if tiered_key is not None:
+                    if source not in source_tier_map:
+                        source_tier_map[source] = {}
+                    source_tier_map[source][t] = tiered_key
+
+        if source_tier_map:
+            phase_config[phase] = source_tier_map
+            continue
+
+        # 2. Legacy dotted keys: model.<phase>
         dotted_key = config.get(f"model.{phase}")
         if dotted_key is not None:
             phase_config[phase] = dotted_key
             continue
 
+        # 3. Direct source keys: model.remote.intake
         direct_remote = config.get(f"model.remote.{phase}")
         direct_local = config.get(f"model.local.{phase}")
         if direct_remote is not None or direct_local is not None:
@@ -311,7 +419,9 @@ def _extract_phase_model_config(config: dict) -> dict[str, object]:
             phase_config[phase] = source_map
             continue
 
+        # 4. Nested model object: model: { remote: { low: { intake: ... } } }
         if isinstance(model_root, dict):
+            # Flat model object: model: { intake: ... }
             if phase in model_root:
                 phase_config[phase] = model_root[phase]
                 continue
@@ -320,10 +430,28 @@ def _extract_phase_model_config(config: dict) -> dict[str, object]:
             local_map = model_root.get("local")
             if isinstance(remote_map, dict) or isinstance(local_map, dict):
                 source_map: dict[str, object] = {}
-                if isinstance(remote_map, dict) and phase in remote_map:
-                    source_map["remote"] = remote_map[phase]
-                if isinstance(local_map, dict) and phase in local_map:
-                    source_map["local"] = local_map[phase]
+                # Check remote tiered/flat
+                if isinstance(remote_map, dict):
+                    for t in tiers_to_extract:
+                        if isinstance(remote_map.get(t), dict) and phase in remote_map[t]:
+                            if "low" not in source_map and "medium" not in source_map and "high" not in source_map:
+                                # First tier found for this source — build nested structure
+                                pass
+                            if "remote" not in source_map:
+                                source_map["remote"] = {}
+                            source_map["remote"][t] = remote_map[t][phase]
+                    if phase in remote_map:
+                        source_map["remote"] = remote_map[phase]
+                # Check local tiered/flat
+                if isinstance(local_map, dict):
+                    for t in tiers_to_extract:
+                        if isinstance(local_map.get(t), dict) and phase in local_map[t]:
+                            if "local" not in source_map:
+                                source_map["local"] = {}
+                            source_map["local"][t] = local_map[t][phase]
+                    if phase in local_map:
+                        source_map["local"] = local_map[phase]
+
                 if source_map:
                     phase_config[phase] = source_map
 
@@ -867,6 +995,8 @@ class RalphLoop:
         fatal_cmds: list[str] | None = None,
         debug_persist: bool = False,
         pi_stream_timeout: float | None = None,
+        signal_file_path: str | None = None,
+        webhook_url: str | None = None,
     ):
         self.runner = runner or _default_runner
         self.pi_bin = pi_bin
@@ -934,7 +1064,82 @@ class RalphLoop:
         self._last_known_head: str | None = None
         self._max_cycles_no_change: int = max_cycles_no_change if max_cycles_no_change is not None else DEFAULT_MAX_CYCLES_NO_CHANGE
 
-    def _resolve_model_for_phase(self, phase: str) -> str:
+        # Signal file and webhook notification infrastructure
+        self._signal_file_path: str | None = signal_file_path
+        if signal_file_path:
+            self._signal_writer: SignalWriter | None = SignalWriter(Path(signal_file_path))
+        else:
+            self._signal_writer = None
+        self._webhook_url: str | None = webhook_url
+        if webhook_url:
+            self._webhook_notifier: WebhookNotifier | None = WebhookNotifier(webhook_url)
+        else:
+            self._webhook_notifier = None
+
+    def _notify_event(
+        self,
+        event_type: EventType,
+        work_item_ids: list[str] | None = None,
+        description: str | None = None,
+        title: str | None = None,
+        cmd: str | None = None,
+    ) -> None:
+        """Write a signal file and optionally send a webhook notification.
+
+        This is fire-and-forget: errors from either channel are logged at
+        WARNING level and never propagated to the caller.
+
+        When ``title`` is provided, it is used as the Discord embed title
+        ("Ralph: {title}"). When omitted but a single ``work_item_id`` is
+        present, the title is automatically fetched from the work item.
+        When neither is available, the embed title falls back to the
+        event-type default.
+
+        When ``cmd`` is provided, it is included in both the signal file
+        JSON payload and the Discord embed as a "Pi Command" field.
+        """
+        # Resolve work-item title if not provided
+        resolved_title = title
+        if resolved_title is None and work_item_ids and len(work_item_ids) == 1:
+            try:
+                item_data = self._wl_show(work_item_ids[0])
+                wi = item_data.get("workItem", {}) if isinstance(item_data, dict) else {}
+                resolved_title = wi.get("title", "") or None
+            except Exception:
+                resolved_title = None
+
+        if self._signal_writer is not None:
+            try:
+                self._signal_writer.write_event(
+                    event_type,
+                    work_item_ids=work_item_ids,
+                    cmd=cmd,
+                    title=resolved_title,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ralph.notify.signal_write_failed event=%s error=%s",
+                    event_type.value,
+                    exc,
+                )
+
+        if self._webhook_notifier is not None:
+            try:
+                self._webhook_notifier.send_event(
+                    event_type,
+                    work_item_ids=work_item_ids,
+                    description=description,
+                    title=resolved_title,
+                    cmd=cmd,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ralph.notify.webhook_failed event=%s error=%s",
+                    event_type.value,
+                    exc,
+                )
+
+    def _resolve_model_for_phase(self, phase: str, tier: str | None = None) -> str:
         if phase not in MODEL_PHASES:
             raise RalphError(f"Unknown model phase: {phase}")
 
@@ -943,7 +1148,7 @@ class RalphLoop:
             return override_value
 
         config_value = self.model_config.get(phase)
-        configured_phase_model = _resolve_phase_model_value(config_value, self.model_source)
+        configured_phase_model = _resolve_phase_model_value(config_value, self.model_source, tier=tier)
         if configured_phase_model:
             return configured_phase_model
 
@@ -1082,6 +1287,19 @@ class RalphLoop:
             logger.debug("ralph.cmd.wl.show id=%s stage=%s status=%s children=%d", item.get("id"), item.get("stage"), item.get("status"), len((result or {}).get("children", [])))
         return result or {}
 
+    def _wl_audit_show(self, work_item_id: str) -> dict:
+        """Call `wl audit-show <id> --json` and return the parsed result.
+
+        Returns a dict with keys: success, workItemId, audit.
+        When no audit exists, audit is None.
+        When an audit exists, audit contains {workItemId, readyToClose,
+        auditedAt, summary, rawOutput, author}.
+        """
+        cmd = [self.wl_bin, "audit-show", work_item_id, "--json"]
+        logger.debug("ralph.cmd.wl.audit_show cmd=%s", cmd)
+        result = self._call_with_retry(cmd, category="wl", expect_json=True)
+        return result or {}
+
     def _wl_comment_list(self, work_item_id: str) -> list[dict]:
         cmd = [self.wl_bin, "comment", "list", work_item_id, "--json"]
         logger.debug("ralph.cmd.wl.comment_list cmd=%s", cmd)
@@ -1120,64 +1338,100 @@ class RalphLoop:
         # Use wrapper to allow fail-open/retry behaviour
         self._call_with_retry(cmd, category="wl", expect_json=True)
 
+    def _wl_comment_delete(self, comment_id: str) -> None:
+        """Delete a work item comment by its ID."""
+        cmd = [
+            self.wl_bin,
+            "comment",
+            "delete",
+            comment_id,
+            "--json",
+        ]
+        logger.debug("ralph.cmd.wl.comment_delete id=%s", comment_id)
+        self._call_with_retry(cmd, category="wl", expect_json=True)
+
     def _wl_update_stage(self, work_item_id: str, stage: str) -> None:
         """Update the work item's stage via wl update."""
         cmd = [self.wl_bin, "update", work_item_id, "--stage", stage]
         logger.info("ralph.cmd.wl.update_stage target=%s stage=%s", work_item_id, stage)
         self._call_with_retry(cmd, category="wl", expect_json=False)
+        # Notify about the stage change
+        self._notify_event(
+            EventType.STATUS_TRANSITION,
+            work_item_ids=[work_item_id],
+            description=f"Work item stage changed to {stage}",
+        )
 
-    def _run_pi(self, prompt: str, phase: str = "implementation") -> str:
+    def _run_pi(self, prompt: str, phase: str = "implementation", work_item_ids: list[str] | None = None, tier: str | None = None) -> str:
         # Use an ephemeral session for each orchestration call so nested or
         # retried runs never attempt to continue a previous assistant turn.
-        model_for_phase = self._resolve_model_for_phase(phase)
+        model_for_phase = self._resolve_model_for_phase(phase, tier=tier)
         cmd = [self.pi_bin, "-p", "--no-session", "--mode", "json", "--model", model_for_phase, prompt]
+        rendered_cmd = _render_command(cmd)
+
+        # Notify: pi subprocess starting (build command BEFORE notifying so cmd is available)
+        self._notify_event(
+            EventType.PI_STARTED,
+            work_item_ids=work_item_ids,
+            description=f"Pi subprocess starting ({phase})",
+            cmd=rendered_cmd,
+        )
         logger.debug("ralph.cmd.pi.run phase=%s model=%s prompt_len=%d", phase, model_for_phase, len(prompt))
         if self.verbose:
             logger.debug("ralph.cmd.pi.run prompt_full=\n%s", prompt)
 
         self._last_structured_response = None
-        if self.stream:
-            return self._stream_pi(cmd, prompt, model_for_phase, phase)
+        try:
+            if self.stream:
+                return self._stream_pi(cmd, prompt, model_for_phase, phase)
 
-        proc = self._call_with_retry(cmd, category="pi", expect_json=False)
-        if getattr(proc, "returncode", 0) != 0:
-            if self.fail_open and ("pi" not in self.fatal_cmds):
-                logger.warning("ralph.cmd.pi.failed_but_fail_open cmd=%s rc=%s stderr=%s", cmd, getattr(proc, "returncode", None), (getattr(proc, "stderr", "") or "").strip())
-                return ""
+            proc = self._call_with_retry(cmd, category="pi", expect_json=False)
+            if getattr(proc, "returncode", 0) != 0:
+                if self.fail_open and ("pi" not in self.fatal_cmds):
+                    logger.warning("ralph.cmd.pi.failed_but_fail_open cmd=%s rc=%s stderr=%s", cmd, getattr(proc, "returncode", None), (getattr(proc, "stderr", "") or "").strip())
+                    return ""
+                if self.verbose:
+                    logger.debug("ralph.cmd.pi.run stderr=%s", (getattr(proc, "stderr", "") or "").strip()[:1000])
+                raise RalphError(f"pi run failed: {(getattr(proc, 'stderr', '') or '').strip()}")
+            self._last_structured_response = None
+            text, structured = _extract_text_and_structured_response_from_json_output(getattr(proc, "stdout", "") or "")
+            self._last_structured_response = structured
+            logger.info(
+                "ralph.cmd.pi.non_streaming_end returncode=%d text_len=%d",
+                getattr(proc, "returncode", 0),
+                len(text),
+                extra={"text": text},
+            )
             if self.verbose:
-                logger.debug("ralph.cmd.pi.run stderr=%s", (getattr(proc, "stderr", "") or "").strip()[:1000])
-            raise RalphError(f"pi run failed: {(getattr(proc, 'stderr', '') or '').strip()}")
-        self._last_structured_response = None
-        text, structured = _extract_text_and_structured_response_from_json_output(getattr(proc, "stdout", "") or "")
-        self._last_structured_response = structured
-        logger.info(
-            "ralph.cmd.pi.non_streaming_end returncode=%d text_len=%d",
-            getattr(proc, "returncode", 0),
-            len(text),
-            extra={"text": text},
-        )
-        if self.verbose:
-            logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(text), text[:1000])
+                logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(text), text[:1000])
 
-        # Validate output to detect silent failures (input echo, raw skill content)
-        is_valid, reason = _validate_pi_output(prompt, text, phase, structured)
-        if not is_valid:
-            logger.warning(
-                "ralph.cmd.pi.output_validation_failed phase=%s reason=%s",
-                phase,
-                reason,
-                extra={"reason": reason, "phase": phase, "input_len": len(prompt), "output_len": len(text)},
-            )
-            if self.fail_open and ("pi" not in self.fatal_cmds):
-                logger.warning("ralph.cmd.pi.output_invalid_but_fail_open phase=%s", phase)
-                return text
-            raise PiInputEchoError(
-                f"pi output validation failed ({phase}): {reason}",
-                input_text=prompt,
-                output_text=text,
-            )
+            # Validate output to detect silent failures (input echo, raw skill content)
+            is_valid, reason = _validate_pi_output(prompt, text, phase, structured)
+            if not is_valid:
+                logger.warning(
+                    "ralph.cmd.pi.output_validation_failed phase=%s reason=%s",
+                    phase,
+                    reason,
+                    extra={"reason": reason, "phase": phase, "input_len": len(prompt), "output_len": len(text)},
+                )
+                if self.fail_open and ("pi" not in self.fatal_cmds):
+                    logger.warning("ralph.cmd.pi.output_invalid_but_fail_open phase=%s", phase)
+                    return text
+                raise PiInputEchoError(
+                    f"pi output validation failed ({phase}): {reason}",
+                    input_text=prompt,
+                    output_text=text,
+                )
 
-        return text
+            return text
+        except Exception:
+            self._notify_event(
+                EventType.ERROR,
+                work_item_ids=work_item_ids,
+                description=f"Pi subprocess failed ({phase})",
+                cmd=_render_command(cmd),
+            )
+            raise
 
 
     def _stream_pi(self, cmd: list[str], prompt: str, model_for_phase: str | None = None, phase: str = "implementation") -> str:
@@ -1704,15 +1958,26 @@ class RalphLoop:
 
         return False
 
-    def _extract_audit_text_from_item(self, item: dict) -> str:
-        """Extract the persisted audit text from a wl show workItem dict."""
-        audit_field = item.get("audit")
-        if isinstance(audit_field, dict):
-            return audit_field.get("text", "") or item.get("auditText", "") or ""
-        elif isinstance(audit_field, str):
-            return audit_field
-        else:
-            return item.get("auditText", "") or ""
+    def _read_persisted_audit_text(self, work_item_id: str) -> str:
+        """Read the persisted audit text via `wl audit-show <id> --json`.
+
+        Returns the raw audit text from the audit_results table, or an empty
+        string if no audit record exists for the work item.
+        """
+        try:
+            result = self._wl_audit_show(work_item_id)
+        except Exception:
+            logger.debug("ralph.audit_show_failed target=%s", work_item_id, exc_info=True)
+            return ""
+        audit = result.get("audit")
+        if not audit:
+            return ""
+        # rawOutput holds the full audit text
+        raw = audit.get("rawOutput") or ""
+        # Also check legacy text field for backwards compatibility
+        if isinstance(audit, dict) and not raw:
+            raw = audit.get("text", "") or ""
+        return raw
 
     def _is_effort_risk_computed(self, target_id: str) -> bool:
         """Check whether effort and risk have already been set on the work item."""
@@ -1842,9 +2107,12 @@ class RalphLoop:
             effort = (item.get("effort") or "").strip()
             risk = (item.get("risk") or "").strip()
             do_plan = not (effort in self.autoplan_effort_skip and risk in self.autoplan_risk_skip)
+
+            # Resolve tier for planning phase
+            tier = _resolve_complexity_tier(self.model_config, item)
             logger.info(
-                "ralph.autoplan.cached_decision target=%s effort=%s risk=%s do_plan=%s",
-                target_id, effort, risk, do_plan,
+                "ralph.autoplan.cached_decision target=%s effort=%s risk=%s tier=%s do_plan=%s",
+                target_id, effort, risk, tier, do_plan,
             )
             if do_plan:
                 stage = item.get("stage", "unknown")
@@ -1855,7 +2123,7 @@ class RalphLoop:
                 logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
                 # Use pi to run the plan skill so the configured model is used.
                 try:
-                    self._run_pi(f"/skill:plan {target_id}", phase="planning")
+                    self._run_pi(f"/skill:plan {target_id}", phase="planning", tier=tier)
                 except RalphError as e:
                     raise RalphError(f"plan command failed: {e}") from e
                 logger.info("ralph.autoplan.plan_complete target=%s", target_id)
@@ -1864,7 +2132,8 @@ class RalphLoop:
 
         # Run effort-and-risk skill
         er_result = self._run_effort_and_risk(target_id)
-
+        
+        # Resolve tier using the effort-and-risk result
         if er_result is None:
             # Failure or ambiguity: default to running /plan (safety-first)
             logger.info("ralph.autoplan.effort_risk_failed_defaults_to_plan target=%s", target_id)
@@ -1872,14 +2141,18 @@ class RalphLoop:
             tshirt = "unknown"
             risk_level = "unknown"
             risk_score = 0
+            tier = "medium"  # Default to medium tier on failure
         else:
             tshirt = er_result.get("effort", {}).get("tshirt", "")
             risk_level = er_result.get("risk", {}).get("level", "")
             risk_score = er_result.get("risk", {}).get("score", 0)
+            # Create a synthetic item dict from the effort-and-risk result for tier resolution
+            synthetic_item = {"effort": tshirt, "risk": risk_level}
+            tier = _resolve_complexity_tier(self.model_config, synthetic_item)
             do_plan = not (tshirt in self.autoplan_effort_skip and risk_level in self.autoplan_risk_skip)
             logger.info(
-                "ralph.autoplan.result target=%s tshirt=%s risk=%s do_plan=%s",
-                target_id, tshirt, risk_level, do_plan,
+                "ralph.autoplan.result target=%s tshirt=%s risk=%s tier=%s do_plan=%s",
+                target_id, tshirt, risk_level, tier, do_plan,
             )
 
         # Post the decision comment idempotently
@@ -1890,7 +2163,7 @@ class RalphLoop:
             logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
             # Use pi to run the plan skill so the configured model is used.
             try:
-                self._run_pi(f"/skill:plan {target_id}", phase="planning")
+                self._run_pi(f"/skill:plan {target_id}", phase="planning", tier=tier)
             except RalphError as e:
                 raise RalphError(f"plan command failed: {e}") from e
             logger.info("ralph.autoplan.plan_complete target=%s", target_id)
@@ -2013,6 +2286,75 @@ class RalphLoop:
             if ts and (latest is None or ts > latest):
                 latest = ts
         return latest
+
+    def _latest_audit_comment_id(self, work_item_id: str) -> str | None:
+        """Return the comment ID of the most-recent audit comment on a work item.
+
+        Matches comments whose first non-empty line starts with
+        '# AMPA Audit Result'. Returns None if no such comment exists.
+        """
+        comments = self._wl_comment_list(work_item_id)
+        latest_id: str | None = None
+        latest_ts = None
+        for c in comments:
+            comment_text = (c.get("comment") or "")
+            first = None
+            for line in comment_text.splitlines():
+                if line.strip():
+                    first = line.strip()
+                    break
+            if not first:
+                continue
+            if not first.startswith("# AMPA Audit Result"):
+                continue
+            created = c.get("createdAt") or c.get("created_at") or c.get("created") or c.get("postedAt")
+            ts = self._parse_iso_ts(created)
+            if ts and (latest_ts is None or ts > latest_ts):
+                latest_ts = ts
+                latest_id = c.get("id")
+        return latest_id
+
+    @staticmethod
+    def _is_stall_error(exc: BaseException) -> bool:
+        """Check if an exception indicates a pi stream stall/timeout."""
+        if not isinstance(exc, RalphError):
+            return False
+        return "pi stream stalled" in str(exc)
+
+    def _handle_audit_timeout(self, work_item_id: str) -> None:
+        """Handle an audit pi stream timeout.
+
+        Removes any existing audit comment and adds a timeout comment
+        so the work item does not retain stale audit results.
+        """
+        timeout_display = (
+            int(self.pi_stream_timeout_seconds)
+            if self.pi_stream_timeout_seconds == int(self.pi_stream_timeout_seconds)
+            else self.pi_stream_timeout_seconds
+        )
+        # Remove existing audit comment if present
+        audit_comment_id = self._latest_audit_comment_id(work_item_id)
+        if audit_comment_id:
+            logger.info(
+                "ralph.audit_timeout.remove_comment target=%s comment_id=%s",
+                work_item_id, audit_comment_id,
+            )
+            self._wl_comment_delete(audit_comment_id)
+        else:
+            logger.info(
+                "ralph.audit_timeout.no_existing_comment target=%s",
+                work_item_id,
+            )
+        # Add timeout comment
+        timeout_comment = (
+            f"No audit completed: Pi stream timed out after {timeout_display} seconds. "
+            "The work item needs a fresh audit."
+        )
+        logger.info(
+            "ralph.audit_timeout.add_comment target=%s timeout=%ds",
+            work_item_id, timeout_display,
+        )
+        self._wl_comment_add(work_item_id, timeout_comment)
 
     def _max_updated_at_for_scope(self, scope_ids):
         """Return the most-recent updatedAt timestamp (as datetime) across the scope.
@@ -2182,6 +2524,21 @@ class RalphLoop:
         max_attempts = max(1, int(self.max_attempts))
         force_fresh_audit = bool(kwargs.get("force_fresh_audit", False))
 
+        # Evaluate complexity tier for this item
+        item = self._wl_show(item_id)
+        if item.get("stage") == "intake_complete" and (not item.get("effort") or not item.get("risk")):
+             # Run effort-and-risk if missing
+             try:
+                 logger.info("ralph.run_single_item.evaluate_complexity item=%s", item_id)
+                 self._call_with_retry([self.pi_bin, "-p", "/skill:effort-and-risk", item_id], category="effort_and_risk")
+                 # Re-fetch to get updated values
+                 item = self._wl_show(item_id)
+             except Exception as exc:
+                 logger.warning("ralph.run_single_item.complexity_eval_failed item=%s error=%s", item_id, exc)
+
+        tier = _resolve_complexity_tier(self.model_config, item)
+        logger.info("ralph.run_single_item.resolved_tier item=%s tier=%s", item_id, tier)
+
         for attempt in range(1, max_attempts + 1):
             # Implement step (unless skipped)
             if not skip_implement and implement_command:
@@ -2189,30 +2546,34 @@ class RalphLoop:
                     prompt = _build_implement_single_prompt(item_id, remediation)
                 else:
                     prompt = _build_implement_prompt(item_id, remediation, command=implement_command)
-                impl_output = self._run_pi(prompt, phase="implementation")
+                impl_output = self._run_pi(prompt, phase="implementation", tier=tier)
                 self._last_implement_output = impl_output
 
             # Audit step — capture output for fallback persistence if needed
             try:
-                audit_output = self._run_pi(f"/skill:audit {item_id}", phase="audit")
-            except Exception:
+                audit_output = self._run_pi(f"/skill:audit {item_id}", phase="audit", tier=tier)
+            except Exception as exc:
+                if self._is_stall_error(exc):
+                    logger.warning(
+                        "ralph.run_single_item.audit_stalled target=%s attempt=%d",
+                        item_id, attempt,
+                    )
+                    self._handle_audit_timeout(item_id)
                 # Treat audit invocation failures as a failed attempt and retry
                 if attempt >= max_attempts:
                     return {"status": "max_attempts", "attempt": attempt}
                 remediation = _build_remediation_prompt()
                 continue
 
-            # Read persisted audit
-            item = self._wl_show(item_id).get("workItem", {})
-            audit_text = self._extract_audit_text_from_item(item)
+            # Read persisted audit via wl audit-show
+            audit_text = self._read_persisted_audit_text(item_id)
 
             if not audit_text:
                 # Audit model did NOT persist — try fallback from captured output
                 fallback_ok = self._try_fallback_persist(item_id, audit_output)
                 if fallback_ok:
                     # Fallback persisted successfully — re-read and evaluate
-                    item = self._wl_show(item_id).get("workItem", {})
-                    audit_text = self._extract_audit_text_from_item(item)
+                    audit_text = self._read_persisted_audit_text(item_id)
 
             if not audit_text:
                 # Still no audit text — this is a genuine failure (output lacked
@@ -2230,6 +2591,11 @@ class RalphLoop:
                         attempt,
                         self._no_change_cycle_count,
                     )
+                    self._notify_event(
+                        EventType.ERROR,
+                        work_item_ids=[item_id],
+                        description="Ralph single item stalled due to audit persistence failure",
+                    )
                     return {
                         "status": "stalled",
                         "attempt": attempt,
@@ -2237,6 +2603,11 @@ class RalphLoop:
                         "no_change_cycles": self._no_change_cycle_count,
                     }
                 if attempt >= max_attempts:
+                    self._notify_event(
+                        EventType.MAX_ATTEMPTS,
+                        work_item_ids=[item_id],
+                        description="Ralph single item exhausted attempts with no persisted audit",
+                    )
                     return {"status": "max_attempts", "attempt": attempt, "reason": "no_persisted_audit"}
                 remediation = _build_remediation_prompt()
                 continue
@@ -2252,6 +2623,11 @@ class RalphLoop:
             )
             if parsed.ready_to_close:
                 logger.debug("ralph.run_single_item.success target=%s attempt=%d", item_id, attempt)
+                self._notify_event(
+                    EventType.STATUS_TRANSITION,
+                    work_item_ids=[item_id],
+                    description="Work item passed audit and is ready for review",
+                )
                 return {"status": "success", "attempt": attempt}
 
             # Audit reported unmet criteria — decide whether to retry
@@ -2265,6 +2641,11 @@ class RalphLoop:
                     attempt,
                     self._no_change_cycle_count,
                 )
+                self._notify_event(
+                    EventType.ERROR,
+                    work_item_ids=[item_id],
+                    description="Ralph single item stalled with unmet audit criteria",
+                )
                 return {
                     "status": "stalled",
                     "attempt": attempt,
@@ -2273,6 +2654,11 @@ class RalphLoop:
                     "unmet": unmet,
                 }
             if attempt >= max_attempts:
+                self._notify_event(
+                    EventType.MAX_ATTEMPTS,
+                    work_item_ids=[item_id],
+                    description="Ralph single item exhausted maximum attempts",
+                )
                 return {"status": "max_attempts", "attempt": attempt, "unmet": unmet}
 
             # Build a remediation hint for the next attempt and retry
@@ -2280,12 +2666,20 @@ class RalphLoop:
             continue
 
         # Should not reach here
+        self._notify_event(
+            EventType.MAX_ATTEMPTS,
+            work_item_ids=[item_id],
+            description="Ralph single item exhausted attempts (unreachable fallback)",
+        )
         return {"status": "max_attempts", "attempt": max_attempts}
 
     def run(self, target_id: str, child_id: str | None = None) -> dict:
         focus_id = self._resolve_focus_target(target_id, child_id)
         self._assert_precondition(focus_id)
         scope_ids = self._scope_ids_recursive(focus_id)
+
+        # Notify: loop starting
+        self._notify_event(EventType.STARTED, work_item_ids=scope_ids)
 
         # If the target is already in_review, skip the first implement pass and
         # go straight to audit. If a persisted audit comment shows the scope is
@@ -2323,9 +2717,23 @@ class RalphLoop:
                     if c.get("id") == cid:
                         stage = c.get("stage")
                         break
-                if stage in {"in_review", "done", "completed", "closed"}:
+                if stage in {"done", "completed", "closed"}:
                     child_results[cid] = {"status": "skipped"}
                     continue
+                
+                if stage == "in_review":
+                    # For in_review, check the most recent persisted audit result.
+                    # If it says "Ready to close: Yes", we skip it.
+                    # Otherwise (failed or no audit), we treat it as needing work.
+                    audit_text = self._read_persisted_audit_text(cid)
+                    if audit_text:
+                        parsed = parse_audit_report(audit_text)
+                        if parsed.ready_to_close:
+                            child_results[cid] = {"status": "skipped"}
+                            continue
+                        logger.info("ralph.run.child_in_review_audit_fail target=%s child=%s", focus_id, cid)
+                    else:
+                        logger.info("ralph.run.child_in_review_no_audit target=%s child=%s", focus_id, cid)
 
                 # Delegate to run_single_item which performs retries internally
                 res = self.run_single_item(cid, implement_command="implement-single")
@@ -2342,6 +2750,11 @@ class RalphLoop:
 
             if failed_children:
                 # All children attempted — report failures
+                self._notify_event(
+                    EventType.MAX_ATTEMPTS,
+                    work_item_ids=scope_ids,
+                    description="Ralph child iteration exhausted all attempts",
+                )
                 return {
                     "status": "child_max_attempts",
                     "attempt": attempts_used,
@@ -2356,8 +2769,18 @@ class RalphLoop:
             parent_attempts = int(parent_res.get("attempt", 1)) if isinstance(parent_res.get("attempt", 1), int) else 1
             total_attempts = max(attempts_used, parent_attempts)
             if parent_res.get("status") == "success":
+                self._notify_event(
+                    EventType.COMPLETED,
+                    work_item_ids=scope_ids,
+                    description="Ralph loop completed successfully with all children",
+                )
                 return {"status": "success", "attempt": total_attempts, "scope": scope_ids, "child_results": child_results, "integration_audit": True, "compact": {"invocations": invocations, "failures": failures}}
             else:
+                self._notify_event(
+                    EventType.MAX_ATTEMPTS,
+                    work_item_ids=scope_ids,
+                    description="Ralph integration audit exhausted all attempts",
+                )
                 return {"status": "integration_max_attempts", "attempt": total_attempts, "scope": scope_ids, "child_results": child_results, "integration_audit": True, "compact": {"invocations": invocations, "failures": failures}}
 
         target_item = self._wl_show(focus_id).get("workItem", {})
@@ -2376,6 +2799,11 @@ class RalphLoop:
             if self.cancel_file and os.path.exists(self.cancel_file):
                 logger.info("ralph.loop.cancelled target=%s attempt=%d", focus_id, attempt)
                 self._cleanup_pi_process()
+                self._notify_event(
+                    EventType.CANCELLED,
+                    work_item_ids=scope_ids,
+                    description="Ralph loop cancelled by operator",
+                )
                 return {
                     "status": "cancelled",
                     "attempt": attempt,
@@ -2410,6 +2838,19 @@ class RalphLoop:
                     do_plan, new_stage = self._run_autoplan(focus_id)
                     if new_stage == "plan_complete":
                         target_stage = "plan_complete"
+                        # Phase change: intake -> planning (plan was invoked)
+                        self._notify_event(
+                            EventType.PHASE_CHANGE,
+                            work_item_ids=scope_ids,
+                            description="Auto-plan invoked /plan phase",
+                        )
+                    else:
+                        # Phase change: intake -> implementation (skipped plan)
+                        self._notify_event(
+                            EventType.PHASE_CHANGE,
+                            work_item_ids=scope_ids,
+                            description="Auto-plan skipped /plan, proceeding to implementation",
+                        )
                 except RalphError:
                     raise
                 except Exception:
@@ -2425,6 +2866,12 @@ class RalphLoop:
                         exc,
                     )
                     previous_child_stages = {}
+                # Phase change: implementation phase starting
+                self._notify_event(
+                    EventType.PHASE_CHANGE,
+                    work_item_ids=scope_ids,
+                    description="Implementation phase starting",
+                )
                 implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation), phase="implementation")
                 self._last_implement_output = implement_output
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
@@ -2447,6 +2894,11 @@ class RalphLoop:
                         no_safe_path_reason,
                     )
                     self._cleanup_pi_process()
+                    self._notify_event(
+                        EventType.ERROR,
+                        work_item_ids=scope_ids,
+                        description=f"Ralph loop requires producer input: {no_safe_path_reason}",
+                    )
                     return {
                         "status": "producer_input_required",
                         "attempt": attempt,
@@ -2501,6 +2953,11 @@ class RalphLoop:
                         no_safe_path_reason,
                     )
                     self._cleanup_pi_process()
+                    self._notify_event(
+                        EventType.ERROR,
+                        work_item_ids=scope_ids,
+                        description=f"Ralph loop requires producer input: {no_safe_path_reason}",
+                    )
                     return {
                         "status": "producer_input_required",
                         "attempt": attempt,
@@ -2509,29 +2966,50 @@ class RalphLoop:
                         "compact": {"invocations": compact_invocations, "failures": compact_failures},
                     }
 
+            # Phase change: audit phase starting
+            self._notify_event(
+                EventType.PHASE_CHANGE,
+                work_item_ids=scope_ids,
+                description="Audit phase starting",
+            )
             logger.info("ralph.loop.audit.start target=%s attempt=%d", focus_id, attempt)
             # Run the audit skill unless we've determined that the persisted audit
             # is up-to-date and can be used without re-running the audit skill.
             audit_output = ""
+            audit_stalled = False
             if use_persisted_audit:
                 logger.info("ralph.loop.audit.skipped_using_persisted target=%s attempt=%d", focus_id, attempt)
             else:
                 # Run the audit skill; capture output for fallback persistence if needed.
-                audit_output = self._run_pi(f"/skill:audit {focus_id}", phase="audit")
-            # Read the persisted audit from the work item via wl show.
-            item = self._wl_show(focus_id).get("workItem", {})
-            audit_text = self._extract_audit_text_from_item(item)
+                try:
+                    audit_output = self._run_pi(f"/skill:audit {focus_id}", phase="audit")
+                except Exception as exc:
+                    if self._is_stall_error(exc):
+                        logger.warning(
+                            "ralph.loop.audit.stalled target=%s attempt=%d",
+                            focus_id, attempt,
+                        )
+                        self._handle_audit_timeout(focus_id)
+                        audit_output = ""
+                        audit_stalled = True
+                    else:
+                        raise
+            # Read the persisted audit via wl audit-show
+            audit_text = self._read_persisted_audit_text(focus_id)
 
-            if not audit_text:
+            if not audit_text and not audit_stalled:
                 # Audit model did NOT persist — try fallback from captured output
                 fallback_ok = self._try_fallback_persist(focus_id, audit_output)
                 if fallback_ok:
                     # Fallback persisted successfully — re-read
-                    item = self._wl_show(focus_id).get("workItem", {})
-                    audit_text = self._extract_audit_text_from_item(item)
+                    audit_text = self._read_persisted_audit_text(focus_id)
 
             if not audit_text:
-                raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit and fallback persistence; expected workItem.audit to contain the structured report.")
+                if audit_stalled:
+                    # Stall was already handled above; treat as failed attempt
+                    remediation = _build_remediation_prompt()
+                    continue
+                raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit and fallback persistence; expected an audit_results row for the work item.")
 
             structured_audit = None
             lines = [l.strip() for l in audit_text.splitlines() if l.strip()]
@@ -2564,6 +3042,11 @@ class RalphLoop:
                 self._wl_update_stage(focus_id, "in_review")
                 logger.info("ralph.loop.stage_update target=%s stage=in_review audit=pass", focus_id)
                 self._cleanup_pi_process()
+                self._notify_event(
+                    EventType.COMPLETED,
+                    work_item_ids=scope_ids,
+                    description="Ralph loop completed successfully after passing audit",
+                )
                 return {
                     "status": "success",
                     "attempt": attempt,
@@ -2600,6 +3083,11 @@ class RalphLoop:
                     self._no_change_cycle_count,
                 )
                 self._cleanup_pi_process()
+                self._notify_event(
+                    EventType.ERROR,
+                    work_item_ids=scope_ids,
+                    description="Ralph loop stalled due to no code changes across attempts",
+                )
                 return {
                     "status": "stalled",
                     "attempt": attempt,
@@ -2627,6 +3115,11 @@ class RalphLoop:
 
         logger.warning("ralph.loop.max_attempts target=%s", focus_id)
         self._cleanup_pi_process()
+        self._notify_event(
+            EventType.MAX_ATTEMPTS,
+            work_item_ids=scope_ids,
+            description="Ralph loop exhausted maximum attempts",
+        )
         return {
             "status": "max_attempts",
             "attempt": self.max_attempts,
@@ -2744,6 +3237,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     phase_model_config = _extract_phase_model_config(config)
     config_model_source_raw = config.get("model_source") if isinstance(config, dict) else None
 
+    # Resolve signal file path and webhook URL from config
+    signal_file_path = str(resolve_signal_path(config))
+    webhook_url = resolve_webhook_url(config)
+
     model_source_explicit = args.model_source is not None or config_model_source_raw is not None
     legacy_model_explicit = args.model is not None or legacy_config_model is not None
     effective_model_source = _normalize_model_source(args.model_source or config_model_source_raw)
@@ -2773,11 +3270,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         retry_delay=args.retry_delay,
         fatal_cmds=args.fatal_cmd,
         debug_persist=args.debug_persist,
+        signal_file_path=signal_file_path,
+        webhook_url=webhook_url,
     )
     loop.no_autoplan = args.no_autoplan
     try:
         result = loop.run(args.work_item_id, child_id=args.child)
     except RalphError as exc:
+        # Notify that Ralph stopped due to an error
+        try:
+            loop._notify_event(
+                EventType.ERROR,
+                work_item_ids=[args.work_item_id] if args.work_item_id else None,
+                description=f"Ralph stopped: {exc}",
+            )
+        except Exception:
+            pass
         if args.json:
             # emit error as single JSON line
             print(json.dumps({"error": str(exc)}))

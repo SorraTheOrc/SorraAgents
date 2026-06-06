@@ -17,13 +17,21 @@ class SingleItemLoop(RalphLoop):
         super().__init__(pi_bin="pi", stream=False)
         self.pi_calls: list[tuple[str, str]] = []
 
-    def _run_pi(self, prompt: str, phase: str = "implementation") -> str:
+    def _run_pi(self, prompt: str, phase: str = "implementation", tier: str | None = None) -> str:
         self.pi_calls.append((phase, prompt))
         return "ok"
 
     def _wl_show(self, work_item_id: str, children: bool = False) -> dict:
         if children:
             return {"workItem": {"id": work_item_id, "stage": "plan_complete"}, "children": []}
+        return {
+            "workItem": {
+                "id": work_item_id,
+                "stage": "plan_complete",
+            }
+        }
+
+    def _wl_audit_show(self, work_item_id: str) -> dict:
         audit_text = (
             "Ready to close: Yes\n\n"
             "## Acceptance Criteria Status\n"
@@ -31,11 +39,16 @@ class SingleItemLoop(RalphLoop):
             "| 1 | ok | met | evidence |"
         )
         return {
-            "workItem": {
-                "id": work_item_id,
-                "stage": "plan_complete",
-                "audit": {"text": audit_text},
-            }
+            "success": True,
+            "workItemId": work_item_id,
+            "audit": {
+                "workItemId": work_item_id,
+                "readyToClose": True,
+                "auditedAt": "2026-06-05T12:00:00Z",
+                "summary": "All criteria met",
+                "rawOutput": audit_text,
+                "author": "audit-agent",
+            },
         }
 
     def _scope_ids_recursive(self, target_id: str) -> list[str]:

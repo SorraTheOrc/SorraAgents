@@ -95,7 +95,7 @@ class TestPersistAuditFailFlag:
         rc = persist_audit("SA-TEST", report_text, wl_bin="wl", runner=fake_runner, _fail=False)
         assert rc == 0
         assert len(persist_calls) == 1
-        assert "update" in persist_calls[0]
+        assert "audit-set" in persist_calls[0]
         assert "SA-TEST" in persist_calls[0]
 
     def test_persist_audit_normal_failure_returns_1(self, monkeypatch):

@@ -24,11 +24,13 @@ def test_persist_audit_calls_wl_update_with_report():
     assert rc == 0
     assert len(calls) == 1
     cmd = calls[0]
-    # ensure wl update was invoked with --audit-text and the full report as a single arg
-    assert cmd[:3] == ["wl", "update", "SA-TEST"]
-    assert "--audit-text" in cmd
-    audit_idx = cmd.index("--audit-text")
-    assert cmd[audit_idx + 1] == "Ready to close: Yes\nDetails"
+    # ensure wl audit-set was invoked
+    assert cmd[:3] == ["wl", "audit-set", "SA-TEST"]
+    assert "--ready-to-close" in cmd
+    assert "yes" in cmd
+    assert "--raw-output" in cmd
+    raw_idx = cmd.index("--raw-output")
+    assert cmd[raw_idx + 1] == "Ready to close: Yes\nDetails"
     assert cmd[-1] == "--json"
 
 

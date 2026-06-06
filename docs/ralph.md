@@ -167,6 +167,11 @@ Testing
   - At `in_review`: ralph **skips the first implement pass** and audits immediately. If audit passes, ralph proceeds to checks/merge without any implement step. If audit fails, ralph falls into the normal implement\u2192audit loop with remediation.
   - At any other stage: ralph exits with an error.
 - **Scope**: Only the target item and its direct children are processed.
+- **Child skip logic**: When iterating through children in per-child mode, Ralph decides whether to skip a child based on its stage and most recent audit result:
+  - Children in terminal stages (`done`, `completed`, `closed`) are **always skipped**.
+  - Children in `in_review` stage are **skipped only if** their most recent persisted audit result says "Ready to close: Yes".
+  - Children in `in_review` whose most recent audit says "Ready to close: No" (or have no persisted audit) are **re-processed** (re-implemented and re-audited).
+  - All other stages (e.g., `in_progress`, `plan_complete`) are processed normally.
 
 ## Compaction trigger behavior
 
@@ -241,15 +246,68 @@ Equivalent dotted keys are also supported (for example: `model.intake`, `model.p
 | `model.audit` | string/object | Audit phase model. |
 | `max_attempts` | integer | Default maximum implement→audit cycles. Overridden by `--max-attempts`. |
 
+### Complexity-tier model configuration
+
+Ralph supports **risk/effort-based model complexity tiers** so that different work items can use different model configurations automatically. This lets you use fast, cost-effective models for simple tasks while reserving stronger models for complex work.
+
+#### Tier mapping
+
+The complexity tier is determined by the work item's `effort` (t-shirt size) and `risk` fields:
+
+| Tier | Mapping |
+|------|---------|
+| **Low** | Effort is `Extra Small` **or** `Small` **AND** Risk is `Low` |
+| **Medium** | Effort is `Medium` **OR** Risk is `Medium` |
+| **High** | Effort is `Large` **or** `Extra Large` **OR** Risk is `High` |
+
+The thresholds are configurable via `complexity_tier` in `.ralph.json`. If a work item has no effort/risk values, or the values cannot be evaluated, the tier defaults to **Medium**.
+
+#### Tiered config structure
+
+Within each model source, you can define per-tier model mappings:
+
+```json
+{
+  "model_source": "local",
+  "model": {
+    "remote": {
+      "low": { "intake": "opencode-go/glm-5.1", "planning": "opencode-go/glm-5.1", "implementation": "opencode-go/glm-5.1", "audit": "opencode-go/glm-5.1" },
+      "medium": { "intake": "opencode/claude-opus-4.7", "planning": "opencode/gpt-5.5", "implementation": "opencode-go/qwen3.6-plus", "audit": "opencode-go/glm-5.1" },
+      "high": { "intake": "opencode/claude-opus-4.7", "planning": "opencode/gpt-5.5", "implementation": "opencode-go/qwen3.6-plus", "audit": "opencode-go/glm-5.1" }
+    },
+    "local": {
+      "low": { "intake": "Proxy/qwen3", "planning": "Proxy/qwen3", "implementation": "Proxy/qwen3", "audit": "Proxy/qwen3" },
+      "medium": { "intake": "Proxy/qwen3", "planning": "Proxy/qwen3", "implementation": "Proxy/qwen3", "audit": "Proxy/qwen3" },
+      "high": { "intake": "Proxy/qwen3", "planning": "Proxy/qwen3", "implementation": "Proxy/qwen3", "audit": "Proxy/qwen3" }
+    }
+  },
+  "complexity_tier": {
+    "low": { "max_effort": "Small", "max_risk": "Low" },
+    "high": { "min_effort": "Large", "min_risk": "High" }
+  }
+}
+```
+
+#### Per-child tier evaluation
+
+When Ralph processes children in per-child mode, it evaluates the effort-and-risk skill (if not already computed) for each child and selects the appropriate tier for that child's phases. The tier is passed through to `pi` subprocess invocations for all phases.
+
+#### Defaults and backwards compatibility
+
+- **No tier specified:** When no complexity tier is active (e.g., during legacy usage or when effort/risk cannot be evaluated), Ralph defaults to the `medium` tier.
+- **Flat per-phase keys (legacy):** If you have an older `.ralph.json` with flat `model.remote.intake` / `model.local.intake` etc. keys (without tier nesting), Ralph will continue to use those. You can migrate to tiered config at your own pace.
+- **Mixed config:** You can mix tiers and flat keys in the same config; tiers take priority where defined.
+
 ### Resolution precedence
 
 For each phase, Ralph resolves `--model` passed to `pi` in this order:
 
 1. CLI phase override (`--model-intake`, `--model-planning`, `--model-implementation`, `--model-audit`)
-2. Per-phase config (`model.<phase>`)
-3. Legacy single model (`--model` CLI or string `model` config)
-4. `DEFAULT_MODEL` (`opencode-go/glm-5.1`) when per-phase mode is not enabled
-5. Canonical source-specific defaults (below) when per-phase mode is enabled but no explicit per-phase value is provided
+2. Per-tier config (`model.<source>.<tier>.<phase>`) — only when a complexity tier is active
+3. Per-phase config (`model.<phase>` or `model.<source>.<phase>`)
+4. Legacy single model (`--model` CLI or string `model` config)
+5. `DEFAULT_MODEL` (`opencode-go/glm-5.1`) when per-phase mode is not enabled
+6. Canonical source-specific defaults (below) when per-phase mode is enabled but no explicit per-phase value is provided
 
 Canonical defaults used by per-phase mode:
 
@@ -491,3 +549,29 @@ python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --ch
 python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py SA-1234 --cancel-file /tmp/ralph-cancel
 # To cancel: touch /tmp/ralph-cancel
 ```
+
+## Signal & Notification System
+
+Ralph writes a JSON signal file and optionally sends a Discord webhook notification when major events occur during the loop lifecycle. See [docs/ralph-signal.md](ralph-signal.md) for:
+
+- Signal file format (JSON schema, event types, file behaviour)
+- Discord webhook payload format and configuration
+- Pi integration specification for consuming signals
+- Signal file path configuration via `.ralph.json`
+
+### Configuration Example
+
+The signal file path and Discord webhook URL are configured in `.ralph.json`:
+
+```json
+{
+  "signal": {
+    "file_path": ".ralph/event.pending"
+  },
+  "discord": {
+    "webhook_url": "https://discord.com/api/webhooks/your-webhook-url"
+  }
+}
+```
+
+When the webhook URL is omitted or empty, no webhook notifications are sent.
