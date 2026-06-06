@@ -192,6 +192,56 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def _resolve_complexity_tier(config: dict, item: dict) -> str:
+    """Resolve the complexity tier (low, medium, high) for a work item.
+
+    Mapping:
+    - Low: Effort XS or S AND risk Low
+    - Medium: Effort M OR risk Medium
+    - High: Effort L or XL OR risk High
+
+    Thresholds are configurable via config["complexity_tier"].
+    Defaults to 'medium' if mapping cannot be determined.
+    """
+    effort = item.get("effort")
+    risk = item.get("risk")
+
+    # Load thresholds from config
+    tier_cfg = config.get("complexity_tier", {})
+    low_cfg = tier_cfg.get("low", {})
+    high_cfg = tier_cfg.get("high", {})
+
+    low_max_effort = low_cfg.get("max_effort", "Small")
+    low_max_risk = low_cfg.get("max_risk", "Low")
+    high_min_effort = high_cfg.get("min_effort", "Large")
+    high_min_risk = high_cfg.get("min_risk", "High")
+
+    # T-shirt size order for comparison
+    effort_order = {"Extra Small": 0, "Small": 1, "Medium": 2, "Large": 3, "Extra Large": 4}
+    risk_order = {"Low": 0, "Medium": 1, "High": 2}
+
+    item_effort_val = effort_order.get(effort)
+    item_risk_val = risk_order.get(risk)
+
+    # Fallback for missing values: treat as Medium (safe middle ground)
+    if item_effort_val is None:
+        item_effort_val = effort_order["Medium"]
+    if item_risk_val is None:
+        item_risk_val = risk_order["Medium"]
+
+    # High tier check (OR)
+    if item_effort_val >= effort_order.get(high_min_effort, 3) or \
+       item_risk_val >= risk_order.get(high_min_risk, 2):
+        return "high"
+
+    # Low tier check (AND)
+    if item_effort_val <= effort_order.get(low_max_effort, 1) and \
+       item_risk_val <= risk_order.get(low_max_risk, 0):
+        return "low"
+
+    return "medium"
+
+
 def _load_asset_config() -> dict:
     """Load the shipped default config from skill/ralph/assets/.ralph.json."""
     try:
@@ -279,29 +329,65 @@ def _coerce_model_str(value: object) -> str | None:
     return None
 
 
-def _resolve_phase_model_value(value: object, model_source: str) -> str | None:
-    """Resolve a model value that may be a string or source-mapped object."""
+def _resolve_phase_model_value(value: object, model_source: str, tier: str | None = None) -> str | None:
+    """Resolve a model value that may be a string, source-mapped object, or tiered object."""
     direct = _coerce_model_str(value)
     if direct:
         return direct
-    if isinstance(value, dict):
-        source_value = _coerce_model_str(value.get(model_source))
-        if source_value:
-            return source_value
+
+    if not isinstance(value, dict):
+        return None
+
+    # If we have a tier, try to resolve from that tier first
+    if tier:
+        # Check source -> tier -> phase (nested structure)
+        source_data = value.get(model_source)
+        if isinstance(source_data, dict):
+            tier_data = source_data.get(tier)
+            tier_model = _coerce_model_str(tier_data)
+            if tier_model:
+                return tier_model
+
+    # Fallback to source-mapped string
+    source_value = _coerce_model_str(value.get(model_source))
+    if source_value:
+        return source_value
+
     return None
 
 
-def _extract_phase_model_config(config: dict) -> dict[str, object]:
-    """Extract per-phase model config from nested or dotted config keys."""
+def _extract_phase_model_config(config: dict, tier: str | None = None) -> dict[str, object]:
+    """Extract per-phase model config from nested or dotted config keys.
+
+    If a tier is provided, it prioritizes tiered config keys:
+    - model.remote.low.intake
+    - model.local.high.planning
+    """
     phase_config: dict[str, object] = {}
     model_root = config.get("model")
 
     for phase in MODEL_PHASES:
+        # 1. Tiered dotted keys: model.<source>.<tier>.<phase>
+        # (This is tricky since we don't know the source yet, so we store a combined map)
+        source_tier_map: dict[str, object] = {}
+        for source in MODEL_SOURCES:
+            if tier:
+                # model.remote.low.intake
+                tiered_key = config.get(f"model.{source}.{tier}.{phase}")
+                if tiered_key is not None:
+                    source_tier_map[source] = tiered_key
+
+        if source_tier_map:
+            phase_config[phase] = source_tier_map
+            continue
+
+        # 2. Legacy dotted keys: model.<phase>
         dotted_key = config.get(f"model.{phase}")
         if dotted_key is not None:
             phase_config[phase] = dotted_key
             continue
 
+        # 3. Direct source keys: model.remote.intake
         direct_remote = config.get(f"model.remote.{phase}")
         direct_local = config.get(f"model.local.{phase}")
         if direct_remote is not None or direct_local is not None:
@@ -313,7 +399,9 @@ def _extract_phase_model_config(config: dict) -> dict[str, object]:
             phase_config[phase] = source_map
             continue
 
+        # 4. Nested model object: model: { remote: { low: { intake: ... } } }
         if isinstance(model_root, dict):
+            # Flat model object: model: { intake: ... }
             if phase in model_root:
                 phase_config[phase] = model_root[phase]
                 continue
@@ -322,10 +410,19 @@ def _extract_phase_model_config(config: dict) -> dict[str, object]:
             local_map = model_root.get("local")
             if isinstance(remote_map, dict) or isinstance(local_map, dict):
                 source_map: dict[str, object] = {}
-                if isinstance(remote_map, dict) and phase in remote_map:
-                    source_map["remote"] = remote_map[phase]
-                if isinstance(local_map, dict) and phase in local_map:
-                    source_map["local"] = local_map[phase]
+                # Check remote tiered/flat
+                if isinstance(remote_map, dict):
+                    if tier and isinstance(remote_map.get(tier), dict) and phase in remote_map[tier]:
+                        source_map["remote"] = remote_map[tier][phase]
+                    elif phase in remote_map:
+                        source_map["remote"] = remote_map[phase]
+                # Check local tiered/flat
+                if isinstance(local_map, dict):
+                    if tier and isinstance(local_map.get(tier), dict) and phase in local_map[tier]:
+                        source_map["local"] = local_map[tier][phase]
+                    elif phase in local_map:
+                        source_map["local"] = local_map[phase]
+
                 if source_map:
                     phase_config[phase] = source_map
 
@@ -1013,7 +1110,7 @@ class RalphLoop:
                     exc,
                 )
 
-    def _resolve_model_for_phase(self, phase: str) -> str:
+    def _resolve_model_for_phase(self, phase: str, tier: str | None = None) -> str:
         if phase not in MODEL_PHASES:
             raise RalphError(f"Unknown model phase: {phase}")
 
@@ -1022,7 +1119,7 @@ class RalphLoop:
             return override_value
 
         config_value = self.model_config.get(phase)
-        configured_phase_model = _resolve_phase_model_value(config_value, self.model_source)
+        configured_phase_model = _resolve_phase_model_value(config_value, self.model_source, tier=tier)
         if configured_phase_model:
             return configured_phase_model
 
@@ -1236,10 +1333,10 @@ class RalphLoop:
             description=f"Work item stage changed to {stage}",
         )
 
-    def _run_pi(self, prompt: str, phase: str = "implementation", work_item_ids: list[str] | None = None) -> str:
+    def _run_pi(self, prompt: str, phase: str = "implementation", work_item_ids: list[str] | None = None, tier: str | None = None) -> str:
         # Use an ephemeral session for each orchestration call so nested or
         # retried runs never attempt to continue a previous assistant turn.
-        model_for_phase = self._resolve_model_for_phase(phase)
+        model_for_phase = self._resolve_model_for_phase(phase, tier=tier)
         cmd = [self.pi_bin, "-p", "--no-session", "--mode", "json", "--model", model_for_phase, prompt]
         rendered_cmd = _render_command(cmd)
 
@@ -1981,9 +2078,12 @@ class RalphLoop:
             effort = (item.get("effort") or "").strip()
             risk = (item.get("risk") or "").strip()
             do_plan = not (effort in self.autoplan_effort_skip and risk in self.autoplan_risk_skip)
+
+            # Resolve tier for planning phase
+            tier = _resolve_complexity_tier(self.model_config, item)
             logger.info(
-                "ralph.autoplan.cached_decision target=%s effort=%s risk=%s do_plan=%s",
-                target_id, effort, risk, do_plan,
+                "ralph.autoplan.cached_decision target=%s effort=%s risk=%s tier=%s do_plan=%s",
+                target_id, effort, risk, tier, do_plan,
             )
             if do_plan:
                 stage = item.get("stage", "unknown")
@@ -1994,7 +2094,7 @@ class RalphLoop:
                 logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
                 # Use pi to run the plan skill so the configured model is used.
                 try:
-                    self._run_pi(f"/skill:plan {target_id}", phase="planning")
+                    self._run_pi(f"/skill:plan {target_id}", phase="planning", tier=tier)
                 except RalphError as e:
                     raise RalphError(f"plan command failed: {e}") from e
                 logger.info("ralph.autoplan.plan_complete target=%s", target_id)
@@ -2003,6 +2103,10 @@ class RalphLoop:
 
         # Run effort-and-risk skill
         er_result = self._run_effort_and_risk(target_id)
+        
+        # Resolve tier
+        item = self._wl_show(target_id).get("workItem", {})
+        tier = _resolve_complexity_tier(self.model_config, item)
 
         if er_result is None:
             # Failure or ambiguity: default to running /plan (safety-first)
@@ -2017,8 +2121,8 @@ class RalphLoop:
             risk_score = er_result.get("risk", {}).get("score", 0)
             do_plan = not (tshirt in self.autoplan_effort_skip and risk_level in self.autoplan_risk_skip)
             logger.info(
-                "ralph.autoplan.result target=%s tshirt=%s risk=%s do_plan=%s",
-                target_id, tshirt, risk_level, do_plan,
+                "ralph.autoplan.result target=%s tshirt=%s risk=%s tier=%s do_plan=%s",
+                target_id, tshirt, risk_level, tier, do_plan,
             )
 
         # Post the decision comment idempotently
@@ -2029,7 +2133,7 @@ class RalphLoop:
             logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
             # Use pi to run the plan skill so the configured model is used.
             try:
-                self._run_pi(f"/skill:plan {target_id}", phase="planning")
+                self._run_pi(f"/skill:plan {target_id}", phase="planning", tier=tier)
             except RalphError as e:
                 raise RalphError(f"plan command failed: {e}") from e
             logger.info("ralph.autoplan.plan_complete target=%s", target_id)
@@ -2390,6 +2494,21 @@ class RalphLoop:
         max_attempts = max(1, int(self.max_attempts))
         force_fresh_audit = bool(kwargs.get("force_fresh_audit", False))
 
+        # Evaluate complexity tier for this item
+        item = self._show_work_item(item_id)
+        if item.get("stage") == "intake_complete" and (not item.get("effort") or not item.get("risk")):
+             # Run effort-and-risk if missing
+             try:
+                 logger.info("ralph.run_single_item.evaluate_complexity item=%s", item_id)
+                 self._call_with_retry([self.pi_bin, "-p", "/skill:effort-and-risk", item_id], category="effort_and_risk")
+                 # Re-fetch to get updated values
+                 item = self._show_work_item(item_id)
+             except Exception as exc:
+                 logger.warning("ralph.run_single_item.complexity_eval_failed item=%s error=%s", item_id, exc)
+
+        tier = _resolve_complexity_tier(self.model_config, item)
+        logger.info("ralph.run_single_item.resolved_tier item=%s tier=%s", item_id, tier)
+
         for attempt in range(1, max_attempts + 1):
             # Implement step (unless skipped)
             if not skip_implement and implement_command:
@@ -2397,12 +2516,12 @@ class RalphLoop:
                     prompt = _build_implement_single_prompt(item_id, remediation)
                 else:
                     prompt = _build_implement_prompt(item_id, remediation, command=implement_command)
-                impl_output = self._run_pi(prompt, phase="implementation")
+                impl_output = self._run_pi(prompt, phase="implementation", tier=tier)
                 self._last_implement_output = impl_output
 
             # Audit step — capture output for fallback persistence if needed
             try:
-                audit_output = self._run_pi(f"/skill:audit {item_id}", phase="audit")
+                audit_output = self._run_pi(f"/skill:audit {item_id}", phase="audit", tier=tier)
             except Exception as exc:
                 if self._is_stall_error(exc):
                     logger.warning(

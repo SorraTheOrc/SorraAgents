@@ -2,16 +2,62 @@
   "model_source": "local",
   "model": {
     "remote": {
+      "low": {
+        "intake": "opencode-go/glm-5.1",
+        "planning": "opencode-go/glm-5.1",
+        "implementation": "opencode-go/glm-5.1",
+        "audit": "opencode-go/glm-5.1"
+      },
+      "medium": {
+        "intake": "opencode/claude-opus-4.7",
+        "planning": "opencode/gpt-5.5",
+        "implementation": "opencode-go/qwen3.6-plus",
+        "audit": "opencode-go/glm-5.1"
+      },
+      "high": {
+        "intake": "opencode/claude-opus-4.7",
+        "planning": "opencode/gpt-5.5",
+        "implementation": "opencode-go/qwen3.6-plus",
+        "audit": "opencode-go/glm-5.1"
+      },
       "intake": "opencode/claude-opus-4.7",
       "planning": "opencode/gpt-5.5",
       "implementation": "opencode-go/qwen3.6-plus",
       "audit": "opencode-go/glm-5.1"
     },
     "local": {
+      "low": {
+        "intake": "Proxy/qwen3",
+        "planning": "Proxy/qwen3",
+        "implementation": "Proxy/qwen3",
+        "audit": "Proxy/qwen3"
+      },
+      "medium": {
+        "intake": "Proxy/qwen3",
+        "planning": "Proxy/qwen3",
+        "implementation": "Proxy/qwen3",
+        "audit": "Proxy/qwen3"
+      },
+      "high": {
+        "intake": "Proxy/qwen3",
+        "planning": "Proxy/qwen3",
+        "implementation": "Proxy/qwen3",
+        "audit": "Proxy/qwen3"
+      },
       "intake": "Proxy/qwen3",
       "planning": "Proxy/qwen3",
       "implementation": "Proxy/qwen3",
       "audit": "Proxy/qwen3"
+    }
+  },
+  "complexity_tier": {
+    "low": {
+      "max_effort": "Small",
+      "max_risk": "Low"
+    },
+    "high": {
+      "min_effort": "Large",
+      "min_risk": "High"
     }
   },
   "timeout": {
