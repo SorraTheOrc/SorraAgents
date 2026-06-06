@@ -330,7 +330,16 @@ def _coerce_model_str(value: object) -> str | None:
 
 
 def _resolve_phase_model_value(value: object, model_source: str, tier: str | None = None) -> str | None:
-    """Resolve a model value that may be a string, source-mapped object, or tiered object."""
+    """Resolve a model value that may be a string, source-mapped object, or tiered object.
+
+    Handles these structures:
+    - String: "Proxy/qwen3"
+    - Source-mapped: {"remote": "opencode/claude-4.7", "local": "Proxy/qwen3"}
+    - Tiered per source: {"remote": {"low": "...", "medium": "...", "high": "..."}}
+
+    When tier is None, defaults to "medium" (the default complexity tier).
+    """
+    effective_tier = tier if tier else "medium"
     direct = _coerce_model_str(value)
     if direct:
         return direct
@@ -338,17 +347,20 @@ def _resolve_phase_model_value(value: object, model_source: str, tier: str | Non
     if not isinstance(value, dict):
         return None
 
-    # If we have a tier, try to resolve from that tier first
-    if tier:
-        # Check source -> tier -> phase (nested structure)
-        source_data = value.get(model_source)
-        if isinstance(source_data, dict):
-            tier_data = source_data.get(tier)
-            tier_model = _coerce_model_str(tier_data)
-            if tier_model:
-                return tier_model
+    # Check source -> tier -> phase (nested tiered structure)
+    # e.g., {"remote": {"low": "...", "medium": "...", "high": "..."}}
+    source_data = value.get(model_source)
+    if isinstance(source_data, dict):
+        # Try tiered lookup first: source -> tier
+        tier_model = _coerce_model_str(source_data.get(effective_tier))
+        if tier_model:
+            return tier_model
+        # If the source_data itself contains the model string directly (legacy flat)
+        source_value = _coerce_model_str(source_data)
+        if source_value:
+            return source_value
 
-    # Fallback to source-mapped string
+    # Fallback to source-mapped string: {"remote": "...", "local": "..."}
     source_value = _coerce_model_str(value.get(model_source))
     if source_value:
         return source_value
@@ -359,23 +371,31 @@ def _resolve_phase_model_value(value: object, model_source: str, tier: str | Non
 def _extract_phase_model_config(config: dict, tier: str | None = None) -> dict[str, object]:
     """Extract per-phase model config from nested or dotted config keys.
 
-    If a tier is provided, it prioritizes tiered config keys:
-    - model.remote.low.intake
-    - model.local.high.planning
+    If a specific tier is provided, extracts only that tier's values.
+    When tier is None, extracts all tiers (low/medium/high) so runtime
+    resolution can pick the correct one based on the item's complexity.
+    Also supports legacy flat keys (model.<phase>, model.remote.<phase>)
+    for backwards compatibility.
     """
     phase_config: dict[str, object] = {}
     model_root = config.get("model")
 
+    # Determine which tiers to extract
+    if tier:
+        tiers_to_extract = [tier]
+    else:
+        tiers_to_extract = ["low", "medium", "high"]
+
     for phase in MODEL_PHASES:
         # 1. Tiered dotted keys: model.<source>.<tier>.<phase>
-        # (This is tricky since we don't know the source yet, so we store a combined map)
         source_tier_map: dict[str, object] = {}
         for source in MODEL_SOURCES:
-            if tier:
-                # model.remote.low.intake
-                tiered_key = config.get(f"model.{source}.{tier}.{phase}")
+            for t in tiers_to_extract:
+                tiered_key = config.get(f"model.{source}.{t}.{phase}")
                 if tiered_key is not None:
-                    source_tier_map[source] = tiered_key
+                    if source not in source_tier_map:
+                        source_tier_map[source] = {}
+                    source_tier_map[source][t] = tiered_key
 
         if source_tier_map:
             phase_config[phase] = source_tier_map
@@ -412,15 +432,24 @@ def _extract_phase_model_config(config: dict, tier: str | None = None) -> dict[s
                 source_map: dict[str, object] = {}
                 # Check remote tiered/flat
                 if isinstance(remote_map, dict):
-                    if tier and isinstance(remote_map.get(tier), dict) and phase in remote_map[tier]:
-                        source_map["remote"] = remote_map[tier][phase]
-                    elif phase in remote_map:
+                    for t in tiers_to_extract:
+                        if isinstance(remote_map.get(t), dict) and phase in remote_map[t]:
+                            if "low" not in source_map and "medium" not in source_map and "high" not in source_map:
+                                # First tier found for this source — build nested structure
+                                pass
+                            if "remote" not in source_map:
+                                source_map["remote"] = {}
+                            source_map["remote"][t] = remote_map[t][phase]
+                    if phase in remote_map:
                         source_map["remote"] = remote_map[phase]
                 # Check local tiered/flat
                 if isinstance(local_map, dict):
-                    if tier and isinstance(local_map.get(tier), dict) and phase in local_map[tier]:
-                        source_map["local"] = local_map[tier][phase]
-                    elif phase in local_map:
+                    for t in tiers_to_extract:
+                        if isinstance(local_map.get(t), dict) and phase in local_map[t]:
+                            if "local" not in source_map:
+                                source_map["local"] = {}
+                            source_map["local"][t] = local_map[t][phase]
+                    if phase in local_map:
                         source_map["local"] = local_map[phase]
 
                 if source_map:
@@ -2104,10 +2133,7 @@ class RalphLoop:
         # Run effort-and-risk skill
         er_result = self._run_effort_and_risk(target_id)
         
-        # Resolve tier
-        item = self._wl_show(target_id).get("workItem", {})
-        tier = _resolve_complexity_tier(self.model_config, item)
-
+        # Resolve tier using the effort-and-risk result
         if er_result is None:
             # Failure or ambiguity: default to running /plan (safety-first)
             logger.info("ralph.autoplan.effort_risk_failed_defaults_to_plan target=%s", target_id)
@@ -2115,10 +2141,14 @@ class RalphLoop:
             tshirt = "unknown"
             risk_level = "unknown"
             risk_score = 0
+            tier = "medium"  # Default to medium tier on failure
         else:
             tshirt = er_result.get("effort", {}).get("tshirt", "")
             risk_level = er_result.get("risk", {}).get("level", "")
             risk_score = er_result.get("risk", {}).get("score", 0)
+            # Create a synthetic item dict from the effort-and-risk result for tier resolution
+            synthetic_item = {"effort": tshirt, "risk": risk_level}
+            tier = _resolve_complexity_tier(self.model_config, synthetic_item)
             do_plan = not (tshirt in self.autoplan_effort_skip and risk_level in self.autoplan_risk_skip)
             logger.info(
                 "ralph.autoplan.result target=%s tshirt=%s risk=%s tier=%s do_plan=%s",
@@ -2495,14 +2525,14 @@ class RalphLoop:
         force_fresh_audit = bool(kwargs.get("force_fresh_audit", False))
 
         # Evaluate complexity tier for this item
-        item = self._show_work_item(item_id)
+        item = self._wl_show(item_id)
         if item.get("stage") == "intake_complete" and (not item.get("effort") or not item.get("risk")):
              # Run effort-and-risk if missing
              try:
                  logger.info("ralph.run_single_item.evaluate_complexity item=%s", item_id)
                  self._call_with_retry([self.pi_bin, "-p", "/skill:effort-and-risk", item_id], category="effort_and_risk")
                  # Re-fetch to get updated values
-                 item = self._show_work_item(item_id)
+                 item = self._wl_show(item_id)
              except Exception as exc:
                  logger.warning("ralph.run_single_item.complexity_eval_failed item=%s error=%s", item_id, exc)
 

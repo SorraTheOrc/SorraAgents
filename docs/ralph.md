@@ -292,9 +292,11 @@ Within each model source, you can define per-tier model mappings:
 
 When Ralph processes children in per-child mode, it evaluates the effort-and-risk skill (if not already computed) for each child and selects the appropriate tier for that child's phases. The tier is passed through to `pi` subprocess invocations for all phases.
 
-#### Backwards compatibility
+#### Defaults and backwards compatibility
 
-If no tiered config is provided (no `low`/`medium`/`high` keys under each source), Ralph continues to use the existing flat per-phase model resolution. Existing `.ralph.json` files without tiered structure remain fully valid.
+- **No tier specified:** When no complexity tier is active (e.g., during legacy usage or when effort/risk cannot be evaluated), Ralph defaults to the `medium` tier.
+- **Flat per-phase keys (legacy):** If you have an older `.ralph.json` with flat `model.remote.intake` / `model.local.intake` etc. keys (without tier nesting), Ralph will continue to use those. You can migrate to tiered config at your own pace.
+- **Mixed config:** You can mix tiers and flat keys in the same config; tiers take priority where defined.
 
 ### Resolution precedence
 

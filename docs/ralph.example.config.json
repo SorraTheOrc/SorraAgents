@@ -19,11 +19,7 @@
         "planning": "opencode/gpt-5.5",
         "implementation": "opencode-go/qwen3.6-plus",
         "audit": "opencode-go/glm-5.1"
-      },
-      "intake": "opencode/claude-opus-4.7",
-      "planning": "opencode/gpt-5.5",
-      "implementation": "opencode-go/qwen3.6-plus",
-      "audit": "opencode-go/glm-5.1"
+      }
     },
     "local": {
       "low": {
@@ -43,11 +39,7 @@
         "planning": "Proxy/qwen3",
         "implementation": "Proxy/qwen3",
         "audit": "Proxy/qwen3"
-      },
-      "intake": "Proxy/qwen3",
-      "planning": "Proxy/qwen3",
-      "implementation": "Proxy/qwen3",
-      "audit": "Proxy/qwen3"
+      }
     }
   },
   "complexity_tier": {
