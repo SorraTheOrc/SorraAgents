@@ -143,7 +143,7 @@ export function pushToDev(opts = {}) {
     if (stderr.includes('non-fast-forward') || stderr.includes('[rejected]')) {
       return {
         success: false,
-        error: `Push to '${DEV_BRANCH}' was rejected (likely non-fast-forward / conflict). Do NOT force-push. Create a merge-conflict work item via wl and resolve conflicts first.`,
+        error: `Push to '${DEV_BRANCH}' was rejected (non-fast-forward / conflict). Record the conflict details in a comment on the owning work item and resolve manually.`,
         command,
       };
     }
@@ -214,7 +214,7 @@ export function pushToBranch(targetBranch, opts = {}) {
     if (stderr.includes('non-fast-forward') || stderr.includes('[rejected]')) {
       return {
         success: false,
-        error: `Push to '${targetBranch}' was rejected (likely non-fast-forward / conflict). Do NOT force-push.`,
+        error: `Push to '${targetBranch}' was rejected (non-fast-forward / conflict). Record the conflict details in a comment on the owning work item and resolve manually.`,
         command,
       };
     }

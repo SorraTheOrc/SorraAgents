@@ -29,6 +29,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from skill.ralph.scripts.signal_system import resolve_signal_path
+
 logger = logging.getLogger("ralph")
 
 
@@ -44,6 +46,7 @@ class RalphRuntimeContext:
     last_recent_activity: list[str] = field(default_factory=list)
     exit_code: int | None = None
     launched_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    signal_file_path: str | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -57,6 +60,7 @@ class RalphRuntimeContext:
             "last_recent_activity": self.last_recent_activity,
             "exit_code": self.exit_code,
             "launched_at": self.launched_at,
+            "signal_file_path": self.signal_file_path,
         }
 
     @classmethod
@@ -72,6 +76,7 @@ class RalphRuntimeContext:
             last_recent_activity=[str(line) for line in list(payload.get("last_recent_activity") or [])],
             exit_code=(int(payload["exit_code"]) if payload.get("exit_code") is not None else None),
             launched_at=str(payload.get("launched_at") or datetime.now(timezone.utc).isoformat()),
+            signal_file_path=(str(payload["signal_file_path"]) if payload.get("signal_file_path") else None),
         )
 
 
@@ -131,6 +136,20 @@ def _ensure_json_argument(args: list[str]) -> list[str]:
     return [*args, "--json"]
 
 
+def _load_signal_config() -> dict:
+    """Load Ralph config to extract signal file path configuration."""
+    for path in [Path(".ralph.json"), Path("ralph.config.json")]:
+        if path.exists():
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except (json.JSONDecodeError, OSError):
+                break
+    return {}
+
+
 def _build_launch_command(target_args: Sequence[str], runtime_dir: Path, log_path: Path) -> list[str]:
     script_path = Path(__file__).resolve().with_name("ralph_loop.py")
     launch_args = _ensure_json_argument(list(target_args))
@@ -163,11 +182,17 @@ def launch_background(
     log_path = _log_path(runtime_dir, target_id)
     state_path = _state_path(runtime_dir)
 
+    # Resolve signal file path from any available config so Pi can discover it
+    signal_config = _load_signal_config()
+    resolved_signal_path = resolve_signal_path(signal_config)
+    signal_path_str = str(resolved_signal_path)
+
     context = RalphRuntimeContext(
         target_id=target_id,
         pid=0,
         log_path=log_path,
         state_path=state_path,
+        signal_file_path=signal_path_str,
     )
     _save_context(context)
 

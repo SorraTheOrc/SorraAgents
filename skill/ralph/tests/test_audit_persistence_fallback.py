@@ -1,4 +1,8 @@
-"""Tests for the audit persistence fallback and cycle detection."""
+"""Tests for the audit persistence fallback and cycle detection.
+
+Verifies that Ralph reads audit state via `wl audit-show` instead of the
+deprecated `workItem.audit` field from `wl show`.
+"""
 
 from __future__ import annotations
 
@@ -27,16 +31,33 @@ from skill.ralph.scripts.ralph_loop import (
 # ──────────────────────────────────────────────────────────
 
 
-def _wl_show_response(audit_text: str | None = None, stage: str = "plan_complete") -> str:
-    """Build a wl show JSON response with optional audit text."""
+def _wl_show_response(stage: str = "plan_complete") -> str:
+    """Build a wl show JSON response (no longer carries audit)."""
     work_item = {
         "id": "SA-TEST",
         "stage": stage,
         "status": "open",
     }
-    if audit_text is not None:
-        work_item["audit"] = {"text": audit_text}
     return json.dumps({"success": True, "workItem": work_item, "children": []})
+
+
+def _wl_audit_show_response(audit_text: str | None = None) -> str:
+    """Build a wl audit-show JSON response.
+
+    When audit_text is None, returns audit: null (no audit record).
+    Otherwise returns the audit_results row with rawOutput set.
+    """
+    audit = None
+    if audit_text is not None:
+        audit = {
+            "workItemId": "SA-TEST",
+            "readyToClose": "Yes" in audit_text,
+            "auditedAt": "2026-06-05T12:00:00Z",
+            "summary": "Audit result",
+            "rawOutput": audit_text,
+            "author": "audit-agent",
+        }
+    return json.dumps({"success": True, "workItemId": "SA-TEST", "audit": audit})
 
 
 def _wl_update_audit_response() -> str:
@@ -110,7 +131,62 @@ def test_parse_audit_report_no():
 
 
 # ──────────────────────────────────────────────────────────
-# AC1: Fallback persist when audit model does not persist
+# AC1: _read_persisted_audit_text uses wl audit-show
+# ──────────────────────────────────────────────────────────
+
+
+def test_read_persisted_audit_text_uses_audit_show():
+    """Verify that _read_persisted_audit_text calls wl audit-show, not wl show."""
+    audit_show_called = []
+    wl_show_called = []
+
+    def runner(cmd, **kwargs):
+        argv = list(cmd)
+        if argv[:3] == ["wl", "audit-show", "SA-TEST"]:
+            audit_show_called.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=_wl_audit_show_response(_VALID_AUDIT_REPORT))
+        if argv[:2] == ["wl", "show"]:
+            wl_show_called.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response())
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    loop = RalphLoop(runner=runner, pi_bin="pi", wl_bin="wl", stream=False)
+    text = loop._read_persisted_audit_text("SA-TEST")
+
+    assert len(audit_show_called) == 1, "wl audit-show should have been called"
+    assert len(wl_show_called) == 0, "wl show should NOT have been called for audit"
+    assert text == _VALID_AUDIT_REPORT
+
+
+def test_read_persisted_audit_text_missing_audit_returns_empty():
+    """When no audit_results row exists, _read_persisted_audit_text returns ''."""
+
+    def runner(cmd, **kwargs):
+        argv = list(cmd)
+        if argv[:3] == ["wl", "audit-show", "SA-TEST"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=_wl_audit_show_response(audit_text=None))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    loop = RalphLoop(runner=runner, pi_bin="pi", wl_bin="wl", stream=False)
+    text = loop._read_persisted_audit_text("SA-TEST")
+
+    assert text == ""
+
+
+def test_read_persisted_audit_text_handles_exception():
+    """When wl audit-show fails, _read_persisted_audit_text returns '' without crashing."""
+
+    def runner(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd)
+
+    loop = RalphLoop(runner=runner, pi_bin="pi", wl_bin="wl", stream=False)
+    text = loop._read_persisted_audit_text("SA-TEST")
+
+    assert text == ""
+
+
+# ──────────────────────────────────────────────────────────
+# AC2: Fallback persist when audit model does not persist
 # but produces a valid report in output stream
 # ──────────────────────────────────────────────────────────
 
@@ -119,18 +195,19 @@ def test_fallback_persist_valid_report_ready_to_close():
     """When audit output has 'Ready to close: Yes' but audit is not persisted,
     Ralph should persist from captured output and succeed."""
     persist_called = []
-    wl_show_called = []
+    audit_show_count = []
 
     def runner(cmd, **kwargs):
         argv = list(cmd)
-        if argv[0] == "wl" and argv[1] == "show":
-            wl_show_called.append(argv)
-            # First call: no persisted audit. Second call (after fallback): return persisted.
-            count = len(wl_show_called)
+        if argv[0] == "wl" and argv[1] == "audit-show":
+            audit_show_count.append(argv)
+            count = len(audit_show_count)
             if count == 1:
-                return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response(audit_text=None))
+                return subprocess.CompletedProcess(argv, 0, stdout=_wl_audit_show_response(audit_text=None))
             else:
-                return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response(audit_text=_VALID_AUDIT_REPORT), stderr="")
+                return subprocess.CompletedProcess(argv, 0, stdout=_wl_audit_show_response(audit_text=_VALID_AUDIT_REPORT))
+        if argv[0] == "wl" and argv[1] == "show":
+            return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response())
         if argv[0] == "wl" and argv[1] == "update" and "--audit-text" in argv:
             persist_called.append(argv)
             return subprocess.CompletedProcess(argv, 0, stdout=_wl_update_audit_response(), stderr="")
@@ -167,17 +244,17 @@ def test_fallback_persist_not_used_when_output_lacks_marker():
 
     def runner(cmd, **kwargs):
         argv = list(cmd)
+        if argv[0] == "wl" and argv[1] == "audit-show":
+            return subprocess.CompletedProcess(argv, 0, stdout=_wl_audit_show_response(audit_text=None))
         if argv[0] == "wl" and argv[1] == "show":
-            return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response(audit_text=None), stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response())
         if argv[0] == "wl" and argv[1] == "update" and "--audit-text" in argv:
             persist_called.append(argv)
             return subprocess.CompletedProcess(argv, 0, stdout=_wl_update_audit_response(), stderr="")
         if argv[0] == "pi":
             pi_call_count.append(argv)
-            # First pi call = implement, second = audit
             if len(pi_call_count) == 1:
                 return subprocess.CompletedProcess(argv, 0, stdout="implement done", stderr="")
-            # Audit output lacks the marker
             return subprocess.CompletedProcess(argv, 0, stdout=_pi_audit_output(_INVALID_AUDIT_OUTPUT), stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
@@ -185,7 +262,7 @@ def test_fallback_persist_not_used_when_output_lacks_marker():
         runner=runner,
         pi_bin="pi",
         wl_bin="wl",
-        max_attempts=2,  # Only 2 attempts so test completes quickly
+        max_attempts=2,
         stream=False,
     )
     loop._wl_comment_list = lambda *a, **kw: []
@@ -198,15 +275,12 @@ def test_fallback_persist_not_used_when_output_lacks_marker():
 
     result = loop.run_single_item("SA-TEST", implement_command="implement-single", skip_implement=True)
 
-    # Fallback persist should NOT have been called because the output
-    # doesn't contain a valid 'Ready to close:' marker
     assert len(persist_called) == 0, f"Fallback persist should not be called: {persist_called}"
-    # Should have reached max_attempts and returned
     assert result["status"] == "max_attempts", f"Expected max_attempts, got {result}"
 
 
 # ──────────────────────────────────────────────────────────
-# AC2: Distinguish "not persisted" from "genuine gaps"
+# AC3: Distinguish "not persisted" from "genuine gaps"
 # ──────────────────────────────────────────────────────────
 
 
@@ -214,19 +288,17 @@ def test_genuine_gaps_trigger_remediation_not_persistence():
     """When audit IS persisted and says 'Ready to close: No', Ralph should
     trigger remediation, NOT fallback persistence."""
     persist_called = []
-    remediation_occurred = []
 
     def runner(cmd, **kwargs):
         argv = list(cmd)
+        if argv[0] == "wl" and argv[1] == "audit-show":
+            return subprocess.CompletedProcess(argv, 0, stdout=_wl_audit_show_response(audit_text=_GAP_AUDIT_REPORT))
         if argv[0] == "wl" and argv[1] == "show":
-            # Persisted audit that says "No"
-            return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response(audit_text=_GAP_AUDIT_REPORT), stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response())
         if argv[0] == "wl" and argv[1] == "update" and "--audit-text" in argv:
             persist_called.append(argv)
             return subprocess.CompletedProcess(argv, 0, stdout=_wl_update_audit_response(), stderr="")
         if argv[0] == "pi":
-            # First call = implement (if not skipped)
-            # But we skip_implement=True, so only audit call happens
             return subprocess.CompletedProcess(argv, 0, stdout=_pi_audit_output(_GAP_AUDIT_REPORT), stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
@@ -247,14 +319,12 @@ def test_genuine_gaps_trigger_remediation_not_persistence():
 
     result = loop.run_single_item("SA-TEST", implement_command="implement-single", skip_implement=True)
 
-    # Fallback persist should NOT be called since audit IS persisted
     assert len(persist_called) == 0, f"Fallback persist called on persisted audit: {persist_called}"
-    # Should have tried but max_attempts exhausted
     assert result["status"] == "max_attempts", f"Expected max_attempts, got {result}"
 
 
 # ──────────────────────────────────────────────────────────
-# AC3: Cycle detection — retry limit without code changes
+# AC4: Cycle detection — retry limit without code changes
 # ──────────────────────────────────────────────────────────
 
 
@@ -266,16 +336,15 @@ def test_cycle_detection_stops_after_max_attempts_no_code_change():
 
     def runner(cmd, **kwargs):
         argv = list(cmd)
+        if argv[0] == "wl" and argv[1] == "audit-show":
+            return subprocess.CompletedProcess(argv, 0, stdout=_wl_audit_show_response(audit_text=None))
         if argv[0] == "wl" and argv[1] == "show":
-            # Never persists
-            return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response(audit_text=None), stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response())
         if argv[0] == "wl" and argv[1] == "update" and "--audit-text" in argv:
             persist_called.append(argv)
-            # Simulate failed persist (wl returns error)
             return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"success": False, "error": "failed"}), stderr="")
         if argv[0] == "pi":
             pi_call_count.append(argv)
-            # Valid audit output but wl persist keeps failing
             return subprocess.CompletedProcess(argv, 0, stdout=_pi_audit_output(_VALID_AUDIT_REPORT), stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
@@ -296,14 +365,12 @@ def test_cycle_detection_stops_after_max_attempts_no_code_change():
 
     result = loop.run_single_item("SA-TEST", implement_command="implement-single", skip_implement=True)
 
-    # Should have exhausted max_attempts
     assert result["status"] == "max_attempts"
-    # Reason should indicate no_persisted_audit
     assert result.get("reason") == "no_persisted_audit"
 
 
 # ──────────────────────────────────────────────────────────
-# AC4: Integration test — fallback works with model that does not persist
+# AC5: Integration test — fallback works with model that does not persist
 # ──────────────────────────────────────────────────────────
 
 
@@ -311,29 +378,26 @@ def test_fallback_persist_in_main_loop_no_children():
     """When the main loop (run, not run_single_item) encounters a missing
     audit with valid report in output, it should fallback persist."""
     persist_called = []
-    wl_show_count = []
+    audit_show_count = []
 
     def runner(cmd, **kwargs):
         argv = list(cmd)
         if argv[0] == "wl" and argv[1] == "show":
-            wl_show_count.append(argv)
-            count = len(wl_show_count)
-            # First show returns item in in_review, no children
+            return subprocess.CompletedProcess(
+                argv, 0,
+                stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-TEST", "stage": "in_review", "status": "open"},
+                    "children": [],
+                }),
+                stderr="",
+            )
+        if argv[0] == "wl" and argv[1] == "audit-show":
+            audit_show_count.append(argv)
+            count = len(audit_show_count)
             if count == 1:
-                return subprocess.CompletedProcess(
-                    argv, 0,
-                    stdout=json.dumps({
-                        "success": True,
-                        "workItem": {"id": "SA-TEST", "stage": "in_review", "status": "open"},
-                        "children": [],
-                    }),
-                    stderr="",
-                )
-            # Subsequent shows for audit: first time no audit, second time has audit
-            if count == 2:
-                return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response(audit_text=None), stderr="")
-            # After fallback persist
-            return subprocess.CompletedProcess(argv, 0, stdout=_wl_show_response(audit_text=_VALID_AUDIT_REPORT), stderr="")
+                return subprocess.CompletedProcess(argv, 0, stdout=_wl_audit_show_response(audit_text=None), stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout=_wl_audit_show_response(audit_text=_VALID_AUDIT_REPORT), stderr="")
         if argv[0] == "wl" and argv[1] == "update" and "--audit-text" in argv:
             persist_called.append(argv)
             return subprocess.CompletedProcess(argv, 0, stdout=_wl_update_audit_response(), stderr="")

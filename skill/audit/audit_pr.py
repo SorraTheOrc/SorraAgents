@@ -206,20 +206,31 @@ def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bo
         return 2, log_path
 
 
-def record_audit_text(wl_id: str, audit_text: str, dry_run: bool = True) -> bool:
-    """Record the structured audit text on the work item using the `wl` CLI.
+def record_audit_result(wl_id: str, ready_to_close: bool, summary: str, raw_output: str, dry_run: bool = True) -> bool:
+    """Record the structured audit result on the work item using the `wl audit-set` CLI.
 
-    In dry_run mode the function writes a local file under .pi/tmp and returns True.
+    In dry_run mode the function writes a local JSON file under .pi/tmp and returns True.
     """
     if dry_run:
-        outpath = os.path.abspath(os.path.join('.pi', 'tmp', f'audit-{wl_id}.txt'))
+        outpath = os.path.abspath(os.path.join('.pi', 'tmp', f'audit-result-{wl_id}.json'))
         os.makedirs(os.path.dirname(outpath), exist_ok=True)
         with open(outpath, 'w') as f:
-            f.write(audit_text)
+            json.dump({
+                "ready_to_close": ready_to_close,
+                "summary": summary,
+                "raw_output": raw_output
+            }, f)
         return True
 
     try:
-        subprocess.check_call(['wl', 'update', wl_id, '--audit-text', audit_text])
+        ready = "yes" if ready_to_close else "no"
+        subprocess.check_call([
+            'wl', 'audit-set', wl_id,
+            '--ready-to-close', ready,
+            '--summary', summary,
+            '--raw-output', raw_output,
+            '--author', 'ampa-audit'
+        ])
         return True
     except Exception:
         return False
@@ -351,6 +362,14 @@ def summarize_unmet_criteria(report_text: str) -> list[str]:
     return lines
 
 
+def extract_ready_to_close(report_text: str) -> bool:
+    """Extract the Ready to close: Yes/No value from the report text."""
+    for line in report_text.splitlines():
+        if line.strip().lower().startswith("ready to close:"):
+            return "yes" in line.lower()
+    return False
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument('target', help='Worklog id (WL-...) or GitHub PR (URL or owner/repo#pr)')
@@ -414,7 +433,9 @@ def main(argv=None):
                 with open(alog) as fh:
                     raw_content = fh.read()
                 structured_content = extract_structured_audit_text(raw_content)
-                recorded = record_audit_text(wl, structured_content, dry_run=args.dry_run)
+                ready = extract_ready_to_close(structured_content)
+                summary = "AMPA Audit: See comment for details"  # Simplified summary for audit-set
+                recorded = record_audit_result(wl, ready, summary, structured_content, dry_run=args.dry_run)
                 commented = append_audit_comment(wl, structured_content, dry_run=args.dry_run)
                 print(f"Recorded audit to WL: {recorded}, comment appended: {commented}")
                 audit_ok = (arc == 0 and recorded and commented)

@@ -115,7 +115,7 @@ Use `isBranchBlocked(branch)` or `validatePushTarget(targetBranch)` to check bef
 When `pushToDev()` fails due to a non-fast-forward rejection (conflict):
 
 1. The function returns `{ success: false, error: "..." }` — no force-push is attempted.
-2. The agent should create a merge-conflict work item via `wl create` documenting the conflict.
+2. The agent should record the conflict details in a comment on the owning work item and resolve manually.
 3. The agent reports the failure to the operator.
 
 ## Branch Naming Policy

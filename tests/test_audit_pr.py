@@ -73,12 +73,14 @@ def test_run_audit_dry_run(tmp_path):
     assert 'DRY-RUN' in content
 
 
-def test_record_audit_text_dry_run(tmp_path):
-    ok = audit_pr.record_audit_text('SA-TEST', '---AUDIT---\nOK', dry_run=True)
+def test_record_audit_result_dry_run(tmp_path):
+    ok = audit_pr.record_audit_result('SA-TEST', True, 'summary', 'raw', dry_run=True)
     assert ok
-    fpath = os.path.join('.pi', 'tmp', 'audit-SA-TEST.txt')
+    fpath = os.path.join('.pi', 'tmp', 'audit-result-SA-TEST.json')
     assert os.path.exists(fpath)
-    assert 'AUDIT' in open(fpath).read()
+    data = json.load(open(fpath))
+    assert data['ready_to_close'] is True
+    assert data['summary'] == 'summary'
 
 
 def test_resolve_wl_for_pr_from_metadata():
@@ -112,7 +114,7 @@ def test_merge_pr_dry_run():
     assert audit_pr.merge_pr('o', 'r', 1, dry_run=True) is True
 
 
-def test_record_audit_text_non_dry_run_invokes_wl(monkeypatch):
+def test_record_audit_result_non_dry_run_invokes_wl(monkeypatch):
     calls = []
 
     def fake_call(cmd, *a, **k):
@@ -120,10 +122,16 @@ def test_record_audit_text_non_dry_run_invokes_wl(monkeypatch):
         return 0
 
     monkeypatch.setattr(subprocess, 'check_call', fake_call)
-    ok = audit_pr.record_audit_text('SA-900', 'Ready to close: Yes', dry_run=False)
+    ok = audit_pr.record_audit_result('SA-900', True, 'Summary Text', 'Raw Output', dry_run=False)
     assert ok is True
     assert calls
-    assert calls[0][:4] == ['wl', 'update', 'SA-900', '--audit-text']
+    assert calls[0][:3] == ['wl', 'audit-set', 'SA-900']
+    assert '--ready-to-close' in calls[0]
+    assert 'yes' in calls[0]
+    assert '--summary' in calls[0]
+    assert 'Summary Text' in calls[0]
+    assert '--raw-output' in calls[0]
+    assert 'Raw Output' in calls[0]
 
 
 def test_append_audit_comment_dry_run():
@@ -210,6 +218,13 @@ def test_summarize_unmet_criteria_rows():
     assert 'partial' in rows[1].lower()
 
 
+def test_extract_ready_to_close():
+    assert audit_pr.extract_ready_to_close("Ready to close: Yes") is True
+    assert audit_pr.extract_ready_to_close("Ready to close: No") is False
+    assert audit_pr.extract_ready_to_close("Ready to close: Partial") is False
+    assert audit_pr.extract_ready_to_close("nothing") is False
+
+
 def test_main_pr_flow_dry_run_success(capsys, monkeypatch):
     monkeypatch.setattr(
         audit_pr,
@@ -265,7 +280,7 @@ def test_main_pr_flow_non_dry_run_with_mocked_exec(capsys, monkeypatch, tmp_path
         return 0, str(log)
 
     monkeypatch.setattr(audit_pr, 'run_audit_in_worktree', fake_audit)
-    monkeypatch.setattr(audit_pr, 'record_audit_text', lambda wl, text, dry_run=False: True)
+    monkeypatch.setattr(audit_pr, 'record_audit_result', lambda *a, **k: True)
     monkeypatch.setattr(audit_pr, 'append_audit_comment', lambda wl, text, dry_run=False: True)
     monkeypatch.setattr(audit_pr, 'gh_get_pr_checks', lambda *a, **k: {'checks_ok': True, 'merge_state': 'CLEAN', 'raw': {}})
     monkeypatch.setattr(audit_pr, 'merge_pr', lambda *a, **k: True)
@@ -300,7 +315,7 @@ def test_main_pr_flow_audit_fail_reports_context_and_unmet(capsys, monkeypatch, 
         return 1, str(log)
 
     monkeypatch.setattr(audit_pr, 'run_audit_in_worktree', fake_audit_fail)
-    monkeypatch.setattr(audit_pr, 'record_audit_text', lambda wl, text, dry_run=False: True)
+    monkeypatch.setattr(audit_pr, 'record_audit_result', lambda *a, **k: True)
     monkeypatch.setattr(audit_pr, 'append_audit_comment', lambda wl, text, dry_run=False: True)
 
     rc = audit_pr.main(['owner/repo#31', '--run-checkout', '--run-audit'])

@@ -2,7 +2,7 @@
   "providers": {
     "Proxy": {
       "api": "openai-completions",
-      "baseUrl": "http://192.168.0.199:8000/v1",
+      "baseUrl": "http://100.79.231.101:8000/v1",
       "apiKey": "not_needed",
       "compat": {
         "supportsDeveloperRole": false,
@@ -10,10 +10,7 @@
         "sendSessionAffinityHeaders": true
       },
       "options": {
-        "timeout": 60000
-      },
-      "options": {
-        "timeout": 60000
+        "timeout": 600000
       },
       "models": [
         {
@@ -30,7 +27,7 @@
           "id": "gemma4",
           "name": "Gemma 4",
           "reasoning": true,
-          "contextWindow": 262144,
+          "contextWindow": 131072,
           "maxTokens": 32768
         },
         {
