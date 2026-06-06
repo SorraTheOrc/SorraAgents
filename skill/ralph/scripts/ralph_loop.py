@@ -955,11 +955,18 @@ class RalphLoop:
         event_type: EventType,
         work_item_ids: list[str] | None = None,
         description: str | None = None,
+        title: str | None = None,
     ) -> None:
         """Write a signal file and optionally send a webhook notification.
 
         This is fire-and-forget: errors from either channel are logged at
         WARNING level and never propagated to the caller.
+
+        When ``title`` is provided, it is used as the Discord embed title
+        ("Ralph: {title}"). When omitted but a single ``work_item_id`` is
+        present, the title is automatically fetched from the work item.
+        When neither is available, the embed title falls back to the
+        event-type default.
         """
         if self._signal_writer is not None:
             try:
@@ -973,12 +980,24 @@ class RalphLoop:
                     event_type.value,
                     exc,
                 )
+
+        # Resolve work-item title for the webhook embed if not provided
+        webhook_title = title
+        if webhook_title is None and work_item_ids and len(work_item_ids) == 1:
+            try:
+                item_data = self._wl_show(work_item_ids[0])
+                wi = item_data.get("workItem", {}) if isinstance(item_data, dict) else {}
+                webhook_title = wi.get("title", "") or None
+            except Exception:
+                webhook_title = None
+
         if self._webhook_notifier is not None:
             try:
                 self._webhook_notifier.send_event(
                     event_type,
                     work_item_ids=work_item_ids,
                     description=description,
+                    title=webhook_title,
                 )
             except Exception as exc:
                 logger.warning(

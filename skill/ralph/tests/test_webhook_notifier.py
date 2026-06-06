@@ -91,6 +91,65 @@ class TestWebhookNotifierHttpDelivery:
         # urllib normalizes header keys to 'User-agent' (lowercase 'a')
         assert request.headers.get("User-agent") == "Ralph/1.0 (Worklog Orchestration Agent)"
 
+    def test_send_event_with_title_uses_ralph_prefix(self):
+        """When title is provided, embed title is 'Ralph: <title>'."""
+        url = "https://discord.com/api/webhooks/123/abc"
+        notifier = WebhookNotifier(url)
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_ctx = MagicMock()
+            mock_urlopen.return_value.__enter__.return_value = mock_ctx
+            mock_ctx.status = 204
+            notifier.send_event(
+                EventType.STARTED,
+                work_item_ids=["SA-1"],
+                title="My Work Item",
+            )
+
+        request = mock_urlopen.call_args[0][0]
+        body = json.loads(request.data.decode("utf-8"))
+        embed = body["embeds"][0]
+        assert embed["title"] == "Ralph: My Work Item"
+
+    def test_send_event_without_title_uses_default(self):
+        """When title is not provided, embed title defaults to 'Ralph Event: <event_type>'."""
+        url = "https://discord.com/api/webhooks/123/abc"
+        notifier = WebhookNotifier(url)
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_ctx = MagicMock()
+            mock_urlopen.return_value.__enter__.return_value = mock_ctx
+            mock_ctx.status = 204
+            notifier.send_event(
+                EventType.STATUS_TRANSITION,
+                work_item_ids=["SA-1"],
+            )
+
+        request = mock_urlopen.call_args[0][0]
+        body = json.loads(request.data.decode("utf-8"))
+        embed = body["embeds"][0]
+        assert embed["title"] == "Ralph Event: Status Transition"
+
+    def test_send_event_with_empty_title_falls_back_to_default(self):
+        """When title is an empty string, embed title defaults to 'Ralph Event: <event_type>'."""
+        url = "https://discord.com/api/webhooks/123/abc"
+        notifier = WebhookNotifier(url)
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_ctx = MagicMock()
+            mock_urlopen.return_value.__enter__.return_value = mock_ctx
+            mock_ctx.status = 204
+            notifier.send_event(
+                EventType.COMPLETED,
+                work_item_ids=["SA-1"],
+                title="",
+            )
+
+        request = mock_urlopen.call_args[0][0]
+        body = json.loads(request.data.decode("utf-8"))
+        embed = body["embeds"][0]
+        assert embed["title"] == "Ralph Event: Completed"
+
     def test_send_event_embed_contains_required_fields(self):
         """The POST body JSON contains event_type, timestamp, description, and work_item_ids."""
         url = "https://discord.com/api/webhooks/123/abc"
@@ -394,6 +453,22 @@ class TestWebhookNotifierIndependence:
 
 class TestWebhookNotifierWithEventType:
     """Verify WebhookNotifier works with all EventType values."""
+
+    def test_all_event_types_with_title(self):
+        """All EventType values with a title produce embed title 'Ralph: <title>'."""
+        url = "https://discord.com/api/webhooks/123/abc"
+        notifier = WebhookNotifier(url)
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_ctx = MagicMock()
+            mock_urlopen.return_value.__enter__.return_value = mock_ctx
+            mock_ctx.status = 204
+            notifier.send_event(EventType.STARTED, work_item_ids=["SA-X"], title="Test Title")
+
+        request = mock_urlopen.call_args[0][0]
+        body = json.loads(request.data.decode("utf-8"))
+        assert body["embeds"][0]["title"] == "Ralph: Test Title"
+
 
     @pytest.mark.parametrize("event_type", list(EventType))
     def test_all_event_types_accepted(self, event_type):

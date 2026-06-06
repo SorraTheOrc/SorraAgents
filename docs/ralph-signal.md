@@ -103,7 +103,7 @@ The webhook POST body follows the [Discord Embed](https://discord.com/developers
 {
   "embeds": [
     {
-      "title": "Ralph Event: Completed",
+      "title": "Ralph: My Work Item Title",
       "description": "Ralph loop completed successfully after passing audit",
       "color": 5797046,
       "timestamp": "2026-06-05T22:00:00.123456+00:00",
@@ -122,6 +122,11 @@ The webhook POST body follows the [Discord Embed](https://discord.com/developers
     }
   ]
 }
+```
+
+The embed title is constructed as follows:
+- When a work-item title is available (resolved from the work item), the title is `"Ralph: <work-item-title>"`.
+- When no title can be resolved (e.g., fetch failure or no single work-item ID), it falls back to `"Ralph Event: <event_type>"` (e.g., `"Ralph Event: Completed"`).
 ```
 
 ### Behaviour
