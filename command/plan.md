@@ -36,6 +36,8 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 - If the user indicates uncertainty, add clarifying questions rather than guessing.
 - **Test-first ordering**: When creating child work items, test/verification work items must always be created before implementation work items. This ensures a test-driven development approach is followed — tests are defined first and implementation follows. The feature plan must list test features before implementation features, and the `wl create` commands for test items must be issued before those for implementation items.
 
+- **Vertical slice phasing**: When phasing large work items into multiple integration phases, use the **tracer bullet** approach. Each phase should be a thin vertical slice that cuts through ALL integration layers end-to-end (code, tests, docs, infra, observability), NOT a horizontal slice of a single layer. This ensures each phase delivers end-to-end user value and can be integrated independently. Between each phase, review the next work items and update their descriptions if they depend on completed work or come next in the schedule.
+
 - Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
 
 ## Note
@@ -112,7 +114,14 @@ Keep asking questions until the breakdown into features is clear.
 - Present the draft as a numbered list and ask the user to: accept, edit titles/scopes, reorder, or split/merge features.
 - If the user requests changes, iterate until the feature list is approved.
 
-4. Automated review stages (must follow; no human intervention required)
+4. Verify vertical slice phasing (agent responsibility)
+
+- Review the proposed feature plan to ensure each phase represents a vertical slice that cuts through ALL integration layers end-to-end.
+- If any phase appears to be a horizontal slice (focused on a single layer), ask the user to refactor it into vertical slices.
+- Verify that between-phase guidance is included: implementation should review next work items and update descriptions as needed.
+- If the work item is small enough to not require phasing, document this decision and proceed to the automated review stages.
+
+5. Automated review stages (must follow; no human intervention required)
 
 - After the user approves the feature list, run five review iterations. Each review MUST provide a new draft if any changes are recommended and then output exactly: "Finished <Stage Name> review: <brief notes of improvements>"
 
@@ -139,7 +148,7 @@ Keep asking questions until the breakdown into features is clear.
   - Purpose: Make the plan copy-pasteable and easy to execute.
   - Actions: Standardize bullets, tense, and structure; keep titles canonical.
 
-5. Update work items (agent)
+6. Update work items (agent)
 
 - **Test-first creation**: When creating child work items, always create test/verification work items before implementation work items. This ensures that test tasks are available first, enabling a test-driven development workflow where tests define the validation criteria before implementation begins.
 - Create child work items for each feature with a parent link to the original work item:
@@ -159,7 +168,7 @@ Keep asking questions until the breakdown into features is clear.
     -- Update the planned work item's stage to indicate planning is complete:
   - `wl update $1 --stage plan_complete --status open --json`
 
-6. Calculate Effort and Risk (agent responsibility; must follow)
+7. Calculate Effort and Risk (agent responsibility; must follow)
 
 - Call the `effort_and_risk` skill with the new or updated work item to produce an effort and risk estimate.
 
@@ -178,7 +187,7 @@ Keep asking questions until the breakdown into features is clear.
 - **JSON parsing**: `wl ... --json` output may be either an object or an array; when extracting ids with `jq`, handle both shapes (e.g., `if type=="array" then .[0].id elif type=="object" then .id end`).
 - If any automated step fails or is ambiguous, surface an explicit Open Question and pause for human guidance.
 
-## Finishing steps (must do)
+## 8. Finishing (must do as the final step only)
 
 -- On the parent work item set the work item's stage to `plan_complete`:
 `wl update <work-item-id> --stage plan_complete --status open --json`
