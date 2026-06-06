@@ -956,6 +956,7 @@ class RalphLoop:
         work_item_ids: list[str] | None = None,
         description: str | None = None,
         title: str | None = None,
+        cmd: str | None = None,
     ) -> None:
         """Write a signal file and optionally send a webhook notification.
 
@@ -967,12 +968,27 @@ class RalphLoop:
         present, the title is automatically fetched from the work item.
         When neither is available, the embed title falls back to the
         event-type default.
+
+        When ``cmd`` is provided, it is included in both the signal file
+        JSON payload and the Discord embed as a "Pi Command" field.
         """
+        # Resolve work-item title if not provided
+        resolved_title = title
+        if resolved_title is None and work_item_ids and len(work_item_ids) == 1:
+            try:
+                item_data = self._wl_show(work_item_ids[0])
+                wi = item_data.get("workItem", {}) if isinstance(item_data, dict) else {}
+                resolved_title = wi.get("title", "") or None
+            except Exception:
+                resolved_title = None
+
         if self._signal_writer is not None:
             try:
                 self._signal_writer.write_event(
                     event_type,
                     work_item_ids=work_item_ids,
+                    cmd=cmd,
+                    title=resolved_title,
                 )
             except Exception as exc:
                 logger.warning(
@@ -981,23 +997,14 @@ class RalphLoop:
                     exc,
                 )
 
-        # Resolve work-item title for the webhook embed if not provided
-        webhook_title = title
-        if webhook_title is None and work_item_ids and len(work_item_ids) == 1:
-            try:
-                item_data = self._wl_show(work_item_ids[0])
-                wi = item_data.get("workItem", {}) if isinstance(item_data, dict) else {}
-                webhook_title = wi.get("title", "") or None
-            except Exception:
-                webhook_title = None
-
         if self._webhook_notifier is not None:
             try:
                 self._webhook_notifier.send_event(
                     event_type,
                     work_item_ids=work_item_ids,
                     description=description,
-                    title=webhook_title,
+                    title=resolved_title,
+                    cmd=cmd,
                 )
             except Exception as exc:
                 logger.warning(
@@ -1230,17 +1237,19 @@ class RalphLoop:
         )
 
     def _run_pi(self, prompt: str, phase: str = "implementation", work_item_ids: list[str] | None = None) -> str:
-        # Notify: pi subprocess starting
-        self._notify_event(
-            EventType.PI_STARTED,
-            work_item_ids=work_item_ids,
-            description=f"Pi subprocess starting ({phase})",
-        )
-
         # Use an ephemeral session for each orchestration call so nested or
         # retried runs never attempt to continue a previous assistant turn.
         model_for_phase = self._resolve_model_for_phase(phase)
         cmd = [self.pi_bin, "-p", "--no-session", "--mode", "json", "--model", model_for_phase, prompt]
+        rendered_cmd = _render_command(cmd)
+
+        # Notify: pi subprocess starting (build command BEFORE notifying so cmd is available)
+        self._notify_event(
+            EventType.PI_STARTED,
+            work_item_ids=work_item_ids,
+            description=f"Pi subprocess starting ({phase})",
+            cmd=rendered_cmd,
+        )
         logger.debug("ralph.cmd.pi.run phase=%s model=%s prompt_len=%d", phase, model_for_phase, len(prompt))
         if self.verbose:
             logger.debug("ralph.cmd.pi.run prompt_full=\n%s", prompt)
@@ -1294,6 +1303,7 @@ class RalphLoop:
                 EventType.ERROR,
                 work_item_ids=work_item_ids,
                 description=f"Pi subprocess failed ({phase})",
+                cmd=_render_command(cmd),
             )
             raise
 

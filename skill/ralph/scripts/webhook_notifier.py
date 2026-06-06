@@ -59,6 +59,7 @@ class WebhookNotifier:
         description: str | None = None,
         timestamp: str | None = None,
         title: str | None = None,
+        cmd: str | None = None,
     ) -> bool | None:
         """Send a Discord embed notification for the given event.
 
@@ -76,6 +77,7 @@ class WebhookNotifier:
             title: Optional work-item title. When provided, the embed title
                    becomes "Ralph: {title}". When omitted or empty, the embed
                    title defaults to "Ralph Event: {event_type}".
+            cmd: Optional pi command string to include in the embed.
 
         Returns:
             True on successful HTTP delivery, False on failure, None when
@@ -90,7 +92,7 @@ class WebhookNotifier:
         if description is None:
             description = f"Ralph event: {event_type.value}"
 
-        embed = self._build_embed(event_type, description, work_item_ids, timestamp, title=title)
+        embed = self._build_embed(event_type, description, work_item_ids, timestamp, title=title, cmd=cmd)
         payload = {"embeds": [embed]}
 
         try:
@@ -116,12 +118,16 @@ class WebhookNotifier:
         work_item_ids: Sequence[str] | None,
         timestamp: str,
         title: str | None = None,
+        cmd: str | None = None,
     ) -> dict:
         """Build a Discord embed dict for the event.
 
         When ``title`` is provided and non-empty, the embed title becomes
         "Ralph: {title}". Otherwise it defaults to
         "Ralph Event: {event_type}".
+
+        When ``cmd`` is provided and non-empty, it is included as a
+        "Pi Command" field in the embed.
         """
         ids_str = ", ".join(work_item_ids) if work_item_ids else "None"
 
@@ -130,15 +136,19 @@ class WebhookNotifier:
         else:
             embed_title = f"Ralph Event: {event_type.value.replace('_', ' ').title()}"
 
+        fields: list[dict] = [
+            {"name": "Event Type", "value": event_type.value, "inline": True},
+            {"name": "Work Item IDs", "value": ids_str, "inline": True},
+        ]
+        if cmd:
+            fields.insert(0, {"name": "Pi Command", "value": cmd, "inline": False})
+
         embed: dict = {
             "title": embed_title,
             "description": description,
             "color": _DISCORD_EMBED_COLOR,
             "timestamp": timestamp,
-            "fields": [
-                {"name": "Event Type", "value": event_type.value, "inline": True},
-                {"name": "Work Item IDs", "value": ids_str, "inline": True},
-            ],
+            "fields": fields,
         }
         return embed
 

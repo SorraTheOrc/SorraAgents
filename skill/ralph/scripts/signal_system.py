@@ -57,6 +57,8 @@ class SignalWriter:
         event_type: EventType,
         work_item_ids: Sequence[str] | None = None,
         timestamp: str | None = None,
+        cmd: str | None = None,
+        title: str | None = None,
     ) -> Path:
         """Write an event signal file.
 
@@ -65,6 +67,8 @@ class SignalWriter:
             work_item_ids: Optional list of relevant work-item IDs.
             timestamp: ISO8601 timestamp string. If not provided, the current
                        UTC time is used.
+            cmd: Optional pi command string that was executed.
+            title: Optional work-item title for context.
 
         Returns:
             The Path to the written signal file.
@@ -81,6 +85,10 @@ class SignalWriter:
             "timestamp": timestamp,
             "work_item_ids": list(work_item_ids) if work_item_ids else [],
         }
+        if cmd is not None:
+            payload["cmd"] = cmd
+        if title is not None:
+            payload["title"] = title
 
         try:
             self._signal_file_path.parent.mkdir(parents=True, exist_ok=True)
