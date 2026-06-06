@@ -35,6 +35,17 @@ from skill.audit.scripts.persist_audit import persist_audit
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
 
+# Model / config constants (following Ralph's pattern)
+ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "ralph" / "assets" / ".ralph.json"
+DEFAULT_MODEL = "opencode-go/glm-5.1"
+DEFAULT_MODEL_SOURCE = "local"
+MODEL_SOURCES = frozenset({"remote", "local"})
+RALPH_CONFIG_FILES = [
+    Path(".ralph.json"),
+    Path("ralph.config.json"),
+]
+AUDIT_PHASE = "audit"
+
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
@@ -67,10 +78,174 @@ def _run_wl(runner: Runner, cmd: Sequence[str]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Config loading (following Ralph's _load_config / _deep_merge pattern)
+# ---------------------------------------------------------------------------
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Deep-merge override into base, returning a new dict."""
+    result = dict(base)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _load_asset_config() -> dict:
+    """Load the shipped default config from skill/ralph/assets/.ralph.json."""
+    try:
+        with open(ASSET_CONFIG_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _load_config() -> dict:
+    """Load config merging asset defaults with CWD config file.
+
+    Asset defaults from skill/ralph/assets/.ralph.json are the base.
+    A .ralph.json or ralph.config.json in the current working directory
+    overrides those values. CLI flags take highest precedence downstream.
+    """
+    config = _load_asset_config()
+
+    for path in RALPH_CONFIG_FILES:
+        if not path.exists():
+            continue
+        if path.suffix == ".json":
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    config = _deep_merge(config, data)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    return config
+
+
+def _normalize_model_source(source: str | None) -> str:
+    """Normalize a model_source value to a valid value (remote|local)."""
+    if not source:
+        return DEFAULT_MODEL_SOURCE
+    normalized = str(source).strip().lower()
+    if normalized in MODEL_SOURCES:
+        return normalized
+    return DEFAULT_MODEL_SOURCE
+
+
+def _coerce_model_str(value: object) -> str | None:
+    """Extract a non-empty trimmed string from *value*, or None."""
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if trimmed:
+            return trimmed
+    return None
+
+
+def _resolve_phase_model_value(value: object, model_source: str) -> str | None:
+    """Resolve a model value that may be a string or source-mapped dict.
+
+    If *value* is a plain string, return it directly.
+    If *value* is a dict with keys matching *model_source* (remote|local),
+    return the corresponding value.
+    """
+    direct = _coerce_model_str(value)
+    if direct:
+        return direct
+    if isinstance(value, dict):
+        source_value = _coerce_model_str(value.get(model_source))
+        if source_value:
+            return source_value
+    return None
+
+
+def _extract_phase_model_config(config: dict) -> dict[str, object]:
+    """Extract per-phase model config from the loaded .ralph.json.
+
+    Checks these locations (in order):
+      - model.<phase>  (nested key)
+      - model.remote.<phase> / model.local.<phase>  (source-mapped)
+      - model[phase]   (dict access)
+      - model[remote|local][phase]  (source-mapped dict access)
+    """
+    phase_config: dict[str, object] = {}
+    model_root = config.get("model")
+
+    for phase in (AUDIT_PHASE,):
+        # Check dotted keys first (model.audit, model.remote.audit, etc.)
+        dotted_key = config.get(f"model.{phase}")
+        if dotted_key is not None:
+            phase_config[phase] = dotted_key
+            continue
+
+        direct_remote = config.get(f"model.remote.{phase}")
+        direct_local = config.get(f"model.local.{phase}")
+        if direct_remote is not None or direct_local is not None:
+            source_map: dict[str, object] = {}
+            if direct_remote is not None:
+                source_map["remote"] = direct_remote
+            if direct_local is not None:
+                source_map["local"] = direct_local
+            phase_config[phase] = source_map
+            continue
+
+        if isinstance(model_root, dict):
+            if phase in model_root:
+                phase_config[phase] = model_root[phase]
+                continue
+
+            remote_map = model_root.get("remote")
+            local_map = model_root.get("local")
+            if isinstance(remote_map, dict) or isinstance(local_map, dict):
+                source_map = {}
+                if isinstance(remote_map, dict) and phase in remote_map:
+                    source_map["remote"] = remote_map[phase]
+                if isinstance(local_map, dict) and phase in local_map:
+                    source_map["local"] = local_map[phase]
+                if source_map:
+                    phase_config[phase] = source_map
+
+    return phase_config
+
+
+def _resolve_model_for_phase(phase: str, config: dict,
+                              model_source: str,
+                              cli_model: str | None = None) -> str:
+    """Resolve the model for *phase* with the resolution chain:
+
+    1. --model CLI flag (explicit override, highest priority)
+    2. Config-driven: phase model from .ralph.json resolved via model_source
+    3. Hardcoded fallback: DEFAULT_MODEL
+
+    This mirrors Ralph's _resolve_model_for_phase pattern.
+    """
+    # 1. CLI override
+    explicit = _coerce_model_str(cli_model)
+    if explicit:
+        return explicit
+
+    # 2. Config-driven resolution
+    phase_config = _extract_phase_model_config(config)
+    config_value = phase_config.get(phase)
+    resolved = _resolve_phase_model_value(config_value, model_source)
+    if resolved:
+        return resolved
+
+    # 3. Hardcoded fallback
+    return DEFAULT_MODEL
+
+
+# ---------------------------------------------------------------------------
 # Pi integration (duplicated from ralph for now – see OQ-1)
 # ---------------------------------------------------------------------------
 
-def _call_pi(prompt: str, model: str = "opencode-go/glm-5.1",
+def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              pi_bin: str = "pi") -> dict:
     """Call Pi via subprocess and parse the JSON-stream response.
 
@@ -408,7 +583,7 @@ def _write_debug_log(path: Path, entry: dict) -> None:
 
 
 def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
-                           model: str = "opencode-go/glm-5.1",
+                           model: str = DEFAULT_MODEL,
                            pi_bin: str = "pi", debug_log: str | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
@@ -474,10 +649,23 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
 
 
 def cmd_issue(issue_id: str, persist: bool = True,
-              pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
+              pi_bin: str = "pi", model: str | None = None,
+              model_source: str = DEFAULT_MODEL_SOURCE,
               runner: Runner | None = None, json_mode: bool = False,
               debug_log: str | None = None) -> int:
-    """Audit a single work item."""
+    """Audit a single work item.
+
+    Model resolution order (highest first):
+      1. --model CLI flag (explicit override)
+      2. Config-driven: model.audit from .ralph.json resolved via model_source
+      3. Hardcoded fallback: DEFAULT_MODEL
+    """
+    # Resolve the effective model from config + CLI
+    config = _load_config()
+    resolved_model = _resolve_model_for_phase(
+        AUDIT_PHASE, config, model_source, cli_model=model,
+    )
+
     if runner is None:
         runner = _default_runner
 
@@ -508,7 +696,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
             f"Criteria: {ac_list_json}"
         )
         try:
-            result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=model, pi_bin=pi_bin, debug_log=debug_log)
+            result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -563,7 +751,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 f"Criteria: {child_ac_list}"
             )
             try:
-                result = _call_pi_and_maybe_log(issue_id, f"child:{child.get('id', '')}", prompt, model=model, pi_bin=pi_bin, debug_log=debug_log)
+                result = _call_pi_and_maybe_log(issue_id, f"child:{child.get('id', '')}", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
@@ -621,10 +809,23 @@ def _build_project_json(summary: str, recommendation: str) -> dict:
     }
 
 
-def cmd_project(pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
+def cmd_project(pi_bin: str = "pi", model: str | None = None,
+                model_source: str = DEFAULT_MODEL_SOURCE,
                 runner: Runner | None = None, json_mode: bool = False,
                 debug_log: str | None = None) -> int:
-    """Audit the overall project."""
+    """Audit the overall project.
+
+    Model resolution order (highest first):
+      1. --model CLI flag (explicit override)
+      2. Config-driven: model.audit from .ralph.json resolved via model_source
+      3. Hardcoded fallback: DEFAULT_MODEL
+    """
+    # Resolve the effective model from config + CLI
+    config = _load_config()
+    resolved_model = _resolve_model_for_phase(
+        AUDIT_PHASE, config, model_source, cli_model=model,
+    )
+
     if runner is None:
         runner = _default_runner
 
@@ -663,7 +864,7 @@ def cmd_project(pi_bin: str = "pi", model: str = "opencode-go/glm-5.1",
         f"Return ONLY a JSON object with keys 'summary' and 'recommendation'."
     )
     try:
-        pi_result = _call_pi_and_maybe_log("project", "project", prompt, model=model, pi_bin=pi_bin, debug_log=debug_log)
+        pi_result = _call_pi_and_maybe_log("project", "project", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
         if pi_result.get("verdict") == "met" and pi_result.get("evidence"):
             # Use Pi's response if parseable
             pass  # Could enhance this in future
@@ -692,8 +893,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_issue.add_argument("--do-not-persist", action="store_true",
                          help="Do not persist the audit report via wl update")
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
-    p_issue.add_argument("--model", default="opencode-go/glm-5.1",
-                         help="Pi model to use for review")
+    p_issue.add_argument("--model", default=None,
+                         help="Pi model to use for review (default: resolved from .ralph.json)")
+    p_issue.add_argument("--model-source", default=DEFAULT_MODEL_SOURCE,
+                         choices=sorted(MODEL_SOURCES),
+                         help="Model source: remote or local (default: local)")
     p_issue.add_argument("--json", action="store_true",
                          help="Emit machine-readable JSON output instead of markdown")
     p_issue.add_argument("--debug-log", default=None,
@@ -701,8 +905,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
-    p_project.add_argument("--model", default="opencode-go/glm-5.1",
-                           help="Pi model to use for review")
+    p_project.add_argument("--model", default=None,
+                           help="Pi model to use for review (default: resolved from .ralph.json)")
+    p_project.add_argument("--model-source", default=DEFAULT_MODEL_SOURCE,
+                           choices=sorted(MODEL_SOURCES),
+                           help="Model source: remote or local (default: local)")
     p_project.add_argument("--json", action="store_true",
                            help="Emit machine-readable JSON output instead of markdown")
     p_project.add_argument("--debug-log", default=None,
@@ -721,10 +928,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "issue":
         return cmd_issue(args.issue_id, persist=not args.do_not_persist,
-                         pi_bin=args.pi_bin, model=args.model, json_mode=args.json,
+                         pi_bin=args.pi_bin, model=args.model,
+                         model_source=args.model_source, json_mode=args.json,
                          debug_log=args.debug_log)
     elif args.command == "project":
-        return cmd_project(pi_bin=args.pi_bin, model=args.model, json_mode=args.json,
+        return cmd_project(pi_bin=args.pi_bin, model=args.model,
+                           model_source=args.model_source, json_mode=args.json,
                            debug_log=args.debug_log)
 
     return 2

@@ -65,12 +65,13 @@ Ready to close: Yes/No
 The audit skill ships a small, canonical runner and a persister. Use these from CI, local automation, or orchestrators.
 
 - Runner: `skill/audit/scripts/audit_runner.py`
-  - Usage: `python3 skill/audit/scripts/audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--debug-log <file>]`
-  - Usage: `python3 skill/audit/scripts/audit_runner.py project [--pi-bin pi] [--model <name>] [--debug-log <file>]`
+  - Usage: `python3 skill/audit/scripts/audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--model-source <remote|local>] [--debug-log <file>]`
+  - Usage: `python3 skill/audit/scripts/audit_runner.py project [--pi-bin pi] [--model <name>] [--model-source <remote|local>] [--debug-log <file>]`
   - Flags:
     - `--do-not-persist` — do not run persistence (useful for dry runs)
     - `--pi-bin` — path to the `pi` binary
-    - `--model` — Pi model name
+    - `--model` — Pi model name (default: resolved from `.ralph.json`; falls back to `opencode-go/glm-5.1`)
+    - `--model-source` — model source: `remote` or `local` (default: `local`)
     - `--debug-log` — append Pi debug output to a JSONL file (helpful for triage)
 
 - Persister: `skill/audit/scripts/persist_audit.py`

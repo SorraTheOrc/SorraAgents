@@ -59,6 +59,18 @@ class TestAuditSkillDoc:
         text = _skill_md_text()
         assert "--debug-log" in text
 
+    def test_model_source_flag_documented(self):
+        """SKILL.md must document the --model-source flag."""
+        text = _skill_md_text()
+        assert "--model-source" in text
+        assert "remote" in text or "local" in text
+
+    def test_model_source_choices_documented(self):
+        """SKILL.md must mention remote and local as choices for --model-source."""
+        text = _skill_md_text()
+        assert "remote" in text.lower()
+        assert "local" in text.lower()
+
     def test_exit_codes_documented(self):
         """SKILL.md must document exit code semantics."""
         text = _skill_md_text()
