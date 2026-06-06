@@ -1203,6 +1203,12 @@ class RalphLoop:
         cmd = [self.wl_bin, "update", work_item_id, "--stage", stage]
         logger.info("ralph.cmd.wl.update_stage target=%s stage=%s", work_item_id, stage)
         self._call_with_retry(cmd, category="wl", expect_json=False)
+        # Notify about the stage change
+        self._notify_event(
+            EventType.STATUS_TRANSITION,
+            work_item_ids=[work_item_id],
+            description=f"Work item stage changed to {stage}",
+        )
 
     def _run_pi(self, prompt: str, phase: str = "implementation") -> str:
         # Use an ephemeral session for each orchestration call so nested or
@@ -2639,6 +2645,19 @@ class RalphLoop:
                     do_plan, new_stage = self._run_autoplan(focus_id)
                     if new_stage == "plan_complete":
                         target_stage = "plan_complete"
+                        # Phase change: intake -> planning (plan was invoked)
+                        self._notify_event(
+                            EventType.PHASE_CHANGE,
+                            work_item_ids=scope_ids,
+                            description="Auto-plan invoked /plan phase",
+                        )
+                    else:
+                        # Phase change: intake -> implementation (skipped plan)
+                        self._notify_event(
+                            EventType.PHASE_CHANGE,
+                            work_item_ids=scope_ids,
+                            description="Auto-plan skipped /plan, proceeding to implementation",
+                        )
                 except RalphError:
                     raise
                 except Exception:
@@ -2654,6 +2673,12 @@ class RalphLoop:
                         exc,
                     )
                     previous_child_stages = {}
+                # Phase change: implementation phase starting
+                self._notify_event(
+                    EventType.PHASE_CHANGE,
+                    work_item_ids=scope_ids,
+                    description="Implementation phase starting",
+                )
                 implement_output = self._run_pi(_build_implement_prompt(focus_id, remediation), phase="implementation")
                 self._last_implement_output = implement_output
                 no_safe_path_reason = self._extract_no_safe_path_reason(implement_output)
@@ -2748,6 +2773,12 @@ class RalphLoop:
                         "compact": {"invocations": compact_invocations, "failures": compact_failures},
                     }
 
+            # Phase change: audit phase starting
+            self._notify_event(
+                EventType.PHASE_CHANGE,
+                work_item_ids=scope_ids,
+                description="Audit phase starting",
+            )
             logger.info("ralph.loop.audit.start target=%s attempt=%d", focus_id, attempt)
             # Run the audit skill unless we've determined that the persisted audit
             # is up-to-date and can be used without re-running the audit skill.

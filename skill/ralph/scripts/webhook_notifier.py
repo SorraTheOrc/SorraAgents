@@ -139,7 +139,10 @@ class WebhookNotifier:
         req = urllib.request.Request(
             self._webhook_url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Ralph/1.0 (Worklog Orchestration Agent)",
+            },
             method="POST",
         )
         with urllib.request.urlopen(req) as resp:

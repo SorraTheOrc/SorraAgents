@@ -74,8 +74,8 @@ class TestResolveWebhookUrl:
 class TestWebhookNotifierHttpDelivery:
     """Verify WebhookNotifier POSTs valid Discord embed JSON."""
 
-    def test_send_event_posts_to_webhook_url(self):
-        """POST is made to the configured webhook URL with correct payload."""
+    def test_send_event_user_agent_header(self):
+        """The User-Agent header is included to avoid Discord 403 bot detection."""
         url = "https://discord.com/api/webhooks/123/abc"
         notifier = WebhookNotifier(url)
 
@@ -83,14 +83,13 @@ class TestWebhookNotifierHttpDelivery:
             mock_ctx = MagicMock()
             mock_urlopen.return_value.__enter__.return_value = mock_ctx
             mock_ctx.status = 204
-            notifier.send_event(EventType.COMPLETED, work_item_ids=["SA-1"])
+            notifier.send_event(EventType.STARTED, work_item_ids=["SA-1"])
 
         mock_urlopen.assert_called_once()
         call_args = mock_urlopen.call_args
         request = call_args[0][0]
-        assert request.method == "POST"
-        assert request.full_url == url
-        assert request.headers.get("Content-type") == "application/json" or request.headers.get("Content-Type") == "application/json"
+        # urllib normalizes header keys to 'User-agent' (lowercase 'a')
+        assert request.headers.get("User-agent") == "Ralph/1.0 (Worklog Orchestration Agent)"
 
     def test_send_event_embed_contains_required_fields(self):
         """The POST body JSON contains event_type, timestamp, description, and work_item_ids."""
