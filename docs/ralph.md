@@ -246,15 +246,66 @@ Equivalent dotted keys are also supported (for example: `model.intake`, `model.p
 | `model.audit` | string/object | Audit phase model. |
 | `max_attempts` | integer | Default maximum implement→audit cycles. Overridden by `--max-attempts`. |
 
+### Complexity-tier model configuration
+
+Ralph supports **risk/effort-based model complexity tiers** so that different work items can use different model configurations automatically. This lets you use fast, cost-effective models for simple tasks while reserving stronger models for complex work.
+
+#### Tier mapping
+
+The complexity tier is determined by the work item's `effort` (t-shirt size) and `risk` fields:
+
+| Tier | Mapping |
+|------|---------|
+| **Low** | Effort is `Extra Small` **or** `Small` **AND** Risk is `Low` |
+| **Medium** | Effort is `Medium` **OR** Risk is `Medium` |
+| **High** | Effort is `Large` **or** `Extra Large` **OR** Risk is `High` |
+
+The thresholds are configurable via `complexity_tier` in `.ralph.json`. If a work item has no effort/risk values, or the values cannot be evaluated, the tier defaults to **Medium**.
+
+#### Tiered config structure
+
+Within each model source, you can define per-tier model mappings:
+
+```json
+{
+  "model_source": "local",
+  "model": {
+    "remote": {
+      "low": { "intake": "opencode-go/glm-5.1", "planning": "opencode-go/glm-5.1", "implementation": "opencode-go/glm-5.1", "audit": "opencode-go/glm-5.1" },
+      "medium": { "intake": "opencode/claude-opus-4.7", "planning": "opencode/gpt-5.5", "implementation": "opencode-go/qwen3.6-plus", "audit": "opencode-go/glm-5.1" },
+      "high": { "intake": "opencode/claude-opus-4.7", "planning": "opencode/gpt-5.5", "implementation": "opencode-go/qwen3.6-plus", "audit": "opencode-go/glm-5.1" }
+    },
+    "local": {
+      "low": { "intake": "Proxy/qwen3", "planning": "Proxy/qwen3", "implementation": "Proxy/qwen3", "audit": "Proxy/qwen3" },
+      "medium": { "intake": "Proxy/qwen3", "planning": "Proxy/qwen3", "implementation": "Proxy/qwen3", "audit": "Proxy/qwen3" },
+      "high": { "intake": "Proxy/qwen3", "planning": "Proxy/qwen3", "implementation": "Proxy/qwen3", "audit": "Proxy/qwen3" }
+    }
+  },
+  "complexity_tier": {
+    "low": { "max_effort": "Small", "max_risk": "Low" },
+    "high": { "min_effort": "Large", "min_risk": "High" }
+  }
+}
+```
+
+#### Per-child tier evaluation
+
+When Ralph processes children in per-child mode, it evaluates the effort-and-risk skill (if not already computed) for each child and selects the appropriate tier for that child's phases. The tier is passed through to `pi` subprocess invocations for all phases.
+
+#### Backwards compatibility
+
+If no tiered config is provided (no `low`/`medium`/`high` keys under each source), Ralph continues to use the existing flat per-phase model resolution. Existing `.ralph.json` files without tiered structure remain fully valid.
+
 ### Resolution precedence
 
 For each phase, Ralph resolves `--model` passed to `pi` in this order:
 
 1. CLI phase override (`--model-intake`, `--model-planning`, `--model-implementation`, `--model-audit`)
-2. Per-phase config (`model.<phase>`)
-3. Legacy single model (`--model` CLI or string `model` config)
-4. `DEFAULT_MODEL` (`opencode-go/glm-5.1`) when per-phase mode is not enabled
-5. Canonical source-specific defaults (below) when per-phase mode is enabled but no explicit per-phase value is provided
+2. Per-tier config (`model.<source>.<tier>.<phase>`) — only when a complexity tier is active
+3. Per-phase config (`model.<phase>` or `model.<source>.<phase>`)
+4. Legacy single model (`--model` CLI or string `model` config)
+5. `DEFAULT_MODEL` (`opencode-go/glm-5.1`) when per-phase mode is not enabled
+6. Canonical source-specific defaults (below) when per-phase mode is enabled but no explicit per-phase value is provided
 
 Canonical defaults used by per-phase mode:
 
