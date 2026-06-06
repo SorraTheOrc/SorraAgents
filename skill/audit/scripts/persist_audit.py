@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persist an audit report to a Worklog work item using the `wl` CLI.
+"""Persist an audit report to a Worklog work item using the `wl audit-set` CLI.
 
 Usage:
   persist_audit.py --issue-id <id>            # read report from stdin (if piped)
@@ -7,7 +7,7 @@ Usage:
   persist_audit.py --issue-id <id> --file path/to/file
 
 The script calls:
-  wl update <issue-id> --audit-text "<report>" --json
+  wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json
 
 Returns non-zero on failure.
 """
@@ -22,9 +22,17 @@ from pathlib import Path
 from typing import Callable
 
 
+def _extract_ready_to_close(report_text: str) -> bool:
+    """Extract the Ready to close: Yes/No value from the report text."""
+    for line in report_text.splitlines():
+        if line.strip().lower().startswith("ready to close:"):
+            return "yes" in line.lower()
+    return False
+
+
 def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
                   runner: Callable = None, _fail: bool = False) -> int:
-    """Persist the given report_text to the work item using wl update.
+    """Persist the given report_text to the work item using wl audit-set.
 
     Returns the wl subprocess return code (0 on success).
 
@@ -42,16 +50,25 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     if runner is None:
         runner = subprocess.run
 
+    ready = "yes" if _extract_ready_to_close(report_text) else "no"
+    summary = "Audit result persisted via persist_audit.py"
+
     # Build the command as an argv list to avoid shell quoting pitfalls.
-    cmd = [wl_bin, "update", issue_id, "--audit-text", report_text, "--json"]
+    cmd = [
+        wl_bin, "audit-set", issue_id,
+        "--ready-to-close", ready,
+        "--summary", summary,
+        "--raw-output", report_text,
+        "--json"
+    ]
 
     proc = runner(cmd, check=False, text=True, capture_output=True)
 
     # If wl returned non-zero, bubble up the failure and print diagnostics.
     if getattr(proc, "returncode", 1) != 0:
         stderr = getattr(proc, "stderr", "") or ""
-        print(f"wl update failed (rc={getattr(proc, 'returncode', 'unknown')}): {stderr.strip()}", file=sys.stderr)
-        return int(getattr(proc, "returncode", 1) or 1)
+        print(f"wl audit-set failed (rc={getattr(proc, 'returncode', 'unknown')}): {stderr.strip()}", file=sys.stderr)
+        return int(getattr(proc, 'returncode', 1) or 1)
 
     # Try to parse JSON output and detect explicit failures
     stdout = getattr(proc, "stdout", "") or ""
@@ -59,7 +76,7 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
         data = json.loads(stdout)
         if isinstance(data, dict) and data.get("success") is False:
             err = data.get("error") or data.get("message") or "unknown"
-            print(f"wl update reported failure: {err}", file=sys.stderr)
+            print(f"wl audit-set reported failure: {err}", file=sys.stderr)
             return 1
     except json.JSONDecodeError:
         # If wl didn't produce JSON, that's tolerated; just proceed.
