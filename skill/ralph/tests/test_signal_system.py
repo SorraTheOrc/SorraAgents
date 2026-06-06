@@ -26,7 +26,7 @@ class TestEventType:
     """Verify all 7 event types are defined and return expected string values."""
 
     def test_all_event_types_defined(self):
-        """All 7 required event types exist as enum members."""
+        """All 8 required event types exist as enum members."""
         expected = {
             "STATUS_TRANSITION",
             "PHASE_CHANGE",
@@ -35,6 +35,7 @@ class TestEventType:
             "CANCELLED",
             "COMPLETED",
             "STARTED",
+            "PI_STARTED",
         }
         actual = set(EventType.__members__)
         assert actual == expected, f"Missing or extra event types: {expected ^ actual}"
@@ -55,6 +56,7 @@ class TestEventType:
             (EventType.CANCELLED, "cancelled"),
             (EventType.COMPLETED, "completed"),
             (EventType.STARTED, "started"),
+            (EventType.PI_STARTED, "pi_started"),
         ],
     )
     def test_event_type_value(self, member: EventType, expected_value: str):

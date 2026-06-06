@@ -1229,7 +1229,14 @@ class RalphLoop:
             description=f"Work item stage changed to {stage}",
         )
 
-    def _run_pi(self, prompt: str, phase: str = "implementation") -> str:
+    def _run_pi(self, prompt: str, phase: str = "implementation", work_item_ids: list[str] | None = None) -> str:
+        # Notify: pi subprocess starting
+        self._notify_event(
+            EventType.PI_STARTED,
+            work_item_ids=work_item_ids,
+            description=f"Pi subprocess starting ({phase})",
+        )
+
         # Use an ephemeral session for each orchestration call so nested or
         # retried runs never attempt to continue a previous assistant turn.
         model_for_phase = self._resolve_model_for_phase(phase)
@@ -1239,48 +1246,56 @@ class RalphLoop:
             logger.debug("ralph.cmd.pi.run prompt_full=\n%s", prompt)
 
         self._last_structured_response = None
-        if self.stream:
-            return self._stream_pi(cmd, prompt, model_for_phase, phase)
+        try:
+            if self.stream:
+                return self._stream_pi(cmd, prompt, model_for_phase, phase)
 
-        proc = self._call_with_retry(cmd, category="pi", expect_json=False)
-        if getattr(proc, "returncode", 0) != 0:
-            if self.fail_open and ("pi" not in self.fatal_cmds):
-                logger.warning("ralph.cmd.pi.failed_but_fail_open cmd=%s rc=%s stderr=%s", cmd, getattr(proc, "returncode", None), (getattr(proc, "stderr", "") or "").strip())
-                return ""
+            proc = self._call_with_retry(cmd, category="pi", expect_json=False)
+            if getattr(proc, "returncode", 0) != 0:
+                if self.fail_open and ("pi" not in self.fatal_cmds):
+                    logger.warning("ralph.cmd.pi.failed_but_fail_open cmd=%s rc=%s stderr=%s", cmd, getattr(proc, "returncode", None), (getattr(proc, "stderr", "") or "").strip())
+                    return ""
+                if self.verbose:
+                    logger.debug("ralph.cmd.pi.run stderr=%s", (getattr(proc, "stderr", "") or "").strip()[:1000])
+                raise RalphError(f"pi run failed: {(getattr(proc, 'stderr', '') or '').strip()}")
+            self._last_structured_response = None
+            text, structured = _extract_text_and_structured_response_from_json_output(getattr(proc, "stdout", "") or "")
+            self._last_structured_response = structured
+            logger.info(
+                "ralph.cmd.pi.non_streaming_end returncode=%d text_len=%d",
+                getattr(proc, "returncode", 0),
+                len(text),
+                extra={"text": text},
+            )
             if self.verbose:
-                logger.debug("ralph.cmd.pi.run stderr=%s", (getattr(proc, "stderr", "") or "").strip()[:1000])
-            raise RalphError(f"pi run failed: {(getattr(proc, 'stderr', '') or '').strip()}")
-        self._last_structured_response = None
-        text, structured = _extract_text_and_structured_response_from_json_output(getattr(proc, "stdout", "") or "")
-        self._last_structured_response = structured
-        logger.info(
-            "ralph.cmd.pi.non_streaming_end returncode=%d text_len=%d",
-            getattr(proc, "returncode", 0),
-            len(text),
-            extra={"text": text},
-        )
-        if self.verbose:
-            logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(text), text[:1000])
+                logger.debug("ralph.cmd.pi.run text_len=%d text_start=%s", len(text), text[:1000])
 
-        # Validate output to detect silent failures (input echo, raw skill content)
-        is_valid, reason = _validate_pi_output(prompt, text, phase, structured)
-        if not is_valid:
-            logger.warning(
-                "ralph.cmd.pi.output_validation_failed phase=%s reason=%s",
-                phase,
-                reason,
-                extra={"reason": reason, "phase": phase, "input_len": len(prompt), "output_len": len(text)},
-            )
-            if self.fail_open and ("pi" not in self.fatal_cmds):
-                logger.warning("ralph.cmd.pi.output_invalid_but_fail_open phase=%s", phase)
-                return text
-            raise PiInputEchoError(
-                f"pi output validation failed ({phase}): {reason}",
-                input_text=prompt,
-                output_text=text,
-            )
+            # Validate output to detect silent failures (input echo, raw skill content)
+            is_valid, reason = _validate_pi_output(prompt, text, phase, structured)
+            if not is_valid:
+                logger.warning(
+                    "ralph.cmd.pi.output_validation_failed phase=%s reason=%s",
+                    phase,
+                    reason,
+                    extra={"reason": reason, "phase": phase, "input_len": len(prompt), "output_len": len(text)},
+                )
+                if self.fail_open and ("pi" not in self.fatal_cmds):
+                    logger.warning("ralph.cmd.pi.output_invalid_but_fail_open phase=%s", phase)
+                    return text
+                raise PiInputEchoError(
+                    f"pi output validation failed ({phase}): {reason}",
+                    input_text=prompt,
+                    output_text=text,
+                )
 
-        return text
+            return text
+        except Exception:
+            self._notify_event(
+                EventType.ERROR,
+                work_item_ids=work_item_ids,
+                description=f"Pi subprocess failed ({phase})",
+            )
+            raise
 
 
     def _stream_pi(self, cmd: list[str], prompt: str, model_for_phase: str | None = None, phase: str = "implementation") -> str:
@@ -3103,6 +3118,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = loop.run(args.work_item_id, child_id=args.child)
     except RalphError as exc:
+        # Notify that Ralph stopped due to an error
+        try:
+            loop._notify_event(
+                EventType.ERROR,
+                work_item_ids=[args.work_item_id] if args.work_item_id else None,
+                description=f"Ralph stopped: {exc}",
+            )
+        except Exception:
+            pass
         if args.json:
             # emit error as single JSON line
             print(json.dumps({"error": str(exc)}))

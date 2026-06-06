@@ -36,11 +36,11 @@ class SignalValidationLoop(RalphLoop):
         )
 
 
-# ── Signal file coverage for all 7 event types ─────────────────────────────
+# ── Signal file coverage for all 8 event types ─────────────────────────────
 
 
 class TestAllEventTypesProduceSignalFiles:
-    """Verify each of the 7 event types produces a corresponding signal file."""
+    """Verify each of the 8 event types produces a corresponding signal file."""
 
     @pytest.mark.parametrize(
         "event_type",
@@ -52,6 +52,7 @@ class TestAllEventTypesProduceSignalFiles:
             EventType.MAX_ATTEMPTS,
             EventType.PHASE_CHANGE,
             EventType.STATUS_TRANSITION,
+            EventType.PI_STARTED,
         ],
     )
     def test_event_produces_signal_file(self, tmp_path: Path, event_type: EventType):
@@ -69,10 +70,11 @@ class TestAllEventTypesProduceSignalFiles:
         assert "timestamp" in data
 
     def test_all_events_together(self, tmp_path: Path):
-        """All 7 events can be written sequentially, each overwriting the previous."""
+        """All 8 events can be written sequentially, each overwriting the previous."""
         loop = SignalValidationLoop(tmp_path)
         all_types = [
             EventType.STARTED,
+            EventType.PI_STARTED,
             EventType.PHASE_CHANGE,
             EventType.STATUS_TRANSITION,
             EventType.ERROR,
@@ -88,7 +90,7 @@ class TestAllEventTypesProduceSignalFiles:
         signal_file = tmp_path / "event.pending"
         data = json.loads(signal_file.read_text(encoding="utf-8"))
         assert data["event_type"] == "completed"
-        assert data["work_item_ids"] == ["SA-006"]
+        assert data["work_item_ids"] == ["SA-007"]
 
 
 # ── Webhook integration ────────────────────────────────────────────────────

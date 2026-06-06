@@ -34,6 +34,7 @@ class EventType(str, Enum):
     CANCELLED = "cancelled"
     COMPLETED = "completed"
     STARTED = "started"
+    PI_STARTED = "pi_started"
 
 
 class SignalWriter:
