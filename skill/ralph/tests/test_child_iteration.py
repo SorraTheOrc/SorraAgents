@@ -17,7 +17,7 @@ class SingleItemLoop(RalphLoop):
         super().__init__(pi_bin="pi", stream=False)
         self.pi_calls: list[tuple[str, str]] = []
 
-    def _run_pi(self, prompt: str, phase: str = "implementation") -> str:
+    def _run_pi(self, prompt: str, phase: str = "implementation", tier: str | None = None) -> str:
         self.pi_calls.append((phase, prompt))
         return "ok"
 
