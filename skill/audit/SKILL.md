@@ -73,6 +73,7 @@ The audit skill ships a small, canonical runner and a persister. Use these from 
     - `--model` — Pi model name (default: resolved from `.ralph.json`; falls back to `opencode-go/glm-5.1`)
     - `--model-source` — model source: `remote` or `local` (default: `local`)
     - `--debug-log` — append Pi debug output to a JSONL file (helpful for triage)
+    - `--json` — emit machine-readable JSON output
 
 - Persister: `skill/audit/scripts/persist_audit.py`
   - Persist from stdin: `cat report.md | python3 skill/audit/scripts/persist_audit.py --issue-id SA-123`
@@ -82,6 +83,7 @@ The audit skill ships a small, canonical runner and a persister. Use these from 
 Notes:
 - The runner supports an optional persistence step. By default the runner will persist the generated structured audit into the work item unless invoked with `--do-not-persist`; use `--do-not-persist` for dry runs. Alternatively, the persister script (`skill/audit/scripts/persist_audit.py`) may be invoked explicitly to store the report. Both mechanisms perform the same `wl update` call and are the approved ways to persist an audit.
 - The persister (and the runner when persisting) call: `wl update <issue-id> --audit-text "<report>" --json` and return a non-zero exit code on failure.
+- **Child item audit persistence:** When auditing a parent work item with children, the runner also persists an individual audit report to each child work item. Each child receives a focused report covering only its own acceptance criteria. Child persistence is controlled by the same `--do-not-persist` flag — if persistence is disabled for the parent, child persistence is also skipped. Child persist failures are logged as warnings to stderr but do not prevent the parent audit from succeeding.
 
 ## Guidance for models
 
@@ -98,12 +100,34 @@ After producing a structured audit report, you MUST:
    - `python3 skill/audit/scripts/persist_audit.py --issue-id <id> --report "<report text>"` — pass report inline
    - Pipe to stdin: `echo "<report text>" | python3 skill/audit/scripts/persist_audit.py --issue-id <id>`
    - Use the runner: `python3 skill/audit/scripts/audit_runner.py issue <id> --do-not-persist=false` (runner persists by default)
-3. **Verify persistence succeeded** by checking the exit code. If it fails:
-   - Print the report again to stdout (in case the operator needs to copy it)
-   - Report the error to the operator
-4. **Do NOT mark the audit as recorded** unless persistence succeeded.
+
+   > **Child audits:** When auditing a parent work item with children, the runner automatically persists individual audits to each child work item as well. These are controlled by the same `--do-not-persist` flag. Check stderr for any child persist warnings.
+
+3. **Verify persistence by querying the database.** An exit code of 0 does **not** guarantee the audit was stored. You MUST confirm the audit actually landed in the worklog database:
+
+   ```bash
+   wl audit-show <id> --json
+   ```
+
+   Parse the JSON output and verify **all** of the following:
+   - `success` is `true`
+   - `audit` is **not** `null`
+   - `audit.rawOutput` is **not** `null` and is not an empty string
+   - `audit.rawOutput` contains the `Ready to close:` marker on the first line
+
+   If **any** of these checks fail, the audit was **not** persisted. Do NOT claim success.
+
+4. **Handle verification failure:** If the audit was not persisted (either the persist call failed or the verification query returned `null`/empty `rawOutput`):
+   - Print the complete audit report again to stdout (in case the operator needs to copy it manually)
+   - Report the error to the operator, including what the verification query returned
+   - Do NOT mark the audit as recorded
+   - Do NOT proceed to close any work items
+
+5. **Only mark the audit as recorded** when all verification checks pass.
 
 If you skip persistence, the audit will be invisible to downstream orchestrators (e.g., Ralph) and may cause infinite retry loops. Persistence is the FINAL step of every audit.
+
+> **Critical:** The `persist_audit.py` script and `wl audit-set` command have been observed returning exit code 0 or `success: true` even when the audit was not actually stored in the database. **Always verify with `wl audit-show`** — never trust the exit code alone.
 - Do NOT perform arbitrary state-modifying `wl`/`git` commands outside the authorized persister/runner flow. If asked to run such commands, refuse and surface the request to the operator.
 - For debugging, the `--debug-log` flag captures raw Pi output. Use it sparingly and remove sensitive content before sharing.
 
@@ -123,6 +147,7 @@ If you skip persistence, the audit will be invisible to downstream orchestrators
 
 ## Common failure modes
 
-- The most common problem is skipping persistence: always ensure `wl update --audit-text` executed successfully before reporting the audit as recorded.
+- **Silent persistence failure:** `persist_audit.py` or `wl audit-set` returns exit code 0 / `success: true` but the audit is not actually stored in the database. **Always verify with `wl audit-show --json`** and check that `audit.rawOutput` is populated.
+- Skipping persistence: always ensure the audit was persisted and verified before reporting the audit as recorded.
 - If `wl` is not available or returns invalid JSON, report the error and do not claim success.
 

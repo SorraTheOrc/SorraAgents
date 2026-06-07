@@ -545,6 +545,69 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     return "\n".join(lines)
 
 
+def _assemble_child_audit_report(child: dict, ac_results: list[dict]) -> str:
+    """Assemble an audit report for a single child work item.
+
+    *child* is a dict with keys ``title``, ``id``, ``status``, ``stage``.
+    *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
+    """
+    all_met = all(r["verdict"] == "met" for r in ac_results) if ac_results else False
+    ready = "Yes" if all_met else "No"
+
+    lines = [
+        f"Ready to close: {ready}",
+        "",
+        "## Summary",
+        "",
+        f"Child work item audit for {child['title']} ({child['id']}). "
+        f"Status: {child['status']}/{child['stage']}.",
+        "",
+        "## Acceptance Criteria Status",
+        "",
+        "| # | Criterion | Verdict | Evidence |",
+        "|---|-----------|---------|----------|",
+    ]
+
+    if not ac_results:
+        lines.append("")
+        lines.append("No acceptance criteria defined.")
+    else:
+        for i, r in enumerate(ac_results, 1):
+            evidence = r.get("evidence", "") or ""
+            lines.append(
+                f"| {i} | {r['text']} | {r['verdict']} | {evidence} |"
+            )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _persist_child_audit(
+    child_id: str,
+    child_title: str,
+    child_status: str,
+    child_stage: str,
+    ac_results: list[dict],
+    pi_bin: str = "pi",
+) -> tuple[bool, str]:
+    """Assemble and persist an audit report for a single child work item.
+
+    Returns (success, report_text).
+    On failure the report text is still returned so callers can log it.
+    """
+    child = {
+        "title": child_title,
+        "id": child_id,
+        "status": child_status,
+        "stage": child_stage,
+    }
+    report = _assemble_child_audit_report(child, ac_results)
+
+    rc = persist_audit(child_id, report)
+    success = rc == 0
+    return success, report
+
+
 def _assemble_project_report(summary: str, recommendation: str) -> str:
     """Assemble the canonical project-mode audit report."""
     lines = [
@@ -782,9 +845,33 @@ def cmd_issue(issue_id: str, persist: bool = True,
             "ac_results": child_ac_results,
         })
 
+    # Persist child audits to individual child work items
+    child_persist_results = []
+    for child in child_results:
+        child_success, child_report = _persist_child_audit(
+            child_id=child["id"],
+            child_title=child["title"],
+            child_status=child["status"],
+            child_stage=child["stage"],
+            ac_results=child["ac_results"],
+            pi_bin=pi_bin,
+        )
+        child_persist_results.append({
+            "id": child["id"],
+            "title": child["title"],
+            "success": child_success,
+        })
+        if not child_success:
+            print(
+                f"Warning: Failed to persist audit for child {child['id']} "
+                f"({child['title']}): wl returned exit code {1}",
+                file=sys.stderr,
+            )
+
     # Assemble report
     if json_mode:
         payload = _build_issue_json(work_item, ac_results, child_results)
+        payload["child_persist_results"] = child_persist_results
         print(json.dumps(payload, indent=2))
         report = _assemble_issue_report(work_item, ac_results, child_results)
     else:
