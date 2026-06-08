@@ -22,6 +22,7 @@ from skill.audit.scripts.audit_runner import (
     cmd_project,
     main,
     _extract_acs,
+    _extract_json_array,
     _run_wl,
     _load_config,
     _resolve_model_for_phase,
@@ -196,6 +197,92 @@ class TestRunWl:
 # ---------------------------------------------------------------------------
 # Acceptance-criteria extraction tests
 # ---------------------------------------------------------------------------
+
+class TestExtractJsonArray:
+    """Tests for _extract_json_array helper that extracts JSON array from mixed text."""
+
+    def test_extracts_json_array_from_end_of_text(self):
+        text = (
+            "Here is my analysis:\n\n"
+            "1. Criterion 1 is met because...\n"
+            "2. Criterion 2 is met because...\n\n"
+            '```json\n[\n  {"index": 0, "verdict": "met", "evidence": "file.py:10"},\n'
+            '  {"index": 1, "verdict": "met", "evidence": "file.py:20"}\n]\n```'
+        )
+        result = _extract_json_array(text)
+        assert result is not None
+        assert len(result) == 2
+        assert result[0]["index"] == 0
+        assert result[0]["verdict"] == "met"
+        assert result[1]["index"] == 1
+
+    def test_extracts_json_array_without_code_fences(self):
+        text = (
+            "Analysis complete.\n\n"
+            "All criteria are met.\n\n"
+            '[{"index": 0, "verdict": "met", "evidence": "x:1"}]'
+        )
+        result = _extract_json_array(text)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["verdict"] == "met"
+
+    def test_returns_none_for_empty_text(self):
+        assert _extract_json_array("") is None
+        assert _extract_json_array(None) is None
+
+    def test_returns_none_for_text_without_json(self):
+        text = "This is just plain text with no JSON."
+        assert _extract_json_array(text) is None
+
+    def test_returns_none_for_invalid_json(self):
+        text = "Some text [not valid json]"
+        assert _extract_json_array(text) is None
+
+    def test_handles_nested_brackets_in_json(self):
+        text = (
+            "Analysis:\n\n"
+            '[{"index": 0, "verdict": "met", "evidence": "code with [brackets]"}]'
+        )
+        result = _extract_json_array(text)
+        assert result is not None
+        assert len(result) == 1
+
+    def test_handles_string_with_brackets(self):
+        text = (
+            "Analysis:\n\n"
+            '[{"index": 0, "verdict": "met", "evidence": "arr[0] = x"}]'
+        )
+        result = _extract_json_array(text)
+        assert result is not None
+        assert result[0]["evidence"] == "arr[0] = x"
+
+    def test_prefers_last_json_array(self):
+        text = (
+            "First mention: [1, 2, 3]\n\n"
+            "Real result:\n"
+            '[{"index": 0, "verdict": "met"}]'
+        )
+        result = _extract_json_array(text)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["verdict"] == "met"
+
+    def test_handles_array_of_strings(self):
+        text = 'Result: ["a", "b", "c"]'
+        result = _extract_json_array(text)
+        assert result == ["a", "b", "c"]
+
+    def test_handles_array_of_numbers(self):
+        text = "Result: [1, 2, 3]"
+        result = _extract_json_array(text)
+        assert result == [1, 2, 3]
+
+    def test_handles_empty_array(self):
+        text = "Result: []"
+        result = _extract_json_array(text)
+        assert result == []
+
 
 class TestExtractACs:
     """AC extraction from both ``## Acceptance Criteria`` and

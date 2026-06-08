@@ -424,6 +424,67 @@ def _extract_last_assistant_message_text(messages) -> str | None:
 # Acceptance-criteria extractor
 # ---------------------------------------------------------------------------
 
+def _extract_json_array(text: str) -> list | None:
+    """Extract the last JSON array from text that may contain analysis before the array.
+
+    Pi often returns analysis text followed by a JSON array at the end.
+    This function finds the last `[` that is NOT inside a string and tries to parse.
+
+    Returns the parsed list if found, otherwise None.
+    """
+    if not text:
+        return None
+
+    # Find positions of `[` that could start a JSON array
+    # We need to skip `[` characters that are inside JSON strings
+    possible_starts = []
+    in_string = False
+    escape_next = False
+
+    for i, char in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if char == '\\' and in_string:
+            escape_next = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        # We're not in a string
+        if char == '[':
+            # Check if this could be the start of a JSON array
+            rest = text[i + 1:].lstrip()
+            if rest and (rest[0] in ('{', '"', ']', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-')):
+                possible_starts.append(i)
+
+    # Try each possible start position from last to first
+    for start in reversed(possible_starts):
+        candidate = text[start:].strip()
+
+        # Try the full candidate first
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        # If that failed, try to find where the JSON array ends
+        for end_search in range(len(candidate) - 1, 0, -1):
+            if candidate[end_search] == ']':
+                try:
+                    result = json.loads(candidate[:end_search + 1])
+                    if isinstance(result, list):
+                        return result
+                except json.JSONDecodeError:
+                    continue
+
+    return None
+
+
 def _extract_acs(description: str) -> list[str]:
     """Extract acceptance criteria lines from a markdown description."""
     pattern = re.compile(
@@ -763,12 +824,15 @@ def cmd_issue(issue_id: str, persist: bool = True,
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
-        # Parse the batched result
+        # Parse the batched result - try to extract JSON array from text
         raw_text = result.get("evidence", "") or result.get("text", "")
-        try:
-            batch = json.loads(raw_text)
-        except json.JSONDecodeError:
-            batch = []
+        batch = _extract_json_array(raw_text)
+        if batch is None:
+            # Fallback: try direct JSON parse
+            try:
+                batch = json.loads(raw_text)
+            except json.JSONDecodeError:
+                batch = []
         if isinstance(batch, list):
             reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
             for i, ac in enumerate(acs):
@@ -819,10 +883,12 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 print(str(exc), file=sys.stderr)
                 return 1
             raw_text = result.get("evidence", "") or result.get("text", "")
-            try:
-                batch = json.loads(raw_text)
-            except json.JSONDecodeError:
-                batch = []
+            batch = _extract_json_array(raw_text)
+            if batch is None:
+                try:
+                    batch = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    batch = []
             if isinstance(batch, list):
                 reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
                 for i, ac in enumerate(child_acs):
