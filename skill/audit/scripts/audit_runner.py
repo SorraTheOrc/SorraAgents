@@ -913,37 +913,40 @@ def cmd_issue(issue_id: str, persist: bool = True,
             "ac_results": child_ac_results,
         })
 
-    # Persist child audits to individual child work items
+    # Initialize child_persist_results for reporting
     child_persist_results = []
-    for child in child_results:
-        child_success, child_report = _persist_child_audit(
-            child_id=child["id"],
-            child_title=child["title"],
-            child_status=child["status"],
-            child_stage=child["stage"],
-            ac_results=child["ac_results"],
-            pi_bin=pi_bin,
-        )
-        child_persist_results.append({
-            "id": child["id"],
-            "title": child["title"],
-            "success": child_success,
-        })
-        if not child_success:
-            print(
-                f"Warning: Failed to persist audit for child {child['id']} "
-                f"({child['title']}): wl returned exit code {1}",
-                file=sys.stderr,
-            )
 
-    # Assemble report
+    # Persist child audits to individual child work items (if persist is True)
+    if persist:
+        for child in child_results:
+            child_success, child_report = _persist_child_audit(
+                child_id=child["id"],
+                child_title=child["title"],
+                child_status=child["status"],
+                child_stage=child["stage"],
+                ac_results=child["ac_results"],
+                pi_bin=pi_bin,
+            )
+            child_persist_results.append({
+                "id": child["id"],
+                "title": child["title"],
+                "success": child_success,
+            })
+            if not child_success:
+                print(
+                    f"Warning: Failed to persist audit for child {child['id']} "
+                    f"({child['title']}): wl returned exit code {1}",
+                    file=sys.stderr,
+                )
+
+    # Assemble and output report
+    report = _assemble_issue_report(work_item, ac_results, child_results)
+
     if json_mode:
         payload = _build_issue_json(work_item, ac_results, child_results)
         payload["child_persist_results"] = child_persist_results
         print(json.dumps(payload, indent=2))
-        report = _assemble_issue_report(work_item, ac_results, child_results)
     else:
-        report = _assemble_issue_report(work_item, ac_results, child_results)
         print(report, end="")
 
     if persist:

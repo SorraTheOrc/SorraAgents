@@ -50,6 +50,28 @@ def _fake_pi_result(ac_count: int = 3, verdict: str = "met") -> dict:
     return {"verdict": "met", "evidence": json.dumps(items), "extracted_text": json.dumps(items)}
 
 
+# Fixture with children for testing child persistence
+WI_WITH_CHILDREN = {
+    "success": True,
+    "workItem": {
+        "id": "SA-PARENT",
+        "title": "Parent work item",
+        "description": "## Summary\nParent item.\n\n## Acceptance Criteria\n1. First AC.\n2. Second AC.",
+        "status": "open",
+        "stage": "in_progress"
+    },
+    "children": [
+        {
+            "id": "SA-CHILD-1",
+            "title": "Child item 1",
+            "description": "## Summary\nChild.\n\n## Acceptance Criteria\n1. Child AC.",
+            "status": "open",
+            "stage": "in_progress"
+        }
+    ]
+}
+
+
 # ---------------------------------------------------------------------------
 # Test: persist_audit.py --fail flag
 # ---------------------------------------------------------------------------
@@ -167,6 +189,33 @@ class TestAuditRunnerReportOnPersistFailure:
         captured = capsys.readouterr()
         assert "Ready to close:" in captured.out
 
+    def test_persist_true_calls_child_persist(self, capsys, monkeypatch):
+        """When persist=True, child persist calls are made."""
+        persist_calls = []
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            persist_calls.append(issue_id)
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(ac_count=1),
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(stdout=json.dumps(WI_WITH_CHILDREN))
+
+        rc = cmd_issue("SA-PARENT", runner=fake_runner, persist=True)
+        assert rc == 0
+        # Parent and child both should be persisted
+        assert "SA-PARENT" in persist_calls
+        assert "SA-CHILD-1" in persist_calls
+        assert len(persist_calls) == 2
+
     def test_no_persist_flag_skips_persist_call(self, capsys, monkeypatch):
         """When persist=False, no persist call is made and report is printed."""
         persist_called = []
@@ -201,6 +250,34 @@ class TestAuditRunnerReportOnPersistFailure:
 
         rc = cmd_issue("SA-MISSING", runner=fake_runner)
         assert rc == 1
+
+    def test_no_persist_skips_child_persist_too(self, capsys, monkeypatch):
+        """When persist=False, both parent and child persist calls are skipped."""
+        persist_calls = []
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            persist_calls.append(issue_id)
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(ac_count=1),
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(stdout=json.dumps(WI_WITH_CHILDREN))
+
+        rc = cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+        assert rc == 0
+        # Both parent and child persist should be skipped
+        assert len(persist_calls) == 0, f"persist_audit called unexpectedly for: {persist_calls}"
+
+        captured = capsys.readouterr()
+        assert "Ready to close:" in captured.out
 
 
 # ---------------------------------------------------------------------------
