@@ -825,7 +825,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
             print(str(exc), file=sys.stderr)
             return 1
         # Parse the batched result - try to extract JSON array from text
-        raw_text = result.get("evidence", "") or result.get("text", "")
+        # Use extracted_text (full response) instead of evidence (may be truncated)
+        raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
         batch = _extract_json_array(raw_text)
         if batch is None:
             # Fallback: try direct JSON parse
@@ -882,7 +883,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
-            raw_text = result.get("evidence", "") or result.get("text", "")
+            # Use extracted_text (full response) instead of evidence (may be truncated)
+            raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
             batch = _extract_json_array(raw_text)
             if batch is None:
                 try:
