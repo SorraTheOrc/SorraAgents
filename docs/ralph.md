@@ -190,6 +190,42 @@ Key semantics:
 - `/compact` failures are **non-fatal**. Ralph logs a warning and continues with the loop.
 - Compaction evidence is **logs only** (no worklog comments are persisted for compact output).
 
+### Stage Check Expansion Fix
+
+**Note**: A fix was implemented to expand the stage check logic in Ralph to handle a broader range of completed stages. Previously, Ralph only recognized `in_review` stage for per-child iteration scope. The fix expanded this to also include `done`, `completed`, and `closed` stages in the `_scope_in_review` method.
+
+**Rationale**: This fix addresses CI failures where work items in terminal stages (`done`, `completed`, `closed`) were not properly handled in per-child iteration scenarios, causing the loop to fail with max attempts errors.
+
+**Implementation**: The change was made in `skill/ralph/scripts/ralph_loop.py` around line 2396, expanding the allowed stages from only `in_review` to include `done`, `completed`, and `closed`:
+
+```python
+def _scope_in_review(self, scope_ids: Iterable[str]) -> bool:
+    allowed = {"in_review", "done", "completed", "closed"}  # Expanded from only "in_review"
+    # ... rest of method
+```
+
+### CI Runner Availability Fix
+
+**Note**: Fixes were implemented to address `wl` CLI availability issues in CI environments that were causing `FileNotFoundError` during child iteration tests.
+
+**Rationale**: The CI failures were caused by the `wl` command not being available in the runner environment, leading to `FileNotFoundError` when Ralph tried to execute worklog operations.
+
+**Implementation**: The fixes were implemented in PRs #688 and #689 to ensure the `wl` CLI is properly available in CI runner environments, resolving the FileNotFoundError that was preventing child iteration tests from passing.
+
+### Debug Logging Enhancements
+
+**Note**: Debug logging was enhanced to help identify why per-child runs reach max attempts, particularly for audit parsing and unmet criteria detection.
+
+**Rationale**: The original CI failures included scenarios where Ralph would reach max attempts without clear visibility into why the audit process was failing.
+
+**Implementation**: Debug logging was added in PR #691 to provide better visibility into:
+- Audit parsing processes
+- Unmet criteria detection
+- Per-child iteration progress
+- Compact invocation and failure scenarios
+
+This helps operators and developers understand why Ralph might be reaching max attempts and diagnose issues more effectively.
+
 ## Configuration File
 
 Ralph reads settings from a `.ralph.json` file in the current directory (or `ralph.config.json`). The file is a simple JSON object. Values from the config file are defaults; CLI flags take precedence.
