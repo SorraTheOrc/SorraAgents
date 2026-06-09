@@ -529,29 +529,56 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
     *child_results* is a list of child review dicts with keys:
       ``title``, ``id``, ``status``, ``stage``, ``ac_results``.
+
+    Ready-to-close logic:
+      - All acceptance criteria (parent + children) must be ``met``.
+      - All non-deleted children must be in ``in_review`` or ``done`` stage.
+        Children with ``status: in_progress`` but ``stage: in_review`` are
+        acceptable and do NOT block closure.
     """
-    all_met = all(
+    all_ac_met = all(
         r["verdict"] == "met"
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
-    ready = "Yes" if all_met else "No"
+    # Check that all active children are in in_review or done stage
+    active_children = [c for c in child_results if c.get("stage") not in ("", None)]
+    all_children_reviewed = all(
+        c.get("stage") in ("in_review", "done")
+        for c in active_children
+    )
+    ready = "Yes" if (all_ac_met and all_children_reviewed) else "No"
 
     lines = [f"Ready to close: {ready}", "", "## Summary", ""]
 
-    if all_met:
+    if ready == "Yes":
         lines.append(
             f"All {len(ac_results)} acceptance criteria for work item "
-            f"{issue.get('id', '?')} are met."
+            f"{issue.get('id', '?')} are met. All children are in in_review or done stage."
         )
     else:
         unmet_count = sum(
             1 for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
             if r["verdict"] != "met"
         )
-        lines.append(
-            f"{unmet_count} of {len(ac_results)} acceptance criteria for "
-            f"work item {issue.get('id', '?')} are not met."
-        )
+        # Identify children not in in_review/done stage
+        not_reviewed = [
+            c for c in child_results
+            if c.get("stage") not in ("in_review", "done", "")
+        ]
+        if unmet_count > 0 and not_reviewed:
+            lines.append(
+                f"{unmet_count} acceptance criteria not met AND "
+                f"{len(not_reviewed)} children not yet in in_review/done stage."
+            )
+        elif unmet_count > 0:
+            lines.append(
+                f"{unmet_count} of {len(ac_results)} acceptance criteria for "
+                f"work item {issue.get('id', '?')} are not met."
+            )
+        else:
+            lines.append(
+                f"{len(not_reviewed)} children not yet in in_review/done stage."
+            )
 
     lines.append("")
     lines.append("## Acceptance Criteria Status")
@@ -756,15 +783,22 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
 def _build_issue_json(issue: dict, ac_results: list[dict],
                       child_results: list[dict]) -> dict:
     """Build structured JSON payload for issue-mode audit."""
-    all_met = all(
+    all_ac_met = all(
         r["verdict"] == "met"
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
+    # Check that all active children are in in_review or done stage
+    active_children = [c for c in child_results if c.get("stage") not in ("", None)]
+    all_children_reviewed = all(
+        c.get("stage") in ("in_review", "done")
+        for c in active_children
+    )
+    ready = all_ac_met and all_children_reviewed
     return {
-        "ready_to_close": all_met,
+        "ready_to_close": ready,
         "summary": (
             f"All {len(ac_results)} acceptance criteria met."
-            if all_met else
+            if all_ac_met else
             f"{sum(1 for r in ac_results if r['verdict'] != 'met')} of {len(ac_results)} acceptance criteria not met."
         ),
         "acceptance_criteria": ac_results,

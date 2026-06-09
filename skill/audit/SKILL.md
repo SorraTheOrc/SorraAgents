@@ -28,6 +28,15 @@ The audit report MUST be a structured markdown block that begins with the exact 
 
 Ready to close: Yes/No
 
+### Ready-to-close criteria
+
+A work item is considered ready to close when:
+
+1. **All acceptance criteria are met** — every criterion in the parent and all children must have verdict `met`.
+2. **All active children are in `in_review` or `done` stage** — children with `status: in_progress` but `stage: in_review` are acceptable and do NOT block closure. Only children with stages like `idea`, `intake_complete`, `plan_complete`, or other pre-review stages block closure.
+
+Children with an empty stage (`""`) are excluded from the stage check (they may be newly created or not yet processed).
+
 ## Summary
 
 <concise 2-4 sentence summary of overall status, key findings, and whether the item can be closed>
