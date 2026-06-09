@@ -2393,6 +2393,13 @@ class RalphLoop:
             )
 
     def _scope_in_review(self, scope_ids: Iterable[str]) -> bool:
+        # NOTE: Stage check expansion fix for SA-0MPVR4J1I0063K0T
+        # Previously, this method only allowed "in_review" stage, which caused
+        # CI failures when work items were in terminal stages (done, completed, closed).
+        # The fix expands the allowed stages to include terminal stages to properly
+        # handle per-child iteration scenarios where children may already be completed.
+        # This addresses max attempts errors in CI runs where terminal stage items
+        # were not properly recognized as already processed.
         allowed = {"in_review", "done", "completed", "closed"}
         for item_id in scope_ids:
             item = self._wl_show(item_id).get("workItem", {})
