@@ -57,5 +57,8 @@
       "remote": 900,
       "local": 900
     }
+  },
+  "session": {
+    "retention_days": 112
   }
 }

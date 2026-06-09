@@ -475,6 +475,50 @@ The final JSON result now includes a `compact` object:
 }
 ```
 
+## Session management
+
+### Session-per-call with unique IDs
+
+Each Pi invocation within Ralph uses a unique session ID instead of an ephemeral `--no-session` mode. This preserves session history for debugging and audit purposes while maintaining isolation between orchestration steps.
+
+Session IDs follow the format `ralph-{work_item_id}-{phase}-{short_uuid}`:
+
+- `ralph-` prefix: identifies Ralph-generated sessions for cleanup targeting
+- `{work_item_id}`: the first work item ID in scope (e.g., `SA-1234`)
+- `{phase}`: the orchestration phase (`intake`, `planning`, `implementation`, `audit`)
+- `{short_uuid}`: 8-character hex string from `uuid.uuid4().hex[:8]`
+
+Example session ID: `ralph-SA-1234-implementation-a1b2c3d4`
+
+Each call produces a unique session ID, so sessions can be inspected with `pi --session <id>` or by resuming with `/resume` in a Pi interactive session.
+
+### Session pruning and retention
+
+Ralph automatically prunes old Ralph-generated Pi sessions after each loop completion (success or failure). Only sessions with the `ralph-` prefix are targeted; non-Ralph Pi sessions are never removed.
+
+#### Retention period
+
+- **Default**: 112 days
+- **Config**: `session.retention_days` key in `.ralph.json`
+- **Override**: `--session-retention-days` CLI flag (highest precedence)
+
+The retention period controls how long Ralph-generated sessions are kept before being automatically deleted. Files older than the configured number of days are removed at each loop exit.
+
+#### Session directory
+
+The Pi session directory defaults to `~/.pi/agent/sessions/` and can be overridden via:
+- `PI_CODING_AGENT_SESSION_DIR` environment variable
+- `--session-dir` CLI flag
+
+#### Observability
+
+| Log event | Level | Data |
+|-----------|-------|------|
+| `ralph.session.prune.completed` | INFO | pruned count, bytes reclaimed, retention_days |
+| `ralph.session.prune.directory_not_found` | DEBUG | path |
+| `ralph.session.prune.os_error` | DEBUG | path |
+| `ralph.session.prune.failed` | WARNING | error message |
+
 ## Pi output validation
 
 Ralph validates the output returned from every Pi delegation (implement and audit phases) to detect silent failures:
