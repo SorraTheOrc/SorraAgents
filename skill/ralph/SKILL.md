@@ -26,6 +26,12 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 2. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`.
 3. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
 4. Use `ralph status` to inspect the current background run without needing the original work-item id.
+5. After launching the background Ralph loop, the agent MUST follow this **post-launch behavior**:
+   - Wait exactly **20 seconds** (once, not in a loop) to allow Ralph to initialize.
+   - Check the Ralph status **one time only** using `skill/ralph/ralph status --json`.
+   - If Ralph is running: Report the loop started successfully and inform the operator they can use `ralph status` to monitor progress.
+   - If Ralph has stopped or failed: Provide a **Root Cause Analysis (RCA)** using available log evidence from the status output.
+   - **Do NOT** enter any polling loop — let the operator decide when to check status next.
 
 For direct foreground debugging, run the script locally:
 

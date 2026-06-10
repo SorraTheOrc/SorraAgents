@@ -173,6 +173,45 @@ Testing
   - Children in `in_review` whose most recent audit says "Ready to close: No" (or have no persisted audit) are **re-processed** (re-implemented and re-audited).
   - All other stages (e.g., `in_progress`, `plan_complete`) are processed normally.
 
+## Agent Post-Launch Behavior
+
+When an agent (Pi or other) invokes the Ralph skill via `ralph <work-item-id>`, the agent MUST follow this specific post-launch behavior to avoid unnecessary polling loops:
+
+### Post-launch steps
+
+1. **Launch**: Immediately run the Ralph wrapper in the background (this is handled by the skill invocation).
+2. **Wait**: Wait exactly **20 seconds** once to allow Ralph to initialize and begin processing.
+3. **Check status**: Run `skill/ralph/ralph status --json` one time to verify the loop is running.
+4. **Report result**:
+   - If Ralph is **running**: Confirm success and inform the operator they can use `ralph status` to monitor progress.
+   - If Ralph has **stopped or failed**: Provide a **Root Cause Analysis (RCA)** using available log evidence from the status output.
+5. **Stop polling**: Do NOT enter any polling loop. Let the operator decide when to check status next.
+
+### Example agent workflow
+
+```bash
+# Agent launches Ralph
+skill/ralph/ralph SA-12345
+
+# Agent waits 20 seconds
+sleep 20
+
+# Agent checks status once
+status_output=$(skill/ralph/ralph status --json)
+
+# Agent evaluates and reports
+if echo "$status_output" | grep -q '"state": "running"'; then
+  echo "Ralph loop started successfully. Use 'ralph status' to monitor progress."
+else
+  echo "Ralph loop failed to start. Providing RCA based on logs..."
+  # Extract and analyze log evidence from status output
+fi
+```
+
+### Critical: No polling loops
+
+Agents must NOT implement polling loops after launch (repeatedly sleeping and checking logs). This behavior wastes resources and creates noise. The operator will use `ralph status` to check progress as needed.
+
 ## Compaction trigger behavior
 
 After every implement pass (including the first pass after auto-plan), Ralph snapshots child stages before implementation and compares them to the child stages immediately after implementation.
