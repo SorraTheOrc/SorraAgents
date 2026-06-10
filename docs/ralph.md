@@ -479,7 +479,7 @@ The final JSON result now includes a `compact` object:
 
 ### Session-per-call with unique IDs
 
-Each Pi invocation within Ralph uses a unique session ID instead of an ephemeral `--no-session` mode. This preserves session history for debugging and audit purposes while maintaining isolation between orchestration steps.
+Each Pi invocation within Ralph uses a unique session ID (rather than the previous ephemeral session approach). This preserves session history for debugging and audit purposes while maintaining isolation between orchestration steps.
 
 Session IDs follow the format `ralph-{work_item_id}-{phase}-{short_uuid}`:
 
