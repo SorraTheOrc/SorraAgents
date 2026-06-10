@@ -637,7 +637,7 @@ def _build_remediation_prompt() -> str:
     return "The previous audit found issues. Address all the gaps identified in the audit."
 
 
-def _build_implement_prompt(work_item_id: str, remediation: str = "", command: str = "implement") -> str:
+def _build_implement_prompt(work_item_id: str, remediation: str = "", command: str = "implement", parent_branch: str | None = None) -> str:
     """Build the non-interactive implement prompt for Ralph.
 
     By default this builds the umbrella "implement" prompt that may traverse
@@ -647,9 +647,12 @@ def _build_implement_prompt(work_item_id: str, remediation: str = "", command: s
     The implement step must never ask the producer questions during the
     default loop. If the model cannot continue safely, it must return a
     structured no_safe_path response that names the missing producer decision.
+
+    When ``parent_branch`` is provided, the child must check out and
+    reuse that branch instead of creating a new one.
     """
     if command == "implement-single":
-        return _build_implement_single_prompt(work_item_id, remediation)
+        return _build_implement_single_prompt(work_item_id, remediation, parent_branch=parent_branch)
 
     parts = [
         f"implement {work_item_id}",
@@ -662,7 +665,7 @@ def _build_implement_prompt(work_item_id: str, remediation: str = "", command: s
     return "\n".join(parts)
 
 
-def _build_implement_single_prompt(work_item_id: str, remediation: str = "") -> str:
+def _build_implement_single_prompt(work_item_id: str, remediation: str = "", parent_branch: str | None = None) -> str:
     """Build a scoped implement-single prompt for per-child Ralph runs.
 
     Uses the ``implement-single`` skill which works on exactly the given
@@ -673,6 +676,10 @@ def _build_implement_single_prompt(work_item_id: str, remediation: str = "") -> 
     The implement step must never ask the producer questions during the
     default loop. If the model cannot continue safely, it must return a
     structured no_safe_path response that names the missing producer decision.
+
+    When ``parent_branch`` is provided, the child must check out and
+    reuse that branch instead of creating a new one. This ensures all
+    child iterations share the same feature branch.
     """
     parts = [
         f"implement-single {work_item_id}",
@@ -681,6 +688,18 @@ def _build_implement_single_prompt(work_item_id: str, remediation: str = "") -> 
         "Do not ask the producer questions or pause for interactive input.",
         "If you cannot continue safely without explicit producer input, stop and return a structured no_safe_path response with the missing decision.",
     ]
+    if parent_branch:
+        parts.append(
+            f"IMPORTANT: Use the existing feature branch '{parent_branch}' for all commits. "
+            f"Run 'git checkout {parent_branch}' if not already on this branch. "
+            f"Do NOT create a new branch."
+        )
+        parts.append(
+            "When creating commit messages, include a 'Related-Work: <child-id>' trailer "
+            f"where <child-id> is '{work_item_id}'. Example format:\n"
+            f"  {work_item_id}: <concise summary of changes>\n\n"
+            f"  Related-Work: {work_item_id}"
+        )
     if remediation:
         parts.append(remediation)
     return "\n".join(parts)
@@ -2624,12 +2643,101 @@ class RalphLoop:
 
         return invocations, failures
 
-    def run_single_item(self, item_id: str, implement_command: str = "implement", skip_implement: bool = False, remediation: str = "", **kwargs) -> dict:
+    def _create_feature_branch(self, work_item_id: str, short_desc: str = "") -> str:
+        """Create a feature branch for the given work item.
+
+        Branch naming follows the canonical pattern: wl-<work-item-id>-<short-desc>
+        If the branch already exists, check it out. Otherwise, create it from HEAD.
+
+        Returns the branch name.
+        """
+        # Generate branch name following project convention
+        if not short_desc:
+            # Try to get title from work item and convert to slug
+            try:
+                item = self._wl_show(work_item_id)
+                title = item.get("workItem", {}).get("title", "")
+                if title:
+                    # Convert title to slug: lowercase, replace non-alphanumeric with hyphens
+                    import re
+                    slug = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')
+                    slug = re.sub(r'-+', '-', slug)  # collapse multiple hyphens
+                    slug = slug[:50]  # limit length
+                    if slug:
+                        short_desc = slug
+            except Exception:
+                short_desc = "changes"
+
+        if not short_desc:
+            short_desc = "changes"
+
+        branch_name = f"wl-{work_item_id}-{short_desc}"
+        logger.info("ralph.branch.create target=%s branch=%s", work_item_id, branch_name)
+
+        # Check if branch already exists (non-zero returncode is expected when branch doesn't exist)
+        proc = self._call_runner(
+            ["git", "rev-parse", "--verify", "refs/heads/" + branch_name]
+        )
+        branch_exists = getattr(proc, 'returncode', 1) == 0
+
+        if branch_exists:
+            # Branch exists, check it out
+            logger.info("ralph.branch.exists_checking_out branch=%s", branch_name)
+            proc = self._call_runner(
+                ["git", "checkout", branch_name]
+            )
+            if getattr(proc, 'returncode', 0) != 0:
+                raise RalphError(f"Failed to checkout branch {branch_name}: {getattr(proc, 'stderr', '')}")
+        else:
+            # Create new branch from dev HEAD to ensure we start from the latest integration point
+            # First, fetch both dev and main to have the latest state
+            logger.info("ralph.branch.fetching_remotes")
+            self._call_runner(["git", "fetch", "origin", "dev", "main"])
+            
+            # Check if origin/dev exists
+            proc = self._call_runner(
+                ["git", "rev-parse", "--verify", "refs/remotes/origin/dev"]
+            )
+            use_dev_base = getattr(proc, 'returncode', 0) == 0
+            
+            if use_dev_base:
+                # Check if dev is behind main (optional warning, don't fail)
+                proc = self._call_runner(
+                    ["git", "merge-base", "--is-ancestor", "origin/main", "origin/dev"]
+                )
+                if getattr(proc, 'returncode', 0) != 0:
+                    # origin/main is not an ancestor of origin/dev, meaning dev may be behind
+                    logger.warning(
+                        "ralph.branch.dev_behind_main target=%s",
+                        work_item_id,
+                    )
+                
+                # Create branch from dev HEAD
+                logger.info("ralph.branch.creating_from_dev branch=%s", branch_name)
+                proc = self._call_runner(
+                    ["git", "checkout", "-b", branch_name, "origin/dev"]
+                )
+            else:
+                # Fallback to current HEAD if dev doesn't exist
+                logger.info("ralph.branch.creating_from_head branch=%s dev_not_found", branch_name)
+                proc = self._call_runner(
+                    ["git", "checkout", "-b", branch_name]
+                )
+            
+            if getattr(proc, 'returncode', 0) != 0:
+                raise RalphError(f"Failed to create branch {branch_name}: {getattr(proc, 'stderr', '')}")
+
+        return branch_name
+
+    def run_single_item(self, item_id: str, implement_command: str = "implement", skip_implement: bool = False, remediation: str = "", parent_branch: str | None = None, **kwargs) -> dict:
         """Execute implement and audit for a single work item with retries.
 
         Attempts implement + audit up to self.max_attempts. Returns:
         - {"status": "success", "attempt": n} on success
         - {"status": "max_attempts", "attempt": n, ...} when all attempts fail
+
+        When ``parent_branch`` is provided, child iterations reuse that branch
+        instead of creating new feature branches.
 
         Additional keyword args are accepted for compatibility (e.g. force_fresh_audit).
         """
@@ -2655,9 +2763,9 @@ class RalphLoop:
             # Implement step (unless skipped)
             if not skip_implement and implement_command:
                 if implement_command == "implement-single":
-                    prompt = _build_implement_single_prompt(item_id, remediation)
+                    prompt = _build_implement_single_prompt(item_id, remediation, parent_branch=parent_branch)
                 else:
-                    prompt = _build_implement_prompt(item_id, remediation, command=implement_command)
+                    prompt = _build_implement_prompt(item_id, remediation, command=implement_command, parent_branch=parent_branch)
                 impl_output = self._run_pi(prompt, phase="implementation", tier=tier)
                 self._last_implement_output = impl_output
 
@@ -2807,6 +2915,18 @@ class RalphLoop:
             children = []
 
         if children and child_id is None and focus_id == target_id:
+            # Create a single feature branch for the parent work item.
+            # All child iterations will reuse this branch.
+            try:
+                parent_branch = self._create_feature_branch(focus_id)
+                logger.info("ralph.branch.parent_created target=%s branch=%s", focus_id, parent_branch)
+            except RalphError as exc:
+                logger.warning("ralph.branch.parent_create_failed target=%s error=%s", focus_id, exc)
+                parent_branch = None
+            except Exception as exc:
+                logger.warning("ralph.branch.parent_create_unexpected target=%s error=%s", focus_id, exc)
+                parent_branch = None
+
             child_ids = [c.get("id") for c in children if c.get("id")]
             child_results: dict[str, dict] = {}
             failed_children: list[str] = []
@@ -2848,7 +2968,8 @@ class RalphLoop:
                         logger.info("ralph.run.child_in_review_no_audit target=%s child=%s", focus_id, cid)
 
                 # Delegate to run_single_item which performs retries internally
-                res = self.run_single_item(cid, implement_command="implement-single")
+                # Pass parent_branch so child reuses the shared feature branch
+                res = self.run_single_item(cid, implement_command="implement-single", parent_branch=parent_branch)
                 used = int(res.get("attempt", 1)) if isinstance(res.get("attempt", 1), int) else 1
                 attempts_used = max(attempts_used, used)
                 if res.get("status") == "success":

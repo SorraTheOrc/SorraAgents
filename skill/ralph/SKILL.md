@@ -45,6 +45,17 @@ When Ralph's implement→audit loop ends (whether by success, cancellation, max 
 
 The cleanup is safe to call even if the process has already exited — it checks `process.poll()` before sending any signals.
 
+### Single feature branch for child iterations
+
+When Ralph processes a parent work item with children, it creates a single feature branch at the start of the run and all child iterations reuse that branch. This ensures:
+
+- All changes from child iterations are consolidated on one branch
+- Branch names follow the canonical pattern: `wl-<parent-id>-<short-desc>`
+- Child implementations are serialized (one-at-a-time) on the shared branch
+- Commits are traceable to child work-item IDs via commit messages
+
+The branch is created once before the first child iteration and passed to all subsequent child implementations via the `parent_branch` parameter.
+
 ### Per-phase model routing
 
 Ralph supports phase-specific model selection for `intake`, `planning`, `implementation`, and `audit`.

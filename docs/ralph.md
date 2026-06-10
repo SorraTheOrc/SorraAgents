@@ -226,6 +226,41 @@ def _scope_in_review(self, scope_ids: Iterable[str]) -> bool:
 
 This helps operators and developers understand why Ralph might be reaching max attempts and diagnose issues more effectively.
 
+## Single Feature Branch for Child Iterations
+
+When Ralph processes a parent work item with children, it creates a **single feature branch** that is shared across all child iterations. This ensures all changes from a Ralph run are consolidated on one branch, making review and integration straightforward.
+
+### Branch Creation
+
+- Ralph creates a feature branch named `wl-<parent-id>-<short-desc>` before iterating over children.
+- If the branch already exists, Ralph checks it out rather than creating a new one.
+- The branch is created from `origin/dev` when available, ensuring the latest integration point.
+
+### Child Iteration on Shared Branch
+
+- All child implementations execute on the shared feature branch.
+- Children do **not** create new feature branches — they check out and use the parent's branch.
+- Child iterations are serialized (one-at-a-time) on the shared branch to avoid concurrency hazards.
+
+### Commit Traceability
+
+Child commit messages include a `Related-Work: <child-id>` trailer to ensure traceability back to the child work item. Example commit message format:
+
+```
+SA-12345: Add authentication handler for API endpoints
+
+Related-Work: SA-67890
+```
+
+This convention allows:
+- Tracing which child work item each commit addresses
+- Filtering commits by work item in git history
+- Maintaining clear lineage between parent and child changes
+
+### Graceful Degradation
+
+If branch creation fails (e.g., due to git permissions), Ralph logs a warning and continues without branch sharing. This ensures the orchestration loop is not blocked by transient git issues.
+
 ## Configuration File
 
 Ralph reads settings from a `.ralph.json` file in the current directory (or `ralph.config.json`). The file is a simple JSON object. Values from the config file are defaults; CLI flags take precedence.
