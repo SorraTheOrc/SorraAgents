@@ -186,7 +186,7 @@ Ralph invokes `/compact` once before continuing to audit.
 
 Key semantics:
 
-- `/compact` is invoked **without** an explicit work-item id; the compaction plugin derives context from the current session.
+- `/compact` is invoked **without** an explicit work-item id; the compaction plugin derives context from the current session. With session-per-call invocations, each Pi call operates in its own session (identified by `--session-id`), so compaction is scoped to that session's context.
 - `/compact` failures are **non-fatal**. Ralph logs a warning and continues with the loop.
 - Compaction evidence is **logs only** (no worklog comments are persisted for compact output).
 
@@ -390,7 +390,7 @@ By default, ralph prints two kinds of output to the console:
 2. **Delegated command logs**: every delegated `pi` and `wl` command is logged before it runs. The console formatter shows the rendered command string, and `--json` output includes structured `cmd` and `argv` fields for machine-readable inspection.
 3. **Pi subprocess streaming**: pi output is parsed per pi's JSON streaming protocol. Only `text_delta` events (the agent's actual user-facing response) are shown in real-time, printed additively. Thinking/reasoning, metadata, and structural events are suppressed for a clean, readable console.
 
-This means during an implement or audit pass, you'll see the assistant's response appear token-by-token as `text_delta` events stream in — no thinking blocks, no JSON envelope, no session metadata.
+This means during an implement or audit pass, you'll see the assistant's response appear token-by-token as `text_delta` events stream in — no thinking blocks, no JSON envelope, no session metadata. Each Pi invocation uses a unique session ID (e.g., `ralph-SA-123-implement-a1b2c3`) which is preserved for debugging, but not displayed in the streaming output.
 
 The `text_delta` content is additive (each delta contains only the new text since the last delta), so there's no duplication.
 
