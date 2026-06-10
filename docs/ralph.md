@@ -190,6 +190,42 @@ Key semantics:
 - `/compact` failures are **non-fatal**. Ralph logs a warning and continues with the loop.
 - Compaction evidence is **logs only** (no worklog comments are persisted for compact output).
 
+### Stage Check Expansion Fix
+
+**Note**: A fix was implemented to expand the stage check logic in Ralph to handle a broader range of completed stages. Previously, Ralph only recognized `in_review` stage for per-child iteration scope. The fix expanded this to also include `done`, `completed`, and `closed` stages in the `_scope_in_review` method.
+
+**Rationale**: This fix addresses CI failures where work items in terminal stages (`done`, `completed`, `closed`) were not properly handled in per-child iteration scenarios, causing the loop to fail with max attempts errors.
+
+**Implementation**: The change was made in `skill/ralph/scripts/ralph_loop.py` around line 2396, expanding the allowed stages from only `in_review` to include `done`, `completed`, and `closed`:
+
+```python
+def _scope_in_review(self, scope_ids: Iterable[str]) -> bool:
+    allowed = {"in_review", "done", "completed", "closed"}  # Expanded from only "in_review"
+    # ... rest of method
+```
+
+### CI Runner Availability Fix
+
+**Note**: Fixes were implemented to address `wl` CLI availability issues in CI environments that were causing `FileNotFoundError` during child iteration tests.
+
+**Rationale**: The CI failures were caused by the `wl` command not being available in the runner environment, leading to `FileNotFoundError` when Ralph tried to execute worklog operations.
+
+**Implementation**: The fixes were implemented in PRs #688 and #689 to ensure the `wl` CLI is properly available in CI runner environments, resolving the FileNotFoundError that was preventing child iteration tests from passing.
+
+### Debug Logging Enhancements
+
+**Note**: Debug logging was enhanced to help identify why per-child runs reach max attempts, particularly for audit parsing and unmet criteria detection.
+
+**Rationale**: The original CI failures included scenarios where Ralph would reach max attempts without clear visibility into why the audit process was failing.
+
+**Implementation**: Debug logging was added in PR #691 to provide better visibility into:
+- Audit parsing processes
+- Unmet criteria detection
+- Per-child iteration progress
+- Compact invocation and failure scenarios
+
+This helps operators and developers understand why Ralph might be reaching max attempts and diagnose issues more effectively.
+
 ## Configuration File
 
 Ralph reads settings from a `.ralph.json` file in the current directory (or `ralph.config.json`). The file is a simple JSON object. Values from the config file are defaults; CLI flags take precedence.
@@ -438,6 +474,50 @@ The final JSON result now includes a `compact` object:
   }
 }
 ```
+
+## Session management
+
+### Session-per-call with unique IDs
+
+Each Pi invocation within Ralph uses a unique session ID instead of an ephemeral `--no-session` mode. This preserves session history for debugging and audit purposes while maintaining isolation between orchestration steps.
+
+Session IDs follow the format `ralph-{work_item_id}-{phase}-{short_uuid}`:
+
+- `ralph-` prefix: identifies Ralph-generated sessions for cleanup targeting
+- `{work_item_id}`: the first work item ID in scope (e.g., `SA-1234`)
+- `{phase}`: the orchestration phase (`intake`, `planning`, `implementation`, `audit`)
+- `{short_uuid}`: 8-character hex string from `uuid.uuid4().hex[:8]`
+
+Example session ID: `ralph-SA-1234-implementation-a1b2c3d4`
+
+Each call produces a unique session ID, so sessions can be inspected with `pi --session <id>` or by resuming with `/resume` in a Pi interactive session.
+
+### Session pruning and retention
+
+Ralph automatically prunes old Ralph-generated Pi sessions after each loop completion (success or failure). Only sessions with the `ralph-` prefix are targeted; non-Ralph Pi sessions are never removed.
+
+#### Retention period
+
+- **Default**: 112 days
+- **Config**: `session.retention_days` key in `.ralph.json`
+- **Override**: `--session-retention-days` CLI flag (highest precedence)
+
+The retention period controls how long Ralph-generated sessions are kept before being automatically deleted. Files older than the configured number of days are removed at each loop exit.
+
+#### Session directory
+
+The Pi session directory defaults to `~/.pi/agent/sessions/` and can be overridden via:
+- `PI_CODING_AGENT_SESSION_DIR` environment variable
+- `--session-dir` CLI flag
+
+#### Observability
+
+| Log event | Level | Data |
+|-----------|-------|------|
+| `ralph.session.prune.completed` | INFO | pruned count, bytes reclaimed, retention_days |
+| `ralph.session.prune.directory_not_found` | DEBUG | path |
+| `ralph.session.prune.os_error` | DEBUG | path |
+| `ralph.session.prune.failed` | WARNING | error message |
 
 ## Pi output validation
 

@@ -49,3 +49,6 @@ tmp/
 ampa/.env
 ampa/scheduler_store.json
 .venv/
+
+# Ralph event signals
+.ralph/event.pending

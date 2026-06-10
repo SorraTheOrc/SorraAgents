@@ -2,19 +2,25 @@ import json
 import os
 import tempfile
 import threading
+import time
+import uuid
 from dataclasses import dataclass
 
 import pytest
 
 from skill.ralph.scripts.ralph_loop import (
     DEFAULT_PI_STREAM_TIMEOUT_SECONDS,
+    DEFAULT_SESSION_RETENTION_DAYS,
     JsonLineFormatter,
     RalphError,
     RalphLoop,
     REMOTE_PI_STREAM_TIMEOUT_SECONDS,
     _build_implement_single_prompt,
     _extract_phase_model_config,
+    _get_pi_session_dir,
     _load_asset_config,
+    _make_session_id,
+    _prune_ralph_sessions,
     _resolve_stream_timeout,
     build_parser,
     parse_audit_report,
@@ -256,7 +262,72 @@ def test_child_scoped_run_targets_only_requested_child():
     assert runner.audit_results.get("SA-CHILD") == AUDIT_PASS
 
 
-def test_pi_invocations_use_ephemeral_sessions():
+# ---------------------------------------------------------------------------
+# Session ID generation
+# ---------------------------------------------------------------------------
+
+
+def test_make_session_id_uses_ralph_prefix():
+    """Session IDs start with 'ralph-' prefix."""
+    sid = _make_session_id(["SA-1234"], "implementation")
+    assert sid.startswith("ralph-")
+
+
+def test_make_session_id_includes_work_item_id():
+    """Session IDs include the first work item ID."""
+    sid = _make_session_id(["SA-1234"], "implementation")
+    assert "SA-1234" in sid
+
+
+def test_make_session_id_includes_phase():
+    """Session IDs include the phase name."""
+    sid = _make_session_id(["SA-1234"], "audit")
+    assert "audit" in sid
+
+
+def test_make_session_id_has_uuid_suffix():
+    """Session IDs end with an 8-character hex suffix."""
+    sid = _make_session_id(["SA-1234"], "implementation")
+    parts = sid.split("-")
+    suffix = parts[-1]
+    assert len(suffix) == 8
+    int(suffix, 16)  # raises ValueError if not hex
+
+
+def test_make_session_id_format_exact():
+    """Session IDs follow ralph-{wid}-{phase}-{short_uuid} format."""
+    import re
+    sid = _make_session_id(["SA-1234"], "implementation")
+    assert re.match(r"^ralph-[A-Z0-9a-z_-]+-implementation-[0-9a-f]{8}$", sid)
+
+
+def test_make_session_id_unique_per_call():
+    """Sequential calls produce different session IDs."""
+    ids = {_make_session_id(["SA-1"], "implementation") for _ in range(100)}
+    assert len(ids) == 100
+
+
+def test_make_session_id_no_target_fallback():
+    """When no work_item_ids given, uses 'no-target'."""
+    sid = _make_session_id(None, "audit")
+    assert "no-target" in sid
+
+
+def test_make_session_id_empty_list_fallback():
+    """When work_item_ids is empty, uses 'no-target'."""
+    sid = _make_session_id([], "implementation")
+    assert "no-target" in sid
+
+
+def test_make_session_id_multiple_ids_uses_first():
+    """When multiple IDs provided, only the first is used."""
+    sid = _make_session_id(["SA-FIRST", "SA-SECOND"], "planning")
+    assert "SA-FIRST" in sid
+    assert "SA-SECOND" not in sid
+
+
+def test_pi_invocations_use_session_id_instead_of_no_session():
+    """Pi invocations use --session-id instead of --no-session."""
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
     loop = RalphLoop(runner=runner, stream=False)
@@ -265,7 +336,183 @@ def test_pi_invocations_use_ephemeral_sessions():
 
     pi_calls = [call for call in runner.calls if call and call[0] == "pi" and "-p" in call]
     assert pi_calls
-    assert all("--no-session" in call for call in pi_calls)
+    # Should NOT contain --no-session
+    assert not any("--no-session" in call for call in pi_calls)
+    # Should contain --session-id
+    assert all("--session-id" in call for call in pi_calls)
+
+
+def test_pi_session_ids_are_unique_per_invocation_in_loop():
+    """Each pi invocation in a loop run gets a unique session ID."""
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_FAIL, AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False, max_attempts=3)
+
+    loop.run("SA-TARGET")
+
+    pi_calls = [call for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    session_ids = []
+    for call in pi_calls:
+        idx = call.index("--session-id")
+        session_ids.append(call[idx + 1])
+    assert len(session_ids) == len(set(session_ids)), f"Session IDs are not unique: {session_ids}"
+
+
+def test_pi_session_ids_match_ralph_format_in_loop():
+    """Session IDs in pi invocations match ralph-{wid}-{phase}-{short_uuid}."""
+    import re
+    runner = FakeRunner()
+    runner.audit_outputs = [AUDIT_PASS]
+    loop = RalphLoop(runner=runner, stream=False)
+
+    loop.run("SA-TARGET")
+
+    pi_calls = [call for call in runner.calls if call and call[0] == "pi" and "-p" in call]
+    for call in pi_calls:
+        idx = call.index("--session-id")
+        sid = call[idx + 1]
+        assert re.match(r"^ralph-[A-Z0-9a-z_-]+-(implementation|audit)-[0-9a-f]{8}$", sid), f"Bad session ID: {sid}"
+
+
+# ---------------------------------------------------------------------------
+# Session cleanup and pruning
+# ---------------------------------------------------------------------------
+
+
+def test_prune_ralph_sessions_removes_old_ralph_files(tmp_path):
+    """Sessions older than retention days are pruned."""
+    now = time.time()
+    # Create an old session file (200 days ago)
+    old_file = tmp_path / "ralph-SA-1234-implementation-a1b2c3d4"
+    old_file.write_text("old session data")
+    os.utime(old_file, (now - 200 * 86400, now - 200 * 86400))
+
+    pruned = _prune_ralph_sessions(tmp_path, retention_days=112)
+    assert pruned == 1
+    assert not old_file.exists()
+
+
+def test_prune_ralph_sessions_preserves_recent_ralph_files(tmp_path):
+    """Sessions newer than retention days are preserved."""
+    now = time.time()
+    new_file = tmp_path / "ralph-SA-1234-implementation-b2c3d4e5"
+    new_file.write_text("new session data")
+    os.utime(new_file, (now - 30 * 86400, now - 30 * 86400))
+
+    pruned = _prune_ralph_sessions(tmp_path, retention_days=112)
+    assert pruned == 0
+    assert new_file.exists()
+
+
+def test_prune_ralph_sessions_ignores_non_ralph_files(tmp_path):
+    """Non-Ralph session files are untouched."""
+    now = time.time()
+    # Create a non-ralph session file that is very old
+    other_file = tmp_path / "other-session-xyz"
+    other_file.write_text("other session")
+    os.utime(other_file, (now - 200 * 86400, now - 200 * 86400))
+
+    pruned = _prune_ralph_sessions(tmp_path, retention_days=112)
+    assert pruned == 0
+    assert other_file.exists()
+
+
+def test_prune_ralph_sessions_mixed_files(tmp_path):
+    """Only old ralph-* files are pruned; recent and non-ralph files remain."""
+    now = time.time()
+    # Old ralph file - should be pruned
+    old_ralph = tmp_path / "ralph-old-file-a1b2c3d4"
+    old_ralph.write_text("old ralph")
+    os.utime(old_ralph, (now - 200 * 86400, now - 200 * 86400))
+    # Recent ralph file - should be kept
+    recent_ralph = tmp_path / "ralph-recent-file-e5f6g7h8"
+    recent_ralph.write_text("recent ralph")
+    os.utime(recent_ralph, (now - 30 * 86400, now - 30 * 86400))
+    # Old non-ralph file - should be kept
+    old_other = tmp_path / "other-old-session"
+    old_other.write_text("old other")
+    os.utime(old_other, (now - 200 * 86400, now - 200 * 86400))
+
+    pruned = _prune_ralph_sessions(tmp_path, retention_days=112)
+    assert pruned == 1
+    assert not old_ralph.exists()
+    assert recent_ralph.exists()
+    assert old_other.exists()
+
+
+def test_prune_ralph_sessions_default_retention(tmp_path):
+    """Default retention period of 112 days is applied when not specified."""
+    now = time.time()
+    # File older than 112 days
+    old_file = tmp_path / "ralph-old-default-a1b2c3d4"
+    old_file.write_text("old")
+    os.utime(old_file, (now - 113 * 86400, now - 113 * 86400))
+    # File newer than 112 days
+    new_file = tmp_path / "ralph-new-default-e5f6g7h8"
+    new_file.write_text("new")
+    os.utime(new_file, (now - 111 * 86400, now - 111 * 86400))
+
+    pruned = _prune_ralph_sessions(tmp_path)
+    assert pruned == 1
+    assert not old_file.exists()
+    assert new_file.exists()
+
+
+def test_prune_ralph_sessions_default_retention_value():
+    """DEFAULT_SESSION_RETENTION_DAYS is 112."""
+    assert DEFAULT_SESSION_RETENTION_DAYS == 112
+
+
+def test_prune_ralph_sessions_nonexistent_directory(tmp_path):
+    """Non-existent directory is handled gracefully."""
+    nonexistent = tmp_path / "nonexistent"
+    pruned = _prune_ralph_sessions(nonexistent)
+    assert pruned == 0
+
+
+def test_prune_ralph_sessions_logs_pruned_count(tmp_path, caplog):
+    """Pruning logs the number of files removed."""
+    import logging
+    caplog.set_level(logging.INFO)
+    now = time.time()
+    old_file = tmp_path / "ralph-old-a1b2c3d4"
+    old_file.write_text("data")
+    os.utime(old_file, (now - 200 * 86400, now - 200 * 86400))
+
+    _prune_ralph_sessions(tmp_path, retention_days=112)
+    assert "ralph.session.prune.completed" in caplog.text
+    assert "pruned=1" in caplog.text
+
+
+def test_get_pi_session_dir_env_override(monkeypatch):
+    """PI_CODING_AGENT_SESSION_DIR env var overrides default path."""
+    monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", "/tmp/test-pi-sessions")
+    result = _get_pi_session_dir()
+    assert str(result) == "/tmp/test-pi-sessions"
+
+
+def test_get_pi_session_dir_default():
+    """Default session dir is ~/.pi/agent/sessions/."""
+    result = _get_pi_session_dir()
+    assert str(result).endswith("/.pi/agent/sessions")
+
+
+def test_ralph_loop_session_retention_config(tmp_path):
+    """RalphLoop accepts session_retention_days and session_dir params."""
+    loop = RalphLoop(
+        runner=FakeRunner(),
+        stream=False,
+        session_retention_days=60,
+        session_dir=str(tmp_path),
+    )
+    assert loop.session_retention_days == 60
+    assert str(loop.session_dir) == str(tmp_path)
+
+
+def test_ralph_loop_session_retention_default():
+    """RalphLoop uses default retention when not specified."""
+    loop = RalphLoop(runner=FakeRunner(), stream=False)
+    assert loop.session_retention_days == DEFAULT_SESSION_RETENTION_DAYS
 
 
 def test_retry_path_uses_remediation_in_next_implement_prompt():
@@ -1019,7 +1266,7 @@ def test_debug_persist_writes_raw_payload_for_no_text_stream(tmp_path):
     assert payload["truncated"] is False
 
 
-def test_run_pi_stream_mode_uses_ephemeral_sessions():
+def test_run_pi_stream_mode_uses_session_id():
     from unittest.mock import patch, MagicMock
 
     fake_process = MagicMock()
@@ -1035,8 +1282,11 @@ def test_run_pi_stream_mode_uses_ephemeral_sessions():
         with pytest.raises(RalphError, match="Pi produced invalid output"):
             loop._run_pi("test prompt")
     cmd = popen.call_args.args[0]
-    assert "--no-session" in cmd
-    assert cmd.index("--no-session") < cmd.index("test prompt")
+    assert "--session-id" in cmd, f"Expected --session-id in cmd, got: {cmd}"
+    assert "--no-session" not in cmd, f"Unexpected --no-session in cmd: {cmd}"
+    idx = cmd.index("--session-id")
+    sid = cmd[idx + 1]
+    assert sid.startswith("ralph-"), f"Session ID should start with ralph-, got: {sid}"
 
 
 def test_in_review_skips_first_implement():

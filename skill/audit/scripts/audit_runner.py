@@ -424,6 +424,67 @@ def _extract_last_assistant_message_text(messages) -> str | None:
 # Acceptance-criteria extractor
 # ---------------------------------------------------------------------------
 
+def _extract_json_array(text: str) -> list | None:
+    """Extract the last JSON array from text that may contain analysis before the array.
+
+    Pi often returns analysis text followed by a JSON array at the end.
+    This function finds the last `[` that is NOT inside a string and tries to parse.
+
+    Returns the parsed list if found, otherwise None.
+    """
+    if not text:
+        return None
+
+    # Find positions of `[` that could start a JSON array
+    # We need to skip `[` characters that are inside JSON strings
+    possible_starts = []
+    in_string = False
+    escape_next = False
+
+    for i, char in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if char == '\\' and in_string:
+            escape_next = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        # We're not in a string
+        if char == '[':
+            # Check if this could be the start of a JSON array
+            rest = text[i + 1:].lstrip()
+            if rest and (rest[0] in ('{', '"', ']', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-')):
+                possible_starts.append(i)
+
+    # Try each possible start position from last to first
+    for start in reversed(possible_starts):
+        candidate = text[start:].strip()
+
+        # Try the full candidate first
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        # If that failed, try to find where the JSON array ends
+        for end_search in range(len(candidate) - 1, 0, -1):
+            if candidate[end_search] == ']':
+                try:
+                    result = json.loads(candidate[:end_search + 1])
+                    if isinstance(result, list):
+                        return result
+                except json.JSONDecodeError:
+                    continue
+
+    return None
+
+
 def _extract_acs(description: str) -> list[str]:
     """Extract acceptance criteria lines from a markdown description."""
     pattern = re.compile(
@@ -468,29 +529,56 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
     *child_results* is a list of child review dicts with keys:
       ``title``, ``id``, ``status``, ``stage``, ``ac_results``.
+
+    Ready-to-close logic:
+      - All acceptance criteria (parent + children) must be ``met``.
+      - All non-deleted children must be in ``in_review`` or ``done`` stage.
+        Children with ``status: in_progress`` but ``stage: in_review`` are
+        acceptable and do NOT block closure.
     """
-    all_met = all(
+    all_ac_met = all(
         r["verdict"] == "met"
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
-    ready = "Yes" if all_met else "No"
+    # Check that all active children are in in_review or done stage
+    active_children = [c for c in child_results if c.get("stage") not in ("", None)]
+    all_children_reviewed = all(
+        c.get("stage") in ("in_review", "done")
+        for c in active_children
+    )
+    ready = "Yes" if (all_ac_met and all_children_reviewed) else "No"
 
     lines = [f"Ready to close: {ready}", "", "## Summary", ""]
 
-    if all_met:
+    if ready == "Yes":
         lines.append(
             f"All {len(ac_results)} acceptance criteria for work item "
-            f"{issue.get('id', '?')} are met."
+            f"{issue.get('id', '?')} are met. All children are in in_review or done stage."
         )
     else:
         unmet_count = sum(
             1 for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
             if r["verdict"] != "met"
         )
-        lines.append(
-            f"{unmet_count} of {len(ac_results)} acceptance criteria for "
-            f"work item {issue.get('id', '?')} are not met."
-        )
+        # Identify children not in in_review/done stage
+        not_reviewed = [
+            c for c in child_results
+            if c.get("stage") not in ("in_review", "done", "")
+        ]
+        if unmet_count > 0 and not_reviewed:
+            lines.append(
+                f"{unmet_count} acceptance criteria not met AND "
+                f"{len(not_reviewed)} children not yet in in_review/done stage."
+            )
+        elif unmet_count > 0:
+            lines.append(
+                f"{unmet_count} of {len(ac_results)} acceptance criteria for "
+                f"work item {issue.get('id', '?')} are not met."
+            )
+        else:
+            lines.append(
+                f"{len(not_reviewed)} children not yet in in_review/done stage."
+            )
 
     lines.append("")
     lines.append("## Acceptance Criteria Status")
@@ -543,6 +631,69 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
 
     lines.append("")
     return "\n".join(lines)
+
+
+def _assemble_child_audit_report(child: dict, ac_results: list[dict]) -> str:
+    """Assemble an audit report for a single child work item.
+
+    *child* is a dict with keys ``title``, ``id``, ``status``, ``stage``.
+    *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
+    """
+    all_met = all(r["verdict"] == "met" for r in ac_results) if ac_results else False
+    ready = "Yes" if all_met else "No"
+
+    lines = [
+        f"Ready to close: {ready}",
+        "",
+        "## Summary",
+        "",
+        f"Child work item audit for {child['title']} ({child['id']}). "
+        f"Status: {child['status']}/{child['stage']}.",
+        "",
+        "## Acceptance Criteria Status",
+        "",
+        "| # | Criterion | Verdict | Evidence |",
+        "|---|-----------|---------|----------|",
+    ]
+
+    if not ac_results:
+        lines.append("")
+        lines.append("No acceptance criteria defined.")
+    else:
+        for i, r in enumerate(ac_results, 1):
+            evidence = r.get("evidence", "") or ""
+            lines.append(
+                f"| {i} | {r['text']} | {r['verdict']} | {evidence} |"
+            )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _persist_child_audit(
+    child_id: str,
+    child_title: str,
+    child_status: str,
+    child_stage: str,
+    ac_results: list[dict],
+    pi_bin: str = "pi",
+) -> tuple[bool, str]:
+    """Assemble and persist an audit report for a single child work item.
+
+    Returns (success, report_text).
+    On failure the report text is still returned so callers can log it.
+    """
+    child = {
+        "title": child_title,
+        "id": child_id,
+        "status": child_status,
+        "stage": child_stage,
+    }
+    report = _assemble_child_audit_report(child, ac_results)
+
+    rc = persist_audit(child_id, report)
+    success = rc == 0
+    return success, report
 
 
 def _assemble_project_report(summary: str, recommendation: str) -> str:
@@ -632,15 +783,22 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
 def _build_issue_json(issue: dict, ac_results: list[dict],
                       child_results: list[dict]) -> dict:
     """Build structured JSON payload for issue-mode audit."""
-    all_met = all(
+    all_ac_met = all(
         r["verdict"] == "met"
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
+    # Check that all active children are in in_review or done stage
+    active_children = [c for c in child_results if c.get("stage") not in ("", None)]
+    all_children_reviewed = all(
+        c.get("stage") in ("in_review", "done")
+        for c in active_children
+    )
+    ready = all_ac_met and all_children_reviewed
     return {
-        "ready_to_close": all_met,
+        "ready_to_close": ready,
         "summary": (
             f"All {len(ac_results)} acceptance criteria met."
-            if all_met else
+            if all_ac_met else
             f"{sum(1 for r in ac_results if r['verdict'] != 'met')} of {len(ac_results)} acceptance criteria not met."
         ),
         "acceptance_criteria": ac_results,
@@ -700,12 +858,16 @@ def cmd_issue(issue_id: str, persist: bool = True,
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
-        # Parse the batched result
-        raw_text = result.get("evidence", "") or result.get("text", "")
-        try:
-            batch = json.loads(raw_text)
-        except json.JSONDecodeError:
-            batch = []
+        # Parse the batched result - try to extract JSON array from text
+        # Use extracted_text (full response) instead of evidence (may be truncated)
+        raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
+        batch = _extract_json_array(raw_text)
+        if batch is None:
+            # Fallback: try direct JSON parse
+            try:
+                batch = json.loads(raw_text)
+            except json.JSONDecodeError:
+                batch = []
         if isinstance(batch, list):
             reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
             for i, ac in enumerate(acs):
@@ -755,11 +917,14 @@ def cmd_issue(issue_id: str, persist: bool = True,
             except RuntimeError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
-            raw_text = result.get("evidence", "") or result.get("text", "")
-            try:
-                batch = json.loads(raw_text)
-            except json.JSONDecodeError:
-                batch = []
+            # Use extracted_text (full response) instead of evidence (may be truncated)
+            raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
+            batch = _extract_json_array(raw_text)
+            if batch is None:
+                try:
+                    batch = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    batch = []
             if isinstance(batch, list):
                 reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
                 for i, ac in enumerate(child_acs):
@@ -782,13 +947,40 @@ def cmd_issue(issue_id: str, persist: bool = True,
             "ac_results": child_ac_results,
         })
 
-    # Assemble report
+    # Initialize child_persist_results for reporting
+    child_persist_results = []
+
+    # Persist child audits to individual child work items (if persist is True)
+    if persist:
+        for child in child_results:
+            child_success, child_report = _persist_child_audit(
+                child_id=child["id"],
+                child_title=child["title"],
+                child_status=child["status"],
+                child_stage=child["stage"],
+                ac_results=child["ac_results"],
+                pi_bin=pi_bin,
+            )
+            child_persist_results.append({
+                "id": child["id"],
+                "title": child["title"],
+                "success": child_success,
+            })
+            if not child_success:
+                print(
+                    f"Warning: Failed to persist audit for child {child['id']} "
+                    f"({child['title']}): wl returned exit code {1}",
+                    file=sys.stderr,
+                )
+
+    # Assemble and output report
+    report = _assemble_issue_report(work_item, ac_results, child_results)
+
     if json_mode:
         payload = _build_issue_json(work_item, ac_results, child_results)
+        payload["child_persist_results"] = child_persist_results
         print(json.dumps(payload, indent=2))
-        report = _assemble_issue_report(work_item, ac_results, child_results)
     else:
-        report = _assemble_issue_report(work_item, ac_results, child_results)
         print(report, end="")
 
     if persist:
