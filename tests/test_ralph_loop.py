@@ -2680,3 +2680,110 @@ def test_per_child_iteration_independent_audits_per_child():
     assert audit_order.index("SA-CHILD-B") < audit_order.index("SA-PARENT"), (
         "Child B audit must happen before parent integration audit"
     )
+
+
+def test_load_config_session_retention_days_from_ralph_json(tmp_path):
+    """Config file session.retention_days is parsed and applied."""
+    from skill.ralph.scripts.ralph_loop import _load_config
+
+    config_file = tmp_path / ".ralph.json"
+    config_file.write_text(json.dumps({"session": {"retention_days": 30}}))
+
+    original_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        config = _load_config()
+        session_cfg = config.get("session", {})
+        assert session_cfg.get("retention_days") == 30
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_cli_parser_session_retention_days_flag():
+    """CLI --session-retention-days flag is accepted by parser."""
+    parser = build_parser()
+    args = parser.parse_args(["SA-TARGET", "--session-retention-days", "45"])
+    assert args.session_retention_days == 45
+
+
+def test_cli_parser_session_retention_days_default_is_none():
+    """CLI --session-retention-days defaults to None (resolved downstream)."""
+    parser = build_parser()
+    args = parser.parse_args(["SA-TARGET"])
+    assert args.session_retention_days is None
+
+
+def test_main_session_retention_days_from_cli_flag(monkeypatch, capsys):
+    """CLI --session-retention-days is passed to RalphLoop via main()."""
+    from skill.ralph.scripts import ralph_loop
+
+    captured_kwargs = {}
+
+    class FakeLoop:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        def run(self, *args, **kwargs):
+            return {"status": "success", "attempt": 1, "scope": ["SA-TARGET"]}
+
+    monkeypatch.setattr(ralph_loop, "RalphLoop", FakeLoop)
+    # Prevent actual config loading from interfering
+    monkeypatch.setattr(ralph_loop, "_load_config", lambda: {})
+    monkeypatch.setattr(ralph_loop, "resolve_signal_path", lambda config: "/tmp/signal")
+    monkeypatch.setattr(ralph_loop, "resolve_webhook_url", lambda config: None)
+
+    exit_code = ralph_loop.main(["SA-TARGET", "--session-retention-days", "75"])
+
+    assert exit_code == 0
+    assert captured_kwargs.get("session_retention_days") == 75
+
+
+def test_main_session_retention_days_from_config(monkeypatch, capsys):
+    """Config session.retention_days is passed to RalphLoop when CLI flag is not set."""
+    from skill.ralph.scripts import ralph_loop
+
+    captured_kwargs = {}
+
+    class FakeLoop:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        def run(self, *args, **kwargs):
+            return {"status": "success", "attempt": 1, "scope": ["SA-TARGET"]}
+
+    monkeypatch.setattr(ralph_loop, "RalphLoop", FakeLoop)
+    # Return config with session.retention_days
+    monkeypatch.setattr(ralph_loop, "_load_config", lambda: {"session": {"retention_days": 90}})
+    monkeypatch.setattr(ralph_loop, "resolve_signal_path", lambda config: "/tmp/signal")
+    monkeypatch.setattr(ralph_loop, "resolve_webhook_url", lambda config: None)
+
+    exit_code = ralph_loop.main(["SA-TARGET"])
+
+    assert exit_code == 0
+    assert captured_kwargs.get("session_retention_days") == 90
+
+
+def test_main_cli_flag_overrides_config_for_session_retention(monkeypatch, capsys):
+    """CLI --session-retention-days overrides config session.retention_days."""
+    from skill.ralph.scripts import ralph_loop
+
+    captured_kwargs = {}
+
+    class FakeLoop:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        def run(self, *args, **kwargs):
+            return {"status": "success", "attempt": 1, "scope": ["SA-TARGET"]}
+
+    monkeypatch.setattr(ralph_loop, "RalphLoop", FakeLoop)
+    # Config says 90 days
+    monkeypatch.setattr(ralph_loop, "_load_config", lambda: {"session": {"retention_days": 90}})
+    monkeypatch.setattr(ralph_loop, "resolve_signal_path", lambda config: "/tmp/signal")
+    monkeypatch.setattr(ralph_loop, "resolve_webhook_url", lambda config: None)
+
+    # CLI says 45 days — should win
+    exit_code = ralph_loop.main(["SA-TARGET", "--session-retention-days", "45"])
+
+    assert exit_code == 0
+    assert captured_kwargs.get("session_retention_days") == 45
