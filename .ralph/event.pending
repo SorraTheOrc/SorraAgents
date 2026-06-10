@@ -1,8 +1,0 @@
-{
-  "event_type": "error",
-  "timestamp": "2026-06-06T01:26:06.216700+00:00",
-  "work_item_ids": [
-    "SA-0MPUDRIHW0024K4M"
-  ],
-  "title": "Audit runner: read default model from .ralph.json and support --model-source flag"
-}

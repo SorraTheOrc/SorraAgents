@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,10 +41,11 @@ ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent / "assets" / ".ralph.
 DEFAULT_MODEL = "opencode-go/glm-5.1"
 DEFAULT_MODEL_SOURCE = "local"
 MODEL_SOURCES = frozenset({"remote", "local"})
-DEFAULT_PI_STREAM_TIMEOUT_SECONDS = 60.0
-REMOTE_PI_STREAM_TIMEOUT_SECONDS = 900.0
+DEFAULT_PI_STREAM_TIMEOUT_SECONDS = 1800.0
+REMOTE_PI_STREAM_TIMEOUT_SECONDS = 1200.0
 MODEL_PHASES: tuple[str, ...] = ("intake", "planning", "implementation", "audit")
 DEBUG_PAYLOAD_DIR_NAME = "ralph-payloads"
+DEFAULT_SESSION_RETENTION_DAYS = 112
 DEBUG_PAYLOAD_MAX_BYTES = 1_000_000
 DEBUG_PAYLOAD_MAX_FILES = 200
 DEBUG_PAYLOAD_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -475,6 +477,86 @@ def _safe_filename_component(value: str | None, fallback: str = "unknown") -> st
         return fallback
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
     return cleaned or fallback
+
+
+def _make_session_id(work_item_ids: list[str] | None, phase: str) -> str:
+    """Generate a unique, identifiable session ID for a Pi invocation.
+
+    Format: ralph-{work_item_id}-{phase}-{short_uuid}
+
+    If work_item_ids is provided, the first ID is used. Otherwise,
+    "no-target" is used as the work item identifier.
+
+    Args:
+        work_item_ids: Optional list of work item IDs being processed.
+        phase: The orchestration phase (e.g. "implementation", "audit").
+
+    Returns:
+        A session ID string like "ralph-SA-1234-implementation-a1b2c3d4".
+    """
+    wid_part = work_item_ids[0] if work_item_ids else "no-target"
+    short_uuid = uuid.uuid4().hex[:8]
+    return f"ralph-{wid_part}-{phase}-{short_uuid}"
+
+
+def _get_pi_session_dir() -> Path:
+    """Return the Pi session directory path.
+
+    Checks PI_CODING_AGENT_SESSION_DIR env var first, then falls back
+    to ~/.pi/agent/sessions/.
+    """
+    env_dir = os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return Path.home() / ".pi" / "agent" / "sessions"
+
+
+def _prune_ralph_sessions(session_dir: Path | str, retention_days: int = DEFAULT_SESSION_RETENTION_DAYS) -> int:
+    """Delete ralph-* session files older than retention_days.
+
+    Only targets files with the 'ralph-' prefix in the Pi session directory.
+    Non-Ralph Pi session files with different prefixes are never removed.
+
+    Args:
+        session_dir: Path to the Pi session directory.
+        retention_days: Age threshold in days (default: 112).
+
+    Returns:
+        Number of files pruned.
+    """
+    path = Path(session_dir)
+    if not path.is_dir():
+        logger.debug("ralph.session.prune directory_not_found path=%s", path)
+        return 0
+
+    cutoff = time.time() - (retention_days * 86400)
+    pruned = 0
+    total_bytes = 0
+
+    for entry in path.iterdir():
+        if not entry.is_file():
+            continue
+        if not entry.name.startswith("ralph-"):
+            continue
+        try:
+            stat = entry.stat()
+            if stat.st_mtime < cutoff:
+                total_bytes += stat.st_size
+                entry.unlink()
+                pruned += 1
+        except OSError:
+            logger.debug("ralph.session.prune.os_error path=%s", entry)
+            continue
+
+    if pruned > 0:
+        logger.info(
+            "ralph.session.prune.completed pruned=%d bytes_reclaimed=%d retention_days=%d",
+            pruned,
+            total_bytes,
+            retention_days,
+        )
+
+    return pruned
 
 
 def _extract_pi_session_id(raw_output: str) -> str | None:
@@ -997,6 +1079,8 @@ class RalphLoop:
         pi_stream_timeout: float | None = None,
         signal_file_path: str | None = None,
         webhook_url: str | None = None,
+        session_retention_days: int | None = None,
+        session_dir: str | None = None,
     ):
         self.runner = runner or _default_runner
         self.pi_bin = pi_bin
@@ -1055,6 +1139,13 @@ class RalphLoop:
             self.pi_stream_timeout_seconds = _resolve_stream_timeout(self.model_config, self.model_source)
         # Grace period (seconds) for waiting after SIGTERM before escalating to SIGKILL
         self.pi_cleanup_timeout = 5.0
+        # Session retention config
+        self.session_retention_days = (
+            session_retention_days
+            if session_retention_days is not None
+            else DEFAULT_SESSION_RETENTION_DAYS
+        )
+        self.session_dir = session_dir or _get_pi_session_dir()
         self._pi_process: subprocess.Popen | None = None
         self._debug_context: dict[str, object] = {}
         self._last_structured_response: StructuredResponse | None = None
@@ -1363,10 +1454,12 @@ class RalphLoop:
         )
 
     def _run_pi(self, prompt: str, phase: str = "implementation", work_item_ids: list[str] | None = None, tier: str | None = None) -> str:
-        # Use an ephemeral session for each orchestration call so nested or
-        # retried runs never attempt to continue a previous assistant turn.
+        # Generate a unique session ID for each orchestration call so nested or
+        # retried runs never attempt to continue a previous assistant turn, while
+        # preserving session history for debugging and audit purposes.
         model_for_phase = self._resolve_model_for_phase(phase, tier=tier)
-        cmd = [self.pi_bin, "-p", "--no-session", "--mode", "json", "--model", model_for_phase, prompt]
+        session_id = _make_session_id(work_item_ids, phase)
+        cmd = [self.pi_bin, "-p", "--session-id", session_id, "--mode", "json", "--model", model_for_phase, prompt]
         rendered_cmd = _render_command(cmd)
 
         # Notify: pi subprocess starting (build command BEFORE notifying so cmd is available)
@@ -1714,6 +1807,18 @@ class RalphLoop:
             )
 
         return full_text
+
+    def _prune_sessions(self) -> None:
+        """Prune old Ralph-generated Pi sessions."""
+        try:
+            _prune_ralph_sessions(self.session_dir, self.session_retention_days)
+        except Exception as exc:
+            logger.warning("ralph.session.prune.failed error=%s", exc)
+
+    def _cleanup_loop(self) -> None:
+        """Clean up Pi subprocess and prune old sessions after loop completion."""
+        self._cleanup_pi_process()
+        self._prune_sessions()
 
     def _cleanup_pi_process(self) -> None:
         """Clean up any lingering Pi subprocess after loop completion.
@@ -2393,6 +2498,13 @@ class RalphLoop:
             )
 
     def _scope_in_review(self, scope_ids: Iterable[str]) -> bool:
+        # NOTE: Stage check expansion fix for SA-0MPVR4J1I0063K0T
+        # Previously, this method only allowed "in_review" stage, which caused
+        # CI failures when work items were in terminal stages (done, completed, closed).
+        # The fix expands the allowed stages to include terminal stages to properly
+        # handle per-child iteration scenarios where children may already be completed.
+        # This addresses max attempts errors in CI runs where terminal stage items
+        # were not properly recognized as already processed.
         allowed = {"in_review", "done", "completed", "closed"}
         for item_id in scope_ids:
             item = self._wl_show(item_id).get("workItem", {})
@@ -2798,7 +2910,7 @@ class RalphLoop:
         for attempt in range(1, self.max_attempts + 1):
             if self.cancel_file and os.path.exists(self.cancel_file):
                 logger.info("ralph.loop.cancelled target=%s attempt=%d", focus_id, attempt)
-                self._cleanup_pi_process()
+                self._cleanup_loop()
                 self._notify_event(
                     EventType.CANCELLED,
                     work_item_ids=scope_ids,
@@ -2893,7 +3005,7 @@ class RalphLoop:
                         attempt,
                         no_safe_path_reason,
                     )
-                    self._cleanup_pi_process()
+                    self._cleanup_loop()
                     self._notify_event(
                         EventType.ERROR,
                         work_item_ids=scope_ids,
@@ -2952,7 +3064,7 @@ class RalphLoop:
                         attempt,
                         no_safe_path_reason,
                     )
-                    self._cleanup_pi_process()
+                    self._cleanup_loop()
                     self._notify_event(
                         EventType.ERROR,
                         work_item_ids=scope_ids,
@@ -3041,7 +3153,7 @@ class RalphLoop:
                 # Mark the work item as in_review now that the audit passed
                 self._wl_update_stage(focus_id, "in_review")
                 logger.info("ralph.loop.stage_update target=%s stage=in_review audit=pass", focus_id)
-                self._cleanup_pi_process()
+                self._cleanup_loop()
                 self._notify_event(
                     EventType.COMPLETED,
                     work_item_ids=scope_ids,
@@ -3082,7 +3194,7 @@ class RalphLoop:
                     attempt,
                     self._no_change_cycle_count,
                 )
-                self._cleanup_pi_process()
+                self._cleanup_loop()
                 self._notify_event(
                     EventType.ERROR,
                     work_item_ids=scope_ids,
@@ -3114,7 +3226,7 @@ class RalphLoop:
             )
 
         logger.warning("ralph.loop.max_attempts target=%s", focus_id)
-        self._cleanup_pi_process()
+        self._cleanup_loop()
         self._notify_event(
             EventType.MAX_ATTEMPTS,
             work_item_ids=scope_ids,
@@ -3195,6 +3307,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry", type=int, default=0, help="Number of additional retries for delegated commands (default: 0)")
     parser.add_argument("--retry-delay", type=float, default=1.0, help="Delay in seconds between retries")
     parser.add_argument("--fatal-cmd", action="append", default=[], help="""Command categories to treat as fatal even when --fail-open is set. Example categories: merge, pi, wl, check, effort_and_risk""")
+    parser.add_argument("--session-retention-days", type=int, default=None, help=f"Days to keep Ralph Pi sessions (default: {DEFAULT_SESSION_RETENTION_DAYS})")
+    parser.add_argument("--session-dir", default=None, help="Pi session directory path (default: ~/.pi/agent/sessions/ or PI_CODING_AGENT_SESSION_DIR env var)")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON Lines (jsonl) for lifecycle events and final result")
     return parser
 
@@ -3237,6 +3351,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     phase_model_config = _extract_phase_model_config(config)
     config_model_source_raw = config.get("model_source") if isinstance(config, dict) else None
 
+    # Resolve session retention config
+    config_session_retention_days = None
+    if isinstance(config, dict):
+        session_cfg = config.get("session", {})
+        if isinstance(session_cfg, dict):
+            config_session_retention_days = session_cfg.get("retention_days")
+    session_retention_days = args.session_retention_days if args.session_retention_days is not None else config_session_retention_days
+
     # Resolve signal file path and webhook URL from config
     signal_file_path = str(resolve_signal_path(config))
     webhook_url = resolve_webhook_url(config)
@@ -3272,6 +3394,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         debug_persist=args.debug_persist,
         signal_file_path=signal_file_path,
         webhook_url=webhook_url,
+        session_retention_days=session_retention_days,
+        session_dir=args.session_dir,
     )
     loop.no_autoplan = args.no_autoplan
     try:

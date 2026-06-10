@@ -34,6 +34,78 @@ from skill.ralph.scripts.signal_system import resolve_signal_path
 logger = logging.getLogger("ralph")
 
 
+def _format_timestamp(ts_ms: int | None) -> str:
+    """Convert a millisecond Unix timestamp to an HH:MM:SS string.
+
+    Returns an empty string for ``None`` or invalid values.
+    """
+    if ts_ms is None or not isinstance(ts_ms, (int, float)):
+        return ""
+    try:
+        dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        return dt.strftime("%H:%M:%S")
+    except (OSError, ValueError, OverflowError):
+        return ""
+
+
+def _humanize_time_delta(seconds: int | float | None) -> str:
+    """Return a human-readable relative-time string from seconds.
+
+    Examples::
+
+        >>> _humanize_time_delta(0)
+        'just now'
+        >>> _humanize_time_delta(300)
+        '5 minutes ago'
+        >>> _humanize_time_delta(None)
+        ''
+    """
+    if seconds is None or not isinstance(seconds, (int, float)):
+        return ""
+    seconds = int(seconds)
+    if seconds <= 0:
+        return "just now"
+    if seconds < 60:
+        return f"{seconds} seconds ago"
+    if seconds < 3600:
+        minutes = seconds // 60
+        unit = "minute" if minutes == 1 else "minutes"
+        return f"{minutes} {unit} ago"
+    if seconds < 86400:
+        hours = seconds // 3600
+        unit = "hour" if hours == 1 else "hours"
+        return f"{hours} {unit} ago"
+    days = seconds // 86400
+    unit = "day" if days == 1 else "days"
+    return f"{days} {unit} ago"
+
+
+def _format_log_line(line: str) -> str:
+    """Format a single log line, adding a timestamp for JSON entries.
+
+    If *line* is valid JSON containing a ``ts`` (millisecond timestamp)
+    field the returned string is prefixed with a human-readable
+    ``HH:MM:SS`` timestamp followed by the original JSON payload.
+
+    Plain-text lines are returned unchanged.
+    """
+    if not line:
+        return line
+    try:
+        parsed = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return line
+    if not isinstance(parsed, dict):
+        return line
+    ts = parsed.get("ts")
+    if ts is None:
+        return line
+    time_str = _format_timestamp(ts)
+    if not time_str:
+        return line
+    return f"{time_str} {line}"
+
+
 @dataclass
 class RalphRuntimeContext:
     target_id: str
@@ -429,8 +501,38 @@ def format_status(snapshot: dict[str, object]) -> str:
         lines.append("## Recent Activity")
         lines.append("")
         # Limit to last 20 lines for readability
-        for line in recent[-20:]:
-            lines.append(f"- {line}")
+        last_ts: int | None = None
+        formatted_lines: list[str] = []
+        for raw_line in recent[-20:]:
+            formatted = _format_log_line(raw_line)
+            formatted_lines.append(formatted)
+            # Extract timestamp for recency calculation
+            try:
+                entry = json.loads(raw_line)
+                if isinstance(entry, dict) and "ts" in entry:
+                    last_ts = int(entry["ts"])
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+        for fl in formatted_lines:
+            lines.append(f"- {fl}")
+        # --- Activity Recency Summary ---
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if last_ts is not None:
+            delta_seconds = (now_ms - last_ts) / 1000
+            since_str = _humanize_time_delta(delta_seconds)
+        else:
+            since_str = ""
+        state_word = "running" if state == "running" else "stopped"
+        if since_str:
+            if state == "running":
+                lines.append(f"Ralph is running. Last recorded activity was {since_str}.")
+            else:
+                lines.append(f"Ralph has stopped. Last recorded activity was {since_str}.")
+        else:
+            if state == "running":
+                lines.append("Ralph is running.")
+            else:
+                lines.append("Ralph has stopped.")
         lines.append("")
 
     # --- Exit Code ---

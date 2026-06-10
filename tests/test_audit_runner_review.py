@@ -191,6 +191,110 @@ class TestAssembleIssueReport:
         report = _assemble_issue_report(issue, ac_results, child_results)
         assert report.startswith("Ready to close: No")
 
+    def test_yes_when_children_in_review_stage(self):
+        """Children in in_review stage (even with in_progress status) allow closure."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [{"text": "Criterion 1", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child Task",
+                "id": "SA-CHILD",
+                "status": "in_progress",
+                "stage": "in_review",
+                "ac_results": [{"text": "Child AC", "verdict": "met", "evidence": "y:1 — ok"}],
+            },
+        ]
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert report.startswith("Ready to close: Yes")
+
+    def test_yes_when_children_done_stage(self):
+        """Children in done stage allow closure."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [{"text": "Criterion 1", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child Task",
+                "id": "SA-CHILD",
+                "status": "completed",
+                "stage": "done",
+                "ac_results": [{"text": "Child AC", "verdict": "met", "evidence": "y:1 — ok"}],
+            },
+        ]
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert report.startswith("Ready to close: Yes")
+
+    def test_no_when_children_in_progress_stage(self):
+        """Children in in_progress stage (not in_review) block closure."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [{"text": "Criterion 1", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child Task",
+                "id": "SA-CHILD",
+                "status": "in_progress",
+                "stage": "in_progress",
+                "ac_results": [{"text": "Child AC", "verdict": "met", "evidence": "y:1 — ok"}],
+            },
+        ]
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert report.startswith("Ready to close: No")
+
+    def test_no_when_children_plan_complete_stage(self):
+        """Children in plan_complete stage block closure."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [{"text": "Criterion 1", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child Task",
+                "id": "SA-CHILD",
+                "status": "open",
+                "stage": "plan_complete",
+                "ac_results": [{"text": "Child AC", "verdict": "met", "evidence": "y:1 — ok"}],
+            },
+        ]
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert report.startswith("Ready to close: No")
+
+    def test_mixed_children_stages(self):
+        """Mixed children stages: all must be in_review/done to close."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [{"text": "Criterion 1", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child 1",
+                "id": "SA-C1",
+                "status": "in_progress",
+                "stage": "in_review",
+                "ac_results": [],
+            },
+            {
+                "title": "Child 2",
+                "id": "SA-C2",
+                "status": "in_progress",
+                "stage": "in_progress",
+                "ac_results": [],
+            },
+        ]
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert report.startswith("Ready to close: No")
+
+    def test_empty_stage_excluded_from_check(self):
+        """Children with empty stage are excluded from stage check."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [{"text": "Criterion 1", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child Task",
+                "id": "SA-CHILD",
+                "status": "in_progress",
+                "stage": "",
+                "ac_results": [],
+            },
+        ]
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        # Empty stage children are excluded from check, so all_met is the only factor
+        assert report.startswith("Ready to close: Yes")
+
     def test_contains_section_headings_in_order(self):
         issue = {"id": "SA-123", "title": "Test", "description": ""}
         ac_results = [{"text": "C1", "verdict": "met", "evidence": "x:1 — ok"}]

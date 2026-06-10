@@ -38,6 +38,11 @@
           "maxTokens": 32768
         }
       ]
+    },
+    "LocalAI": {
+      "api": "openai-completions",
+      "baseUrl": "http://localhost:52243/api/v1",
+      "apiKey": "F7FCK9C-FYW4FF0-QZXM1YC-DZ7C1Q3"
     }
   }
 }
