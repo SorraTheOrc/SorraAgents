@@ -951,8 +951,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
             f"Return ONLY a structured JSON array.\n\n"
             f"Review the following acceptance criteria against the codebase. "
             f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
-            f"'verdict' (one of: met, unmet, partial) and 'evidence' "
+            f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
             f"(a one-line note with file:line reference).\n\n"
+            f"Evaluate criteria against user story intent and actual implementation quality, "
+            f"not just literal matching of the original specification. "
+            f"If a criterion has acceptable variance (implementation differs from original "
+            f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
+            f"Include justification in the evidence field.\n\n"
             f"Criteria: {ac_list_json}"
         )
         try:
