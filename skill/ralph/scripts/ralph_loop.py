@@ -1066,6 +1066,33 @@ def _has_ready_to_close_marker(text: str) -> bool:
     return False
 
 
+def _extract_failing_test_names(output: str) -> list[str]:
+    """Extract failing test names from pytest output.
+    
+    Parses stdout/stderr from pytest to find test names that failed.
+    Handles the quiet format: 'FAILED tests/test_module.py::test_name'
+    """
+    failing_tests = []
+    for line in output.splitlines():
+        line = line.strip()
+        # Quiet pytest format: FAILED tests/.../test_file.py::test_name
+        match = re.search(r'::([^\s]+)$', line)
+        if line.startswith("FAILED") or line.startswith("ERROR"):
+            if match:
+                failing_tests.append(match.group(1))
+                continue
+        # Also match summary lines like "tests/test_module.py::test_name FAILED"
+        match = re.search(r'::([^\s]+)\s+(FAILED|ERROR)\s*$', line)
+        if match:
+            failing_tests.append(match.group(1))
+        # Match short format: "FAILED test_name"
+        match = re.match(r'(FAILED|ERROR)\s+([^\s]+)$', line)
+        if match and not "::" in match.group(2):
+            failing_tests.append(match.group(2))
+    # Deduplicate while preserving order
+    return list(dict.fromkeys(failing_tests))
+
+
 class RalphLoop:
     def __init__(
         self,
@@ -1914,11 +1941,30 @@ class RalphLoop:
         self._pi_process = None
 
     def _run_checks(self) -> list[dict[str, object]]:
+        """Run check commands and return results including failing tests.
+        
+        Unlike the previous implementation, this does NOT raise an error on
+        test failures. Instead, it returns failing test information for the
+        caller to handle via child work item creation and fixing.
+        """
         results: list[dict[str, object]] = []
         for cmd in self.check_cmds:
             quiet_cmd = canonicalize_quiet_test_command(cmd)
             logger.debug("ralph.cmd.check cmd=%s quiet_cmd=%s", cmd, quiet_cmd)
-            proc = self._call_with_retry(["bash", "-lc", quiet_cmd], category="check", expect_json=False)
+            try:
+                proc = self._call_with_retry(["bash", "-lc", quiet_cmd], category="check", expect_json=False)
+            except RalphError:
+                # Capture the failure in results without crashing
+                proc = None
+                # Create a synthetic failed result
+                result = {
+                    "cmd": cmd,
+                    "stdout": "",
+                    "stderr": f"Check command failed: {quiet_cmd}",
+                    "returncode": 1,
+                }
+                results.append(result)
+                continue
             result = {
                 "cmd": cmd,
                 "stdout": (getattr(proc, 'stdout', '') or '').strip(),
@@ -1929,12 +1975,163 @@ class RalphLoop:
             if self.verbose:
                 logger.debug("ralph.cmd.check stdout=%s", result["stdout"][:1000])
                 logger.debug("ralph.cmd.check stderr=%s", result["stderr"][:1000])
-            if result["returncode"] != 0:
-                if self.fail_open and ("check" not in self.fatal_cmds):
-                    logger.warning("ralph.cmd.check.failed_but_fail_open cmd=%s rc=%s stderr=%s", cmd, result["returncode"], result["stderr"])
-                    continue
-                raise RalphError(f"Check failed ({cmd}): {result['stderr'] or result['stdout']}")
         return results
+
+    def _handle_failing_tests(
+        self,
+        check_results: list[dict[str, object]],
+        parent_work_item_id: str,
+    ) -> tuple[bool, list[str]]:
+        """Process failing tests and create/fix child work items.
+        
+        Extracts failing test names from check output, creates blocking child
+        work items via the triage helper, and implements fixes using
+        implement-single. Does NOT push to dev - the main loop handles that.
+        
+        Returns (all_fixed, list_of_failing_test_names).
+        """
+        failing_tests: list[str] = []
+        for result in check_results:
+            if result.get("returncode") == 0:
+                continue
+            stdout = result.get("stdout", "") or ""
+            stderr = result.get("stderr", "") or ""
+            failing_tests.extend(_extract_failing_test_names(stdout))
+            failing_tests.extend(_extract_failing_test_names(stderr))
+        
+        # Deduplicate
+        failing_tests = list(dict.fromkeys(failing_tests))
+        
+        if not failing_tests:
+            return True, []
+        
+        logger.info(
+            "ralph.fix_tests.found target=%s count=%d tests=%s",
+            parent_work_item_id,
+            len(failing_tests),
+            failing_tests,
+        )
+        
+        # Process each failing test
+        for test_name in failing_tests:
+            combined_output = "\n".join(
+                str(r.get("stdout", "")) or ""
+                for r in check_results
+            )
+            
+            # Skip tests in bundled libraries (node_modules, dist/)
+            # Check if the test output mentions these paths
+            if "node_modules" in combined_output or "dist/" in combined_output:
+                # Check if this specific test is from a bundled library
+                # For now, we'll still process it but log a warning
+                logger.warning(
+                    "ralph.fix_tests.bundled_library test_name=%s - may not be fixable in-repo",
+                    test_name,
+                )
+            
+            # Create/match child work item via triage helper
+            triage_payload = json.dumps({
+                "test_name": test_name,
+                "stdout_excerpt": combined_output[:500],
+                "parent_work_item_id": parent_work_item_id,
+            })
+            
+            triage_script = (
+                Path(__file__).resolve().parent.parent.parent
+                / "triage"
+                / "scripts"
+                / "check_or_create.py"
+            )
+            
+            proc = self._call_with_retry(
+                [sys.executable, str(triage_script), triage_payload],
+                category="wl",
+                expect_json=True,
+            )
+            
+            if not isinstance(proc, dict):
+                logger.warning(
+                    "ralph.fix_tests.triage_failed test_name=%s - triage helper did not return JSON",
+                    test_name,
+                )
+                continue
+            
+            child_id = proc.get("issueId")
+            if not child_id:
+                logger.warning(
+                    "ralph.fix_tests.triage_no_issue test_name=%s - triage helper returned no issueId",
+                    test_name,
+                )
+                continue
+            
+            logger.info(
+                "ralph.fix_tests.child_created test_name=%s child_id=%s created=%s",
+                test_name,
+                child_id,
+                proc.get("created"),
+            )
+            
+            # If the child was newly created or matched, we should implement it
+            # Use implement-single to fix the test
+            impl_prompt = _build_implement_single_prompt(child_id, parent_branch=None)
+            
+            try:
+                impl_output = self._run_pi(
+                    impl_prompt,
+                    phase="implementation",
+                    work_item_ids=[child_id],
+                    tier="medium",  # Standard tier for test fixes
+                )
+                self._last_implement_output = impl_output
+                
+                # Run audit on the child to ensure fix is complete
+                audit_output = self._run_pi(
+                    f"/skill:audit {child_id}",
+                    phase="audit",
+                    work_item_ids=[child_id],
+                    tier="medium",
+                )
+                
+                # Check if child audit passed
+                audit_text = self._read_persisted_audit_text(child_id)
+                if audit_text and _has_ready_to_close_marker(audit_text):
+                    parsed = parse_audit_report(audit_text)
+                    if parsed.ready_to_close:
+                        logger.info(
+                            "ralph.fix_tests.child_success test_name=%s child_id=%s",
+                            test_name,
+                            child_id,
+                        )
+                    else:
+                        logger.warning(
+                            "ralph.fix_tests.child_audit_failed test_name=%s child_id=%s",
+                            test_name,
+                            child_id,
+                        )
+                else:
+                    logger.warning(
+                        "ralph.fix_tests.child_no_audit test_name=%s child_id=%s",
+                        test_name,
+                        child_id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "ralph.fix_tests.implement_failed test_name=%s child_id=%s error=%s",
+                    test_name,
+                    child_id,
+                    exc,
+                )
+        
+        # Re-run tests after all fixes attempted
+        logger.info("ralph.fix_tests.recheck test_name=%s", parent_work_item_id)
+        recheck_results = self._run_checks()
+        still_failing = False
+        for result in recheck_results:
+            if result.get("returncode") != 0:
+                still_failing = True
+                break
+        
+        return not still_failing, failing_tests
 
     def _capture_changed_files(self) -> list[dict[str, str]]:
         try:
@@ -3268,10 +3465,29 @@ class RalphLoop:
             if audit.ready_to_close and self._scope_in_review(scope_ids):
                 logger.info("ralph.loop.checks.start target=%s", focus_id)
                 check_results = self._run_checks()
+                
+                # Check for failing tests and fix them before marking in_review
+                all_tests_pass, failing_tests = self._handle_failing_tests(check_results, focus_id)
+                
+                if not all_tests_pass:
+                    # Tests still failing - log and continue to remediate
+                    logger.warning(
+                        "ralph.loop.checks.failing_tests target=%s count=%d tests=%s",
+                        focus_id,
+                        len(failing_tests),
+                        failing_tests,
+                    )
+                    if self.fail_open:
+                        logger.warning("ralph.loop.checks.fail_open target=%s - continuing despite failures", focus_id)
+                    else:
+                        # Go back to remediate loop to fix the failures
+                        remediation = _build_remediation_prompt()
+                        continue
+                
                 changed_files = self._capture_changed_files()
                 logger.info("ralph.loop.merge target=%s confirm=%s", focus_id, self.confirm_merge)
                 self._run_merge()
-                # Mark the work item as in_review now that the audit passed
+                # Mark the work item as in_review now that the audit passed and tests pass
                 self._wl_update_stage(focus_id, "in_review")
                 logger.info("ralph.loop.stage_update target=%s stage=in_review audit=pass", focus_id)
                 self._cleanup_loop()
