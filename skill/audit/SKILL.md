@@ -32,7 +32,7 @@ Ready to close: Yes/No
 
 A work item is considered ready to close when:
 
-1. **All acceptance criteria are met** — every criterion in the parent and all children must have verdict `met`.
+1. **All acceptance criteria are met or have acceptable variance** — every criterion in the parent and all children must have verdict `met` or `adjusted`. The `adjusted` verdict indicates that the criterion was adapted during implementation in a way that still satisfies the user story intent.
 2. **All active children are in `in_review` or `done` stage** — children with `status: in_progress` but `stage: in_review` are acceptable and do NOT block closure. Only children with stages like `idea`, `intake_complete`, `plan_complete`, or other pre-review stages block closure.
 
 Children with an empty stage (`""`) are excluded from the stage check (they may be newly created or not yet processed).
@@ -45,9 +45,23 @@ Children with an empty stage (`""`) are excluded from the stage check (they may 
 
 | # | Criterion | Verdict | Evidence |
 |---|-----------|---------|----------|
-| 1 | <criterion text> | met/unmet/partial | <file_path:line_number — one-line note> |
+| 1 | <criterion text> | met/unmet/partial/adjusted | <file_path:line_number — one-line note> |
 
 <If no acceptance criteria were found, write: "No acceptance criteria defined.">
+
+## Variance Decisions
+
+When one or more acceptance criteria have verdict `adjusted`, a **Variance Decisions** section appears after the Acceptance Criteria Status table. This section documents the adjustments made and the justification for accepting them.
+
+| # | Source | Criterion | Justification |
+|---|--------|-----------|---------------|
+| 1 | parent or child (<id>) | <criterion text> | <justification> |
+
+<This section is only included when at least one criterion has verdict `adjusted`; otherwise it is omitted.>
+
+**Variance decision template:**
+- **AC<#> adjusted to allow <description of adjustment>.**
+- **Justification:** <why the variance is acceptable — user story intent preserved, quality standards met>
 
 ## Children Status
 
@@ -55,9 +69,16 @@ Children with an empty stage (`""`) are excluded from the stage check (they may 
 
 | # | Criterion | Verdict | Evidence |
 |---|-----------|---------|----------|
-| 1 | <criterion text> | met/unmet/partial | <file_path:line_number — one-line note> |
+| 1 | <criterion text> | met/unmet/partial/adjusted | <file_path:line_number — one-line note> |
 
 <If there are no children, write: "No children.">
+
+### Verdict guidance
+
+- **met** — Acceptance criterion is fully satisfied.
+- **unmet** — Acceptance criterion is not satisfied; blocks closure.
+- **partial** — Acceptance criterion is partially but not fully satisfied; blocks closure.
+- **adjusted** — Acceptance criterion was adapted during implementation. The change is acceptable because it still satisfies the user story intent, produces bug-free execution, and meets quality standards. Does **not** block closure. When using this verdict, include a clear justification in the evidence field explaining why the variance is acceptable.
 
 ## Success Criteria
 

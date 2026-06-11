@@ -9,6 +9,13 @@ Usage:
   audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>]
   audit_runner.py project [--pi-bin pi] [--model <name>]
 
+Verdicts:
+  met       – acceptance criterion fully satisfied
+  unmet     – acceptance criterion not satisfied
+  partial   – acceptance criterion partially satisfied
+  adjusted  – acceptance criterion adapted with acceptable variance
+              (does not block ready-to-close, recorded in variance decisions)
+
 Exit codes:
   0 – success (report printed to stdout)
   1 – Worklog / CLI / Pi failure
@@ -34,6 +41,13 @@ from skill.audit.scripts.persist_audit import persist_audit
 # Constants
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
+
+# Verdict constants
+VERDICT_MET = "met"
+VERDICT_UNMET = "unmet"
+VERDICT_PARTIAL = "partial"
+VERDICT_ADJUSTED = "adjusted"
+_ACCEPTABLE_VERDICTS = {VERDICT_MET, VERDICT_ADJUSTED}
 
 # Model / config constants (following Ralph's pattern)
 ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "ralph" / "assets" / ".ralph.json"
@@ -253,7 +267,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     On success, implementations may also include additional diagnostic keys
     such as ``raw_stdout``, ``raw_stderr`` and ``extracted_text`` which are
     useful for debugging. This function returns at minimum
-    ``{"verdict": <met|unmet|partial>, "evidence": <text>}``.
+    ``{"verdict": <met|unmet|partial|adjusted>, "evidence": <text>}``.
 
     Uses the same JSON-stream protocol as ralph (``pi -p --mode json``).
     Uses ``communicate()`` to avoid pipe-buffer deadlocks.
@@ -531,13 +545,14 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       ``title``, ``id``, ``status``, ``stage``, ``ac_results``.
 
     Ready-to-close logic:
-      - All acceptance criteria (parent + children) must be ``met``.
+      - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
+        ``adjusted`` criteria represent acceptable variance and do not block closure.
       - All non-deleted children must be in ``in_review`` or ``done`` stage.
         Children with ``status: in_progress`` but ``stage: in_review`` are
         acceptable and do NOT block closure.
     """
-    all_ac_met = all(
-        r["verdict"] == "met"
+    all_ac_acceptable = all(
+        r["verdict"] in _ACCEPTABLE_VERDICTS
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
     # Check that all active children are in in_review or done stage
@@ -546,25 +561,33 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         c.get("stage") in ("in_review", "done")
         for c in active_children
     )
-    ready = "Yes" if (all_ac_met and all_children_reviewed) else "No"
+    ready = "Yes" if (all_ac_acceptable and all_children_reviewed) else "No"
 
     lines = [f"Ready to close: {ready}", "", "## Summary", ""]
 
+    # Count verdicts across all criteria (parent + children)
+    all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
+    met_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_MET)
+    adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
+    unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
+    partial_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_PARTIAL)
+
+    not_reviewed = [
+        c for c in child_results
+        if c.get("stage") not in ("in_review", "done", "")
+    ]
+
     if ready == "Yes":
-        lines.append(
+        parts = []
+        parts.append(
             f"All {len(ac_results)} acceptance criteria for work item "
-            f"{issue.get('id', '?')} are met. All children are in in_review or done stage."
+            f"{issue.get('id', '?')} are acceptable"
         )
+        if adjusted_count > 0:
+            parts.append(f"({adjusted_count} with acceptable variance)")
+        parts.append(". All children are in in_review or done stage.")
+        lines.append(" ".join(parts))
     else:
-        unmet_count = sum(
-            1 for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
-            if r["verdict"] != "met"
-        )
-        # Identify children not in in_review/done stage
-        not_reviewed = [
-            c for c in child_results
-            if c.get("stage") not in ("in_review", "done", "")
-        ]
         if unmet_count > 0 and not_reviewed:
             lines.append(
                 f"{unmet_count} acceptance criteria not met AND "
@@ -574,6 +597,11 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(
                 f"{unmet_count} of {len(ac_results)} acceptance criteria for "
                 f"work item {issue.get('id', '?')} are not met."
+            )
+        elif partial_count > 0:
+            lines.append(
+                f"{partial_count} of {len(ac_results)} acceptance criteria are "
+                f"only partially met."
             )
         else:
             lines.append(
@@ -594,6 +622,38 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             evidence = r.get("evidence", "") or ""
             lines.append(
                 f"| {i} | {r['text']} | {r['verdict']} | {evidence} |"
+            )
+
+    # Variance Decisions section: appears when any parent or child criterion
+    # has 'adjusted' verdict
+    variance_criteria = [
+        {"index": i + 1, "source": "parent", "text": r["text"], "evidence": r.get("evidence", "") or ""}
+        for i, r in enumerate(ac_results)
+        if r["verdict"] == VERDICT_ADJUSTED
+    ]
+    for child in child_results:
+        for i, r in enumerate(child.get("ac_results", [])):
+            if r["verdict"] == VERDICT_ADJUSTED:
+                variance_criteria.append({
+                    "index": i + 1,
+                    "source": f"child ({child.get('id', '')})",
+                    "text": r["text"],
+                    "evidence": r.get("evidence", "") or "",
+                })
+
+    if variance_criteria:
+        lines.append("")
+        lines.append("## Variance Decisions")
+        lines.append("")
+        lines.append("The following acceptance criteria have acceptable variance."
+                      " These criteria were adjusted during implementation but"
+                      " satisfy the user story intent.")
+        lines.append("")
+        lines.append("| # | Source | Criterion | Justification |")
+        lines.append("|---|--------|-----------|---------------|")
+        for vc in variance_criteria:
+            lines.append(
+                f"| {vc['index']} | {vc['source']} | {vc['text']} | {vc['evidence']} |"
             )
 
     lines.append("")
@@ -638,9 +698,13 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict]) -> str:
 
     *child* is a dict with keys ``title``, ``id``, ``status``, ``stage``.
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
+
+    Ready-to-close logic:
+      - All acceptance criteria must be ``met`` or ``adjusted``.
+        ``adjusted`` criteria represent acceptable variance and do not block closure.
     """
-    all_met = all(r["verdict"] == "met" for r in ac_results) if ac_results else False
-    ready = "Yes" if all_met else "No"
+    all_acceptable = all(r["verdict"] in _ACCEPTABLE_VERDICTS for r in ac_results) if ac_results else False
+    ready = "Yes" if all_acceptable else "No"
 
     lines = [
         f"Ready to close: {ready}",
@@ -664,6 +728,25 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict]) -> str:
             evidence = r.get("evidence", "") or ""
             lines.append(
                 f"| {i} | {r['text']} | {r['verdict']} | {evidence} |"
+            )
+
+    # Variance Decisions section for child report
+    variance_criteria = [
+        {"index": i + 1, "text": r["text"], "evidence": r.get("evidence", "") or ""}
+        for i, r in enumerate(ac_results)
+        if r["verdict"] == VERDICT_ADJUSTED
+    ]
+    if variance_criteria:
+        lines.append("")
+        lines.append("## Variance Decisions")
+        lines.append("")
+        lines.append("The following acceptance criteria have acceptable variance:")
+        lines.append("")
+        lines.append("| # | Criterion | Justification |")
+        lines.append("|---|-----------|---------------|")
+        for vc in variance_criteria:
+            lines.append(
+                f"| {vc['index']} | {vc['text']} | {vc['evidence']} |"
             )
 
     lines.append("")
@@ -782,9 +865,14 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
 
 def _build_issue_json(issue: dict, ac_results: list[dict],
                       child_results: list[dict]) -> dict:
-    """Build structured JSON payload for issue-mode audit."""
-    all_ac_met = all(
-        r["verdict"] == "met"
+    """Build structured JSON payload for issue-mode audit.
+
+    Ready-to-close logic:
+      - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
+        ``adjusted`` criteria represent acceptable variance and do not block closure.
+    """
+    all_ac_acceptable = all(
+        r["verdict"] in _ACCEPTABLE_VERDICTS
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
     # Check that all active children are in in_review or done stage
@@ -793,14 +881,28 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         c.get("stage") in ("in_review", "done")
         for c in active_children
     )
-    ready = all_ac_met and all_children_reviewed
+    ready = all_ac_acceptable and all_children_reviewed
+
+    all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
+    unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
+    adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
+
+    if all_ac_acceptable:
+        if adjusted_count > 0:
+            summary = (
+                f"All {len(ac_results)} acceptance criteria acceptable "
+                f"({adjusted_count} with acceptable variance)."
+            )
+        else:
+            summary = f"All {len(ac_results)} acceptance criteria met."
+    else:
+        summary = (
+            f"{unmet_count} of {len(ac_results)} acceptance criteria not met."
+        )
+
     return {
         "ready_to_close": ready,
-        "summary": (
-            f"All {len(ac_results)} acceptance criteria met."
-            if all_ac_met else
-            f"{sum(1 for r in ac_results if r['verdict'] != 'met')} of {len(ac_results)} acceptance criteria not met."
-        ),
+        "summary": summary,
         "acceptance_criteria": ac_results,
         "children": child_results,
     }
@@ -908,8 +1010,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 f"Review the following acceptance criteria for child work item '{child.get('title', '')}' "
                 f"against the codebase. "
                 f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
-                f"'verdict' (one of: met, unmet, partial) and 'evidence' "
+                f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
                 f"(a one-line note with file:line reference).\n\n"
+                f"If a criterion has acceptable variance (implementation differs from original "
+                f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
+                f"Include justification in the evidence field.\n\n"
                 f"Criteria: {child_ac_list}"
             )
             try:

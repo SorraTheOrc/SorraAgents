@@ -89,6 +89,16 @@ class AuditParseResult:
     def unmet_or_partial(self) -> list[CriterionResult]:
         return [c for c in self.criteria if c.verdict in {"unmet", "partial"}]
 
+    @property
+    def unmet_or_partial_or_adjusted(self) -> list[CriterionResult]:
+        """Criteria that are not fully met, including adjusted (acceptable variance).
+
+        Adjusted criteria are excluded from ``unmet_or_partial`` since they represent
+        acceptable variance, but this property provides access to all non-met verdicts
+        for callers that need the full picture.
+        """
+        return [c for c in self.criteria if c.verdict not in {"met", "adjusted"}]
+
 
 class JsonLineFormatter(logging.Formatter):
     """Emit log records as JSON lines and preserve structured extras.
@@ -171,7 +181,7 @@ def parse_audit_report(report_text: str) -> AuditParseResult:
         if parts[0] in {"#", "---"}:
             continue
         verdict = parts[2].lower()
-        if verdict not in {"met", "unmet", "partial"}:
+        if verdict not in {"met", "unmet", "partial", "adjusted"}:
             continue
         criteria.append(CriterionResult(text=parts[1], verdict=verdict, evidence=parts[3]))
     return AuditParseResult(ready_to_close=ready, criteria=criteria)
