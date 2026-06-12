@@ -69,8 +69,8 @@ def project_with_python_and_typescript(project_with_python: Path) -> Path:
 @pytest.fixture
 def empty_project(temp_project: Path) -> Path:
     """Create a project with no recognizable code files."""
-    (temp_project / "README.md").touch()
     (temp_project / "data.json").touch()
+    (temp_project / "config.yaml").touch()
     return temp_project
 
 
@@ -274,3 +274,158 @@ class TestDetectionIntegration:
         probe = detection.probe_linter("eslint")
         assert probe["name"] == "eslint"
         assert "available" in probe
+# Phase 2 fixtures
+@pytest.fixture
+def project_with_markdown(temp_project: Path) -> Path:
+    """Create a project with Markdown files."""
+    (temp_project / "docs").mkdir(parents=True, exist_ok=True)
+    (temp_project / "docs" / "README.md").touch()
+    (temp_project / "docs" / "CONTRIBUTING.md").touch()
+    return temp_project
+
+
+@pytest.fixture
+def project_with_shell(temp_project: Path) -> Path:
+    """Create a project with Shell scripts."""
+    (temp_project / "scripts").mkdir(parents=True, exist_ok=True)
+    (temp_project / "scripts" / "setup.sh").touch()
+    (temp_project / "scripts" / "deploy.bash").touch()
+    return temp_project
+
+
+@pytest.fixture
+def project_with_javascript(temp_project: Path) -> Path:
+    """Create a project with JavaScript files."""
+    (temp_project / "src").mkdir(parents=True, exist_ok=True)
+    (temp_project / "src" / "index.js").touch()
+    (temp_project / "src" / "config.cjs").touch()
+    (temp_project / "src" / "module.mjs").touch()
+    return temp_project
+
+
+@pytest.fixture
+def project_with_nodejs(temp_project: Path) -> Path:
+    """Create a Node.js project (detected via package.json)."""
+    (temp_project / "package.json").touch()
+    (temp_project / "package-lock.json").touch()
+    return temp_project
+
+
+@pytest.fixture
+def project_with_csharp(temp_project: Path) -> Path:
+    """Create a C# project."""
+    (temp_project / "src").mkdir(parents=True, exist_ok=True)
+    (temp_project / "src" / "Program.cs").touch()
+    (temp_project / "src" / "Utils.cs").touch()
+    (temp_project / "Project.csproj").touch()
+    return temp_project
+
+
+# Phase 2 test classes
+class TestPhase2LanguageDetection:
+    """Tests for Phase 2 language detection (Markdown, Shell, JavaScript, C#)."""
+
+    def _import_detection(self):
+        """Import detection module; skip test if not yet implemented."""
+        try:
+            from skill.code_review.scripts import detection
+            return detection
+        except (ImportError, ModuleNotFoundError) as exc:
+            pytest.skip(f"Detection module not yet available: {exc}")
+
+    def test_detects_markdown_if_supported(self, project_with_markdown: Path):
+        """detect_languages() returns ['markdown'] if Markdown detection is implemented."""
+        detection = self._import_detection()
+        result = detection.detect_languages(str(project_with_markdown))
+        # Check if markdown is in LANGUAGE_EXTENSIONS; skip if not yet supported
+        if "markdown" not in detection.LANGUAGE_EXTENSIONS:
+            pytest.skip("Markdown detection not yet implemented (Phase 2)")
+        assert "markdown" in result
+
+    def test_detects_shell_if_supported(self, project_with_shell: Path):
+        """detect_languages() returns ['shell'] if Shell detection is implemented."""
+        detection = self._import_detection()
+        result = detection.detect_languages(str(project_with_shell))
+        if "shell" not in detection.LANGUAGE_EXTENSIONS:
+            pytest.skip("Shell detection not yet implemented (Phase 2)")
+        assert "shell" in result
+
+    def test_detects_javascript_if_supported(self, project_with_javascript: Path):
+        """detect_languages() returns ['javascript'] if JS detection is implemented."""
+        detection = self._import_detection()
+        result = detection.detect_languages(str(project_with_javascript))
+        if "javascript" not in detection.LANGUAGE_EXTENSIONS:
+            pytest.skip("JavaScript detection not yet implemented (Phase 2)")
+        assert "javascript" in result
+
+    def test_detects_nodejs_if_supported(self, project_with_nodejs: Path):
+        """detect_languages() detects Node.js via package.json if supported."""
+        detection = self._import_detection()
+        result = detection.detect_languages(str(project_with_nodejs))
+        if "javascript" not in detection.LANGUAGE_EXTENSIONS:
+            pytest.skip("Node.js detection not yet implemented (Phase 2)")
+        assert "javascript" in result
+
+    def test_detects_csharp_if_supported(self, project_with_csharp: Path):
+        """detect_languages() returns ['csharp'] if C# detection is implemented."""
+        detection = self._import_detection()
+        result = detection.detect_languages(str(project_with_csharp))
+        if "csharp" not in detection.LANGUAGE_EXTENSIONS:
+            pytest.skip("C# detection not yet implemented (Phase 2)")
+        assert "csharp" in result
+
+
+class TestPhase2LinterProbing:
+    """Tests for Phase 2 linter probing (markdownlint, shellcheck, dotnet-format)."""
+
+    def _import_detection(self):
+        """Import detection module; skip test if not yet implemented."""
+        try:
+            from skill.code_review.scripts import detection
+            return detection
+        except (ImportError, ModuleNotFoundError) as exc:
+            pytest.skip(f"Detection module not yet available: {exc}")
+
+    def test_probe_markdownlint(self):
+        """probe_linter('markdownlint') returns expected structure."""
+        detection = self._import_detection()
+        result = detection.probe_linter("markdownlint")
+        assert isinstance(result, dict)
+        assert result["name"] == "markdownlint"
+        assert "available" in result
+        assert isinstance(result["available"], bool)
+
+    def test_probe_shellcheck(self):
+        """probe_linter('shellcheck') returns expected structure."""
+        detection = self._import_detection()
+        result = detection.probe_linter("shellcheck")
+        assert isinstance(result, dict)
+        assert result["name"] == "shellcheck"
+        assert "available" in result
+        assert isinstance(result["available"], bool)
+
+    def test_probe_dotnet_format(self):
+        """probe_linter('dotnet-format') returns expected structure."""
+        detection = self._import_detection()
+        result = detection.probe_linter("dotnet-format")
+        assert isinstance(result, dict)
+        assert result["name"] == "dotnet-format"
+        assert "available" in result
+        assert isinstance(result["available"], bool)
+
+    def test_probe_dotnet(self):
+        """probe_linter('dotnet') returns expected structure."""
+        detection = self._import_detection()
+        result = detection.probe_linter("dotnet")
+        assert isinstance(result, dict)
+        assert result["name"] == "dotnet"
+        assert "available" in result
+        assert isinstance(result["available"], bool)
+
+    def test_probe_eslint_returns_structure(self):
+        """probe_linter('eslint') returns expected structure (also used for JS/Node)."""
+        detection = self._import_detection()
+        result = detection.probe_linter("eslint")
+        assert isinstance(result, dict)
+        assert result["name"] == "eslint"
+        assert "available" in result

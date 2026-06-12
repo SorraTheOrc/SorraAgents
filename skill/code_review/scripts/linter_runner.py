@@ -4,6 +4,9 @@ Provides:
   - classify_finding(): Map raw linter severity to a normalised level.
   - run_ruff(): Execute ruff on a project and return structured findings.
   - run_eslint(): Execute eslint on a project and return structured findings.
+  - run_markdownlint(): Execute markdownlint on a project and return structured findings.
+  - run_shellcheck(): Execute shellcheck on a project and return structured findings.
+  - run_dotnet_format(): Execute dotnet format on a project and return structured findings.
   - run_linters_for_project(): Orchestrate detection + linting in one call.
 
 Severity mapping
@@ -20,6 +23,19 @@ Severity mapping
   - 2 / "error" → high
   - 1 / "warn" → medium
   - 0 / "off" → low
+
+*Markdownlint severity mapping:*
+  - error → high
+  - warning → medium
+  - default → medium
+
+*Shellcheck severity mapping:*
+  - error → high
+  - warning → medium
+  - default → medium
+
+*dotnet-format severity mapping:*
+  - All findings → medium (formatting issues)
 """
 
 from __future__ import annotations
@@ -119,10 +135,13 @@ def classify_finding(linter: str, raw_severity: Any) -> str:
     """Map a linter's raw severity value to a normalised severity level.
 
     Args:
-        linter: The linter name (``"ruff"``, ``"eslint"``).
+        linter: The linter name (``"ruff"``, ``"eslint"``, ``"markdownlint"``,
+                ``"shellcheck"``, ``"dotnet-format"``).
         raw_severity: The raw severity value from the linter's output.
                       For ruff this is a rule code like ``"F841"``.
                       For eslint this is a number (0,1,2) or label.
+                      For markdownlint/shellcheck this is a string label.
+                      For dotnet-format this is ignored (always medium).
 
     Returns:
         One of ``"critical"``, ``"high"``, ``"medium"``, ``"low"``.
@@ -131,7 +150,47 @@ def classify_finding(linter: str, raw_severity: Any) -> str:
         return _classify_ruff(str(raw_severity) if raw_severity is not None else "")
     elif linter == "eslint":
         return _classify_eslint(raw_severity)
+    elif linter == "markdownlint":
+        return _classify_markdownlint(raw_severity)
+    elif linter == "shellcheck":
+        return _classify_shellcheck(raw_severity)
+    elif linter == "dotnet-format":
+        return "medium"
     # Unknown linter
+    return "medium"
+
+
+def _classify_markdownlint(severity: Any) -> str:
+    """Classify a markdownlint severity to normalised level.
+    
+    Args:
+        severity: The severity value (typically "error" or "warning").
+    
+    Returns:
+        One of "high", "medium", "low".
+    """
+    if isinstance(severity, str):
+        if severity.lower() in ("error",):
+            return "high"
+        if severity.lower() in ("warn", "warning"):
+            return "medium"
+    return "medium"
+
+
+def _classify_shellcheck(severity: Any) -> str:
+    """Classify a shellcheck severity to normalised level.
+    
+    Args:
+        severity: The severity value (typically "error" or "warning").
+    
+    Returns:
+        One of "high", "medium", "low".
+    """
+    if isinstance(severity, str):
+        if severity.lower() in ("error",):
+            return "high"
+        if severity.lower() in ("warn", "warning"):
+            return "medium"
     return "medium"
 
 
@@ -273,7 +332,7 @@ def run_eslint(
     root = _normalize_paths(project_root)
     languages = detect_languages(root)
 
-    if "typescript" not in languages:
+    if "typescript" not in languages and "javascript" not in languages:
         return []
 
     if runner is None:
@@ -328,6 +387,211 @@ def run_eslint(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 Linter runners
+# ---------------------------------------------------------------------------
+
+
+def run_markdownlint(
+    project_root: Union[str, os.PathLike[str], None] = None,
+    runner: Any = None,
+) -> list[dict[str, Any]]:
+    """Run markdownlint on the given project root and return structured findings.
+
+    Only runs if the linter is available on PATH and Markdown files are detected.
+
+    Args:
+        project_root: Path to the project root (default: cwd).
+        runner: Optional injectable runner for testing.
+
+    Returns:
+        A list of finding dicts (same format as :func:`run_ruff`).
+        Returns an empty list if markdownlint is not available or no MD files exist.
+    """
+    probe = probe_linter("markdownlint")
+    if not probe["available"]:
+        return []
+
+    root = _normalize_paths(project_root)
+    languages = detect_languages(root)
+
+    if "markdown" not in languages:
+        return []
+
+    if runner is None:
+        runner = _run_subprocess
+
+    findings: list[dict[str, Any]] = []
+
+    # markdownlint-cli2 uses --json flag, fallback to markdownlint
+    cmd = ["markdownlint", "--json", str(root)]
+    result = runner(cmd)
+
+    if result.returncode not in (0, 1):
+        return []
+
+    output = result.stdout.strip()
+    if not output:
+        return []
+
+    try:
+        raw = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(raw, list):
+        return []
+
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        severity = classify_finding("markdownlint", item.get("severity", "warning"))
+        findings.append({
+            "file": str(item.get("path", "")),
+            "line": item.get("lineNumber", 0),
+            "severity": severity,
+            "message": item.get("message", ""),
+            "linter": "markdownlint",
+            "code": str(item.get("rule", "")),
+        })
+
+    return findings
+
+
+def run_shellcheck(
+    project_root: Union[str, os.PathLike[str], None] = None,
+    runner: Any = None,
+) -> list[dict[str, Any]]:
+    """Run shellcheck on the given project root and return structured findings.
+
+    Only runs if shellcheck is available on PATH and Shell files are detected.
+
+    Args:
+        project_root: Path to the project root (default: cwd).
+        runner: Optional injectable runner for testing.
+
+    Returns:
+        A list of finding dicts (same format as :func:`run_ruff`).
+        Returns an empty list if shellcheck is not available or no Shell files exist.
+    """
+    probe = probe_linter("shellcheck")
+    if not probe["available"]:
+        return []
+
+    root = _normalize_paths(project_root)
+    languages = detect_languages(root)
+
+    if "shell" not in languages:
+        return []
+
+    if runner is None:
+        runner = _run_subprocess
+
+    findings: list[dict[str, Any]] = []
+
+    # Find shell scripts to check
+    shell_files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for filename in filenames:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in {".sh", ".bash", ".zsh", ".ksh"}:
+                shell_files.append(Path(dirpath) / filename)
+
+    if not shell_files:
+        return []
+
+    for shell_file in shell_files:
+        cmd = ["shellcheck", "-f", "json", str(shell_file)]
+        result = runner(cmd)
+
+        if result.returncode not in (0, 1):
+            continue
+
+        output = result.stdout.strip()
+        if not output:
+            continue
+
+        try:
+            raw = json.loads(output)
+        except json.JSONDecodeError:
+            continue
+
+        # shellcheck -f json outputs a list of diagnostics
+        diagnostics = raw if isinstance(raw, list) else [raw]
+        for diag in diagnostics:
+            if not isinstance(diag, dict):
+                continue
+            severity = classify_finding("shellcheck", diag.get("severity", "warning"))
+            findings.append({
+                "file": str(diag.get("file", "")),
+                "line": diag.get("line", 0),
+                "severity": severity,
+                "message": diag.get("message", ""),
+                "linter": "shellcheck",
+                "code": str(diag.get("code", "")),
+            })
+
+    return findings
+
+
+def run_dotnet_format(
+    project_root: Union[str, os.PathLike[str], None] = None,
+    runner: Any = None,
+) -> list[dict[str, Any]]:
+    """Run dotnet-format on the given project root and return structured findings.
+
+    Only runs if dotnet-format is available on PATH and C# files are detected.
+
+    Args:
+        project_root: Path to the project root (default: cwd).
+        runner: Optional injectable runner for testing.
+
+    Returns:
+        A list of finding dicts (same format as :func:`run_ruff`).
+        Returns an empty list if dotnet-format is not available or no C# files exist.
+    """
+    probe = probe_linter("dotnet-format")
+    if not probe["available"]:
+        return []
+
+    root = _normalize_paths(project_root)
+    languages = detect_languages(root)
+
+    if "csharp" not in languages:
+        return []
+
+    if runner is None:
+        runner = _run_subprocess
+
+    findings: list[dict[str, Any]] = []
+
+    cmd = ["dotnet", "format", str(root), "--verify-no-changes", "--verbosity", "quiet"]
+    result = runner(cmd)
+
+    if result.returncode not in (0, 1):
+        return []
+
+    output = (result.stdout + result.stderr).strip()
+    if not output:
+        return []
+
+    # dotnet format outputs file paths for violations
+    for line in output.splitlines():
+        line = line.strip()
+        if line and (line.endswith(".cs") or line.endswith(".csproj")):
+            findings.append({
+                "file": line,
+                "line": 0,
+                "severity": "medium",
+                "message": "Formatting violation detected",
+                "linter": "dotnet-format",
+                "code": "formatting",
+            })
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -374,6 +638,15 @@ def run_linters_for_project(
             all_findings.extend(findings)
         elif linter_name == "eslint":
             findings = run_eslint(root, runner=runner)
+            all_findings.extend(findings)
+        elif linter_name == "markdownlint":
+            findings = run_markdownlint(root, runner=runner)
+            all_findings.extend(findings)
+        elif linter_name == "shellcheck":
+            findings = run_shellcheck(root, runner=runner)
+            all_findings.extend(findings)
+        elif linter_name == "dotnet-format":
+            findings = run_dotnet_format(root, runner=runner)
             all_findings.extend(findings)
 
     # Count by severity

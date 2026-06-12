@@ -23,12 +23,20 @@ from typing import Iterable, Union
 LANGUAGE_EXTENSIONS: dict[str, set[str]] = {
     "python": {".py", ".pyi", ".pyx"},
     "typescript": {".ts", ".tsx"},
+    "markdown": {".md", ".markdown"},
+    "shell": {".sh", ".bash", ".zsh", ".ksh"},
+    "javascript": {".js", ".mjs", ".cjs", ".jsx"},
+    "csharp": {".cs", ".csproj"},
 }
 
 # Linters we can probe for each language.
 LANGUAGE_LINTERS: dict[str, list[str]] = {
     "python": ["ruff"],
     "typescript": ["eslint"],
+    "markdown": ["markdownlint"],
+    "shell": ["shellcheck"],
+    "javascript": ["eslint"],
+    "csharp": ["dotnet-format"],
 }
 
 # ---------------------------------------------------------------------------
@@ -45,6 +53,8 @@ def detect_languages(
     extensions and returns a sorted list of language names detected.
 
     Hidden directories (names starting with ``.``) are skipped.
+
+    Also detects Node.js projects via ``package.json`` presence.
 
     Args:
         project_root: Path to the project root directory.
@@ -77,6 +87,10 @@ def detect_languages(
             for language, extensions in LANGUAGE_EXTENSIONS.items():
                 if ext in extensions:
                     detected.add(language)
+
+    # Detect Node.js via package.json in the root directory
+    if (root / "package.json").exists():
+        detected.add("javascript")
 
     return sorted(detected)
 
