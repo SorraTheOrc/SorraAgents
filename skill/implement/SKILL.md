@@ -134,12 +134,12 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 - Once all acceptance criteria for the primary work item and all blockers and dependents are met:
   - Build the project and verify the build completes without errors.
   - Run the entire test suite using the shared quiet test helper or the project's quiet test command.
-    - Report the reults
+    - Report the results.
     - Fix any failing tests before continuing.
-    - If the test run discovers failing tests that appear to be outside the scope or ownership of the current work item (e.g., failures in files not modified by this branch), invoke the triage helper to search or create a critical test-failure issue:
-      - Example: `python3 skill/triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"..."}'`
-      - If `check_or_create` returns that it created a NEW critical issue for this run, record the created issue id in the agent's local run-state and DO NOT proceed to create a PR for the current work item while that issue remains open, unless the PR will explicitly reference and close that issue.
-      - If an existing incomplete critical issue was matched, append any new evidence as a comment (the helper will do this) and proceed: pre-existing critical issues do not block PR creation for unrelated agent work.
+    - If the test run discovers failing tests that appear to be outside the scope or ownership of the current work item (e.g., failures in files not modified by this branch), invoke the triage helper with `parent_work_item_id` to create a **blocking child work item**:
+      - Example: `python3 skill/triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`
+      - If `check_or_create` returns that it created a NEW critical issue, or matched an existing incomplete one, the agent should implement that child work item to fix the test failure, commit the fix, and re-run tests until all pass before proceeding.
+      - If running under Ralph, failing tests are automatically handled: Ralph will create child work items, implement fixes, and ensure all tests pass before marking the parent as `in_review`.
   - Update or create relevant documentation.
   - Summarize changes made in the work item description or comments.
   - Do not proceed to the next step until the user confirms it is OK to do so.
@@ -186,7 +186,12 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 Pre-push blocking check
 -----------------------
-- Before pushing to `dev`, inspect the agent-run local state for any NEW critical test-failure issues created during this run. If any exist and remain open, the agent MUST not push to `dev` for the current work item unless the push explicitly references and closes the created critical issue(s). Pre-existing critical issues (created prior to this agent run) are informational and do not block pushes.
+- Before pushing to `dev`, the Ralph orchestration loop automatically ensures all tests pass. If tests fail:
+  1. Child work items are created via triage helper (with `parent_work_item_id`)
+  2. Fixes are implemented via `implement-single`
+  3. Tests are re-run until all pass
+  4. Only then does Ralph proceed with the push
+- When running manually (not under Ralph), the agent should manually invoke the triage helper and fix any failing tests before pushing.
 
 ## Scripts (canonical runner & modules)
 

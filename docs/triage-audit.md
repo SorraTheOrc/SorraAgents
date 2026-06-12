@@ -73,7 +73,7 @@ The audit agent should produce a structured report bounded by delimiter markers.
 
 | # | Criterion | Verdict | Evidence |
 |---|-----------|---------|----------|
-| 1 | <text>    | met/unmet/partial | <file:line — note> |
+| 1 | <text>    | met/unmet/partial/adjusted | <file:line — note> |
 
 ## Children Status
 
@@ -81,7 +81,7 @@ The audit agent should produce a structured report bounded by delimiter markers.
 
 | # | Criterion | Verdict | Evidence |
 |---|-----------|---------|----------|
-| 1 | <text>    | met/unmet/partial | <file:line — note> |
+| 1 | <text>    | met/unmet/partial/adjusted | <file:line — note> |
 
 ## Recommendation
 

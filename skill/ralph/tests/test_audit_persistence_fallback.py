@@ -130,6 +130,38 @@ def test_parse_audit_report_no():
     assert result.criteria[0].verdict == "unmet"
 
 
+def test_parse_audit_report_adjusted():
+    """parse_audit_report should recognize 'adjusted' verdict."""
+    adjusted_report = (
+        "Ready to close: Yes\n\n"
+        "## Summary\n"
+        "All criteria acceptable with adjustments.\n\n"
+        "## Acceptance Criteria Status\n"
+        "| # | Criterion | Verdict | Evidence |\n"
+        "|---|-----------|---------|----------|\n"
+        "| 1 | AC-1 | adjusted | src/main.py:10 — adjusted for performance |\n"
+    )
+    result = parse_audit_report(adjusted_report)
+    assert result.ready_to_close is True
+    assert len(result.criteria) == 1
+    assert result.criteria[0].verdict == "adjusted"
+
+
+def test_parse_audit_report_adjusted_does_not_trigger_unmet():
+    """Criteria with 'adjusted' verdict should not appear in unmet_or_partial."""
+    adjusted_report = (
+        "Ready to close: Yes\n\n"
+        "## Summary\n"
+        "All good.\n\n"
+        "## Acceptance Criteria Status\n"
+        "| # | Criterion | Verdict | Evidence |\n"
+        "|---|-----------|---------|----------|\n"
+        "| 1 | AC-1 | adjusted | src/main.py:10 — reason |\n"
+    )
+    result = parse_audit_report(adjusted_report)
+    assert len(result.unmet_or_partial) == 0
+
+
 # ──────────────────────────────────────────────────────────
 # AC1: _read_persisted_audit_text uses wl audit-show
 # ──────────────────────────────────────────────────────────

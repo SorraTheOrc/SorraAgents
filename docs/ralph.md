@@ -173,6 +173,45 @@ Testing
   - Children in `in_review` whose most recent audit says "Ready to close: No" (or have no persisted audit) are **re-processed** (re-implemented and re-audited).
   - All other stages (e.g., `in_progress`, `plan_complete`) are processed normally.
 
+## Agent Post-Launch Behavior
+
+When an agent (Pi or other) invokes the Ralph skill via `ralph <work-item-id>`, the agent MUST follow this specific post-launch behavior to avoid unnecessary polling loops:
+
+### Post-launch steps
+
+1. **Launch**: Immediately run the Ralph wrapper in the background (this is handled by the skill invocation).
+2. **Wait**: Wait exactly **20 seconds** once to allow Ralph to initialize and begin processing.
+3. **Check status**: Run `skill/ralph/ralph status --json` one time to verify the loop is running.
+4. **Report result**:
+   - If Ralph is **running**: Confirm success and inform the operator they can use `ralph status` to monitor progress.
+   - If Ralph has **stopped or failed**: Provide a **Root Cause Analysis (RCA)** using available log evidence from the status output.
+5. **Stop polling**: Do NOT enter any polling loop. Let the operator decide when to check status next.
+
+### Example agent workflow
+
+```bash
+# Agent launches Ralph
+skill/ralph/ralph SA-12345
+
+# Agent waits 20 seconds
+sleep 20
+
+# Agent checks status once
+status_output=$(skill/ralph/ralph status --json)
+
+# Agent evaluates and reports
+if echo "$status_output" | grep -q '"state": "running"'; then
+  echo "Ralph loop started successfully. Use 'ralph status' to monitor progress."
+else
+  echo "Ralph loop failed to start. Providing RCA based on logs..."
+  # Extract and analyze log evidence from status output
+fi
+```
+
+### Critical: No polling loops
+
+Agents must NOT implement polling loops after launch (repeatedly sleeping and checking logs). This behavior wastes resources and creates noise. The operator will use `ralph status` to check progress as needed.
+
 ## Compaction trigger behavior
 
 After every implement pass (including the first pass after auto-plan), Ralph snapshots child stages before implementation and compares them to the child stages immediately after implementation.
@@ -186,7 +225,7 @@ Ralph invokes `/compact` once before continuing to audit.
 
 Key semantics:
 
-- `/compact` is invoked **without** an explicit work-item id; the compaction plugin derives context from the current session.
+- `/compact` is invoked **without** an explicit work-item id; the compaction plugin derives context from the current session. With session-per-call invocations, each Pi call operates in its own session (identified by `--session-id`), so compaction is scoped to that session's context.
 - `/compact` failures are **non-fatal**. Ralph logs a warning and continues with the loop.
 - Compaction evidence is **logs only** (no worklog comments are persisted for compact output).
 
@@ -225,6 +264,41 @@ def _scope_in_review(self, scope_ids: Iterable[str]) -> bool:
 - Compact invocation and failure scenarios
 
 This helps operators and developers understand why Ralph might be reaching max attempts and diagnose issues more effectively.
+
+## Single Feature Branch for Child Iterations
+
+When Ralph processes a parent work item with children, it creates a **single feature branch** that is shared across all child iterations. This ensures all changes from a Ralph run are consolidated on one branch, making review and integration straightforward.
+
+### Branch Creation
+
+- Ralph creates a feature branch named `wl-<parent-id>-<short-desc>` before iterating over children.
+- If the branch already exists, Ralph checks it out rather than creating a new one.
+- The branch is created from `origin/dev` when available, ensuring the latest integration point.
+
+### Child Iteration on Shared Branch
+
+- All child implementations execute on the shared feature branch.
+- Children do **not** create new feature branches — they check out and use the parent's branch.
+- Child iterations are serialized (one-at-a-time) on the shared branch to avoid concurrency hazards.
+
+### Commit Traceability
+
+Child commit messages include a `Related-Work: <child-id>` trailer to ensure traceability back to the child work item. Example commit message format:
+
+```
+SA-12345: Add authentication handler for API endpoints
+
+Related-Work: SA-67890
+```
+
+This convention allows:
+- Tracing which child work item each commit addresses
+- Filtering commits by work item in git history
+- Maintaining clear lineage between parent and child changes
+
+### Graceful Degradation
+
+If branch creation fails (e.g., due to git permissions), Ralph logs a warning and continues without branch sharing. This ensures the orchestration loop is not blocked by transient git issues.
 
 ## Configuration File
 
@@ -390,7 +464,7 @@ By default, ralph prints two kinds of output to the console:
 2. **Delegated command logs**: every delegated `pi` and `wl` command is logged before it runs. The console formatter shows the rendered command string, and `--json` output includes structured `cmd` and `argv` fields for machine-readable inspection.
 3. **Pi subprocess streaming**: pi output is parsed per pi's JSON streaming protocol. Only `text_delta` events (the agent's actual user-facing response) are shown in real-time, printed additively. Thinking/reasoning, metadata, and structural events are suppressed for a clean, readable console.
 
-This means during an implement or audit pass, you'll see the assistant's response appear token-by-token as `text_delta` events stream in — no thinking blocks, no JSON envelope, no session metadata.
+This means during an implement or audit pass, you'll see the assistant's response appear token-by-token as `text_delta` events stream in — no thinking blocks, no JSON envelope, no session metadata. Each Pi invocation uses a unique session ID (e.g., `ralph-SA-123-implement-a1b2c3`) which is preserved for debugging, but not displayed in the streaming output.
 
 The `text_delta` content is additive (each delta contains only the new text since the last delta), so there's no duplication.
 
@@ -479,7 +553,7 @@ The final JSON result now includes a `compact` object:
 
 ### Session-per-call with unique IDs
 
-Each Pi invocation within Ralph uses a unique session ID instead of an ephemeral `--no-session` mode. This preserves session history for debugging and audit purposes while maintaining isolation between orchestration steps.
+Each Pi invocation within Ralph uses a unique session ID (rather than the previous ephemeral session approach). This preserves session history for debugging and audit purposes while maintaining isolation between orchestration steps.
 
 Session IDs follow the format `ralph-{work_item_id}-{phase}-{short_uuid}`:
 

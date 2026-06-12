@@ -63,8 +63,11 @@ def list_critical_issues() -> List[Dict[str, Any]]:
         return []
 
 
-def create_issue(title: str, body: str) -> Optional[Dict[str, Any]]:
-    """Create a critical test-failure work item via wl create."""
+def create_issue(title: str, body: str, parent_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Create a critical test-failure work item via wl create.
+    
+    If parent_id is provided, the created issue will be a child of the parent.
+    """
     args = [
         "create",
         "--title",
@@ -77,8 +80,10 @@ def create_issue(title: str, body: str) -> Optional[Dict[str, Any]]:
         "test-failure",
         "--issue-type",
         "bug",
-        "--json",
     ]
+    if parent_id:
+        args.extend(["--parent", parent_id])
+    args.append("--json")
     out = run_wl(args)
     if not out:
         return None
@@ -102,6 +107,15 @@ def add_comment(issue_id: str, comment: str) -> None:
             "--json",
         ]
     )
+
+
+def add_dependency(parent_id: str, child_id: str) -> None:
+    """Add a blocking dependency: parent depends on child being completed.
+    
+    This ensures the parent work item cannot be closed until the child
+    (test-failure fix) is completed.
+    """
+    run_wl(["dep", "add", parent_id, child_id, "--json"])
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +363,8 @@ def check_or_create(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Core logic: search for or create a critical test-failure issue.
 
     Returns a structured dict with issueId, created, matchedId, reason.
+    
+    Supports parent_work_item_id to create child work items for test failures.
     """
     # Parse input — support both flat and nested failure_signature formats
     sig = payload.get("failure_signature", {})
@@ -359,6 +375,7 @@ def check_or_create(payload: Dict[str, Any]) -> Dict[str, Any]:
     ci_url = payload.get("ci_url") or sig.get("ci_url")
     repo_path = payload.get("repo_path", ".")
     file_path = payload.get("file_path") or sig.get("file_path")
+    parent_work_item_id = payload.get("parent_work_item_id")
 
     if not test_name:
         return {"error": "test_name is required"}
@@ -397,9 +414,19 @@ def check_or_create(payload: Dict[str, Any]) -> Dict[str, Any]:
         if commit_hash:
             comment_lines.append(f"\nFailing commit: {commit_hash}")
         add_comment(issue_id, "\n".join(comment_lines))
-        emit_event(
-            "triage.issue.enhanced", {"issueId": issue_id, "heuristic": heuristic_name}
-        )
+        
+        # If parent_work_item_id is provided, add dependency so the existing
+        # issue blocks the parent work item (ensures it gets fixed)
+        if parent_work_item_id:
+            add_dependency(parent_work_item_id, issue_id)
+            emit_event(
+                "triage.issue.blocking_child",
+                {"issueId": issue_id, "parentWorkItemId": parent_work_item_id, "heuristic": heuristic_name}
+            )
+        else:
+            emit_event(
+                "triage.issue.enhanced", {"issueId": issue_id, "heuristic": heuristic_name}
+            )
         return {
             "issueId": issue_id,
             "created": False,
@@ -420,7 +447,7 @@ def check_or_create(payload: Dict[str, Any]) -> Dict[str, Any]:
         owner_info=owner_info,
     )
 
-    created = create_issue(title, body)
+    created = create_issue(title, body, parent_id=parent_work_item_id)
     if not created:
         return {"error": "failed to create issue via wl create"}
 

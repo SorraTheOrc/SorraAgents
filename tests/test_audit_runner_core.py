@@ -888,6 +888,12 @@ class TestPiPromptSafetyInstructions:
         """Child AC review prompt must instruct to return structured JSON array."""
         assert "Return ONLY a structured JSON array" in self.SOURCE
 
+    def test_prompt_has_adjusted_verdict_option(self):
+        """Both parent and child prompts must include 'adjusted' as a valid verdict."""
+        assert "adjusted" in self.SOURCE
+        # The verdict enumeration must include adjusted
+        assert "one of: met, unmet, partial, adjusted" in self.SOURCE
+
     def test_project_prompt_has_read_only_designation(self):
         """Project summary prompt must contain [READ-ONLY AUDIT]."""
         count = self.SOURCE.count("[READ-ONLY AUDIT]")

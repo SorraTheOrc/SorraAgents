@@ -90,7 +90,10 @@ Execute the following steps in order. Do not skip steps.
 
 ### Step 2 — Create a working branch
 
-- Inspect the current branch name via `git rev-parse --abbrev-ref HEAD`.
+- If the prompt specifies a `parent_branch` to use, check out that branch
+  via `git checkout <parent_branch>` and proceed to Step 3. Do NOT create
+  a new branch when a parent branch is provided.
+- Otherwise, inspect the current branch name via `git rev-parse --abbrev-ref HEAD`.
 - If the current branch was created for this work item, continue on it.
 - Otherwise create or switch to a branch named
   `feature/<work-item-id>-<short>` or `bug/<work-item-id>-<short>`.

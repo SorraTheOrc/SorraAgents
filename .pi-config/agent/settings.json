@@ -15,7 +15,7 @@
       "maxRetryDelayMs": 60000
     }
   },
-  "httpIdleTimeoutMs": 600000,
+  "httpIdleTimeoutMs": 1800000,
   "enabledModels": [
     "Proxy/qwen3",
     "Proxy/gpt120",

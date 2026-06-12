@@ -26,6 +26,12 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 2. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`.
 3. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
 4. Use `ralph status` to inspect the current background run without needing the original work-item id.
+5. After launching the background Ralph loop, the agent MUST follow this **post-launch behavior**:
+   - Wait exactly **20 seconds** (once, not in a loop) to allow Ralph to initialize.
+   - Check the Ralph status **one time only** using `skill/ralph/ralph status --json`.
+   - If Ralph is running: Report the loop started successfully and inform the operator they can use `ralph status` to monitor progress.
+   - If Ralph has stopped or failed: Provide a **Root Cause Analysis (RCA)** using available log evidence from the status output.
+   - **Do NOT** enter any polling loop — let the operator decide when to check status next.
 
 For direct foreground debugging, run the script locally:
 
@@ -44,6 +50,17 @@ When Ralph's implement→audit loop ends (whether by success, cancellation, max 
 3. **Observability**: Every step is logged with distinct event names so operators can distinguish normal completion (`ralph.cleanup.pi.graceful_exit`) from forced termination (`ralph.cleanup.pi.forced_kill`) in the log output.
 
 The cleanup is safe to call even if the process has already exited — it checks `process.poll()` before sending any signals.
+
+### Single feature branch for child iterations
+
+When Ralph processes a parent work item with children, it creates a single feature branch at the start of the run and all child iterations reuse that branch. This ensures:
+
+- All changes from child iterations are consolidated on one branch
+- Branch names follow the canonical pattern: `wl-<parent-id>-<short-desc>`
+- Child implementations are serialized (one-at-a-time) on the shared branch
+- Commits are traceable to child work-item IDs via commit messages
+
+The branch is created once before the first child iteration and passed to all subsequent child implementations via the `parent_branch` parameter.
 
 ### Per-phase model routing
 
