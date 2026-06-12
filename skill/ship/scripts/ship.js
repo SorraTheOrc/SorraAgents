@@ -27,6 +27,7 @@
 
 import { execSync } from 'node:child_process';
 import { isBranchBlocked, validateBranchName, makeBranchName } from './git-helpers.js';
+import { checkUnmergedBranches } from './check-unmerged-branches.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -129,7 +130,16 @@ export function pushToDev(opts = {}) {
     };
   }
 
-  // Step 4: execute the push
+  // Step 4: check for unmerged branches (gating step)
+  const unmergedCheck = checkUnmergedBranches();
+  if (unmergedCheck.hasUnmergedBranches) {
+    return {
+      success: false,
+      error: `Cannot push to '${DEV_BRANCH}' — there are unmerged branches that should be resolved first:\n\n${unmergedCheck.message}`,
+    };
+  }
+
+  // Step 5: execute the push
   const command = `git push ${remote} HEAD:refs/heads/${DEV_BRANCH}`;
   try {
     execSync(command, {
@@ -201,7 +211,18 @@ export function pushToBranch(targetBranch, opts = {}) {
     };
   }
 
-  // Step 4: execute the push
+  // Step 4: check for unmerged branches (gating step) — only when pushing to dev
+  if (targetBranch === DEV_BRANCH) {
+    const unmergedCheck = checkUnmergedBranches();
+    if (unmergedCheck.hasUnmergedBranches) {
+      return {
+        success: false,
+        error: `Cannot push to '${DEV_BRANCH}' — there are unmerged branches that should be resolved first:\n\n${unmergedCheck.message}`,
+      };
+    }
+  }
+
+  // Step 5: execute the push
   const command = `git push ${remote} HEAD:refs/heads/${targetBranch}`;
   try {
     execSync(command, {
@@ -229,3 +250,4 @@ export function pushToBranch(targetBranch, opts = {}) {
 // ── Exports ──────────────────────────────────────────────────────────────────
 
 export { makeBranchName, validateBranchName, isBranchBlocked };
+export { checkUnmergedBranches, getUnmergedBranchNames, extractWorkItemId, getWorkItemStatus, getCurrentBranch } from './check-unmerged-branches.js';

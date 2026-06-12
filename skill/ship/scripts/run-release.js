@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // run-release.js — safe wrapper to invoke repository-level release script
-// Usage: node run-release.js [--dry-run] [--work-item-id <id>] [--force]
+// Usage: node run-release.js [--dry-run] [--work-item-id <id>] [--force] [--skip-checks]
 
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
+import { checkUnmergedBranches } from './check-unmerged-branches.js';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -15,7 +16,30 @@ const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
 const skillDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const SKILL_RELEASE_SCRIPT = join(skillDir, 'scripts', 'release', 'merge-dev-to-main.sh');
 
-// Determine which script to run (prefer skill-level script)
+// ── Parse CLI arguments ──────────────────────────────────────────────────────
+
+const args = process.argv.slice(2);
+const skipChecks = args.includes('--skip-checks');
+
+// ── Step 1: Check for unmerged branches (gating step) ────────────────────────
+
+if (!skipChecks) {
+  const report = checkUnmergedBranches();
+  if (report.hasUnmergedBranches) {
+    console.error(
+      '⚠️  Gating check failed — there are unmerged local branches that should be resolved first:\n',
+    );
+    console.error(report.message);
+    console.error(
+      '\nTo bypass this check, re-run with --skip-checks.',
+    );
+    process.exitCode = 3;
+    process.exit(3);
+  }
+}
+
+// ── Step 2: Find the release script ─────────────────────────────────────────
+
 let selectedScript = null;
 if (existsSync(SKILL_RELEASE_SCRIPT)) {
   selectedScript = SKILL_RELEASE_SCRIPT;
@@ -48,8 +72,8 @@ if (!selectedScript) {
   process.exit(2);
 }
 
-// If the script exists, forward arguments and execute it
-const args = process.argv.slice(2);
+// ── Step 3: Execute the release script ──────────────────────────────────────
+
 const child = spawnSync('bash', [selectedScript, ...args], { stdio: 'inherit' });
 process.exitCode = child.status || 0;
 process.exit(process.exitCode);

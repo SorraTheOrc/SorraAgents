@@ -42,6 +42,7 @@ Where `<action>` is one of:
 
 | Action | Description |
 |--------|-------------|
+| `check-unmerged-branches` | Check for local branches not yet merged into `dev` and report their work item details |
 | `push-to-dev` | Push the current feature branch into the `dev` integration branch |
 | `validate-branch <name>` | Validate a branch name against the canonical pattern |
 | `generate-name <work-item-id> <short-desc>` | Generate a canonical branch name |
@@ -59,9 +60,10 @@ Where `<action>` is one of:
 
 ## Scripts and Modules
 
-- `skill/ship/scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, and re-exports from `git-helpers.js`)
+- `skill/ship/scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, `checkUnmergedBranches`, and re-exports from `git-helpers.js`)
 - `skill/ship/scripts/git-helpers.js` — Branch naming and policy helpers (exports: `makeBranchName`, `validateBranchName`, `isBranchBlocked`, `BLOCKED_BRANCHS`, `BRANCH_NAME_PATTERN`)
-- `skill/ship/scripts/run-release.js` — Safe wrapper to invoke the release process
+- `skill/ship/scripts/check-unmerged-branches.js` — Unmerged branch detection module (exports: `checkUnmergedBranches`, `getUnmergedBranchNames`, `extractWorkItemId`, `getWorkItemStatus`)
+- `skill/ship/scripts/run-release.js` — Safe wrapper to invoke the release process (includes unmerged branches gating check)
 - `skill/ship/scripts/release/merge-dev-to-main.sh` — Canonical release merge script (installed in the skill directory)
 
 ## Usage
@@ -88,6 +90,80 @@ const blocked = isBranchBlocked('main');
 // Returns: true
 ```
 
+## Unmerged Branches Gating Step
+
+Before performing any operation that integrates branches (push-to-dev, release),
+the ship skill automatically checks for local branches that are not yet merged
+into `dev`. This is a **gating step** to prevent accidentally pushing when there
+are unmerged feature branches that should be dealt with first.
+
+The check works as follows:
+1. Runs `git branch --no-merged dev` to list all local branches not merged into `dev`.
+2. Excludes `dev` itself, protected branches (`main`, `master`), and the
+   **current branch** (the branch being worked on).
+3. For each remaining branch matching the canonical `wl-<work-item-id>-<slug>` pattern,
+   extracts the work item ID and queries Worklog (wl) for its title, status, and stage.
+4. Returns a structured report listing each unmerged branch with its associated
+   work item details.
+
+If unmerged branches are found, the operation is blocked with a report that shows:
+- The branch name
+- The associated work item title and ID (if the branch follows the canonical pattern)
+- The work item's status and stage
+
+### Using checkUnmergedBranches Programmatically
+
+```javascript
+import { checkUnmergedBranches } from 'skill/ship/scripts/check-unmerged-branches.js';
+
+const report = checkUnmergedBranches();
+
+if (report.hasUnmergedBranches) {
+  console.log(report.message);
+  // Example output:
+  //   Found 2 local branch(es) not yet merged into 'dev':
+  //
+  //   1. Branch: wl-SA-001-fix-login-bug
+  //      Work Item: Fix login bug (SA-001)
+  //      Status: in_progress
+  //      Stage: in_review
+  //
+  //   Would you like to merge these branches into dev first before proceeding?
+}
+```
+
+The report is also available as structured data:
+
+```javascript
+// report.unmergedBranches is an array of:
+// {
+//   branch: string,          // The branch name
+//   workItemId: string|null,  // Extracted work item ID (null if not a wl- branch)
+//   title: string|null,       // Work item title from Worklog
+//   status: string|null,      // Work item status
+//   stage: string|null,       // Work item stage
+//   error?: string            // Any error from querying Worklog
+// }
+```
+
+### Gating in pushToDev and pushToBranch
+
+Both `pushToDev()` and `pushToBranch()` (when targeting `dev`) automatically
+run the unmerged branches check before executing the push. If unmerged branches
+are found, the push is rejected with the report in the error message.
+
+To bypass the gating check, resolve or merge the unmerged branches first.
+
+### Gating in run-release.js
+
+The release wrapper (`run-release.js`) also runs the unmerged branches check
+before executing the release script. If unmerged branches are found, the release
+is aborted. To bypass, use the `--skip-checks` flag:
+
+```bash
+node skill/ship/scripts/run-release.js --skip-checks
+```
+
 ## Push-to-Dev Workflow
 
 Agents work in feature branches and push completed work into the `dev` integration branch. This is the canonical integration action.
@@ -95,9 +171,11 @@ Agents work in feature branches and push completed work into the `dev` integrati
 1. **Create a feature branch** using `makeBranchName(workItemId, shortDesc)` from `skill/ship/scripts/git-helpers.js`. 
 2. **Make changes and commit** on the feature branch.
 3. **Validate** the current branch name with `validateBranchName(name)`.
-4. **Push to dev** using `pushToDev()` from `skill/ship/scripts/ship.js`. This:
+4. **Check for unmerged branches** using `checkUnmergedBranches()` (also run automatically by `pushToDev()`).
+5. **Push to dev** using `pushToDev()` from `skill/ship/scripts/ship.js`. This:
    - Validates the push target is not a protected branch
    - Rejects force-push
+   - Checks for unmerged branches (gating step)
    - Executes `git push origin HEAD:refs/heads/dev`
    - Returns a structured result `{ success, error?, command? }`
 
@@ -159,7 +237,10 @@ node skill/ship/scripts/run-release.js
 
 The script performs the following steps:
 
-1. **Pre-flight checks**: Verifies `gh` authentication, `wl` availability,
+1. **Unmerged branches check**: Runs `checkUnmergedBranches()` to verify no local
+   branches are pending merge into `dev`. If unmerged branches are found, the
+   release is aborted with a report. Use `--skip-checks` to bypass.
+2. **Pre-flight checks**: Verifies `gh` authentication, `wl` availability,
    and a clean working tree.
 2. **CI verification**: Checks that the `dev-full-suite` workflow is green
    on the `dev` branch via the GitHub Actions API. This is a **hard gate**
