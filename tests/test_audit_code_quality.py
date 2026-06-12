@@ -329,7 +329,7 @@ class TestCodeQualityBlocking:
 
 
 class TestCmdIssueCodeQualityIntegration:
-    """Tests that cmd_issue integrates code quality via subprocess/runner."""
+    """Tests that cmd_issue integrates code quality via monkey-patching."""
 
     @pytest.fixture(autouse=True)
     def _check_support(self):
@@ -344,21 +344,12 @@ class TestCmdIssueCodeQualityIntegration:
                 pytest.skip("cmd_issue does not yet integrate code quality")
         except (OSError, TypeError):
             pytest.skip("Cannot inspect cmd_issue source")
-    """Tests that cmd_issue integrates code quality via subprocess/runner."""
 
-    def _make_fake_cq_runner(self, cq_output_json: str):
-        """Create a mock runner that returns standard wl + code_quality outputs.
-
-        The first call is to ``wl show``, which returns a simple issue.
-        The second call is to ``python3 code_quality.py``, which returns
-        the provided *cq_output_json*.
-        """
-        call_count = [0]
-
+    def _make_wl_runner(self):
+        """Create a mock runner for wl calls only."""
         def fake_runner(cmd, **kwargs):
-            call_count[0] += 1
-            # First call: wl show
-            if call_count[0] == 1:
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "wl show" in cmd_str or "wl search" in cmd_str:
                 return _fake_proc(
                     stdout=json.dumps({
                         "success": True,
@@ -372,29 +363,48 @@ class TestCmdIssueCodeQualityIntegration:
                         "children": [],
                     })
                 )
-            # Second call: code_quality.py (or maybe more for pi, persistence)
-            # Return code quality output
-            return _fake_proc(stdout=cq_output_json)
-
+            return _fake_proc(stdout=json.dumps({"success": True}))
         return fake_runner
+
+    def _patch_pi(self, monkeypatch):
+        """Mock _call_pi to return 'met' for all acceptance criteria."""
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, **kw: {
+                "verdict": "met",
+                "evidence": "Test mock",
+                "extracted_text": json.dumps([
+                    {"index": 0, "verdict": "met", "evidence": "Test mock"}
+                ]),
+            }
+        )
 
     def test_cmd_issue_with_critical_finding_blocks(
         self, monkeypatch, capsys
     ):
         """cmd_issue with critical code quality finding should report blocking."""
-        # Skip this test if the target module doesn't support code_quality yet
-        try:
-            from skill.audit.scripts.audit_runner import cmd_issue
-        except ImportError:
-            pytest.skip("audit_runner not importable")
-
-        runner = self._make_fake_cq_runner(SAMPLE_CQ_CRITICAL_FINDING)
-
-        rc = cmd_issue(
-            "SA-CQTEST",
-            persist=False,
-            runner=runner,
+        self._patch_pi(monkeypatch)
+        monkeypatch.setattr(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            lambda **kw: {
+                "success": True,
+                "languages": ["python"],
+                "linters": [{"name": "ruff", "available": False}],
+                "total_findings": 1,
+                "findings_by_severity": {"critical": 1, "high": 0, "medium": 0, "low": 0},
+                "findings": [
+                    {"file": "src/main.py", "line": 42, "severity": "critical",
+                     "message": "Unused variable", "linter": "ruff", "code": "F841"}
+                ],
+            }
         )
+        monkeypatch.setattr(
+            "skill.code_review.scripts.create_quality_epics.create_epics_for_findings",
+            lambda findings, runner=None: {"epic_id": "SA-EPIC", "children_created": 1},
+        )
+
+        runner = self._make_wl_runner()
+        rc = cmd_issue("SA-CQTEST", persist=False, runner=runner)
         captured = capsys.readouterr()
         output = captured.out
         assert "Ready to close: No" in output
@@ -406,18 +416,28 @@ class TestCmdIssueCodeQualityIntegration:
         self, monkeypatch, capsys
     ):
         """cmd_issue with only medium findings should allow closure."""
-        try:
-            from skill.audit.scripts.audit_runner import cmd_issue
-        except ImportError:
-            pytest.skip("audit_runner not importable")
-
-        runner = self._make_fake_cq_runner(SAMPLE_CQ_MEDIUM_FINDING)
-
-        rc = cmd_issue(
-            "SA-CQTEST",
-            persist=False,
-            runner=runner,
+        self._patch_pi(monkeypatch)
+        monkeypatch.setattr(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            lambda **kw: {
+                "success": True,
+                "languages": ["python"],
+                "linters": [{"name": "ruff", "available": False}],
+                "total_findings": 1,
+                "findings_by_severity": {"critical": 0, "high": 0, "medium": 1, "low": 0},
+                "findings": [
+                    {"file": "src/utils.py", "line": 5, "severity": "medium",
+                     "message": "Unused import", "linter": "ruff", "code": "W0611"}
+                ],
+            }
         )
+        monkeypatch.setattr(
+            "skill.code_review.scripts.create_quality_epics.create_epics_for_findings",
+            lambda findings, runner=None: {"epic_id": "SA-EPIC", "children_created": 1},
+        )
+
+        runner = self._make_wl_runner()
+        rc = cmd_issue("SA-CQTEST", persist=False, runner=runner)
         captured = capsys.readouterr()
         output = captured.out
         assert "Ready to close: Yes" in output
@@ -429,22 +449,28 @@ class TestCmdIssueCodeQualityIntegration:
         self, monkeypatch, capsys
     ):
         """cmd_issue with no findings should show clean quality section."""
-        try:
-            from skill.audit.scripts.audit_runner import cmd_issue
-        except ImportError:
-            pytest.skip("audit_runner not importable")
-
-        runner = self._make_fake_cq_runner(SAMPLE_CQ_CLEAN)
-
-        rc = cmd_issue(
-            "SA-CQTEST",
-            persist=False,
-            runner=runner,
+        self._patch_pi(monkeypatch)
+        monkeypatch.setattr(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            lambda **kw: {
+                "success": True,
+                "languages": ["python"],
+                "linters": [{"name": "ruff", "available": False}],
+                "total_findings": 0,
+                "findings_by_severity": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+                "findings": [],
+            }
         )
+        monkeypatch.setattr(
+            "skill.code_review.scripts.create_quality_epics.create_epics_for_findings",
+            lambda findings, runner=None: {"epic_id": None, "children_created": 0},
+        )
+
+        runner = self._make_wl_runner()
+        rc = cmd_issue("SA-CQTEST", persist=False, runner=runner)
         captured = capsys.readouterr()
         output = captured.out
         assert "Ready to close: Yes" in output
         assert "Code Quality" in output
-        # Should mention no issues
-        assert "No issues" in output or "clean" in output.lower() or "0 findings" in output.lower()
+        assert "No code quality issues" in output or "clean" in output.lower()
         assert rc == 0

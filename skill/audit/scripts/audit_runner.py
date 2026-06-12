@@ -537,12 +537,19 @@ def _extract_acs(description: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _assemble_issue_report(issue: dict, ac_results: list[dict],
-                           child_results: list[dict]) -> str:
+                           child_results: list[dict],
+                           code_quality_findings: list[dict] | None = None,
+                           code_quality_skipped_reason: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
     *child_results* is a list of child review dicts with keys:
       ``title``, ``id``, ``status``, ``stage``, ``ac_results``.
+    *code_quality_findings* is an optional list of finding dicts from
+      code quality checks. Each dict has ``severity``, ``file``, ``line``,
+      ``message``, ``linter``, ``code`` keys.
+    *code_quality_skipped_reason* is an optional string explaining why
+      code quality was not run (e.g., no linters available).
 
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
@@ -550,6 +557,9 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       - All non-deleted children must be in ``in_review`` or ``done`` stage.
         Children with ``status: in_progress`` but ``stage: in_review`` are
         acceptable and do NOT block closure.
+      - Code quality findings: critical or high severity findings block closure
+        ("Ready to close: No"). Medium and low findings produce warnings
+        but do NOT block closure.
     """
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
@@ -561,7 +571,19 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         c.get("stage") in ("in_review", "done")
         for c in active_children
     )
-    ready = "Yes" if (all_ac_acceptable and all_children_reviewed) else "No"
+
+    # Code quality blocking: critical or high findings block closure
+    cq_findings = code_quality_findings or []
+    has_blocking_cq = any(
+        f.get("severity") in ("critical", "high")
+        for f in cq_findings
+    )
+
+    ready_before_cq = "Yes" if (all_ac_acceptable and all_children_reviewed) else "No"
+    if ready_before_cq == "Yes" and has_blocking_cq:
+        ready = "No"
+    else:
+        ready = ready_before_cq
 
     lines = [f"Ready to close: {ready}", "", "## Summary", ""]
 
@@ -577,16 +599,22 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if c.get("stage") not in ("in_review", "done", "")
     ]
 
-    if ready == "Yes":
-        parts = []
-        parts.append(
-            f"All {len(ac_results)} acceptance criteria for work item "
-            f"{issue.get('id', '?')} are acceptable"
-        )
-        if adjusted_count > 0:
-            parts.append(f"({adjusted_count} with acceptable variance)")
-        parts.append(". All children are in in_review or done stage.")
-        lines.append(" ".join(parts))
+    if ready_before_cq == "Yes":
+        if has_blocking_cq:
+            lines.append(
+                "All acceptance criteria are met and children are reviewed, "
+                "but code quality findings block closure."
+            )
+        else:
+            parts = []
+            parts.append(
+                f"All {len(ac_results)} acceptance criteria for work item "
+                f"{issue.get('id', '?')} are acceptable"
+            )
+            if adjusted_count > 0:
+                parts.append(f"({adjusted_count} with acceptable variance)")
+            parts.append(". All children are in in_review or done stage.")
+            lines.append(" ".join(parts))
     else:
         if unmet_count > 0 and not_reviewed:
             lines.append(
@@ -687,6 +715,39 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             remaining = len(child_results) - _CHILDREN_CAP
             lines.append(
                 f"*{_CHILDREN_CAP} children reviewed; {remaining} omitted for brevity.*"
+            )
+
+    lines.append("")
+    lines.append("### Code Quality")
+    lines.append("")
+
+    if code_quality_skipped_reason:
+        lines.append(f"Code quality check skipped: {code_quality_skipped_reason}")
+    elif not cq_findings:
+        lines.append("No code quality issues found.")
+    else:
+        has_critical_or_high = any(
+            f.get("severity") in ("critical", "high") for f in cq_findings
+        )
+        if has_critical_or_high:
+            lines.append(
+                "**Critical and/or high severity findings detected — "
+                "these block closure.**"
+            )
+        else:
+            lines.append(
+                "**Medium/low severity findings detected — "
+                "these are reported as warnings and do not block closure.**"
+            )
+        lines.append("")
+        lines.append("| # | Severity | File | Line | Message | Linter | Code |")
+        lines.append("|---|----------|------|------|---------|--------|------|")
+        for i, f in enumerate(cq_findings, 1):
+            lines.append(
+                f"| {i} | {f.get('severity', '?')} | "
+                f"{f.get('file', '?')} | {f.get('line', 0)} | "
+                f"{f.get('message', '')} | {f.get('linter', '?')} | "
+                f"{f.get('code', '')} |"
             )
 
     lines.append("")
@@ -864,12 +925,14 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
 # ---------------------------------------------------------------------------
 
 def _build_issue_json(issue: dict, ac_results: list[dict],
-                      child_results: list[dict]) -> dict:
+                      child_results: list[dict],
+                      code_quality_findings: list[dict] | None = None) -> dict:
     """Build structured JSON payload for issue-mode audit.
 
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
         ``adjusted`` criteria represent acceptable variance and do not block closure.
+      - Critical/high code quality findings block closure.
     """
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
@@ -881,7 +944,15 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         c.get("stage") in ("in_review", "done")
         for c in active_children
     )
-    ready = all_ac_acceptable and all_children_reviewed
+
+    # Code quality blocking
+    cq_findings = code_quality_findings or []
+    has_blocking_cq = any(
+        f.get("severity") in ("critical", "high")
+        for f in cq_findings
+    )
+
+    ready = all_ac_acceptable and all_children_reviewed and not has_blocking_cq
 
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
@@ -905,6 +976,10 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         "summary": summary,
         "acceptance_criteria": ac_results,
         "children": child_results,
+        "code_quality": {
+            "total_findings": len(cq_findings),
+            "findings": cq_findings,
+        },
     }
 
 
@@ -938,6 +1013,25 @@ def cmd_issue(issue_id: str, persist: bool = True,
     work_item = data.get("workItem", {})
     children = data.get("children", [])
     description = work_item.get("description", "")
+
+    # ------------------------------------------------------------------
+    # Code quality check (before AC verification)
+    # ------------------------------------------------------------------
+    cq_findings: list[dict] = []
+    cq_skipped_reason: str | None = None
+    try:
+        from skill.code_review.scripts.code_quality import run_code_quality
+        cq_result = run_code_quality(project_root=REPO_ROOT, runner=runner)
+        if cq_result.get("success", False):
+            cq_findings = cq_result.get("findings", [])
+        else:
+            cq_skipped_reason = cq_result.get("error", "Code quality check failed")
+    except ImportError:
+        # code_quality module not available — skip gracefully
+        cq_skipped_reason = "code_quality module not available"
+    except Exception as exc:
+        cq_skipped_reason = str(exc)
+
     acs = _extract_acs(description)
 
     # Review parent ACs via Pi (batched into a single call for performance)
@@ -1083,11 +1177,32 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     file=sys.stderr,
                 )
 
+    # ------------------------------------------------------------------
+    # Create quality epics for findings (before report assembly)
+    # ------------------------------------------------------------------
+    if cq_findings:
+        try:
+            from skill.code_review.scripts.create_quality_epics import (
+                create_epics_for_findings
+            )
+            epic_result = create_epics_for_findings(cq_findings, runner=runner)
+        except ImportError:
+            epic_result = {"epic_id": None, "error": "create_quality_epics module not available"}
+        except Exception as exc:
+            epic_result = {"epic_id": None, "error": str(exc)}
+
     # Assemble and output report
-    report = _assemble_issue_report(work_item, ac_results, child_results)
+    report = _assemble_issue_report(
+        work_item, ac_results, child_results,
+        code_quality_findings=cq_findings,
+        code_quality_skipped_reason=cq_skipped_reason,
+    )
 
     if json_mode:
-        payload = _build_issue_json(work_item, ac_results, child_results)
+        payload = _build_issue_json(
+            work_item, ac_results, child_results,
+            code_quality_findings=cq_findings,
+        )
         payload["child_persist_results"] = child_persist_results
         print(json.dumps(payload, indent=2))
     else:
