@@ -52,3 +52,6 @@ ampa/scheduler_store.json
 
 # Ralph event signals
 .ralph/event.pending
+
+# Ralph config with secrets
+.ralph.json

@@ -191,6 +191,97 @@ class TestAssembleIssueReport:
         report = _assemble_issue_report(issue, ac_results, child_results)
         assert report.startswith("Ready to close: No")
 
+    def test_yes_when_all_adjusted(self):
+        """Adjusted verdict should not block ready-to-close."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [
+            {"text": "Criterion 1", "verdict": "adjusted", "evidence": "file.py:1 — adjusted with justification"},
+        ]
+        child_results = []
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert report.startswith("Ready to close: Yes")
+
+    def test_yes_when_mixed_met_and_adjusted(self):
+        """Mixed met and adjusted should still be ready to close."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [
+            {"text": "Criterion 1", "verdict": "met", "evidence": "file.py:1 — ok"},
+            {"text": "Criterion 2", "verdict": "adjusted", "evidence": "file.py:2 — adjusted for performance"},
+        ]
+        child_results = []
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert report.startswith("Ready to close: Yes")
+
+    def test_no_when_mixed_adjusted_and_unmet(self):
+        """Unmet criteria still block closure even when adjusted ones are present."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [
+            {"text": "Criterion 1", "verdict": "adjusted", "evidence": "file.py:1 — adjusted"},
+            {"text": "Criterion 2", "verdict": "unmet", "evidence": ""},
+        ]
+        child_results = []
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert report.startswith("Ready to close: No")
+
+    def test_summary_mentions_adjusted_count(self):
+        """Summary should mention how many criteria were adjusted."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [
+            {"text": "Criterion 1", "verdict": "adjusted", "evidence": "file.py:1 — adjusted"},
+            {"text": "Criterion 2", "verdict": "met", "evidence": "file.py:2 — ok"},
+        ]
+        child_results = []
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert "adjusted" in report.lower()
+
+    def test_variance_decisions_section_present_when_adjusted(self):
+        """When adjusted verdicts exist, a variance decisions section should appear."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [
+            {"text": "Criterion 1", "verdict": "adjusted", "evidence": "file.py:1 — adjusted for reason X"},
+        ]
+        child_results = []
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert "## Variance Decisions" in report
+        assert "adjusted for reason X" in report
+
+    def test_variance_decisions_section_absent_when_no_adjusted(self):
+        """When no adjusted verdicts, variance section should be absent."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [
+            {"text": "Criterion 1", "verdict": "met", "evidence": "file.py:1 — ok"},
+            {"text": "Criterion 2", "verdict": "partial", "evidence": "file.py:2 — partial"},
+        ]
+        child_results = []
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert "## Variance Decisions" not in report
+
+    def test_adjusted_in_child_does_not_block_closure(self):
+        """Adjusted verdicts in children should not block closure."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [{"text": "Parent AC", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child Task",
+                "id": "SA-CHILD",
+                "status": "in_progress",
+                "stage": "in_review",
+                "ac_results": [{"text": "Child AC", "verdict": "adjusted", "evidence": "y:1 — adjusted"}],
+            },
+        ]
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert report.startswith("Ready to close: Yes")
+
+    def test_adjusted_verdict_table_shows_adjusted(self):
+        """The table should show 'adjusted' as the verdict."""
+        issue = {"id": "SA-123", "title": "Test", "description": ""}
+        ac_results = [
+            {"text": "Criterion 1", "verdict": "adjusted", "evidence": "file.py:1 — reason"},
+        ]
+        child_results = []
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        # The verdict should appear as 
+
     def test_yes_when_children_in_review_stage(self):
         """Children in in_review stage (even with in_progress status) allow closure."""
         issue = {"id": "SA-123", "title": "Test", "description": ""}

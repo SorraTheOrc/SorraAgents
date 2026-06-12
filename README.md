@@ -14,6 +14,7 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 - agent/: workflow and agent-focused reference guides (e.g., [agent/forge.md](agent/forge.md), [agent/ship.md](agent/ship.md)).
 - command/: design, intake, implementation and review process documents (see [command/implement.md](command/implement.md)).
 - skill/: skill templates and utilities to scaffold and package agent skills (see [skill/skill-creator/SKILL.md](skill/skill-creator/SKILL.md)).
+  - [skill/planall/](skill/planall/): PlanAll — automated batch planning for intake_complete work items.
 - plugins/: local agent framework plugins used by this repository (includes `ralph` compaction plugin).
 - docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)).
 - Workflow.md: high-level workflow for using this repository.
@@ -42,6 +43,26 @@ Ralph runs non-interactively by default, includes a stream watchdog so a delegat
 When the target work item has children, Ralph iterates over each child independently: implementing, auditing, and remediating each child before moving to the next, followed by a final parent-level integration audit. For single work items (no children), Ralph uses the classic implement→audit→remediate loop.
 
 See `docs/ralph.md` for the full command reference and operational guidance.
+
+## PlanAll — Automated Batch Planning
+
+The PlanAll skill (`skill/planall/`) provides automated batch planning for work items
+in `intake_complete` status. It discovers all eligible items, invokes `/plan` for
+each sequentially, detects items that require producer input, and produces a
+summary report.
+
+```bash
+# Process all intake_complete items
+python3 skill/planall/scripts/planall.py
+
+# JSON output for programmatic use
+python3 skill/planall/scripts/planall.py --json
+
+# Post summary as a comment on a parent epic
+python3 skill/planall/scripts/planall.py --parent-id SA-0MQA6ECEU003GUKH
+```
+
+See [skill/planall/SKILL.md](skill/planall/SKILL.md) for full documentation.
 
 A useful debugging pattern is to focus Ralph on a single direct child work item:
 

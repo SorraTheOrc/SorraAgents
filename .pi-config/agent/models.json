@@ -39,6 +39,21 @@
         }
       ]
     },
+    "LocalNPU": {
+      "api": "openai-completions",
+      "baseUrl": "http://100.73.107.128:52243/api/v1/openai",
+      "apiKey": "F7FCK9C-FYW4FF0-QZXM1YC-DZ7C1Q3",
+      "options": {
+        "timeout": 1200000
+      },
+      "models": [
+        {
+          "id": "sorra-orchestrator",
+          "name": "AnythingLLM Orchestrator",
+          "reasoning": true
+        }
+       ]
+    },
     "LocalAI": {
       "api": "openai-completions",
       "baseUrl": "http://localhost:52243/api/v1",

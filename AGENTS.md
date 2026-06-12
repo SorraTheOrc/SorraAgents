@@ -209,8 +209,19 @@ Worklog does not enforce these relationships but they can be used for planning a
 
 - When an agent discovers a failing test that appears to be outside its ownership/scope, it should call the triage helper `skill/triage/scripts/check_or_create.py` with structured evidence (test name, stdout excerpt, optional stack trace/commit/CI URL).
 - Any incomplete (open or in_progress) work item tagged `test-failure` that matches the failing test name in title or body should be considered a match and will be linked/updated. If no match exists the helper will create a `critical` work item using the repository template `skill/triage/resources/test-failure-template.md`.
-- If the agent creates a NEW critical test-failure issue during its run, the agent MUST not create or merge a PR for its current work item while that newly-created issue remains open unless the PR explicitly references and closes that issue. Pre-existing critical issues do not block PR creation.
+- **Extension (SA-0MQ7WR2MT004U82N):** When test failures are detected during the implement workflow:
+  1. The triage helper is invoked with `parent_work_item_id` to create a **blocking child work item**.
+  2. The child work item is implemented using `implement-single` to fix the failure.
+  3. The agent commits the fix and re-runs tests before marking the parent as `in_review`.
+  4. **All tests must pass** before a work item reaches `in_review` status — including pre-existing failures.
 - Agents may continue to use `gh` or other tooling directly; this policy is enforced by agent workflow conventions and the implement skill.
+
+**Test-failure fix workflow (automated via Ralph):**
+- When `ralph run` completes successfully and tests are run, any failing tests trigger:
+  - Creation of a child work item via triage helper (with `parent_work_item_id`)
+  - Implementation of the fix using `implement-single`
+  - Re-checking tests until all pass
+  - Only then marking the parent as `in_review`
 
 1. Check ready work: `wl next`
 2. Claim your task: `wl update <id> --status in_progress`
