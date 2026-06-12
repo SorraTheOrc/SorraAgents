@@ -34,6 +34,7 @@ A work item is considered ready to close when:
 
 1. **All acceptance criteria are met or have acceptable variance** — every criterion in the parent and all children must have verdict `met` or `adjusted`. The `adjusted` verdict indicates that the criterion was adapted during implementation in a way that still satisfies the user story intent.
 2. **All active children are in `in_review` or `done` stage** — children with `status: in_progress` but `stage: in_review` are acceptable and do NOT block closure. Only children with stages like `idea`, `intake_complete`, `plan_complete`, or other pre-review stages block closure.
+3. **No critical or high code quality findings** — code quality checks run automatically during the audit. Critical and high severity findings block closure. Medium and low findings produce warnings but do not block closure.
 
 Children with an empty stage (`""`) are excluded from the stage check (they may be newly created or not yet processed).
 
@@ -73,6 +74,24 @@ When one or more acceptance criteria have verdict `adjusted`, a **Variance Decis
 
 <If there are no children, write: "No children.">
 
+## Code Quality
+
+This section is automatically added by the audit runner when code quality checks are enabled. It appears after the Children Status section.
+
+*If no code quality issues found:*
+
+```
+No code quality issues found.
+```
+
+*If findings are present:*
+
+| # | Severity | File | Line | Message | Linter | Code |
+|---|----------|------|------|---------|--------|------|
+| 1 | critical | src/main.py | 42 | Unused variable `x` | ruff | F841 |
+
+**Important:** The Code Quality section is generated automatically by the runner. Agents should not manually construct this section.
+
 ### Verdict guidance
 
 - **met** — Acceptance criterion is fully satisfied.
@@ -92,7 +111,7 @@ When one or more acceptance criteria have verdict `adjusted`, a **Variance Decis
 
 ## Scripts (canonical runner & persister)
 
-The audit skill ships a small, canonical runner and a persister. Use these from CI, local automation, or orchestrators.
+The audit skill ships a canonical runner and a persister. Use these from CI, local automation, or orchestrators.
 
 - Runner: `skill/audit/scripts/audit_runner.py`
   - Usage: `python3 skill/audit/scripts/audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--model-source <remote|local>] [--debug-log <file>]`
@@ -106,6 +125,18 @@ The audit skill ships a small, canonical runner and a persister. Use these from 
     - `--json` — emit machine-readable JSON output
 
 - Persister: `skill/audit/scripts/persist_audit.py`
+
+### Code Quality Integration
+
+The audit runner automatically performs code quality checks alongside acceptance criteria verification. The pipeline is:
+
+1. **Code quality check** runs before AC verification (invokes `skill/code_review/scripts/code_quality.py`)
+2. **Findings classified** by severity (critical, high, medium, low)
+3. **Quality epics created**: a "Quality Improvement - Refactoring" epic is created or reused, with child tasks for each finding
+4. **Blocking logic**: critical/high findings result in "Ready to close: No"; medium/low findings are warnings only
+5. **Report section**: findings appear in a `### Code Quality` section after Children Status
+
+If the `code_quality` module is unavailable, the audit continues with a warning instead of crashing.
   - Persist from stdin: `cat report.md | python3 skill/audit/scripts/persist_audit.py --issue-id SA-123`
   - Persist from a file: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --file report.md`
   - Persist from a CLI string: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --report "Ready to close: Yes\n..."`

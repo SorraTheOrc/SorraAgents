@@ -44,9 +44,84 @@ Structure:
 *   Be constructive, professional, and friendly.
 *   Explain *why* a change is requested.
 
+## Automated Linting (Code Quality)
+
+In addition to AI-driven analysis, this skill provides **automated linting** through a set of canonical Python scripts in `skill/code_review/`. These scripts detect project languages, probe for available linters, run them, and classify findings by severity.
+
+### Pipeline
+
+The code quality pipeline runs automatically as part of an audit (via `audit_runner.py`) but can also be invoked standalone:
+
+1. **Language Detection** (`detection.py`): Scans the project tree for known file extensions (`.py` → Python, `.ts`/`.tsx` → TypeScript).
+2. **Linter Probing** (`detection.py`): Checks if recommended linters (ruff for Python, eslint for TypeScript) are available on `PATH`.
+3. **Linting** (`linter_runner.py`): Runs each available linter and parses its JSON output.
+4. **Severity Classification** (`linter_runner.py`): Maps raw linter output to standardised severity levels (critical, high, medium, low).
+5. **Work Item Creation** (`create_quality_epics.py`): Creates or reuses a "Quality Improvement - Refactoring" epic and adds child tasks for each finding.
+
+### Canonical Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `skill/code_review/scripts/code_quality.py` | Orchestrator — runs the full pipeline and outputs JSON |
+| `skill/code_review/scripts/detection.py` | Language detection and linter probing |
+| `skill/code_review/scripts/linter_runner.py` | Linter execution and severity classification |
+| `skill/code_review/scripts/create_quality_epics.py` | Work item creation for findings |
+
+### Standalone Usage
+
+Run the full code quality check on a project:
+
+```bash
+python3 skill/code_review/scripts/code_quality.py --path /path/to/project --json
+```
+
+Filter to specific languages:
+
+```bash
+python3 skill/code_review/scripts/code_quality.py --languages python --json
+```
+
+Dry-run quality epic creation:
+
+```bash
+python3 skill/code_review/scripts/create_quality_epics.py \
+    --findings '<json-array>' --dry-run
+```
+
+### Linter Prerequisites (Phase 1)
+
+| Language | Linter | Requirement |
+|----------|--------|-------------|
+| Python | [ruff](https://docs.astral.sh/ruff/) | `ruff` on PATH (install via pip) |
+| TypeScript | [ESLint](https://eslint.org/) | `eslint` on PATH (install via npm) |
+
+If a linter is not available, the corresponding language is skipped gracefully with empty findings (no error).
+
+### Severity Classification
+
+| Linter | Raw Severity | Normalised |
+|--------|-------------|------------|
+| ruff | F (Pyflakes error) | critical |
+| ruff | E (pycodestyle error), S (security) | high |
+| ruff | W (warning), D (docstring), N (naming) | medium |
+| ruff | C (complexity) | low |
+| eslint | 2 / "error" | high |
+| eslint | 1 / "warn" | medium |
+| eslint | 0 / "off" | low |
+
+### Audit Integration
+
+When used via the audit runner (`skill/audit/scripts/audit_runner.py`):
+
+- The code quality check runs **before** acceptance criteria verification.
+- **Critical and high** severity findings block closure ("Ready to close: No").
+- **Medium and low** findings are reported as warnings but do not block closure.
+- Findings automatically create/reuse a "Quality Improvement - Refactoring" epic with child tasks.
+- If the `code_quality` module is unavailable, the audit continues with a warning.
+
 ## Scripts (canonical runner & modules)
 
-This skill does not ship a canonical in-repo CLI script. Agents should perform code review analysis using local git commands and project tooling. When automating reviews prefer the project's linters, test runners, and pre-existing CI scripts.
+This skill now ships several canonical in-repo CLI scripts (see [Canonical Scripts](#canonical-scripts) above). Agents should prefer these over ad-hoc linting commands.
 
 Preferred execution behaviour (policy)
 
@@ -58,5 +133,9 @@ Usage example (worklog context)
 - To fetch the work item context before a review:
 
   wl show SA-0MPYMFZXO0004ZU4 --json
+
+- To run code quality checks programmatically (e.g., from an audit):
+
+  python3 -m skill.code_review.scripts.code_quality --path . --json
 
 End.
