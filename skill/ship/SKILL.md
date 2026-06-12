@@ -63,7 +63,7 @@ Where `<action>` is one of:
 - `skill/ship/scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, `checkUnmergedBranches`, and re-exports from `git-helpers.js`)
 - `skill/ship/scripts/git-helpers.js` — Branch naming and policy helpers (exports: `makeBranchName`, `validateBranchName`, `isBranchBlocked`, `BLOCKED_BRANCHS`, `BRANCH_NAME_PATTERN`)
 - `skill/ship/scripts/check-unmerged-branches.js` — Unmerged branch detection module (exports: `checkUnmergedBranches`, `getUnmergedBranchNames`, `extractWorkItemId`, `getWorkItemStatus`)
-- `skill/ship/scripts/run-release.js` — Safe wrapper to invoke the release process (includes unmerged branches gating check)
+- `skill/ship/scripts/run-release.js` — Safe wrapper to invoke the release process (exports: `runRelease`, `syncDevWithMain`, `parsePRUrl`, `waitForPRMerge`; includes unmerged branches gating check, post-release dev sync)
 - `skill/ship/scripts/release/merge-dev-to-main.sh` — Canonical release merge script (installed in the skill directory)
 
 ## Usage
@@ -242,21 +242,31 @@ The script performs the following steps:
    release is aborted with a report. Use `--skip-checks` to bypass.
 2. **Pre-flight checks**: Verifies `gh` authentication, `wl` availability,
    and a clean working tree.
-2. **CI verification**: Checks that the `dev-full-suite` workflow is green
+3. **CI verification**: Checks that the `dev-full-suite` workflow is green
    on the `dev` branch via the GitHub Actions API. This is a **hard gate**
    — the script aborts if CI is not green (use `--force` to bypass in
    exceptional circumstances).
-3. **Merge commit creation**: Fetches latest `dev` and `main`, creates a
+4. **Merge commit creation**: Fetches latest `dev` and `main`, creates a
    merge commit locally (`dev` → `main` with `--no-ff`).
-4. **PR creation**: Pushes the merge commit to a temporary
+5. **PR creation**: Pushes the merge commit to a temporary
    `release/dev-to-main-<timestamp>` branch and creates a GitHub Pull
    Request targeting `main`.
-5. **Status check wait**: Waits for required status checks to pass on the PR
-   (configurable timeout, default 10 minutes).
-6. **PR merge**: Merges the PR using `gh pr merge --merge --delete-branch`,
-   which satisfies server-side branch protection on `main`.
+6. **Status check wait & PR merge**: Waits for required status checks to pass
+   on the PR (configurable timeout, default 10 minutes), then merges the PR
+   using `gh pr merge --merge --delete-branch`. When using `--force`, the PR
+   is merged immediately without waiting.
 7. **Audit logging**: Records the merge commit hash, CI run IDs, PR URL,
    and approver identity in the worklog.
+8. **Sync dev with main**: After the release is complete, the script
+   automatically switches back to the `dev` branch, merges `origin/main` into
+   it (fast-forward), and pushes the updated `dev` to origin. This ensures
+   `dev` stays in sync with `main` after each release.
+
+   The dev sync is performed by `syncDevWithMain()` which:
+   - Runs `git fetch origin --prune`
+   - Runs `git checkout dev`
+   - Runs `git merge origin/main`
+   - Runs `git push origin dev`
 
 ### Fallback: Human Release Manager
 
