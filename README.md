@@ -112,6 +112,20 @@ command -v podman && podman --version
 command -v distrobox && distrobox version
 ```
 
+### Code Quality Linters (Optional)
+
+The automated code quality review feature supports the following linters. Install them to enable quality scanning during audits:
+
+| Language | Linter | Install command |
+|----------|--------|-----------------|
+| Python | [ruff](https://docs.astral.sh/ruff/) | `pip install ruff` |
+| TypeScript/JavaScript | [ESLint](https://eslint.org/) | `npm install -g eslint` |
+| Markdown | [markdownlint-cli](https://github.com/igmpaul/markdownlint-cli) | `npm install -g markdownlint-cli` |
+| Shell | [ShellCheck](https://shellcheck.net/) | `apt install shellcheck` or `brew install shellcheck` |
+| C# | [dotnet-format](https://github.com/dotnet/format) | Install [.NET SDK](https://dotnet.microsoft.com/download) |
+
+If a linter is not available, the code quality check skips that language gracefully without errors.
+
 ### Podman runtime directory error
 
 If `podman --version` prints an error like:

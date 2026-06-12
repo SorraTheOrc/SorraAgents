@@ -88,12 +88,16 @@ python3 skill/code_review/scripts/create_quality_epics.py \
     --findings '<json-array>' --dry-run
 ```
 
-### Linter Prerequisites (Phase 1)
+### Linter Prerequisites
 
 | Language | Linter | Requirement |
 |----------|--------|-------------|
 | Python | [ruff](https://docs.astral.sh/ruff/) | `ruff` on PATH (install via pip) |
 | TypeScript | [ESLint](https://eslint.org/) | `eslint` on PATH (install via npm) |
+| Markdown | [markdownlint-cli](https://github.com/igmpaul/markdownlint-cli) | `markdownlint` on PATH (install via npm) |
+| Shell | [ShellCheck](https://shellcheck.net/) | `shellcheck` on PATH (install via apt/brew) |
+| JavaScript/Node | [ESLint](https://eslint.org/) | `eslint` on PATH (install via npm) |
+| C# | [dotnet-format](https://github.com/dotnet/format) | `dotnet` on PATH (install via dotnet SDK) |
 
 If a linter is not available, the corresponding language is skipped gracefully with empty findings (no error).
 
@@ -103,11 +107,16 @@ If a linter is not available, the corresponding language is skipped gracefully w
 |--------|-------------|------------|
 | ruff | F (Pyflakes error) | critical |
 | ruff | E (pycodestyle error), S (security) | high |
-| ruff | W (warning), D (docstring), N (naming) | medium |
-| ruff | C (complexity) | low |
+| ruff | W (warning), D (docstring), N (naming), UP, ANN, B, SIM, T20, PL, RUF | medium |
+| ruff | C (complexity), ISC, PIE, COM | low |
 | eslint | 2 / "error" | high |
 | eslint | 1 / "warn" | medium |
 | eslint | 0 / "off" | low |
+| markdownlint | "error" | high |
+| markdownlint | "warning" | medium |
+| shellcheck | "error" | high |
+| shellcheck | "warning" | medium |
+| dotnet-format | (any) | medium |
 
 ### Audit Integration
 
