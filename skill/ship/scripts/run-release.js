@@ -225,11 +225,16 @@ export function runRelease(cliArgs = []) {
 
   const child = spawnSync('bash', [selectedScript, ...args], {
     encoding: 'utf-8',
-    stdio: ['pipe', 'inherit', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
 
   const exitCode = child.status || 0;
   const stdout = child.stdout || '';
+
+  // Print the release script output so the user can see progress
+  if (stdout) {
+    process.stdout.write(stdout);
+  }
 
   if (exitCode !== 0) {
     console.error(`Release script exited with code ${exitCode}.`);
