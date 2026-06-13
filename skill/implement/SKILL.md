@@ -196,6 +196,21 @@ Pre-push blocking check
   4. Only then does Ralph proceed with the push
 - When running manually (not under Ralph), the agent should manually invoke the triage helper and fix any failing tests before pushing.
 
+## Status Transition Matrix
+
+The following table documents the expected status and stage transitions at each workflow phase for the `implement` skill.
+
+| Phase | Command | Status | Stage |
+|-------|---------|--------|-------|
+| Start (Step 1 - Claim) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
+| Blocker complete (Step 4) | `wl update <id> --status in_progress --stage in_review --json` | in_progress | in_review |
+| Final (Step 6 - Mark in_review) | `wl update <id> --stage in_review --json` | in_progress | in_review |
+| Abort - dirty work tree (Step 0) | Abort with message, no wl command | (unchanged) | (unchanged) |
+| Abort - definition gate failure | Run intake/plan interview, update item | open | (unchanged) |
+| Under Ralph (Step 6 note) | Skip in_review step; Ralph handles transition | in_progress | in_progress |
+
+Abort/failure transitions use `--status open` while keeping the stage unchanged.
+
 ## Scripts (canonical runner & modules)
 
 This skill does not ship a single orchestrator script. Implementation is carried out by following the steps above and invoking project-local build/test and linters. When a repository provides an "implement" helper script, prefer that script for deterministic behavior.

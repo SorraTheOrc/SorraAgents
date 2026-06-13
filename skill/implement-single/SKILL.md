@@ -123,6 +123,19 @@ Execute the following steps in order. Do not skip steps.
   `wl update <work-item-id> --status completed --stage in_review --json`
 - Do not create a PR or merge. Ralph will handle PR/merge externally.
 
+## Status Transition Matrix
+
+The following table documents the expected status and stage transitions at each workflow phase for the `implement-single` skill.
+
+| Phase | Command | Status | Stage |
+|-------|---------|--------|-------|
+| Start (Step 1 - Claim) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
+| Complete (Step 5) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
+| Abort - dirty tree (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
+| Abort - no_safe_path (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
+
+Abort/failure transitions use `--status open` while keeping the stage unchanged.
+
 ## Scripts (canonical runner & modules)
 
 This skill does not ship a canonical CLI runner. When present, prefer any
