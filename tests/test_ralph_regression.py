@@ -6,7 +6,7 @@ and provide regression coverage for the specific issues that were resolved.
 """
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from skill.ralph.scripts.ralph_loop import RalphLoop, RalphError
 
 

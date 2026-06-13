@@ -3,7 +3,6 @@ import os
 import tempfile
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 
 import pytest
@@ -799,7 +798,6 @@ def test_cli_parser_accepts_debug_persist_flag():
 
 
 def test_main_returns_error_on_precondition_failure():
-    from skill.ralph.scripts.ralph_loop import main
 
     runner = FakeRunner()
     runner.items["SA-TARGET"]["stage"] = "idea"
@@ -1093,7 +1091,6 @@ def test_verbose_mode_logs_pi_output_start():
 
 def test_stream_pi_captures_and_returns_output():
     """When stream=True, _stream_pi parses JSON and streams only text_delta content."""
-    import subprocess
     from unittest.mock import patch, MagicMock
 
     # Simulate a pi subprocess producing pi JSON protocol events
@@ -2198,7 +2195,6 @@ def test_ralph_loop_explicit_remote_timeout():
 
 def test_stream_pi_uses_configured_timeout():
     """_stream_pi respects the configured timeout from RalphLoop."""
-    import subprocess
     from unittest.mock import patch, MagicMock
 
     fake_process = MagicMock()
@@ -2210,7 +2206,7 @@ def test_stream_pi_uses_configured_timeout():
     fake_process.stderr.read.return_value = ""
     fake_process.wait.return_value = None
 
-    with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process) as popen:
+    with patch("skill.ralph.scripts.ralph_loop.subprocess.Popen", return_value=fake_process) as _popen:
         loop = RalphLoop(verbose=False, stream=True, pi_stream_timeout=42.0)
         loop.pi_bin = "echo"
         result = loop._stream_pi(["echo", "test"], "test prompt")
@@ -2880,5 +2876,5 @@ def test_handle_failing_tests_creates_child_and_implements(monkeypatch):
     # Should have attempted to fix tests
     assert failing == ["test_fail"]
     # Check that pi was called (for implement-single)
-    pi_calls = [c for c in calls if isinstance(c, list) and len(c) > 1 and c[0] == "pi"]
+    _pi_calls = [c for c in calls if isinstance(c, list) and len(c) > 1 and c[0] == "pi"]
     # Note: This test verifies the method runs without error; actual pi invocation depends on config

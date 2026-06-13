@@ -35,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts.persist_audit import persist_audit
+from skill.audit.scripts.persist_audit import persist_audit  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -589,7 +589,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
 
     # Count verdicts across all criteria (parent + children)
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
-    met_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_MET)
+    _met_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_MET)
     adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
     partial_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_PARTIAL)
@@ -1185,11 +1185,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
             from skill.code_review.scripts.create_quality_epics import (
                 create_epics_for_findings
             )
-            epic_result = create_epics_for_findings(cq_findings, runner=runner)
+            _epic_result = create_epics_for_findings(cq_findings, runner=runner)
         except ImportError:
-            epic_result = {"epic_id": None, "error": "create_quality_epics module not available"}
+            _epic_result = {"epic_id": None, "error": "create_quality_epics module not available"}
         except Exception as exc:
-            epic_result = {"epic_id": None, "error": str(exc)}
+            _epic_result = {"epic_id": None, "error": str(exc)}
 
     # Assemble and output report
     report = _assemble_issue_report(

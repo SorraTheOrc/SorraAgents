@@ -155,7 +155,7 @@ def run_build_test(path: str, build_cmd: str, timeout: int = 600, dry_run: bool 
             f.write('\nSTDERR:\n')
             f.write(proc.stderr or '')
         return proc.returncode, log_path
-    except subprocess.TimeoutExpired as e:
+    except subprocess.TimeoutExpired:
         with open(log_path, 'w') as f:
             f.write(f'Timeout after {timeout}s\n')
         return 124, log_path

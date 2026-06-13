@@ -276,7 +276,6 @@ def main():
     # Now render the human-readable table and post it as a comment (mandatory)
     try:
         import subprocess
-        import tempfile
 
         # Build a sanitized object for rendering to avoid contaminating the human text
         sanitized = {

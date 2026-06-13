@@ -57,7 +57,7 @@ def main() -> None:
             break
 
         try:
-            assistant = client.session.chat(
+            _assistant = client.session.chat(
                 session.id,
                 provider_id=provider_id,
                 model_id=model_id,

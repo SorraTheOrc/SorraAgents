@@ -10,7 +10,7 @@ import json
 import logging
 from pathlib import Path
 import sys
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -18,8 +18,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.signal_system import EventType
-from skill.ralph.scripts.webhook_notifier import WebhookNotifier, resolve_webhook_url
+from skill.ralph.scripts.signal_system import EventType  # noqa: E402
+from skill.ralph.scripts.webhook_notifier import WebhookNotifier, resolve_webhook_url  # noqa: E402
 
 
 # ── Config-based webhook URL resolution ─────────────────────────────────────

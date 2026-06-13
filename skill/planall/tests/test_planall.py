@@ -12,19 +12,17 @@ Related work item: SA-0MQA7HOLS007HMHZ
 """
 
 import json
-import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 
 # Ensure the repo root is on sys.path so skill packages are importable
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-import sys
+import sys  # noqa: E402
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.planall.scripts.planall import (
+from skill.planall.scripts.planall import (  # noqa: E402
     PlanAllEngine,
     generate_summary,
 )
@@ -579,7 +577,6 @@ class TestEngineConfig:
         engine = PlanAllEngine()
         assert engine.runner is not None
         # Verify it's the default subprocess.run behavior
-        import subprocess
         # We can't directly check subprocess.run identity but we can check it's callable
         assert callable(engine.runner)
 

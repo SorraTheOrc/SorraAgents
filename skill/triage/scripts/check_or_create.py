@@ -15,19 +15,18 @@ attach a comment to the most recent candidate and alert triage.
 """
 
 import json
-import os
 import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.test_runner import canonicalize_quiet_pytest_command
+from skill.test_runner import canonicalize_quiet_pytest_command  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

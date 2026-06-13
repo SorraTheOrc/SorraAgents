@@ -16,11 +16,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Sequence, Union
+from typing import Any, Callable, Sequence
 
 # Ensure the package is importable when run as __main__
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -206,16 +205,16 @@ def create_child_tasks(
         priority = _severity_to_priority(severity)
 
         description_lines = [
-            f"## Code quality finding",
-            f"",
+            "## Code quality finding",
+            "",
             f"- **Severity**: {severity}",
             f"- **File**: {finding.get('file', '?')}",
             f"- **Line**: {finding.get('line', 0)}",
             f"- **Message**: {finding.get('message', '')}",
             f"- **Linter**: {finding.get('linter', '?')}",
             f"- **Code**: {finding.get('code', '')}",
-            f"",
-            f"Discovered during automated code quality review.",
+            "",
+            "Discovered during automated code quality review.",
         ]
         description = "\n".join(description_lines)
 

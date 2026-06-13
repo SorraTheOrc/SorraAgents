@@ -30,10 +30,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.signal_system import EventType, SignalWriter, resolve_signal_path
-from skill.ralph.scripts.structured_response import StructuredResponse, parse_structured_response
-from skill.ralph.scripts.webhook_notifier import WebhookNotifier, resolve_webhook_url
-from skill.test_runner import canonicalize_quiet_test_command
+from skill.ralph.scripts.signal_system import EventType, SignalWriter, resolve_signal_path  # noqa: E402
+from skill.ralph.scripts.structured_response import StructuredResponse, parse_structured_response  # noqa: E402
+from skill.ralph.scripts.webhook_notifier import WebhookNotifier, resolve_webhook_url  # noqa: E402
+from skill.test_runner import canonicalize_quiet_test_command  # noqa: E402
 
 logger = logging.getLogger("ralph")
 
@@ -1097,7 +1097,7 @@ def _extract_failing_test_names(output: str) -> list[str]:
             failing_tests.append(match.group(1))
         # Match short format: "FAILED test_name"
         match = re.match(r'(FAILED|ERROR)\s+([^\s]+)$', line)
-        if match and not "::" in match.group(2):
+        if match and "::" not in match.group(2):
             failing_tests.append(match.group(2))
     # Deduplicate while preserving order
     return list(dict.fromkeys(failing_tests))
@@ -2095,7 +2095,7 @@ class RalphLoop:
                 self._last_implement_output = impl_output
                 
                 # Run audit on the child to ensure fix is complete
-                audit_output = self._run_pi(
+                _audit_output = self._run_pi(
                     f"/skill:audit {child_id}",
                     phase="audit",
                     work_item_ids=[child_id],
@@ -2949,7 +2949,7 @@ class RalphLoop:
         Additional keyword args are accepted for compatibility (e.g. force_fresh_audit).
         """
         max_attempts = max(1, int(self.max_attempts))
-        force_fresh_audit = bool(kwargs.get("force_fresh_audit", False))
+        _force_fresh_audit = bool(kwargs.get("force_fresh_audit", False))
 
         # Evaluate complexity tier for this item
         item = self._wl_show(item_id)
@@ -3452,15 +3452,15 @@ class RalphLoop:
                 raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit and fallback persistence; expected an audit_results row for the work item.")
 
             structured_audit = None
-            lines = [l.strip() for l in audit_text.splitlines() if l.strip()]
-            if not any(l.lower().startswith("ready to close:") for l in lines):
+            lines = [line.strip() for line in audit_text.splitlines() if line.strip()]
+            if not any(line.lower().startswith("ready to close:") for line in lines):
                 structured_audit = parse_structured_response(audit_text)
                 if structured_audit:
                     audit_text = structured_audit.render()
                     self._last_structured_response = structured_audit
-                    lines = [l.strip() for l in audit_text.splitlines() if l.strip()]
+                    lines = [line.strip() for line in audit_text.splitlines() if line.strip()]
 
-            if not any(l.lower().startswith("ready to close:") for l in lines):
+            if not any(line.lower().startswith("ready to close:") for line in lines):
                 excerpt = audit_text.strip().replace("\n", " ")[:200]
                 raise RalphError(f"No 'Ready to close:' header found in persisted audit for {focus_id}. Excerpt: {excerpt}")
             audit = parse_audit_report(audit_text)
@@ -3639,7 +3639,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="Suppress console progress output and pi streaming (only print final JSON result)")
     parser.add_argument("--verbose", action="store_true", help="Show detailed delegation commands and subprocess output")
     parser.add_argument("--no-stream", action="store_true", help="Don't stream pi subprocess output to console (use buffered capture instead)")
-    parser.add_argument("--model", default=None, help=f"Legacy single model for all phases (default from skill/ralph/assets/.ralph.json, or string 'model' key in .ralph.json)")
+    parser.add_argument("--model", default=None, help="Legacy single model for all phases (default from skill/ralph/assets/.ralph.json, or string 'model' key in .ralph.json)")
     parser.add_argument("--model-source", choices=sorted(MODEL_SOURCES), default=None, help="Model source for phase defaults/config (remote|local). Default is local.")
     parser.add_argument("--model-intake", default=None, help="Override intake phase model")
     parser.add_argument("--model-planning", default=None, help="Override planning phase model")

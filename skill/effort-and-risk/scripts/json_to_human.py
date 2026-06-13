@@ -16,7 +16,7 @@ def main():
     effort = data.get("effort", {})
     risk = data.get("risk", {})
     confidence = data.get("confidence_percent", 0)
-    assumptions = data.get("assumptions", [])
+    _assumptions = data.get("assumptions", [])
     unknowns = data.get("unknowns", [])
 
     # Map tshirt codes to readable words; accept either codes or full-text

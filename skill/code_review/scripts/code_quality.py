@@ -27,13 +27,12 @@ _PACKAGE_ROOT = _SCRIPT_DIR.parent.parent.parent  # repo root
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
-from skill.code_review.scripts.detection import (
+from skill.code_review.scripts.detection import (  # noqa: E402
     detect_languages,
     get_linters_for_language,
-    get_full_report as get_detection_report,
     probe_linter,
 )
-from skill.code_review.scripts.linter_runner import (
+from skill.code_review.scripts.linter_runner import (  # noqa: E402
     run_linters_for_project,
 )
 
@@ -223,9 +222,9 @@ def _print_human_readable(result: dict[str, Any]) -> None:
 
     print(f"Languages detected: {', '.join(languages) if languages else 'none'}")
     print(f"Linters probed: {len(linters)} available")
-    for l in linters:
-        status = "available" if l.get("available") else "not found"
-        print(f"  - {l['name']}: {status}")
+    for lint in linters:
+        status = "available" if lint.get("available") else "not found"
+        print(f"  - {lint['name']}: {status}")
 
     print(f"\nTotal findings: {len(findings)}")
 

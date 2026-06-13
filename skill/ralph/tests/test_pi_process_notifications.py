@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.ralph_loop import EventType, RalphLoop, RalphError
+from skill.ralph.scripts.ralph_loop import RalphLoop, RalphError  # noqa: E402
 
 
 # ── Helper: a RalphLoop subclass for testing notifications ────────────────
@@ -262,7 +262,7 @@ class TestMainErrorNotification:
         """When main() catches RalphError, an ERROR notification is produced."""
         from skill.ralph.scripts.ralph_loop import main
 
-        signal_path = tmp_path / "event.pending"
+        _signal_path = tmp_path / "event.pending"
 
         # Need to mock the loop creation and run to inject our signal path
         with patch("skill.ralph.scripts.ralph_loop.RalphLoop") as MockLoop:

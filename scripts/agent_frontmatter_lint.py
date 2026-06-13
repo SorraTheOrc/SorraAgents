@@ -13,7 +13,6 @@ Checks:
 Exits with code 0 if no errors found, 1 if warnings only, 2 if errors found.
 """
 import argparse
-import glob
 import sys
 import yaml
 import re

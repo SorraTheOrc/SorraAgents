@@ -9,10 +9,8 @@ is driven by a precise contract rather than being inferred from prose.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 

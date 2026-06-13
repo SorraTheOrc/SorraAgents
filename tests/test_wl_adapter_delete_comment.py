@@ -1,5 +1,4 @@
 import json
-import subprocess
 from plan.wl_adapter import WLAdapter
 
 

@@ -16,14 +16,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.ralph_loop import (
+from skill.ralph.scripts.ralph_loop import (  # noqa: E402
     DEFAULT_MODEL,
-    DEFAULT_MODEL_SOURCE,
     RalphLoop,
     _extract_phase_model_config,
     _resolve_complexity_tier,
     _resolve_phase_model_value,
-)
+)  # noqa: E402
 
 
 class _FakeProc:

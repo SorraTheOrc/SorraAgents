@@ -16,7 +16,6 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
@@ -301,7 +300,7 @@ class TestQualityEpicCreation:
                 }))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        result = mod.create_epics_for_findings(
+        _result = mod.create_epics_for_findings(
             SAMPLE_FINDINGS_CRITICAL,
             runner=fake_runner,
         )

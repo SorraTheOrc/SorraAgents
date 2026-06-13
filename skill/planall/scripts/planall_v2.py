@@ -116,7 +116,6 @@ class PlanAllV2Engine:
         Returns: "completed", "skipped", or "error"
         """
         item_id = item.get("id", "")
-        title = item.get("title", "")
         issue_type = (item.get("issueType") or "").lower()
 
         if not item_id:

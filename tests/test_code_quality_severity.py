@@ -155,12 +155,12 @@ class TestEslintSeverity:
 
     def test_eslint_warn_label(self):
         """eslint severity 'warn' label should map to 'medium'."""
-        result = self.classify("eslint", "warn")
+        _result = self.classify("eslint", "warn")
 
     def test_eslint_unknown_severity_defaults_to_medium(self):
         """eslint with an unknown severity value should default to 'medium'."""
-        result = self.classify("eslint", "99")
-        assert result in ("medium", "high", "low")
+        _result = self.classify("eslint", "99")
+        assert _result in ("medium", "high", "low")
 
 
 # ===================================================================

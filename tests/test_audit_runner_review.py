@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import subprocess
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -89,7 +88,7 @@ class TestCallPi:
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
 
-        result = _call_pi("review this criterion", model="test/model", pi_bin="pi")
+        _result = _call_pi("review this criterion", model="test/model", pi_bin="pi")
         assert len(captured_cmds) == 1
         cmd = captured_cmds[0]
         assert cmd[0] == "pi"
@@ -279,7 +278,7 @@ class TestAssembleIssueReport:
             {"text": "Criterion 1", "verdict": "adjusted", "evidence": "file.py:1 — reason"},
         ]
         child_results = []
-        report = _assemble_issue_report(issue, ac_results, child_results)
+        _report = _assemble_issue_report(issue, ac_results, child_results)
         # The verdict should appear as 
 
     def test_yes_when_children_in_review_stage(self):

@@ -16,7 +16,6 @@ Output: JSON with keys: unit, o, m, p, expected, overheads_total, recommended, r
 
 import sys
 import json
-import math
 
 
 def pick_tshirt(hours, thresholds):
