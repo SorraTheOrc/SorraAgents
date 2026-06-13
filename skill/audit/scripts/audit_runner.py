@@ -539,6 +539,7 @@ def _extract_acs(description: str) -> list[str]:
 def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            child_results: list[dict],
                            code_quality_findings: list[dict] | None = None,
+                           code_quality_fixes_applied: int = 0,
                            code_quality_skipped_reason: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
@@ -721,10 +722,16 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     lines.append("### Code Quality")
     lines.append("")
 
+    cq_findings = code_quality_findings or []
+    cq_fixes = code_quality_fixes_applied
+
     if code_quality_skipped_reason:
         lines.append(f"Code quality check skipped: {code_quality_skipped_reason}")
-    elif not cq_findings:
+    elif not cq_findings and cq_fixes == 0:
         lines.append("No code quality issues found.")
+    elif not cq_findings and cq_fixes > 0:
+        lines.append(f"All issues auto-fixed by **{cq_fixes}** linter(s).")
+        lines.append("No remaining issues.")
     else:
         has_critical_or_high = any(
             f.get("severity") in ("critical", "high") for f in cq_findings
@@ -926,7 +933,8 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
 
 def _build_issue_json(issue: dict, ac_results: list[dict],
                       child_results: list[dict],
-                      code_quality_findings: list[dict] | None = None) -> dict:
+                      code_quality_findings: list[dict] | None = None,
+                      code_quality_fixes_applied: int = 0) -> dict:
     """Build structured JSON payload for issue-mode audit.
 
     Ready-to-close logic:
@@ -978,6 +986,7 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         "children": child_results,
         "code_quality": {
             "total_findings": len(cq_findings),
+            "fixes_applied": code_quality_fixes_applied,
             "findings": cq_findings,
         },
     }
@@ -1018,12 +1027,14 @@ def cmd_issue(issue_id: str, persist: bool = True,
     # Code quality check (before AC verification)
     # ------------------------------------------------------------------
     cq_findings: list[dict] = []
+    cq_fixes_applied: int = 0
     cq_skipped_reason: str | None = None
     try:
         from skill.code_review.scripts.code_quality import run_code_quality
-        cq_result = run_code_quality(project_root=REPO_ROOT, runner=runner)
+        cq_result = run_code_quality(project_root=REPO_ROOT, runner=runner, fix=True)
         if cq_result.get("success", False):
             cq_findings = cq_result.get("findings", [])
+            cq_fixes_applied = cq_result.get("fixes_applied", 0)
         else:
             cq_skipped_reason = cq_result.get("error", "Code quality check failed")
     except ImportError:
@@ -1195,6 +1206,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
     report = _assemble_issue_report(
         work_item, ac_results, child_results,
         code_quality_findings=cq_findings,
+        code_quality_fixes_applied=cq_fixes_applied,
         code_quality_skipped_reason=cq_skipped_reason,
     )
 
@@ -1202,6 +1214,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         payload = _build_issue_json(
             work_item, ac_results, child_results,
             code_quality_findings=cq_findings,
+            code_quality_fixes_applied=cq_fixes_applied,
         )
         payload["child_persist_results"] = child_persist_results
         print(json.dumps(payload, indent=2))

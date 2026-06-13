@@ -321,6 +321,20 @@ class TestCodeQualityBlocking:
         )
         assert report.startswith("Ready to close: No")
 
+    def test_no_findings_with_fixes_shows_all_fixed(self):
+        """When there are no remaining findings but fixes were applied,
+        the report should indicate all issues were auto-fixed."""
+        report = _assemble_issue_report(
+            ISSUE_WITH_ACS["workItem"],
+            [{"text": "Handle authentication", "verdict": "met", "evidence": ""}],
+            [],
+            code_quality_findings=[],
+            code_quality_fixes_applied=2,
+        )
+        assert "Ready to close: Yes" in report
+        assert "All issues auto-fixed by **2** linter(s)" in report
+        assert "No remaining issues" in report
+
 
 # ===================================================================
 # Tests: cmd_issue integration (mock subprocess calls)
@@ -472,4 +486,34 @@ class TestCmdIssueCodeQualityIntegration:
         assert "Ready to close: Yes" in output
         assert "Code Quality" in output
         assert "No code quality issues" in output or "clean" in output.lower()
+        assert rc == 0
+
+    def test_cmd_issue_with_fixes_applied(
+        self, monkeypatch, capsys
+    ):
+        """cmd_issue with fixes_applied should show all-fixed message."""
+        self._patch_pi(monkeypatch)
+        monkeypatch.setattr(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            lambda **kw: {
+                "success": True,
+                "languages": ["python"],
+                "linters": [{"name": "ruff", "available": True}],
+                "total_findings": 0,
+                "findings_by_severity": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+                "findings": [],
+                "fixes_applied": 2,
+            }
+        )
+        monkeypatch.setattr(
+            "skill.code_review.scripts.create_quality_epics.create_epics_for_findings",
+            lambda findings, runner=None: {"epic_id": None, "children_created": 0},
+        )
+
+        runner = self._make_wl_runner()
+        rc = cmd_issue("SA-CQTEST", persist=False, runner=runner)
+        captured = capsys.readouterr()
+        output = captured.out
+        assert "Ready to close: Yes" in output
+        assert "All issues auto-fixed by **2** linter(s)" in output
         assert rc == 0
