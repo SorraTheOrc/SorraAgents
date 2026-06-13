@@ -3,6 +3,7 @@
 A lightweight collection of workflow guides, command patterns, and skill templates for building and operating small automation agents.
 
 ## Purpose
+
 - Centralize documentation and reusable "skills" for agent development and operational workflows.
 - Provide templates and checklists to guide feature implementation, testing, and release.
 
@@ -11,6 +12,7 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 "Acceptance Criteria" is the canonical term for work-item requirements. "Success Criteria" is an accepted synonym and may be used interchangeably. Both terms are recognized by validation logic in the workflow invariants (`docs/workflow/workflow.json`, `docs/workflow/workflow.yaml`). When defining work items, prefer the heading **Acceptance Criteria** (synonym: Success Criteria) for consistency.
 
 ## Repository structure
+
 - agent/: workflow and agent-focused reference guides (e.g., [agent/forge.md](agent/forge.md), [agent/ship.md](agent/ship.md)).
 - command/: design, intake, implementation and review process documents (see [command/implement.md](command/implement.md)).
 - skill/: skill templates and utilities to scaffold and package agent skills (see [skill/skill-creator/SKILL.md](skill/skill-creator/SKILL.md)).
@@ -89,6 +91,7 @@ This repository uses GitHub Actions to validate changes. The following workflows
 ### Release process
 
 The `dev-full-suite` workflow result is used as a gate in the release process:
+
 1. Changes are integrated into `dev` via feature branch pushes.
 2. The release manager triggers `dev-full-suite` manually on the release candidate.
 3. If the full suite passes, the release manager reviews uploaded artifacts and proceeds with the `dev` → `main` merge.
@@ -99,10 +102,10 @@ The `dev-full-suite` workflow result is used as a gate in the release process:
 The dev container commands (`wl ampa start-work`, `finish-work`, `list-containers`) require the following tools on the host:
 
 - **Podman** — container runtime (rootless mode)
-  - Install: https://podman.io/getting-started/installation
+  - Install: <https://podman.io/getting-started/installation>
 - **Distrobox** — manages dev containers on top of Podman
   - Install: `curl -s https://raw.githubusercontent.com/89luca89/distrobox/main/install | sudo sh`
-  - Alternative methods: https://github.com/89luca89/distrobox?tab=readme-ov-file#installation
+  - Alternative methods: <https://github.com/89luca89/distrobox?tab=readme-ov-file#installation>
 - **Git** and **wl** (Worklog CLI) — assumed to already be available
 
 Verify the installations:
@@ -162,7 +165,7 @@ Pool state (`pool-state.json`, `pool-cleanup.json`, `pool-replenish.log`) is sto
 
 If the AMPA Containerfile has been modified since the image was last built, `warm-pool` will automatically tear down unclaimed pool containers and the template, rebuild the image, and re-fill the pool. Simply run `wl ampa warm-pool` again — no manual cleanup is needed.
 
-See the AMPA container pool reference for full details: https://github.com/opencode/ampa/blob/main/docs/ampa_container_pool.md
+See the AMPA container pool reference for full details: <https://github.com/opencode/ampa/blob/main/docs/ampa_container_pool.md>
 
 ### Browser test capability
 
@@ -193,6 +196,7 @@ The installer for the AMPA Worklog plugin will attempt to pre-warm the container
 If the installer cannot find `podman` or `distrobox`, it will continue installation but print one-line actionable guidance explaining how to install the missing tools and how to run `wl ampa warm-pool` manually. Warm-pool failures are treated as non-fatal by the installer; it records the decision and prints short guidance and where the captured output is stored.
 
 Installer output capture and logs:
+
 - When the installer runs warm-pool it captures stdout/stderr to `/tmp/ampa_warm_pool.out` and `/tmp/ampa_warm_pool.err` and prints a short snippet on completion or a one-line actionable error on failure.
 
 Examples:
@@ -239,6 +243,7 @@ After the gate passes, the script merges `dev` into `main`, pushes the result,
 and records an audit comment in the worklog.
 
 ## Getting started
+
 1. Read the main workflow: [Workflow.md](Workflow.md).
 2. Pick a folder to work in (e.g., `skill/` or `agent/`).
 3. Follow the appropriate guide (see files inside each folder) to implement, test, and package your work.
@@ -259,10 +264,11 @@ Daemon / scheduler note
   sends a single heartbeat and exits; to run the scheduler loop you must
   explicitly enable it (for example: use `--start-scheduler` or set an
   environment flag like `AMPA_RUN_SCHEDULER=1`). Check the AMPA repository
-  README at https://github.com/opencode/ampa for the exact flags and
+  README at <https://github.com/opencode/ampa> for the exact flags and
   environment variables.
 
 ## Contributing
+
 - Open an issue describing the change you'd like to make.
 - Follow the relevant guide under `command/` for design and review steps.
 - If adding a new skill, consider using the scripts in `skill/skill-creator/scripts` to scaffold and package it.
@@ -271,7 +277,7 @@ Daemon / scheduler note
 
 The AMPA Worklog plugin has been moved to its own independent repository:
 
-**https://github.com/opencode/ampa**
+**<https://github.com/opencode/ampa>**
 
 The `skill/install-ampa/resources/ampa.mjs` file in this repository is a runtime loader that delegates to the installed AMPA package. To develop or modify AMPA:
 
@@ -283,10 +289,12 @@ The `skill/install-ampa/resources/ampa.mjs` file in this repository is a runtime
 See the [Migration Guide](docs/AMPA_MIGRATION.md) for information about transitioning from the old bundled installation to the new repository-based installation.
 
 ## Next steps / Suggestions
+
 - Add a CI workflow to validate new skills and docs.
 - Add example usage for each skill in `skill/` to make onboarding easier.
 
 ## License
+
 See individual files for licenses. Some folders include a LICENSE.txt (for example: [skill/skill-creator/LICENSE.txt](skill/skill-creator/LICENSE.txt)).
 
 ---

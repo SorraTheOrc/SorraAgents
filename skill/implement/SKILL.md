@@ -46,7 +46,7 @@ any sensitive values before writing them to logs or comments.
 - Follow the steps in order and do not skip steps.
 - Do not use search tools such as grep, ripgrep, or code search in the implementation process. Rely on the context provided in the work item, linked documentation, and your understanding of the codebase. If you find that you do not have enough context to implement, use the intake interview to gather more information and update the work item before proceeding.
 - Keep implementation focused on meeting acceptance criteria with minimal changes.
-- Never edit code outside of the src/, tests/ and docs/ for this project unless they are essential configuration files. 
+- Never edit code outside of the src/, tests/ and docs/ for this project unless they are essential configuration files.
 - Never edit code in bundled libraries such as dist/ and node_modules/.
 - When implementing a CLI or API always provide a way to obtain a JSON formatted output for agents to consume.
 - Use work item comments to document your process, decisions, and next steps.
@@ -76,7 +76,7 @@ any sensitive values before writing them to logs or comments.
 
 Execute the following steps in order. Do not skip steps. Use the live commands where applicable and record outputs in the work-item comments as you proceed.
 
-0. Safety gate: handle dirty working tree
+1. Safety gate: handle dirty working tree
 
 - Inspect `git status --porcelain=v1 -b`.
 - If uncommitted changes are limited to `.worklog/`, carry them into the new working branch and commit there.
@@ -108,14 +108,14 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 - If you ran the plan interview, convert this work item to an epic and inform the user that implementation should move to the first child work item created.
 - If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
 
-2. Create a working branch
+1. Create a working branch
 
 - Inspect the current branch name via `git rev-parse --abbrev-ref HEAD`.
 - If the current branch was created for a work item that is an ancestor of <work-item-id>, continue on that branch (that is if the name has an ancestor work item id).
 - Otherwise create or switch to a branch named `feature/<work-item-id>-<short>` or `bug/<work-item-id>-<short>` (include the work item id).
 - Never commit directly to `main`.
 
-3. Implement
+1. Implement
 
 - If the work item has any open or in_progress blockers or dependencies:
   - Select the most appropriate work item to work on next (blocker > dependency; most critical first).
@@ -144,7 +144,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Summarize changes made in the work item description or comments.
   - Do not proceed to the next step until the user confirms it is OK to do so.
 
-4. Automated self-review
+1. Automated self-review
 
 - Build and lint the code to catch basic issues, fix any issues raised before proceeding.
 - Run all tests again using quiet test commands to ensure nothing is broken, fix any failing tests before proceeding.
@@ -155,7 +155,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 - Run the entire test suite using the shared quiet test helper or quiet project commands.
   - Fix any failing tests before continuing.
 
-5. Commit, Push to dev and mark in_review
+1. Commit, Push to dev and mark in_review
 
 - Before committing, follow the mandatory build → test → commit order: build the project and verify no errors, then run all tests and verify they pass, and only then commit changes.
 - Ensure all work has been committed on the feature branch.
@@ -165,10 +165,12 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Direct git command: `git push origin HEAD:refs/heads/dev`
   - The push target `dev` is **not** a protected branch; the `.githooks/pre-push` hook only blocks `main`, `master`, and `HEAD`.
 - After pushing, switch to the `dev` branch locally and pull the latest:
+
   ```bash
   git checkout dev
   git pull origin dev
   ```
+
   This ensures subsequent operations begin from the current HEAD of the integration branch.
 - Add a work-item comment recording the commit hash and that the work has been pushed to dev:
   `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>. The work-item stays open until the release process merges dev to main." --author "<AGENT>" --json`
@@ -186,6 +188,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 Pre-push blocking check
 -----------------------
+
 - Before pushing to `dev`, the Ralph orchestration loop automatically ensures all tests pass. If tests fail:
   1. Child work items are created via triage helper (with `parent_work_item_id`)
   2. Fixes are implemented via `implement-single`

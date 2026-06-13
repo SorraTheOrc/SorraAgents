@@ -59,6 +59,7 @@ All pre invariants pass. Command execution proceeds.
 | **Discord** | `"Delegating 'intake' task for 'Add user preference export API' (WL-EXAMPLE-001)"` |
 
 **Audit Comment Recorded:**
+
 ```
 Command: delegate (intake)
 Actor: PM -> ampa-scheduler
@@ -70,6 +71,7 @@ Prompt ref: prompts/delegate.md
 ```
 
 **Engine Action:**
+
 ```bash
 wl update WL-EXAMPLE-001 --status in_progress --stage delegated
 wl comment add WL-EXAMPLE-001 --comment "..." --author "ampa-scheduler"
@@ -110,6 +112,7 @@ AMPA's next scheduler cycle finds WL-EXAMPLE-001 at stage `plan_complete`.
 ### Step 6: Patch Implements Autonomously
 
 Patch works without any back-and-forth:
+
 - Writes implementation code
 - Writes unit and integration tests
 - Creates documentation
@@ -148,6 +151,7 @@ Patch works without any back-and-forth:
 | **Engine Action** | `opencode run "/audit WL-EXAMPLE-001"` |
 
 **Audit Output:**
+
 ```
 AMPA Audit Result
 
@@ -170,6 +174,7 @@ AMPA Audit Result
 | **Discord** | `"Audit Completed -- 'Add user preference export API' ready for producer review"` |
 
 **Engine Action:**
+
 ```bash
 wl update WL-EXAMPLE-001 --status completed --stage in_review
 ```

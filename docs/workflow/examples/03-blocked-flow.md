@@ -34,12 +34,14 @@ During autonomous implementation, Patch discovers that the payment service's web
 | **Input: reason** | "Payment service webhook endpoint (POST /webhooks/payment) not deployed. Required for integration testing. See INFRA-456." |
 
 **Engine Action:**
+
 ```bash
 wl update WL-EXAMPLE-003 --status blocked --stage delegated
 wl comment add WL-EXAMPLE-003 --comment "Blocked: Payment service webhook endpoint not deployed. Required for integration testing. See INFRA-456." --author "patch-agent"
 ```
 
 **Audit Comment Recorded:**
+
 ```
 Command: block_delegated
 Actor: Patch -> opencode-patch-1
@@ -72,6 +74,7 @@ The DevOps team deploys the payment service webhook endpoint. A team member or a
 | **State After** | `in_progress / delegated` (alias: `delegated`) |
 
 **Engine Action:**
+
 ```bash
 wl update WL-EXAMPLE-003 --status in_progress --stage delegated
 wl comment add WL-EXAMPLE-003 --comment "Unblocked: Payment service webhook endpoint now deployed. Resuming implementation." --author "patch-agent"

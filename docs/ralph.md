@@ -81,6 +81,7 @@ The background launcher stores the current runtime context in `.worklog/ralph/cu
 Ralph monitors the stdout pipe of the delegated `pi` process with a watchdog timeout. If the stream becomes idle for longer than the timeout, Ralph terminates the subprocess with a clear `stream_stalled` error. This prevents the orchestration loop from hanging indefinitely when `pi` keeps the pipe open.
 
 **Default timeouts:**
+
 - **Local models**: 60 seconds — suitable for fast, low-latency local inference.
 - **Remote models**: 300 seconds — accommodates higher network latency and variable response times from cloud providers.
 
@@ -258,6 +259,7 @@ def _scope_in_review(self, scope_ids: Iterable[str]) -> bool:
 **Rationale**: The original CI failures included scenarios where Ralph would reach max attempts without clear visibility into why the audit process was failing.
 
 **Implementation**: Debug logging was added in PR #691 to provide better visibility into:
+
 - Audit parsing processes
 - Unmet criteria detection
 - Per-child iteration progress
@@ -292,6 +294,7 @@ Related-Work: SA-67890
 ```
 
 This convention allows:
+
 - Tracing which child work item each commit addresses
 - Filtering commits by work item in git history
 - Maintaining clear lineage between parent and child changes
@@ -522,6 +525,7 @@ Ralph emits structured log events at key lifecycle points using the `ralph` Pyth
 | `ralph.cleanup.pi.forced_kill` | WARNING | pid, returncode |
 | `ralph.cleanup.pi.sigkill_wait_timeout` | WARNING | pid |
 | `ralph.cleanup.pi.kill_failed` | WARNING | pid, error |
+
 | Event | Level | Data |
 |-------|-------|------|
 | `ralph.loop.start` | INFO | target, scope, max_attempts |
@@ -581,6 +585,7 @@ The retention period controls how long Ralph-generated sessions are kept before 
 #### Session directory
 
 The Pi session directory defaults to `~/.pi/agent/sessions/` and can be overridden via:
+
 - `PI_CODING_AGENT_SESSION_DIR` environment variable
 - `--session-dir` CLI flag
 

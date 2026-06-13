@@ -44,6 +44,7 @@ The engine's triage audit cycle picks up WL-EXAMPLE-006 in `in_review` state.
 **Effects:** `add_tags: [audit_failed]`
 
 **Audit Output (recorded as comment):**
+
 ```
 # AMPA Audit Result
 
@@ -59,6 +60,7 @@ The engine's triage audit cycle picks up WL-EXAMPLE-006 in `in_review` state.
 ```
 
 **Engine Actions:**
+
 ```bash
 wl update WL-EXAMPLE-006 --stage audit_failed
 wl comment add WL-EXAMPLE-006 --comment "Audit 1: 2/5 AC unmet..." --author "ampa-scheduler"
@@ -77,6 +79,7 @@ The engine checks the failure count (1) against the retry threshold (2). First f
 | **Effects** | `remove_tags: [audit_failed]` |
 
 **Engine Actions:**
+
 ```bash
 wl update WL-EXAMPLE-006 --status open --stage plan_complete
 ```
@@ -102,12 +105,14 @@ Next scheduler cycle picks up WL-EXAMPLE-006 at stage `plan_complete`.
 | `no_in_progress_items` | No other in-progress items | PASS |
 
 **Engine Actions:**
+
 ```bash
 wl update WL-EXAMPLE-006 --status in_progress --stage delegated
 opencode run "work on WL-EXAMPLE-006 using the implement skill"
 ```
 
 Patch reads the prior audit comment and attempts fixes:
+
 - Makes the signature key configurable (reads from `WEBHOOK_SECRET` env var)
 - Does **not** add timestamp replay protection (misunderstands the requirement)
 
@@ -135,6 +140,7 @@ Patch reads the prior audit comment and attempts fixes:
 **Effects:** `add_tags: [audit_failed]`
 
 **Audit Output (recorded as comment):**
+
 ```
 # AMPA Audit Result
 
@@ -150,6 +156,7 @@ Patch reads the prior audit comment and attempts fixes:
 ```
 
 **Engine Actions:**
+
 ```bash
 wl update WL-EXAMPLE-006 --stage audit_failed
 wl comment add WL-EXAMPLE-006 --comment "Audit 2: 1/5 AC still unmet..." --author "ampa-scheduler"
@@ -171,17 +178,20 @@ The engine checks the failure count (2) against the retry threshold (2). Thresho
 | `audit_does_not_recommend_closure` | "Can this item be closed? No" | PASS |
 
 **Input:**
+
 ```
 reason: "2 audit failures. Remaining gap: timestamp replay protection not implemented
          despite clear AC. Escalating for Producer guidance."
 ```
 
 **Effects:**
+
 - `set_assignee: Producer`
 - `add_tags: [escalated]`
 - Notification: Discord bot notification fires
 
 **Engine Actions:**
+
 ```bash
 wl update WL-EXAMPLE-006 --status blocked --stage escalated --assignee Producer
 wl comment add WL-EXAMPLE-006 --comment "Escalated after 2 audit failures. ..." --author "ampa-scheduler"
@@ -189,6 +199,7 @@ wl comment add WL-EXAMPLE-006 --comment "Escalated after 2 audit failures. ..." 
 ```
 
 **Discord Message:**
+
 ```
 Escalation: 'Add webhook signature verification' requires producer review —
 2 audit failures. Remaining gap: timestamp replay protection not implemented
@@ -198,6 +209,7 @@ despite clear AC. Escalating for Producer guidance.
 ### Step 7: Producer Reviews and Provides Guidance
 
 The Producer reviews the work item, reads the audit comments, and determines the issue:
+
 - The acceptance criterion "Replay attacks prevented with timestamp validation" needs a more specific description — Patch did not understand *how* to implement it.
 
 The Producer adds a comment with implementation guidance:
@@ -227,6 +239,7 @@ and maintain a nonce cache to prevent duplicate delivery."
 **Effects:** `remove_tags: [escalated]`
 
 **Engine Actions (executed by Producer):**
+
 ```bash
 wl update WL-EXAMPLE-006 --status open --stage plan_complete
 wl comment add WL-EXAMPLE-006 --comment "De-escalated. Added implementation guidance..." --author "producer"
@@ -247,6 +260,7 @@ Next scheduler cycle picks up WL-EXAMPLE-006, now with the Producer's guidance i
 All 5 delegation invariants pass.
 
 Patch reads the Producer's guidance and implements:
+
 - Parses `X-Webhook-Timestamp` header
 - Rejects requests where `|now - timestamp| > 300`
 - Adds a TTL-based nonce cache
@@ -273,6 +287,7 @@ Patch reads the Producer's guidance and implements:
 | `audit_recommends_closure` | "Can this item be closed? Yes" | PASS |
 
 **Audit Output (recorded as comment):**
+
 ```
 # AMPA Audit Result
 

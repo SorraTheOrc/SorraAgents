@@ -44,7 +44,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Callable, Union
 
 from .detection import detect_languages, get_linters_for_language, probe_linter
 
@@ -128,6 +128,129 @@ def _classify_eslint(severity: Any) -> str:
         return "medium"
     # 0 or anything else
     return "low"
+
+
+def _run_eslint_findings(
+    result: Any,
+) -> list[dict[str, Any]]:
+    """Parse eslint JSON output into findings.
+
+    Args:
+        result: A CompletedProcess-like object from running eslint.
+
+    Returns:
+        A list of finding dicts.
+    """
+    findings: list[dict[str, Any]] = []
+    output = result.stdout.strip() if hasattr(result, "stdout") else ""
+    if not output:
+        return []
+
+    try:
+        raw = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(raw, list):
+        return []
+
+    for file_result in raw:
+        if not isinstance(file_result, dict):
+            continue
+        file_path = str(file_result.get("filePath", ""))
+        messages = file_result.get("messages", [])
+        if not isinstance(messages, list):
+            continue
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            severity_val = msg.get("severity", 1)
+            severity = classify_finding("eslint", severity_val)
+            findings.append({
+                "file": file_path,
+                "line": msg.get("line", 0),
+                "severity": severity,
+                "message": msg.get("message", ""),
+                "linter": "eslint",
+                "code": msg.get("ruleId", ""),
+            })
+
+    return findings
+
+
+def _run_eslint_findings_check(
+    root: Path,
+    runner: Callable,
+) -> list[dict[str, Any]]:
+    """Run eslint check (without fix) and return structured findings.
+
+    Args:
+        root: The project root path.
+        runner: Subprocess runner callable.
+
+    Returns:
+        A list of finding dicts.
+    """
+    cmd = ["eslint", str(root), "-f", "json", "--no-eslintrc", "--quiet"]
+    result = runner(cmd)
+
+    if result.returncode not in (0, 1):
+        return []
+
+    return _run_eslint_findings(result)
+
+
+def _run_ruff_check(
+    root: Path,
+    runner: Callable,
+) -> list[dict[str, Any]]:
+    """Run ruff check (without fix) and return structured findings.
+
+    Args:
+        root: The project root path.
+        runner: Subprocess runner callable.
+
+    Returns:
+        A list of finding dicts.
+    """
+    findings: list[dict[str, Any]] = []
+
+    cmd = ["ruff", "check", str(root), "--output-format", "json", "--quiet"]
+    result = runner(cmd)
+
+    if result.returncode not in (0, 1):
+        return []
+
+    output = result.stdout.strip()
+    if not output:
+        return []
+
+    try:
+        raw = json.loads(output)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(raw, list):
+        return []
+
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        code = str(item.get("code", ""))
+        severity = classify_finding("ruff", code)
+        loc = item.get("location", {}) or {}
+        findings.append({
+            "file": str(item.get("filename", "")),
+            "line": loc.get("row", 0) if isinstance(loc, dict) else 0,
+            "severity": severity,
+            "message": item.get("message", ""),
+            "linter": "ruff",
+            "code": code,
+        })
+
+    return findings
 
 
 def classify_finding(linter: str, raw_severity: Any) -> str:
@@ -226,6 +349,42 @@ def _run_subprocess(cmd: list[str], cwd: str | Path | None = None) -> subprocess
         )
 
 
+def _commit_changes(
+    root: Path,
+    linter_name: str,
+    runner: Callable | None = None,
+) -> bool:
+    """Stage and commit any changes made by a linter.
+
+    Args:
+        root: The project root path.
+        linter_name: The name of the linter (for commit message).
+        runner: Optional injectable runner for testing.
+
+    Returns:
+        True if changes were committed, False otherwise.
+    """
+    if runner is None:
+        runner = _run_subprocess
+
+    try:
+        # Check if there are changes to commit
+        check = runner(["git", "status", "--porcelain"], cwd=root)
+        if not check.stdout.strip():
+            return False
+
+        # Stage all changes
+        runner(["git", "add", "."], cwd=root)
+
+        # Commit
+        msg = f"Auto-fix: {linter_name} applied fixes"
+        runner(["git", "commit", "-m", msg], cwd=root)
+        return True
+    except Exception:
+        # Silently fail - don't block the main flow
+        return False
+
+
 def _normalize_paths(root: Union[str, os.PathLike[str], None] = None) -> Path:
     """Normalise the project root to an absolute Path."""
     if root is None:
@@ -236,7 +395,8 @@ def _normalize_paths(root: Union[str, os.PathLike[str], None] = None) -> Path:
 def run_ruff(
     project_root: Union[str, os.PathLike[str], None] = None,
     runner: Any = None,
-) -> list[dict[str, Any]]:
+    fix: bool = False,
+) -> dict[str, Any]:
     """Run ruff check on the given project root and return structured findings.
 
     Only runs if the linter is available on PATH and Python files are detected.
@@ -246,71 +406,95 @@ def run_ruff(
         runner: Optional injectable runner for testing (must be a callable
                 accepting a list of strings and returning a
                 ``subprocess.CompletedProcess``-like object).
+        fix: If True, run ruff with ``--fix`` to auto-fix issues, then re-scan
+             for remaining (non-fixable) issues.
 
     Returns:
-        A list of finding dicts, each with keys:
-          ``file``, ``line``, ``severity``, ``message``, ``linter``, ``code``.
-        Returns an empty list if ruff is not available or no Python files exist.
+        A dict with keys:
+          - ``findings``: list of finding dicts (same format as before)
+          - ``fixes_applied``: bool — True if any fixes were applied
+        Returns empty findings and ``fixes_applied: False`` if ruff is not
+        available or no Python files exist.
     """
     # Check linter availability
     probe = probe_linter("ruff")
     if not probe["available"]:
-        return []
+        return {"findings": [], "fixes_applied": False}
 
     root = _normalize_paths(project_root)
     languages = detect_languages(root)
 
     if "python" not in languages:
-        return []
+        return {"findings": [], "fixes_applied": False}
 
     if runner is None:
         runner = _run_subprocess
 
-    findings: list[dict[str, Any]] = []
+    fixes_applied = False
 
-    # Run ruff check on the whole project
-    cmd = ["ruff", "check", str(root), "--output-format", "json", "--quiet"]
-    result = runner(cmd)
+    if fix:
+        # Run ruff with --fix to auto-fix issues
+        cmd = ["ruff", "check", str(root), "--fix", "--output-format", "json", "--quiet"]
+        result = runner(cmd)
 
-    if result.returncode not in (0, 1):
-        # Ruff exits 0 for no issues, 1 for issues found, other = error
-        return []
+        if result.returncode not in (0, 1):
+            # Ruff exits 0 for no issues, 1 for issues found, other = error
+            return {"findings": [], "fixes_applied": False}
 
-    output = result.stdout.strip()
-    if not output:
-        return []
+        # Check if any fixes were made by comparing file state
+        output = result.stdout.strip()
+        if result.returncode == 1:
+            # Issues found (some may have been fixed)
+            try:
+                raw = json.loads(output)
+            except json.JSONDecodeError:
+                raw = []
+            # If ruff reported issues, fixes were attempted/applied
+            if isinstance(raw, list) and len(raw) > 0:
+                fixes_applied = True
+            else:
+                fixes_applied = True
 
-    try:
-        raw = json.loads(output)
-    except json.JSONDecodeError:
-        return []
+        # Re-scan to get remaining (non-fixable) issues
+        cmd = ["ruff", "check", str(root), "--output-format", "json", "--quiet"]
+        result = runner(cmd)
 
-    if not isinstance(raw, list):
-        return []
+        findings: list[dict[str, Any]] = []
+        if result.returncode == 1:
+            output = result.stdout.strip()
+            if output:
+                try:
+                    raw = json.loads(output)
+                except json.JSONDecodeError:
+                    return {"findings": findings, "fixes_applied": fixes_applied}
 
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
+                if isinstance(raw, list):
+                    for item in raw:
+                        if not isinstance(item, dict):
+                            continue
+                        code = str(item.get("code", ""))
+                        severity = classify_finding("ruff", code)
+                        loc = item.get("location", {}) or {}
+                        findings.append({
+                            "file": str(item.get("filename", "")),
+                            "line": loc.get("row", 0) if isinstance(loc, dict) else 0,
+                            "severity": severity,
+                            "message": item.get("message", ""),
+                            "linter": "ruff",
+                            "code": code,
+                        })
+    else:
+        # Normal check mode (no fix)
+        findings = _run_ruff_check(root, runner)
 
-        code = str(item.get("code", ""))
-        severity = classify_finding("ruff", code)
-        loc = item.get("location", {}) or {}
-        findings.append({
-            "file": str(item.get("filename", "")),
-            "line": loc.get("row", 0) if isinstance(loc, dict) else 0,
-            "severity": severity,
-            "message": item.get("message", ""),
-            "linter": "ruff",
-            "code": code,
-        })
-
-    return findings
+    return {"findings": findings, "fixes_applied": fixes_applied}
 
 
 def run_eslint(
     project_root: Union[str, os.PathLike[str], None] = None,
     runner: Any = None,
-) -> list[dict[str, Any]]:
+    fix: bool = False,
+) -> dict[str, Any]:
     """Run eslint on the given project root and return structured findings.
 
     Only runs if eslint is available on PATH and TypeScript files are detected.
@@ -318,71 +502,70 @@ def run_eslint(
     Args:
         project_root: Path to the project root (default: cwd).
         runner: Optional injectable runner for testing.
+        fix: If True, run eslint with ``--fix`` to auto-fix issues, then re-scan
+             for remaining (non-fixable) issues.
 
     Returns:
-        A list of finding dicts (same format as :func:`run_ruff`).
-        Returns an empty list if eslint is not available or no TS files exist.
+        A dict with keys:
+          - ``findings``: list of finding dicts
+          - ``fixes_applied``: bool — True if any fixes were applied
     """
     # Check linter availability
     probe = probe_linter("eslint")
     if not probe["available"]:
-        return []
+        return {"findings": [], "fixes_applied": False}
 
     root = _normalize_paths(project_root)
     languages = detect_languages(root)
 
     if "typescript" not in languages and "javascript" not in languages:
-        return []
+        return {"findings": [], "fixes_applied": False}
 
     if runner is None:
         runner = _run_subprocess
 
-    findings: list[dict[str, Any]] = []
+    fixes_applied = False
 
-    # Run eslint on the project
-    # Use --no-eslintrc to avoid config issues, or just run with -f json
-    cmd = ["eslint", str(root), "-f", "json", "--no-eslintrc", "--quiet"]
-    result = runner(cmd)
+    if fix:
+        # Run eslint with --fix to auto-fix issues
+        cmd = ["eslint", str(root), "-f", "json", "--fix", "--no-eslintrc", "--quiet"]
+        result = runner(cmd)
 
-    if result.returncode not in (0, 1):
-        # eslint exits 0 for no issues, 1 for issues found, other = error
-        return []
+        if result.returncode not in (0, 1):
+            return {"findings": [], "fixes_applied": False}
 
-    output = result.stdout.strip()
-    if not output:
-        return []
+        # Check if eslint reported issues after fix attempt
+        output = result.stdout.strip()
+        if result.returncode == 1:
+            fixes_applied = True
+        elif output:
+            # eslint returned 0 but had output - check if messages exist
+            try:
+                raw = json.loads(output)
+                if isinstance(raw, list):
+                    for file_result in raw:
+                        if isinstance(file_result, dict):
+                            msgs = file_result.get("messages", [])
+                            if msgs:
+                                fixes_applied = True
+                                break
+            except json.JSONDecodeError:
+                pass
 
-    try:
-        raw = json.loads(output)
-    except json.JSONDecodeError:
-        return []
+        # Commit any changes
+        if fixes_applied:
+            _commit_changes(root, "eslint")
 
-    if not isinstance(raw, list):
-        return []
+        # Re-scan to get remaining (non-fixable) issues
+        cmd = ["eslint", str(root), "-f", "json", "--no-eslintrc", "--quiet"]
+        result = runner(cmd)
 
-    for file_result in raw:
-        if not isinstance(file_result, dict):
-            continue
-        file_path = str(file_result.get("filePath", ""))
-        messages = file_result.get("messages", [])
-        if not isinstance(messages, list):
-            continue
+        findings = _run_eslint_findings(result)
+    else:
+        # Normal check mode (no fix)
+        findings = _run_eslint_findings_check(root, runner)
 
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            severity_val = msg.get("severity", 1)
-            severity = classify_finding("eslint", severity_val)
-            findings.append({
-                "file": file_path,
-                "line": msg.get("line", 0),
-                "severity": severity,
-                "message": msg.get("message", ""),
-                "linter": "eslint",
-                "code": msg.get("ruleId", ""),
-            })
-
-    return findings
+    return {"findings": findings, "fixes_applied": fixes_applied}
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +576,8 @@ def run_eslint(
 def run_markdownlint(
     project_root: Union[str, os.PathLike[str], None] = None,
     runner: Any = None,
-) -> list[dict[str, Any]]:
+    fix: bool = False,
+) -> dict[str, Any]:
     """Run markdownlint on the given project root and return structured findings.
 
     Only runs if the linter is available on PATH and Markdown files are detected.
@@ -401,44 +585,62 @@ def run_markdownlint(
     Args:
         project_root: Path to the project root (default: cwd).
         runner: Optional injectable runner for testing.
+        fix: If True, run markdownlint with ``--fix`` to auto-fix issues, then
+             re-scan for remaining (non-fixable) issues.
 
     Returns:
-        A list of finding dicts (same format as :func:`run_ruff`).
-        Returns an empty list if markdownlint is not available or no MD files exist.
+        A dict with keys:
+          - ``findings``: list of finding dicts
+          - ``fixes_applied``: bool — True if any fixes were applied
     """
     probe = probe_linter("markdownlint")
     if not probe["available"]:
-        return []
+        return {"findings": [], "fixes_applied": False}
 
     root = _normalize_paths(project_root)
     languages = detect_languages(root)
 
     if "markdown" not in languages:
-        return []
+        return {"findings": [], "fixes_applied": False}
 
     if runner is None:
         runner = _run_subprocess
 
+    fixes_applied = False
+
+    if fix:
+        # Run markdownlint with --fix to auto-fix issues
+        cmd = ["markdownlint", "--fix", "--json", str(root)]
+        result = runner(cmd)
+
+        # markdownlint may exit 0 or 1; check if fixes were applied by
+        # looking at git changes
+        _commit_changes(root, "markdownlint")
+        fixes_applied = True
+
+        # Re-scan to get remaining issues
+        cmd = ["markdownlint", "--json", str(root)]
+        result = runner(cmd)
+    else:
+        # Normal check mode
+        cmd = ["markdownlint", "--json", str(root)]
+        result = runner(cmd)
+
     findings: list[dict[str, Any]] = []
-
-    # markdownlint-cli2 uses --json flag, fallback to markdownlint
-    cmd = ["markdownlint", "--json", str(root)]
-    result = runner(cmd)
-
     if result.returncode not in (0, 1):
-        return []
+        return {"findings": findings, "fixes_applied": fixes_applied}
 
     output = result.stdout.strip()
     if not output:
-        return []
+        return {"findings": findings, "fixes_applied": fixes_applied}
 
     try:
         raw = json.loads(output)
     except json.JSONDecodeError:
-        return []
+        return {"findings": findings, "fixes_applied": fixes_applied}
 
     if not isinstance(raw, list):
-        return []
+        return {"findings": findings, "fixes_applied": fixes_applied}
 
     for item in raw:
         if not isinstance(item, dict):
@@ -453,7 +655,7 @@ def run_markdownlint(
             "code": str(item.get("rule", "")),
         })
 
-    return findings
+    return {"findings": findings, "fixes_applied": fixes_applied}
 
 
 def run_shellcheck(
@@ -536,7 +738,8 @@ def run_shellcheck(
 def run_dotnet_format(
     project_root: Union[str, os.PathLike[str], None] = None,
     runner: Any = None,
-) -> list[dict[str, Any]]:
+    fix: bool = False,
+) -> dict[str, Any]:
     """Run dotnet-format on the given project root and return structured findings.
 
     Only runs if dotnet-format is available on PATH and C# files are detected.
@@ -544,35 +747,55 @@ def run_dotnet_format(
     Args:
         project_root: Path to the project root (default: cwd).
         runner: Optional injectable runner for testing.
+        fix: If True, run dotnet format without ``--verify-no-changes`` to
+             auto-format files.
 
     Returns:
-        A list of finding dicts (same format as :func:`run_ruff`).
-        Returns an empty list if dotnet-format is not available or no C# files exist.
+        A dict with keys:
+          - ``findings``: list of finding dicts
+          - ``fixes_applied``: bool — True if any formatting was applied
     """
     probe = probe_linter("dotnet-format")
     if not probe["available"]:
-        return []
+        return {"findings": [], "fixes_applied": False}
 
     root = _normalize_paths(project_root)
     languages = detect_languages(root)
 
     if "csharp" not in languages:
-        return []
+        return {"findings": [], "fixes_applied": False}
 
     if runner is None:
         runner = _run_subprocess
 
+    fixes_applied = False
+
+    if fix:
+        # Auto-format mode: run without --verify-no-changes
+        cmd = ["dotnet", "format", str(root), "--verbosity", "quiet"]
+        result = runner(cmd)
+
+        # Check if changes were made by looking at git status
+        status = _run_subprocess(["git", "status", "--porcelain"], cwd=root)
+        if status.stdout.strip():
+            fixes_applied = True
+            _commit_changes(root, "dotnet-format")
+
+        # Re-scan for remaining issues (should be none after fix, but check)
+        cmd = ["dotnet", "format", str(root), "--verify-no-changes", "--verbosity", "quiet"]
+        result = runner(cmd)
+    else:
+        # Normal check mode
+        cmd = ["dotnet", "format", str(root), "--verify-no-changes", "--verbosity", "quiet"]
+        result = runner(cmd)
+
     findings: list[dict[str, Any]] = []
-
-    cmd = ["dotnet", "format", str(root), "--verify-no-changes", "--verbosity", "quiet"]
-    result = runner(cmd)
-
     if result.returncode not in (0, 1):
-        return []
+        return {"findings": findings, "fixes_applied": fixes_applied}
 
     output = (result.stdout + result.stderr).strip()
     if not output:
-        return []
+        return {"findings": findings, "fixes_applied": fixes_applied}
 
     # dotnet format outputs file paths for violations
     for line in output.splitlines():
@@ -587,7 +810,7 @@ def run_dotnet_format(
                 "code": "formatting",
             })
 
-    return findings
+    return {"findings": findings, "fixes_applied": fixes_applied}
 
 
 # ---------------------------------------------------------------------------
@@ -598,12 +821,14 @@ def run_dotnet_format(
 def run_linters_for_project(
     project_root: Union[str, os.PathLike[str], None] = None,
     runner: Any = None,
+    fix: bool = False,
 ) -> dict[str, Any]:
     """Detect languages, probe linters, and run all available linters.
 
     Args:
         project_root: Path to the project root (default: cwd).
         runner: Optional injectable runner for testing.
+        fix: If True, run all linters with auto-fix mode enabled.
 
     Returns:
         A dict with keys:
@@ -612,6 +837,7 @@ def run_linters_for_project(
           - ``total_findings``: total number of findings
           - ``findings_by_severity``: dict of severity → count
           - ``findings``: list of finding dicts
+          - ``fixes_applied``: total number of linters that applied fixes
     """
     root = _normalize_paths(project_root)
     languages = detect_languages(root)
@@ -627,26 +853,35 @@ def run_linters_for_project(
 
     # Run all available linters
     all_findings: list[dict[str, Any]] = []
+    fixes_applied = 0
 
     for linter_info in linters:
         if not linter_info.get("available"):
             continue
         linter_name = linter_info["name"]
         if linter_name == "ruff":
-            findings = run_ruff(root, runner=runner)
-            all_findings.extend(findings)
+            result = run_ruff(root, runner=runner, fix=fix)
+            all_findings.extend(result.get("findings", []))
+            if result.get("fixes_applied"):
+                fixes_applied += 1
         elif linter_name == "eslint":
-            findings = run_eslint(root, runner=runner)
-            all_findings.extend(findings)
+            result = run_eslint(root, runner=runner, fix=fix)
+            all_findings.extend(result.get("findings", []))
+            if result.get("fixes_applied"):
+                fixes_applied += 1
         elif linter_name == "markdownlint":
-            findings = run_markdownlint(root, runner=runner)
-            all_findings.extend(findings)
+            result = run_markdownlint(root, runner=runner, fix=fix)
+            all_findings.extend(result.get("findings", []))
+            if result.get("fixes_applied"):
+                fixes_applied += 1
         elif linter_name == "shellcheck":
-            findings = run_shellcheck(root, runner=runner)
-            all_findings.extend(findings)
+            result = run_shellcheck(root, runner=runner)
+            all_findings.extend(result)
         elif linter_name == "dotnet-format":
-            findings = run_dotnet_format(root, runner=runner)
-            all_findings.extend(findings)
+            result = run_dotnet_format(root, runner=runner, fix=fix)
+            all_findings.extend(result.get("findings", []))
+            if result.get("fixes_applied"):
+                fixes_applied += 1
 
     # Count by severity
     severity_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
@@ -661,4 +896,5 @@ def run_linters_for_project(
         "total_findings": len(all_findings),
         "findings_by_severity": severity_counts,
         "findings": all_findings,
+        "fixes_applied": fixes_applied,
     }

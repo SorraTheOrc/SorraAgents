@@ -5,10 +5,11 @@ description: "Produce engineering effort and risk estimates using WBS, three-poi
 
 Purpose
 -------
+
 Produce a concise, auditable engineering estimate (effort + risk) for a prepared work item. The skill's canonical outputs are:
 
 - A machine-readable JSON object containing effort (effort_units, tshirt size, O/M/P, expected, recommended, range), risk (probability, impact, score, level, top drivers, mitigations), confidence, assumptions, and unknowns.
- - A machine-readable JSON object containing effort (effort_units, tshirt size (full-text, e.g. "Small", "Extra Large"), O/M/P, expected, recommended, range), risk (probability, impact, score, level, top drivers, mitigations), confidence, assumptions, and unknowns.
+- A machine-readable JSON object containing effort (effort_units, tshirt size (full-text, e.g. "Small", "Extra Large"), O/M/P, expected, recommended, range), risk (probability, impact, score, level, top drivers, mitigations), confidence, assumptions, and unknowns.
 - A human-readable summary generated and posted by the orchestrator; the posted content is included in the orchestrator output.
 
 Gating (mandatory)
@@ -27,10 +28,12 @@ The `orchestrate_estimate.py` script accepts work items in either `intake_comple
 
 When to use
 -----------
+
 Use this skill only after the Producer has prepared a plan and set the work item's stage to `intake_complete` or `plan_complete`.
 
 Required inputs (what you must prepare before running the scripts)
 ----------------------------------------------------------------
+
 - issue id (string). Fetch the full issue and its children for auditability: wl show <issue-id> --json
 - A lightweight WBS. Use the issue's child work items as the WBS source (children are returned recursively by wl show --json). If the issue has no children and the scope is small, the parent issue itself can be treated as the WBS.
 - Provide Optimistic (O), Most Likely (M), and Pessimistic (P) estimates in effort_units for the overall work scope. Optionally (for traceability), provide O/M/P per WBS item or per child issue; the scripts will aggregate per-item inputs into the overall estimate when present.
@@ -41,6 +44,7 @@ Required inputs (what you must prepare before running the scripts)
 
 Principles (kept brief)
 -----------------------
+
 - Use effort_units as the canonical unit.
 - Use three-point (PERT) estimating for expected value: E = (O + 4*M + P) / 6.
 - Surface assumptions and unknowns explicitly so reviewers can decide if further planning (spikes) is needed.
@@ -48,6 +52,7 @@ Principles (kept brief)
 
 Canonical workflow (minimal, authoritative)
 -----------------------------------------
+
 Follow these steps from the project root (run commands from the repository root, not from the `skill/effort_and_risk` directory):
 
 1) Fetch the issue and its children (audit file):
@@ -85,10 +90,12 @@ Follow these steps from the project root (run commands from the repository root,
 
 Outputs
 -------
+
 - `final-<issue-id>.json` (or captured stdout): canonical machine-readable estimate (as described above), plus orchestration metadata including human_text and comment_result. Prefer filenames generated from the work-item id to avoid fixed temporary filenames.
 
 References (bundled)
 --------------------
+
 - references/t-shirt_sizes.json — T-shirt thresholds used by scripts
 - skill/effort-and-risk/scripts/calc_effort.py
 - skill/effort-and-risk/scripts/calc_risk.py

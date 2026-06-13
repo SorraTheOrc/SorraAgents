@@ -98,6 +98,7 @@ into `dev`. This is a **gating step** to prevent accidentally pushing when there
 are unmerged feature branches that should be dealt with first.
 
 The check works as follows:
+
 1. Runs `git branch --no-merged dev` to list all local branches not merged into `dev`.
 2. Excludes `dev` itself, protected branches (`main`, `master`), and the
    **current branch** (the branch being worked on).
@@ -107,6 +108,7 @@ The check works as follows:
    work item details.
 
 If unmerged branches are found, the operation is blocked with a report that shows:
+
 - The branch name
 - The associated work item title and ID (if the branch follows the canonical pattern)
 - The work item's status and stage
@@ -168,7 +170,7 @@ node skill/ship/scripts/run-release.js --skip-checks
 
 Agents work in feature branches and push completed work into the `dev` integration branch. This is the canonical integration action.
 
-1. **Create a feature branch** using `makeBranchName(workItemId, shortDesc)` from `skill/ship/scripts/git-helpers.js`. 
+1. **Create a feature branch** using `makeBranchName(workItemId, shortDesc)` from `skill/ship/scripts/git-helpers.js`.
 2. **Make changes and commit** on the feature branch.
 3. **Validate** the current branch name with `validateBranchName(name)`.
 4. **Check for unmerged branches** using `checkUnmergedBranches()` (also run automatically by `pushToDev()`).
@@ -182,6 +184,7 @@ Agents work in feature branches and push completed work into the `dev` integrati
 ### Protected Branches
 
 Agents MUST NOT push directly to:
+
 - `main`
 - `master`
 - `HEAD`
@@ -205,11 +208,13 @@ wl-<work-item-id>-<short-description>
 ```
 
 Where:
+
 - `wl-` is a literal prefix
 - `<work-item-id>` is the Worklog identifier (e.g., `SA-0MPDZDPZB00121IE`)
 - `<short-description>` is a lowercase, hyphen-separated slug
 
 Examples:
+
 - `wl-SA-0MPDZDPZB00121IE-branch-naming-policy`
 - `wl-SA-001-fix-login-bug`
 

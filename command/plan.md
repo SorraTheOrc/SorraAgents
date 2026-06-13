@@ -54,7 +54,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 ## Process (must follow)
 
-0. Evaluate whether planning is required (agent responsibility)
+1. Evaluate whether planning is required (agent responsibility)
 
 - Before starting the full planning interview and decomposition, run a quick assessment to determine whether the work item already has a sufficient plan or is too small to require decomposition.
 - Suggested checks (conservative, idempotent heuristics):
@@ -66,8 +66,6 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
   - `wl update <work-item-id> --stage plan_complete --status open --json`
   - Optionally add a comment documenting the reason: `wl comment add <work-item-id> "Plan auto-complete: work item appears sufficiently sized/defined for direct implementation." --actor Map --json`
 - If evidence is borderline or key uncertainties remain, proceed with the normal planning process (ask clarifying questions rather than auto-completing).
-
-
 
 1. Fetch & summarise (agent responsibility)
 
@@ -82,7 +80,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 - Read any PRD linked in the work item or any of its parents to extract key details for later reference.
 - Derive 3–6 keywords from the work item title/description to search the repo and work items for related work. Present any likely duplicates or parent/child relationships.
 
-2. Interview
+1. Interview
 
 In interview iterations (≤ 3 questions each), gather the minimum information needed to produce an actionable feature plan in which each feature is large enough to be meaningful but small enough to be delivered as an end-to-end slice. For each feature capture:
 
@@ -95,7 +93,7 @@ Keep asking questions until the breakdown into features is clear.
 
 - Review existing Appendix entries first: the agent MUST NOT ask any question that already appears in the Appendix of the parent work item or the current work item unless further clarification is required. If further clarification is required, reference the existing Appendix entry in the question and explain what additional detail is needed before re-asking.
 
-3. Propose feature plan (agent responsibility + user confirmation)
+1. Propose feature plan (agent responsibility + user confirmation)
 
 - Produce a draft plan (soft guide: 3–12 features) where each feature includes:
   - **Short Title** (canonical, stable, ≤ 7 words)
@@ -114,14 +112,14 @@ Keep asking questions until the breakdown into features is clear.
 - Present the draft as a numbered list and ask the user to: accept, edit titles/scopes, reorder, or split/merge features.
 - If the user requests changes, iterate until the feature list is approved.
 
-4. Verify vertical slice phasing (agent responsibility)
+1. Verify vertical slice phasing (agent responsibility)
 
 - Review the proposed feature plan to ensure each phase represents a vertical slice that cuts through ALL integration layers end-to-end.
 - If any phase appears to be a horizontal slice (focused on a single layer), ask the user to refactor it into vertical slices.
 - Verify that between-phase guidance is included: implementation should review next work items and update descriptions as needed.
 - If the work item is small enough to not require phasing, document this decision and proceed to the automated review stages.
 
-5. Automated review stages (must follow; no human intervention required)
+1. Automated review stages (must follow; no human intervention required)
 
 - After the user approves the feature list, run five review iterations. Each review MUST provide a new draft if any changes are recommended and then output exactly: "Finished <Stage Name> review: <brief notes of improvements>"
 
@@ -135,20 +133,20 @@ Keep asking questions until the breakdown into features is clear.
   1. Completeness review
   - Purpose: Ensure every feature has all required fields.
   - Actions: Add missing placeholders only when obvious; otherwise add Open Questions.
-  2. Sequencing & dependencies review
+  1. Sequencing & dependencies review
   - Purpose: Ensure dependencies are coherent and actionable.
   - Actions: Detect cycles, missing prerequisites, or vague dependencies; propose minimal fixes that do not change intent; record uncertainty as Open Questions. Verify that test/verification features appear before implementation features — if they do not, reorder them so test features come first.
-  3. Scope sizing review
+  1. Scope sizing review
   - Purpose: Ensure features are sized as deliverable increments.
   - Actions: Flag features that are too broad/vague or duplicate scope; suggest split/merge candidates as Open Questions.
-  4. Acceptance & testability review
+  1. Acceptance & testability review
   - Purpose: Ensure acceptance criteria are pass/fail and testable.
   - Actions: Tighten criteria wording; add missing negative cases only when clearly implied.
-  5. Polish & handoff review
+  1. Polish & handoff review
   - Purpose: Make the plan copy-pasteable and easy to execute.
   - Actions: Standardize bullets, tense, and structure; keep titles canonical.
 
-6. Update work items (agent)
+1. Update work items (agent)
 
 - **Test-first creation**: When creating child work items, always create test/verification work items before implementation work items. This ensures that test tasks are available first, enabling a test-driven development workflow where tests define the validation criteria before implementation begins.
 - Create child work items for each feature with a parent link to the original work item:
@@ -168,10 +166,9 @@ Keep asking questions until the breakdown into features is clear.
     -- Update the planned work item's stage to indicate planning is complete:
   - `wl update $1 --stage plan_complete --status open --json`
 
-7. Calculate Effort and Risk (agent responsibility; must follow)
+1. Calculate Effort and Risk (agent responsibility; must follow)
 
 - Call the `effort_and_risk` skill with the new or updated work item to produce an effort and risk estimate.
-
 
 ## Traceability & idempotence
 
@@ -207,7 +204,6 @@ Keep asking questions until the breakdown into features is clear.
   - Starts an interview to break epic `wl-456` into feature and task work items.
 - `/plan wl-456 MVP first`
   - Same as above, but seeds the interview with the phrase "MVP first".
-
 
 ## Appendix: Clarifying questions & answers (must include)
 

@@ -9,6 +9,7 @@ This directory contains comprehensive tests for the refactored ampa plugin insta
 A standalone shell script test suite that doesn't require any external dependencies. This is the primary test file and can be run on any POSIX-compliant shell.
 
 **Features:**
+
 - 22 comprehensive tests covering all major functionality
 - Tests argument parsing, plugin installation, environment file handling, Python setup, and more
 - Colorized output for easy reading
@@ -16,11 +17,13 @@ A standalone shell script test suite that doesn't require any external dependenc
 - Can be run without any test framework dependencies
 
 **Run with:**
+
 ```bash
 sh tests/test-installer-manual.sh
 ```
 
 **Expected output:**
+
 ```
 === Ampa Plugin Installer Test Suite ===
 ...
@@ -37,10 +40,12 @@ All tests passed!
 An optional BATS (Bash Automated Testing System) test suite for users with bats installed. Provides additional test structure and integration with CI/CD systems.
 
 **Requirements:**
+
 - `bats` (Bash Automated Testing System)
 - Install with: `npm install -g bats` or `apt-get install bats`
 
 **Run with:**
+
 ```bash
 bats tests/install-worklog-plugin.bats
 ```
@@ -50,6 +55,7 @@ bats tests/install-worklog-plugin.bats
 The test suite covers the following areas:
 
 ### Argument Parsing
+
 - Help flag (`--help`, `-h`)
 - Bot token option (`--bot-token`) and channel ID option (`--channel-id`) with and without values
 - Auto-yes option (`--yes`, `-y`)
@@ -59,12 +65,14 @@ The test suite covers the following areas:
 - Positional arguments (source file, target directory)
 
 ### Plugin Installation
+
 - Install .mjs plugin file to target directory
 - Default target directory (`.worklog/plugins`)
 - Overwrite existing plugin files
 - Create target directory if it doesn't exist
 
 ### Python Package Installation
+
 - Clone Python package from remote repository (github.com/opencode/ampa)
 - Copy Python package to `.worklog/plugins/ampa_py/ampa`
 - Install Python dependencies via pip
@@ -72,6 +80,7 @@ The test suite covers the following areas:
 - Create and verify virtual environment
 
 ### Environment File Handling
+
 - Detect `.env.sample` and `.env.samplw` files
 - Create `.env` from sample template
 - Write bot token and channel ID to `.env` file
@@ -80,6 +89,7 @@ The test suite covers the following areas:
 - Backup and restore `.env` files
 
 ### Installation Flow
+
 - Detect existing installations (both .mjs and Python package)
 - Prompt for upgrade vs. abort (in interactive mode)
 - Handle daemon PID files
@@ -87,6 +97,7 @@ The test suite covers the following areas:
 - Create decision logs for debugging
 
 ### Backward Compatibility
+
 - Single argument: source file only
 - Two arguments: source and target directory
 - No arguments: use default paths
@@ -94,6 +105,7 @@ The test suite covers the following areas:
 - Original auto-yes behavior
 
 ### Script Quality
+
 - Valid shell syntax (passes `sh -n`)
 - Executable permissions
 - Strict mode (`set -eu`)
@@ -203,6 +215,7 @@ sh tests/test-installer-manual.sh
 ### Tests fail with "python not found"
 
 Some tests require Python to be installed. If Python is not in your PATH:
+
 ```bash
 export PATH="/usr/bin:$PATH"
 sh tests/test-installer-manual.sh
@@ -211,6 +224,7 @@ sh tests/test-installer-manual.sh
 ### Lock file prevents tests from running
 
 If you get "Another ampa install appears to be running":
+
 ```bash
 rm -rf /tmp/ampa_install.lock
 ```
@@ -218,6 +232,7 @@ rm -rf /tmp/ampa_install.lock
 ### Tests fail in CI environment
 
 Ensure the test environment has:
+
 - `sh` (POSIX shell)
 - `mkdir`, `cp`, `rm`, `grep` commands
 - Write permissions to `/tmp`
@@ -267,4 +282,4 @@ The manual test suite runs in approximately 5-10 seconds depending on system per
 
 - `skill/install-ampa/scripts/install-worklog-plugin.sh` - The canonical installer script
 - `https://github.com/opencode/ampa` - Canonical AMPA plugin source repository
-- https://github.com/opencode/ampa/blob/main/README.md - AMPA daemon documentation
+- <https://github.com/opencode/ampa/blob/main/README.md> - AMPA daemon documentation

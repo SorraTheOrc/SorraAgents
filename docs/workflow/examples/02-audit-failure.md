@@ -48,6 +48,7 @@ The engine's triage audit cycle picks up WL-EXAMPLE-002 in `in_review` state.
 **Effects:** `add_tags: [audit_failed]`
 
 **Audit Output (recorded as comment):**
+
 ```
 # AMPA Audit Result
 
@@ -75,6 +76,7 @@ This item cannot be closed: 2 acceptance criteria are unmet (rate limit headers,
 ```
 
 **Engine Action:**
+
 ```bash
 wl update WL-EXAMPLE-002 --stage audit_failed
 wl comment add WL-EXAMPLE-002 --comment "..." --author "ampa-scheduler"
@@ -109,6 +111,7 @@ Next scheduler cycle picks up WL-EXAMPLE-002 at stage `plan_complete`.
 | **Engine Action** | `opencode run "work on WL-EXAMPLE-002 using the implement skill"` |
 
 Patch reads the audit comment, addresses the gaps:
+
 - Adds X-RateLimit-* response headers
 - Implements Redis-backed rate limit storage
 
@@ -129,6 +132,7 @@ Patch reads the audit comment, addresses the gaps:
 | **State After** | `completed / audit_passed` (alias: `audit_passed`) |
 
 **Audit Output:**
+
 ```
 # AMPA Audit Result
 

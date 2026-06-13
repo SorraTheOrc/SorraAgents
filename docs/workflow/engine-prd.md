@@ -39,6 +39,7 @@ Provide precise, implementation-referenced documentation for:
 ### 1.3 Scope
 
 **In scope:**
+
 - Engine execution lifecycle (Modes A and B)
 - Delegation orchestration (`DelegationOrchestrator`)
 - Scheduler timing loop and command dispatch
@@ -49,6 +50,7 @@ Provide precise, implementation-referenced documentation for:
 - Executable test plan
 
 **Out of scope:**
+
 - Workflow descriptor schema definition (SA-0MLT1ELCS16VDQV6)
 - Post-delegation audit flow (SA-0MLWQI6DC09TF7IY)
 - Proposed architectural changes where scheduler only executes commands and engine owns full delegation lifecycle (SA-0MLYOP9XN1I6P8MX — acknowledged, not prescribed)
@@ -358,6 +360,7 @@ Called from `Scheduler.start_command()` when `command_type == "delegation"`. Flo
 #### `_inspect_idle_delegation()` — Pre-Flight (lines 348-396)
 
 Lightweight check using `CandidateSelector.select()`. Returns one of:
+
 - `"in_progress"` — agents are already working (single-concurrency block)
 - `"idle_no_candidate"` — idle but nothing actionable
 - `"idle_with_candidate"` — idle with a selected candidate ready to dispatch
@@ -580,6 +583,7 @@ Pool-based Podman/Distrobox dispatcher for isolated agent sessions:
 5. **Schedule** teardown-on-completion daemon thread (waits for process exit, then `podman stop` + `podman rm`)
 
 Pool configuration:
+
 - Pool prefix: `ampa-pool-`
 - Pool size: 3
 - Max index: 9
@@ -880,6 +884,7 @@ def build_invariant_evaluator(descriptor, querier=None):
 **Objective:** Verify the engine correctly handles the case where no actionable work items exist.
 
 **Preconditions:**
+
 - No work items with status `in_progress`
 - No work items in states `(open, idea)`, `(open, intake_complete)`, or `(open, plan_complete)`
 
@@ -932,6 +937,7 @@ def test_idle_delegation_no_candidates():
 **Objective:** Verify end-to-end delegation of a `plan_complete` work item through the engine's 4-step lifecycle.
 
 **Preconditions:**
+
 - One work item exists in state `(open, plan_complete)` with sufficient description and acceptance criteria
 - No in-progress work items
 
@@ -1024,6 +1030,7 @@ def test_successful_dispatch_plan_complete():
 **Objective:** Verify that the stale delegation watchdog correctly identifies and recovers stuck delegations.
 
 **Preconditions:**
+
 - One work item in state `(in_progress, delegated)` with `updatedAt` older than `AMPA_STALE_DELEGATION_THRESHOLD_SECONDS`
 
 **Steps:**
@@ -1152,16 +1159,16 @@ def test_single_concurrency_blocks_delegation():
 
 | File | Key Classes/Functions | Line References |
 |---|---|---|
-| AMPA Engine Core | `Engine`, `EngineResult`, `EngineStatus`, `EngineConfig`, `process_delegation()`, `process_transition()` | https://github.com/opencode/ampa/blob/main/src/ampa/engine/core.py |
-| AMPA Descriptor Module | `WorkflowDescriptor`, `StateTuple`, `Command`, `Invariant`, `Role`, `load_descriptor()` | https://github.com/opencode/ampa/blob/main/src/ampa/engine/descriptor.py |
-| AMPA Candidates Module | `CandidateSelector`, `WorkItemCandidate`, `CandidateResult`, `is_do_not_delegate()` | https://github.com/opencode/ampa/blob/main/src/ampa/engine/candidates.py |
-| AMPA Invariants Module | `InvariantEvaluator`, `evaluate_logic()`, `extract_work_item_fields()` | https://github.com/opencode/ampa/blob/main/src/ampa/engine/invariants.py |
-| AMPA Dispatch Module | `Dispatcher`, `OpenCodeRunDispatcher`, `ContainerDispatcher`, `DryRunDispatcher`, `DispatchResult` | https://github.com/opencode/ampa/blob/main/src/ampa/engine/dispatch.py |
-| AMPA Adapters Module | `ShellCandidateFetcher`, `ShellWorkItemFetcher`, `ShellWorkItemUpdater`, `ShellCommentWriter`, `StoreDispatchRecorder`, `DiscordNotificationSender` | https://github.com/opencode/ampa/blob/main/src/ampa/engine/adapters.py |
-| AMPA Delegation Module | `DelegationOrchestrator`, `execute()`, `run_idle_delegation()`, `recover_stale_delegations()`, `run_delegation_report()` | https://github.com/opencode/ampa/blob/main/src/ampa/delegation.py |
-| AMPA Scheduler Module | `Scheduler`, `select_next()`, `start_command()`, `run_forever()`, `run_once()` | https://github.com/opencode/ampa/blob/main/src/ampa/scheduler.py |
-| AMPA Scheduler Types | `CommandSpec`, `SchedulerConfig`, `RunResult`, `CommandRunResult` | https://github.com/opencode/ampa/blob/main/src/ampa/scheduler_types.py |
-| AMPA Scheduler Store | `SchedulerStore` | https://github.com/opencode/ampa/blob/main/src/ampa/scheduler_store.py |
+| AMPA Engine Core | `Engine`, `EngineResult`, `EngineStatus`, `EngineConfig`, `process_delegation()`, `process_transition()` | <https://github.com/opencode/ampa/blob/main/src/ampa/engine/core.py> |
+| AMPA Descriptor Module | `WorkflowDescriptor`, `StateTuple`, `Command`, `Invariant`, `Role`, `load_descriptor()` | <https://github.com/opencode/ampa/blob/main/src/ampa/engine/descriptor.py> |
+| AMPA Candidates Module | `CandidateSelector`, `WorkItemCandidate`, `CandidateResult`, `is_do_not_delegate()` | <https://github.com/opencode/ampa/blob/main/src/ampa/engine/candidates.py> |
+| AMPA Invariants Module | `InvariantEvaluator`, `evaluate_logic()`, `extract_work_item_fields()` | <https://github.com/opencode/ampa/blob/main/src/ampa/engine/invariants.py> |
+| AMPA Dispatch Module | `Dispatcher`, `OpenCodeRunDispatcher`, `ContainerDispatcher`, `DryRunDispatcher`, `DispatchResult` | <https://github.com/opencode/ampa/blob/main/src/ampa/engine/dispatch.py> |
+| AMPA Adapters Module | `ShellCandidateFetcher`, `ShellWorkItemFetcher`, `ShellWorkItemUpdater`, `ShellCommentWriter`, `StoreDispatchRecorder`, `DiscordNotificationSender` | <https://github.com/opencode/ampa/blob/main/src/ampa/engine/adapters.py> |
+| AMPA Delegation Module | `DelegationOrchestrator`, `execute()`, `run_idle_delegation()`, `recover_stale_delegations()`, `run_delegation_report()` | <https://github.com/opencode/ampa/blob/main/src/ampa/delegation.py> |
+| AMPA Scheduler Module | `Scheduler`, `select_next()`, `start_command()`, `run_forever()`, `run_once()` | <https://github.com/opencode/ampa/blob/main/src/ampa/scheduler.py> |
+| AMPA Scheduler Types | `CommandSpec`, `SchedulerConfig`, `RunResult`, `CommandRunResult` | <https://github.com/opencode/ampa/blob/main/src/ampa/scheduler_types.py> |
+| AMPA Scheduler Store | `SchedulerStore` | <https://github.com/opencode/ampa/blob/main/src/ampa/scheduler_store.py> |
 | `docs/workflow/workflow.yaml` | Workflow descriptor (states, commands, invariants, roles) | 449 lines |
 | `docs/workflow/workflow-schema.json` | JSON Schema for descriptor validation | N/A |
 

@@ -22,7 +22,7 @@ Follow thhe steps below when completing tasks. If you are already working on a s
 2. **Ensure the work-item is clearly defined**:
    - retrieve the work-item details with `wl show <id> --children --json`
    - Read the the work-item and any related files/paths/work-items identified within
-   - If the work-item is not clearly defined (it _MUST_ included a clear description of the goal and how it will change behaviour, preferably in the form of a user story, along with acceptance criteria that can be used to verify completion and references to important specifications, user-stories, designs, or other important context):
+   - If the work-item is not clearly defined (it *MUST* included a clear description of the goal and how it will change behaviour, preferably in the form of a user story, along with acceptance criteria that can be used to verify completion and references to important specifications, user-stories, designs, or other important context):
      - Search the worklog (`wl search <search-terms> --json` and `wl show <id> --children --json`) and repository for any existing information that may clarify the requirements
      - If the operator has allowed further questions ask for clarification on specific requirements, acceptance criteria, and context. Where possible provide suggested responses, but always allow for a free form text response.
      - If the operator has not allowed further questions attempt to clarify the requirements based on the existing information in the repository and worklog.
@@ -71,10 +71,12 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      the push-to-dev workflow and `scripts/release/merge-dev-to-main.sh` for
      the dev→main release process.
    - After pushing, switch to the `dev` branch locally and pull the latest:
+
      ```bash
      git checkout dev
      git pull origin dev
      ```
+
      This ensures subsequent operations (e.g., starting the next work-item)
      begin from the current HEAD of the integration branch.
    - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
@@ -115,7 +117,7 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 ## CRITICAL RULES
 
 - Use Worklog (wl), described below, for ALL task tracking, do NOT use markdown TODOs, task lists, or other tracking methods
-- _NEVER_ write directly to `.worklog/worklog-data.jsonl` unless you are given permission to do so by a Producer, and you have confirmed the correct format and structure of the data to be added. Use `wl` commands to interact with the worklog data. All manipulation of work items must be done through `wl` commands to ensure data integrity and consistency.
+- *NEVER* write directly to `.worklog/worklog-data.jsonl` unless you are given permission to do so by a Producer, and you have confirmed the correct format and structure of the data to be added. Use `wl` commands to interact with the worklog data. All manipulation of work items must be done through `wl` commands to ensure data integrity and consistency.
 - A child work-item may be closed independently; however, a parent work-item can only be closed once all of its child work-items are closed, all blocking dependencies are resolved, and a Producer has reviewed and approved the work
 - Always ensure that work-items are kept up to date and accurately reflect the current state of the work. This includes updating descriptions, acceptance criteria, stages, and comments as needed throughout the lifecycle of the work.
 - Always ensure that any work-item created is associated with a clear goal and context, preferably in the form of a user story, along with measurable and testable acceptance criteria. If the requirements are not clear, seek clarification and update the work-item accordingly before proceeding with implementation.
@@ -217,6 +219,7 @@ Worklog does not enforce these relationships but they can be used for planning a
 - Agents may continue to use `gh` or other tooling directly; this policy is enforced by agent workflow conventions and the implement skill.
 
 **Test-failure fix workflow (automated via Ralph):**
+
 - When `ralph run` completes successfully and tests are run, any failing tests trigger:
   - Creation of a child work item via triage helper (with `parent_work_item_id`)
   - Implementation of the fix using `implement-single`
@@ -230,8 +233,8 @@ Worklog does not enforce these relationships but they can be used for planning a
 
 - `wl create "Found bug" --priority high --tags "discovered-from:<parent-id>"`
 
-5. Complete: `wl close <id> --reason "PR #123 merged"`
-6. Sync: run `wl sync` before ending the session
+1. Complete: `wl close <id> --reason "PR #123 merged"`
+2. Sync: run `wl sync` before ending the session
 
 ## Work-Item Management
 

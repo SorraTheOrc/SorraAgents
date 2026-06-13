@@ -62,6 +62,7 @@ guidelines from CHANGELOG_STYLE.md
 **User**: "Create a changelog for commits from the past 7 days"
 
 **Output**:
+
 ```markdown
 # Updates - Week of March 10, 2024
 

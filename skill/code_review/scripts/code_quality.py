@@ -6,7 +6,7 @@ and outputs structured JSON with classified findings.
 
 Usage:
   python3 -m skill.code_review.scripts.code_quality [--path <project-root>]
-      [--languages python,typescript] [--json]
+      [--languages python,typescript] [--json] [--fix]
 
 Exit codes:
   0 – success (findings may be present)
@@ -80,6 +80,7 @@ def run_code_quality(
     project_root: Union[str, os.PathLike[str], None] = None,
     languages: list[str] | None = None,
     runner: Any = None,
+    fix: bool = False,
 ) -> dict[str, Any]:
     """Run the full code quality pipeline and return structured results.
 
@@ -88,6 +89,7 @@ def run_code_quality(
         languages: Optional list of language names to restrict to.
                    If None, all detected languages are processed.
         runner: Optional injectable subprocess runner for testing.
+        fix: If True, run all linters with auto-fix mode enabled.
 
     Returns:
         A dict with keys:
@@ -96,6 +98,7 @@ def run_code_quality(
           - ``total_findings``: total number of findings
           - ``findings_by_severity``: severity → count mapping
           - ``findings``: list of finding dicts
+          - ``fixes_applied``: int — number of linters that applied fixes
           - ``success``: bool — True if pipeline completed
     """
     try:
@@ -122,7 +125,7 @@ def run_code_quality(
                     linters.append(probe_linter(linter_name))
 
         # 4. Run linters
-        result = run_linters_for_project(project_root, runner=runner)
+        result = run_linters_for_project(project_root, runner=runner, fix=fix)
 
         # 5. Build result ensuring detected/filtered languages are reflected
         return {
@@ -131,6 +134,7 @@ def run_code_quality(
             "total_findings": result.get("total_findings", 0),
             "findings_by_severity": result.get("findings_by_severity", {}),
             "findings": result.get("findings", []),
+            "fixes_applied": result.get("fixes_applied", 0),
             "success": True,
         }
     except Exception as exc:
@@ -170,6 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit structured JSON output to stdout",
     )
+    p.add_argument(
+        "--fix",
+        action="store_true",
+        help="Run linters with auto-fix mode enabled",
+    )
     return p
 
 
@@ -194,6 +203,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = run_code_quality(
             project_root=args.path,
             languages=languages,
+            fix=args.fix,
         )
     except Exception as exc:
         print(f"Internal error: {exc}", file=sys.stderr)
@@ -227,6 +237,9 @@ def _print_human_readable(result: dict[str, Any]) -> None:
         print(f"  - {lint['name']}: {status}")
 
     print(f"\nTotal findings: {len(findings)}")
+    fixes = result.get("fixes_applied", 0)
+    if fixes > 0:
+        print(f"Auto-fixes applied: {fixes} linter(s)")
 
     if severity_counts:
         parts = [f"{sev}: {count}" for sev, count in severity_counts.items() if count > 0]

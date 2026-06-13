@@ -29,7 +29,7 @@ You will follow an interview-driven approach to gather requirements, constraints
 
 The command implements the procedural workflow below. Each numbered step is part of the canonical execution path; substeps describe concrete checks or commands that implementors or automation should run.
 
-## Hard requirements:
+## Hard requirements
 
 - Do not create a work item for this intake process itself; the output of this command is the completion of a description for the work item of interest.
 - Use an interview style if additional information is needed: concise, high-signal questions grouped to a soft-maximum of three per iteration.
@@ -46,7 +46,7 @@ The command implements the procedural workflow below. Each numbered step is part
 
 ## Process (must follow)
 
-0. Evaluate whether intake is required (agent responsibility)
+1. Evaluate whether intake is required (agent responsibility)
 
 - Before performing the full intake, run a lightweight evaluation to determine whether the work item already contains sufficient information to skip the interview/draft process and simply mark intake as complete.
 - Suggested checks (conservative, idempotent heuristics):
@@ -58,8 +58,6 @@ The command implements the procedural workflow below. Each numbered step is part
   - `wl update <work-item-id> --stage intake_complete --json`
   - Optionally add a comment documenting the reason: `wl comment add <work-item-id> "Intake auto-complete: work item appears sufficiently defined (acceptance criteria present / small task)." --actor Map --json`
 - If any heuristic is uncertain, fall back to running the normal intake process (do not auto-complete on borderline evidence).
-
-
 
 1. Gather context (agent responsibility)
 
@@ -75,7 +73,7 @@ The command implements the procedural workflow below. Each numbered step is part
   - "Potentially related work items" (titles followed by ID)
 - Read and summarize each of these related artifacts for later reference.
 
-2. Work Item prep (agent responsibility)
+1. Work Item prep (agent responsibility)
 
 - If a <work-item-id> was provided:
   - Mark the work item as in progress and at stage idea by running `wl update $1 --stage idea --status in_progress --assignee Map --json`.
@@ -84,7 +82,7 @@ The command implements the procedural workflow below. Each numbered step is part
   - Create a new Worklog work item using `wl create --stage idea --status in_progress --title "<working-title>" --description "<seed-context>" --type epic --assignee Map --json`
   - Remember the returned <work-item-id> for later steps.
 
-3. Interview
+1. Interview
 
 If there are no ambiguities and the seed context and previously asked questions are sufficient to draft a clear intake brief, you may skip this step. However, if there are any gaps in understanding or if the seed context is vague, proceed with the interview.
 
@@ -96,7 +94,7 @@ If there are no ambiguities and the seed context and previously asked questions 
   - The goal is not a complete spec but a sufficient understanding to draft a problem definition with user stories, acceptance criteria, and related work.
 - Do not proceed until you have gathered sufficient information to draft an intake brief.
 
-4. Draft intake brief (agent responsibility)
+1. Draft intake brief (agent responsibility)
 
 - Write a clear intake brief to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` containing the following sections:
   - Problem statement: one or two sentences summarizing the problem to be solved.
@@ -108,7 +106,7 @@ If there are no ambiguities and the seed context and previously asked questions 
   - Related work: list of related documents or work items with brief descriptions and links/ids.
 - Present the draft brief to the user and invite feedback. Incorporate any edits or clarifications supplied by the user, but do not block progress waiting for an explicit approval. Apply edits when provided and proceed automatically to the review stages.
 
-5. Five mini-review stages (agent responsibility; must follow)
+1. Five mini-review stages (agent responsibility; must follow)
 
 Run five review iterations automatically on the draft brief; each review will make any necessary conservative edits to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
 
@@ -122,39 +120,41 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
   2. Capture fidelity
      - Verify the user's answers are accurately and neutrally represented. Shorten or rephrase only for clarity; do not change meaning.
   3. Related-work & traceability
-   - Confirm related docs/work items are correctly referenced.
-  4. Risks & assumptions
+  - Confirm related docs/work items are correctly referenced.
+  1. Risks & assumptions
      - Add missing risks and mitigations, failure modes, and assumptions in short bullets.
      - Ensure that a risk addressing scope screep is present. The mitigaation is to record opportunities for additional features/refactorings as work items linked to the main item, rather than expanding the scope of the current item.
      - Do not invent mitigations beyond note-level comments.
-  5. Polish & handoff
+  2. Polish & handoff
   - Tighten language for reading speed, ensure copy-paste-ready commands, and produce the final 1–2 sentence summary used as the work item body headline.
 
-6. Call the `find_related` skill to collect related work and add a report to the work item description.
+1. Call the `find_related` skill to collect related work and add a report to the work item description.
 
-7. Review the new issue in the overall context of the project and consider:
+2. Review the new issue in the overall context of the project and consider:
 
 - Adding dependencies with `wl comment add <work-item-id> --comment "Blocks:<blocked-item-id>" --json` and `wl comment add <work-item-id> --comment "Blocked-by:<blocking-item-id>" --json`
 - Adjusting priority to better match the new understanding of scope and impact using `wl update <work-item-id> --priority <level> --json`
 
-8. Update the work item with the final brief using `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --stage intake_complete --status open --json`
+1. Update the work item with the final brief using `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --stage intake_complete --status open --json`
 
-9. Calculate Effort and Risk (agent responsibility; must follow)
+2. Calculate Effort and Risk (agent responsibility; must follow)
 
 - Call the `effort_and_risk` skill with the new or updated work item to produce an effort and risk estimate.
 
-10.   Finishing (must do as the final step only)
-    
- - change the issue to state "open" (wl update <work-item-id> --status open --json). DO NOT close the issue
- - Run `wl sync` to sync work item changes.
- - Run `wl show <work-item-id>` (not --json) to show the entire work item.
- - Remove all temporary files created during the process, including `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
- - Output the new work item id and a structured summary containing the following sections exactly:
+1. Finishing (must do as the final step only)
 
-  # Objective
+- change the issue to state "open" (wl update <work-item-id> --status open --json). DO NOT close the issue
+- Run `wl sync` to sync work item changes.
+- Run `wl show <work-item-id>` (not --json) to show the entire work item.
+- Remove all temporary files created during the process, including `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
+- Output the new work item id and a structured summary containing the following sections exactly:
+
+# Objective
+
   Headline summary of the issue
 
-  # Acceptance Criteria
+# Acceptance Criteria
+
   Complete list of acceptance criteria which *must* be measurable. If any acceptance criteria are not measurable, add a clarifying question to the Appendix asking for clarification and mark that criterion as "TBD pending clarification".
 
   Always include at least one acceptance criterion related to testing and validation of the work.
@@ -165,10 +165,11 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
 
   Do not include tests related to continuous integration or deployment pipelines as acceptance criteria.
 
-  # Effort and Risk
+# Effort and Risk
+
   T-shirt sizing and one line description of the biggest risks
 
- - Finish with "This completes the Intake process for <work-item-id> <work-item-title>"
+- Finish with "This completes the Intake process for <work-item-id> <work-item-title>"
 
 ## Traceability & idempotence
 

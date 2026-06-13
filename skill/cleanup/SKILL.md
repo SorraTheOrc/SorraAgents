@@ -74,7 +74,7 @@ Examples:
 python skill/cleanup/scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json
 ```
 
-2. Handle uncommitted and unpushed changes
+1. Handle uncommitted and unpushed changes
 
 If the previous step detected uncommitted or unpushed changes, the agent MUST present the inspection report (see step 1) showing those changes and then provide sensible options with a recommendation based on the state (e.g., "Branch has unpushed commits. Would you like to push, stash, or skip?"). The report MUST be visible to the user before any choices are requested.
 
@@ -82,7 +82,7 @@ The presented options must include the option to review the branch with the audi
 
 If the agent is unable to address the uncommitted/unpushed changes through the provided options, it should pause and provide guidance on how to resolve these issues manually before proceeding and stop further.
 
-3. Switch to default branch and update
+1. Switch to default branch and update
 
 Only continue with this step if there are no uncommitted or unpushed changes in the current branch.
 
@@ -96,7 +96,7 @@ Example:
 python skill/cleanup/scripts/switch_to_default_and_update.py --report /tmp/cleanup/switch_default.json
 ```
 
-4. Summarize branches and open PRs
+1. Summarize branches and open PRs
 
 Run `skill/cleanup/scripts/summarize_branches.py` to list local branches and include any open PRs targeting the default branch. The agent MUST run this script by default and present the script-generated report, in markdown format, for any deletion decisions.
 
@@ -110,7 +110,7 @@ Example:
 python skill/cleanup/scripts/summarize_branches.py --report /tmp/cleanup/branches.json
 ```
 
-5. Delete local merged branches
+1. Delete local merged branches
 
 Use `skill/cleanup/scripts/prune_local_branches.py` with an explicit branch list derived from the summarize report and user input. The summarize report and user choice are the authoritative source; the prune script only deletes branches you pass in. The agent MUST NOT delete branches outside of the explicit branch list produced by the script and approved by the human.
 
@@ -128,7 +128,7 @@ python ./scripts/prune_local_branches.py --dry-run \
   --report /tmp/cleanup/local.json
 ```
 
-6. Delete remote merged branches
+1. Delete remote merged branches
 
 Run `skill/cleanup/scripts/delete_remote_branches.py` — deletes remote branches that are merged into default and older than a threshold (default 14 days). Report on branches deleted, skipped (e.g., due to open PRs), and any errors.
 
@@ -142,15 +142,15 @@ python skill/cleanup/scripts/delete_remote_branches.py --days 14 --report /tmp/c
 python skill/cleanup/scripts/delete_remote_branches.py --days 14 --dry-run --report /tmp/cleanup/delete_remote.json
 ```
 
-7. Handle edge cases and manual review:
+1. Handle edge cases and manual review:
 
 Provide interactive options for handling remaining branches such as rebase, merge, create PR, or assign work item for any remaining branches. Where possible, provide guidance on next steps (e.g., "Branch X is not merged but has no open PR. Would you like to create a PR, rebase onto default, or assign to a work item?").
 
-8. Temporary File Removal
+1. Temporary File Removal
 
 If any temporary files were created (e.g., branch lists, reports), remove them to avoid clutter.
 
-9. Final report
+1. Final report
 
 - Produce concise report including:
   - Branches deleted (local + remote)

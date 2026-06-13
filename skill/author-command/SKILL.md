@@ -15,16 +15,15 @@ You are authoring a new command for the agent framework that implements a specif
 
 ## Behavior
 
-1. Review command authoring documentation at https://opencode.ai/docs/commands
-2. Review example commands at https://claude.ai/public/artifacts/e2725e41-cca5-48e5-9c15-6eab92012e75
+1. Review command authoring documentation at <https://opencode.ai/docs/commands>
+2. Review example commands at <https://claude.ai/public/artifacts/e2725e41-cca5-48e5-9c15-6eab92012e75>
 3. Gather requirements from the user about the desired command functionality, inputs, outputs, and any specific constraints or considerations.
-4. Draft the command code in markdown format, ensuring it adheres to project coding standards and conventions. Use the format in the examples at in https://claude.ai/public/artifacts/e2725e41-cca5-48e5-9c15-6eab92012e75 
+4. Draft the command code in markdown format, ensuring it adheres to project coding standards and conventions. Use the format in the examples at in <https://claude.ai/public/artifacts/e2725e41-cca5-48e5-9c15-6eab92012e75>
 5. Review the command markdown with the user for feedback and make necessary revisions. Do not proceed until the user approves the draft.
 6. Once approved, finalize the command markdown and place in the `.opencode/commands` directory
 7. Document the command in the README.md file and any other relevant documentation.
 
-
-## Special placeholders supported by the agent framework:
+## Special placeholders supported by the agent framework
 
 - `$ARGUMENTS` — the full argument string passed to the command.
 - `$1`, `$2`, ... — individual positional arguments.

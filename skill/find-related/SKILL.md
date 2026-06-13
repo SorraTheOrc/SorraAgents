@@ -39,14 +39,14 @@ that is inserted into the work item description under a clearly-marked section.
 
 - ignore data directories such as `node_modules`, `.git` and most "." named folders.
 
-7. Produce a short informational report describing related work in the repository, using the previously discovered items as seeds. The report MUST:
+1. Produce a short informational report describing related work in the repository, using the previously discovered items as seeds. The report MUST:
 
 - be clearly labeled and inserted under the heading "Related work (automated report)".
 - include links to any related work items or docs discovered, along with their titles or file paths.
 - Describe the relevance of each related item or doc in 1–2 sentences. This is the key value-add of the report, so it should not just be a list of links but should provide insight into why each item is related.
 
-8. Update the item description by appending the generated report. Note, if the existing description already contains a related items report or markers, the new report can replace this content, but ONLY this content. Use `wl update` to perform the update.
-9. Return the JSON summary.
+1. Update the item description by appending the generated report. Note, if the existing description already contains a related items report or markers, the new report can replace this content, but ONLY this content. Use `wl update` to perform the update.
+2. Return the JSON summary.
 
 ## Hard requirements
 
@@ -67,4 +67,4 @@ wl show SA-0MPYMFZXO0004ZU4 --json
 # python3 skill/find-related/scripts/find_related.py --issue SA-0MPYMFZXO0004ZU4 --output related.json
 ```
 
-## End.
+## End

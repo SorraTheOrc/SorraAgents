@@ -160,11 +160,13 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
 If a release introduces a critical issue:
 
 1. Revert the merge commit on `main`:
+
    ```sh
    git checkout main
    git revert -m 1 <merge-commit-hash>
    git push origin main
    ```
+
 2. Create a bug work-item documenting the issue.
 3. Fix the issue on a feature branch, push to `dev`, and follow the release process again.
 
