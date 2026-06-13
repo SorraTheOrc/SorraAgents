@@ -361,7 +361,6 @@ class TestRunWlUpdate:
 def test_search_and_dedup_aggregates_results(monkeypatch):
     """search_and_dedup should search for each keyword and aggregate."""
     mod = _import_find_related()
-    import json
 
     search_calls = []
 
@@ -388,7 +387,6 @@ def test_search_and_dedup_aggregates_results(monkeypatch):
 def test_search_and_dedup_removes_duplicates(monkeypatch):
     """Duplicate work items from different keywords should be removed."""
     mod = _import_find_related()
-    import json
 
     def mock_search(keyword):
         # Both keywords return the same item (duplicate)

@@ -13,7 +13,6 @@ import json
 import os
 import subprocess
 import sys
-from pathlib import Path
 
 
 def _write_wl_state(path, state):
