@@ -38,7 +38,8 @@ is invoked.
   or related work items.
 - **No interactive questions.** The implementing agent must never ask the
   producer questions or pause for interactive input. If it cannot continue
-  safely without explicit producer input, it must return a structured
+  safely without explicit producer input, it must first run
+  `wl update <work-item-id> --status open --json`, then return a structured
   `no_safe_path` response with the missing decision.
 - **No merge.** Do not merge changes into main. Only commit to a feature branch.
 
@@ -53,7 +54,9 @@ is invoked.
   formatted output for agents to consume.
 - Use work item comments to document your process, decisions, and next steps.
 - If the work item is not well-defined, do not proceed with implementation.
-  Instead, return a `no_safe_path` response describing the missing information.
+  Instead, first run `wl update <work-item-id> --status open --json` to mark
+  the item as open, then return a `no_safe_path` response describing the
+  missing information.
 - Never commit directly to `main`. Always create a feature or bug branch for
   implementation.
 - The required order of operations before any commit is always:
@@ -79,10 +82,14 @@ Execute the following steps in order. Do not skip steps.
 
 - Inspect `git status --porcelain=v1 -b`.
 - If uncommitted changes exist, either carry them into the work item branch
-  (if limited to `.worklog/`) or abort with a `no_safe_path` response.
+  (if limited to `.worklog/`) or abort: first run
+  `wl update <work-item-id> --status open --json` to mark the item as open,
+  then return a structured `no_safe_path` response.
 
 ### Step 1 — Understand the work item
 
+- Claim the work item by running
+  `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`.
 - Fetch the work item details: `wl show <work-item-id> --json --children`
 - Restate acceptance criteria and current status along with any constraints.
 - Surface blockers, dependencies and missing requirements.
@@ -122,6 +129,19 @@ Execute the following steps in order. Do not skip steps.
 - Mark the work item as in-review:
   `wl update <work-item-id> --status completed --stage in_review --json`
 - Do not create a PR or merge. Ralph will handle PR/merge externally.
+
+## Status Transition Matrix
+
+The following table documents the expected status and stage transitions at each workflow phase for the `implement-single` skill.
+
+| Phase | Command | Status | Stage |
+|-------|---------|--------|-------|
+| Start (Step 1 - Claim) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
+| Complete (Step 5) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
+| Abort - dirty tree (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
+| Abort - no_safe_path (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
+
+Abort/failure transitions use `--status open` while keeping the stage unchanged.
 
 ## Scripts (canonical runner & modules)
 

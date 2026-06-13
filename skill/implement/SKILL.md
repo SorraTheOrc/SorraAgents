@@ -80,7 +80,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 - Inspect `git status --porcelain=v1 -b`.
 - If uncommitted changes are limited to `.worklog/`, carry them into the new working branch and commit there.
-- If other uncommitted changes exist, pause and present explicit choices: carry them into the work item branch, commit first, stash (and optionally pop later), revert/discard (explicit confirmation), or abort.
+- If other uncommitted changes exist, pause and present explicit choices: carry them into the work item branch, commit first, stash (and optionally pop later), revert/discard (explicit confirmation), or abort. If abort is chosen, first run `wl update <work-item-id> --status open --json` to mark the item as open.
 
 1. Understand the work item
 
@@ -102,10 +102,11 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Concrete, testable acceptance criteria.
   - Constraints and compatibility expectations.
   - Unknowns captured as explicit questions.
-- If the work item is not well-defined, run the intake interview to update the existing work item (see `command/intake.md`) and update the work item `description` or `acceptance` fields with the intake output.
-- If the work item is too large to implement in one pass, run plan interview (see `command/plan.md`) to break it into smaller work items, create those work items, link them as blockers/dependencies, and pick the highest-priority work item to implement next.
-- If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
-- If you ran the plan interview, convert this work item to an epic and inform the user that implementation should move to the first child work item created.
+- If the work item fails the definition gate, first run `wl update <work-item-id> --status open --json` to mark the item as open, then take the appropriate action:
+  - If the work item is not well-defined, run the intake interview to update the existing work item (see `command/intake.md`) and update the work item `description` or `acceptance` fields with the intake output.
+  - If the work item is too large to implement in one pass, run plan interview (see `command/plan.md`) to break it into smaller work items, create those work items, link them as blockers/dependencies, and pick the highest-priority work item to implement next.
+  - If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
+  - If you ran the plan interview, convert this work item to an epic and inform the user that implementation should move to the first child work item created.
 - If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
 
 1. Create a working branch
@@ -195,6 +196,21 @@ Pre-push blocking check
   3. Tests are re-run until all pass
   4. Only then does Ralph proceed with the push
 - When running manually (not under Ralph), the agent should manually invoke the triage helper and fix any failing tests before pushing.
+
+## Status Transition Matrix
+
+The following table documents the expected status and stage transitions at each workflow phase for the `implement` skill.
+
+| Phase | Command | Status | Stage |
+|-------|---------|--------|-------|
+| Start (Step 1 - Claim) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
+| Blocker complete (Step 4) | `wl update <id> --status in_progress --stage in_review --json` | in_progress | in_review |
+| Final (Step 6 - Mark in_review) | `wl update <id> --stage in_review --json` | in_progress | in_review |
+| Abort - dirty work tree (Step 0) | `wl update <id> --status open --json`, then abort | open | (unchanged) |
+| Abort - definition gate failure | Run intake/plan interview, update item | open | (unchanged) |
+| Under Ralph (Step 6 note) | Skip in_review step; Ralph handles transition | in_progress | in_progress |
+
+Abort/failure transitions use `--status open` while keeping the stage unchanged.
 
 ## Scripts (canonical runner & modules)
 
