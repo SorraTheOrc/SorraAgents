@@ -136,6 +136,7 @@ work item description. The report includes:
 ### Idempotency
 
 Re-running the script on the same work item is safe:
+
 - The existing **Related work (automated report)** section is replaced, not duplicated
 - Manual **Related work** sections (without the `(automated report)` suffix) are preserved
 
