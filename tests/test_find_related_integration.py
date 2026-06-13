@@ -194,7 +194,6 @@ def test_find_related_integration(tmp_path, monkeypatch):
     )
 
     assert proc2.returncode == 0, f"second run failed: {proc2.stderr}"
-    out2 = json.loads(proc2.stdout)
 
     # Verify idempotency: the report section should not be duplicated
     with open(state_file, "r") as fh:

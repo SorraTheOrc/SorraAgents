@@ -213,7 +213,6 @@ def search_repo(repo_path: str, keywords: List[str]) -> List[Dict[str, Any]]:
     if not root.is_dir():
         return []
 
-    keyword_set = set(k.lower() for k in keywords)
     results: List[Dict[str, Any]] = []
 
     for file_path in root.rglob("*"):

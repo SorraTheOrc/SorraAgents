@@ -56,7 +56,6 @@ class TestRunRuffAutoFix:
 
         def runner(cmd):
             nonlocal call_index
-            idx = call_index
             call_index += 1
             if "--fix" in cmd:
                 # First call: ruff with --fix found issues, returned some
