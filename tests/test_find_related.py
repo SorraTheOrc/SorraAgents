@@ -100,3 +100,127 @@ def test_repo_path_flag():
     )
     # Should not crash with --repo-path
     assert result.returncode in (0, 1), f"Unexpected error: {result.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Keyword extraction tests
+# ---------------------------------------------------------------------------
+
+
+def _import_find_related():
+    """Import the find_related module for unit testing."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("find_related", SCRIPT_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_keywords_from_title():
+    """Keywords should be extracted from a work-item title."""
+    mod = _import_find_related()
+    title = "Add deterministic script automation to find-related skill"
+    keywords = mod.extract_keywords(title, "")
+    assert isinstance(keywords, list)
+    assert len(keywords) > 0
+    assert "deterministic" in keywords
+    assert "script" in keywords
+    assert "automation" in keywords
+    assert "find" in keywords
+    assert "related" in keywords
+    assert "skill" in keywords
+
+
+def test_keywords_from_description():
+    """Keywords should be extracted from a work-item description."""
+    mod = _import_find_related()
+    description = "Create a deterministic Python script to automate the find-related skill, generating a related-work report."
+    keywords = mod.extract_keywords("", description)
+    assert isinstance(keywords, list)
+    assert len(keywords) > 0
+    assert "deterministic" in keywords
+    assert "python" in keywords
+    assert "script" in keywords
+    assert "automate" in keywords
+    assert "related" in keywords
+    assert "report" in keywords
+
+
+def test_keywords_from_both_title_and_description():
+    """Keywords should be merged from both title and description without duplicates."""
+    mod = _import_find_related()
+    title = "Add find-related automation"
+    description = "Automation for finding related work items in the project repository."
+    keywords = mod.extract_keywords(title, description)
+    assert isinstance(keywords, list)
+    assert len(set(keywords)) == len(keywords), "Keywords should be unique"
+    assert "automation" in keywords
+    assert "find" in keywords
+    assert "related" in keywords
+    assert "work" in keywords
+    assert "project" in keywords
+    assert "repository" in keywords
+
+
+def test_keywords_empty_title():
+    """Keywords from empty title should not cause errors."""
+    mod = _import_find_related()
+    keywords = mod.extract_keywords("", "Some description text")
+    assert isinstance(keywords, list)
+    assert len(keywords) > 0
+    assert "description" in keywords
+    assert "text" in keywords
+
+
+def test_keywords_empty_description():
+    """Keywords from empty description should not cause errors."""
+    mod = _import_find_related()
+    keywords = mod.extract_keywords("Some title", "")
+    assert isinstance(keywords, list)
+    assert len(keywords) > 0
+    assert "title" in keywords
+
+
+def test_keywords_both_empty():
+    """Keywords from empty title and description should return empty list."""
+    mod = _import_find_related()
+    keywords = mod.extract_keywords("", "")
+    assert isinstance(keywords, list)
+    assert len(keywords) == 0
+
+
+def test_keywords_with_special_characters():
+    """Keywords should handle special characters gracefully."""
+    mod = _import_find_related()
+    title = "[CRITICAL] fix: broken build (v2.1) - urgent!"
+    description = "Fix the **broken** build; update dependencies (see #123)..."
+    keywords = mod.extract_keywords(title, description)
+    assert isinstance(keywords, list)
+    assert "critical" in keywords
+    assert "fix" in keywords
+    assert "broken" in keywords
+    assert "build" in keywords
+    assert "urgent" in keywords
+    assert "update" in keywords
+    assert "dependencies" in keywords
+
+
+def test_keywords_excludes_common_stop_words():
+    """Common English stop words should be excluded from keywords."""
+    mod = _import_find_related()
+    title = "The a an is in on at for to of and or the this that with"
+    keywords = mod.extract_keywords(title, "")
+    # None of these common words should be keywords
+    for word in ["the", "a", "an", "is", "in", "on", "at", "for", "to", "of", "and", "or"]:
+        assert word not in keywords, f"Stop word '{word}' should be excluded"
+
+
+def test_keywords_are_lowercase():
+    """Keywords should be normalized to lowercase."""
+    mod = _import_find_related()
+    title = "IMPLEMENT Workflow Integration TEST"
+    keywords = mod.extract_keywords(title, "")
+    assert "implement" in keywords
+    assert "workflow" in keywords
+    assert "integration" in keywords
+    assert "test" in keywords
