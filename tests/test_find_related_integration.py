@@ -51,7 +51,8 @@ if cmd == 'show':
         item = state.get('show', {{}})
         if work_item_id in state.get('work_items', {{}}):
             item = state['work_items'][work_item_id]
-        print(json.dumps(item))
+        # Match real wl show --json output format
+        print(json.dumps({{"success": True, "workItem": item}}))
     sys.exit(0)
 
 elif cmd == 'search':

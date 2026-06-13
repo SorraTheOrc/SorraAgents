@@ -55,16 +55,95 @@ that is inserted into the work item description under a clearly-marked section.
 
 ## Scripts (canonical runner & modules)
 
-- This skill has no bundled CLI runner script. Agents should invoke the logic via the documented prompt or call the helper script if the repository provides one.
+This skill includes a bundled Python script that automates the related-work discovery
+and report generation. The script runs the decision logic described above, updates the
+work item description, and returns a structured result.
 
-Example (work-item id):
+### Script location
+
+`skill/find-related/scripts/find_related.py`
+
+### Requirements
+
+- Python 3.8+
+- [Worklog CLI (`wl`)](https://github.com/sorrathec/worklog) installed and accessible on PATH
+
+### Usage
 
 ```bash
-# Fetch the work item for context
-wl show SA-0MPYMFZXO0004ZU4 --json
+# Basic usage (find related items for a work item and update its description)
+python3 skill/find-related/scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4
 
-# (Optional) If a project script exists, run it with the work-item id as an argument
-# python3 skill/find-related/scripts/find_related.py --issue SA-0MPYMFZXO0004ZU4 --output related.json
+# JSON output (for programmatic consumption)
+python3 skill/find-related/scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4 --json
+
+# Verbose mode (prints debug information to stderr)
+python3 skill/find-related/scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4 --verbose
+
+# Specify a custom repository path
+python3 skill/find-related/scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4 --repo-path /path/to/repo
 ```
+
+### Arguments
+
+| Argument | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `--work-item-id` | Yes | — | ID of the work item to find related items for |
+| `--verbose` | No | `false` | Enable verbose debug output to stderr |
+| `--json` | No | `false` | Output results as JSON |
+| `--repo-path` | No | Auto-detected | Path to the repository root |
+
+### Output (default mode)
+
+```
+Work item: SA-0MPYMFZXO0004ZU4
+Related items found: 3
+Repository matches: 2
+Added IDs: REL-001, REL-002, REL-003
+Report inserted: True
+```
+
+### Output (JSON mode)
+
+```json
+{
+  "workItemId": "SA-0MPYMFZXO0004ZU4",
+  "found": true,
+  "addedIds": ["REL-001", "REL-002", "REL-003"],
+  "reportInserted": true,
+  "keywords": ["script", "automation", "related"],
+  "relatedItemCount": 3,
+  "repoMatchCount": 2
+}
+```
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success — report was generated and description updated |
+| `1` | Error — failed to fetch work item, or unexpected failure |
+
+### Report format
+
+The script generates a Markdown section under **Related work (automated report)**
+that is appended to or replaces the existing automated report section in the
+work item description. The report includes:
+
+- A list of related work items with their IDs, titles, and statuses
+- A list of repository file matches with file paths and matched keywords
+
+### Idempotency
+
+Re-running the script on the same work item is safe:
+- The existing **Related work (automated report)** section is replaced, not duplicated
+- Manual **Related work** sections (without the `(automated report)` suffix) are preserved
+
+### Design notes
+
+- The script is fully offline — it uses only the local Worklog CLI and repository file system
+- It conservatively matches keywords (preferring false negatives over false positives)
+- `.git`, `node_modules`, `__pycache__`, and similar directories are excluded from file scanning
+- Only `.md`, `.py`, `.js`, `.mjs`, and `.txt` files are scanned for keyword matches
 
 ## End

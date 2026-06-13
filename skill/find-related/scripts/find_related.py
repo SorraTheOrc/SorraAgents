@@ -115,12 +115,17 @@ def extract_keywords(title: str, description: str) -> List[str]:
 def run_wl_show(work_item_id: str) -> Optional[Dict[str, Any]]:
     """Fetch a work item via `wl show <id> --json` and return parsed JSON.
 
+    Unwraps the nested 'workItem' object from the wl response.
     Returns None if the command fails or output is not valid JSON.
     """
     try:
         cmd = ["wl", "show", work_item_id, "--json"]
         out = subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
-        return json.loads(out)
+        data = json.loads(out)
+        # wl show --json returns {success: true, workItem: {...}}
+        if isinstance(data, dict) and "workItem" in data:
+            return data["workItem"]
+        return data
     except Exception:
         return None
 
