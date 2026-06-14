@@ -478,17 +478,6 @@ class TestWorklogCLIIntegration:
         pri1 = severity_to_priority(sample_smell_critical["severity"])
         cmd1 = _build_wl_create_cmd(title1, desc1, pri1)
 
-        # Mock the JSON for the second call too
-        mock_json2 = json.dumps({
-            "success": True,
-            "workItem": {
-                "id": "SA-0MOCK5678X000WORK",
-                "title": "Refactor: Unused import in src/utils.py",
-                "status": "open",
-                "priority": "medium",
-            },
-        })
-
         responses = {cmd1: _cp(stdout=mock_wl_create_json)}
         monkeypatch.setattr(
             subprocess, "run", _make_fake_subprocess_run(responses)
