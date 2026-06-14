@@ -12,7 +12,6 @@ import json
 import subprocess
 import sys
 import os
-import tempfile
 import unittest
 
 SCRIPT_DIR = os.path.join(os.path.dirname(__file__), "..", "skill", "effort-and-risk", "scripts")
@@ -279,7 +278,7 @@ class TestJsonToHumanNarrative(unittest.TestCase):
 
         # Should be more than 3 lines of substance (the old behavior was 3 lines)
         # Count non-empty lines
-        lines = [l for l in output.split("\n") if l.strip()]
+        lines = [line for line in output.split("\n") if line.strip()]
         self.assertGreaterEqual(
             len(lines), 8,
             f"Narrative should have at least 8 non-empty lines, got {len(lines)}. Output:\n{output}"
