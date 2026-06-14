@@ -959,8 +959,6 @@ class TestSmellDetectionIntegration:
         )
 
         assert isinstance(findings, list)
-        # All file paths should appear in findings (if findings exist)
-        file_paths_in_findings = {f.get("file") for f in findings if "file" in f}
         # The LLM client was called - check that file info was passed
         mock_llm_client.analyze.assert_called()
 
