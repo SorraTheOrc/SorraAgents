@@ -278,12 +278,17 @@ def main():
         import subprocess
 
         # Build a sanitized object for rendering to avoid contaminating the human text
+        # Include WBS data (items and children) for narrative generation
+        wbs_items = data.get("items", [])
+        wbs_children = data.get("children", [])
         sanitized = {
             "effort": final.get("effort"),
             "risk": final.get("risk"),
             "confidence_percent": final.get("confidence_percent"),
             "assumptions": final.get("assumptions"),
             "unknowns": final.get("unknowns"),
+            "wbs_items": wbs_items,
+            "wbs_children": wbs_children,
         }
 
         import os
