@@ -127,7 +127,7 @@ Execute the following steps in order. Do not skip steps.
 - Close your response to the operator with a suggested commit message:
   `If you want to commit this work now I suggest the following commit message:\n\n<work-item-id>: <concise-summary-of-changes>`
 - Mark the work item as in-review:
-  `wl update <work-item-id> --status completed --stage in_review --json`
+  `wl update <work-item-id> --status open --stage in_review --json`
 - Do not create a PR or merge. Ralph will handle PR/merge externally.
 
 ## Status Transition Matrix
@@ -137,7 +137,7 @@ The following table documents the expected status and stage transitions at each 
 | Phase | Command | Status | Stage |
 |-------|---------|--------|-------|
 | Start (Step 1 - Claim) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
-| Complete (Step 5) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
+| Complete (Step 5) | `wl update <id> --status open --stage in_review --json` | open | in_review |
 | Abort - dirty tree (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
 | Abort - no_safe_path (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
 
@@ -155,7 +155,7 @@ Usage (work-item example):
 wl show SA-0MPYMFZXO0004ZU4 --json --children
 
 # After completing implementation, mark the item in_review
-wl update SA-0MPYMFZXO0004ZU4 --stage in_review --json
+wl update SA-0MPYMFZXO0004ZU4 --status open --stage in_review --json
 ```
 
 End.

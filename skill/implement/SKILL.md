@@ -122,7 +122,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Select the most appropriate work item to work on next (blocker > dependency; most critical first).
   - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
   - Recursively implement that work item as described in this procedure.
-  - When a work item is completed, follow the mandatory build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit the work. Update the stage: `wl update <work-item-id> --status in_progress --stage in_review --json`
+  - When a work item is completed, follow the mandatory build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit the work. Update the stage: `wl update <work-item-id> --status open --stage in_review --json`
 
 - If the work item has a recent audit record, review the audit notes and address any unmet acceptance criteria or other issues identified.
 - If there is no recent audit record, run `/skill:audit <work-item-id>` and use the resulting audit output to establish the work that needs to be done.
@@ -182,7 +182,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
   > **When running under Ralph:** Skip the `wl update --stage in_review` step. Ralph will mark the item as `in_review` after a successful audit.
   > **When running manually:** Mark the work item as `in_review` (do **NOT** close it):
-  `wl update <work-item-id> --stage in_review --json`
+  `wl update <work-item-id> --status open --stage in_review --json`
 
   > **Important:** The work-item is **not closed** at this stage. It remains `in_review` until the release process promotes `dev` to `main`. Agents may perform the release by invoking the Ship skill's release command (`skill/ship/scripts/run-release.js`), or a Release Manager may perform it manually. Agents should not push directly to `main` unless explicitly authorized.
   > See `skill/ship/SKILL.md` for the push-to-dev workflow and `skill/ship/scripts/run-release.js` (safe wrapper) for the release process. The wrapper detects when a repository lacks `scripts/release/merge-dev-to-main.sh` and prints a clear human fallback message.
@@ -204,8 +204,8 @@ The following table documents the expected status and stage transitions at each 
 | Phase | Command | Status | Stage |
 |-------|---------|--------|-------|
 | Start (Step 1 - Claim) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
-| Blocker complete (Step 4) | `wl update <id> --status in_progress --stage in_review --json` | in_progress | in_review |
-| Final (Step 6 - Mark in_review) | `wl update <id> --stage in_review --json` | in_progress | in_review |
+| Blocker complete (Step 4) | `wl update <id> --status open --stage in_review --json` | open | in_review |
+| Final (Step 6 - Mark in_review) | `wl update <id> --status open --stage in_review --json` | open | in_review |
 | Abort - dirty work tree (Step 0) | `wl update <id> --status open --json`, then abort | open | (unchanged) |
 | Abort - definition gate failure | Run intake/plan interview, update item | open | (unchanged) |
 | Under Ralph (Step 6 note) | Skip in_review step; Ralph handles transition | in_progress | in_progress |
@@ -228,7 +228,7 @@ wl show SA-0MPYMFZXO0004ZU4 --json
 git push origin HEAD:refs/heads/dev
 
 # Mark in_review
-wl update SA-0MPYMFZXO0004ZU4 --stage in_review --json
+wl update SA-0MPYMFZXO0004ZU4 --status open --stage in_review --json
 ```
 
 End.

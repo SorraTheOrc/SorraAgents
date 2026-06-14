@@ -1498,9 +1498,20 @@ class RalphLoop:
         self._call_with_retry(cmd, category="wl", expect_json=True)
 
     def _wl_update_stage(self, work_item_id: str, stage: str) -> None:
-        """Update the work item's stage via wl update."""
-        cmd = [self.wl_bin, "update", work_item_id, "--stage", stage]
-        logger.info("ralph.cmd.wl.update_stage target=%s stage=%s", work_item_id, stage)
+        """Update the work item's stage via wl update.
+
+        When transitioning to in_review, also set status to open
+        (work is ready for review, not actively being worked on).
+        """
+        if stage == "in_review":
+            cmd = [self.wl_bin, "update", work_item_id, "--status", "open", "--stage", stage]
+            logger.info(
+                "ralph.cmd.wl.update_stage target=%s status=open stage=in_review",
+                work_item_id,
+            )
+        else:
+            cmd = [self.wl_bin, "update", work_item_id, "--stage", stage]
+            logger.info("ralph.cmd.wl.update_stage target=%s stage=%s", work_item_id, stage)
         self._call_with_retry(cmd, category="wl", expect_json=False)
         # Notify about the stage change
         self._notify_event(
