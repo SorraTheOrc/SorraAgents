@@ -161,6 +161,7 @@ injected into the source file to prevent duplicate work items. The comment
 format varies by file type:
 
 **Python:**
+
 ```python
 # <!-- REFACTOR-SA-0MOCK9999
 # smell: security
@@ -170,6 +171,7 @@ format varies by file type:
 ```
 
 **JavaScript/TypeScript:**
+
 ```javascript
 // <!-- REFACTOR-SA-0MOCK9999
 // smell: security
@@ -179,6 +181,7 @@ format varies by file type:
 ```
 
 **Markdown/HTML:**
+
 ```html
 <!-- REFACTOR-SA-0MOCK9999
 smell: security
