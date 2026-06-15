@@ -546,7 +546,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            code_quality_fixes_applied: int = 0,
                            code_quality_skipped_reason: str | None = None,
                            model: str | None = _MISSING,
-                           model_source: str | None = _MISSING) -> str:
+                           model_source: str | None = _MISSING,
+                           phase2_completed: bool = False) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -638,9 +639,21 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             if adjusted_count > 0:
                 parts.append(f"({adjusted_count} with acceptable variance)")
             parts.append(". All children are in in_review or done stage.")
+            if phase2_completed:
+                parts.append(" Deep code analysis (Phase 2) completed and confirmed all verdicts.")
             lines.append(" ".join(parts))
     else:
-        if unmet_count > 0 and not_reviewed:
+        if not phase2_completed and any(
+            r["verdict"] == VERDICT_PARTIAL
+            and "pending deep code review" in r.get("evidence", "")
+            for r in ac_results
+        ):
+            lines.append(
+                "Phase 1 automated screening detected blocking issues. "
+                "All 'met' verdicts have been demoted to 'partial' (pending deep code review). "
+                "Phase 2 deep analysis was skipped. Resolve Phase 1 blockers and re-audit."
+            )
+        elif unmet_count > 0 and not_reviewed:
             lines.append(
                 f"{unmet_count} acceptance criteria not met AND "
                 f"{len(not_reviewed)} children not yet in in_review/done stage."
@@ -978,10 +991,55 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
 # Subcommand: issue
 # ---------------------------------------------------------------------------
 
+def _demote_met_to_partial(results: list[dict]) -> list[dict]:
+    """Demote any 'met' verdicts to 'partial' with a pending deep review note.
+
+    Used when Phase 1 (automated screening) detects blocking issues,
+    preventing Phase 2 (deep code analysis) from running.
+    """
+    demoted: list[dict] = []
+    for r in results:
+        if r["verdict"] == VERDICT_MET:
+            demoted.append({
+                "text": r["text"],
+                "verdict": VERDICT_PARTIAL,
+                "evidence": "pending deep code review (Phase 1 blocked)",
+            })
+        else:
+            demoted.append(dict(r))
+    return demoted
+
+
+def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict]) -> tuple[bool, str]:
+    """Check whether Phase 1 automated screening has blocking issues.
+
+    Returns (blocked, reason). If blocked, Phase 2 deep analysis should be
+    skipped and all 'met' verdicts demoted to 'partial'.
+    """
+    # Check code quality findings
+    for f in cq_findings:
+        if f.get("severity") in ("critical", "high"):
+            return True, f"Critical/high code quality finding: {f.get('file', '?')}:{f.get('line', 0)} — {f.get('message', '')}"
+
+    # Check children stages
+    active_children = [c for c in child_results if c.get("stage") not in ("", None)]
+    blocked_children = [
+        c for c in active_children
+        if c.get("stage") not in ("in_review", "done")
+    ]
+    if blocked_children:
+        names = ", ".join(f"{c.get('title', '?')} ({c.get('stage', '?')})" for c in blocked_children[:3])
+        return True, f"Children not in in_review/done stage: {names}"
+
+    return False, ""
+
+
+
 def _build_issue_json(issue: dict, ac_results: list[dict],
                       child_results: list[dict],
                       code_quality_findings: list[dict] | None = None,
-                      code_quality_fixes_applied: int = 0) -> dict:
+                      code_quality_fixes_applied: int = 0,
+                      phase2_completed: bool = False) -> dict:
     """Build structured JSON payload for issue-mode audit.
 
     Ready-to-close logic:
@@ -1013,17 +1071,18 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
     adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
 
+    phase2_note = " Deep analysis completed." if phase2_completed else " Phase 2 skipped."
     if all_ac_acceptable:
         if adjusted_count > 0:
             summary = (
                 f"All {len(ac_results)} acceptance criteria acceptable "
-                f"({adjusted_count} with acceptable variance)."
+                f"({adjusted_count} with acceptable variance).{phase2_note}"
             )
         else:
-            summary = f"All {len(ac_results)} acceptance criteria met."
+            summary = f"All {len(ac_results)} acceptance criteria met.{phase2_note}"
     else:
         summary = (
-            f"{unmet_count} of {len(ac_results)} acceptance criteria not met."
+            f"{unmet_count} of {len(ac_results)} acceptance criteria not met.{phase2_note}"
         )
 
     return {
@@ -1036,7 +1095,196 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
             "fixes_applied": code_quality_fixes_applied,
             "findings": cq_findings,
         },
+        "pipeline": {
+            "phase1_completed": True,
+            "phase2_completed": phase2_completed,
+        },
     }
+
+
+def _run_phase2_deep_analysis(
+    issue: dict,
+    ac_results: list[dict],
+    child_results: list[dict],
+    resolved_model: str,
+    pi_bin: str = "pi",
+    debug_log: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Run Phase 2 deep code analysis.
+
+    Calls Pi with a detailed prompt asking the model to read the actual
+    implementation files and verify each acceptance criterion against
+    what the code actually does.
+
+    Returns (updated_ac_results, updated_child_results).
+    """
+    # Build a detailed prompt for deep analysis
+    ac_list_json = json.dumps([
+        {"index": i, "text": r["text"], "initial_verdict": r["verdict"]}
+        for i, r in enumerate(ac_results)
+    ])
+
+    prompt = (
+        "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS] "
+        "You are performing a deep code analysis. "
+        "Do NOT close, modify, create, or delete any work items. "
+        "Do NOT execute any wl, git, or other state-modifying commands. "
+        "Return ONLY a structured JSON array.\n\n"
+        "Phase 1 automated screening has PASSED. You must now perform deep code analysis.\n\n"
+        "For each acceptance criterion:\n"
+        "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
+        "2. **Verify the code actually does what the criterion claims.**\n"
+        "3. **Check for gaps between documented behavior and actual behavior.**\n"
+        "4. **Provide a specific file:line reference** as evidence.\n\n"
+        "Instructions:\n"
+        "- Use 'met' ONLY if the code genuinely satisfies the criterion.\n"
+        "- Use 'unmet' if the criterion is not satisfied at all.\n"
+        "- Use 'partial' if the criterion is partially satisfied (e.g., documented but not implemented, or implemented with gaps).\n"
+        "- Use 'adjusted' if the implementation differs from the original specification but the user story intent is preserved.\n"
+        "- Evidence MUST include a file path and line number. If no line number is available, state why.\n"
+        "- If a criterion says 'X is implemented' but the code only has scaffolding/stubs, use 'partial' not 'met'.\n\n"
+        f"Criteria: {ac_list_json}"
+    )
+
+    try:
+        issue_id = issue.get("id", "")
+        result = _call_pi_and_maybe_log(
+            issue_id, "phase2_deep", prompt,
+            model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+        )
+    except RuntimeError as exc:
+        # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
+        print(f"Warning: Phase 2 deep analysis failed: {exc}", file=sys.stderr)
+        return ac_results, child_results
+
+    # Parse the batched result
+    raw_text = (
+        result.get("extracted_text", "")
+        or result.get("evidence", "")
+        or result.get("text", "")
+    )
+    batch = _extract_json_array(raw_text)
+    if batch is None:
+        try:
+            batch = json.loads(raw_text)
+        except json.JSONDecodeError:
+            batch = []
+
+    updated_ac = list(ac_results)
+    if isinstance(batch, list):
+        reviewed = {
+            item["index"]: item
+            for item in batch
+            if isinstance(item, dict) and "index" in item
+        }
+        for i in range(len(updated_ac)):
+            item = reviewed.get(i, {})
+            deep_verdict = item.get("verdict", "")
+            deep_evidence = item.get("evidence", "")
+            if deep_verdict:
+                # Final verdict = Phase 1 passes AND Phase 2 confirms
+                initial = updated_ac[i]["verdict"]
+                if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
+                    updated_ac[i] = {
+                        "text": updated_ac[i]["text"],
+                        "verdict": VERDICT_MET,
+                        "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
+                    }
+                elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
+                    # Phase 1 said met, Phase 2 disagrees → downgrade
+                    updated_ac[i] = {
+                        "text": updated_ac[i]["text"],
+                        "verdict": deep_verdict,
+                        "evidence": f"Phase 1: {updated_ac[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
+                    }
+                else:
+                    # Use Phase 2 verdict (deep override for initial non-met)
+                    updated_ac[i] = {
+                        "text": updated_ac[i]["text"],
+                        "verdict": deep_verdict,
+                        "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
+                    }
+
+    # Also run deep analysis on active children
+    updated_children = list(child_results)
+    for ci, child in enumerate(updated_children):
+        if child.get("status") == "completed" and child.get("stage") == "done":
+            continue  # Skip already-closed children
+
+        child_acs = child.get("ac_results", [])
+        if not child_acs:
+            continue
+
+        child_ac_list = json.dumps([
+            {"index": i, "text": r["text"], "initial_verdict": r["verdict"]}
+            for i, r in enumerate(child_acs)
+        ])
+        child_prompt = (
+            "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — CHILD] "
+            "Do NOT close, modify, create, or delete any work items. "
+            "Return ONLY a structured JSON array.\n\n"
+            f"Deep code analysis for child: {child.get('title', '')} ({child.get('id', '')})\n\n"
+            "For each criterion, read the actual implementation files and verify "
+            "the code genuinely satisfies the stated requirements. "
+            "Use the same verdict guidance as the parent deep analysis.\n\n"
+            f"Criteria: {child_ac_list}"
+        )
+
+        try:
+            child_result = _call_pi_and_maybe_log(
+                child.get("id", ""), f"phase2_child:{ci}", child_prompt,
+                model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+            )
+        except RuntimeError:
+            continue
+
+        child_raw = (
+            child_result.get("extracted_text", "")
+            or child_result.get("evidence", "")
+            or child_result.get("text", "")
+        )
+        child_batch = _extract_json_array(child_raw)
+        if child_batch is None:
+            try:
+                child_batch = json.loads(child_raw)
+            except json.JSONDecodeError:
+                child_batch = []
+
+        if isinstance(child_batch, list):
+            reviewed = {
+                item["index"]: item
+                for item in child_batch
+                if isinstance(item, dict) and "index" in item
+            }
+            updated_child_acs = list(child_acs)
+            for i in range(len(updated_child_acs)):
+                item = reviewed.get(i, {})
+                deep_verdict = item.get("verdict", "")
+                deep_evidence = item.get("evidence", "")
+                if deep_verdict:
+                    initial = updated_child_acs[i]["verdict"]
+                    if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": VERDICT_MET,
+                            "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
+                        }
+                    elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": deep_verdict,
+                            "evidence": f"Phase 1: {updated_child_acs[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
+                        }
+                    else:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": deep_verdict,
+                            "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
+                        }
+            updated_children[ci] = dict(child)
+            updated_children[ci]["ac_results"] = updated_child_acs
+
+    return updated_ac, updated_children
 
 
 def cmd_issue(issue_id: str, persist: bool = True,
@@ -1241,6 +1489,37 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 )
 
     # ------------------------------------------------------------------
+    # Phase 2 gate: check if Phase 1 automated screening has blocking issues
+    # ------------------------------------------------------------------
+    phase1_blocked, phase1_reason = _has_phase1_blocking_issues(
+        cq_findings, child_results
+    )
+    phase2_completed = False
+
+    if phase1_blocked:
+        # Phase 1 blocked → demote all "met" verdicts to "partial"
+        ac_results = _demote_met_to_partial(ac_results)
+        for ci, child in enumerate(child_results):
+            child_results[ci]["ac_results"] = _demote_met_to_partial(
+                child.get("ac_results", [])
+            )
+        print(
+            f"Phase 1 blocked ({phase1_reason}): demoting 'met' verdicts to 'partial', "
+            "skipping Phase 2 deep analysis.",
+            file=sys.stderr,
+        )
+    else:
+        # Phase 1 passed → run Phase 2 deep code analysis
+        print("Phase 1 passed: running Phase 2 deep code analysis...", file=sys.stderr)
+        ac_results, child_results = _run_phase2_deep_analysis(
+            work_item, ac_results, child_results,
+            resolved_model=resolved_model,
+            pi_bin=pi_bin,
+            debug_log=debug_log,
+        )
+        phase2_completed = True
+
+    # ------------------------------------------------------------------
     # Create quality epics for findings (before report assembly)
     # ------------------------------------------------------------------
     if cq_findings:
@@ -1262,6 +1541,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         code_quality_skipped_reason=cq_skipped_reason,
         model=resolved_model,
         model_source=model_source,
+        phase2_completed=phase2_completed,
     )
 
     if json_mode:
@@ -1269,6 +1549,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
             work_item, ac_results, child_results,
             code_quality_findings=cq_findings,
             code_quality_fixes_applied=cq_fixes_applied,
+            phase2_completed=phase2_completed,
         )
         payload["child_persist_results"] = child_persist_results
         print(json.dumps(payload, indent=2))

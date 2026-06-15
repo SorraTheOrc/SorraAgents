@@ -22,17 +22,68 @@ Provide a concise, human-friendly summary of project status or a specific work i
 - The model should return a structured markdown report. If ambiguity prevents a reliable verdict on acceptance criteria, return immediately and do NOT persist the audit. Persistence must be an explicit, deliberate step — do not persist partial or ambiguous audits.
 - To aid debugging, the canonical runner supports a `--debug-log` flag which appends raw Pi output to a JSONL file (see Scripts section).
 
-## Structured report (canonical)
+## Two-Phase Audit Pipeline
 
-The audit report MUST be a structured markdown block that begins with the exact header `Ready to close:` on the first line. Downstream orchestrators parse this block; do not include any prefix text before it.
+The audit follows a strict two-phase pipeline:
 
-Ready to close: Yes/No
+```
+Phase 1: Automated Screening
+  ├─ Code quality check (linters)
+  ├─ Children stage check
+  └─ Surface-level AC verdict pass
+        ↓
+Decision Gate → If Phase 1 has BLOCKING issues → demote "met"→"partial" (pending deep code review), skip Phase 2
+        ↓ (no blocking issues)
+Phase 2: Deep Code Analysis
+  └─ Model reads and verifies implementation code against each AC
+        ↓
+Final Verdict: "met" only if BOTH phases confirm it
+```
+
+### Phase 1 — Automated Screening
+
+Runs in this order:
+
+1. **Code quality check** — linters (ruff, eslint, markdownlint, shellcheck)
+2. **Children stage check** — all children must be in `in_review` or `done`
+3. **Surface-level AC assessment** — model evaluates criteria against file existence and test results
+
+Blocking conditions that stop Phase 1:
+- Any critical or high code quality finding
+- Any non-deleted child with stage not in `in_review` or `done`
+
+### Decision Gate
+
+If Phase 1 encounters blocking conditions:
+- **All** ACs that were assessed "met" are demoted to **"partial"** with evidence **"pending deep code review"**
+- Phase 2 is skipped entirely
+- Report reads "Ready to close: No"
+
+If Phase 1 passes (no blocking issues):
+- Proceed to Phase 2
+
+### Phase 2 — Deep Code Analysis
+
+Only runs when Phase 1 passes. The model:
+
+1. **Reads the actual implementation files** referenced in each AC
+2. **Verifies each AC against actual code behavior** — confirms the code does what the AC claims
+3. **Checks for discrepancies** between documented behavior and actual implementation
+4. **Provides specific file:line evidence** for every verdict
+
+### Final Verdict
+
+An AC is recorded as **"met"** only when:
+- Phase 1 surface-level check passes (no blockers)
+- Phase 2 deep code analysis confirms the AC is genuinely satisfied
+
+If either phase disagrees, the verdict is "partial" (with evidence noting which phase flagged the issue).
 
 ### Ready-to-close criteria
 
 A work item is considered ready to close when:
 
-1. **All acceptance criteria are met or have acceptable variance** — every criterion in the parent and all children must have verdict `met` or `adjusted`. The `adjusted` verdict indicates that the criterion was adapted during implementation in a way that still satisfies the user story intent.
+1. **All acceptance criteria are met or have acceptable variance** — every criterion in the parent and all children must have final verdict `met` or `adjusted`. The `adjusted` verdict indicates that the criterion was adapted during implementation in a way that still satisfies the user story intent.
 2. **All active children are in `in_review` or `done` stage** — children with `status: in_progress` but `stage: in_review` are acceptable and do NOT block closure. Only children with stages like `idea`, `intake_complete`, `plan_complete`, or other pre-review stages block closure.
 3. **No critical or high code quality findings** — code quality checks run automatically during the audit. Critical and high severity findings block closure. Medium and low findings produce warnings but do not block closure.
 
@@ -113,9 +164,9 @@ No code quality issues found.
 
 ### Verdict guidance
 
-- **met** — Acceptance criterion is fully satisfied.
+- **met** — Acceptance criterion is fully satisfied. Only assigned when **both** Phase 1 (automated screening) and Phase 2 (deep code analysis) confirm the criterion is met.
 - **unmet** — Acceptance criterion is not satisfied; blocks closure.
-- **partial** — Acceptance criterion is partially but not fully satisfied; blocks closure.
+- **partial** — Acceptance criterion is partially but not fully satisfied; blocks closure. May also indicate that Phase 1 flagged blocking issues, preventing Phase 2 deep analysis from running (evidence shows "pending deep code review").
 - **adjusted** — Acceptance criterion was adapted during implementation. The change is acceptable because it still satisfies the user story intent, produces bug-free execution, and meets quality standards. Does **not** block closure. When using this verdict, include a clear justification in the evidence field explaining why the variance is acceptable.
 
 ## Success Criteria
@@ -172,6 +223,8 @@ Notes:
 ## Guidance for models
 
 - Return a structured markdown report only. Use the header `Ready to close:` and the canonical sections above.
+- **Follow the two-phase pipeline.** Phase 1 (automated screening) must complete successfully before Phase 2 (deep code analysis) begins. If Phase 1 has blocking issues, do NOT proceed to Phase 2 — instead demote all "met" verdicts to "partial" with evidence "pending deep code review".
+- **Deep code analysis is mandatory when Phase 1 passes.** Read the actual implementation files, not just the work item descriptions. Verify each AC against what the code actually does.
 - If the model cannot determine acceptance criteria verdicts unambiguously, return immediately and do NOT persist or claim the audit was recorded.
 - You MUST persist the audit report to the work item after producing a structured report. Persistence is **mandatory**, not optional. Use one of the approved persistence mechanisms: the canonical runner (which persists by default unless invoked with `--do-not-persist`) or the persister script (`skill/audit/scripts/persist_audit.py`). When performing the authorized persistence step, annotate the prompt with `[PERSIST-AUDIT]` and ensure the report is final and complete.
 
