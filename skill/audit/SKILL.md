@@ -38,6 +38,24 @@ A work item is considered ready to close when:
 
 Children with an empty stage (`""`) are excluded from the stage check (they may be newly created or not yet processed).
 
+### Model metadata line
+
+When model information is available (e.g., when the runner is invoked with
+``--model`` and ``--model-source`` flags), a metadata line is inserted after
+``Ready to close:`` and before ``## Summary`` in issue-level and child audit
+reports:
+
+- When model and source are provided: ``Model: <model> (provider: <source>)``
+- When no model info is available: ``Model: manual (no provider)``
+
+**Project-level reports** (``_assemble_project_report``) are NOT modified.
+
+Examples:
+
+- ``Model: opencode-go/deepseek-v4-flash (provider: local)``
+- ``Model: gpt-4 (provider: remote)``
+- ``Model: manual (no provider)``
+
 ## Summary
 
 <concise 2-4 sentence summary of overall status, key findings, and whether the item can be closed>

@@ -536,11 +536,17 @@ def _extract_acs(description: str) -> list[str]:
 # Report assembly
 # ---------------------------------------------------------------------------
 
+# Sentinel to detect when model/model_source were not explicitly passed
+_MISSING = object()
+
+
 def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            child_results: list[dict],
                            code_quality_findings: list[dict] | None = None,
                            code_quality_fixes_applied: int = 0,
-                           code_quality_skipped_reason: str | None = None) -> str:
+                           code_quality_skipped_reason: str | None = None,
+                           model: str | None = _MISSING,
+                           model_source: str | None = _MISSING) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -551,6 +557,13 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       ``message``, ``linter``, ``code`` keys.
     *code_quality_skipped_reason* is an optional string explaining why
       code quality was not run (e.g., no linters available).
+    *model* is the name of the model used for the audit (e.g.,
+      ``"opencode-go/deepseek-v4-flash"``). When not provided, no model
+      line is emitted (backward compatibility). When provided as ``None``
+      or empty string, the fallback ``Model: manual (no provider)`` is used.
+    *model_source* is the source of the model (``"local"`` or ``"remote"``).
+      When provided alongside *model*, produces
+      ``Model: <model> (provider: <source>)``.
 
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
@@ -586,7 +599,17 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     else:
         ready = ready_before_cq
 
-    lines = [f"Ready to close: {ready}", "", "## Summary", ""]
+    # Build model line (only when model/model_source was explicitly provided)
+    if model is not _MISSING:
+        effective_model = (model or "").strip() or "manual"
+        effective_source = ((model_source or "") if model_source is not _MISSING else "").strip()
+        if effective_source:
+            model_line = f"Model: {effective_model} (provider: {effective_source})"
+        else:
+            model_line = f"Model: {effective_model} (no provider)"
+        lines = [f"Ready to close: {ready}", "", model_line, "", "## Summary", ""]
+    else:
+        lines = [f"Ready to close: {ready}", "", "## Summary", ""]
 
     # Count verdicts across all criteria (parent + children)
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
@@ -761,11 +784,17 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     return "\n".join(lines)
 
 
-def _assemble_child_audit_report(child: dict, ac_results: list[dict]) -> str:
+def _assemble_child_audit_report(child: dict, ac_results: list[dict],
+                                 model: str | None = _MISSING,
+                                 model_source: str | None = _MISSING) -> str:
     """Assemble an audit report for a single child work item.
 
     *child* is a dict with keys ``title``, ``id``, ``status``, ``stage``.
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
+    *model* is the name of the model used for the audit. When not provided,
+      no model line is emitted. When ``None`` or empty, the fallback
+      ``Model: manual (no provider)`` is used.
+    *model_source* is the source of the model (``"local"`` or ``"remote"``).
 
     Ready-to-close logic:
       - All acceptance criteria must be ``met`` or ``adjusted``.
@@ -777,6 +806,19 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict]) -> str:
     lines = [
         f"Ready to close: {ready}",
         "",
+    ]
+
+    # Build model line (only when model was explicitly provided)
+    if model is not _MISSING:
+        effective_model = (model or "").strip() or "manual"
+        effective_source = ((model_source or "") if model_source is not _MISSING else "").strip()
+        if effective_source:
+            lines.append(f"Model: {effective_model} (provider: {effective_source})")
+        else:
+            lines.append(f"Model: {effective_model} (no provider)")
+        lines.append("")
+
+    lines.extend([
         "## Summary",
         "",
         f"Child work item audit for {child['title']} ({child['id']}). "
@@ -786,7 +828,7 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict]) -> str:
         "",
         "| # | Criterion | Verdict | Evidence |",
         "|---|-----------|---------|----------|",
-    ]
+    ])
 
     if not ac_results:
         lines.append("")
@@ -828,8 +870,13 @@ def _persist_child_audit(
     child_stage: str,
     ac_results: list[dict],
     pi_bin: str = "pi",
+    model: str | None = None,
+    model_source: str | None = None,
 ) -> tuple[bool, str]:
     """Assemble and persist an audit report for a single child work item.
+
+    *model* and *model_source* are passed through to
+    ``_assemble_child_audit_report()`` for inclusion in the child report.
 
     Returns (success, report_text).
     On failure the report text is still returned so callers can log it.
@@ -840,7 +887,7 @@ def _persist_child_audit(
         "status": child_status,
         "stage": child_stage,
     }
-    report = _assemble_child_audit_report(child, ac_results)
+    report = _assemble_child_audit_report(child, ac_results, model=model, model_source=model_source)
 
     rc = persist_audit(child_id, report)
     success = rc == 0
@@ -998,6 +1045,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
               runner: Runner | None = None, json_mode: bool = False,
               debug_log: str | None = None) -> int:
     """Audit a single work item.
+
+    The resolved model name and source are included as a metadata line
+    in the audit report output (issue-level and child reports).
 
     Model resolution order (highest first):
       1. --model CLI flag (explicit override)
@@ -1175,6 +1225,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 child_stage=child["stage"],
                 ac_results=child["ac_results"],
                 pi_bin=pi_bin,
+                model=resolved_model,
+                model_source=model_source,
             )
             child_persist_results.append({
                 "id": child["id"],
@@ -1208,6 +1260,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
         code_quality_findings=cq_findings,
         code_quality_fixes_applied=cq_fixes_applied,
         code_quality_skipped_reason=cq_skipped_reason,
+        model=resolved_model,
+        model_source=model_source,
     )
 
     if json_mode:
