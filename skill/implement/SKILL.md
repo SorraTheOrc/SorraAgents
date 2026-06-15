@@ -145,6 +145,33 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Summarize changes made in the work item description or comments.
   - Do not proceed to the next step until the user confirms it is OK to do so.
 
+1. Optional refactor step
+
+After implementation completes and before the final commit, an automated
+refactor step may be invoked to detect and remediate code smells:
+
+- The refactor step analyzes only files modified in the current session
+  (git diff against parent branch).
+- It uses a hybrid approach: linters for mechanical issues + LLM for
+  design/architectural smells.
+- **Session-introduced smells** are fixed immediately in the same run.
+- **Pre-existing smells** create Worklog work items with structured
+  REFACTOR comments in the source files.
+- The step can be skipped with the ``--no-refactor`` flag:
+
+  ```
+  implement <work-item-id> --no-refactor
+  ```
+
+- The canonical orchestrator can also be invoked directly:
+
+  ```bash
+  python3 skill/refactor/scripts/refactor.py <work-item-id>
+  python3 skill/refactor/scripts/refactor.py <work-item-id> --json
+  ```
+
+- See ``skill/refactor/SKILL.md`` for full documentation.
+
 1. Automated self-review
 
 - Build and lint the code to catch basic issues, fix any issues raised before proceeding.

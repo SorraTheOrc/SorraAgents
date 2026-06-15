@@ -114,14 +114,27 @@ Execute the following steps in order. Do not skip steps.
 - Follow project style and conventions.
 - Add comments to the work item describing any significant design decisions.
 
-### Step 4 — Build, test and commit
+### Step 4 — Optional refactor step
+
+After implementation completes and before building/testing, an automated
+refactor step may be invoked to detect and remediate code smells:
+
+- The refactor step analyzes only files modified in the current session
+  (git diff against parent branch).
+- **Session-introduced smells** are fixed immediately in the same run.
+- **Pre-existing smells** create Worklog work items with structured
+  REFACTOR comments in the source files.
+- The step can be skipped with the ``--no-refactor`` flag.
+- See ``skill/refactor/SKILL.md`` for full documentation.
+
+### Step 5 — Build, test and commit
 
 - Build the project and verify no errors.
 - Run the entire test suite. Fix any failing tests.
 - Commit changes with a message referencing the work item id.
 - Add a comment to the work item with the commit hash.
 
-### Step 5 — Push and mark in-review
+### Step 6 — Push and mark in-review
 
 - Push the branch to `origin`.
 - Close your response to the operator with a suggested commit message:
@@ -137,7 +150,7 @@ The following table documents the expected status and stage transitions at each 
 | Phase | Command | Status | Stage |
 |-------|---------|--------|-------|
 | Start (Step 1 - Claim) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
-| Complete (Step 5) | `wl update <id> --status open --stage in_review --json` | open | in_review |
+| Complete (Step 6) | `wl update <id> --status open --stage in_review --json` | open | in_review |
 | Abort - dirty tree (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
 | Abort - no_safe_path (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
 
