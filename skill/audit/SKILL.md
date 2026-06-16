@@ -49,17 +49,20 @@ Runs in this order:
 3. **Surface-level AC assessment** — model evaluates criteria against file existence and test results
 
 Blocking conditions that stop Phase 1:
+
 - Any critical or high code quality finding
 - Any non-deleted child with stage not in `in_review` or `done`
 
 ### Decision Gate
 
 If Phase 1 encounters blocking conditions:
+
 - **All** ACs that were assessed "met" are demoted to **"partial"** with evidence **"pending deep code review"**
 - Phase 2 is skipped entirely
 - Report reads "Ready to close: No"
 
 If Phase 1 passes (no blocking issues):
+
 - Proceed to Phase 2
 
 ### Phase 2 — Deep Code Analysis
@@ -74,6 +77,7 @@ Only runs when Phase 1 passes. The model:
 ### Final Verdict
 
 An AC is recorded as **"met"** only when:
+
 - Phase 1 surface-level check passes (no blockers)
 - Phase 2 deep code analysis confirms the AC is genuinely satisfied
 
