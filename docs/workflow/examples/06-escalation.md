@@ -34,7 +34,7 @@ The engine's triage audit cycle picks up WL-EXAMPLE-006 in `in_review` state.
 | **Command** | `audit_fail` |
 | **Actor** | QA (AMPA via audit skill) |
 | **State Before** | `in_progress / in_review` (alias: `review`) |
-| **State After** | `in_progress / audit_failed` (alias: `audit_failed`) |
+| **State After** | `open / audit_failed` (alias: `audit_failed`) |
 
 | Invariant | Check | Result |
 |---|---|---|
@@ -62,7 +62,7 @@ The engine's triage audit cycle picks up WL-EXAMPLE-006 in `in_review` state.
 **Engine Actions:**
 
 ```bash
-wl update WL-EXAMPLE-006 --stage audit_failed
+wl update WL-EXAMPLE-006 --status open --stage audit_failed
 wl comment add WL-EXAMPLE-006 --comment "Audit 1: 2/5 AC unmet..." --author "ampa-scheduler"
 ```
 
@@ -74,7 +74,7 @@ The engine checks the failure count (1) against the retry threshold (2). First f
 |---|---|
 | **Command** | `retry_delegation` |
 | **Actor** | PM (AMPA scheduler) |
-| **State Before** | `in_progress / audit_failed` (alias: `audit_failed`) |
+| **State Before** | `open / audit_failed` (alias: `audit_failed`) |
 | **State After** | `open / plan_complete` (alias: `plan`) |
 | **Effects** | `remove_tags: [audit_failed]` |
 
@@ -130,7 +130,7 @@ Patch reads the prior audit comment and attempts fixes:
 | **Command** | `audit_fail` |
 | **Actor** | QA (AMPA via audit skill) |
 | **State Before** | `in_progress / in_review` (alias: `review`) |
-| **State After** | `in_progress / audit_failed` (alias: `audit_failed`) |
+| **State After** | `open / audit_failed` (alias: `audit_failed`) |
 
 | Invariant | Check | Result |
 |---|---|---|
@@ -158,7 +158,7 @@ Patch reads the prior audit comment and attempts fixes:
 **Engine Actions:**
 
 ```bash
-wl update WL-EXAMPLE-006 --stage audit_failed
+wl update WL-EXAMPLE-006 --status open --stage audit_failed
 wl comment add WL-EXAMPLE-006 --comment "Audit 2: 1/5 AC still unmet..." --author "ampa-scheduler"
 ```
 
@@ -170,7 +170,7 @@ The engine checks the failure count (2) against the retry threshold (2). Thresho
 |---|---|
 | **Command** | `escalate` |
 | **Actor** | PM (AMPA scheduler) |
-| **State Before** | `in_progress / audit_failed` (alias: `audit_failed`) |
+| **State Before** | `open / audit_failed` (alias: `audit_failed`) |
 | **State After** | `blocked / escalated` (alias: `escalated`) |
 
 | Invariant | Check | Result |

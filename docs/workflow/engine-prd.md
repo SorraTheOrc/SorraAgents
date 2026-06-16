@@ -204,7 +204,7 @@ The descriptor defines named state aliases that map to `(status, stage)` tuples.
 | `delegated` | `in_progress` | `delegated` | Delegated to an agent (AMPA) |
 | `review` | `in_progress` | `in_review` | Implementation complete, under review |
 | `audit_passed` | `completed` | `in_review` | Audit passed, awaiting approval |
-| `audit_failed` | `in_progress` | `audit_failed` | Audit found gaps |
+| `audit_failed` | `open` | `audit_failed` | Audit found gaps |
 | `escalated` | `in_progress` | `escalated` | Escalated to Producer |
 | `blocked_in_progress` | `blocked` | `in_progress` | Blocked during active work |
 | `blocked_delegated` | `blocked` | `delegated` | Blocked during delegation |
@@ -817,7 +817,7 @@ This section addresses the gap identified in the SA-0MLT1ENFV0CTQ1IO audit: no i
 | `delegated` | `(in_progress, delegated)` | `states.delegated` | `StateTuple("in_progress", "delegated")` |
 | `review` | `(in_progress, in_review)` | `states.review` | `StateTuple("in_progress", "in_review")` |
 | `audit_passed` | `(completed, in_review)` | `states.audit_passed` | `StateTuple("completed", "in_review")` |
-| `audit_failed` | `(in_progress, audit_failed)` | `states.audit_failed` | `StateTuple("in_progress", "audit_failed")` |
+| `audit_failed` | `(open, audit_failed)` | `states.audit_failed` | `StateTuple("open", "audit_failed")` |
 | `escalated` | `(in_progress, escalated)` | `states.escalated` | `StateTuple("in_progress", "escalated")` |
 | `blocked_in_progress` | `(blocked, in_progress)` | `states.blocked_in_progress` | `StateTuple("blocked", "in_progress")` |
 | `blocked_delegated` | `(blocked, delegated)` | `states.blocked_delegated` | `StateTuple("blocked", "delegated")` |
