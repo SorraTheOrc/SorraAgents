@@ -335,7 +335,7 @@ class TestMakeAutoplanDecisionIdempotence:
     def test_comment_does_not_create_duplicate_decision_comment(self):
         """When autoplan decision already determined, append_autoplan_decision_comment is not called."""
         with (
-            patch("command.plan_helpers.run_effort_and_risk") as mock_er,
+            patch("command.plan_helpers.run_effort_and_risk"),
             patch("command.plan_helpers.append_autoplan_decision_comment") as mock_append,
         ):
             do_plan, stage, _ = make_autoplan_decision(
