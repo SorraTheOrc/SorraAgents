@@ -30,11 +30,11 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 - Where possible identify existing implementations details that are related to the feature.
 - Where possible identify existing features or tasks that can be reused instead of creating duplicates.
 - Use an interview style: concise, high-signal questions grouped to a soft-maximum of three per iteration.
-- Do not invent requirements, commitments (dates), or owners — propose options and ask the user to confirm.
+- Do not invent requirements, commitments (dates), or owners - propose options and ask the user to confirm.
 - Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or the agent framework's ignore rules.
 - Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
 - If the user indicates uncertainty, add clarifying questions rather than guessing.
-- **Test-first ordering**: When creating child work items, test/verification work items must always be created before implementation work items. This ensures a test-driven development approach is followed — tests are defined first and implementation follows. The feature plan must list test features before implementation features, and the `wl create` commands for test items must be issued before those for implementation items.
+- **Test-first ordering**: When creating child work items, test/verification work items must always be created before implementation work items. This ensures a test-driven development approach is followed - tests are defined first and implementation follows. The feature plan must list test features before implementation features, and the `wl create` commands for test items must be issued before those for implementation items.
 
 - **Vertical slice phasing**: When phasing large work items into multiple integration phases, use the **tracer bullet** approach. Each phase should be a thin vertical slice that cuts through ALL integration layers end-to-end (code, tests, docs, infra, observability), NOT a horizontal slice of a single layer. This ensures each phase delivers end-to-end user value and can be integrated independently. Between each phase, review the next work items and update their descriptions if they depend on completed work or come next in the schedule.
 
@@ -50,7 +50,53 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 - Fetch and read the work item details using Worklog CLI: `wl show <work-item-id> --json` and treat the work item description and any referenced artifacts as authoritative seed intent.
 - Pay particular attention to any PRD referenced in this work item or any of its parent work items.
 - If `wl` is unavailable or the work item cannot be found, fail fast and ask the user to provide a valid <work-item-id> or paste the work item content.
-- Prepend a short “Seed Context” block to the interview that includes the fetched work item title, type, current tags, and one-line description.
+- Prepend a short "Seed Context" block to the interview that includes the fetched work item title, type, current tags, and one-line description.
+
+## Pre-check: Effort/Risk Threshold (must do before Process step 1)
+
+Before starting the planning process, check whether the work item is small enough
+that planning can be skipped. This uses the shared decision logic from
+``command/plan_helpers.py`` (the same logic used by Ralph's autoplan).
+
+1. Run the effort/risk check:
+
+   ```bash
+   python3 command/plan_helpers.py plan-if-needed <work-item-id>
+   ```
+
+2. Parse the JSON result. Expected keys:
+
+   - ``target_id`` — the work item id
+   - ``decision`` — ``"skip"`` (effort and risk below threshold, planning not needed)
+                   or ``"plan"`` (effort or risk above threshold, planning required)
+
+3. Act on the decision:
+
+   - **If ``decision == "skip"``**: The work item is small enough to implement
+     directly without decomposition.  Mark it as ``plan_complete`` and record
+     a brief comment:
+
+     ```bash
+     wl update <work-item-id> --stage plan_complete --status open --json
+     wl comment add <work-item-id> --author "plan" --comment "Auto-plan skipped: effort and risk below threshold (checked via command/plan_helpers.py plan-if-needed). Proceeding directly to implementation." --json
+     ```
+
+     Then **exit** the planning command without proceeding to the Process steps.
+
+   - **If ``decision == "plan"``**: Proceed to the Process steps below.  The
+     work item is large or risky enough to warrant full decomposition.
+
+   - **If the CLI fails** (non-zero exit, invalid JSON, or unexpected output):
+     Default to full planning as a safety measure.  Proceed to the Process
+     steps below and log a warning.
+
+4. **Idempotence**: If the work item's stage is already ``plan_complete`` or
+   later, the pre-check will return ``decision: "skip"`` and the command will
+   exit with the existing stage preserved (a warning comment is added).
+
+> **Note for PlanAll**: This pre-check is built into the ``/plan`` command
+> prompt. PlanAll shells out to ``/plan <id>`` which runs this pre-check
+> automatically — no changes to PlanAll are needed.
 
 ## Process (must follow)
 
@@ -58,7 +104,7 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 - Before starting the full planning interview and decomposition, run a quick assessment to determine whether the work item already has a sufficient plan or is too small to require decomposition.
 - Suggested checks (conservative, idempotent heuristics):
-  - If the work item's `stage` is `plan_complete` or later, planning is already complete — skip with a no-op (step 2 handles this case with a comment).
+  - If the work item's `stage` is `plan_complete` or later, planning is already complete - skip with a no-op (step 2 handles this case with a comment).
   - If the work item is not an `epic` (for example `task` or `bug`) and the description already contains measurable acceptance criteria and a minimal implementation sketch, consider it "ready" and mark planning complete.
   - If the work item already has child features/tasks that cover the intended scope (use `wl list --parent <work-item-id> --json` and compare), and those children are adequate and idempotent, skip full planning and mark `plan_complete`.
   - If a concise plan block already exists in the work item (for example a labeled "Plan:" or a short numbered feature list with acceptance criteria), treat that as sufficient evidence to skip the full interview.
@@ -79,16 +125,16 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
     - Then proceed to the finishing steps.
   - Any other `stage` value suggests the work item is not currently at the intake_complete stage. Run the planning heuristics (see step 1) to determine whether the item is sufficiently small/well-defined to auto-complete. If so, auto-complete via step 1. If the heuristics genuinely cannot determine, ask the user how to proceed (indicating that if the work item is small enough it is OK to proceed).
 - Read any PRD linked in the work item or any of its parents to extract key details for later reference.
-- Derive 3–6 keywords from the work item title/description to search the repo and work items for related work. Present any likely duplicates or parent/child relationships.
+- Derive 3-6 keywords from the work item title/description to search the repo and work items for related work. Present any likely duplicates or parent/child relationships.
 
 1. Interview
 
 In interview iterations (≤ 3 questions each), gather the minimum information needed to produce an actionable feature plan in which each feature is large enough to be meaningful but small enough to be delivered as an end-to-end slice. For each feature capture:
 
-- Target outcome: what user-visible capability must exist when this epic is “done”?
+- Target outcome: what user-visible capability must exist when this epic is "done"?
 - Definition of done: what are the pass/fail acceptance checks (a short manual checklist and automated tests if possible)?
 - Constraints: performance, compatibility, rollout/feature-flag expectations, or timeline constraints.
-- Risky assumptions: identify where a prototype/experiment is needed (fake API, mock UI, spike) and what “success” means.
+- Risky assumptions: identify where a prototype/experiment is needed (fake API, mock UI, spike) and what "success" means.
 
 Keep asking questions until the breakdown into features is clear.
 
@@ -96,11 +142,11 @@ Keep asking questions until the breakdown into features is clear.
 
 1. Propose feature plan (agent responsibility + user confirmation)
 
-- Produce a draft plan (soft guide: 3–12 features) where each feature includes:
+- Produce a draft plan (soft guide: 3-12 features) where each feature includes:
   - **Short Title** (canonical, stable, ≤ 7 words)
   - **Summary** (one sentence)
-  - **Acceptance Criteria** (2–6 concise bullets; measurable/testable)
-  - **Minimal Implementation** (2–6 bullets; smallest end-to-end slice)
+  - **Acceptance Criteria** (2-6 concise bullets; measurable/testable)
+  - **Minimal Implementation** (2-6 bullets; smallest end-to-end slice)
   - **Prototype / Experiment** (optional; include success thresholds)
   - **Dependencies** (other features or explicit external factors)
   - **Deliverables** (artifacts: docs, tests, demo script, telemetry)
@@ -136,7 +182,7 @@ Keep asking questions until the breakdown into features is clear.
   - Actions: Add missing placeholders only when obvious; otherwise add Open Questions.
   1. Sequencing & dependencies review
   - Purpose: Ensure dependencies are coherent and actionable.
-  - Actions: Detect cycles, missing prerequisites, or vague dependencies; propose minimal fixes that do not change intent; record uncertainty as Open Questions. Verify that test/verification features appear before implementation features — if they do not, reorder them so test features come first.
+  - Actions: Detect cycles, missing prerequisites, or vague dependencies; propose minimal fixes that do not change intent; record uncertainty as Open Questions. Verify that test/verification features appear before implementation features - if they do not, reorder them so test features come first.
   1. Scope sizing review
   - Purpose: Ensure features are sized as deliverable increments.
   - Actions: Flag features that are too broad/vague or duplicate scope; suggest split/merge candidates as Open Questions.
@@ -214,12 +260,12 @@ Keep asking questions until the breakdown into features is clear.
   - The question text exactly as asked.
   - The answer provided and the answering party (user, stakeholder, or agent inference) and any supporting evidence or references (work item id, file path, PR link).
   - If the answer changed during the process, record prior answers and mark the final accepted answer.
-  - If the question resulted in a discussion and/or research, include a concise summary (1–6 sentences) describing the discussion, research performed, findings, and any links to supporting artifacts (files, PRs, issues). Summaries should focus on impact to scope, dependencies, or implementation choices.
+  - If the question resulted in a discussion and/or research, include a concise summary (1-6 sentences) describing the discussion, research performed, findings, and any links to supporting artifacts (files, PRs, issues). Summaries should focus on impact to scope, dependencies, or implementation choices.
 
 - Example format:
 
-  - Q: "Should feature X be behind a feature flag? (yes/no/ask)" — Answer (product@acme): "Yes, gradual rollout behind flag". Source: interactive reply. Final: yes.
-  - Q: "Can we reuse library Y?" — Answer (eng@acme): "Partially. Research: reviewed `libs/y` and PR #88; requires adapter wrapper. Follow-up: created wl-789 to implement adapter." (Research summary: adapter required; library lacks needed API surface.)
+  - Q: "Should feature X be behind a feature flag? (yes/no/ask)" - Answer (product@acme): "Yes, gradual rollout behind flag". Source: interactive reply. Final: yes.
+  - Q: "Can we reuse library Y?" - Answer (eng@acme): "Partially. Research: reviewed `libs/y` and PR #88; requires adapter wrapper. Follow-up: created wl-789 to implement adapter." (Research summary: adapter required; library lacks needed API surface.)
 
 - Behavior and placement rules:
   - The agent MUST append the complete Appendix to any temporary draft file used for the plan and include it in the parent work item's description or as a `wl comment` when calling `wl update` or `wl comment add`.
