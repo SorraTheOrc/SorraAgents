@@ -9,6 +9,11 @@ These tests verify that:
 
 The target implementation lives in
 skill/code_review/scripts/create_quality_epics.py.
+
+NOTE: The ``find_or_create_epic()`` function uses ``wl list --status open``
+and ``wl list --status in_progress`` (not ``wl search``) because ``wl search``
+does not reliably return matching epics.  All mock runners below must handle
+``wl list`` commands, not ``wl search``.
 """
 from __future__ import annotations
 
@@ -125,6 +130,29 @@ class TestQualityEpicCreation:
     # Epic search / reuse
     # ------------------------------------------------------------------
 
+    def _wl_list_open_empty(self, cmd: list[str]):
+        """Return response for ``wl list --status open`` with no matching epics."""
+        return _fake_proc(stdout=json.dumps({
+            "success": True,
+            "workItems": [
+                {"id": "SA-OTHER01", "title": "Some other task", "status": "open", "issueType": "task"},
+            ],
+        }))
+
+    def _wl_list_inprogress_empty(self, cmd: list[str]):
+        """Return response for ``wl list --status in_progress`` with no matching epics."""
+        return _fake_proc(stdout=json.dumps({
+            "success": True,
+            "workItems": [],
+        }))
+
+    def _handle_wl_create_epic(self, cmd):
+        """Return a new epic creation response."""
+        return _fake_proc(stdout=json.dumps({
+            "success": True,
+            "workItem": {"id": "SA-NEWEPIC01", "title": EXPECTED_EPIC_TITLE},
+        }))
+
     def test_creates_epic_when_none_exists(self):
         """When no 'Quality Improvement - Refactoring' epic exists, create one."""
         mod = self._import_module()
@@ -135,15 +163,13 @@ class TestQualityEpicCreation:
             calls.append(list(cmd))
             cmd_str = " ".join(str(c) for c in cmd)
 
-            # wl search - should return empty (no existing epic)
-            if "search" in cmd_str and EXPECTED_EPIC_TITLE in cmd_str:
-                return _fake_proc(stdout=json.dumps({"success": True, "workItems": []}))
-            # wl create (epic) - return new epic id
+            if "list" in cmd_str and "open" in cmd_str:
+                return self._wl_list_open_empty(cmd)
+            if "list" in cmd_str and "in_progress" in cmd_str:
+                return self._wl_list_inprogress_empty(cmd)
+            # wl create (epic)
             if "create" in cmd_str and "Quality Improvement" in cmd_str:
-                return _fake_proc(stdout=json.dumps({
-                    "success": True,
-                    "workItem": {"id": "SA-NEWEPIC01", "title": EXPECTED_EPIC_TITLE},
-                }))
+                return self._handle_wl_create_epic(cmd)
             # wl create (child) - return child id
             if "create" in cmd_str:
                 return _fake_proc(stdout=json.dumps({
@@ -161,9 +187,9 @@ class TestQualityEpicCreation:
         assert result["epic_created"] is True
         assert result["epic_id"] == "SA-NEWEPIC01"
         assert result["children_created"] == 1
-        # Verify search was called first
-        search_calls = [c for c in calls if "search" in str(c)]
-        assert len(search_calls) >= 1
+        # Verify list was called for both open and in_progress
+        list_calls = [c for c in calls if "list" in str(c)]
+        assert len(list_calls) >= 2
 
     def test_reuses_existing_epic(self):
         """When an existing 'Quality Improvement - Refactoring' epic exists, reuse it."""
@@ -175,14 +201,16 @@ class TestQualityEpicCreation:
             calls.append(list(cmd))
             cmd_str = " ".join(str(c) for c in cmd)
 
-            # wl search - return existing epic
-            if "search" in cmd_str and EXPECTED_EPIC_TITLE in cmd_str:
+            # wl list --status open - return existing epic
+            if "list" in cmd_str and "open" in cmd_str:
                 return _fake_proc(stdout=json.dumps({
                     "success": True,
                     "workItems": [{
                         "id": "SA-EXISTING01",
                         "title": EXPECTED_EPIC_TITLE,
                         "status": "open",
+                        "issueType": "epic",
+                        "createdAt": "2026-01-01T00:00:00.000Z",
                     }],
                 }))
             # wl create (child) - return child id
@@ -208,13 +236,22 @@ class TestQualityEpicCreation:
 
         def fake_runner(cmd, **kwargs):
             cmd_str = " ".join(str(c) for c in cmd)
-            if "search" in cmd_str and EXPECTED_EPIC_TITLE in cmd_str:
+            # wl list --status open returns no matching epics
+            if "list" in cmd_str and "open" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItems": [],
+                }))
+            # wl list --status in_progress returns the matching epic
+            if "list" in cmd_str and "in_progress" in cmd_str:
                 return _fake_proc(stdout=json.dumps({
                     "success": True,
                     "workItems": [{
                         "id": "SA-INPROGRESS01",
                         "title": EXPECTED_EPIC_TITLE,
                         "status": "in_progress",
+                        "issueType": "epic",
+                        "createdAt": "2026-01-01T00:00:00.000Z",
                     }],
                 }))
             if "create" in cmd_str:
@@ -233,20 +270,28 @@ class TestQualityEpicCreation:
         assert result["epic_id"] == "SA-INPROGRESS01"
 
     def test_does_not_reuse_closed_epic(self):
-        """A closed/completed epic should not be reused; a new one should be created."""
+        """A closed/completed epic should not be reused; a new one should be created.
+
+        With the new ``wl list`` approach, closed epics are not returned by
+        ``wl list --status open`` or ``wl list --status in_progress``, so
+        this test verifies that when no open/in-progress epic is found,
+        a new one is created.
+        """
         mod = self._import_module()
 
         def fake_runner(cmd, **kwargs):
             cmd_str = " ".join(str(c) for c in cmd)
-            # First search returns a closed epic
-            if "search" in cmd_str and EXPECTED_EPIC_TITLE in cmd_str:
+            # wl list --status open returns no matching epics (closed epics
+            # are not included in the open list)
+            if "list" in cmd_str and "open" in cmd_str:
                 return _fake_proc(stdout=json.dumps({
                     "success": True,
-                    "workItems": [{
-                        "id": "SA-CLOSED01",
-                        "title": EXPECTED_EPIC_TITLE,
-                        "status": "completed",
-                    }],
+                    "workItems": [],
+                }))
+            if "list" in cmd_str and "in_progress" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItems": [],
                 }))
             # Then create a new one
             if "create" in cmd_str and "Quality Improvement" in cmd_str:
@@ -283,13 +328,14 @@ class TestQualityEpicCreation:
             child_calls.append(list(cmd))
             cmd_str = " ".join(str(c) for c in cmd)
 
-            if "search" in cmd_str and EXPECTED_EPIC_TITLE in cmd_str:
+            if "list" in cmd_str and "open" in cmd_str:
                 return _fake_proc(stdout=json.dumps({
                     "success": True,
                     "workItems": [{
                         "id": "SA-EXISTING01",
                         "title": EXPECTED_EPIC_TITLE,
                         "status": "open",
+                        "issueType": "epic",
                     }],
                 }))
             if "create" in cmd_str:
@@ -325,13 +371,14 @@ class TestQualityEpicCreation:
             child_calls.append(list(cmd))
             cmd_str = " ".join(str(c) for c in cmd)
 
-            if "search" in cmd_str and EXPECTED_EPIC_TITLE in cmd_str:
+            if "list" in cmd_str and "open" in cmd_str:
                 return _fake_proc(stdout=json.dumps({
                     "success": True,
                     "workItems": [{
                         "id": "SA-EXISTING01",
                         "title": EXPECTED_EPIC_TITLE,
                         "status": "open",
+                        "issueType": "epic",
                     }],
                 }))
             if "create" in cmd_str:
@@ -355,13 +402,14 @@ class TestQualityEpicCreation:
 
         def fake_runner(cmd, **kwargs):
             cmd_str = " ".join(str(c) for c in cmd)
-            if "search" in cmd_str and EXPECTED_EPIC_TITLE in cmd_str:
+            if "list" in cmd_str and "open" in cmd_str:
                 return _fake_proc(stdout=json.dumps({
                     "success": True,
                     "workItems": [{
                         "id": "SA-EXISTING01",
                         "title": EXPECTED_EPIC_TITLE,
                         "status": "open",
+                        "issueType": "epic",
                     }],
                 }))
             return _fake_proc(stdout=json.dumps({"success": True}))
@@ -383,7 +431,12 @@ class TestQualityEpicCreation:
 
         def fake_runner(cmd, **kwargs):
             cmd_str = " ".join(str(c) for c in cmd)
-            if "search" in cmd_str and EXPECTED_EPIC_TITLE in cmd_str:
+            if "list" in cmd_str and "open" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItems": [],
+                }))
+            if "list" in cmd_str and "in_progress" in cmd_str:
                 return _fake_proc(stdout=json.dumps({
                     "success": True,
                     "workItems": [],
@@ -418,7 +471,12 @@ class TestQualityEpicCreation:
 
         def fake_runner(cmd, **kwargs):
             cmd_str = " ".join(str(c) for c in cmd)
-            if "search" in cmd_str and EXPECTED_EPIC_TITLE in cmd_str:
+            if "list" in cmd_str and "open" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItems": [],
+                }))
+            if "list" in cmd_str and "in_progress" in cmd_str:
                 return _fake_proc(stdout=json.dumps({
                     "success": True,
                     "workItems": [],
@@ -448,6 +506,50 @@ class TestQualityEpicCreation:
         assert isinstance(result["epic_created"], bool)
 
     # ------------------------------------------------------------------
+    # Epic description includes lifecycle policy
+    # ------------------------------------------------------------------
+
+    def test_epic_creation_includes_lifecycle_in_description(self):
+        """When creating a new epic, the description should include lifecycle policy."""
+        mod = self._import_module()
+
+        epic_create_calls: list[list[str]] = []
+
+        def fake_runner(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "list" in cmd_str and "open" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True, "workItems": [],
+                }))
+            if "list" in cmd_str and "in_progress" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True, "workItems": [],
+                }))
+            if "create" in cmd_str and "Quality Improvement" in cmd_str:
+                epic_create_calls.append(list(cmd))
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-EPIC01", "title": EXPECTED_EPIC_TITLE},
+                }))
+            if "create" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-CHILD", "title": "child"},
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        _result = mod.create_epics_for_findings(
+            SAMPLE_FINDINGS_CRITICAL,
+            runner=fake_runner,
+        )
+
+        # Check the epic create call includes lifecycle info in description
+        assert len(epic_create_calls) == 1
+        call_str = " ".join(str(a) for a in epic_create_calls[0])
+        assert "Closed when all child work items are resolved" in call_str
+        assert "new epic is created if new findings arrive after closure" in call_str
+
+    # ------------------------------------------------------------------
     # CLI interface
     # ------------------------------------------------------------------
 
@@ -460,3 +562,95 @@ class TestQualityEpicCreation:
         sig = inspect.signature(mod.create_epics_for_findings)
         params = list(sig.parameters.keys())
         assert "findings" in params or "findings_json" in params
+
+    # ------------------------------------------------------------------
+    # New tests for the wl list approach
+    # ------------------------------------------------------------------
+
+    def test_picks_oldest_when_multiple_open_epics(self):
+        """When multiple open epics with the same title exist, pick the oldest by createdAt."""
+        mod = self._import_module()
+
+        def fake_runner(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "list" in cmd_str and "open" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItems": [
+                        {
+                            "id": "SA-YOUNGER01",
+                            "title": EXPECTED_EPIC_TITLE,
+                            "status": "open",
+                            "issueType": "epic",
+                            "createdAt": "2026-06-15T00:00:00.000Z",
+                        },
+                        {
+                            "id": "SA-OLDEST01",
+                            "title": EXPECTED_EPIC_TITLE,
+                            "status": "open",
+                            "issueType": "epic",
+                            "createdAt": "2026-06-10T00:00:00.000Z",
+                        },
+                    ],
+                }))
+            if "create" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-CHILD", "title": "child"},
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        result = mod.create_epics_for_findings(
+            SAMPLE_FINDINGS_CRITICAL,
+            runner=fake_runner,
+        )
+
+        # Should pick the oldest (earliest createdAt)
+        assert result["epic_id"] == "SA-OLDEST01"
+        assert result["epic_created"] is False
+
+    def test_ignores_non_epic_matching_title(self):
+        """Items with matching title but wrong issueType should be ignored."""
+        mod = self._import_module()
+
+        def fake_runner(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "list" in cmd_str and "open" in cmd_str:
+                # Return a task (not epic) with matching title - should be ignored
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItems": [
+                        {
+                            "id": "SA-TASK01",
+                            "title": EXPECTED_EPIC_TITLE,
+                            "status": "open",
+                            "issueType": "task",
+                            "createdAt": "2026-06-10T00:00:00.000Z",
+                        },
+                    ],
+                }))
+            if "list" in cmd_str and "in_progress" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItems": [],
+                }))
+            if "create" in cmd_str and "Quality Improvement" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-NEWEPIC", "title": EXPECTED_EPIC_TITLE},
+                }))
+            if "create" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-CHILD", "title": "child"},
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        result = mod.create_epics_for_findings(
+            SAMPLE_FINDINGS_CRITICAL,
+            runner=fake_runner,
+        )
+
+        # Should create new epic because no epic-type matching was found
+        assert result["epic_created"] is True
+        assert result["epic_id"] == "SA-NEWEPIC"

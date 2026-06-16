@@ -120,6 +120,11 @@ def find_or_create_epic(
 ) -> tuple[str, bool]:
     """Find an existing 'Quality Improvement - Refactoring' epic or create one.
 
+    Uses ``wl list`` (not ``wl search``) because ``wl search`` does not reliably
+    find matching epics (known issue).  Queries for open/in-progress items,
+    filters by exact title and issueType="epic", and picks the oldest by
+    creation date if multiple are found.
+
     Args:
         runner: Subprocess runner injection.
 
@@ -127,28 +132,49 @@ def find_or_create_epic(
         A tuple of (epic_id, was_created).
         was_created is True if a new epic was created, False if reused.
     """
-    # Search for existing epic with open/in_progress status
-    try:
-        search_result = _run_wl(runner, [
-            "wl", "search", EPIC_TITLE, "--json",
-        ])
-    except RuntimeError as exc:
-        print(f"Warning: wl search failed: {exc}", file=sys.stderr)
-        search_result = {}  # Continue and create new epic
+    # Use wl list instead of wl search — wl search may return 0 results
+    # even when matching epics exist.
+    for status_filter in ("open", "in_progress"):
+        try:
+            list_result = _run_wl(runner, [
+                "wl", "list", "--status", status_filter, "--json",
+            ])
+        except RuntimeError as exc:
+            print(f"Warning: wl list --status {status_filter} failed: {exc}", file=sys.stderr)
+            continue
 
-    work_items = search_result.get("workItems", [])
-    if isinstance(work_items, dict):
-        work_items = [work_items]
+        work_items = list_result.get("workItems", [])
+        if isinstance(work_items, dict):
+            work_items = [work_items]
 
-    # Look for an open or in_progress epic matching the title exactly
-    for item in work_items:
-        if isinstance(item, dict):
-            title = (item.get("title") or item.get("name") or "").strip()
-            status = (item.get("status") or "").lower()
-            if title == EPIC_TITLE and status in ("open", "in_progress"):
-                epic_id = item.get("id", "")
-                if epic_id:
-                    return epic_id, False
+        # Filter for epics matching the exact title
+        matching: list[dict[str, Any]] = []
+        for item in work_items:
+            if not isinstance(item, dict):
+                continue
+            title = (item.get("title") or "").strip()
+            issue_type = (item.get("issueType") or "").lower()
+            if title == EPIC_TITLE and issue_type == "epic":
+                matching.append(item)
+
+        if matching:
+            # Pick the oldest epic by creation date (defensive against
+            # duplicates caused by previous script bugs).
+            def _created_at(item: dict[str, Any]) -> str:
+                return item.get("createdAt") or ""
+            matching.sort(key=_created_at)
+            epic_id = matching[0].get("id", "")
+            if epic_id:
+                if len(matching) > 1:
+                    # Log a warning so operators know duplicates exist
+                    extra_ids = [m.get("id", "?") for m in matching[1:]]
+                    print(
+                        f"Warning: found {len(matching)} open/in-progress epics "
+                        f"with title '{EPIC_TITLE}'. Using oldest ({epic_id}). "
+                        f"Duplicate IDs: {', '.join(extra_ids)}",
+                        file=sys.stderr,
+                    )
+                return epic_id, False
 
     # Create new epic
     create_result = _run_wl(runner, [
@@ -156,7 +182,9 @@ def find_or_create_epic(
         "--title", EPIC_TITLE,
         "--description", (
             "Quality Improvement epic for tracking code quality findings "
-            "discovered during automated code review."
+            "discovered during automated code review. "
+            "Closed when all child work items are resolved; "
+            "a new epic is created if new findings arrive after closure."
         ),
         "--issue-type", "epic",
         "--priority", "medium",
