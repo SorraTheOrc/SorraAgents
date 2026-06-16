@@ -207,8 +207,8 @@ refactor step may be invoked to detect and remediate code smells:
   This ensures subsequent operations begin from the current HEAD of the integration branch.
 - Add a work-item comment recording the commit hash and that the work has been pushed to dev:
   `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>. The work-item stays open until the release process merges dev to main." --author "<AGENT>" --json`
-- Close your response to the operator with a suggested commit message:
-  `If you want to commit this work now I suggest the following commit message:\n\n<work-item-id>: <concise-summary-of-changes>`
+- Close your response to the operator with:
+  `<work-item-id>: <concise-summary-of-changes>\n\nWork committed to dev`
 
   > **Note:** When running under **Ralph** (the target work item's stage is `in_progress` or `plan_complete`), **do NOT** mark the work item as `in_review`. Ralph will handle the stage transition after the audit passes. When running manually (not under Ralph), mark the work item as `in_review` after pushing to dev:
 

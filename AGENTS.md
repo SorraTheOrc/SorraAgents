@@ -80,7 +80,7 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      This ensures subsequent operations (e.g., starting the next work-item)
      begin from the current HEAD of the integration branch.
    - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
-   - After committing and pushing changes, close your response to the operator with: "If you want to commit this work now I suggest the following commit message:\n\n`<WIP-id>: <concise-summary>`"
+   - After committing and pushing changes, close your response to the operator with: "`<WIP-id>: <concise-summary>`\n\nWork committed to dev"
    - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
 
      > ⚠️ **Do NOT close the work-item at this stage.**
