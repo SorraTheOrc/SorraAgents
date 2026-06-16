@@ -35,6 +35,14 @@ from skill.ralph.scripts.structured_response import StructuredResponse, parse_st
 from skill.ralph.scripts.webhook_notifier import WebhookNotifier, resolve_webhook_url  # noqa: E402
 from skill.test_runner import canonicalize_quiet_test_command  # noqa: E402
 
+# Shared autoplan decision logic (extracted from this module)
+from command.plan_helpers import (  # noqa: E402
+    is_effort_risk_computed,
+    resolve_complexity_tier,
+    DEFAULT_AUTOPLAN_EFFORT_SKIP,
+    DEFAULT_AUTOPLAN_RISK_SKIP,
+)
+
 logger = logging.getLogger("ralph")
 
 ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent / "assets" / ".ralph.json"
@@ -207,51 +215,10 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def _resolve_complexity_tier(config: dict, item: dict) -> str:
     """Resolve the complexity tier (low, medium, high) for a work item.
 
-    Mapping:
-    - Low: Effort XS or S AND risk Low
-    - Medium: Effort M OR risk Medium
-    - High: Effort L or XL OR risk High
-
-    Thresholds are configurable via config["complexity_tier"].
-    Defaults to 'medium' if mapping cannot be determined.
+    Delegates to ``command.plan_helpers.resolve_complexity_tier``.
+    Kept as a local function for backward compatibility.
     """
-    effort = item.get("effort")
-    risk = item.get("risk")
-
-    # Load thresholds from config
-    tier_cfg = config.get("complexity_tier", {})
-    low_cfg = tier_cfg.get("low", {})
-    high_cfg = tier_cfg.get("high", {})
-
-    low_max_effort = low_cfg.get("max_effort", "Small")
-    low_max_risk = low_cfg.get("max_risk", "Low")
-    high_min_effort = high_cfg.get("min_effort", "Large")
-    high_min_risk = high_cfg.get("min_risk", "High")
-
-    # T-shirt size order for comparison
-    effort_order = {"Extra Small": 0, "Small": 1, "Medium": 2, "Large": 3, "Extra Large": 4}
-    risk_order = {"Low": 0, "Medium": 1, "High": 2}
-
-    item_effort_val = effort_order.get(effort)
-    item_risk_val = risk_order.get(risk)
-
-    # Fallback for missing values: treat as Medium (safe middle ground)
-    if item_effort_val is None:
-        item_effort_val = effort_order["Medium"]
-    if item_risk_val is None:
-        item_risk_val = risk_order["Medium"]
-
-    # High tier check (OR)
-    if item_effort_val >= effort_order.get(high_min_effort, 3) or \
-       item_risk_val >= risk_order.get(high_min_risk, 2):
-        return "high"
-
-    # Low tier check (AND)
-    if item_effort_val <= effort_order.get(low_max_effort, 1) and \
-       item_risk_val <= risk_order.get(low_max_risk, 0):
-        return "low"
-
-    return "medium"
+    return resolve_complexity_tier(item, config)
 
 
 def _load_asset_config() -> dict:
@@ -1053,8 +1020,9 @@ def _validate_pi_output(
 # Default thresholds for auto-plan decision
 # If effort t-shirt is in this set AND risk level is in the risk set,
 # skip /plan and proceed directly to implement.
-DEFAULT_AUTOPLAN_EFFORT_SKIP: frozenset[str] = frozenset({"Extra Small", "Small"})
-DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
+# Effort/risk threshold constants are now defined in command/plan_helpers.py
+# and imported above. The local definitions are kept as aliases for backward
+# compatibility, but new code should import from plan_helpers directly.
 
 # Maximum consecutive attempts on unchanged code before reporting a stall
 DEFAULT_MAX_CYCLES_NO_CHANGE: int = 3
@@ -2322,20 +2290,20 @@ class RalphLoop:
         return raw
 
     def _is_effort_risk_computed(self, target_id: str) -> bool:
-        """Check whether effort and risk have already been set on the work item."""
+        """Check whether effort and risk have already been set on the work item.
+
+        Delegates the pure logic to ``command.plan_helpers.is_effort_risk_computed``
+        while fetching data via Ralph's runner for backward compatibility.
+        """
         item = self._wl_show(target_id).get("workItem", {})
-        effort = (item.get("effort") or "").strip()
-        risk = (item.get("risk") or "").strip()
-        if effort and risk:
-            logger.info("ralph.autoplan.already_computed target=%s effort=%s risk=%s", target_id, effort, risk)
-            return True
-        # Also check for an existing autoplan decision comment
-        for comment in self._wl_comment_list(target_id):
-            comment_text = comment.get("comment") or ""
-            if "autoplan-decision-hash:" in comment_text:
-                logger.info("ralph.autoplan.decision_comment_exists target=%s", target_id)
-                return True
-        return False
+        comments = self._wl_comment_list(target_id)
+        result = is_effort_risk_computed(item, comments)
+        if result:
+            logger.info(
+                "ralph.autoplan.already_computed target=%s effort=%s risk=%s",
+                target_id, item.get("effort", ""), item.get("risk", ""),
+            )
+        return result
 
     def _run_effort_and_risk(self, target_id: str) -> dict | None:
         """Run the effort-and-risk skill for the target work item.
@@ -2435,23 +2403,29 @@ class RalphLoop:
     def _run_autoplan(self, target_id: str) -> tuple[bool, str]:
         """Run the auto-plan decision for a work item at intake_complete.
 
+        Uses shared decision logic from ``command.plan_helpers`` while
+        keeping Ralph's own I/O infrastructure (runner, retry, fail-open)
+        for backward compatibility with existing tests.
+
         Returns (do_plan, updated_stage):
         - do_plan: True if /plan should be invoked
         - updated_stage: the effective stage after autoplan
         """
         logger.info("ralph.autoplan.start target=%s", target_id)
 
-        # Idempotence check: if effort/risk already computed, skip re-computation
-        if self._is_effort_risk_computed(target_id):
+        # Fetch work item data (via runner for test compatibility)
+        item = self._wl_show(target_id).get("workItem", {})
+        comments = self._wl_comment_list(target_id)
+
+        # Idempotence check: delegate pure logic to shared function
+        if is_effort_risk_computed(item, comments):
             logger.info("ralph.autoplan.already_computed_skipping target=%s", target_id)
-            # Use the existing values to determine the decision
-            item = self._wl_show(target_id).get("workItem", {})
             effort = (item.get("effort") or "").strip()
             risk = (item.get("risk") or "").strip()
             do_plan = not (effort in self.autoplan_effort_skip and risk in self.autoplan_risk_skip)
 
             # Resolve tier for planning phase
-            tier = _resolve_complexity_tier(self.model_config, item)
+            tier = resolve_complexity_tier(item, self.model_config)
             logger.info(
                 "ralph.autoplan.cached_decision target=%s effort=%s risk=%s tier=%s do_plan=%s",
                 target_id, effort, risk, tier, do_plan,
@@ -2459,11 +2433,8 @@ class RalphLoop:
             if do_plan:
                 stage = item.get("stage", "unknown")
                 if stage == "plan_complete":
-                    # Plan was already completed
                     return False, "plan_complete"
-                # Need to run plan
                 logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
-                # Use pi to run the plan skill so the configured model is used.
                 try:
                     self._run_pi(f"/skill:plan {target_id}", phase="planning", tier=tier)
                 except RalphError as e:
@@ -2472,25 +2443,23 @@ class RalphLoop:
                 return True, "plan_complete"
             return False, "intake_complete"
 
-        # Run effort-and-risk skill
+        # Run effort-and-risk skill (via runner for test compatibility)
         er_result = self._run_effort_and_risk(target_id)
-        
+
         # Resolve tier using the effort-and-risk result
         if er_result is None:
-            # Failure or ambiguity: default to running /plan (safety-first)
             logger.info("ralph.autoplan.effort_risk_failed_defaults_to_plan target=%s", target_id)
             do_plan = True
             tshirt = "unknown"
             risk_level = "unknown"
             risk_score = 0
-            tier = "medium"  # Default to medium tier on failure
+            tier = "medium"
         else:
             tshirt = er_result.get("effort", {}).get("tshirt", "")
             risk_level = er_result.get("risk", {}).get("level", "")
             risk_score = er_result.get("risk", {}).get("score", 0)
-            # Create a synthetic item dict from the effort-and-risk result for tier resolution
             synthetic_item = {"effort": tshirt, "risk": risk_level}
-            tier = _resolve_complexity_tier(self.model_config, synthetic_item)
+            tier = resolve_complexity_tier(synthetic_item, self.model_config)
             do_plan = not (tshirt in self.autoplan_effort_skip and risk_level in self.autoplan_risk_skip)
             logger.info(
                 "ralph.autoplan.result target=%s tshirt=%s risk=%s tier=%s do_plan=%s",
@@ -2501,9 +2470,7 @@ class RalphLoop:
         self._append_autoplan_comment_once(target_id, tshirt, risk_level, risk_score, do_plan)
 
         if do_plan:
-            # Invoke plan and wait for completion
             logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
-            # Use pi to run the plan skill so the configured model is used.
             try:
                 self._run_pi(f"/skill:plan {target_id}", phase="planning", tier=tier)
             except RalphError as e:
