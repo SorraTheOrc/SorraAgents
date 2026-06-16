@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Refactor orchestration script.
 
-Runs the refactor pipeline: session boundary detection → hybrid smell
-detection → remediation (fix session-introduced smells, create work items
-and inject REFACTOR comments for pre-existing smells).
+Runs the refactor pipeline: session boundary detection → auto-fix
+session-introduced smells → hybrid smell detection → remediation
+(create work items and inject REFACTOR comments for pre-existing smells).
 
 Usage:
   refactor.py                          # Auto-detect session, run all
@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from skill.code_review.scripts.linter_runner import probe_linter  # noqa: E402
 from skill.refactor.session_boundary import get_changed_files, get_untracked_files  # noqa: E402
 from skill.refactor.smell_detection import detect_smells, load_rules  # noqa: E402
 from skill.refactor.workitem_creation import create_smell_work_items  # noqa: E402
@@ -45,6 +46,126 @@ LOG = logging.getLogger("refactor.scripts.refactor")
 # ---------------------------------------------------------------------------
 
 DEFAULT_PARENT_BRANCH = "dev"
+
+
+# ---------------------------------------------------------------------------
+# Auto-fix helpers
+# ---------------------------------------------------------------------------
+
+
+def auto_fix_files(
+    files: list[str],
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Auto-fix session-introduced smells by running linters with --fix.
+
+    Runs auto-fixable linters (ruff --fix for Python, eslint --fix for JS/TS)
+    on the given session files. Fixable issues (unused imports, formatting,
+    etc.) are resolved in-place, reducing the number of smells that need work
+    item creation.
+
+    Args:
+        files: List of file paths to auto-fix.
+        dry_run: If True, log actions without making changes.
+
+    Returns:
+        A dict with:
+          - ``fixes_applied``: True if any fixes were applied.
+          - ``fixed_findings``: List of dicts describing what was fixed.
+    """
+    result: dict[str, Any] = {
+        "fixes_applied": False,
+        "fixed_findings": [],
+    }
+
+    if not files:
+        return result
+
+    if dry_run:
+        LOG.info("[DRY RUN] Would auto-fix %d files with linter --fix", len(files))
+        return result
+
+    fixed_findings: list[dict[str, Any]] = []
+
+    # Group files by type for targeted linting
+    python_files = [f for f in files if f.endswith(".py")]
+    js_ts_files = [f for f in files if f.endswith((".js", ".jsx", ".ts", ".tsx"))]
+
+    # --- Python: ruff check --fix ---
+    if python_files:
+        ruff_probe = probe_linter("ruff")
+        if ruff_probe.get("available"):
+            try:
+                import subprocess
+                cmd = ["ruff", "check", "--fix", "--output-format", "json", "--quiet"] + python_files
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+                if proc.returncode in (0, 1):
+                    output = proc.stdout.strip()
+                    if output:
+                        try:
+                            raw = json.loads(output)
+                            if isinstance(raw, list):
+                                for item in raw:
+                                    fixed_findings.append({
+                                        "file": str(item.get("filename", "")),
+                                        "line": item.get("location", {}).get("row", 0) if isinstance(item.get("location"), dict) else 0,
+                                        "code": str(item.get("code", "")),
+                                        "message": item.get("message", ""),
+                                        "severity": "low",
+                                        "source": "linter",
+                                        "smell_type": "unused_import" if str(item.get("code", "")).startswith("F4") else "formatting",
+                                    })
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+            except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+                LOG.warning("ruff --fix failed: %s", exc)
+
+    # --- JS/TS: eslint --fix ---
+    if js_ts_files:
+        eslint_probe = probe_linter("eslint")
+        if eslint_probe.get("available"):
+            try:
+                import subprocess
+                cmd = ["eslint", "--fix", "--format", "json", "--quiet"] + js_ts_files
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+                if proc.returncode in (0, 1):
+                    output = proc.stdout.strip()
+                    if output:
+                        try:
+                            raw = json.loads(output)
+                            if isinstance(raw, list):
+                                for file_result in raw:
+                                    file_path = file_result.get("filePath", "")
+                                    messages = file_result.get("messages", [])
+                                    if isinstance(messages, list):
+                                        for msg in messages:
+                                            fixed_findings.append({
+                                                "file": file_path,
+                                                "line": msg.get("line", 0),
+                                                "code": str(msg.get("ruleId", "")),
+                                                "message": msg.get("message", ""),
+                                                "severity": "medium",
+                                                "source": "linter",
+                                                "smell_type": "lint",
+                                            })
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+            except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+                LOG.warning("eslint --fix failed: %s", exc)
+
+    result["fixes_applied"] = len(fixed_findings) > 0
+    result["fixed_findings"] = fixed_findings
+
+    if fixed_findings:
+        LOG.info(
+            "Auto-fix applied %d fixes via linters on %d files",
+            len(fixed_findings),
+            len(python_files) + len(js_ts_files),
+        )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +331,10 @@ def refactor_pipeline(
     report: dict[str, Any] = {
         "success": True,
         "session_files": {"changed": [], "untracked": [], "all_files": []},
+        "auto_fix": {
+            "fixes_applied": False,
+            "fixed_findings": [],
+        },
         "smells_detected": [],
         "pre_existing_smells": [],
         "session_introduced_smells": [],
@@ -220,6 +345,7 @@ def refactor_pipeline(
         },
         "summary": {
             "files_analyzed": 0,
+            "auto_fixed": 0,
             "total_smells": 0,
             "session_introduced": 0,
             "pre_existing": 0,
@@ -244,7 +370,24 @@ def refactor_pipeline(
     )
     report["summary"]["files_analyzed"] = len(session["all_files"])
 
-    # Step 2: Run smell detection
+    # Step 2: Auto-fix session-introduced smells (before detection)
+    # Run linters with --fix to resolve auto-fixable issues in-place.
+    # This handles simple, mechanical issues (unused imports, formatting)
+    # before the detection phase, so only non-auto-fixable smells remain.
+    auto_fix_result = auto_fix_files(
+        files=session["all_files"],
+        dry_run=dry_run,
+    )
+    report["auto_fix"] = auto_fix_result
+    report["summary"]["auto_fixed"] = len(auto_fix_result["fixed_findings"])
+
+    if auto_fix_result["fixes_applied"]:
+        LOG.info(
+            "Auto-fixed %d issues before smell detection",
+            len(auto_fix_result["fixed_findings"]),
+        )
+
+    # Step 3: Run smell detection (on auto-fixed files)
     smells = run_smell_detection(
         files=session["all_files"],
         config=config,
@@ -255,18 +398,17 @@ def refactor_pipeline(
     report["summary"]["total_smells"] = len(smells)
 
     if not smells:
-        LOG.info("No code smells detected")
+        LOG.info("No code smells detected after auto-fix")
         return report
 
-    # Step 3: Classify smells
-    # For now, all detected smells are treated as pre-existing since we lack
-    # a reliable mechanism to distinguish session-introduced from pre-existing
-    # at the per-smell level. Future improvements can diff against the parent
-    # branch's lint output.
+    # Step 4: Classify smells
+    # After auto-fix, any remaining smells are non-auto-fixable and treated
+    # as pre-existing (e.g., design/architectural smells from LLM analysis,
+    # or linter issues that cannot be auto-fixed).
     report["pre_existing_smells"] = smells
     report["summary"]["pre_existing"] = len(smells)
 
-    # Step 4: Remediate pre-existing smells
+    # Step 5: Remediate pre-existing smells
     remediation = remediate_pre_existing(
         smells=smells,
         work_item_id=None,
@@ -277,7 +419,8 @@ def refactor_pipeline(
     report["summary"]["comments_injected"] = remediation["comments_injected"]
 
     LOG.info(
-        "Refactor complete: %d smells, %d work items created, %d comments injected",
+        "Refactor complete: %d auto-fixed, %d smells, %d work items, %d comments injected",
+        len(auto_fix_result["fixed_findings"]),
         len(smells),
         len(remediation["work_items_created"]),
         remediation["comments_injected"],
@@ -375,12 +518,20 @@ def main(argv: list[str] | None = None) -> int:
         summary = report["summary"]
         print("=== Refactor Report ===")
         print(f"Files analyzed: {summary['files_analyzed']}")
-        print(f"Total smells:   {summary['total_smells']}")
+        print(f"Auto-fixed:     {summary['auto_fixed']}")
+        print(f"Remaining smells: {summary['total_smells']}")
         print(f"Pre-existing:   {summary['pre_existing']}")
         print(f"Work items:     {summary['work_items_created']}")
         print(f"Comments:       {summary['comments_injected']}")
+        if report.get("auto_fix", {}).get("fixed_findings"):
+            print("\nAuto-fixes applied:")
+            for fix in report["auto_fix"]["fixed_findings"]:
+                file_path = fix.get("file", "?")
+                code = fix.get("code", "?")
+                message = fix.get("message", "?")
+                print(f"  [{code}] {message} in {file_path}")
         if report["smells_detected"]:
-            print("\nSmells detected:")
+            print("\nRemaining smells (non-auto-fixable):")
             for smell in report["smells_detected"]:
                 file_path = smell.get("file", "?")
                 smell_type = smell.get("smell_type", "?")

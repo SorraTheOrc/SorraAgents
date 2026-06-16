@@ -7,10 +7,11 @@ implementation and before the final commit. It detects code smells in files
 modified during the current session and takes appropriate action:
 
 - **Session-introduced smells** (e.g., unused imports, formatting issues) are
-  fixed immediately.
-- **Pre-existing smells** (e.g., complex functions, security issues) create
-  Worklog work items with structured REFACTOR comments in the source files,
-  tracking technical debt without blocking feature work.
+  auto-fixed by running linters with --fix on session files before detection.
+- **Pre-existing smells** (e.g., complex functions, security issues) that
+  cannot be auto-fixed create Worklog work items with structured REFACTOR
+  comments in the source files, tracking technical debt without blocking
+  feature work.
 
 ## Benefits
 
@@ -58,13 +59,18 @@ Results from both sources are merged and deduplicated.
 
 ### 3. Auto-Fix Session-Introduced Smells
 
-Smells introduced in the current session that are low or medium severity and
-match known auto-fixable patterns are fixed automatically:
+Before running smell detection, the refactor step runs auto-fixable linters
+with the --fix flag on session files:
 
-- Unused imports
-- Unused variables (low/medium severity)
-- Formatting issues
-- Naming issues
+- **ruff check --fix** is run on Python files to auto-fix issues like
+  unused imports and formatting problems.
+- **eslint --fix** is run on JS/TS files to auto-fix issues like
+  unused variables and formatting problems.
+
+After auto-fix, smell detection runs on the cleaned files. Any remaining
+smells are non-auto-fixable and are treated as pre-existing (creating work
+items). Auto-fixed issues are reported in the refactor output under
+`auto_fix.fixed_findings`.
 
 ### 4. Work Item Creation for Pre-existing Smells
 
@@ -125,21 +131,28 @@ python3 skill/refactor/scripts/refactor.py --verbose
 | Option | Description | Default |
 |--------|-------------|---------|
 | `work_item_id` | Optional work item ID for context | None |
-| `--no-refactor` | Skip the refactor step entirely | False |
+| `--no-linter` | Skip linter-based smell detection | False |
+| `--no-llm` | Skip LLM-based smell detection | False |
 | `--config PATH` | Path to `.refactor.json` config file | None |
 | `--parent-branch BRANCH` | Parent branch for session boundary | `dev` |
+| `--dry-run` | Show what would be changed without making changes | False |
 | `--json` | Output results as JSON | False |
 | `--verbose` | Enable verbose logging | False |
 
 ## Configuration
 
-### `--no-refactor` Flag
+### Skipping the Refactor Step
 
-The simplest way to disable the refactor step is the `--no-refactor` flag:
+The simplest way to disable the refactor step is passing the `--no-refactor`
+flag to the implement or implement-single skill:
 
 ```bash
 implement SA-0MPFD4SPC000MXWH --no-refactor
 ```
+
+This tells the agent to skip invoking the refactor step entirely.
+To disable specific detection modes within the refactor step itself,
+use the refactor.py CLI flags (`--no-linter`, `--no-llm`).
 
 ### `.refactor.json` Config File
 
@@ -214,7 +227,9 @@ The following code smells are currently detected:
 
 ### Refactor step takes too long
 
-- Use `--no-refactor` to skip the step entirely for quick iterations.
+- Use `implement <id> --no-refactor` to skip the step entirely for quick
+  iterations.
+- Use `--no-llm` to skip LLM-based detection (linter-only mode).
 - Disable LLM-based detection in `.refactor.json` (`llm.enabled: false`).
 - Limit the number of files analyzed by committing frequently (smaller
   sessions = faster analysis).
@@ -255,15 +270,15 @@ Output:
     {"status": "M", "file": "src/main.py"},
     {"status": "A", "file": "tests/test_main.py"}
   ],
-  "findings": [
-    {"file": "src/main.py", "line": 42, "severity": "low",
-     "message": "Unused import 'os'", "source": "linter",
-     "smell_type": "unused_import", "code": "F401"}
-  ],
-  "auto_fixed": [
-    {"file": "src/main.py", "line": 42, "severity": "low",
-     "message": "Unused import 'os'", "smell_type": "unused_import"}
-  ],
+  "auto_fix": {
+    "fixes_applied": true,
+    "fixed_findings": [
+      {"file": "src/main.py", "line": 42, "severity": "low",
+       "message": "Unused import 'os'", "smell_type": "unused_import",
+       "code": "F401"}
+    ]
+  },
+  "smells_detected": [],
   "work_items_created": [],
   "comments_injected": [],
   "errors": [],

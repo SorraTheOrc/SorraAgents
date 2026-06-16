@@ -17,11 +17,12 @@ before the final commit) to identify and address code quality issues.
   session are analyzed (determined via git diff against the parent branch).
 - **Hybrid detection**: Combines linter-based mechanical checks with LLM-based
   design/architectural analysis.
-- **Session-introduced smells**: Issues introduced by current changes are
-  fixed immediately in the same run.
-- **Pre-existing smells**: Issues that existed before the current session are
-  tracked as Worklog work items with structured REFACTOR comments in the
-  source code to prevent duplicate work items.
+- **Auto-fix**: Before smell detection, auto-fixable linters (ruff --fix for
+  Python, eslint --fix for JS/TS) are run on session files to resolve
+  mechanical issues (unused imports, formatting) in-place.
+- **Pre-existing smells**: After auto-fix, any remaining non-auto-fixable
+  issues are tracked as Worklog work items with structured REFACTOR comments
+  in the source code to prevent duplicate work items.
 
 ### Architecture
 
@@ -63,8 +64,14 @@ python -m skill.refactor.scripts.refactor --no-llm
 # Disable linter detection (LLM only)
 python -m skill.refactor.scripts.refactor --no-linter
 
-# Disable the refactor step entirely (for use with implement --no-refactor)
+# Dry-run mode: show what would be changed without making changes
 python -m skill.refactor.scripts.refactor --dry-run
+
+# Skip linter-based detection (LLM only)
+python -m skill.refactor.scripts.refactor --no-linter
+
+# Skip LLM-based detection (linter only)
+python -m skill.refactor.scripts.refactor --no-llm
 
 # Get JSON output for programmatic consumption
 python -m skill.refactor.scripts.refactor --json
