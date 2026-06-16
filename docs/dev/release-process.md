@@ -98,13 +98,22 @@ The script will:
    is a **hard gate** — the script will abort if CI is not green. Use
    `--force` to bypass (only in exceptional circumstances).
 2. Fetch the latest `dev` and `main` from origin.
-3. Create a merge commit locally (`dev` → `main`).
-4. Push the merge commit to a temporary `release/dev-to-main-<timestamp>` branch.
-5. Create a **GitHub Pull Request** from the temp branch to `main`.
-6. Wait for required status checks to pass on the PR.
-7. Merge the PR using `gh pr merge --merge --delete-branch`.
-8. Record an audit comment in the worklog with the merge commit hash,
-   CI run IDs, PR number, and approver identity.
+3. **Automatically increment** the version in `package.json` (default: patch
+   bump; use `--bump minor` or `--bump major` to override) and commit it.
+4. Merge `dev` into the release branch (`dev` → `main`).
+5. Create an **annotated git tag** `v<new-version>` on the merge commit.
+6. Push the merge branch and the tag to `origin`.
+7. Create a **GitHub Pull Request** from the temp branch to `main`.
+8. Wait for required status checks to pass on the PR.
+9. Merge the PR using `gh pr merge --merge --delete-branch`.
+10. Record an audit comment in the worklog with the merge commit hash,
+    CI run IDs, PR number, and approver identity.
+
+Example with custom bump:
+
+```bash
+bash scripts/release/merge-dev-to-main.sh --bump minor
+```
 
 The PR-based approach works with **server-side branch protection** on `main`
 that requires pull requests or status checks. The script uses the `gh` CLI to
@@ -151,9 +160,43 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
 
 1. Verify `main` is green — confirm the `ci` workflow passes on the merge
    commit.
-2. Optionally tag the release: `git tag -a v<version> -m "Release v<version>"`
-3. Push the tag: `git push origin v<version>`
+2. Version numbering, tagging, and tag pushing are **now automated** as part
+   of the merge script (`merge-dev-to-main.sh`). Before merging, the script:
+   - Increments the version in `package.json` (default: patch bump).
+   - Commits the version change.
+   - Creates an annotated git tag `v<new-version>` on the merge commit.
+   - Pushes the tag to `origin`.
+3. Customize the bump type with the `--bump` flag:
+   ```bash
+   bash scripts/release/merge-dev-to-main.sh --bump minor
+   ```
 4. Update any downstream consumers or deployment targets.
+
+> **Note:** If you need to see the current version, run:
+> ```bash
+> node -p "require('./package.json').version"
+> ```
+>
+> The initial version is set to `0.1.0`.
+
+### Version Bump Types
+
+| Flag | Effect | Example |
+|------|--------|---------|
+| `--bump patch` (default) | Increments patch version | `0.1.0` → `0.1.1` |
+| `--bump minor` | Increments minor version, resets patch | `0.1.0` → `0.2.0` |
+| `--bump major` | Increments major version, resets minor and patch | `0.1.0` → `1.0.0` |
+
+### Tag Collision Handling
+
+If a git tag already exists for the computed version (e.g., from a prior
+manual tag), the script will fail when attempting to create the tag. In that
+case:
+
+1. Check existing tags: `git tag -l 'v*'`
+2. Decide whether to bump the version manually (e.g., `--bump minor` instead
+   of patch) or delete the conflicting tag.
+3. Re-run the release script.
 
 ## Rollback
 

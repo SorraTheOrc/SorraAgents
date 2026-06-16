@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 // run-release.js — safe wrapper to invoke repository-level release script
-// Usage: node run-release.js [--dry-run] [--work-item-id <id>] [--force] [--skip-checks]
+// Usage: node run-release.js [--dry-run] [--work-item-id <id>] [--force] [--skip-checks] [--bump patch|minor|major]
+//
+// The --bump flag is passed through to the canonical release script
+// (merge-dev-to-main.sh) and controls which part of the semver is
+// incremented before the merge. Default is 'patch'.
 
 import { existsSync } from 'node:fs';
 import { spawnSync, execSync } from 'node:child_process';

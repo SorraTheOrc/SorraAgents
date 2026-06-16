@@ -5,21 +5,33 @@ set -euo pipefail
 # Canonical release merge script. Intended to be installed under the ship skill
 # at <skill-dir>/scripts/release/merge-dev-to-main.sh. The wrapper
 # skill/ship/scripts/run-release.js will invoke this script.
+#
+# Version numbering:
+#   Before merging dev into main, this script automatically increments the
+#   version in package.json, commits the change, and creates an annotated git
+#   tag (v<semver>) on the merge commit. The tag is pushed to origin.
+
+# Resolve the directory where this script resides (used to find sibling scripts)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
   cat <<EOF
-Usage: $0 [--dry-run] [--force] [--work-item-id <id>]
+Usage: $0 [--dry-run] [--force] [--work-item-id <id>] [--bump patch|minor|major]
 
 Options:
   --dry-run       Do not push or create/merge the PR; just show planned actions
   --force         Proceed even if CI checks are not green or other hard gates
   --work-item-id  Worklog item id to record in logs (optional)
+  --bump <type>   Version bump type: patch, minor, or major (default: patch).
+                  The version in package.json is incremented before the merge.
+  -h, --help      Show this help message
 EOF
 }
 
 DRY_RUN=false
 FORCE=false
 WORK_ITEM=""
+BUMP="patch"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,6 +45,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --work-item-id)
       WORK_ITEM="$2"
+      shift 2
+      ;;
+    --bump)
+      BUMP="$2"
+      if [[ ! "$BUMP" =~ ^(patch|minor|major)$ ]]; then
+        echo "Error: --bump must be one of: patch, minor, major (got: $BUMP)" >&2
+        exit 2
+      fi
       shift 2
       ;;
     -h|--help)
@@ -77,6 +97,24 @@ git fetch origin main:refs/remotes/origin/main || true
 # Checkout a new branch from origin/main
 git checkout -b "$BRANCH" origin/main
 
+# ── Version bump (only on actual release, not dry-run) ──────────────
+if [[ "$DRY_RUN" != "true" ]]; then
+  BUMPS_SCRIPT="${SCRIPT_DIR}/bump-version.js"
+  if [[ -f "$BUMPS_SCRIPT" ]]; then
+    NEW_VERSION=$(node "$BUMPS_SCRIPT" --bump "$BUMP" 2>/dev/null) || {
+      echo "Version bump failed. Check that package.json has a valid version field and node is available." >&2
+      exit 1
+    }
+    git add package.json
+    git commit -m "Bump version to v${NEW_VERSION}"
+    echo "Version bumped to v${NEW_VERSION}"
+  else
+    echo "Warning: bump-version.js not found at $BUMPS_SCRIPT; skipping version bump." >&2
+  fi
+elif [[ "$DRY_RUN" == "true" ]]; then
+  echo "Dry-run: version bump would be applied with --bump $BUMP"
+fi
+
 # Merge origin/dev into the release branch
 if git merge --no-ff origin/dev -m "Merge origin/dev into main (automated)"; then
   echo "Created merge commit on $BRANCH"
@@ -85,13 +123,24 @@ else
   exit 1
 fi
 
+# ── Create git tag (only on actual release) ───────────────────────
+if [[ "$DRY_RUN" != "true" && -n "${NEW_VERSION:-}" ]]; then
+  git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
+  echo "Created annotated tag v${NEW_VERSION} on merge commit"
+elif [[ "$DRY_RUN" == "true" ]]; then
+  echo "Dry-run: tag v<version> would be created on the merge commit"
+fi
+
 if [[ "$DRY_RUN" == "true" ]]; then
   echo "Dry-run: created merge commit on branch $BRANCH. No push or PR will be created."
   exit 0
 fi
 
-# Push the release branch
+# Push the release branch and tag
 git push origin HEAD
+if [[ -n "${NEW_VERSION:-}" ]]; then
+  git push origin "v${NEW_VERSION}"
+fi
 
 # Create a PR
 PR_TITLE="Merge dev → main (automated)"
