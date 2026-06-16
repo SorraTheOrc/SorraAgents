@@ -167,12 +167,15 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
    - Creates an annotated git tag `v<new-version>` on the merge commit.
    - Pushes the tag to `origin`.
 3. Customize the bump type with the `--bump` flag:
+
    ```bash
    bash scripts/release/merge-dev-to-main.sh --bump minor
    ```
+
 4. Update any downstream consumers or deployment targets.
 
 > **Note:** If you need to see the current version, run:
+>
 > ```bash
 > node -p "require('./package.json').version"
 > ```
