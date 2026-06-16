@@ -58,14 +58,14 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 - Before starting the full planning interview and decomposition, run a quick assessment to determine whether the work item already has a sufficient plan or is too small to require decomposition.
 - Suggested checks (conservative, idempotent heuristics):
-  - If the work item's `stage` is `plan_complete` or later, ask the user whether they want to re-run planning; do not re-run automatically.
+  - If the work item's `stage` is `plan_complete` or later, planning is already complete — skip with a no-op (step 2 handles this case with a comment).
   - If the work item is not an `epic` (for example `task` or `bug`) and the description already contains measurable acceptance criteria and a minimal implementation sketch, consider it "ready" and mark planning complete.
   - If the work item already has child features/tasks that cover the intended scope (use `wl list --parent <work-item-id> --json` and compare), and those children are adequate and idempotent, skip full planning and mark `plan_complete`.
   - If a concise plan block already exists in the work item (for example a labeled "Plan:" or a short numbered feature list with acceptance criteria), treat that as sufficient evidence to skip the full interview.
 - If the checks indicate planning is not needed, update the work item to record the decision and advance the stage:
   - `wl update <work-item-id> --stage plan_complete --status open --json`
-  - Optionally add a comment documenting the reason: `wl comment add <work-item-id> "Plan auto-complete: work item appears sufficiently sized/defined for direct implementation." --actor Map --json`
-- If evidence is borderline or key uncertainties remain, proceed with the normal planning process (ask clarifying questions rather than auto-completing).
+  - Add a comment documenting the reason: `wl comment add <work-item-id> "Plan auto-complete: work item appears sufficiently sized/defined for direct implementation." --actor Map --json`
+- If evidence is borderline or key uncertainties remain, err on the side of progress and auto-complete (update stage and record a comment). Only fall back to the normal planning process (asking clarifying questions) when there is clear evidence that the item genuinely needs decomposition and the heuristics cannot make a determination.
 
 1. Fetch & summarise (agent responsibility)
 
@@ -74,9 +74,10 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 - Run `wl show <work-item-id> --json` and summarise the work item in one paragraph: title, type (epic/feature/task), headline, and any existing child tasks and plan info.
 - Validate readiness by examining the work item's `stage` value:
   - `intake_complete` indicates it is ready for planning.
-  - `plan_complete` or later stages indicate planning has already been completed; ask the user if they want to re-run the planning process and update the existing plan or skip to the next steps. If they choose to update the existing plan, proceed with the
-    steps below but consider previous planning and implementation work.
-- any other `stage` value suggests the work item is not currently ready for planning — ask the user how to proceed indicating that if the work item is small enough it is OK to proceed.
+  - `plan_complete` or later stages indicate planning has already been completed; skip planning entirely and record a no-op comment:
+    - `wl comment add <work-item-id> "Plan not needed: stage is already plan_complete or later." --actor Map --json`
+    - Then proceed to the finishing steps.
+  - Any other `stage` value suggests the work item is not currently at the intake_complete stage. Run the planning heuristics (see step 1) to determine whether the item is sufficiently small/well-defined to auto-complete. If so, auto-complete via step 1. If the heuristics genuinely cannot determine, ask the user how to proceed (indicating that if the work item is small enough it is OK to proceed).
 - Read any PRD linked in the work item or any of its parents to extract key details for later reference.
 - Derive 3–6 keywords from the work item title/description to search the repo and work items for related work. Present any likely duplicates or parent/child relationships.
 
