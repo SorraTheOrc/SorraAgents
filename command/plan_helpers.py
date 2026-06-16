@@ -23,9 +23,8 @@ import hashlib
 import json
 import logging
 import subprocess
-import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger("plan_helpers")
 
@@ -37,14 +36,45 @@ DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
 
 
 # ---------------------------------------------------------------------------
+# Subprocess execution helper (supports custom runners for test injection)
+# ---------------------------------------------------------------------------
+
+
+def _execute_subprocess(
+    cmd: list[str],
+    input_data: str | None = None,
+    runner: Callable[..., Any] | None = None,
+) -> Any:
+    """Execute a subprocess, supporting custom runners for test injection.
+
+    When ``runner`` is provided, the payload is appended as a trailing
+    command-line argument (the convention used by Ralph's FakeRunner).
+    When ``runner`` is None, the payload is supplied via stdin (the
+    convention used by the CLI and production subprocess calls).
+
+    Returns an object with ``returncode``, ``stdout``, and ``stderr``
+    attributes (compatible with both ``subprocess.CompletedProcess``
+    and Ralph's ``Result`` dataclass).
+    """
+    if runner is not None:
+        if input_data is not None:
+            return runner(list(cmd) + [input_data])
+        return runner(list(cmd))
+    return subprocess.run(cmd, input=input_data, capture_output=True, text=True)
+
+
+# ---------------------------------------------------------------------------
 # Helpers: calling wl via subprocess
 # ---------------------------------------------------------------------------
 
 
-def _wl_comment_list(work_item_id: str) -> list[dict]:
+def _wl_comment_list(
+    work_item_id: str,
+    runner: Callable[..., Any] | None = None,
+) -> list[dict]:
     """Call ``wl comment list <id> --json`` and return the comment list."""
     cmd = ["wl", "comment", "list", work_item_id, "--json"]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _execute_subprocess(cmd, runner=runner)
     if proc.returncode != 0:
         logger.warning("wl comment list failed target=%s stderr=%s", work_item_id, proc.stderr)
         return []
@@ -59,7 +89,12 @@ def _wl_comment_list(work_item_id: str) -> list[dict]:
     return data.get("comments", []) if isinstance(data, dict) else []
 
 
-def _wl_comment_add(work_item_id: str, comment: str, author: str = "ralph") -> dict:
+def _wl_comment_add(
+    work_item_id: str,
+    comment: str,
+    author: str = "ralph",
+    runner: Callable[..., Any] | None = None,
+) -> dict:
     """Call ``wl comment add <id> --author <a> --comment <c> --json``."""
     cmd = [
         "wl",
@@ -72,7 +107,7 @@ def _wl_comment_add(work_item_id: str, comment: str, author: str = "ralph") -> d
         comment,
         "--json",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _execute_subprocess(cmd, runner=runner)
     if proc.returncode != 0:
         logger.warning(
             "wl comment add failed target=%s rc=%s stderr=%s",
@@ -172,13 +207,22 @@ def is_effort_risk_computed(work_item: dict, comments: list[dict]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def run_effort_and_risk(target_id: str) -> dict | None:
+def run_effort_and_risk(
+    target_id: str,
+    runner: Callable[..., Any] | None = None,
+) -> dict | None:
     """Run the effort-and-risk orchestration skill for a work item.
 
     Invokes ``skill/effort-and-risk/scripts/orchestrate_estimate.py`` via
-    subprocess and returns the parsed JSON result.
+    subprocess (or via the provided runner) and returns the parsed JSON
+    result.
 
-    Returns None on failure (non-zero exit, invalid JSON, or error key in result).
+    When ``runner`` is provided, the payload is appended as a trailing CLI
+    argument (the convention used by Ralph's FakeRunner in tests). When
+    ``runner`` is None, the payload is supplied via stdin (production use).
+
+    Returns None on failure (non-zero exit, invalid JSON, or error key in
+    result).
     """
     skill_root = Path(__file__).resolve().parents[1]
     orchestrate_script = skill_root / "skill" / "effort-and-risk" / "scripts" / "orchestrate_estimate.py"
@@ -194,7 +238,7 @@ def run_effort_and_risk(target_id: str) -> dict | None:
     logger.info("plan_helpers.effort_risk.start target=%s", target_id)
 
     try:
-        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True)
+        proc = _execute_subprocess(cmd, input_data=payload, runner=runner)
     except OSError as exc:
         logger.warning("plan_helpers.effort_risk.os_error target=%s exc=%s", target_id, exc)
         return None
@@ -241,18 +285,27 @@ def append_autoplan_decision_comment(
     risk_score: int | float,
     do_plan: bool,
     author: str = "ralph",
+    runner: Callable[..., Any] | None = None,
 ) -> None:
     """Post (or skip posting) an auto-plan decision comment, idempotently.
 
     Builds a deterministic hash marker from the decision values. If a comment
     with the same hash already exists, no new comment is posted.
+
+    When ``runner`` is provided, uses it for all subprocess calls (test
+    compatibility). When ``runner`` is None, uses direct subprocess calls
+    (production/CLI use).
     """
     marker_key = f"autoplan-decision:{tshirt}:{risk_level}:{risk_score}"
     marker_hash = hashlib.sha256(marker_key.encode("utf-8")).hexdigest()[:16]
     marker = f"autoplan-decision-hash:{marker_hash}"
 
     # Check for existing comment with this marker
-    for existing in _wl_comment_list(work_item_id):
+    if runner is not None:
+        comment_list = _wl_comment_list(work_item_id, runner=runner)
+    else:
+        comment_list = _wl_comment_list(work_item_id)
+    for existing in comment_list:
         if marker in (existing.get("comment") or ""):
             logger.debug(
                 "plan_helpers.comment_exists target=%s marker=%s",
@@ -274,7 +327,10 @@ def append_autoplan_decision_comment(
         f"Decision: {decision}",
     ]
     comment = "\n".join(comment_parts)
-    _wl_comment_add(work_item_id, comment, author=author)
+    if runner is not None:
+        _wl_comment_add(work_item_id, comment, author=author, runner=runner)
+    else:
+        _wl_comment_add(work_item_id, comment, author=author)
 
 
 # ---------------------------------------------------------------------------
@@ -289,26 +345,37 @@ def make_autoplan_decision(
     risk_skip: frozenset[str] | None = None,
     precomputed_item: dict | None = None,
     precomputed_comments: list[dict] | None = None,
-) -> tuple[bool, str]:
+    runner: Callable[..., Any] | None = None,
+) -> tuple[bool, str, dict | None]:
     """Make an autoplan decision for a work item.
 
-    Returns (do_plan, updated_stage):
+    Returns (do_plan, updated_stage, effort_risk):
     - do_plan: True if /plan should be invoked, False to skip
     - updated_stage: the effective stage after autoplan
         ("intake_complete" if skipping, "plan_complete" if planning)
+    - effort_risk: dict with "effort" (tshirt) and "risk" (level) keys,
+        or None if effort/risk could not be determined
 
     When ``precomputed_item`` and ``precomputed_comments`` are provided, the
     function uses those instead of fetching the work item from the worklog.
     This allows callers (like Ralph) to supply already-fetched data and avoid
     redundant wl calls.
+
+    When ``runner`` is provided, uses it for all subprocess calls (enables
+    test injection via Ralph's FakeRunner). When ``runner`` is None, uses
+    direct subprocess calls (production/CLI use).
     """
     effort_skip = effort_skip or DEFAULT_AUTOPLAN_EFFORT_SKIP
     risk_skip = risk_skip or DEFAULT_AUTOPLAN_RISK_SKIP
+    effort_risk: dict | None = None
 
     # Fetch work item data if not precomputed
     if precomputed_item is not None:
         item = precomputed_item
         comments = precomputed_comments or []
+    elif runner is not None:
+        item = _wl_show(target_id, runner=runner)
+        comments = _wl_comment_list(target_id, runner=runner)
     else:
         item = _wl_show(target_id)
         comments = _wl_comment_list(target_id)
@@ -317,23 +384,25 @@ def make_autoplan_decision(
     if is_effort_risk_computed(item, comments):
         effort = (item.get("effort") or "").strip()
         risk = (item.get("risk") or "").strip()
+        effort_risk = {"effort": effort, "risk": risk}
         do_plan = not (effort in effort_skip and risk in risk_skip)
 
         if do_plan:
             stage = item.get("stage", "unknown")
             if stage == "plan_complete":
-                # Plan was already completed
-                return False, "plan_complete"
-            return True, "plan_complete"
+                return False, "plan_complete", effort_risk
+            return True, "plan_complete", effort_risk
 
-        return False, "intake_complete"
+        return False, "intake_complete", effort_risk
 
     # Run effort-and-risk skill
     do_plan: bool = True
-    er_result = run_effort_and_risk(target_id)
+    if runner is not None:
+        er_result = run_effort_and_risk(target_id, runner=runner)
+    else:
+        er_result = run_effort_and_risk(target_id)
 
     if er_result is None:
-        # Failure or ambiguity: default to running /plan (safety-first)
         logger.info("plan_helpers.effort_risk_failed_defaults_to_plan target=%s", target_id)
         tshirt = "unknown"
         risk_level = "unknown"
@@ -348,14 +417,19 @@ def make_autoplan_decision(
             target_id, tshirt, risk_level, do_plan,
         )
 
+    effort_risk = {"effort": tshirt, "risk": risk_level}
+
     # Post the decision comment idempotently
-    append_autoplan_decision_comment(target_id, tshirt, risk_level, risk_score, do_plan)
+    if runner is not None:
+        append_autoplan_decision_comment(target_id, tshirt, risk_level, risk_score, do_plan, runner=runner)
+    else:
+        append_autoplan_decision_comment(target_id, tshirt, risk_level, risk_score, do_plan)
 
     if do_plan:
-        return True, "plan_complete"
+        return True, "plan_complete", effort_risk
 
     logger.info("plan_helpers.autoplan.skip_plan target=%s", target_id)
-    return False, "intake_complete"
+    return False, "intake_complete", effort_risk
 
 
 # ---------------------------------------------------------------------------
@@ -363,13 +437,16 @@ def make_autoplan_decision(
 # ---------------------------------------------------------------------------
 
 
-def _wl_show(work_item_id: str) -> dict:
+def _wl_show(
+    work_item_id: str,
+    runner: Callable[..., Any] | None = None,
+) -> dict:
     """Call ``wl show <id> --json`` and return the workItem dict.
 
     Returns an empty dict on failure.
     """
     cmd = ["wl", "show", work_item_id, "--json"]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = _execute_subprocess(cmd, runner=runner)
     if proc.returncode != 0:
         logger.warning("wl show failed target=%s stderr=%s", work_item_id, proc.stderr)
         return {}
@@ -398,7 +475,7 @@ def plan_if_needed(target_id: str) -> dict[str, Any]:
       - effort
       - risk
     """
-    do_plan, stage = make_autoplan_decision(target_id, config={})
+    do_plan, stage, _effort_risk = make_autoplan_decision(target_id, config={})
     return {
         "target_id": target_id,
         "decision": "plan" if do_plan else "skip",

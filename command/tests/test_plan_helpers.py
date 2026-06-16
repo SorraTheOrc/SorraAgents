@@ -5,8 +5,7 @@ Once command/plan_helpers.py is implemented, these tests should all pass.
 """
 
 import json
-import subprocess
-from unittest.mock import ANY, MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -206,7 +205,7 @@ class TestThresholdDecision:
 
     def test_skip_plan_for_small_low(self):
         """Small effort + Low risk  -> do_plan=False (skip plan)."""
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST",
             config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
@@ -220,7 +219,7 @@ class TestThresholdDecision:
 
     def test_skip_plan_for_xs_low(self):
         """Extra Small + Low  -> do_plan=False."""
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
             risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -231,7 +230,7 @@ class TestThresholdDecision:
 
     def test_invoke_plan_for_medium_high(self):
         """Medium + High  -> do_plan=True."""
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
             risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -242,7 +241,7 @@ class TestThresholdDecision:
 
     def test_invoke_plan_for_large_high(self):
         """Large + High  -> do_plan=True."""
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
             risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -253,7 +252,7 @@ class TestThresholdDecision:
 
     def test_invoke_plan_for_xl_low(self):
         """Extra Large + Low  -> do_plan=True (effort above threshold even though risk low)."""
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
             risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -264,7 +263,7 @@ class TestThresholdDecision:
 
     def test_invoke_plan_for_small_high(self):
         """Small + High  -> do_plan=True (risk above threshold)."""
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
             risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -275,7 +274,7 @@ class TestThresholdDecision:
 
     def test_custom_thresholds_medium_effort_skip(self):
         """Custom thresholds: Medium effort included in skip set."""
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=frozenset({"Extra Small", "Small", "Medium"}),
             risk_skip=frozenset({"Low"}),
@@ -286,7 +285,7 @@ class TestThresholdDecision:
 
     def test_custom_thresholds_should_plan(self):
         """Custom thresholds: Medium + Medium risk -> plan when risk not in skip set."""
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=frozenset({"Extra Small", "Small", "Medium"}),
             risk_skip=frozenset({"Low"}),
@@ -307,7 +306,7 @@ class TestMakeAutoplanDecisionIdempotence:
     def test_existing_fields_skip_recomputation(self):
         """When effort and risk are already set, do not run effort-and-risk script."""
         with patch("command.plan_helpers.run_effort_and_risk") as mock_er:
-            do_plan, stage = make_autoplan_decision(
+            do_plan, stage, _ = make_autoplan_decision(
                 target_id="SA-TEST", config={},
                 effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
                 risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -321,7 +320,7 @@ class TestMakeAutoplanDecisionIdempotence:
         """When comment with autoplan-decision-hash exists, skip effort-and-risk."""
         comments = [{"comment": "# Ralph Auto-Plan Decision\nautoplan-decision-hash:abc123\n\nEffort: Small\nRisk: Low", "author": "ralph"}]
         with patch("command.plan_helpers.run_effort_and_risk") as mock_er:
-            do_plan, stage = make_autoplan_decision(
+            do_plan, stage, _ = make_autoplan_decision(
                 target_id="SA-TEST", config={},
                 effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
                 risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -339,7 +338,7 @@ class TestMakeAutoplanDecisionIdempotence:
             patch("command.plan_helpers.run_effort_and_risk") as mock_er,
             patch("command.plan_helpers.append_autoplan_decision_comment") as mock_append,
         ):
-            do_plan, stage = make_autoplan_decision(
+            do_plan, stage, _ = make_autoplan_decision(
                 target_id="SA-TEST", config={},
                 effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
                 risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -589,7 +588,7 @@ class TestMakeAutoplanDecisionErrors:
     @patch("command.plan_helpers.run_effort_and_risk", return_value=None)
     def test_effort_risk_failure_defaults_to_plan(self, mock_er):
         """When effort-and-risk fails, default to running /plan (safety-first)."""
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
             risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -603,7 +602,7 @@ class TestMakeAutoplanDecisionErrors:
     def test_ambiguous_result_defaults_to_plan(self, mock_er):
         """When effort-and-risk returns ambiguous/malformed data, default to plan."""
         mock_er.return_value = {"effort": {}, "risk": {}}
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
             risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -621,7 +620,7 @@ class TestMakeAutoplanDecisionErrors:
             "risk": {"level": "Low", "score": 2},
         }
         with patch("command.plan_helpers.append_autoplan_decision_comment") as mock_append:
-            do_plan, stage = make_autoplan_decision(
+            do_plan, stage, _ = make_autoplan_decision(
                 target_id="SA-TEST", config={},
                 effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
                 risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -646,7 +645,7 @@ class TestCliPlanIfNeeded:
     @patch("command.plan_helpers.make_autoplan_decision")
     def test_skip_decision_json_output(self, mock_make):
         """plan-if-needed returns JSON with decision=skip when thresholds met."""
-        mock_make.return_value = (False, "intake_complete")
+        mock_make.return_value = (False, "intake_complete", None)
         result = plan_if_needed("SA-TEST")
         assert result["decision"] == "skip"
         assert result["target_id"] == "SA-TEST"
@@ -654,7 +653,7 @@ class TestCliPlanIfNeeded:
     @patch("command.plan_helpers.make_autoplan_decision")
     def test_plan_decision_json_output(self, mock_make):
         """plan-if-needed returns JSON with decision=plan when thresholds exceeded."""
-        mock_make.return_value = (True, "plan_complete")
+        mock_make.return_value = (True, "plan_complete", None)
         result = plan_if_needed("SA-TEST")
         assert result["decision"] == "plan"
         assert result["target_id"] == "SA-TEST"
@@ -662,7 +661,7 @@ class TestCliPlanIfNeeded:
     @patch("command.plan_helpers.make_autoplan_decision")
     def test_includes_effort_and_risk_in_output(self, mock_make):
         """plan-if-needed output includes effort and risk values."""
-        mock_make.return_value = (False, "intake_complete")
+        mock_make.return_value = (False, "intake_complete", None)
         # When called with precomputed_item and precomputed_comments, the test
         # should verify those are passed through. We rely on make_autoplan_decision
         # returning effort/risk info in the output.
@@ -716,7 +715,7 @@ class TestMakeAutoplanDecisionPrecomputed:
     @patch("command.plan_helpers.run_effort_and_risk")
     def test_small_low_with_precomputed_skips_er_script(self, mock_er):
         """When precomputed_item has effort/risk, do not call run_effort_and_risk."""
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
             risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -729,7 +728,7 @@ class TestMakeAutoplanDecisionPrecomputed:
     @patch("command.plan_helpers.run_effort_and_risk")
     def test_medium_high_with_precomputed_skips_er_script(self, mock_er):
         """When precomputed_item has effort/risk, do not call run_effort_and_risk."""
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
             risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
@@ -743,7 +742,7 @@ class TestMakeAutoplanDecisionPrecomputed:
     def test_precomputed_with_existing_comment(self, mock_er):
         """Precomputed with existing autoplan comment uses cached data."""
         comments = [{"comment": "autoplan-decision-hash:xyz", "author": "ralph"}]
-        do_plan, stage = make_autoplan_decision(
+        do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,
             risk_skip=DEFAULT_AUTOPLAN_RISK_SKIP,
