@@ -101,10 +101,42 @@ skill/ralph/ralph status --json
 
 See `docs/ralph.md` and `ralph --help` for full details of the features available.
 
+## Architecture: Shared Auto-Plan Decision Logic
+
+The auto-plan decision logic (effort/risk threshold checks) has been extracted
+from Ralph's inline code into a **shared module** at:
+
+- `command/plan_helpers.py`
+
+This module is the single source of truth for autoplan decisions, shared by:
+
+- **Ralph** (`skill/ralph/scripts/ralph_loop.py`) — delegates decision logic to
+  `command.plan_helpers` functions while keeping its own I/O infrastructure
+  (runner, retry, fail-open) for backward compatibility.
+- **`/plan` command** (`command/plan.md`) — runs `python3 command/plan_helpers.py
+  plan-if-needed <id>` as a pre-check before the full planning decomposition.
+- **PlanAll** — benefits automatically since it shells out to `/plan <id>`.
+
+Key functions provided by `command/plan_helpers.py`:
+
+| Function / Constant | Purpose |
+|---------------------|---------|
+| `make_autoplan_decision()` | Top-level orchestrator returning `(do_plan, stage)` |
+| `resolve_complexity_tier()` | Resolve low/medium/high from effort+risk |
+| `is_effort_risk_computed()` | Idempotence check (pure function) |
+| `run_effort_and_risk()` | Invoke the effort-and-risk orchestrator |
+| `append_autoplan_decision_comment()` | Idempotent decision comment posting |
+| `plan_if_needed()` | CLI entry point returning JSON `{decision, effort, risk}` |
+| `DEFAULT_AUTOPLAN_EFFORT_SKIP` | Default threshold: `{Extra Small, Small}` |
+| `DEFAULT_AUTOPLAN_RISK_SKIP` | Default threshold: `{Low}` |
+
+See `docs/ralph.md` for the full auto-plan decision flow.
+
 ## Scripts (canonical runner & modules)
 
 - Launcher wrapper: `skill/ralph/ralph` (preferred wrapper that records PID/start-time and handles background runs)
 - Foreground loop: `skill/ralph/scripts/ralph_loop.py` (python3)
+- Shared autoplan module: `command/plan_helpers.py`
 - Helpers and control: `skill/ralph/scripts/ralph_control.py`, `skill/ralph/scripts/structured_response.py`
 
 Example (documentation):
