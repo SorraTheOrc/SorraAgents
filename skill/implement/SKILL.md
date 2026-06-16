@@ -44,6 +44,7 @@ any sensitive values before writing them to logs or comments.
 ## Best Practices
 
 - Follow the steps in order and do not skip steps.
+- **Write tests before implementation code.** Always create at least one test file before modifying or adding implementation code (test-driven development). Tests created first may fail on the initial run; implementation code is then written to make them pass. When external constraints prevent writing complete tests, create harnesses or mocks that allow the tests-first flow to proceed and document the limitation as a temporary placeholder.
 - Do not use search tools such as grep, ripgrep, or code search in the implementation process. Rely on the context provided in the work item, linked documentation, and your understanding of the codebase. If you find that you do not have enough context to implement, use the intake interview to gather more information and update the work item before proceeding.
 - Keep implementation focused on meeting acceptance criteria with minimal changes.
 - Never edit code outside of the src/, tests/ and docs/ for this project unless they are essential configuration files.
@@ -128,7 +129,11 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 - If there is no recent audit record, run `/skill:audit <work-item-id>` and use the resulting audit output to establish the work that needs to be done.
 - Once the audit selection is complete, continue to step 4 and write tests and code to ensure all acceptance criteria defined in or related to the current work item are met:
   - Make minimal, focused changes that satisfy acceptance criteria.
-  - Follow a test-driven development approach where applicable.
+  - Write tests first (test-driven development approach):
+    - Create at least one new test file before adding or editing implementation code. These tests must be recorded in the run artifacts and visible in the commit history.
+    - Tests created in this step are allowed to fail on first run; the agent must then implement code to make them pass before committing.
+    - If tests cannot be completed due to external constraints (e.g., unavailable external service, missing infrastructure), create harnesses or mocks that enable the tests to run. The tests should fail due to the external constraint, not because of missing implementation logic.
+    - When a harness, mock, or test placeholder is used, include an explicit note in the work item comment and in the test file header stating the reason for the limitation and marking it as a temporary placeholder.
   - Ensure code follows project style and conventions.
   - Add comments to the work item describing any significant design decisions, code edits or tradeoffs.
   - If additional work is discovered, create linked work items: `wl create "<title>" --deps discovered-from:<work-item-id> --json`

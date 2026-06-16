@@ -108,7 +108,11 @@ Execute the following steps in order. Do not skip steps.
 
 ### Step 3 — Implement
 
-- Write tests first (test-driven development approach).
+- Write tests first (test-driven development approach):
+  - Create at least one new test file before adding or editing implementation code.
+  - Tests created in this step are allowed to fail on first run; the agent must then implement code to make them pass before committing.
+  - If tests cannot be completed due to external constraints (e.g., unavailable external service, missing infrastructure), create harnesses or mocks that enable the tests to run. The tests should fail due to the external constraint, not because of missing implementation logic.
+  - When a harness, mock, or test placeholder is used, include an explicit note in the work item comment and in the test file header stating the reason for the limitation and marking it as a temporary placeholder.
 - Write implementation code to meet acceptance criteria.
 - Make minimal, focused changes.
 - Follow project style and conventions.
