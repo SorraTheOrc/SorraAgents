@@ -413,6 +413,10 @@ class TestPersistenceDelegation:
             "skill.audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
+        )
 
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
@@ -479,7 +483,12 @@ class TestReportStructure:
         assert "The API must return 200 for valid requests." in captured.out
         assert "unmet" in captured.out
 
-    def test_report_no_ac_fallback(self, capsys):
+    def test_report_no_ac_fallback(self, capsys, monkeypatch):
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
+        )
+
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
                 stdout=json.dumps(_load_fixture("wi_without_ac.json")),

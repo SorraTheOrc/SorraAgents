@@ -1508,6 +1508,12 @@ def cmd_issue(issue_id: str, persist: bool = True,
             "skipping Phase 2 deep analysis.",
             file=sys.stderr,
         )
+    elif not acs or acs[0] == "No acceptance criteria defined.":
+        # No ACs defined — nothing to deep-analyze; skip Phase 2
+        print(
+            "No acceptance criteria defined: skipping Phase 2 deep analysis.",
+            file=sys.stderr,
+        )
     else:
         # Phase 1 passed → run Phase 2 deep code analysis
         print("Phase 1 passed: running Phase 2 deep code analysis...", file=sys.stderr)

@@ -837,6 +837,11 @@ class TestCmdProjectJsonMode:
     """Verify cmd_project emits structured JSON when json_mode=True."""
 
     def test_json_output_has_expected_keys(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
+        )
+
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
                 stdout=json.dumps({"success": True, "workItems": []}),
@@ -851,6 +856,11 @@ class TestCmdProjectJsonMode:
         assert payload["ready_to_close"] is False
 
     def test_default_mode_still_emits_markdown(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
+        )
+
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
                 stdout=json.dumps({"success": True, "workItems": []}),

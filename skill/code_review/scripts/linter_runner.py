@@ -554,7 +554,7 @@ def run_eslint(
 
         # Commit any changes
         if fixes_applied:
-            _commit_changes(root, "eslint")
+            _commit_changes(root, "eslint", runner=runner)
 
         # Re-scan to get remaining (non-fixable) issues
         cmd = ["eslint", str(root), "-f", "json", "--no-eslintrc", "--quiet"]
@@ -615,7 +615,7 @@ def run_markdownlint(
 
         # markdownlint may exit 0 or 1; check if fixes were applied by
         # looking at git changes
-        _commit_changes(root, "markdownlint")
+        _commit_changes(root, "markdownlint", runner=runner)
         fixes_applied = True
 
         # Re-scan to get remaining issues
@@ -779,7 +779,7 @@ def run_dotnet_format(
         status = _run_subprocess(["git", "status", "--porcelain"], cwd=root)
         if status.stdout.strip():
             fixes_applied = True
-            _commit_changes(root, "dotnet-format")
+            _commit_changes(root, "dotnet-format", runner=runner)
 
         # Re-scan for remaining issues (should be none after fix, but check)
         cmd = ["dotnet", "format", str(root), "--verify-no-changes", "--verbosity", "quiet"]
