@@ -16,6 +16,7 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 - agent/: workflow and agent-focused reference guides (e.g., [agent/forge.md](agent/forge.md), [agent/ship.md](agent/ship.md)).
 - command/: design, intake, implementation and review process documents (see [command/implement.md](command/implement.md)).
 - skill/: skill templates and utilities to scaffold and package agent skills (see [skill/skill-creator/SKILL.md](skill/skill-creator/SKILL.md)).
+  - [skill/skills-script-paths.md](skill/skills-script-paths.md): Best practices for referencing scripts and assets from skills.
   - [skill/planall/](skill/planall/): PlanAll — automated batch planning for intake_complete work items.
 - plugins/: local agent framework plugins used by this repository (includes `ralph` compaction plugin).
 - docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)).
