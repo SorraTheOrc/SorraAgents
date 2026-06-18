@@ -93,6 +93,8 @@ A work item is considered ready to close when:
 
 Children with an empty stage (`""`) are excluded from the stage check (they may be newly created or not yet processed).
 
+> **IMPORTANT:** The release process (e.g., "must be merged to main first") is **not** an audit concern. Do NOT include release-process constraints, merge-status conditions, or any other deployment/release criteria in audit verdicts. An item is ready to close based solely on the three criteria above. Adding constraints outside these criteria is a prompt violation.
+
 ### Model metadata line
 
 When model information is available (e.g., when the runner is invoked with
@@ -229,6 +231,13 @@ Notes:
 - Return a structured markdown report only. Use the header `Ready to close:` and the canonical sections above.
 - **Follow the two-phase pipeline.** Phase 1 (automated screening) must complete successfully before Phase 2 (deep code analysis) begins. If Phase 1 has blocking issues, do NOT proceed to Phase 2 — instead demote all "met" verdicts to "partial" with evidence "pending deep code review".
 - **Deep code analysis is mandatory when Phase 1 passes.** Read the actual implementation files, not just the work item descriptions. Verify each AC against what the code actually does.
+- **Apply the ready-to-close criteria strictly.** A work item is ready to close when:
+  1. All acceptance criteria (parent + children) are `met` or `adjusted`.
+  2. All active children are in `in_review` or `done` stage.
+  3. No critical or high code quality findings.
+- **Children in `in_review` stage do NOT block closure.** Children with `status: in_progress` but `stage: in_review` are acceptable and should result in "Ready to close: Yes" (provided all other criteria are met). Only children in pre-review stages (`idea`, `intake_complete`, `plan_complete`, etc.) block closure.
+- **DO NOT add constraints outside the defined criteria.** The release process ("must be merged to main", merge status, deployment status) is not an audit concern. Do not include any release-process, deployment, or merge-status conditions in your verdict. If a child is in `in_review` stage, that is sufficient — do not demand that it be merged or released first.
+- **Phase 1 children stage check logic:** Check that every non-deleted child with a non-empty stage has stage `in_review` or `done`. Children with `status: in_progress` but `stage: in_review` are acceptable and do NOT count as blocking. This mirrors the logic in `audit_runner.py`'s `_has_phase1_blocking_issues`.
 - If the model cannot determine acceptance criteria verdicts unambiguously, return immediately and do NOT persist or claim the audit was recorded.
 - You MUST persist the audit report to the work item after producing a structured report. Persistence is **mandatory**, not optional. Use one of the approved persistence mechanisms: the canonical runner (which persists by default unless invoked with `--do-not-persist`) or the persister script (`skill/audit/scripts/persist_audit.py`). When performing the authorized persistence step, annotate the prompt with `[PERSIST-AUDIT]` and ensure the report is final and complete.
 
