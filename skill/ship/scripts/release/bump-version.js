@@ -20,7 +20,7 @@
  *   1  Error (invalid arguments, missing file, parse error)
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -221,7 +221,7 @@ function main() {
 
 // Allow both import (ESM) and direct CLI execution
 const isMainModule = process.argv[1] &&
-  (fileURLToPath(import.meta.url) === resolve(process.argv[1]));
+  (realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1])));
 
 if (isMainModule) {
   main();

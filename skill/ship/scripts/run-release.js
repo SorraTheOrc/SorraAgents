@@ -6,7 +6,7 @@
 // (merge-dev-to-main.sh) and controls which part of the semver is
 // incremented before the merge. Default is 'patch'.
 
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { spawnSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -278,7 +278,7 @@ export function runRelease(cliArgs = []) {
 
 // Only run when executed directly, not when imported as a module
 const isMainModule = process.argv[1] &&
-  (fileURLToPath(import.meta.url) === resolve(process.argv[1]));
+  (realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1])));
 
 if (isMainModule) {
   const exitCode = runRelease(process.argv.slice(2));
