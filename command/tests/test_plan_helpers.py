@@ -93,15 +93,15 @@ class TestResolveComplexityTier:
         tier = resolve_complexity_tier({"effort": "Extra Small", "risk": "Medium"}, {})
         assert tier == "medium"
 
-    def test_missing_values_default_medium(self):
-        """Missing effort/risk values default to Medium -> medium."""
+    def test_missing_values_default_low(self):
+        """Missing effort/risk values default to low tier."""
         tier = resolve_complexity_tier({"effort": "", "risk": ""}, {})
-        assert tier == "medium"
+        assert tier == "low"
 
-    def test_none_values_default_medium(self):
-        """None effort/risk values default to Medium -> medium."""
+    def test_none_values_default_low(self):
+        """None effort/risk values default to low tier."""
         tier = resolve_complexity_tier({"effort": None, "risk": None}, {})
-        assert tier == "medium"
+        assert tier == "low"
 
     def test_custom_thresholds_via_config(self):
         """Custom config overrides default thresholds."""

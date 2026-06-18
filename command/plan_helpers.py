@@ -134,10 +134,15 @@ def resolve_complexity_tier(item: dict, config: dict) -> str:
     - High: Effort L or XL OR risk High
 
     Thresholds are configurable via config["complexity_tier"].
-    Defaults to 'medium' if mapping cannot be determined.
+    Defaults to 'low' when both effort and risk are absent, otherwise
+    defaults to 'medium' if mapping cannot be determined.
     """
     effort = item.get("effort")
     risk = item.get("risk")
+
+    # When both effort and risk are absent, default to low tier
+    if not effort and not risk:
+        return "low"
 
     # Load thresholds from config
     tier_cfg = config.get("complexity_tier", {})

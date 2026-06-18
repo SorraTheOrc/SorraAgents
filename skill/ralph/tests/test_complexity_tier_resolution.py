@@ -98,13 +98,13 @@ class TestResolveComplexityTier:
         """Missing risk -> defaults to Medium for tier resolution."""
         assert _resolve_complexity_tier(self._default_config(), {"effort": "Small"}) == "medium"
 
-    def test_both_missing_defaults_to_medium(self):
-        """Both missing -> medium tier."""
-        assert _resolve_complexity_tier(self._default_config(), {}) == "medium"
+    def test_both_missing_defaults_to_low(self):
+        """Both missing -> low tier."""
+        assert _resolve_complexity_tier(self._default_config(), {}) == "low"
 
-    def test_none_values_defaults_to_medium(self):
-        """None values -> medium tier."""
-        assert _resolve_complexity_tier(self._default_config(), {"effort": None, "risk": None}) == "medium"
+    def test_none_values_defaults_to_low(self):
+        """None values -> low tier."""
+        assert _resolve_complexity_tier(self._default_config(), {"effort": None, "risk": None}) == "low"
 
     def test_unknown_values_defaults_to_medium(self):
         """Unknown values -> defaults to Medium -> medium tier."""
