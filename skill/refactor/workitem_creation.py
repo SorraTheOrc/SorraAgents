@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 from typing import Any
 
@@ -178,11 +179,79 @@ def has_existing_smell_comment(file_path: str, smell_type: str) -> bool:
     return False
 
 
+def _has_existing_worklog_item(smell: dict[str, Any]) -> bool:
+    """Check if a work item already exists in the worklog for this smell.
+
+    Queries the worklog database for Refactor-tagged items and checks if any
+    existing item matches the same (file, line, code) combination.  This is a
+    secondary safety net when the REFACTOR comment check is insufficient
+    (e.g. the source file was deleted after the work item was created).
+
+    Args:
+        smell: A smell finding dict with ``file``, ``line``, and ``code`` keys.
+
+    Returns:
+        ``True`` if a matching work item already exists, ``False`` otherwise.
+    """
+    if not shutil.which("wl"):
+        return False
+
+    try:
+        result = subprocess.run(
+            ["wl", "list", "--tags", REFACTOR_TAG, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+    if result.returncode != 0:
+        return False
+
+    try:
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+    # Extract existing work items
+    work_items = data.get("workItems", data.get("data", []))
+    if not isinstance(work_items, list):
+        return False
+
+    target_file = smell.get("file", "")
+    target_line = smell.get("line", 0)
+    target_code = smell.get("code", "")
+
+    for item in work_items:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title", "") or ""
+        description = item.get("description", "") or ""
+        combined = (title + " " + description).lower()
+
+        # Check if the description or title references the same file, line, and code
+        if target_file.lower() in combined and target_code.lower() in combined:
+            # Also check line number if it appears
+            if str(target_line) in combined:
+                return True
+
+    return False
+
+
 def create_smell_work_item(smell: dict[str, Any]) -> str | None:
     """Create a single Worklog work item for a code smell.
 
-    Checks for duplicate REFACTOR comments before creating. If a duplicate
-    exists, returns ``None`` without creating a new work item.
+    Enforces the following guards before creating a work item:
+
+    1. **File existence**: If the referenced source file does not exist on
+       disk, a warning is logged and creation is skipped.\
+       (AC: SA-0MQJLXMV7002X1VY)
+    2. **REFACTOR comment duplicate**: If the source file already contains a
+       REFACTOR comment for the same smell type, creation is skipped.
+    3. **Worklog duplicate**: The worklog database is queried for existing
+       items with the same (file, line, code) combination as a secondary
+       safety net.
 
     Args:
         smell: A smell finding dict.
@@ -191,12 +260,32 @@ def create_smell_work_item(smell: dict[str, Any]) -> str | None:
         The work item ID if creation succeeded, or ``None`` if it was
         skipped (duplicate) or failed.
     """
-    # Check for duplicate first
     file_path = smell.get("file", "")
     smell_type = smell.get("smell_type", "unknown")
+
+    # Guard 1: File existence check (AC1)
+    if file_path and not os.path.isfile(file_path):
+        LOG.warning(
+            "Skipping work item creation for %s in %s: "
+            "source file does not exist on disk",
+            smell_type,
+            file_path,
+        )
+        return None
+
+    # Guard 2: Check for duplicate REFACTOR comment in source file
     if file_path and has_existing_smell_comment(file_path, smell_type):
         LOG.info(
             "Skipping creation for %s in %s: duplicate REFACTOR comment exists",
+            smell_type,
+            file_path,
+        )
+        return None
+
+    # Guard 3: Check worklog database for existing items (AC3)
+    if _has_existing_worklog_item(smell):
+        LOG.info(
+            "Skipping creation for %s in %s: existing worklog item found",
             smell_type,
             file_path,
         )

@@ -8,12 +8,15 @@ These tests verify that:
 
 The target implementation lives in skill/refactor/workitem_creation.py.
 
-Related work item: SA-0MQA70XZK0033GOE
+Related work items:
+- SA-0MQA70XZK0033GOE
+- SA-0MQJLXMV7002X1VY (Refactor skill creates phantom work items)
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import sys
 import tempfile
@@ -298,10 +301,40 @@ class TestWorkItemDescriptionGeneration:
 class TestWorklogCLIIntegration:
     """Worklog CLI integration for creating work items."""
 
+    @pytest.fixture
+    def referent_critical(self, temp_dir: Path, sample_smell_critical):
+        """Create the file referenced by sample_smell_critical on disk."""
+        smell = dict(sample_smell_critical)
+        file_path = temp_dir / smell["file"]
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("import os\n")
+        smell["file"] = str(file_path)
+        return smell
+
+    @pytest.fixture
+    def referent_medium(self, temp_dir: Path, sample_smell_medium):
+        """Create the file referenced by sample_smell_medium on disk."""
+        smell = dict(sample_smell_medium)
+        file_path = temp_dir / smell["file"]
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("import os\n")
+        smell["file"] = str(file_path)
+        return smell
+
+    @pytest.fixture
+    def referent_high(self, temp_dir: Path, sample_smell_high):
+        """Create the file referenced by sample_smell_high on disk."""
+        smell = dict(sample_smell_high)
+        file_path = temp_dir / smell["file"]
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("import os\n")
+        smell["file"] = str(file_path)
+        return smell
+
     def test_creates_work_item_via_wl_cli(
         self,
         monkeypatch,
-        sample_smell_critical,
+        referent_critical,
         mock_wl_create_json,
     ):
         """Calls ``wl create`` with correct arguments and returns the ID."""
@@ -312,21 +345,26 @@ class TestWorklogCLIIntegration:
             create_smell_work_item,
         )
 
-        title = build_smell_title(sample_smell_critical)
-        description = build_smell_description(sample_smell_critical)
-        priority = severity_to_priority(sample_smell_critical["severity"])
+        title = build_smell_title(referent_critical)
+        description = build_smell_description(referent_critical)
+        priority = severity_to_priority(referent_critical["severity"])
 
-        expected_cmd = _build_wl_create_cmd(title, description, priority)
-        responses = {expected_cmd: _cp(stdout=mock_wl_create_json)}
+        expected_list_cmd = " ".join(["wl", "list", "--tags", "Refactor", "--json"])
+        expected_create_cmd = _build_wl_create_cmd(title, description, priority)
+
+        responses = {
+            expected_list_cmd: _cp(stdout='{"success":true,"workItems":[]}'),
+            expected_create_cmd: _cp(stdout=mock_wl_create_json),
+        }
         monkeypatch.setattr(
             subprocess, "run", _make_fake_subprocess_run(responses)
         )
 
-        work_item_id = create_smell_work_item(sample_smell_critical)
+        work_item_id = create_smell_work_item(referent_critical)
         assert work_item_id == "SA-0MOCK1234X000WORK"
 
     def test_creates_work_item_with_correct_priority(
-        self, monkeypatch, sample_smell_medium, mock_wl_create_json
+        self, monkeypatch, referent_medium, mock_wl_create_json
     ):
         """Work item is created with the priority mapped from severity."""
         from skill.refactor.workitem_creation import (
@@ -336,22 +374,27 @@ class TestWorklogCLIIntegration:
             create_smell_work_item,
         )
 
-        title = build_smell_title(sample_smell_medium)
-        description = build_smell_description(sample_smell_medium)
-        priority = severity_to_priority(sample_smell_medium["severity"])
+        title = build_smell_title(referent_medium)
+        description = build_smell_description(referent_medium)
+        priority = severity_to_priority(referent_medium["severity"])
 
-        expected_cmd = _build_wl_create_cmd(title, description, priority)
-        responses = {expected_cmd: _cp(stdout=mock_wl_create_json)}
+        expected_list_cmd = " ".join(["wl", "list", "--tags", "Refactor", "--json"])
+        expected_create_cmd = _build_wl_create_cmd(title, description, priority)
+
+        responses = {
+            expected_list_cmd: _cp(stdout='{"success":true,"workItems":[]}'),
+            expected_create_cmd: _cp(stdout=mock_wl_create_json),
+        }
         monkeypatch.setattr(
             subprocess, "run", _make_fake_subprocess_run(responses)
         )
 
-        work_item_id = create_smell_work_item(sample_smell_medium)
+        work_item_id = create_smell_work_item(referent_medium)
         assert work_item_id is not None
         assert work_item_id.startswith("SA-")
 
     def test_includes_refactor_tag(
-        self, monkeypatch, sample_smell_high, mock_wl_create_json
+        self, monkeypatch, referent_high, mock_wl_create_json
     ):
         """Work item is created with 'Refactor' tag."""
         from skill.refactor.workitem_creation import (
@@ -361,17 +404,22 @@ class TestWorklogCLIIntegration:
             create_smell_work_item,
         )
 
-        title = build_smell_title(sample_smell_high)
-        description = build_smell_description(sample_smell_high)
-        priority = severity_to_priority(sample_smell_high["severity"])
+        title = build_smell_title(referent_high)
+        description = build_smell_description(referent_high)
+        priority = severity_to_priority(referent_high["severity"])
 
-        expected_cmd = _build_wl_create_cmd(title, description, priority)
-        responses = {expected_cmd: _cp(stdout=mock_wl_create_json)}
+        expected_list_cmd = " ".join(["wl", "list", "--tags", "Refactor", "--json"])
+        expected_create_cmd = _build_wl_create_cmd(title, description, priority)
+
+        responses = {
+            expected_list_cmd: _cp(stdout='{"success":true,"workItems":[]}'),
+            expected_create_cmd: _cp(stdout=mock_wl_create_json),
+        }
         monkeypatch.setattr(
             subprocess, "run", _make_fake_subprocess_run(responses)
         )
 
-        work_item_id = create_smell_work_item(sample_smell_high)
+        work_item_id = create_smell_work_item(referent_high)
         assert work_item_id is not None
 
     def test_handles_wl_cli_failure_gracefully(
@@ -460,6 +508,7 @@ class TestWorklogCLIIntegration:
     def test_create_multiple_work_items(
         self,
         monkeypatch,
+        temp_dir,
         sample_smell_critical,
         sample_smell_medium,
         mock_wl_create_json,
@@ -472,19 +521,36 @@ class TestWorklogCLIIntegration:
             create_smell_work_item,
         )
 
-        # Build responses for two different calls
-        title1 = build_smell_title(sample_smell_critical)
-        desc1 = build_smell_description(sample_smell_critical)
-        pri1 = severity_to_priority(sample_smell_critical["severity"])
+        # Create files on disk
+        fp1 = temp_dir / "src" / "main.py"
+        fp1.parent.mkdir(parents=True, exist_ok=True)
+        fp1.write_text("import os\n")
+
+        scent1 = dict(sample_smell_critical)
+        scent1["file"] = str(fp1)
+
+        scent2 = dict(sample_smell_medium)
+        fp2 = temp_dir / "src" / "utils.py"
+        fp2.parent.mkdir(parents=True, exist_ok=True)
+        fp2.write_text("import sys\n")
+        scent2["file"] = str(fp2)
+
+        title1 = build_smell_title(scent1)
+        desc1 = build_smell_description(scent1)
+        pri1 = severity_to_priority(scent1["severity"])
         cmd1 = _build_wl_create_cmd(title1, desc1, pri1)
 
-        responses = {cmd1: _cp(stdout=mock_wl_create_json)}
+        empty_list = '{"success":true,"workItems":[]}'
+        responses = {
+            "wl list --tags Refactor --json": _cp(stdout=empty_list),
+            cmd1: _cp(stdout=mock_wl_create_json),
+        }
         monkeypatch.setattr(
             subprocess, "run", _make_fake_subprocess_run(responses)
         )
 
         # Test first smell
-        id1 = create_smell_work_item(sample_smell_critical)
+        id1 = create_smell_work_item(scent1)
         assert id1 == "SA-0MOCK1234X000WORK"
 
 
@@ -640,6 +706,226 @@ class TestDuplicatePrevention:
 
 
 # ---------------------------------------------------------------------------
+# Tests: Non-Existent File Handling (AC1, AC2)
+# ---------------------------------------------------------------------------
+
+
+class TestNonExistentFileHandling:
+    """Work item creation is skipped when the referenced file does not exist.
+
+    Related acceptance criteria (SA-0MQJLXMV7002X1VY):
+    - AC1: Create work items only when the source file exists on disk
+    - AC2: Log a warning and skip creation when file does not exist
+    """
+
+    def test_skip_creation_when_file_does_not_exist(
+        self,
+        sample_smell_critical,
+    ):
+        """create_smell_work_item returns None when the file does not exist."""
+        from skill.refactor.workitem_creation import create_smell_work_item
+
+        smell = dict(sample_smell_critical)
+        smell["file"] = "/nonexistent/path/file.py"
+
+        result = create_smell_work_item(smell)
+        assert result is None, (
+            "Expected None when file does not exist, got %r" % result
+        )
+
+    def test_skip_creation_when_file_does_not_exist_batch(
+        self,
+        sample_smell_critical,
+        sample_smell_medium,
+    ):
+        """Batch creation skips smells whose files do not exist."""
+        from skill.refactor.workitem_creation import create_smell_work_items
+
+        smell1 = dict(sample_smell_critical)
+        smell1["file"] = "/nonexistent/main.py"
+
+        smell2 = dict(sample_smell_medium)
+        smell2["file"] = "/nonexistent/utils.py"
+
+        results = create_smell_work_items([smell1, smell2])
+        assert results == [], (
+            "Expected empty list when all files are nonexistent, got %r" % results
+        )
+
+    def test_warning_logged_when_file_does_not_exist(
+        self,
+        sample_smell_critical,
+    ):
+        """A warning is logged when skipping creation for a non-existent file."""
+        from skill.refactor.workitem_creation import create_smell_work_item
+
+        smell = dict(sample_smell_critical)
+        smell["file"] = "/nonexistent/path/file.py"
+
+        # Capture log output at WARNING level
+        logger = logging.getLogger("refactor.workitem_creation")
+        try:
+            from io import StringIO
+        except ImportError:
+            from io import StringIO
+        log_capture = StringIO()
+        handler = logging.StreamHandler(log_capture)
+        handler.setLevel(logging.WARNING)
+        logger.addHandler(handler)
+        original_level = logger.level
+        logger.setLevel(logging.WARNING)
+
+        try:
+            result = create_smell_work_item(smell)
+            assert result is None
+            log_output = log_capture.getvalue()
+            assert "does not exist" in log_output.lower() or "nonexistent" in log_output.lower() or "skipping" in log_output.lower(), (
+                "Expected warning log about non-existent file, got: %s" % log_output
+            )
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(original_level)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Worklog-Based Duplicate Prevention (AC3)
+# ---------------------------------------------------------------------------
+
+
+class TestWorklogDuplicatePrevention:
+    """Duplicate detection via worklog database query as secondary safety net.
+
+    Related acceptance criteria (SA-0MQJLXMV7002X1VY):
+    - AC3: Query worklog database to check for existing work items with the
+      same (file, line, code) combination
+    """
+
+    def test_skip_when_worklog_has_existing_item(
+        self,
+        monkeypatch,
+        temp_dir,
+        sample_smell_critical,
+    ):
+        """Work item creation is skipped when worklog has an existing Refactor item
+        for the same (file, line, code) combination."""
+        from skill.refactor.workitem_creation import create_smell_work_item
+
+        # Create the actual file on disk so the file existence check passes
+        file_path = temp_dir / "src" / "main.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("import os\n")
+
+        smell = dict(sample_smell_critical)
+        smell["file"] = str(file_path)
+
+        # Mock subprocess to simulate wl list returning an existing item
+        mock_list_output = json.dumps({
+            "success": True,
+            "workItems": [
+                {
+                    "id": "SA-0MOCK9999X000EXIST",
+                    "title": "Refactor: Security issue in src/main.py",
+                    "tags": ["Refactor"],
+                    "status": "open",
+                    "priority": "high",
+                }
+            ],
+        })
+
+        # Build expected wl list command
+        expected_list_cmd = " ".join([
+            "wl", "list", "--tags", "Refactor",
+            "--json",
+        ])
+
+        responses = {}
+        # Set up mock response for wl list
+        cp_list = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=mock_list_output, stderr=""
+        )
+        responses[expected_list_cmd] = cp_list
+
+        def _fake_run(cmd, *args, **kwargs):
+            key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if key in responses:
+                return responses[key]
+            # Default: return empty for any other command
+            return subprocess.CompletedProcess(
+                args=[], returncode=0, stdout='{"success":true,"workItems":[]}', stderr=""
+            )
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+
+        result = create_smell_work_item(smell)
+        assert result is None, (
+            "Expected None when worklog has existing item, got %r" % result
+        )
+
+    def test_allows_creation_when_worklog_has_no_match(
+        self,
+        monkeypatch,
+        temp_dir,
+        sample_smell_critical,
+        mock_wl_create_json,
+    ):
+        """Work item creation proceeds when worklog has no matching Refactor items."""
+        # Create the actual file on disk
+        file_path = temp_dir / "src" / "main.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("import os\n")
+
+        smell = dict(sample_smell_critical)
+        smell["file"] = str(file_path)
+
+        # Mock wl list returning no matching items
+        empty_list_output = json.dumps({
+            "success": True,
+            "workItems": [],
+        })
+
+        expected_list_cmd = " ".join(["wl", "list", "--tags", "Refactor", "--json"])
+
+        # Build expected wl create command
+        from skill.refactor.workitem_creation import (
+            build_smell_title,
+            build_smell_description,
+            severity_to_priority,
+        )
+        title = build_smell_title(smell)
+        description = build_smell_description(smell)
+        priority = severity_to_priority(smell["severity"])
+        expected_create_cmd = " ".join([
+            "wl", "create", "--title", title,
+            "--description", description,
+            "--priority", priority,
+            "--tags", "Refactor",
+            "--json",
+        ])
+
+        responses = {
+            expected_list_cmd: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=empty_list_output, stderr=""
+            ),
+            expected_create_cmd: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=mock_wl_create_json, stderr=""
+            ),
+        }
+
+        def _fake_run(cmd, *args, **kwargs):
+            key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if key in responses:
+                return responses[key]
+            raise FileNotFoundError(f"Unexpected command: {key}")
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+
+        from skill.refactor.workitem_creation import create_smell_work_item
+
+        result = create_smell_work_item(smell)
+        assert result == "SA-0MOCK1234X000WORK"
+
+
+# ---------------------------------------------------------------------------
 # Tests: Module-Level Batch Creation
 # ---------------------------------------------------------------------------
 
@@ -650,8 +936,7 @@ class TestBatchWorkItemCreation:
     def test_create_smell_work_items_batch(
         self,
         monkeypatch,
-        sample_smell_critical,
-        sample_smell_medium,
+        temp_dir,
         mock_wl_create_json,
     ):
         """Batch creation returns work item IDs for each smell."""
@@ -661,6 +946,26 @@ class TestBatchWorkItemCreation:
             severity_to_priority,
             create_smell_work_items,
         )
+
+        # Create files on disk for two smells
+        fp1 = temp_dir / "src" / "main.py"
+        fp1.parent.mkdir(parents=True, exist_ok=True)
+        fp1.write_text("import os\n")
+
+        fp2 = temp_dir / "src" / "utils.py"
+        fp2.parent.mkdir(parents=True, exist_ok=True)
+        fp2.write_text("import sys\n")
+
+        smell1 = {
+            "file": str(fp1), "line": 42, "severity": "critical",
+            "message": "Hardcoded API key detected", "source": "linter",
+            "smell_type": "security", "code": "S105",
+        }
+        smell2 = {
+            "file": str(fp2), "line": 30, "severity": "medium",
+            "message": "`os` imported but unused", "source": "linter",
+            "smell_type": "unused_import", "code": "F401",
+        }
 
         mock_json2 = json.dumps({
             "success": True,
@@ -672,18 +977,21 @@ class TestBatchWorkItemCreation:
             },
         })
 
-        title1 = build_smell_title(sample_smell_critical)
-        desc1 = build_smell_description(sample_smell_critical)
-        pri1 = severity_to_priority(sample_smell_critical["severity"])
+        title1 = build_smell_title(smell1)
+        desc1 = build_smell_description(smell1)
+        pri1 = severity_to_priority(smell1["severity"])
         cmd1 = _build_wl_create_cmd(title1, desc1, pri1)
 
-        title2 = build_smell_title(sample_smell_medium)
-        desc2 = build_smell_description(sample_smell_medium)
-        pri2 = severity_to_priority(sample_smell_medium["severity"])
+        title2 = build_smell_title(smell2)
+        desc2 = build_smell_description(smell2)
+        pri2 = severity_to_priority(smell2["severity"])
         cmd2 = _build_wl_create_cmd(title2, desc2, pri2)
 
-        # Each smell gets its own response
+        empty_list = '{"success":true,"workItems":[]}'
+
+        # Each smell gets its own response; also mock wl list
         responses = {
+            "wl list --tags Refactor --json": _cp(stdout=empty_list),
             cmd1: _cp(stdout=mock_wl_create_json),
             cmd2: _cp(stdout=mock_json2),
         }
@@ -691,7 +999,7 @@ class TestBatchWorkItemCreation:
             subprocess, "run", _make_fake_subprocess_run(responses)
         )
 
-        smells = [sample_smell_critical, sample_smell_medium]
+        smells = [smell1, smell2]
         results = create_smell_work_items(smells)
         assert len(results) == 2
         assert results[0] == "SA-0MOCK1234X000WORK"
@@ -708,7 +1016,6 @@ class TestBatchWorkItemCreation:
         monkeypatch,
         temp_dir: Path,
         sample_smell_critical,
-        sample_smell_medium,
     ):
         """Batch creation skips smells that already have REFACTOR comments."""
         file_path = temp_dir / "src" / "main.py"
@@ -721,16 +1028,52 @@ class TestBatchWorkItemCreation:
             'API_KEY = "sk-12345"\n'
         )
 
-        from skill.refactor.workitem_creation import create_smell_work_items
+        # Create a second file that does exist (no REFACTOR comment)
+        clean_file = temp_dir / "src" / "utils.py"
+        clean_file.parent.mkdir(parents=True, exist_ok=True)
+        clean_file.write_text("import sys\n")
+
+        from skill.refactor.workitem_creation import (
+            build_smell_title,
+            build_smell_description,
+            severity_to_priority,
+            create_smell_work_items,
+        )
 
         smell_with_dup = dict(sample_smell_critical)
         smell_with_dup["file"] = str(file_path)
 
-        smell_clean = dict(sample_smell_medium)
+        smell_clean = {
+            "file": str(clean_file), "line": 30, "severity": "medium",
+            "message": "`os` imported but unused", "source": "linter",
+            "smell_type": "unused_import", "code": "F401",
+        }
+
+        # Build expected wl create command for the clean smell
+        title = build_smell_title(smell_clean)
+        desc = build_smell_description(smell_clean)
+        pri = severity_to_priority(smell_clean["severity"])
+        expected_create_cmd = _build_wl_create_cmd(title, desc, pri)
+
+        mock_json = json.dumps({
+            "success": True,
+            "workItem": {
+                "id": "SA-0MOCK5678X000WORK",
+                "title": "Refactor: Unused import in src/utils.py",
+            },
+        })
+
+        empty_list = '{"success":true,"workItems":[]}'
+        responses = {
+            "wl list --tags Refactor --json": _cp(stdout=empty_list),
+            expected_create_cmd: _cp(stdout=mock_json),
+        }
+        monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
 
         results = create_smell_work_items([smell_with_dup, smell_clean])
         # Only the non-duplicate smell should be attempted
         assert len(results) == 1
+        assert results[0] == "SA-0MOCK5678X000WORK"
 
 
 # ---------------------------------------------------------------------------

@@ -220,6 +220,12 @@ def detect_linter_smells(
     if not existing_files:
         return []
     else:
+        # Build a set of normalized session file paths for filtering
+        # ruff and eslint may report findings for files outside the
+        # current session's scope; we only keep findings that match
+        # files the caller explicitly asked about.
+        session_file_set = set(os.path.abspath(f) for f in files)
+
         # Run actual linters on the project
         project_root = _find_common_root(existing_files)
         if project_root is None:
@@ -232,8 +238,12 @@ def detect_linter_smells(
             if ruff_probe.get("available"):
                 ruff_result = run_ruff(project_root)
                 for rf in ruff_result.get("findings", []):
+                    rf_file = rf.get("file", "")
+                    # Only keep findings for files in the session file set
+                    if os.path.abspath(rf_file) not in session_file_set:
+                        continue
                     finding = {
-                        "file": rf.get("file", ""),
+                        "file": rf_file,
                         "line": rf.get("line", 0),
                         "severity": rf.get("severity", "medium"),
                         "message": rf.get("message", ""),
@@ -254,8 +264,12 @@ def detect_linter_smells(
             if eslint_probe.get("available"):
                 eslint_result = run_eslint(project_root)
                 for ef in eslint_result.get("findings", []):
+                    ef_file = ef.get("file", "")
+                    # Only keep findings for files in the session file set
+                    if os.path.abspath(ef_file) not in session_file_set:
+                        continue
                     finding = {
-                        "file": ef.get("file", ""),
+                        "file": ef_file,
                         "line": ef.get("line", 0),
                         "severity": ef.get("severity", "medium"),
                         "message": ef.get("message", ""),
