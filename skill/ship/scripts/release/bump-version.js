@@ -220,6 +220,9 @@ function main() {
 }
 
 // Allow both import (ESM) and direct CLI execution
+// Use realpathSync on both sides to handle symlinked install paths:
+// import.meta.url resolves to the real path while process.argv[1]
+// may retain the symlink path.
 const isMainModule = process.argv[1] &&
   (realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1])));
 
