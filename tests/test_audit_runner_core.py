@@ -621,6 +621,10 @@ class TestExitCodes:
 
     def test_issue_wl_failure_returns_1(self, capsys):
         def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            # Let status updates succeed, only fail on wl show
+            if "--status" in cmd_list:
+                return _fake_proc(stdout=json.dumps({"success": True}))
             return _fake_proc(returncode=1, stderr="work item not found")
 
         rc = cmd_issue("SA-MISSING", runner=fake_runner)
@@ -909,3 +913,110 @@ class TestPiPromptSafetyInstructions:
     def test_project_prompt_has_structured_object_instruction(self):
         """Project summary prompt must instruct to return structured JSON object."""
         assert "Return ONLY a structured JSON object" in self.SOURCE
+
+
+# ---------------------------------------------------------------------------
+# Status lifecycle tests
+# ---------------------------------------------------------------------------
+
+class TestStatusLifecycle:
+    """Verify that cmd_issue manages work item status (in_progress -> completed)."""
+
+    def _fake_runner_with_calls(self, calls: list, fail_show: bool = False):
+        """Create a fake runner that records calls and optionally fails on ``wl show``."""
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            calls.append(cmd_list)
+            # If fail_show is True and this is a "wl show" call, return failure
+            if fail_show and "show" in cmd_list:
+                return _fake_proc(returncode=1, stderr="wl: work item not found")
+            # All other calls succeed with valid JSON
+            return _fake_proc(stdout=json.dumps({"success": True}))
+        return fake_runner
+
+    def test_sets_in_progress_before_audit(self, monkeypatch):
+        """in_progress status must be set before wl show (first operation)."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+        )
+
+        cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        # The first wl update call should be for status in_progress
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
+        assert len(wl_updates) >= 1, f"Expected at least one wl update call, got: {calls}"
+        assert wl_updates[0][:5] == ["wl", "update", "SA-LIFECYCLE", "--status", "in_progress"], (
+            f"First update should be in_progress, got: {wl_updates[0]}"
+        )
+
+    def test_sets_completed_after_audit(self, monkeypatch):
+        """completed status must be set at the end of a successful audit."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+        )
+
+        cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected at least one completed status update, got: {wl_updates}"
+        )
+
+    def test_sets_completed_on_wl_show_failure(self):
+        """completed status must be set even when wl show fails."""
+        calls = []
+
+        rc = cmd_issue("SA-FAIL", runner=self._fake_runner_with_calls(calls, fail_show=True), persist=False)
+        assert rc == 1, f"Expected exit code 1 on wl show failure, got {rc}"
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-FAIL"]]
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected completed update even on failure, got: {wl_updates}"
+        )
+
+    def test_in_progress_before_completed(self, monkeypatch):
+        """in_progress must appear before completed in the call sequence."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+        )
+
+        cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
+        statuses = [" ".join(c[3:]) for c in wl_updates]
+        in_progress_idx = next(i for i, s in enumerate(statuses) if "in_progress" in s)
+        completed_idx = next(i for i, s in enumerate(statuses) if "completed" in s)
+        assert in_progress_idx < completed_idx, (
+            f"in_progress (index {in_progress_idx}) must come before completed (index {completed_idx}): {statuses}"
+        )
+
+    def test_sets_completed_on_exception_in_main_logic(self, monkeypatch):
+        """completed must be set when an unhandled exception occurs in the main logic."""
+        calls = []
+
+        def fake_call_pi(prompt, model="x", pi_bin="x", **kwargs):
+            raise RuntimeError("Pi crashed")
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        rc = cmd_issue("SA-EXCEPT", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-EXCEPT"]]
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected completed update after exception, got: {wl_updates}"
+        )

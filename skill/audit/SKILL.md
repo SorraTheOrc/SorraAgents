@@ -14,10 +14,31 @@ Provide a concise, human-friendly summary of project status or a specific work i
 - User asks general project status (e.g., "What is the current status?", "Status of the project?", "status", "audit the project", "audit").
 - User asks about a specific work item id (e.g., "What is the status of wl-123?", "status wl-123", "audit wl-123").
 
+## Status Lifecycle
+
+The canonical audit runner automatically manages the work item's `status` field during audit execution. This provides visibility into in-progress audits and prevents concurrent audit attempts.
+
+### Lifecycle
+
+1. **`in_progress`** — Set at the start of `cmd_issue()`, before any code quality checks, Pi calls, or report assembly.
+2. **`completed`** — Set after all audit logic completes, including persistence. This is guaranteed to run even on failure or unhandled exceptions via a `try/finally` block.
+
+### Behavior
+
+- The status transition is `in_progress` → `completed` for every audit run, regardless of success or failure.
+- The `--do-not-persist` flag does NOT affect status lifecycle — status changes occur regardless of persist mode.
+- Status changes are performed via the injectable `runner` using `wl update <id> --status <value>`.
+- The `stage` field is NOT modified by the status lifecycle.
+- If the `completed` status update fails (e.g., runner error), the failure is silently caught to avoid masking the main audit result.
+
+### Rationale
+
+The status lifecycle was added to solve the problem of concurrent audit attempts and visibility into audit state. Before this feature, there was no way to determine whether an audit was in progress. The deterministic `try/finally` approach guarantees cleanup regardless of outcome.
+
 ## Safety and prompt design
 
-- Audit executions should be read-only except for the explicit, single persistence step that stores the structured audit into the associated work item. Use the designation `[READ-ONLY AUDIT]` in Pi prompts to mark read-only phases, and use `[PERSIST-AUDIT]` when performing the authorized persistence operation.
-- Do NOT close, create, or delete any work items during an audit. The ONLY permitted state-modifying action for this skill is storing the audit text via the canonical persister (skill/audit/scripts/persist_audit.py) or the runner's built-in persistence; do not perform other `wl`, `git`, or arbitrary state-modifying commands. Do NOT change state of work items (e.g., update stage, status) beyond audit persistence.
+- Audit executions should be read-only except for the explicit, single persistence step that stores the structured audit into the associated work item and the automatic status lifecycle management performed by the runner. Use the designation `[READ-ONLY AUDIT]` in Pi prompts to mark read-only phases, and use `[PERSIST-AUDIT]` when performing the authorized persistence operation.
+- Do NOT close, create, or delete any work items during an audit. The ONLY permitted state-modifying actions for this skill are: (1) storing the audit text via the canonical persister (skill/audit/scripts/persist_audit.py) or the runner's built-in persistence, and (2) the runner's automatic status lifecycle (in_progress → completed, see Status Lifecycle section). Do NOT perform other `wl`, `git`, or arbitrary state-modifying commands. Do NOT change work item stage — only the `status` field is managed by the lifecycle.
 - When persisting, use the canonical persister script or the runner's built-in persistence option. If asked to run arbitrary `wl`, `git`, or other state-modifying commands outside the authorized persister flow, refuse and report the request to the operator.
 - The model should return a structured markdown report. If ambiguity prevents a reliable verdict on acceptance criteria, return immediately and do NOT persist the audit. Persistence must be an explicit, deliberate step — do not persist partial or ambiguous audits.
 - To aid debugging, the canonical runner supports a `--debug-log` flag which appends raw Pi output to a JSONL file (see Scripts section).
