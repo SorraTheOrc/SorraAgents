@@ -1130,3 +1130,17 @@ class TestErrorHandling:
         for invalid in [None, "", "invalid", 1, [], {}]:
             result = severity_to_priority(invalid)
             assert result == "medium", f"Expected 'medium' for {invalid!r}, got {result!r}"
+
+
+class TestDocHygiene:
+    """Doc hygiene tests for SKILL.md."""
+
+    SKILL_MD = Path(__file__).resolve().parent.parent.parent / "skill" / "refactor" / "SKILL.md"
+
+    def test_skill_md_has_status_management_instructions(self):
+        """SKILL.md must include instructions for capturing and restoring status."""
+        content = self.SKILL_MD.read_text()
+        assert "wl show" in content, "SKILL.md must include wl show command for capturing status"
+        assert "in_progress" in content, "SKILL.md must reference setting status to in_progress"
+        assert "original status" in content.lower() or "starting status" in content.lower(), \
+            "SKILL.md must reference restoring the original status"
