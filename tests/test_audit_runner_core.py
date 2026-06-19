@@ -1013,7 +1013,7 @@ class TestStatusLifecycle:
             fake_call_pi,
         )
 
-        rc = cmd_issue("SA-EXCEPT", runner=self._fake_runner_with_calls(calls), persist=False)
+        cmd_issue("SA-EXCEPT", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-EXCEPT"]]
         completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]

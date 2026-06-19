@@ -11,7 +11,25 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 ## When To Use
 
+### 1. Scan for a work item ID
+
+Search the user's request for a pattern matching `[A-Z]{2}-[A-Z0-9]+` (e.g., `CG-0MM1OPSGM052NPUN`, `WL-123`, `SA-0ABC...`).
+
+- **If found:** Store it as `<work-item-id>` and proceed to step 3 (item-level audit).
+- **If not found:** Proceed to step 2 (project-level audit).
+
+> **Pre-flight affirmation:** State to yourself: `"Proceeding with audit of: <work-item-id>"` or `"Proceeding with project-level audit."` If the ID pattern matched but looks ambiguous, re-scan the request.
+
+### 2. No ID found (project-level audit)
+
+Run `wl list --json`, `wl in_progress --json`, `wl blocked --json`, and compile a project-level summary. Applicable when:
 - User asks general project status (e.g., "What is the current status?", "Status of the project?", "status", "audit the project", "audit").
+
+> **Verify absence before proceeding:** Confirm that no line in the user's message contains a string matching `[A-Z]{2}-[A-Z0-9]+\b`. If one is found, return to step 1 and extract it.
+
+### 3. ID found (item-level audit)
+
+Run `wl show <id> --children --json` and compile a focused report on that specific work item. Applicable when:
 - User asks about a specific work item id (e.g., "What is the status of wl-123?", "status wl-123", "audit wl-123").
 
 ## Status Lifecycle

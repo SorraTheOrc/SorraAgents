@@ -244,6 +244,10 @@ class TestAuditRunnerReportOnPersistFailure:
     def test_wl_failure_returns_1(self):
         """When wl show fails, cmd_issue returns 1."""
         def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            # Let status lifecycle updates succeed
+            if "--status" in cmd_list:
+                return _fake_proc(stdout=json.dumps({"success": True}))
             return _fake_proc(returncode=1, stderr="work item not found")
 
         rc = cmd_issue("SA-MISSING", runner=fake_runner)
@@ -323,6 +327,10 @@ class TestExitCodes:
 
     def test_wl_failure_returns_1(self):
         def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            # Let status lifecycle updates succeed
+            if "--status" in cmd_list:
+                return _fake_proc(stdout=json.dumps({"success": True}))
             return _fake_proc(returncode=1, stderr="wl not found")
         rc = cmd_issue("SA-MISSING", runner=fake_runner)
         assert rc == 1

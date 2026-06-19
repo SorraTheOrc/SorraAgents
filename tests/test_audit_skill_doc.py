@@ -174,7 +174,8 @@ class TestAuditSkillSafetyInstructions:
     def test_no_wl_state_commands_prohibition(self):
         """SKILL.md must prohibit executing wl commands that change state."""
         text = _skill_md_text()
-        assert "wl" in text and "change state" in text
+        assert "wl" in text
+        assert "state-modifying" in text or "change state" in text
 
     def test_structured_markdown_report_instruction(self):
         """SKILL.md must instruct the model to produce only a structured markdown report."""
@@ -192,3 +193,42 @@ class TestAuditSkillSafetyInstructions:
         text = _skill_md_text()
         assert "refuse" in text.lower()
         assert "wl" in text
+
+
+class TestAuditSkillWorkItemIdDetection:
+    """Assert that SKILL.md contains explicit work item ID detection instructions."""
+
+    def test_regex_pattern_present(self):
+        """SKILL.md must include explicit regex for work item ID detection."""
+        text = _skill_md_text()
+        assert "[A-Z]{2}-[A-Z0-9]+" in text or "[A-Z]{2}-[A-Z0-9]+\\b" in text
+
+    def test_pre_flight_affirmation_present(self):
+        """SKILL.md must include a pre-flight affirmation step."""
+        text = _skill_md_text()
+        assert "Pre-flight affirmation" in text
+
+    def test_verification_guard_present(self):
+        """SKILL.md must include a verification guard before project-level path."""
+        text = _skill_md_text()
+        assert "Verify absence before proceeding" in text
+
+    def test_scan_match_branch_structure(self):
+        """SKILL.md must use active 'scan → match → branch' structure."""
+        text = _skill_md_text()
+        assert "Scan for a work item ID" in text
+        assert "No ID found" in text
+        assert "ID found" in text
+
+    def test_item_level_routes_to_wl_show(self):
+        """SKILL.md must route item-level audits to `wl show`."""
+        text = _skill_md_text()
+        # Verify the item-level path references wl show with children
+        assert "wl show" in text
+        assert "--children" in text
+
+    def test_project_level_routes_to_wl_list(self):
+        """SKILL.md must route project-level audits to `wl list`."""
+        text = _skill_md_text()
+        assert "wl list" in text
+        assert "wl in_progress" in text
