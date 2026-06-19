@@ -85,6 +85,13 @@ The command implements the procedural workflow below. Each numbered step is part
   - `extract_wl_id() { printf '%s\n' "$1" | grep -o -E "${prefix}-?[0-9]+" | head -n1; }`
   - `work_item_id=$(extract_wl_id "$title"); [ -n "$work_item_id" ] || work_item_id=$(extract_wl_id "$branch"); [ -n "$work_item_id" ] || work_item_id=$(extract_wl_id "$body")`
 
+1. Manage work item status (agent responsibility)
+
+- **Capture** the current status of the canonical work item before making any changes: `wl show <work_item_id> --json` (extract the `status` field).
+- **Set** the status to `in_progress` to signal the item is being processed: `wl update <work_item_id> --status in_progress`.
+- At the end of the review (after cleanup steps), **reset** the status to the original status: `wl update <work_item_id> --status <original-status>`.
+- Stage is NOT modified by this command. Only `--status` is used.
+
 1. Ensure a Review child work item exists (agent responsibility)
 
 - Confirm the canonical work item has a child titled "Review PR #<pr number>". This child is used to track the specific review task and record audit comments if desired.
