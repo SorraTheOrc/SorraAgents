@@ -18,6 +18,7 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 - skill/: skill templates and utilities to scaffold and package agent skills (see [skill/skill-creator/SKILL.md](skill/skill-creator/SKILL.md)).
   - [skill/skills-script-paths.md](skill/skills-script-paths.md): Best practices for referencing scripts and assets from skills.
   - [skill/planall/](skill/planall/): PlanAll — automated batch planning for intake_complete work items.
+  - [skill/intakeall/](skill/intakeall/): IntakeAll — automated batch intake for idea-stage work items.
 - plugins/: local agent framework plugins used by this repository (includes `ralph` compaction plugin).
 - docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)).
 - Workflow.md: high-level workflow for using this repository.
@@ -66,6 +67,29 @@ python3 skill/planall/scripts/planall.py --parent-id SA-0MQA6ECEU003GUKH
 ```
 
 See [skill/planall/SKILL.md](skill/planall/SKILL.md) for full documentation.
+
+## IntakeAll — Automated Batch Intake
+
+The IntakeAll skill (`skill/intakeall/`) provides automated batch intake for work items
+in `idea` stage. It discovers all eligible items, auto-completes well-defined items,
+invokes `/intake` for each sequentially, detects items that require producer input,
+attempts error recovery, and produces a summary report.
+
+```bash
+# Process all idea-stage items
+python3 skill/intakeall/scripts/intakeall.py
+
+# JSON output for programmatic use
+python3 skill/intakeall/scripts/intakeall.py --json
+
+# Dry run (simulate without changes)
+python3 skill/intakeall/scripts/intakeall.py --dry-run
+
+# Post summary as a comment on a parent epic
+python3 skill/intakeall/scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
+```
+
+See [skill/intakeall/SKILL.md](skill/intakeall/SKILL.md) for full documentation.
 
 A useful debugging pattern is to focus Ralph on a single direct child work item:
 
