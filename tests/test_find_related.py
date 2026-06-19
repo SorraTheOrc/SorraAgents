@@ -667,3 +667,15 @@ def test_search_repo_scans_allowed_extensions(tmp_path):
         assert not f.endswith(".png"), f"Unexpected match: {f}"
         assert not f.endswith(".json"), f"Unexpected match: {f}"
         assert not f.endswith(".o"), f"Unexpected match: {f}"
+
+
+def test_skill_md_has_status_management_instructions():
+    """SKILL.md must include instructions for capturing and restoring status."""
+    skill_md = REPO_ROOT / "skill" / "find-related" / "SKILL.md"
+    content = skill_md.read_text()
+
+    # Must contain the capture step
+    assert "wl show" in content, "SKILL.md must include wl show command for capturing status"
+    assert "status" in content.lower(), "SKILL.md must mention status"
+    assert "in_progress" in content, "SKILL.md must reference setting status to in_progress"
+    assert "original status" in content.lower() or "starting status" in content.lower() or "original" in content.lower(), "SKILL.md must reference restoring the original status"

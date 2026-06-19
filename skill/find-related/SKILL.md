@@ -28,6 +28,16 @@ that is inserted into the work item description under a clearly-marked section.
   - reportInserted (boolean)
   - updatedDescription (string)
 
+## Status management
+
+This skill manages the work item status during execution to signal that the item is being processed.
+
+1. **Capture** the current status before making any changes: `wl show <id> --json` (extract the `status` field).
+2. **Set** the status to `in_progress` at the start of execution: `wl update <id> --status in_progress`.
+3. **Reset** the status to the original value at the end of execution (whether success or failure): `wl update <id> --status <original-status>`.
+
+> Stage is NOT modified by this skill. Only `--status` is used.
+
 ## Decision logic
 
 1. Fetch work item: `wl show <id> --json`.
