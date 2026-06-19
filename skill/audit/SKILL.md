@@ -23,6 +23,7 @@ Search the user's request for a pattern matching `[A-Z]{2}-[A-Z0-9]+` (e.g., `CG
 ### 2. No ID found (project-level audit)
 
 Run `wl list --json`, `wl in_progress --json`, `wl blocked --json`, and compile a project-level summary. Applicable when:
+
 - User asks general project status (e.g., "What is the current status?", "Status of the project?", "status", "audit the project", "audit").
 
 > **Verify absence before proceeding:** Confirm that no line in the user's message contains a string matching `[A-Z]{2}-[A-Z0-9]+\b`. If one is found, return to step 1 and extract it.
@@ -30,6 +31,7 @@ Run `wl list --json`, `wl in_progress --json`, `wl blocked --json`, and compile 
 ### 3. ID found (item-level audit)
 
 Run `wl show <id> --children --json` and compile a focused report on that specific work item. Applicable when:
+
 - User asks about a specific work item id (e.g., "What is the status of wl-123?", "status wl-123", "audit wl-123").
 
 ## Status Lifecycle
@@ -65,7 +67,7 @@ The status lifecycle was added to solve the problem of concurrent audit attempts
 
 The audit follows a strict two-phase pipeline:
 
-```
+```text
 Phase 1: Automated Screening
   ├─ Code quality check (linters)
   ├─ Children stage check
@@ -160,7 +162,7 @@ Examples:
 
 | # | Criterion | Verdict | Evidence |
 |---|-----------|---------|----------|
-| 1 | <criterion text> | met/unmet/partial/adjusted | <file_path:line_number — one-line note> |
+| 1 | `<criterion text>` | met/unmet/partial/adjusted | `<file_path:line_number — one-line note>` |
 
 <If no acceptance criteria were found, write: "No acceptance criteria defined.">
 
@@ -170,22 +172,22 @@ When one or more acceptance criteria have verdict `adjusted`, a **Variance Decis
 
 | # | Source | Criterion | Justification |
 |---|--------|-----------|---------------|
-| 1 | parent or child (<id>) | <criterion text> | <justification> |
+| 1 | parent or child (`<id>`) | `<criterion text>` | `<justification>` |
 
 <This section is only included when at least one criterion has verdict `adjusted`; otherwise it is omitted.>
 
 **Variance decision template:**
 
-- **AC<#> adjusted to allow <description of adjustment>.**
-- **Justification:** <why the variance is acceptable — user story intent preserved, quality standards met>
+- **AC`<#>` adjusted to allow `<description of adjustment>`.**
+- **Justification:** `<why the variance is acceptable — user story intent preserved, quality standards met>`
 
 ## Children Status
 
-### <child-title> (<child-id>) — <status>/<stage>
+### `<child-title>` (`<child-id>`) — `<status>`/`<stage>`
 
 | # | Criterion | Verdict | Evidence |
 |---|-----------|---------|----------|
-| 1 | <criterion text> | met/unmet/partial/adjusted | <file_path:line_number — one-line note> |
+| 1 | `<criterion text>` | met/unmet/partial/adjusted | `<file_path:line_number — one-line note>` |
 
 <If there are no children, write: "No children.">
 
@@ -195,7 +197,7 @@ This section is automatically added by the audit runner when code quality checks
 
 *If no code quality issues found:*
 
-```
+```text
 No code quality issues found.
 ```
 
