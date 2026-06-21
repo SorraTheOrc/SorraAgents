@@ -20,18 +20,21 @@ recorded in this document.
 
 ## Branch Model
 
-| Branch          | Purpose                                          |
-|-----------------|--------------------------------------------------|
-| `main`          | Always releasable; production-ready code.        |
-| `dev`           | Integration branch; agents push completed work here. |
-| `wl-<id>-<desc>`| Feature branches; one per work item.             |
+| Branch / Worktree | Purpose                                                                  |
+|-------------------|--------------------------------------------------------------------------|
+| `main`            | Always releasable; production-ready code.                                |
+| `dev`             | Integration branch; agents push completed work here (from worktrees).    |
+| `wl-<id>-<desc>`  | Feature branches (one per work item) inside a worktree.                  |
 
-Agents work in feature branches, push to `dev`, and the Release Manager
-promotes `dev` → `main` after review.
+Agents work in worktrees with feature branches (see the [[concepts/git-worktree-best-practices-for-agent-workflows]] wiki page for the canonical workflow), push to `dev`, and the Release Manager promotes `dev` → `main` after review.
+
+The release/ship process operates from the **main checkout** (not a worktree).
+Implementation agents create worktrees for feature work; after pushing to dev,
+they clean up the worktree and return to the main checkout.
 
 ## Overview
 
-- Agents work in feature branches and push completed work to `dev` as the integration step.
+- Agents work in worktrees with feature branches and push completed work to `dev` as the integration step. See the [[concepts/git-worktree-best-practices-for-agent-workflows]] wiki page for the canonical worktree workflow.
 - CI validates `dev` on every change.
 - A human reviewer inspects CI results and triggers the merge from `dev` → `main`.
 - `main` must always be releasable.
