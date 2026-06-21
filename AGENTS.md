@@ -55,7 +55,7 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      - If the operator has allowed further questions ask for clarification on specific requirements, acceptance criteria, and context. Where possible provide suggested responses, but always allow for a free form text response.
      - If the operator has not allowed further questions attempt to clarify the requirements based on the existing information in the repository and worklog.
      - Update the work-item description and acceptance criteria with any clarifications found with `wl update <WIP-id> --description "<updated-description>"`. DO NOT remove existing content unless it is incorrect, ONLY add to it with appropriate clarifications.
-   - Create a new branch for the work-item following the branch naming conventions (e.g. `wl-<WIP-id>-short-description`)
+   - Create a worktree for the work-item with a new branch following the naming conventions (e.g., `wl-<WIP-id>-short-description`). See the canonical [[concepts/git-worktree-best-practices-for-agent-workflows]] wiki page for the worktree workflow (create, use, push, clean up).
    - Complete all work required to meet the acceptance criteria (code, tests, documentation, etc.)
      - If new work-items are discovered during implementation create new work-items using `wl create "<work-item-title>" --description "<detailed-description-of-goals-and-context>" --issue-type <type-of-work-item> --json`. If the item must be completed in order to satisfy the requirements of the parent work-item, make the new item a child of the parent work-item using `--parent <parent-id>`. If it is an optional item make it a sibling of the <base-item-id> and add a reference to the base item in the description using `discovered-from:<base-item-id>`.
      - Regularly build the project and run all tests and checks to ensure nothing is broken. Always follow the build → test → commit order: build first, then test, then commit.
@@ -70,9 +70,18 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      from `dev` to `main`. See [skill/ship/SKILL.md](skill/ship/SKILL.md) for
      the push-to-dev workflow and `scripts/release/merge-dev-to-main.sh` for
      the dev→main release process.
-   - After pushing, switch to the `dev` branch locally and pull the latest:
+   - After pushing, clean up the worktree:
 
      ```bash
+     git worktree remove .worklog/worktrees/<worktree-name>
+     git worktree prune
+     ```
+
+     This keeps the repository free of stale worktrees between sessions.
+     Then switch to the `dev` branch in the main checkout and pull the latest:
+
+     ```bash
+     cd /path/to/repo/root
      git checkout dev
      git pull origin dev
      ```
@@ -107,6 +116,15 @@ Follow thhe steps below when completing tasks. If you are already working on a s
    - If the operator wishes to address any remaining tasks, return to the `Claim the work-item` with the selected work-item id as the new <base-item-id>.
    - When the operator indicates that the session is complete, ensure all work-items created or worked on during the session are in the `in_review` or `done` stage.
    - Provide a final summary to the operator of all work completed during the session, including work-item ids, commit hashes, and any relevant links.
+   - Clean up the worktree if not already removed:
+
+     ```bash
+     git worktree prune
+     rm -rf .worklog/worktrees/<worktree-name>
+     ```
+
+     See the [[concepts/git-worktree-best-practices-for-agent-workflows]]
+     wiki page for the full worktree lifecycle.
    - Thank the operator and end the session.
    <!-- WORKFLOW: end -->
 
