@@ -55,6 +55,7 @@ any sensitive values before writing them to logs or comments.
 - If the work item is not well-defined, do not proceed with implementation. Instead, run the intake interview to clarify and update the work item before implementing.
 - If the work item has blockers or dependencies, implement those first before proceeding with the main work item.
 - Never commit directly to `main`. Always create a feature or bug branch for implementation.
+- When implementing, create a worktree first, then branch inside it. See the canonical [[concepts/git-worktree-best-practices-for-agent-workflows]] wiki page for the worktree workflow.
 - When implementing a CLI or API always provide a way to obtain a JSON formatted output for agents to consume.
 - When creating branches, include the work item id in the branch name for traceability (e.g., `feature/WL-123-add-auth`).
 - When creating a commit message, review the diff and write a concise message summarizing the changes made and the reason for the change, referencing the work item id.
@@ -110,12 +111,24 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - If you ran the plan interview, convert this work item to an epic and inform the user that implementation should move to the first child work item created.
 - If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
 
-1. Create a working branch
+1. Create a working branch (inside a worktree)
 
-- Inspect the current branch name via `git rev-parse --abbrev-ref HEAD`.
-- If the current branch was created for a work item that is an ancestor of <work-item-id>, continue on that branch (that is if the name has an ancestor work item id).
-- Otherwise create or switch to a branch named `feature/<work-item-id>-<short>` or `bug/<work-item-id>-<short>` (include the work item id).
+- Create a worktree following the conventions in [[concepts/git-worktree-best-practices-for-agent-workflows]]:
+
+  ```bash
+  git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-id>-<short-slug> dev
+  ```
+
+- Change into the worktree directory:
+
+  ```bash
+  cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
+  ```
+
+- This creates an isolated working directory with a new branch already checked out.
+  The branch name includes the work item id for traceability.
 - Never commit directly to `main`.
+- See [AGENTS.md](../../AGENTS.md#implement-the-work-item) for the top-level policy on worktree-first implementation.
 
 1. Implement
 
@@ -197,7 +210,15 @@ refactor step may be invoked to detect and remediate code smells:
   - Using the ship skill: `pushToDev()` from `skill/ship/scripts/ship.js` (preferred)
   - Direct git command: `git push origin HEAD:refs/heads/dev`
   - The push target `dev` is **not** a protected branch; the `.githooks/pre-push` hook only blocks `main`, `master`, and `HEAD`.
-- After pushing, switch to the `dev` branch locally and pull the latest:
+- After pushing, clean up the worktree:
+
+  ```bash
+  cd /path/to/repo/root
+  git worktree remove .worklog/worktrees/wl-<WIP-id>-<short-slug>
+  git worktree prune
+  ```
+
+  Then switch to the `dev` branch in the main checkout and pull the latest:
 
   ```bash
   git checkout dev
@@ -205,6 +226,7 @@ refactor step may be invoked to detect and remediate code smells:
   ```
 
   This ensures subsequent operations begin from the current HEAD of the integration branch.
+  See [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full worktree lifecycle.
 - Add a work-item comment recording the commit hash and that the work has been pushed to dev:
   `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>. The work-item stays open until the release process merges dev to main." --author "<AGENT>" --json`
 - Close your response to the operator with:
