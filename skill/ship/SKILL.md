@@ -168,13 +168,15 @@ node skill/ship/scripts/run-release.js --skip-checks
 
 ## Push-to-Dev Workflow
 
-Agents work in feature branches and push completed work into the `dev` integration branch. This is the canonical integration action.
+Agents work in worktrees with feature branches and push completed work into the `dev` integration branch. This is the canonical integration action.
 
-1. **Create a feature branch** using `makeBranchName(workItemId, shortDesc)` from `skill/ship/scripts/git-helpers.js`.
-2. **Make changes and commit** on the feature branch.
+See [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full worktree workflow (create, use, push, clean up) and [AGENTS.md](../../AGENTS.md#implement-the-work-item) for the top-level policy.
+
+1. **Create a worktree with a feature branch** inside `.worklog/worktrees/` using the naming convention from `makeBranchName(workItemId, shortDesc)` in `skill/ship/scripts/git-helpers.js`.
+2. **Make changes and commit** inside the worktree.
 3. **Validate** the current branch name with `validateBranchName(name)`.
 4. **Check for unmerged branches** using `checkUnmergedBranches()` (also run automatically by `pushToDev()`).
-5. **Push to dev** using `pushToDev()` from `skill/ship/scripts/ship.js`. This:
+5. **Push to dev** from inside the worktree using `pushToDev()` from `skill/ship/scripts/ship.js`. This:
    - Validates the push target is not a protected branch
    - Rejects force-push
    - Checks for unmerged branches (gating step)
@@ -273,6 +275,12 @@ The script performs the following steps:
    - Runs `git merge origin/main`
    - Runs `git push origin dev`
 
+   **Note**: Release operations run from the **main checkout** (not a
+   worktree). Implementation agents use worktrees for feature work; the
+   release/ship process operates on the canonical `dev` branch in the main
+   checkout. After pushing from a worktree, agents should clean up the
+   worktree and return to the main checkout.
+
 ### Fallback: Human Release Manager
 
 For repositories where the automated merge is not suitable, a **human Release Manager** can perform the release
@@ -327,12 +335,14 @@ test commands to run locally.
 
 ## Integration with AGENTS.md
 
-The per-work-item merge workflow in AGENTS.md (step 6) describes PR-based merging into `main`. This skill's `pushToDev()` function handles the **dev integration step** that happens *before* the final PR to `main`:
+The per-work-item merge workflow in [AGENTS.md](../../AGENTS.md) describes PR-based merging into `main`. This skill's `pushToDev()` function handles the **dev integration step** that happens *before* the final PR to `main`:
 
-1. Agent implements work on a feature branch → commits → builds → tests
-2. Agent calls `pushToDev()` to integrate into `dev`
-3. CI runs on `dev`
-4. Release Manager merges `dev` → `main` via PR (see AGENTS.md step 6)
+1. Agent implements work inside a worktree → commits → builds → tests
+2. Agent calls `pushToDev()` from within the worktree to integrate into `dev`
+3. After pushing, the agent cleans up the worktree (see [[concepts/git-worktree-best-practices-for-agent-workflows]])
+4. Agent switches to the main checkout's `dev` branch
+5. CI runs on `dev`
+6. Release Manager merges `dev` → `main` via PR (see AGENTS.md step 6)
 
 ## Outputs
 
