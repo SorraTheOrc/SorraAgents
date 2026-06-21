@@ -1,63 +1,6 @@
 {
-  "providers": {
-    "Proxy": {
-      "api": "openai-completions",
-      "baseUrl": "http://100.79.231.101:8000/v1",
-      "apiKey": "not_needed",
-      "compat": {
-        "supportsDeveloperRole": false,
-        "supportsUsageInStreaming": true,
-        "sendSessionAffinityHeaders": true
-      },
-      "options": {
-        "timeout": 600000
-      },
-      "models": [
-        {
-          "id": "qwen3",
-          "name": "Qwen3 Coder Next",
-          "reasoning": true,
-          "contextWindow": 131072,
-          "maxTokens": 32768,
-          "compat": {
-            "thinkingFormat": "qwen"
-          }
-        },
-        {
-          "id": "gemma4",
-          "name": "Gemma 4",
-          "reasoning": true,
-          "contextWindow": 131072,
-          "maxTokens": 32768
-        },
-        {
-          "id": "gpt120",
-          "name": "GPT-OSS 120B (Casey)",
-          "reasoning": true,
-          "contextWindow": 131072,
-          "maxTokens": 32768
-        }
-      ]
-    },
-    "LocalNPU": {
-      "api": "openai-completions",
-      "baseUrl": "http://100.73.107.128:52243/api/v1/openai",
-      "apiKey": "F7FCK9C-FYW4FF0-QZXM1YC-DZ7C1Q3",
-      "options": {
-        "timeout": 1200000
-      },
-      "models": [
-        {
-          "id": "sorra-orchestrator",
-          "name": "AnythingLLM Orchestrator",
-          "reasoning": true
-        }
-       ]
-    },
-    "LocalAI": {
-      "api": "openai-completions",
-      "baseUrl": "http://localhost:52243/api/v1",
-      "apiKey": "F7FCK9C-FYW4FF0-QZXM1YC-DZ7C1Q3"
-    }
+  "llama_v3_2_3b_chat_8k": {
+    "base_url": "http://localhost:52243",
+    "api_key": "F7FCK9C-FYW4FF0-QZXM1YC-DZ7C1Q3"
   }
 }
