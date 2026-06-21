@@ -444,11 +444,11 @@ class TestMaxFlag:
             stdout=SAMPLE_WL_LIST_RESPONSE,
         )
         runner.set_response(
-            f"wl update SA-IMPL-001 --status",
+            "wl update SA-IMPL-001 --status",
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi run /skill:implement SA-IMPL-001",
+            "pi run /skill:implement SA-IMPL-001",
             stdout=json.dumps({"success": True}),
         )
 

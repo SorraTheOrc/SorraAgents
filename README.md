@@ -19,6 +19,7 @@ A lightweight collection of workflow guides, command patterns, and skill templat
   - [skill/skills-script-paths.md](skill/skills-script-paths.md): Best practices for referencing scripts and assets from skills.
   - [skill/planall/](skill/planall/): PlanAll — automated batch planning for intake_complete work items.
   - [skill/intakeall/](skill/intakeall/): IntakeAll — automated batch intake for idea-stage work items.
+  - [skill/implementall/](skill/implementall/): ImplementAll — automated batch implementation for plan_complete work items.
 - plugins/: local agent framework plugins used by this repository (includes `ralph` compaction plugin).
 - docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)).
 - Workflow.md: high-level workflow for using this repository.
@@ -90,6 +91,32 @@ python3 skill/intakeall/scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
 ```
 
 See [skill/intakeall/SKILL.md](skill/intakeall/SKILL.md) for full documentation.
+
+## ImplementAll — Automated Batch Implementation
+
+The ImplementAll skill (`skill/implementall/`) provides automated batch implementation
+for work items in `plan_complete` stage. It discovers all eligible items, invokes
+`/skill:implement` for each sequentially, detects items that require producer input,
+attempts error recovery on failures, and produces a summary report.
+
+```bash
+# Process all plan_complete items
+python3 skill/implementall/scripts/implementall.py
+
+# JSON output for programmatic use
+python3 skill/implementall/scripts/implementall.py --json
+
+# Dry run (simulate without changes)
+python3 skill/implementall/scripts/implementall.py --dry-run
+
+# Process at most 5 items
+python3 skill/implementall/scripts/implementall.py --max 5
+
+# Post summary as a comment on a parent epic
+python3 skill/implementall/scripts/implementall.py --parent-id SA-0MQO6YMZ3006N5MG
+```
+
+See [skill/implementall/SKILL.md](skill/implementall/SKILL.md) for full documentation.
 
 A useful debugging pattern is to focus Ralph on a single direct child work item:
 
