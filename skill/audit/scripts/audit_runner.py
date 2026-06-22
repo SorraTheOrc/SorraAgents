@@ -44,17 +44,20 @@ from skill.scripts.failure_notice import FailureNotice  # noqa: E402
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
 
-CALL_PI_TIMEOUT = 100
+CALL_PI_TIMEOUT = 600
 """Internal timeout (seconds) for each Pi model subprocess call.
 
-Must be less than the parent bash-tool execution timeout (~120s) to ensure
-the Pi call times out internally and produces a clean diagnostic before the
-parent kills the process externally (which would result in a silent failure).
-The value 100s provides ~20s margin below 120s.
+This is a generous safety net for individual Pi model calls during audit
+processing. Large audit prompts can take several minutes, so the timeout
+must be high enough to not interrupt normal operation.
 
-If this value is changed, ensure it remains at least 20s below the actual
-parent timeout to allow for cumulative operations (child audits, report
-assembly, persistence) to complete after the last Pi call.
+The cumulative elapsed-time guard in ``cmd_issue`` (110s threshold for
+child audit skipping) provides the primary protection against the parent
+bash-tool execution timeout (~120s), not this per-call timeout.
+
+If the Pi model itself takes longer than this value, something is likely
+wrong (model hang, provider issue) and the timeout diagnostic should be
+produced rather than blocking indefinitely.
 """
 
 # Verdict constants

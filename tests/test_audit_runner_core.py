@@ -580,25 +580,31 @@ class TestDebugLogging:
 # ---------------------------------------------------------------------------
 
 class TestCallPiTimeoutConstant:
-    """Verify the CALL_PI_TIMEOUT constant exists and is set to a safe value."""
+    """Verify the CALL_PI_TIMEOUT constant exists and is generously sized.
+
+    The per-call timeout is a safety net for individual Pi model calls.
+    The primary protection against the parent bash-tool timeout (~120s)
+    is the cumulative elapsed-time guard in cmd_issue (110s threshold
+    for skipping remaining child audits), not this per-call timeout.
+    """
 
     def test_call_pi_timeout_constant_exists(self):
         """CALL_PI_TIMEOUT must be defined."""
         assert CALL_PI_TIMEOUT is not None
         assert isinstance(CALL_PI_TIMEOUT, int)
 
-    def test_call_pi_timeout_under_120_seconds(self):
-        """Timeout must be under 120s (parent tool timeout)."""
-        assert CALL_PI_TIMEOUT < 120, (
-            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} must be < 120s "
-            "to fire before the parent bash-tool timeout"
+    def test_call_pi_timeout_generous_for_large_prompts(self):
+        """Timeout must be generous (>= 300s) so large audit prompts complete."""
+        assert CALL_PI_TIMEOUT >= 300, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} must be >= 300s "
+            "to allow large audit prompts to complete"
         )
 
-    def test_call_pi_timeout_reasonable_for_large_prompts(self):
-        """Timeout should be at least 60s to allow large audit prompts."""
-        assert CALL_PI_TIMEOUT >= 60, (
-            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be >= 60s "
-            "to allow large audit prompts to complete"
+    def test_call_pi_timeout_not_excessive(self):
+        """Timeout should still have a reasonable upper bound."""
+        assert CALL_PI_TIMEOUT <= 900, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 900s "
+            "to bound the original indefinite-hang risk"
         )
 
 

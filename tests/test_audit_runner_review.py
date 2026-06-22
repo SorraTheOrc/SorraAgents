@@ -178,8 +178,8 @@ class TestCallPi:
             f"Evidence should mention manual audit: {evidence}"
         )
 
-    def test_call_pi_timeout_under_120_seconds(self, monkeypatch):
-        """The communicate timeout should be under 120s (parent tool timeout)."""
+    def test_call_pi_timeout_is_generous(self, monkeypatch):
+        """The communicate timeout should be generous (>= 300s) for large prompts."""
         captured_timeout = [None]
         call_count = [0]
 
@@ -203,13 +203,13 @@ class TestCallPi:
         _call_pi("test prompt", model="test/model")
 
         assert captured_timeout[0] is not None, "communicate should receive a timeout value"
-        assert captured_timeout[0] < 120, (
-            f"communicate timeout {captured_timeout[0]}s should be under 120s "
-            "to ensure the Pi call times out before the parent tool kill"
-        )
-        assert captured_timeout[0] >= 20, (
-            f"communicate timeout {captured_timeout[0]}s should be at least 20s "
+        assert captured_timeout[0] >= 300, (
+            f"communicate timeout {captured_timeout[0]}s should be >= 300s "
             "to allow large audit prompts to complete"
+        )
+        assert captured_timeout[0] <= 900, (
+            f"communicate timeout {captured_timeout[0]}s should be <= 900s "
+            "(not exceed the original value)"
         )
 
 
