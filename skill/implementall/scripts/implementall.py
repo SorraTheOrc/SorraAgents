@@ -20,7 +20,16 @@ import json
 import logging
 import subprocess
 import sys
+import traceback
+from pathlib import Path
 from typing import Any, Callable, Sequence
+
+# Add repo root to sys.path for shared utility access
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from skill.scripts.failure_notice import FailureNotice
 
 logger = logging.getLogger("implementall")
 
@@ -332,7 +341,11 @@ class ImplementAllEngine:
             results: The list of processing results.
             parent_id: If provided, post the summary as a comment on this item.
         """
-        summary_md = generate_summary(results, json_output=False)
+        summary_md = _wrap_with_failure_notice_if_needed(
+            generate_summary(results, json_output=False),
+            results,
+            script_name="implementall.py",
+        )
         print(summary_md)
 
         if parent_id:
@@ -356,6 +369,18 @@ class ImplementAllEngine:
 # ---------------------------------------------------------------------------
 # Summary generation
 # ---------------------------------------------------------------------------
+
+def _wrap_with_failure_notice_if_needed(report: str, results: list[dict],
+                                       script_name: str = "implementall.py") -> str:
+    """Wrap the report with a FailureNotice if any results have errors."""
+    errors = sum(1 for r in results if r.get("outcome") == "error")
+    if errors == 0:
+        return report
+    return FailureNotice(
+        script_name=script_name,
+        reason=f"{errors} item(s) failed during batch implementation",
+    ).wrap(report)
+
 
 def generate_summary(results: list[dict], json_output: bool = False) -> str:
     """Generate a summary report from processing results.
@@ -476,6 +501,21 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Exit code (0 for success, 1 for error).
     """
+    try:
+        return _main(argv)
+    except Exception as exc:
+        notice = FailureNotice(
+            script_name="implementall.py",
+            reason=f"Unhandled exception: {exc}",
+            stderr_context=traceback.format_exc(),
+        )
+        print(notice.wrap(
+            f"An unexpected error occurred: {exc}"
+        ))
+        return 1
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 

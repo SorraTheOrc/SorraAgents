@@ -24,8 +24,17 @@ import argparse
 import json
 import logging
 import sys
+import traceback
 from pathlib import Path
 from typing import Any
+
+# Add repo root to sys.path for shared utility access
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from skill.scripts.failure_notice import FailureNotice
+
 
 # Ensure repo root is on sys.path
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -485,6 +494,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Main entry point for the refactor orchestration."""
+    try:
+        return _main(argv)
+    except Exception as exc:
+        notice = FailureNotice(
+            script_name="refactor.py",
+            reason=f"Unhandled exception: {exc}",
+            stderr_context=traceback.format_exc(),
+        )
+        print(notice.wrap(
+            f"An unexpected error occurred: {exc}"
+        ))
+        return 1
+
+
+def _main(argv: list[str] | None = None) -> int:
     """Main entry point for the refactor orchestration."""
     args = parse_args(argv)
 

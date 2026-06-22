@@ -21,6 +21,16 @@ Output: final JSON block written to stdout
 
 import sys
 import json
+import traceback
+from pathlib import Path
+
+# Add repo root to sys.path for shared utility access
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from skill.scripts.failure_notice import FailureNotice
+
 
 
 def level_from_score(score):
@@ -354,5 +364,21 @@ def main():
     print(json.dumps(final))
 
 
+def _run() -> None:
+    """Entry point with failure notice wrapping."""
+    try:
+        main()
+    except Exception as exc:
+        notice = FailureNotice(
+            script_name="orchestrate_estimate.py",
+            reason=f"Unhandled exception: {exc}",
+            stderr_context=traceback.format_exc(),
+        )
+        print(notice.wrap(
+            json.dumps({"error": str(exc)})
+        ))
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    main()
+    _run()

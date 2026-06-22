@@ -36,6 +36,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from skill.audit.scripts.persist_audit import persist_audit  # noqa: E402
+from skill.scripts.failure_notice import FailureNotice  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1109,6 +1110,7 @@ def _run_phase2_deep_analysis(
     resolved_model: str,
     pi_bin: str = "pi",
     debug_log: str | None = None,
+    script_failure_callback=None,
 ) -> tuple[list[dict], list[dict]]:
     """Run Phase 2 deep code analysis.
 
@@ -1155,6 +1157,8 @@ def _run_phase2_deep_analysis(
     except RuntimeError as exc:
         # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
         print(f"Warning: Phase 2 deep analysis failed: {exc}", file=sys.stderr)
+        if script_failure_callback:
+            script_failure_callback("pi (Phase 2 deep analysis)", exc)
         return ac_results, child_results
 
     # Parse the batched result
@@ -1311,6 +1315,29 @@ def cmd_issue(issue_id: str, persist: bool = True,
     if runner is None:
         runner = _default_runner
 
+    # Track script execution failures for prominent surfacing
+    script_failure: dict | None = None
+
+    def _record_script_failure(script_name: str, exc: Exception) -> None:
+        """Record a script execution failure into the enclosing scope.
+
+        Only records the first failure; subsequent failures are suppressed
+        to avoid overwriting the root cause.
+        """
+        nonlocal script_failure
+        if script_failure is not None:
+            return
+        reason = str(exc)
+        if isinstance(exc, subprocess.TimeoutExpired):
+            reason = f"Timeout after {exc.timeout}s"
+        elif isinstance(exc, FileNotFoundError):
+            reason = f"File not found: {exc.filename}"
+        script_failure = {
+            "script_name": script_name,
+            "reason": reason,
+            "stderr": str(exc),
+        }
+
     # ------------------------------------------------------------------
     # Status lifecycle: set in_progress on entry
     # ------------------------------------------------------------------
@@ -1320,7 +1347,23 @@ def cmd_issue(issue_id: str, persist: bool = True,
         try:
             data = _run_wl(runner, ["wl", "show", issue_id, "--children", "--json"])
         except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
+            _record_script_failure("wl show", exc)
+            print(f"Warning: wl show failed: {exc}", file=sys.stderr)
+            # Build a minimal failure report
+            fail_notice = FailureNotice(
+                script_name="wl show",
+                reason=str(exc),
+                stderr_context=str(exc),
+            )
+            fail_report = fail_notice.wrap(
+                f"Could not fetch work item {issue_id}. "
+                "No audit report could be generated."
+            )
+            if json_mode:
+                payload = {"error": str(exc), "script_failure": {"script_name": "wl show", "reason": str(exc)}}
+                print(json.dumps(payload, indent=2))
+            else:
+                print(fail_report)
             return 1
 
         work_item = data.get("workItem", {})
@@ -1372,8 +1415,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
             try:
                 result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
             except RuntimeError as exc:
-                print(str(exc), file=sys.stderr)
-                return 1
+                _record_script_failure("pi (parent AC review)", exc)
+                print(f"Warning: Pi call failed for parent AC review: {exc}", file=sys.stderr)
+                result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
             # Parse the batched result - try to extract JSON array from text
             # Use extracted_text (full response) instead of evidence (may be truncated)
             raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
@@ -1434,8 +1478,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 try:
                     result = _call_pi_and_maybe_log(issue_id, f"child:{child.get('id', '')}", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
                 except RuntimeError as exc:
-                    print(str(exc), file=sys.stderr)
-                    return 1
+                    _record_script_failure("pi (child AC review)", exc)
+                    print(f"Warning: Pi call failed for child AC review: {exc}", file=sys.stderr)
+                    result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
                 # Use extracted_text (full response) instead of evidence (may be truncated)
                 raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
                 batch = _extract_json_array(raw_text)
@@ -1528,6 +1573,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 resolved_model=resolved_model,
                 pi_bin=pi_bin,
                 debug_log=debug_log,
+                script_failure_callback=_record_script_failure,
             )
             phase2_completed = True
 
@@ -1556,6 +1602,15 @@ def cmd_issue(issue_id: str, persist: bool = True,
             phase2_completed=phase2_completed,
         )
 
+        # Wrap report with failure notice if any subprocess calls failed
+        if script_failure:
+            notice = FailureNotice(
+                script_name=script_failure["script_name"],
+                reason=script_failure["reason"],
+                stderr_context=script_failure["stderr"],
+            )
+            report = notice.wrap(report)
+
         if json_mode:
             payload = _build_issue_json(
                 work_item, ac_results, child_results,
@@ -1564,6 +1619,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 phase2_completed=phase2_completed,
             )
             payload["child_persist_results"] = child_persist_results
+            # Include script failure info in JSON output
+            if script_failure:
+                payload["script_failure"] = {
+                    "script_name": script_failure["script_name"],
+                    "reason": script_failure["reason"],
+                    "stderr": script_failure.get("stderr", ""),
+                }
             print(json.dumps(payload, indent=2))
         else:
             print(report, end="")
@@ -1616,12 +1678,45 @@ def cmd_project(pi_bin: str = "pi", model: str | None = None,
     if runner is None:
         runner = _default_runner
 
+    # Track script execution failures
+    script_failure: dict | None = None
+
+    def _record_script_failure(script_name: str, exc: Exception) -> None:
+        nonlocal script_failure
+        if script_failure is not None:
+            return
+        reason = str(exc)
+        if isinstance(exc, subprocess.TimeoutExpired):
+            reason = f"Timeout after {exc.timeout}s"
+        elif isinstance(exc, FileNotFoundError):
+            reason = f"File not found: {exc.filename}"
+        script_failure = {
+            "script_name": script_name,
+            "reason": reason,
+            "stderr": str(exc),
+        }
+
     try:
         data = _run_wl(runner, ["wl", "list", "--json"])
     except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+        _record_script_failure("wl list", exc)
+        fail_notice = FailureNotice(
+            script_name="wl list",
+            reason=str(exc),
+            stderr_context=str(exc),
+        )
+        fail_report = fail_notice.wrap(
+            "Could not fetch work items from Worklog. "
+            "No project audit could be generated."
+        )
+        if json_mode:
+            payload = {"error": str(exc), "script_failure": {"script_name": "wl list", "reason": str(exc)}}
+            print(json.dumps(payload, indent=2))
+        else:
+            print(fail_report)
         return 1
 
+    script_failure = None
     work_items = data.get("workItems", data) if isinstance(data, dict) else data
     in_progress = [w for w in work_items if w.get("status") == "in_progress"] if isinstance(work_items, list) else []
     blocked = [w for w in work_items if w.get("status") == "blocked"] if isinstance(work_items, list) else []
@@ -1655,14 +1750,28 @@ def cmd_project(pi_bin: str = "pi", model: str | None = None,
         if pi_result.get("verdict") == "met" and pi_result.get("evidence"):
             # Use Pi's response if parseable
             pass  # Could enhance this in future
-    except RuntimeError:
-        pass  # Pi failure is non-fatal for project mode
+    except RuntimeError as exc:
+        _record_script_failure("pi (project-level summary)", exc)
+        print(f"Warning: Pi call failed for project summary: {exc}", file=sys.stderr)
 
     if json_mode:
         payload = _build_project_json(summary, recommendation)
+        if script_failure:
+            payload["script_failure"] = {
+                "script_name": script_failure["script_name"],
+                "reason": script_failure["reason"],
+                "stderr": script_failure.get("stderr", ""),
+            }
         print(json.dumps(payload, indent=2))
     else:
         report = _assemble_project_report(summary, recommendation)
+        if script_failure:
+            notice = FailureNotice(
+                script_name=script_failure["script_name"],
+                reason=script_failure["reason"],
+                stderr_context=script_failure["stderr"],
+            )
+            report = notice.wrap(report)
         print(report, end="")
     return 0
 

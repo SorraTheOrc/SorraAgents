@@ -16,8 +16,16 @@ import json
 import re
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Add repo root to sys.path for shared utility access
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from skill.scripts.failure_notice import FailureNotice
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +335,22 @@ def update_description(original_desc: str, report_section: str) -> str:
 
 
 def main() -> None:
+    try:
+        _main()
+    except Exception as exc:
+        notice = FailureNotice(
+            script_name="find_related.py",
+            reason=f"Unhandled exception: {exc}",
+            stderr_context=traceback.format_exc(),
+        )
+        print(notice.wrap(
+            f"An unexpected error occurred: {exc}\n"
+            "Related work report could not be completed."
+        ))
+        sys.exit(1)
+
+
+def _main() -> None:
     args = parse_args()
 
     if args.verbose:
@@ -337,10 +361,16 @@ def main() -> None:
     work_item = run_wl_show(args.work_item_id)
     if work_item is None:
         msg = f"Failed to fetch work item {args.work_item_id}"
+        notice = FailureNotice(
+            script_name="find_related.py",
+            reason=f"Could not fetch work item {args.work_item_id}",
+            stderr_context=msg,
+        )
         if args.json_output:
-            print(json.dumps({"error": msg}))
+            payload = {"error": msg, "script_failure": {"script_name": "find_related.py", "reason": msg}}
+            print(json.dumps(payload))
         else:
-            print(f"Error: {msg}")
+            print(notice.wrap(f"Error: {msg}"))
         sys.exit(1)
 
     title = work_item.get("title", "")

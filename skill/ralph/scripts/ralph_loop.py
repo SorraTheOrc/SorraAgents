@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -3697,4 +3698,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _repo_root = Path(__file__).resolve().parents[3]
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+    from skill.scripts.failure_notice import FailureNotice
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        notice = FailureNotice(
+            script_name="ralph_loop.py",
+            reason=f"Unhandled exception: {exc}",
+            stderr_context=traceback.format_exc(),
+        )
+        print(notice.wrap(
+            json.dumps({"error": str(exc), "status": "error"})
+        ))
+        raise SystemExit(1)

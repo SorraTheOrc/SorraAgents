@@ -84,6 +84,10 @@ Items flagged as `needs_input` are not retried — the skill moves on to the nex
 - If `/skill:implement` output contains question patterns, marks the item as `needs_input` without recovery (status stays `in_progress` to preserve the question context)
 - All errors and recovery actions are captured in the summary report
 - Recovery outcomes (success/failure) are included in per-item results
+- When any items report an error outcome, the summary report is wrapped with a
+  **Script Execution Failure Notice** (first and last lines) using the shared
+  utility at `skill/scripts/failure_notice.py`. This provides a prominent visual
+  signal that some items failed during batch implementation.
 
 ## `--max` flag
 

@@ -7,9 +7,19 @@ import os
 import shutil
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
+from pathlib import Path
+from typing import Any, Callable, Iterable, Sequence
+
+# Add repo root to sys.path for shared utility access
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from skill.scripts.failure_notice import FailureNotice
+
 
 
 LOG = logging.getLogger("skill.cleanup")
@@ -184,6 +194,32 @@ def render_summary(actions: Iterable[dict[str, Any]]) -> dict[str, int]:
         key = action.get("result", "unknown")
         summary[key] = summary.get(key, 0) + 1
     return summary
+
+
+def run_main(main_fn: Callable[..., int], script_name: str,
+             argv: list[str] | None = None) -> int:
+    """Run a main function with exception handling and failure notice wrapping.
+
+    Args:
+        main_fn: The main function to run.
+        script_name: Name of the script (for the failure notice).
+        argv: Command-line arguments to pass to main_fn.
+
+    Returns:
+        Exit code from main_fn, or 1 if an exception was caught.
+    """
+    try:
+        return main_fn(argv)
+    except Exception as exc:
+        notice = FailureNotice(
+            script_name=script_name,
+            reason=f"Unhandled exception: {exc}",
+            stderr_context=traceback.format_exc(),
+        )
+        print(notice.wrap(
+            f"An unexpected error occurred: {exc}"
+        ))
+        return 1
 
 
 def exit_with_error(message: str) -> None:

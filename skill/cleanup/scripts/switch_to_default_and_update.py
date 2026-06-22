@@ -69,4 +69,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(lib.run_main(main, "switch_to_default_and_update.py"))
