@@ -25,7 +25,7 @@ ImplementAll can be invoked in the following ways:
 - `/skill:implementall --parent-id <id>` — Post the summary as a comment on the specified parent work item
 - `/skill:implementall --max N` — Process at most N items before stopping
 - `/skill:implementall --dry-run` — Simulate processing without making any changes
-- `python3 skill/implementall/scripts/implementall.py` — Direct Python invocation
+- `python3 ./scripts/implementall.py` — Direct Python invocation
 - `pi run /skill:implementall` — Agent framework invocation
 
 ## Output
@@ -114,29 +114,29 @@ The count includes all processed items regardless of outcome (implemented, needs
 
 ```bash
 # Process all plan_complete items
-python3 skill/implementall/scripts/implementall.py
+python3 ./scripts/implementall.py
 
 # JSON output
-python3 skill/implementall/scripts/implementall.py --json
+python3 ./scripts/implementall.py --json
 
 # Dry run (simulate without changes)
-python3 skill/implementall/scripts/implementall.py --dry-run
+python3 ./scripts/implementall.py --dry-run
 
 # Process at most 5 items
-python3 skill/implementall/scripts/implementall.py --max 5
+python3 ./scripts/implementall.py --max 5
 
 # Post summary as a comment on a parent epic
-python3 skill/implementall/scripts/implementall.py --parent-id SA-0MQO6YMZ3006N5MG
+python3 ./scripts/implementall.py --parent-id SA-0MQO6YMZ3006N5MG
 ```
 
 ## Scripts
 
-- Canonical runner: `skill/implementall/scripts/implementall.py`
-- Tests: `skill/implementall/tests/test_implementall.py`
+- Canonical runner: `./scripts/implementall.py`
+- Tests: `./tests/test_implementall.py`
 
 ## Related skills
 
-- `skill/implement/SKILL.md` — The implement skill that ImplementAll invokes for each item
-- `skill/planall/SKILL.md` — PlanAll: the batch planning skill that ImplementAll mirrors
-- `skill/intakeall/SKILL.md` — IntakeAll: the batch intake skill that ImplementAll mirrors
-- `skill/ralph/SKILL.md` — Ralph orchestration loop that provides auto-implementation for individual items
+- `../implement/SKILL.md` — The implement skill that ImplementAll invokes for each item
+- `../planall/SKILL.md` — PlanAll: the batch planning skill that ImplementAll mirrors
+- `../intakeall/SKILL.md` — IntakeAll: the batch intake skill that ImplementAll mirrors
+- `../ralph/SKILL.md` — Ralph orchestration loop that provides auto-implementation for individual items

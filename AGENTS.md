@@ -67,7 +67,7 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      `git push origin HEAD:refs/heads/dev`
      This makes your changes available in `dev` — the primary working branch.
      Only the release process (ship agent / release manager) promotes changes
-     from `dev` to `main`. See [skill/ship/SKILL.md](skill/ship/SKILL.md) for
+     from `dev` to `main`. See [skills/ship/SKILL.md](skills/ship/SKILL.md) for
      the push-to-dev workflow and `scripts/release/merge-dev-to-main.sh` for
      the dev→main release process.
    - After pushing, clean up the worktree:
@@ -101,7 +101,7 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      > agent may perform the release by invoking the Ship skill's release command,
      > or a designated Release Manager may perform it manually. The process creates
      > a PR, waits for CI, and merges via `gh pr merge`. See
-     > [skill/ship/SKILL.md](skill/ship/SKILL.md) and
+     > [skills/ship/SKILL.md](skills/ship/SKILL.md) and
      > [docs/dev/release-process.md](docs/dev/release-process.md) for details.
 
    - Report back to the operator summarising the work completed and proceed to the next step.
@@ -227,8 +227,8 @@ Worklog does not enforce these relationships but they can be used for planning a
 
 ## Test-failure triage policy
 
-- When an agent discovers a failing test that appears to be outside its ownership/scope, it should call the triage helper `skill/triage/scripts/check_or_create.py` with structured evidence (test name, stdout excerpt, optional stack trace/commit/CI URL).
-- Any incomplete (open or in_progress) work item tagged `test-failure` that matches the failing test name in title or body should be considered a match and will be linked/updated. If no match exists the helper will create a `critical` work item using the repository template `skill/triage/resources/test-failure-template.md`.
+- When an agent discovers a failing test that appears to be outside its ownership/scope, it should call the triage helper `skills/triage/scripts/check_or_create.py` with structured evidence (test name, stdout excerpt, optional stack trace/commit/CI URL).
+- Any incomplete (open or in_progress) work item tagged `test-failure` that matches the failing test name in title or body should be considered a match and will be linked/updated. If no match exists the helper will create a `critical` work item using the repository template `skills/triage/resources/test-failure-template.md`.
 - **Extension (SA-0MQ7WR2MT004U82N):** When test failures are detected during the implement workflow:
   1. The triage helper is invoked with `parent_work_item_id` to create a **blocking child work item**.
   2. The child work item is implemented using `implement-single` to fix the failure.

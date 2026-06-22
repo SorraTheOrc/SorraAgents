@@ -71,7 +71,7 @@ work item description, and returns a structured result.
 
 ### Script location
 
-`skill/find-related/scripts/find_related.py`
+`./scripts/find_related.py`
 
 ### Requirements
 
@@ -82,16 +82,16 @@ work item description, and returns a structured result.
 
 ```bash
 # Basic usage (find related items for a work item and update its description)
-python3 skill/find-related/scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4
+python3 ./scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4
 
 # JSON output (for programmatic consumption)
-python3 skill/find-related/scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4 --json
+python3 ./scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4 --json
 
 # Verbose mode (prints debug information to stderr)
-python3 skill/find-related/scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4 --verbose
+python3 ./scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4 --verbose
 
 # Specify a custom repository path
-python3 skill/find-related/scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4 --repo-path /path/to/repo
+python3 ./scripts/find_related.py --work-item-id SA-0MPYMFZXO0004ZU4 --repo-path /path/to/repo
 ```
 
 ### Arguments

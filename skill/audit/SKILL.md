@@ -82,7 +82,7 @@ The status lifecycle was added to solve the problem of concurrent audit attempts
 ## Safety and prompt design
 
 - Audit executions should be read-only except for the explicit, single persistence step that stores the structured audit into the associated work item and the automatic status lifecycle management performed by the runner. Use the designation `[READ-ONLY AUDIT]` in Pi prompts to mark read-only phases, and use `[PERSIST-AUDIT]` when performing the authorized persistence operation.
-- Do NOT close, create, or delete any work items during an audit. The ONLY permitted state-modifying actions for this skill are: (1) storing the audit text via the canonical persister (skill/audit/scripts/persist_audit.py) or the runner's built-in persistence, and (2) the runner's automatic status lifecycle (in_progress → completed, see Status Lifecycle section). Do NOT perform other `wl`, `git`, or arbitrary state-modifying commands. Do NOT change work item stage — only the `status` field is managed by the lifecycle.
+- Do NOT close, create, or delete any work items during an audit. The ONLY permitted state-modifying actions for this skill are: (1) storing the audit text via the canonical persister (./scripts/persist_audit.py) or the runner's built-in persistence, and (2) the runner's automatic status lifecycle (in_progress → completed, see Status Lifecycle section). Do NOT perform other `wl`, `git`, or arbitrary state-modifying commands. Do NOT change work item stage — only the `status` field is managed by the lifecycle.
 - When persisting, use the canonical persister script or the runner's built-in persistence option. If asked to run arbitrary `wl`, `git`, or other state-modifying commands outside the authorized persister flow, refuse and report the request to the operator.
 - The model should return a structured markdown report. If ambiguity prevents a reliable verdict on acceptance criteria, return immediately and do NOT persist the audit. Persistence must be an explicit, deliberate step — do not persist partial or ambiguous audits.
 - To aid debugging, the canonical runner supports a `--debug-log` flag which appends raw Pi output to a JSONL file (see Scripts section).
@@ -254,9 +254,9 @@ No code quality issues found.
 
 The audit skill ships a canonical runner and a persister. Use these from CI, local automation, or orchestrators.
 
-- Runner: `skill/audit/scripts/audit_runner.py`
-  - Usage: `python3 skill/audit/scripts/audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--model-source <remote|local>] [--debug-log <file>]`
-  - Usage: `python3 skill/audit/scripts/audit_runner.py project [--pi-bin pi] [--model <name>] [--model-source <remote|local>] [--debug-log <file>]`
+- Runner: `./scripts/audit_runner.py`
+  - Usage: `python3 ./scripts/audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--model-source <remote|local>] [--debug-log <file>]`
+  - Usage: `python3 ./scripts/audit_runner.py project [--pi-bin pi] [--model <name>] [--model-source <remote|local>] [--debug-log <file>]`
   - Flags:
     - `--do-not-persist` — do not run persistence (useful for dry runs)
     - `--pi-bin` — path to the `pi` binary
@@ -265,13 +265,13 @@ The audit skill ships a canonical runner and a persister. Use these from CI, loc
     - `--debug-log` — append Pi debug output to a JSONL file (helpful for triage)
     - `--json` — emit machine-readable JSON output
 
-- Persister: `skill/audit/scripts/persist_audit.py`
+- Persister: `./scripts/persist_audit.py`
 
 ### Code Quality Integration
 
 The audit runner automatically performs code quality checks alongside acceptance criteria verification. The pipeline is:
 
-1. **Code quality check** runs before AC verification (invokes `skill/code_review/scripts/code_quality.py`)
+1. **Code quality check** runs before AC verification (invokes `../code_review/scripts/code_quality.py`)
 2. **Language detection** scans for Python, TypeScript, Markdown, Shell, JavaScript/Node.js, and C# files
 3. **Linter probing** checks for available linters (ruff, eslint, markdownlint, shellcheck, dotnet-format)
 4. **Findings classified** by severity (critical, high, medium, low)
@@ -281,13 +281,13 @@ The audit runner automatically performs code quality checks alongside acceptance
 
 If the `code_quality` module is unavailable, the audit continues with a warning instead of crashing.
 
-- Persist from stdin: `cat report.md | python3 skill/audit/scripts/persist_audit.py --issue-id SA-123`
-- Persist from a file: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --file report.md`
-- Persist from a CLI string: `python3 skill/audit/scripts/persist_audit.py --issue-id SA-123 --report "Ready to close: Yes\n..."`
+- Persist from stdin: `cat report.md | python3 ./scripts/persist_audit.py --issue-id SA-123`
+- Persist from a file: `python3 ./scripts/persist_audit.py --issue-id SA-123 --file report.md`
+- Persist from a CLI string: `python3 ./scripts/persist_audit.py --issue-id SA-123 --report "Ready to close: Yes\n..."`
 
 Notes:
 
-- The runner supports an optional persistence step. By default the runner will persist the generated structured audit into the work item unless invoked with `--do-not-persist`; use `--do-not-persist` for dry runs. Alternatively, the persister script (`skill/audit/scripts/persist_audit.py`) may be invoked explicitly to store the report. Both mechanisms perform the same `wl update` call and are the approved ways to persist an audit.
+- The runner supports an optional persistence step. By default the runner will persist the generated structured audit into the work item unless invoked with `--do-not-persist`; use `--do-not-persist` for dry runs. Alternatively, the persister script (`./scripts/persist_audit.py`) may be invoked explicitly to store the report. Both mechanisms perform the same `wl update` call and are the approved ways to persist an audit.
 - The persister (and the runner when persisting) call: `wl update <issue-id> --audit-text "<report>" --json` and return a non-zero exit code on failure.
 - **Child item audit persistence:** When auditing a parent work item with children, the runner also persists an individual audit report to each child work item. Each child receives a focused report covering only its own acceptance criteria. Child persistence is controlled by the same `--do-not-persist` flag — if persistence is disabled for the parent, child persistence is also skipped. Child persist failures are logged as warnings to stderr but do not prevent the parent audit from succeeding.
 
@@ -304,7 +304,7 @@ Notes:
 - **DO NOT add constraints outside the defined criteria.** The release process ("must be merged to main", merge status, deployment status) is not an audit concern. Do not include any release-process, deployment, or merge-status conditions in your verdict. If a child is in `in_review` stage, that is sufficient — do not demand that it be merged or released first.
 - **Phase 1 children stage check logic:** Check that every non-deleted child with a non-empty stage has stage `in_review` or `done`. Children with `status: in_progress` but `stage: in_review` are acceptable and do NOT count as blocking. This mirrors the logic in `audit_runner.py`'s `_has_phase1_blocking_issues`.
 - If the model cannot determine acceptance criteria verdicts unambiguously, return immediately and do NOT persist or claim the audit was recorded.
-- You MUST persist the audit report to the work item after producing a structured report. Persistence is **mandatory**, not optional. Use one of the approved persistence mechanisms: the canonical runner (which persists by default unless invoked with `--do-not-persist`) or the persister script (`skill/audit/scripts/persist_audit.py`). When performing the authorized persistence step, annotate the prompt with `[PERSIST-AUDIT]` and ensure the report is final and complete.
+- You MUST persist the audit report to the work item after producing a structured report. Persistence is **mandatory**, not optional. Use one of the approved persistence mechanisms: the canonical runner (which persists by default unless invoked with `--do-not-persist`) or the persister script (`./scripts/persist_audit.py`). When performing the authorized persistence step, annotate the prompt with `[PERSIST-AUDIT]` and ensure the report is final and complete.
 
 ### Persistence Procedure (MUST FOLLOW)
 
@@ -312,9 +312,9 @@ After producing a structured audit report, you MUST:
 
 1. **Print the complete audit report to stdout** so the operator can see it.
 2. **Persist the report** using one of these methods:
-   - `python3 skill/audit/scripts/persist_audit.py --issue-id <id> --report "<report text>"` — pass report inline
-   - Pipe to stdin: `echo "<report text>" | python3 skill/audit/scripts/persist_audit.py --issue-id <id>`
-   - Use the runner: `python3 skill/audit/scripts/audit_runner.py issue <id> --do-not-persist=false` (runner persists by default)
+   - `python3 ./scripts/persist_audit.py --issue-id <id> --report "<report text>"` — pass report inline
+   - Pipe to stdin: `echo "<report text>" | python3 ./scripts/persist_audit.py --issue-id <id>`
+   - Use the runner: `python3 ./scripts/audit_runner.py issue <id> --do-not-persist=false` (runner persists by default)
 
    > **Child audits:** When auditing a parent work item with children, the runner automatically persists individual audits to each child work item as well. These are controlled by the same `--do-not-persist` flag. Check stderr for any child persist warnings.
 
@@ -351,15 +351,15 @@ If you skip persistence, the audit will be invisible to downstream orchestrators
 
 - Run an issue audit and persist:
 
-  python3 skill/audit/scripts/audit_runner.py issue SA-123
+  python3 ./scripts/audit_runner.py issue SA-123
 
 - Run an issue audit without persisting (dry run):
 
-  python3 skill/audit/scripts/audit_runner.py issue SA-123 --do-not-persist
+  python3 ./scripts/audit_runner.py issue SA-123 --do-not-persist
 
 - Run a project audit and write debug output:
 
-  python3 skill/audit/scripts/audit_runner.py project --debug-log /tmp/audit_debug.jsonl
+  python3 ./scripts/audit_runner.py project --debug-log /tmp/audit_debug.jsonl
 
 ## Common failure modes
 

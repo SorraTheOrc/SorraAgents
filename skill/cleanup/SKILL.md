@@ -44,7 +44,7 @@ Scripts (implementation)
 
 1. Inspect current branch
 
-Use `skill/cleanup/scripts/inspect_current_branch.py` to inspect the current branch, detect the default branch, fetch `origin --prune` when needed, determine merge status, last commit, unpushed commits, and parse work item token. The agent MUST run this script by default and only perform inline git inspections if an edge case (see "Preferred execution behaviour") applies and the operator approves.
+Use `./scripts/inspect_current_branch.py` to inspect the current branch, detect the default branch, fetch `origin --prune` when needed, determine merge status, last commit, unpushed commits, and parse work item token. The agent MUST run this script by default and only perform inline git inspections if an edge case (see "Preferred execution behaviour") applies and the operator approves.
 
 Output a human readable summary of this report using Markdown formatting. IMPORTANT: the agent MUST display the inspection report (or a concise excerpt of it) to the user before presenting any interactive prompts or choices. The displayed report should include at minimum:
 
@@ -71,7 +71,7 @@ The agent should NOT proceed without approval when uncommitted changes are prese
 Examples:
 
 ```bash
-python skill/cleanup/scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json
+python ./scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json
 ```
 
 1. Handle uncommitted and unpushed changes
@@ -86,19 +86,19 @@ If the agent is unable to address the uncommitted/unpushed changes through the p
 
 Only continue with this step if there are no uncommitted or unpushed changes in the current branch.
 
-Run `skill/cleanup/scripts/switch_to_default_and_update.py` to fetch, check out the default branch, and perform a fast-forward pull. The agent MUST run this script by default (see Preferred execution behaviour) and only attempt manual git switch/pull sequences when explicitly instructed by the human in an allowed edge case.
+Run `./scripts/switch_to_default_and_update.py` to fetch, check out the default branch, and perform a fast-forward pull. The agent MUST run this script by default (see Preferred execution behaviour) and only attempt manual git switch/pull sequences when explicitly instructed by the human in an allowed edge case.
 
 If the pull fails (e.g., due to conflicts), the script will report the issue and you should work with the user to determine how to proceed (e.g., "Default branch cannot be fast-forwarded. Would you like to resolve conflicts manually and retry, or skip updating?"). The agent should NOT attempt to resolve conflicts automatically and should always defer to the human for next steps in this scenario.
 
 Example:
 
 ```bash
-python skill/cleanup/scripts/switch_to_default_and_update.py --report /tmp/cleanup/switch_default.json
+python ./scripts/switch_to_default_and_update.py --report /tmp/cleanup/switch_default.json
 ```
 
 1. Summarize branches and open PRs
 
-Run `skill/cleanup/scripts/summarize_branches.py` to list local branches and include any open PRs targeting the default branch. The agent MUST run this script by default and present the script-generated report, in markdown format, for any deletion decisions.
+Run `./scripts/summarize_branches.py` to list local branches and include any open PRs targeting the default branch. The agent MUST run this script by default and present the script-generated report, in markdown format, for any deletion decisions.
 
 For branches with unmerged commits or open PRs, present the PR details and skip deletion unless explicitly authorized. The agent should present a clear summary of these branches, including their merge status, last commit, and any associated work items, to help the user make informed decisions about which branches to delete.
 
@@ -107,18 +107,18 @@ Branches that are merged into default, have no unmerged commits and have no open
 Example:
 
 ```bash
-python skill/cleanup/scripts/summarize_branches.py --report /tmp/cleanup/branches.json
+python ./scripts/summarize_branches.py --report /tmp/cleanup/branches.json
 ```
 
 1. Delete local merged branches
 
-Use `skill/cleanup/scripts/prune_local_branches.py` with an explicit branch list derived from the summarize report and user input. The summarize report and user choice are the authoritative source; the prune script only deletes branches you pass in. The agent MUST NOT delete branches outside of the explicit branch list produced by the script and approved by the human.
+Use `./scripts/prune_local_branches.py` with an explicit branch list derived from the summarize report and user input. The summarize report and user choice are the authoritative source; the prune script only deletes branches you pass in. The agent MUST NOT delete branches outside of the explicit branch list produced by the script and approved by the human.
 
 Example:
 
 ```bash
 # delete branches identfied by the previous step
-python skill/cleanup/scripts/prune_local_branches.py \
+python ./scripts/prune_local_branches.py \
   --branches-file /tmp/cleanup/branches_to_delete.json \
   --report /tmp/cleanup/prune_local.json
 
@@ -130,16 +130,16 @@ python ./scripts/prune_local_branches.py --dry-run \
 
 1. Delete remote merged branches
 
-Run `skill/cleanup/scripts/delete_remote_branches.py` — deletes remote branches that are merged into default and older than a threshold (default 14 days). Report on branches deleted, skipped (e.g., due to open PRs), and any errors.
+Run `./scripts/delete_remote_branches.py` — deletes remote branches that are merged into default and older than a threshold (default 14 days). Report on branches deleted, skipped (e.g., due to open PRs), and any errors.
 
 Example:
 
 ```bash
 # Delete all remote branches merged into default and older than 14 days
-python skill/cleanup/scripts/delete_remote_branches.py --days 14 --report /tmp/cleanup/delete_remote.json
+python ./scripts/delete_remote_branches.py --days 14 --report /tmp/cleanup/delete_remote.json
 
 # Dry-run mode
-python skill/cleanup/scripts/delete_remote_branches.py --days 14 --dry-run --report /tmp/cleanup/delete_remote.json
+python ./scripts/delete_remote_branches.py --days 14 --dry-run --report /tmp/cleanup/delete_remote.json
 ```
 
 1. Handle edge cases and manual review:

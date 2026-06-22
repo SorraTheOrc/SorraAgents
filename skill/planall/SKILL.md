@@ -22,7 +22,7 @@ PlanAll can be invoked in the following ways:
 - `/skill:planall` — Process all intake_complete items with markdown summary output
 - `/skill:planall --json` — JSON output for programmatic consumption
 - `/skill:planall --parent-id <id>` — Post the summary as a comment on the specified parent work item
-- `python3 skill/planall/scripts/planall.py` — Direct Python invocation
+- `python3 ./scripts/planall.py` — Direct Python invocation
 - `pi run /planall` — Agent framework invocation
 
 ## Output
@@ -87,21 +87,21 @@ Items flagged as `needs_input` are not retried — the skill moves on to the nex
 
 ```bash
 # Process all intake_complete items
-python3 skill/planall/scripts/planall.py
+python3 ./scripts/planall.py
 
 # JSON output
-python3 skill/planall/scripts/planall.py --json
+python3 ./scripts/planall.py --json
 
 # Post summary as a comment on a parent epic
-python3 skill/planall/scripts/planall.py --parent-id SA-0MQA6ECEU003GUKH
+python3 ./scripts/planall.py --parent-id SA-0MQA6ECEU003GUKH
 ```
 
 ## Scripts
 
-- Canonical runner: `skill/planall/scripts/planall.py`
-- Tests: `skill/planall/tests/test_planall.py`
+- Canonical runner: `./scripts/planall.py`
+- Tests: `./tests/test_planall.py`
 
 ## Related skills
 
 - `command/plan.md` — The `/plan` command that PlanAll invokes for each item
-- `skill/ralph/SKILL.md` — Ralph orchestration loop that provides auto-planning for individual items
+- `../ralph/SKILL.md` — Ralph orchestration loop that provides auto-planning for individual items

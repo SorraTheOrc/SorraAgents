@@ -66,12 +66,12 @@ Where `<action>` is one of:
 
 - Direct pushes to `main`, `master`, or `HEAD` are always rejected.
 - Branch deletion of protected branches is always skipped.
-- Use `isBranchBlocked()` from `skill/ship/scripts/git-helpers.js` for validation.
+- Use `isBranchBlocked()` from `../ship/scripts/git-helpers.js` for validation.
 
 ### Branch naming
 
 - All agent-created branches MUST follow `wl-<work-item-id>-<short-desc>`.
-- Use `makeBranchName()` from `skill/ship/scripts/git-helpers.js` for generation.
+- Use `makeBranchName()` from `../ship/scripts/git-helpers.js` for generation.
 - Use `validateBranchName()` for validation.
 
 ### Worktree naming
@@ -87,7 +87,7 @@ Where `<action>` is one of:
 
 ## Script Contract
 
-All scripts in `skill/git-management/scripts/` follow these conventions:
+All scripts in `./scripts/` follow these conventions:
 
 ### Exit codes
 
@@ -130,9 +130,9 @@ Each script checks its prerequisites before performing operations:
 
 This skill delegates to existing scripts where possible:
 
-- **Branch naming/policy**: `skill/ship/scripts/git-helpers.js` (`makeBranchName`, `validateBranchName`, `isBranchBlocked`)
-- **Push validation**: `skill/ship/scripts/ship.js` (`validatePushTarget`, `validateForcePush`, `pushToDev`, `pushToBranch`)
-- **Post-merge cleanup**: `skill/cleanup/scripts/` (Python cleanup scripts)
+- **Branch naming/policy**: `../ship/scripts/git-helpers.js` (`makeBranchName`, `validateBranchName`, `isBranchBlocked`)
+- **Push validation**: `../ship/scripts/ship.js` (`validatePushTarget`, `validateForcePush`, `pushToDev`, `pushToBranch`)
+- **Post-merge cleanup**: `../cleanup/scripts/` (Python cleanup scripts)
 
 This skill does NOT duplicate the logic in these modules; it wraps and orchestrates them.
 

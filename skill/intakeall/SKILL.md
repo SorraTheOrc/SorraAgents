@@ -28,7 +28,7 @@ IntakeAll can be invoked in the following ways:
 - `/skill:intakeall --json` — JSON output for programmatic consumption
 - `/skill:intakeall --parent-id <id>` — Post the summary as a comment on the specified parent work item
 - `/skill:intakeall --dry-run` — Simulate processing without making any changes
-- `python3 skill/intakeall/scripts/intakeall.py` — Direct Python invocation
+- `python3 ./scripts/intakeall.py` — Direct Python invocation
 - `pi run /intakeall` — Agent framework invocation
 
 ## Output
@@ -141,25 +141,25 @@ SIGINT (Ctrl+C) and SIGTERM handlers are registered at the start of `run_all()`:
 
 ```bash
 # Process all idea-stage items
-python3 skill/intakeall/scripts/intakeall.py
+python3 ./scripts/intakeall.py
 
 # JSON output
-python3 skill/intakeall/scripts/intakeall.py --json
+python3 ./scripts/intakeall.py --json
 
 # Dry run (simulate without changes)
-python3 skill/intakeall/scripts/intakeall.py --dry-run
+python3 ./scripts/intakeall.py --dry-run
 
 # Post summary as a comment on a parent epic
-python3 skill/intakeall/scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
+python3 ./scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
 ```
 
 ## Scripts
 
-- Canonical runner: `skill/intakeall/scripts/intakeall.py`
-- Tests: `skill/intakeall/tests/test_intakeall.py`
+- Canonical runner: `./scripts/intakeall.py`
+- Tests: `./tests/test_intakeall.py`
 
 ## Related skills
 
 - `command/intake.md` — The `/intake` command that IntakeAll invokes for each item
-- `skill/planall/SKILL.md` — PlanAll: the batch planning skill that IntakeAll mirrors
-- `skill/ralph/SKILL.md` — Ralph orchestration loop that provides auto-intake for individual items
+- `../planall/SKILL.md` — PlanAll: the batch planning skill that IntakeAll mirrors
+- `../ralph/SKILL.md` — Ralph orchestration loop that provides auto-intake for individual items

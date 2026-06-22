@@ -33,14 +33,14 @@ Outputs
 References
 ----------
 
-- Templates: `skill/triage/resources/test-failure-template.md`
-- Runbook: `skill/triage/resources/runbook-test-failure.md`
-- Owner inference: `skill/owner_inference/SKILL.md`
+- Templates: `./resources/test-failure-template.md`
+- Runbook: `./resources/runbook-test-failure.md`
+- Owner inference: `../owner_inference/SKILL.md`
 
 Scripts
 -------
 
-- `skill/triage/scripts/check_or_create.py` — implementation using `wl` CLI.
+- `./scripts/check_or_create.py` — implementation using `wl` CLI.
 
 Matching Heuristics
 -------------------
@@ -86,7 +86,7 @@ cat <<'JSON' > payload.json
 }
 
 # Run the triage helper (prints JSON to stdout)
-python3 skill/triage/scripts/check_or_create.py payload.json
+python3 ./scripts/check_or_create.py payload.json
 ```
 
 Possible script output when a new critical issue is created:

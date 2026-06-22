@@ -50,7 +50,7 @@ Structure:
 
 ## Automated Linting (Code Quality)
 
-In addition to AI-driven analysis, this skill provides **automated linting** through a set of canonical Python scripts in `skill/code_review/`. These scripts detect project languages, probe for available linters, run them, and classify findings by severity.
+In addition to AI-driven analysis, this skill provides **automated linting** through a set of canonical Python scripts in `../code_review/`. These scripts detect project languages, probe for available linters, run them, and classify findings by severity.
 
 ### Pipeline
 
@@ -66,29 +66,29 @@ The code quality pipeline runs automatically as part of an audit (via `audit_run
 
 | Script | Purpose |
 |--------|---------|
-| `skill/code_review/scripts/code_quality.py` | Orchestrator — runs the full pipeline and outputs JSON |
-| `skill/code_review/scripts/detection.py` | Language detection and linter probing |
-| `skill/code_review/scripts/linter_runner.py` | Linter execution and severity classification |
-| `skill/code_review/scripts/create_quality_epics.py` | Work item creation for findings |
+| `../code_review/scripts/code_quality.py` | Orchestrator — runs the full pipeline and outputs JSON |
+| `../code_review/scripts/detection.py` | Language detection and linter probing |
+| `../code_review/scripts/linter_runner.py` | Linter execution and severity classification |
+| `../code_review/scripts/create_quality_epics.py` | Work item creation for findings |
 
 ### Standalone Usage
 
 Run the full code quality check on a project:
 
 ```bash
-python3 skill/code_review/scripts/code_quality.py --path /path/to/project --json
+python3 ../code_review/scripts/code_quality.py --path /path/to/project --json
 ```
 
 Filter to specific languages:
 
 ```bash
-python3 skill/code_review/scripts/code_quality.py --languages python --json
+python3 ../code_review/scripts/code_quality.py --languages python --json
 ```
 
 Dry-run quality epic creation:
 
 ```bash
-python3 skill/code_review/scripts/create_quality_epics.py \
+python3 ../code_review/scripts/create_quality_epics.py \
     --findings '<json-array>' --dry-run
 ```
 
@@ -124,7 +124,7 @@ If a linter is not available, the corresponding language is skipped gracefully w
 
 ### Audit Integration
 
-When used via the audit runner (`skill/audit/scripts/audit_runner.py`):
+When used via the audit runner (`../audit/scripts/audit_runner.py`):
 
 * The code quality check runs **before** acceptance criteria verification.
 * **Critical and high** severity findings block closure ("Ready to close: No").

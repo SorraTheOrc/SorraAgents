@@ -53,7 +53,7 @@ Principles (kept brief)
 Canonical workflow (minimal, authoritative)
 -----------------------------------------
 
-Follow these steps from the project root (run commands from the repository root, not from the `skill/effort_and_risk` directory):
+Follow these steps from the project root (run commands from the repository root, not from the `../effort_and_risk` directory):
 
 1) Fetch the issue and its children (audit file):
 
@@ -75,7 +75,7 @@ Follow these steps from the project root (run commands from the repository root,
 3) Run the orchestrator. Prefer capturing output to a filename derived from the work-item id (avoid fixed names):
 
        ```sh
-       python3 skill/effort-and-risk/scripts/run_skill.py --issue <issue-id> <<'JSON' > final-<issue-id>.json
+       python3 ./scripts/run_skill.py --issue <issue-id> <<'JSON' > final-<issue-id>.json
        { ... }
        JSON
        ```
@@ -97,23 +97,23 @@ References (bundled)
 --------------------
 
 - references/t-shirt_sizes.json — T-shirt thresholds used by scripts
-- skill/effort-and-risk/scripts/calc_effort.py
-- skill/effort-and-risk/scripts/calc_risk.py
-- skill/effort-and-risk/scripts/calc_effort_with_risk.py
-- skill/effort-and-risk/scripts/assemble_json.py
-- skill/effort-and-risk/scripts/json_to_human.py
-- skill/effort-and-risk/scripts/orchestrate_estimate.py
+- ./scripts/calc_effort.py
+- ./scripts/calc_risk.py
+- ./scripts/calc_effort_with_risk.py
+- ./scripts/assemble_json.py
+- ./scripts/json_to_human.py
+- ./scripts/orchestrate_estimate.py
 
 ## Scripts (canonical runner & modules)
 
-- Orchestrator: `skill/effort-and-risk/scripts/orchestrate_estimate.py` (invokes the local calc scripts and performs wl updates)
-- Helper CLI wrapper: `skill/effort-and-risk/scripts/run_skill.py`
+- Orchestrator: `./scripts/orchestrate_estimate.py` (invokes the local calc scripts and performs wl updates)
+- Helper CLI wrapper: `./scripts/run_skill.py`
 
 Example (recommended invocation using the repository Worklog id shown in documentation):
 
 ```sh
 # Using SA-0MPYMFZXO0004ZU4 as the work-item id for examples
-python3 skill/effort-and-risk/scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > final-SA-0MPYMFZXO0004ZU4.json
+python3 ./scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > final-SA-0MPYMFZXO0004ZU4.json
 { ... }
 JSON
 ```

@@ -34,7 +34,7 @@ You are authoring a new command for the agent framework that implements a specif
 
 This skill does not ship a canonical CLI runner script. The recommended invocation is via Pi prompts or the agent command framework using the provided templates.
 
-- Template: `skill/author-command/assets/command-template.md`
+- Template: `./assets/command-template.md`
 
 Preferred execution behaviour (policy)
 

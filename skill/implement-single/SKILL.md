@@ -129,7 +129,7 @@ refactor step may be invoked to detect and remediate code smells:
 - **Pre-existing smells** create Worklog work items with structured
   REFACTOR comments in the source files.
 - The step can be skipped with the ``--no-refactor`` flag.
-- See ``skill/refactor/SKILL.md`` for full documentation.
+- See ``../refactor/SKILL.md`` for full documentation.
 
 ### Step 5 — Build, test and commit
 

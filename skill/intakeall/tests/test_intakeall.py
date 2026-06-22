@@ -1358,7 +1358,6 @@ class TestSignalHandling:
         engine._setup_signal_handlers()
 
         # Verify both signals are registered to the handler method
-        import signal
         assert signal.getsignal(signal.SIGINT) == engine._signal_handler
         assert signal.getsignal(signal.SIGTERM) == engine._signal_handler
 
@@ -1379,7 +1378,6 @@ class TestSignalHandling:
         engine._current_item_id = SAMPLE_ITEM_C["id"]
 
         # Simulate receiving a signal by calling the handler directly
-        import signal
         try:
             engine._signal_handler(signal.SIGINT, None)
         except SystemExit:
@@ -1398,7 +1396,6 @@ class TestSignalHandling:
         engine = IntakeAllEngine(runner=runner)
         engine._current_item_id = None
 
-        import signal
         try:
             engine._signal_handler(signal.SIGINT, None)
         except SystemExit:
@@ -1445,7 +1442,6 @@ class TestSignalHandling:
         runner = FakeRunner()
         engine = IntakeAllEngine(runner=runner)
 
-        import signal
         try:
             engine._signal_handler(signal.SIGINT, None)
             # Should not reach here

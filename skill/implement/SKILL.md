@@ -156,7 +156,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
     - Report the results.
     - Fix any failing tests before continuing.
     - If the test run discovers failing tests that appear to be outside the scope or ownership of the current work item (e.g., failures in files not modified by this branch), invoke the triage helper with `parent_work_item_id` to create a **blocking child work item**:
-      - Example: `python3 skill/triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`
+      - Example: `python3 ../triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`
       - If `check_or_create` returns that it created a NEW critical issue, or matched an existing incomplete one, the agent should implement that child work item to fix the test failure, commit the fix, and re-run tests until all pass before proceeding.
       - If running under Ralph, failing tests are automatically handled: Ralph will create child work items, implement fixes, and ensure all tests pass before marking the parent as `in_review`.
   - Update or create relevant documentation.
@@ -184,11 +184,11 @@ refactor step may be invoked to detect and remediate code smells:
 - The canonical orchestrator can also be invoked directly:
 
   ```bash
-  python3 skill/refactor/scripts/refactor.py <work-item-id>
-  python3 skill/refactor/scripts/refactor.py <work-item-id> --json
+  python3 ../refactor/scripts/refactor.py <work-item-id>
+  python3 ../refactor/scripts/refactor.py <work-item-id> --json
   ```
 
-- See ``skill/refactor/SKILL.md`` for full documentation.
+- See ``../refactor/SKILL.md`` for full documentation.
 
 1. Automated self-review
 
@@ -207,7 +207,7 @@ refactor step may be invoked to detect and remediate code smells:
 - Ensure all work has been committed on the feature branch.
 - Do NOT create a Pull Request to `main`. Work is integrated into `dev`; the `dev`→`main` promotion is handled separately by the release process.
 - Push the feature branch into `dev` using one of the following:
-  - Using the ship skill: `pushToDev()` from `skill/ship/scripts/ship.js` (preferred)
+  - Using the ship skill: `pushToDev()` from `../ship/scripts/ship.js` (preferred)
   - Direct git command: `git push origin HEAD:refs/heads/dev`
   - The push target `dev` is **not** a protected branch; the `.githooks/pre-push` hook only blocks `main`, `master`, and `HEAD`.
 - After pushing, clean up the worktree:
@@ -238,8 +238,8 @@ refactor step may be invoked to detect and remediate code smells:
   > **When running manually:** Mark the work item as `in_review` (do **NOT** close it):
   `wl update <work-item-id> --status open --stage in_review --json`
 
-  > **Important:** The work-item is **not closed** at this stage. It remains `in_review` until the release process promotes `dev` to `main`. Agents may perform the release by invoking the Ship skill's release command (`skill/ship/scripts/run-release.js`), or a Release Manager may perform it manually. Agents should not push directly to `main` unless explicitly authorized.
-  > See `skill/ship/SKILL.md` for the push-to-dev workflow and `skill/ship/scripts/run-release.js` (safe wrapper) for the release process. The wrapper detects when a repository lacks `scripts/release/merge-dev-to-main.sh` and prints a clear human fallback message.
+  > **Important:** The work-item is **not closed** at this stage. It remains `in_review` until the release process promotes `dev` to `main`. Agents may perform the release by invoking the Ship skill's release command (`../ship/scripts/run-release.js`), or a Release Manager may perform it manually. Agents should not push directly to `main` unless explicitly authorized.
+  > See `../ship/SKILL.md` for the push-to-dev workflow and `../ship/scripts/run-release.js` (safe wrapper) for the release process. The wrapper detects when a repository lacks `scripts/release/merge-dev-to-main.sh` and prints a clear human fallback message.
 
 Pre-push blocking check
 -----------------------
@@ -277,7 +277,7 @@ Example Worklog-oriented commands using SA-0MPYMFZXO0004ZU4 (documentation examp
 wl show SA-0MPYMFZXO0004ZU4 --json
 
 # After implementing locally, push to dev (preferred via ship skill):
-# (JS example) node -e "require('./skill/ship/scripts/ship.js').pushToDev('origin')"
+# (JS example) node -e "require('../ship/scripts/ship.js').pushToDev('origin')"
 # or direct push
 git push origin HEAD:refs/heads/dev
 

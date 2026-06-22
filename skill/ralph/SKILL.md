@@ -23,12 +23,12 @@ A work-item id is any short token matching the Worklog id pattern used in your e
 ## Behavior
 
 1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id or abort, except for `ralph status`, which intentionally runs without a work-item id.
-2. For `ralph <work-item-id>`, immediately run the deterministic loop through the `skill/ralph/ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`.
+2. For `ralph <work-item-id>`, immediately run the deterministic loop through the `./ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`.
 3. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
 4. Use `ralph status` to inspect the current background run without needing the original work-item id.
 5. After launching the background Ralph loop, the agent MUST follow this **post-launch behavior**:
    - Wait exactly **20 seconds** (once, not in a loop) to allow Ralph to initialize.
-   - Check the Ralph status **one time only** using `skill/ralph/ralph status --json`.
+   - Check the Ralph status **one time only** using `./ralph status --json`.
    - If Ralph is running: Report the loop started successfully and inform the operator they can use `ralph status` to monitor progress.
    - If Ralph has stopped or failed: Provide a **Root Cause Analysis (RCA)** using available log evidence from the status output.
    - **Do NOT** enter any polling loop — let the operator decide when to check status next.
@@ -89,23 +89,23 @@ Ralph supports phase-specific model selection for `intake`, `planning`, `impleme
   - `--model-audit`
 - Config supports `model_source` plus `model.<phase>` keys (nested object or dotted keys).
 - No implicit remote↔local fallback is attempted by Ralph.
-- Backward compatibility remains: when per-phase inputs are not used, Ralph continues the legacy single-model path (`--model` / string `model` config / `skill/ralph/assets/.ralph.json` defaults).
-- Default per-phase models are shipped in `skill/ralph/assets/.ralph.json`. Values in that file are overridden by a `.ralph.json` in the current working directory, which in turn are overridden by CLI flags.
+- Backward compatibility remains: when per-phase inputs are not used, Ralph continues the legacy single-model path (`--model` / string `model` config / `./assets/.ralph.json` defaults).
+- Default per-phase models are shipped in `./assets/.ralph.json`. Values in that file are overridden by a `.ralph.json` in the current working directory, which in turn are overridden by CLI flags.
 
 ```bash
 # Launch a background Ralph run from the skill installation.
 # The wrapper handles nohup plus PID/start-time capture for status reporting.
 # Preferred (skill-relative):
-skill/ralph/ralph <work-item-id> --json
+./ralph <work-item-id> --json
 
 # Inspect the current background run (no work item id required):
-skill/ralph/ralph status --json
+./ralph status --json
 
 # If you need to run the foreground loop directly for debugging:
-# python3 skill/ralph/scripts/ralph_loop.py <work-item-id> --json
+# python3 ./scripts/ralph_loop.py <work-item-id> --json
 #
 # To focus on a single direct child while keeping the parent for context:
-# python3 skill/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
+# python3 ./scripts/ralph_loop.py <parent-id> --child <child-id> --json
 
 # If your skills are installed at a different location (for example a
 # project-level skills directory), run the script using the full path to
@@ -124,7 +124,7 @@ from Ralph's inline code into a **shared module** at:
 
 This module is the single source of truth for autoplan decisions, shared by:
 
-- **Ralph** (`skill/ralph/scripts/ralph_loop.py`) — delegates decision logic to
+- **Ralph** (`./scripts/ralph_loop.py`) — delegates decision logic to
   `command.plan_helpers` functions while keeping its own I/O infrastructure
   (runner, retry, fail-open) for backward compatibility.
 - **`/plan` command** (`command/plan.md`) — runs `python3 command/plan_helpers.py
@@ -148,22 +148,22 @@ See `docs/ralph.md` for the full auto-plan decision flow.
 
 ## Scripts (canonical runner & modules)
 
-- Launcher wrapper: `skill/ralph/ralph` (preferred wrapper that records PID/start-time and handles background runs)
-- Foreground loop: `skill/ralph/scripts/ralph_loop.py` (python3)
+- Launcher wrapper: `./ralph` (preferred wrapper that records PID/start-time and handles background runs)
+- Foreground loop: `./scripts/ralph_loop.py` (python3)
 - Shared autoplan module: `command/plan_helpers.py`
-- Helpers and control: `skill/ralph/scripts/ralph_control.py`, `skill/ralph/scripts/structured_response.py`
+- Helpers and control: `./scripts/ralph_control.py`, `./scripts/structured_response.py`
 
 Example (documentation):
 
 ```bash
 # Start a background Ralph run for work item SA-0MPYMFZXO0004ZU4
-skill/ralph/ralph SA-0MPYMFZXO0004ZU4 --json
+./ralph SA-0MPYMFZXO0004ZU4 --json
 
 # For direct debugging (foreground)
-python3 skill/ralph/scripts/ralph_loop.py SA-0MPYMFZXO0004ZU4 --json
+python3 ./scripts/ralph_loop.py SA-0MPYMFZXO0004ZU4 --json
 
 # Inspect status (no work item id required)
-skill/ralph/ralph status --json
+./ralph status --json
 ```
 
 ## Ralph Status
@@ -174,10 +174,10 @@ When the operator runs `ralph status`, the script produces a **structured markdo
 
 ```bash
 # Human-readable markdown output (recommended):
-skill/ralph/ralph status
+./ralph status
 
 # JSON output for programmatic use:
-skill/ralph/ralph status --json
+./ralph status --json
 ```
 
 ### What the script reports
