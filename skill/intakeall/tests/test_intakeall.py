@@ -289,7 +289,7 @@ class TestAutoComplete:
         # Verify no /intake was called for this item
         intake_calls = [
             cmd for cmd in runner.calls
-            if "pi" in cmd and "run" in cmd and "intake" in " ".join(cmd)
+            if "pi" in cmd and "-p" in cmd and "/intake" in " ".join(cmd)
         ]
         assert len(intake_calls) == 0, "Auto-completed items should skip /intake"
 
@@ -365,7 +365,7 @@ class TestIntakeInvocation:
             )
         # Mock /intake for the vague epic
         runner.set_response(
-            f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
             stdout=json.dumps({"success": True}),
         )
         # Mock stage update for C after successful intake
@@ -381,7 +381,7 @@ class TestIntakeInvocation:
         # Check /intake was called for the epic only
         intake_calls = [
             cmd for cmd in runner.calls
-            if "pi" in cmd and "run" in cmd and "intake" in " ".join(cmd)
+            if "pi" in cmd and "-p" in cmd and "/intake" in " ".join(cmd)
         ]
         assert len(intake_calls) == 1
         assert SAMPLE_ITEM_C["id"] in " ".join(intake_calls[0])
@@ -401,7 +401,7 @@ class TestIntakeInvocation:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
@@ -418,7 +418,7 @@ class TestIntakeInvocation:
             cmd_str = " ".join(cmd)
             if "wl update" in cmd_str and "--status" in cmd_str:
                 claim_calls.append(cmd)
-            if "pi run /intake" in cmd_str:
+            if "pi -p --mode json /intake" in cmd_str:
                 intake_calls.append(cmd)
 
         assert len(claim_calls) >= 1
@@ -450,10 +450,16 @@ class TestProducerInputDetection:
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
         )
-        # Simulate intake output that indicates unanswered questions
+        # Simulate intake output that indicates unanswered questions (JSON stream format)
         runner.set_response(
-            f"pi run /intake {SAMPLE_ITEM_C['id']}",
-            stdout="Should feature Z be a separate module? (yes/no):",
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            stdout=json.dumps({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "text_end",
+                    "content": "Should feature Z be a separate module? (yes/no):"
+                }
+            }),
             returncode=1,
         )
 
@@ -478,7 +484,7 @@ class TestProducerInputDetection:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
@@ -506,8 +512,14 @@ class TestProducerInputDetection:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi run /intake {SAMPLE_ITEM_C['id']}",
-            stdout="What should we name the new feature?",
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            stdout=json.dumps({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "text_end",
+                    "content": "What should we name the new feature?"
+                }
+            }),
             returncode=0,  # Zero exit but still contains questions
         )
 
@@ -533,7 +545,7 @@ class TestProducerInputDetection:
         # Don't set response for /intake, causing exception in subprocess.run
         # Our fake runner will return default "[]" response, but let's make it fail
         runner.set_response(
-            f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
             returncode=1,
             stderr="Connection refused",
         )
@@ -566,7 +578,7 @@ class TestErrorHandlingWithRecovery:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
             returncode=1,
             stdout="Some output before error",
             stderr="Intake failed: timeout exceeded",
@@ -596,7 +608,7 @@ class TestErrorHandlingWithRecovery:
         )
         # Intake fails
         runner.set_response(
-            f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
             returncode=1,
             stderr="timeout",
         )
@@ -633,7 +645,7 @@ class TestErrorHandlingWithRecovery:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
             returncode=1,
             stderr="timeout",
         )
@@ -679,7 +691,7 @@ class TestErrorResilience:
             )
         # First item (vague epic) intake fails
         runner.set_response(
-            f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
             returncode=1,
             stderr="timeout",
         )
@@ -905,7 +917,7 @@ class TestIdempotence:
         )
         # SAMPLE_ITEM_C needs intake (epic)
         runner.set_response(
-            f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
@@ -1006,7 +1018,7 @@ class TestCLI:
         # Should NOT have made any update calls
         update_calls = [
             cmd for cmd in runner.calls
-            if "wl update" in " ".join(cmd) or "pi run" in " ".join(cmd)
+            if "wl update" in " ".join(cmd) or "pi -p --mode json" in " ".join(cmd)
         ]
         assert len(update_calls) == 0, "Dry run should not make changes"
 

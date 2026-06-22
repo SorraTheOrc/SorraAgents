@@ -273,8 +273,8 @@ class IntakeAllEngine:
             result["error_detail"] = f"Claim failed (rc={claim_result.returncode}): {stderr}"
             return result
 
-        # Invoke /intake via pi
-        intake_cmd = ["pi", "run", f"/intake {item_id}"]
+        # Invoke /intake via pi (canonical pattern: pi -p --mode json <prompt>)
+        intake_cmd = ["pi", "-p", "--mode", "json", f"/intake {item_id}"]
         logger.debug("intakeall.intake.invoke cmd=%s", " ".join(intake_cmd))
         try:
             intake_result = self.runner(intake_cmd)
@@ -285,19 +285,22 @@ class IntakeAllEngine:
             result["recovery"] = self._attempt_recovery(item_id)
             return result
 
+        # Extract user-facing text from pi's JSON-stream output
+        raw_stdout = intake_result.stdout or ""
+        intake_text = self._extract_pi_text(raw_stdout)
+
         if intake_result.returncode != 0:
             stderr = (intake_result.stderr or "").strip()
-            stdout = (intake_result.stdout or "").strip()
             logger.warning(
                 "intakeall.intake.failed item=%s rc=%s stderr=%s stdout=%s",
                 item_id,
                 intake_result.returncode,
                 stderr,
-                stdout[:500],
+                raw_stdout[:500],
             )
             # If the intake command stopped with non-zero exit, it likely
             # indicates unanswered questions (producer input needed).
-            if self._contains_questions(intake_result.stdout or ""):
+            if self._contains_questions(intake_text):
                 result["outcome"] = "needs_input"
                 result["error_detail"] = f"Intake needs input (rc={intake_result.returncode}): {stderr}"
                 return result
@@ -308,7 +311,7 @@ class IntakeAllEngine:
             return result
 
         # Check for question patterns even on zero exit
-        if self._contains_questions(intake_result.stdout or ""):
+        if self._contains_questions(intake_text):
             result["outcome"] = "needs_input"
             result["error_detail"] = "Intake output contains unanswered questions"
             return result
@@ -385,6 +388,61 @@ class IntakeAllEngine:
 
         recovery["success"] = True
         return recovery
+
+    @staticmethod
+    def _extract_pi_text(raw: str) -> str:
+        """Extract user-facing text from pi --mode json JSON-stream output.
+
+        Parses JSON lines looking for assistant message content (text_delta,
+        text_end, message_end, turn_end events). Returns the last complete
+        block of text found, or accumulated delta text if no complete blocks.
+
+        Mirrors the canonical pattern from skill/audit/scripts/audit_runner.py.
+        """
+        delta_parts: list[str] = []
+        complete_blocks: list[str] = []
+
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+
+            event_type = obj.get("type", "")
+
+            if event_type == "message_update":
+                assistant = obj.get("assistantMessageEvent")
+                if isinstance(assistant, dict):
+                    inner = assistant.get("type", "")
+                    if inner == "text_delta":
+                        delta = assistant.get("delta", "")
+                        if delta:
+                            delta_parts.append(delta)
+                    elif inner == "text_end":
+                        content = assistant.get("content", "")
+                        if content:
+                            complete_blocks.append(content)
+
+            if event_type in ("message_end", "turn_end"):
+                message = obj.get("message")
+                if isinstance(message, dict):
+                    content = message.get("content", "")
+                    if content:
+                        complete_blocks.append(content)
+                    for part in (message.get("parts") or []):
+                        if isinstance(part, dict):
+                            part_text = part.get("text", "") or part.get("content", "")
+                            if part_text:
+                                complete_blocks.append(part_text)
+
+        if complete_blocks:
+            return complete_blocks[-1]
+        return "".join(delta_parts)
 
     @staticmethod
     def _contains_questions(text: str) -> bool:
