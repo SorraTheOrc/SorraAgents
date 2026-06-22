@@ -80,11 +80,33 @@ Execute the following steps in order. Do not skip steps.
 
 ### Step 0 — Safety gate
 
-- Inspect `git status --porcelain=v1 -b`.
-- If uncommitted changes exist, either carry them into the work item branch
-  (if limited to `.worklog/`) or abort: first run
-  `wl update <work-item-id> --status open --json` to mark the item as open,
-  then return a structured `no_safe_path` response.
+- Detect whether the current directory is inside a git worktree:
+  `git rev-parse --is-inside-work-tree` (returns `true` or `false`).
+  Inside a worktree, `git status` is inherently scoped to that worktree's
+  working tree — files from other checkouts do not appear.
+
+- **Inside a worktree** — use the standard rules:
+  - Run `git status --porcelain=v1 -b`.
+  - If uncommitted changes are limited to `.worklog/`, carry them into the
+    work item branch and commit there.
+  - If other uncommitted changes exist, abort: first run
+    `wl update <work-item-id> --status open --json` to mark the item as open,
+    then return a structured `no_safe_path` response.
+
+- **In the main checkout** (not inside a worktree):
+  - Run `git status --porcelain=v1 -b`.
+  - If uncommitted changes are limited to `.worklog/`, carry them forward as
+    usual.
+  - If other uncommitted changes exist, these may be stale files from a
+    previous agent session or another worktree. The agent should:
+    1. Report the dirty files and note they may be stale.
+    2. Proceed to create a working branch (Step 2). The worktree or new
+       branch provides an isolated working directory where `git status`
+       reflects only the worktree's state, bypassing stale files in the
+       main checkout.
+    3. If the dirty files would prevent branch creation, abort via
+       `wl update <work-item-id> --status open --json` and return a
+       structured `no_safe_path` response.
 
 ### Step 1 — Understand the work item
 

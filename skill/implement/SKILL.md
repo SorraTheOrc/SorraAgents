@@ -80,9 +80,34 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 1. Safety gate: handle dirty working tree
 
-- Inspect `git status --porcelain=v1 -b`.
-- If uncommitted changes are limited to `.worklog/`, carry them into the new working branch and commit there.
-- If other uncommitted changes exist, pause and present explicit choices: carry them into the work item branch, commit first, stash (and optionally pop later), revert/discard (explicit confirmation), or abort. If abort is chosen, first run `wl update <work-item-id> --status open --json` to mark the item as open.
+- Detect whether the current directory is inside a git worktree:
+  `git rev-parse --is-inside-work-tree` (returns `true` or `false`).
+  Inside a worktree, `git status` is inherently scoped to that worktree's
+  working tree — files from other checkouts do not appear.
+
+- **Inside a worktree** — use the standard rules:
+  - Run `git status --porcelain=v1 -b`.
+  - If uncommitted changes are limited to `.worklog/`, carry them into the
+    new working branch and commit there.
+  - If other uncommitted changes exist, pause and present explicit choices:
+    carry them into the work item branch, commit first, stash (and optionally
+    pop later), revert/discard (explicit confirmation), or abort. If abort is
+    chosen, first run `wl update <work-item-id> --status open --json` to mark
+    the item as open.
+
+- **In the main checkout** (not inside a worktree):
+  - Run `git status --porcelain=v1 -b`.
+  - If uncommitted changes are limited to `.worklog/`, carry them forward as
+    usual.
+  - If other uncommitted changes exist, these may be stale files from a
+    previous agent session or another worktree. The agent should:
+    1. Report the dirty files and note they may be stale.
+    2. Proceed to create a worktree (Step 3). The worktree provides an
+       isolated working directory where `git status` reflects only the
+       worktree's branch, bypassing stale files in the main checkout.
+    3. If the dirty files would prevent worktree creation (e.g., `HEAD` is
+       not at `dev` or local changes block checkout), follow the existing
+       choices prompt (carry, commit, stash, revert, abort).
 
 1. Understand the work item
 
