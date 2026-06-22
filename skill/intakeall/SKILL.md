@@ -12,9 +12,10 @@ Use this skill when asked to run batch intake on all `idea` stage work items. It
 1. Query `wl list --stage idea --status open --json` to discover all eligible work items
 2. For each item:
    - If the item has sufficient detail (acceptance criteria + implementation guidance), auto-complete it to `intake_complete` without invoking `/intake`
-   - Otherwise, claim it (`wl update <id> --status in_progress`) and invoke `/intake`
+   - Otherwise, claim it (`wl update <id> --status in_progress --stage in_progress`) and invoke `/intake`
+   - After `/intake` completes successfully, update to `stage=intake_complete, status=open`
 3. Detect items needing producer input (unanswered questions, non-zero exit, or specific output patterns)
-4. On error, attempt recovery (reset item status to `open`) and record recovery outcome
+4. On error, attempt recovery (reset item stage to `idea` and status to `open`) and record recovery outcome
 5. Continue processing remaining items even when one requires input or encounters an error
 6. Produce a summary report showing totals and per-item outcomes with error/recovery details
 
@@ -71,7 +72,7 @@ When `--json` is used, the output is a JSON object:
 
 ## Auto-complete criteria
 
-Items with sufficient detail are auto-completed to `intake_complete` without invoking `/intake`:
+Items with sufficient detail are auto-completed to `stage=intake_complete, status=open` without invoking `/intake`:
 
 - Item is NOT an epic
 - Description contains measurable acceptance criteria (e.g., `## Acceptance Criteria` or `## Success Criteria`)
@@ -93,7 +94,8 @@ Items flagged as `needs_input` are not retried — the skill moves on to the nex
 
 - If `wl list` fails (non-zero exit or exception), returns an empty list gracefully
 - If claiming an item fails, logs a warning and marks the item as `error`
-- If `/intake` fails for an item, logs a warning, attempts recovery (resets item status to `open`), and continues to the next item
+- After `/intake` succeeds for an item, updates to `stage=intake_complete, status=open`
+- If `/intake` fails for an item, logs a warning, attempts recovery (resets item stage to `idea` and status to `open`), and continues to the next item
 - All errors and recovery actions are captured in the summary report
 - Recovery outcomes (success/failure) are included in per-item results
 

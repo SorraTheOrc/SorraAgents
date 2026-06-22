@@ -313,6 +313,29 @@ class IntakeAllEngine:
             result["error_detail"] = "Intake output contains unanswered questions"
             return result
 
+        # Mark the item as intake_complete
+        if not self.dry_run:
+            complete_cmd = [
+                "wl", "update", item_id,
+                "--stage", "intake_complete",
+                "--status", "open",
+                "--json",
+            ]
+            logger.debug("intakeall.intake_complete cmd=%s", " ".join(complete_cmd))
+            try:
+                complete_result = self.runner(complete_cmd)
+                if complete_result.returncode != 0:
+                    stderr = (complete_result.stderr or "").strip()
+                    logger.warning(
+                        "intakeall.intake_complete.failed item=%s rc=%s stderr=%s",
+                        item_id, complete_result.returncode, stderr,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "intakeall.intake_complete.error item=%s exc=%s",
+                    item_id, exc,
+                )
+
         result["outcome"] = "intake_completed"
         return result
 
@@ -338,6 +361,7 @@ class IntakeAllEngine:
 
         reset_cmd = [
             "wl", "update", item_id,
+            "--stage", "idea",
             "--status", "open",
             "--json",
         ]

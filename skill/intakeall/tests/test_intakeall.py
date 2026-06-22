@@ -368,6 +368,11 @@ class TestIntakeInvocation:
             f"pi run /intake {SAMPLE_ITEM_C['id']}",
             stdout=json.dumps({"success": True}),
         )
+        # Mock stage update for C after successful intake
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
 
         engine = IntakeAllEngine(runner=runner)
         results = engine.run_all()
@@ -397,6 +402,10 @@ class TestIntakeInvocation:
         )
         runner.set_response(
             f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
             stdout=json.dumps({"success": True}),
         )
 
@@ -470,6 +479,10 @@ class TestProducerInputDetection:
         )
         runner.set_response(
             f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
             stdout=json.dumps({"success": True}),
         )
 
@@ -568,7 +581,7 @@ class TestErrorHandlingWithRecovery:
         assert "timeout exceeded" in error_detail or "failed" in error_detail
 
     def test_recovery_attempts_reset_status_on_unrecoverable(self):
-        """On unrecoverable error, item status is reset to open."""
+        """On unrecoverable error, item stage and status are reset to idea and open."""
         runner = FakeRunner()
         runner.set_response(
             "wl list --stage idea",
@@ -587,9 +600,9 @@ class TestErrorHandlingWithRecovery:
             returncode=1,
             stderr="timeout",
         )
-        # Recovery: reset the item status back to open
+        # Recovery: reset the item stage back to idea and status to open
         runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --status open",
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
             stdout=json.dumps({"success": True}),
         )
 
@@ -597,12 +610,12 @@ class TestErrorHandlingWithRecovery:
         results = engine.run_all()
 
         assert len(results) == 1
-        # Verify recovery was attempted (reset to open)
+        # Verify recovery was attempted (reset stage to idea, status to open)
         reset_calls = [
             cmd for cmd in runner.calls
-            if "wl" in cmd and "update" in cmd and "open" in " ".join(cmd)
+            if "wl" in cmd and "update" in cmd and "stage" in " ".join(cmd)
         ]
-        # Error + recovery should have at least one reset call
+        # Error + recovery should have at least one reset call (the claim is --status only)
         assert len(reset_calls) >= 1
 
     def test_recovery_actions_recorded_in_result(self):
@@ -625,7 +638,7 @@ class TestErrorHandlingWithRecovery:
             stderr="timeout",
         )
         runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --status open",
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
             stdout=json.dumps({"success": True}),
         )
 
@@ -671,7 +684,7 @@ class TestErrorResilience:
             stderr="timeout",
         )
         runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --status open",
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
             stdout=json.dumps({"success": True}),
         )
         # Second item (well-defined) auto-completes
@@ -893,6 +906,10 @@ class TestIdempotence:
         # SAMPLE_ITEM_C needs intake (epic)
         runner.set_response(
             f"pi run /intake {SAMPLE_ITEM_C['id']}",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
             stdout=json.dumps({"success": True}),
         )
 
