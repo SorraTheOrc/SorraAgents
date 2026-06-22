@@ -9,15 +9,16 @@ Use this skill when asked to run batch intake on all `idea` stage work items. It
 
 ## Behavior
 
-1. Query `wl list --stage idea --status open --json` to discover all eligible work items
-2. For each item:
+1. **Pre-processing — orphan recovery**: Query `wl list --stage idea --json` (no status filter) to discover ALL items in `idea` stage. Orphaned items in contradictory states (`status=completed` + `stage=idea` or `status=in_progress` + `stage=idea`) are automatically reset to `status=open` via `_recover_orphans()` before any processing begins.
+2. **Signal handler registration**: SIGINT and SIGTERM handlers are registered. If an external abort (Ctrl+C) occurs during processing, the currently-active item is recovered (reset to `status=open, stage=idea`) before the process exits.
+3. For each item:
    - If the item has sufficient detail (acceptance criteria + implementation guidance), auto-complete it to `intake_complete` without invoking `/intake`
    - Otherwise, claim it (`wl update <id> --status in_progress --stage in_progress`) and invoke `/intake`
    - After `/intake` completes successfully, update to `stage=intake_complete, status=open`
-3. Detect items needing producer input (unanswered questions, non-zero exit, or specific output patterns)
-4. On error, attempt recovery (reset item stage to `idea` and status to `open`) and record recovery outcome
-5. Continue processing remaining items even when one requires input or encounters an error
-6. Produce a summary report showing totals and per-item outcomes with error/recovery details
+4. Detect items needing producer input (unanswered questions, non-zero exit, or specific output patterns)
+5. On error, attempt recovery (reset item stage to `idea` and status to `open`) and record recovery outcome
+6. Continue processing remaining items even when one requires input or encounters an error
+7. Produce a summary report showing totals and per-item outcomes with error/recovery details
 
 ## Command invocation
 
@@ -89,6 +90,27 @@ IntakeAll detects items requiring producer intervention by:
 - Any exception during the intake invocation
 
 Items flagged as `needs_input` are not retried — the skill moves on to the next item.
+
+## Orphan recovery
+
+Before processing any items, `_recover_orphans()` scans all discovered items for orphaned states:
+
+- Any item in `stage=idea` with `status=completed` is detected as an orphan
+- Any item in `stage=idea` with `status=in_progress` is detected as an orphan
+- Each orphan is reset via `wl update <id> --stage idea --status open --json`
+- If `wl` rejects the status transition (e.g., `completed→open` is not allowed), the error is logged and processing continues — the item's in-memory status is still set to `open`
+- Items already at `status=open` are unaffected
+- During dry-run mode, no actual `wl` calls are made
+
+## Signal handling (abort recovery)
+
+SIGINT (Ctrl+C) and SIGTERM handlers are registered at the start of `run_all()`:
+
+- The handler tracks which work item is currently being processed via `_current_item_id`
+- On signal, the handler calls `_attempt_recovery()` for the current item (reset to `status=open, stage=idea`)
+- After recovery, the process exits with code `128 + signum`
+- If no item is being processed when the signal arrives, no recovery is attempted
+- Handlers are restored to their original values in the `finally` block of `run_all()`
 
 ## Error handling and recovery
 

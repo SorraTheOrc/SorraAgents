@@ -18,9 +18,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import subprocess
 import sys
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 logger = logging.getLogger("intakeall")
 
@@ -99,6 +100,8 @@ class IntakeAllEngine:
         self.runner = runner or _default_runner
         self.dry_run = dry_run
         self.verbose = verbose
+        # Track the item currently being processed for signal-handler recovery
+        self._current_item_id: Optional[str] = None
 
     # -----------------------------------------------------------------------
     # Discovery
@@ -107,10 +110,16 @@ class IntakeAllEngine:
     def discover_items(self) -> list[dict]:
         """Query wl to discover all work items in idea stage.
 
+        Discovers items regardless of status (open, completed, in_progress,
+        etc.) so that orphaned items stuck in contradictory states can be
+        found and recovered before processing.
+
         Returns:
             A list of work item dicts, or an empty list on error.
         """
-        cmd = ["wl", "list", "--stage", "idea", "--status", "open", "--json"]
+        # NOTE: No --status filter — we query ALL items in idea stage so
+        # that orphaned items (e.g. completed+idea) are not invisible.
+        cmd = ["wl", "list", "--stage", "idea", "--json"]
         logger.debug("intakeall.discover cmd=%s", " ".join(cmd))
 
         try:
@@ -469,16 +478,104 @@ class IntakeAllEngine:
         return False
 
     # -----------------------------------------------------------------------
+    # Orphan recovery
+    # -----------------------------------------------------------------------
+
+    def _recover_orphans(self, items: list[dict]) -> list[dict]:
+        """Reset orphaned items in idea stage to open status.
+
+        Items stuck in contradictory states (e.g. status=completed/
+        in_progress while stage=idea) are reset to status=open so they
+        can be discovered and processed on subsequent runs.
+
+        Orphan detection is resilient:
+        - If wl rejects the status transition (e.g. completed->open),
+          the error is logged and the item is still included in the
+          returned list with its in-memory status updated to open.
+        - Items already at status=open pass through unchanged.
+        - During dry-run, no actual wl calls are made.
+
+        Args:
+            items: List of work item dicts from discover_items().
+
+        Returns:
+            The same list with orphan statuses reset to 'open' in memory.
+        """
+        remaining: list[dict] = []
+        for item in items:
+            status = item.get("status", "")
+            stage = item.get("stage", "")
+            if status in ("completed", "in_progress") and stage == "idea":
+                result = self._attempt_recovery(item["id"])
+                logger.info(
+                    "intakeall.orphan_recovery item=%s success=%s action=%s",
+                    item["id"],
+                    result.get("success", False),
+                    result.get("action", "unknown"),
+                )
+                # Update in-memory status regardless of wl success
+                item["status"] = "open"
+            remaining.append(item)
+        return remaining
+
+    # -----------------------------------------------------------------------
+    # Signal handling
+    # -----------------------------------------------------------------------
+
+    def _setup_signal_handlers(self) -> None:
+        """Register signal handlers for graceful abort on SIGINT/SIGTERM.
+
+        When a signal is caught while processing an item, the handler
+        attempts to recover that item (reset to status=open, stage=idea)
+        before exiting.
+        """
+        self._original_sigint = signal.getsignal(signal.SIGINT)
+        self._original_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _restore_signal_handlers(self) -> None:
+        """Restore original signal handlers."""
+        if hasattr(self, "_original_sigint"):
+            signal.signal(signal.SIGINT, self._original_sigint)
+        if hasattr(self, "_original_sigterm"):
+            signal.signal(signal.SIGTERM, self._original_sigterm)
+
+    def _signal_handler(self, signum: int, _frame: Any) -> None:
+        """Handle abort signals by recovering the current item.
+
+        Args:
+            signum: Signal number received.
+            _frame: Current stack frame (unused).
+        """
+        if self._current_item_id:
+            logger.warning(
+                "intakeall.signal received=%s recovering item=%s",
+                signum,
+                self._current_item_id,
+            )
+            self._attempt_recovery(self._current_item_id)
+        raise SystemExit(128 + signum)
+
+    # -----------------------------------------------------------------------
     # Run all
     # -----------------------------------------------------------------------
 
     def run_all(self) -> list[dict]:
         """Process all idea-stage items and return results.
 
+        Pre-processing:
+        1. Discover ALL items in idea stage (including orphans)
+        2. Recover orphaned items (reset status=completed/in_progress
+           to status=open)
+
         For each item:
         1. Check if it has sufficient detail for auto-complete
         2. If yes, auto-complete to intake_complete (skip /intake)
         3. If no, invoke /intake and classify the outcome
+
+        Signal handlers are registered so that an external abort
+        (SIGINT/SIGTERM) triggers recovery for the in-progress item.
 
         Returns:
             A list of result dicts, each with keys:
@@ -490,63 +587,80 @@ class IntakeAllEngine:
                 - recovery: dict or None
         """
         items = self.discover_items()
+
+        # Recover orphans before processing
+        items = self._recover_orphans(items)
+
+        # Register signal handlers for graceful abort
+        self._setup_signal_handlers()
+
         results: list[dict] = []
 
-        for item in items:
-            item_id = item.get("id", "")
-            if not item_id:
-                continue
+        try:
+            for item in items:
+                item_id = item.get("id", "")
+                if not item_id:
+                    continue
 
-            title = item.get("title", "")
+                # Track current item for signal-handler recovery
+                self._current_item_id = item_id
 
-            # Check if item can be auto-completed
-            if has_sufficient_detail(item):
-                if self.dry_run:
-                    outcome = "auto_completed"
-                    result: dict[str, Any] = {
-                        "id": item_id,
-                        "title": title,
-                        "outcome": outcome,
-                        "error_detail": None,
-                        "recovery": None,
-                    }
-                else:
-                    ac_result = self.auto_complete(item)
-                    if ac_result == "completed":
-                        result = {
+                title = item.get("title", "")
+
+                # Check if item can be auto-completed
+                if has_sufficient_detail(item):
+                    if self.dry_run:
+                        outcome = "auto_completed"
+                        result: dict[str, Any] = {
                             "id": item_id,
                             "title": title,
-                            "outcome": "auto_completed",
+                            "outcome": outcome,
                             "error_detail": None,
                             "recovery": None,
                         }
                     else:
+                        ac_result = self.auto_complete(item)
+                        if ac_result == "completed":
+                            result = {
+                                "id": item_id,
+                                "title": title,
+                                "outcome": "auto_completed",
+                                "error_detail": None,
+                                "recovery": None,
+                            }
+                        else:
+                            result = {
+                                "id": item_id,
+                                "title": title,
+                                "outcome": "error",
+                                "error_detail": f"Auto-complete failed: {ac_result}",
+                                "recovery": None,
+                            }
+                else:
+                    # Item needs /intake
+                    if self.dry_run:
                         result = {
                             "id": item_id,
                             "title": title,
-                            "outcome": "error",
-                            "error_detail": f"Auto-complete failed: {ac_result}",
+                            "outcome": "intake_completed",
+                            "error_detail": None,
                             "recovery": None,
                         }
-            else:
-                # Item needs /intake
-                if self.dry_run:
-                    result = {
-                        "id": item_id,
-                        "title": title,
-                        "outcome": "intake_completed",
-                        "error_detail": None,
-                        "recovery": None,
-                    }
-                else:
-                    intake_result = self._invoke_intake(item_id)
-                    result = {
-                        "id": item_id,
-                        "title": title,
-                        **intake_result,
-                    }
+                    else:
+                        intake_result = self._invoke_intake(item_id)
+                        result = {
+                            "id": item_id,
+                            "title": title,
+                            **intake_result,
+                        }
 
-            results.append(result)
+                results.append(result)
+
+                # Clear current item now that it's done
+                self._current_item_id = None
+        finally:
+            self._restore_signal_handlers()
+            self._current_item_id = None
 
         return results
 

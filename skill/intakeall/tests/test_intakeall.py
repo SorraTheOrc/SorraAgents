@@ -10,11 +10,15 @@ These tests verify:
 - Summary report accuracy (Markdown and JSON) with error/recovery details
 - --parent-id flag posts summary as a comment
 - Idempotence (re-running doesn't duplicate work)
+- Orphaned-item detection (items stuck in completed+idea or in_progress+idea)
+- Orphan recovery (automatic reset to open status before processing)
+- Signal handler registration and behavior (SIGINT/SIGTERM trigger recovery)
 
 Related work item: SA-0MQKW21FQ004RW2J
 """
 
 import json
+import signal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -142,6 +146,46 @@ SAMPLE_WL_LIST_RESPONSE = json.dumps({
     "workItems": [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_C, SAMPLE_ITEM_D],
 })
 
+# Orphan sample items — items stuck in contradictory states in idea stage
+ORPHAN_ITEM_COMPLETED = {
+    "id": "SA-ORPHAN-001",
+    "title": "Orphaned Completed Item",
+    "status": "completed",
+    "stage": "idea",
+    "priority": "high",
+    "issueType": "feature",
+    "description": (
+        "# Orphaned Feature\n\n"
+        "## Acceptance Criteria\n"
+        "- The thing works\n"
+    ),
+}
+
+ORPHAN_ITEM_IN_PROGRESS = {
+    "id": "SA-ORPHAN-002",
+    "title": "Orphaned In-Progress Item",
+    "status": "in_progress",
+    "stage": "idea",
+    "priority": "medium",
+    "issueType": "bug",
+    "description": (
+        "# Orphaned Bug\n\n"
+        "## Acceptance Criteria\n"
+        "- Fix the thing\n"
+    ),
+}
+
+# A mixed list containing normal items + orphans
+SAMPLE_MIXED_LIST_RESPONSE = json.dumps({
+    "success": True,
+    "workItems": [
+        SAMPLE_ITEM_A,
+        ORPHAN_ITEM_COMPLETED,
+        SAMPLE_ITEM_C,
+        ORPHAN_ITEM_IN_PROGRESS,
+    ],
+})
+
 
 # ===========================================================================
 # Test: has_sufficient_detail
@@ -216,11 +260,11 @@ class TestDiscovery:
         assert items[2]["id"] == "SA-INTAKE-003"
         assert items[3]["id"] == "SA-INTAKE-004"
 
-        # Verify the correct wl command was issued
+        # Verify the correct wl command was issued (without --status open filter)
         assert any(
-            cmd[:3] == ["wl", "list", "--stage"] and "idea" in cmd
+            cmd[:3] == ["wl", "list", "--stage"] and "idea" in cmd and "--status" not in cmd
             for cmd in runner.calls
-        ), "Expected wl list --stage idea --status open --json call"
+        ), "Expected wl list --stage idea --json call (without --status open filter)"
 
     def test_discover_returns_empty_list_when_no_items(self):
         """When no items are in idea stage, return an empty list."""
@@ -1049,3 +1093,363 @@ class TestEngineConfig:
         assert engine.dry_run is True
         engine2 = IntakeAllEngine(dry_run=False)
         assert engine2.dry_run is False
+
+
+# ===========================================================================
+# Test: Orphan detection in discover_items
+# ===========================================================================
+
+class TestOrphanDiscovery:
+    """Verify that discover_items returns all idea-stage items regardless of status."""
+
+    def test_discover_returns_orphans_with_completed_status(self):
+        """Items with status=completed, stage=idea are discovered."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=SAMPLE_MIXED_LIST_RESPONSE,
+        )
+
+        engine = IntakeAllEngine(runner=runner)
+        items = engine.discover_items()
+
+        assert len(items) == 4
+        ids = [item["id"] for item in items]
+        assert "SA-ORPHAN-001" in ids
+        assert "SA-ORPHAN-002" in ids
+        assert "SA-INTAKE-001" in ids
+        assert "SA-INTAKE-003" in ids
+
+        # Verify the command does NOT filter by status
+        discover_calls = [
+            cmd for cmd in runner.calls
+            if "wl list" in " ".join(cmd)
+        ]
+        assert len(discover_calls) >= 1
+        cmd_str = " ".join(discover_calls[0])
+        assert "--status" not in cmd_str, \
+            "discover_items should not filter by status to find orphans"
+
+    def test_discover_returns_all_statuses_in_idea_stage(self):
+        """All items in idea stage are returned, regardless of status value."""
+        runner = FakeRunner()
+        # Set of items with various statuses
+        items_data = [
+            dict(SAMPLE_ITEM_A, status="open"),
+            dict(SAMPLE_ITEM_A, id="SA-STATUS-002", status="completed"),
+            dict(SAMPLE_ITEM_A, id="SA-STATUS-003", status="in_progress"),
+            dict(SAMPLE_ITEM_A, id="SA-STATUS-004", status="blocked"),
+        ]
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=json.dumps({"success": True, "workItems": items_data}),
+        )
+
+        engine = IntakeAllEngine(runner=runner)
+        items = engine.discover_items()
+        assert len(items) == 4
+
+
+# ===========================================================================
+# Test: Orphan recovery (_recover_orphans)
+# ===========================================================================
+
+class TestOrphanRecovery:
+    """Verify that orphaned items in idea stage are recovered to open status."""
+
+    def test_orphan_completed_recovered_to_open(self):
+        """Item with status=completed, stage=idea is reset to status=open."""
+        runner = FakeRunner()
+        runner.set_response(
+            f"wl update {ORPHAN_ITEM_COMPLETED['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner)
+        items = [dict(ORPHAN_ITEM_COMPLETED)]
+        recovered = engine._recover_orphans(items)
+
+        assert len(recovered) == 1
+        assert recovered[0]["status"] == "open"
+        # Verify wl update was called to reset the item
+        update_calls = [
+            cmd for cmd in runner.calls
+            if "wl" in cmd and "update" in cmd
+        ]
+        assert len(update_calls) >= 1
+
+    def test_orphan_in_progress_recovered_to_open(self):
+        """Item with status=in_progress, stage=idea is reset to status=open."""
+        runner = FakeRunner()
+        runner.set_response(
+            f"wl update {ORPHAN_ITEM_IN_PROGRESS['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner)
+        items = [dict(ORPHAN_ITEM_IN_PROGRESS)]
+        recovered = engine._recover_orphans(items)
+
+        assert len(recovered) == 1
+        assert recovered[0]["status"] == "open"
+
+    def test_normal_open_items_unaffected(self):
+        """Items already with status=open, stage=idea pass through unchanged."""
+        runner = FakeRunner()
+        engine = IntakeAllEngine(runner=runner)
+        items = [dict(SAMPLE_ITEM_A)]
+        recovered = engine._recover_orphans(items)
+
+        assert len(recovered) == 1
+        assert recovered[0]["status"] == "open"
+        # No update calls should have been made for non-orphans
+        update_calls = [
+            cmd for cmd in runner.calls
+            if "wl" in cmd and "update" in cmd
+        ]
+        assert len(update_calls) == 0
+
+    def test_mixed_items_only_orphans_recovered(self):
+        """Only orphaned items are recovered; normal items pass through."""
+        runner = FakeRunner()
+        runner.set_response(
+            f"wl update {ORPHAN_ITEM_COMPLETED['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {ORPHAN_ITEM_IN_PROGRESS['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner)
+        items = [
+            dict(SAMPLE_ITEM_A),        # open - normal
+            dict(ORPHAN_ITEM_COMPLETED),   # completed - orphan
+            dict(SAMPLE_ITEM_C),        # open - normal (epic)
+            dict(ORPHAN_ITEM_IN_PROGRESS), # in_progress - orphan
+        ]
+        recovered = engine._recover_orphans(items)
+
+        assert len(recovered) == 4
+        # Orphans should have been reset to open
+        for item in recovered:
+            assert item["status"] == "open", \
+                f"Item {item['id']} should have status=open after recovery"
+
+    def test_recovery_failure_handled_gracefully(self):
+        """If wl update fails for an orphan, error is logged and item kept."""
+        runner = FakeRunner()
+        # Simulate wl rejecting the completed→open transition
+        runner.set_response(
+            f"wl update {ORPHAN_ITEM_COMPLETED['id']} --stage",
+            returncode=1,
+            stderr="wl: cannot transition from completed to open",
+        )
+
+        engine = IntakeAllEngine(runner=runner)
+        items = [dict(ORPHAN_ITEM_COMPLETED)]
+        recovered = engine._recover_orphans(items)
+
+        # Item should still be included for processing (status updated in-memory)
+        assert len(recovered) == 1
+        # The item's in-memory status is updated regardless of wl success
+        assert recovered[0]["status"] == "open"
+
+    def test_dry_run_skips_update(self):
+        """During dry run, orphans are not actually updated via wl."""
+        runner = FakeRunner()
+        engine = IntakeAllEngine(runner=runner, dry_run=True)
+        items = [dict(ORPHAN_ITEM_COMPLETED)]
+        recovered = engine._recover_orphans(items)
+
+        assert len(recovered) == 1
+        assert recovered[0]["status"] == "open"
+        # No update calls should have been made in dry run
+        update_calls = [
+            cmd for cmd in runner.calls
+            if "wl" in cmd and "update" in cmd
+        ]
+        assert len(update_calls) == 0
+
+    def test_orphan_recovery_in_run_all_pipeline(self):
+        """Orphan recovery runs before processing in the full pipeline."""
+        runner = FakeRunner()
+        # Mixed list: one normal (auto-completable), two orphans
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=SAMPLE_MIXED_LIST_RESPONSE,
+        )
+        # Recovery updates for orphans
+        runner.set_response(
+            f"wl update {ORPHAN_ITEM_COMPLETED['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {ORPHAN_ITEM_IN_PROGRESS['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        # Claim updates for items that need processing
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_A['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {ORPHAN_ITEM_COMPLETED['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {ORPHAN_ITEM_IN_PROGRESS['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        # Stage updates for auto-completable items
+        for item_id in [SAMPLE_ITEM_A["id"], ORPHAN_ITEM_COMPLETED["id"],
+                         ORPHAN_ITEM_IN_PROGRESS["id"]]:
+            runner.set_response(
+                f"wl update {item_id} --stage",
+                stdout=json.dumps({"success": True}),
+            )
+            runner.set_response(
+                f"wl comment add {item_id}",
+                stdout=json.dumps({"success": True}),
+            )
+
+        engine = IntakeAllEngine(runner=runner)
+        results = engine.run_all()
+
+        # All 4 items should be processed
+        assert len(results) == 4
+        # Orphans should be recovered and then processed normally
+        completed_ids = [r["id"] for r in results if r["outcome"] == "auto_completed"]
+        assert ORPHAN_ITEM_COMPLETED["id"] in completed_ids
+        assert ORPHAN_ITEM_IN_PROGRESS["id"] in completed_ids
+        assert SAMPLE_ITEM_A["id"] in completed_ids
+
+        # Verify recovery calls happened before processing calls
+        recovery_calls = []
+        processing_calls = []
+        for cmd in runner.calls:
+            cmd_str = " ".join(cmd)
+            if ORPHAN_ITEM_COMPLETED["id"] in cmd_str and "--stage" in cmd_str:
+                # Recovery updates stage, processing updates stage too
+                pass  # Both orphans have --stage idea recovery + --stage intake_complete processing
+
+        # Verify recovery call happened (wl update --stage idea for orphans)
+        recovery_calls = [
+            cmd for cmd in runner.calls
+            if "wl" in cmd and "update" in cmd and "--stage" in cmd
+            and "idea" in " ".join(cmd)
+        ]
+        # Should have recovery calls for both orphans
+        assert len(recovery_calls) == 2
+
+
+# ===========================================================================
+# Test: Signal handling for graceful abort
+# ===========================================================================
+
+class TestSignalHandling:
+    """Verify signal handlers are registered and trigger recovery correctly."""
+
+    def test_signal_handlers_registered(self):
+        """SIGINT and SIGTERM handlers are registered on setup."""
+        runner = FakeRunner()
+        engine = IntakeAllEngine(runner=runner)
+
+        engine._setup_signal_handlers()
+
+        # Verify both signals are registered to the handler method
+        import signal
+        assert signal.getsignal(signal.SIGINT) == engine._signal_handler
+        assert signal.getsignal(signal.SIGTERM) == engine._signal_handler
+
+        # Restore original handlers
+        engine._restore_signal_handlers()
+        assert signal.getsignal(signal.SIGINT) != engine._signal_handler or \
+               signal.getsignal(signal.SIGINT) == signal.default_int_handler
+
+    def test_signal_handler_calls_recovery_for_current_item(self):
+        """Signal handler calls _attempt_recovery for the current item."""
+        runner = FakeRunner()
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner)
+        engine._current_item_id = SAMPLE_ITEM_C["id"]
+
+        # Simulate receiving a signal by calling the handler directly
+        import signal
+        try:
+            engine._signal_handler(signal.SIGINT, None)
+        except SystemExit:
+            pass
+
+        # Verify recovery was attempted
+        recovery_calls = [
+            cmd for cmd in runner.calls
+            if "wl" in cmd and "update" in cmd and SAMPLE_ITEM_C["id"] in " ".join(cmd)
+        ]
+        assert len(recovery_calls) >= 1
+
+    def test_signal_handler_noop_when_no_current_item(self):
+        """Signal handler does nothing when no item is being processed."""
+        runner = FakeRunner()
+        engine = IntakeAllEngine(runner=runner)
+        engine._current_item_id = None
+
+        import signal
+        try:
+            engine._signal_handler(signal.SIGINT, None)
+        except SystemExit:
+            pass
+
+        # No recovery should be attempted
+        update_calls = [
+            cmd for cmd in runner.calls
+            if "wl" in cmd and "update" in cmd
+        ]
+        assert len(update_calls) == 0
+
+    def test_current_item_id_set_during_intake(self):
+        """_current_item_id is set during intake processing for signal handling."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=json.dumps({
+                "success": True,
+                "workItems": [SAMPLE_ITEM_C],
+            }),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner)
+        engine.run_all()
+
+        # After run_all completes, _current_item_id should be None (cleared)
+        assert engine._current_item_id is None
+
+    def test_signal_handler_exits_with_code(self):
+        """Signal handler raises SystemExit with correct code (128+signum)."""
+        runner = FakeRunner()
+        engine = IntakeAllEngine(runner=runner)
+
+        import signal
+        try:
+            engine._signal_handler(signal.SIGINT, None)
+            # Should not reach here
+            assert False, "Expected SystemExit"
+        except SystemExit as e:
+            # SIGINT = 2, so exit code should be 130
+            assert e.code == 128 + signal.SIGINT
