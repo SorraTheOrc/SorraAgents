@@ -1314,7 +1314,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
     # ------------------------------------------------------------------
     # Status lifecycle: set in_progress on entry
     # ------------------------------------------------------------------
-    _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress"])
+    _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"])
 
     try:
         try:
@@ -1578,7 +1578,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # Always runs because of try/finally — guarantees cleanup.
         # ------------------------------------------------------------------
         try:
-            _run_wl(runner, ["wl", "update", issue_id, "--status", "completed"])
+            _run_wl(runner, ["wl", "update", issue_id, "--status", "completed", "--json"])
         except RuntimeError:
             pass  # Status update failure must not mask the main result
 

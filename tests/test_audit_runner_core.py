@@ -952,6 +952,26 @@ class TestStatusLifecycle:
             f"First update should be in_progress, got: {wl_updates[0]}"
         )
 
+    def test_in_progress_includes_json_flag(self, monkeypatch):
+        """in_progress wl update must include --json flag."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+        )
+
+        cmd_issue("SA-JSONFLAG", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-JSONFLAG"]]
+        assert len(wl_updates) >= 1, f"Expected at least one wl update call, got: {calls}"
+        # The first wl update call should include --json as the 6th argument
+        in_progress_updates = [c for c in wl_updates if "--status" in c and "in_progress" in c]
+        assert len(in_progress_updates) >= 1, f"Expected in_progress update, got: {wl_updates}"
+        assert "--json" in in_progress_updates[0], (
+            f"in_progress update must include --json, got: {in_progress_updates[0]}"
+        )
+
     def test_sets_completed_after_audit(self, monkeypatch):
         """completed status must be set at the end of a successful audit."""
         calls = []
@@ -967,6 +987,28 @@ class TestStatusLifecycle:
         completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
         assert len(completed_updates) >= 1, (
             f"Expected at least one completed status update, got: {wl_updates}"
+        )
+
+    def test_completed_includes_json_flag(self, monkeypatch):
+        """completed wl update must include --json flag."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+        )
+
+        cmd_issue("SA-JSONFLAG2", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-JSONFLAG2"]]
+        assert len(wl_updates) >= 1, f"Expected at least one wl update call, got: {calls}"
+        # The completed update should include --json
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected completed update, got: {wl_updates}"
+        )
+        assert "--json" in completed_updates[0], (
+            f"completed update must include --json, got: {completed_updates[0]}"
         )
 
     def test_sets_completed_on_wl_show_failure(self):

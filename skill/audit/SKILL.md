@@ -51,6 +51,30 @@ The canonical audit runner automatically manages the work item's `status` field 
 - The `stage` field is NOT modified by the status lifecycle.
 - If the `completed` status update fails (e.g., runner error), the failure is silently caught to avoid masking the main audit result.
 
+### Manual Fallback (Running Without the Runner)
+
+When running an audit manually (i.e., without the `audit_runner.py` script), the
+status lifecycle must be managed by hand to match the runner's behavior:
+
+1. **Before starting the audit**, set status to `in_progress`:
+
+   ```bash
+   wl update <id> --status in_progress --json
+   ```
+
+2. **After the audit completes** (whether successful or failed), set status to `completed`:
+
+   ```bash
+   wl update <id> --status completed --json
+   ```
+
+> **Important:** Always include the `--json` flag with `wl update` commands to
+> ensure machine-readable output. The audit runner's `_run_wl()` function
+> expects JSON output from all `wl` commands.
+
+This ensures the same `in_progress` → `completed` transition regardless of
+whether the automated runner or a manual process performs the audit.
+
 ### Rationale
 
 The status lifecycle was added to solve the problem of concurrent audit attempts and visibility into audit state. Before this feature, there was no way to determine whether an audit was in progress. The deterministic `try/finally` approach guarantees cleanup regardless of outcome.
