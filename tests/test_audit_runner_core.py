@@ -26,6 +26,7 @@ from skill.audit.scripts.audit_runner import (
     _resolve_model_for_phase,
     _normalize_model_source,
     _deep_merge,
+    CALL_PI_TIMEOUT,
     DEFAULT_MODEL,
     DEFAULT_MODEL_SOURCE,
 )
@@ -572,6 +573,33 @@ class TestDebugLogging:
         entry = json.loads(lines[0])
         assert entry["reason"] == "debug_log"
         assert entry["raw_stdout"] == "RAW"
+
+
+# ---------------------------------------------------------------------------
+# Timeout constant tests
+# ---------------------------------------------------------------------------
+
+class TestCallPiTimeoutConstant:
+    """Verify the CALL_PI_TIMEOUT constant exists and is set to a safe value."""
+
+    def test_call_pi_timeout_constant_exists(self):
+        """CALL_PI_TIMEOUT must be defined."""
+        assert CALL_PI_TIMEOUT is not None
+        assert isinstance(CALL_PI_TIMEOUT, int)
+
+    def test_call_pi_timeout_under_120_seconds(self):
+        """Timeout must be under 120s (parent tool timeout)."""
+        assert CALL_PI_TIMEOUT < 120, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} must be < 120s "
+            "to fire before the parent bash-tool timeout"
+        )
+
+    def test_call_pi_timeout_reasonable_for_large_prompts(self):
+        """Timeout should be at least 60s to allow large audit prompts."""
+        assert CALL_PI_TIMEOUT >= 60, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be >= 60s "
+            "to allow large audit prompts to complete"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -265,6 +265,17 @@ The audit skill ships a canonical runner and a persister. Use these from CI, loc
     - `--debug-log` — append Pi debug output to a JSONL file (helpful for triage)
     - `--json` — emit machine-readable JSON output
 
+  **Timeout behavior:**
+  - Each internal Pi model call has a default timeout of `CALL_PI_TIMEOUT`=100s
+    (configurable via the module constant in `audit_runner.py`). This is shorter
+    than the typical parent bash-tool execution timeout (~120s) to ensure the
+    runner produces a clean diagnostic before being killed externally.
+  - On timeout, the runner returns an `unmet` verdict for the affected criteria
+    with evidence reading "Pi model call timed out after Ns. Manual audit required."
+  - If the cumulative audit time exceeds 110s (e.g., when auditing many children),
+    remaining child audits are skipped with a "Skipped due to audit timeout"
+    diagnostic, preventing a silent external kill.
+
 - Persister: `./scripts/persist_audit.py`
 
 ### Code Quality Integration

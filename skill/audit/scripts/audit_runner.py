@@ -28,6 +28,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -42,6 +43,19 @@ from skill.scripts.failure_notice import FailureNotice  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
+
+CALL_PI_TIMEOUT = 100
+"""Internal timeout (seconds) for each Pi model subprocess call.
+
+Must be less than the parent bash-tool execution timeout (~120s) to ensure
+the Pi call times out internally and produces a clean diagnostic before the
+parent kills the process externally (which would result in a silent failure).
+The value 100s provides ~20s margin below 120s.
+
+If this value is changed, ensure it remains at least 20s below the actual
+parent timeout to allow for cumulative operations (child audits, report
+assembly, persistence) to complete after the last Pi call.
+"""
 
 # Verdict constants
 VERDICT_MET = "met"
@@ -286,10 +300,21 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         raise RuntimeError(f"pi binary not found: {pi_bin}")
 
     try:
-        stdout, stderr = process.communicate(timeout=900)
+        stdout, stderr = process.communicate(timeout=CALL_PI_TIMEOUT)
     except subprocess.TimeoutExpired:
         process.kill()
         stdout, stderr = process.communicate()
+        return {
+            "verdict": "unmet",
+            "evidence": (
+                f"Pi model call timed out after {CALL_PI_TIMEOUT}s. "
+                "Manual audit required."
+            ),
+            "raw_stdout": stdout,
+            "raw_stderr": stderr,
+            "extracted_text": "",
+            "_timeout": True,
+        }
 
     raw = stdout or ""
     if not raw:
@@ -1392,6 +1417,14 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
         acs = _extract_acs(description)
 
+        # Track elapsed time so we can skip remaining child audits if we
+        # approach the parent bash-tool timeout (~120s). This ensures a
+        # graceful degradation instead of a silent external kill.
+        _audit_start = time.monotonic()
+
+        def _elapsed():
+            return time.monotonic() - _audit_start
+
         # Review parent ACs via Pi (batched into a single call for performance)
         ac_results = []
         if acs and acs[0] != "No acceptance criteria defined.":
@@ -1428,7 +1461,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     batch = json.loads(raw_text)
                 except json.JSONDecodeError:
                     batch = []
-            if isinstance(batch, list):
+            if isinstance(batch, list) and batch:
                 reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
                 for i, ac in enumerate(acs):
                     item = reviewed.get(i, {})
@@ -1438,7 +1471,10 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         "evidence": item.get("evidence", ""),
                     })
             else:
-                # Fallback: treat single result as covering all ACs equally
+                # Fallback: treat single result as covering all ACs equally.
+                # This path is reached when the Pi response was not a parseable
+                # JSON array (e.g., a timeout diagnostic). Preserve the root-level
+                # evidence so the diagnostic is visible in the report.
                 verdict = result.get("verdict", "unmet")
                 evidence = result.get("evidence", "")
                 for ac in acs:
@@ -1454,6 +1490,34 @@ def cmd_issue(issue_id: str, persist: bool = True,
             if not c.get("deletedBy") and c.get("status") != "completed"
         ]
         for child in active_children:
+            # Skip remaining children if we're too close to the parent
+            # timeout (~120s). This prevents a silent external kill and
+            # instead produces a clear diagnostic for skipped audits.
+            if _elapsed() >= 110:
+                print(
+                    f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
+                    f"Skipping child {child.get('id', '')} ({child.get('title', '')}). "
+                    "Manual audit required for this child.",
+                    file=sys.stderr,
+                )
+                child_results.append({
+                    "title": child.get("title", ""),
+                    "id": child.get("id", ""),
+                    "status": child.get("status", ""),
+                    "stage": child.get("stage", ""),
+                    "ac_results": [{
+                        "text": "Skipped due to audit timeout. Manual audit required.",
+                        "verdict": "unmet",
+                        "evidence": (
+                            f"Audit runner skipped this child after "
+                            f"{_elapsed():.0f}s total elapsed time to avoid "
+                            f"the parent process timeout (~120s). "
+                            "Manual audit required."
+                        ),
+                    }],
+                })
+                continue
+
             child_desc = child.get("description", "")
             child_acs = _extract_acs(child_desc)
             child_ac_results = []
@@ -1489,7 +1553,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         batch = json.loads(raw_text)
                     except json.JSONDecodeError:
                         batch = []
-                if isinstance(batch, list):
+                if isinstance(batch, list) and batch:
                     reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
                     for i, ac in enumerate(child_acs):
                         item = reviewed.get(i, {})
@@ -1499,6 +1563,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
                             "evidence": item.get("evidence", ""),
                         })
                 else:
+                    # Fallback: preserve root-level evidence from the Pi
+                    # result (e.g., a timeout diagnostic) when batched
+                    # parsing produced an empty or unparseable result.
                     verdict = result.get("verdict", "unmet")
                     evidence = result.get("evidence", "")
                     for ac in child_acs:
