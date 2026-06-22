@@ -293,8 +293,8 @@ class TestAutoComplete:
         ]
         assert len(intake_calls) == 0, "Auto-completed items should skip /intake"
 
-    def test_well_defined_item_advances_to_intake_complete(self):
-        """Auto-completed item is advanced to intake_complete stage."""
+    def test_auto_completed_item_set_to_open(self):
+        """Auto-completed item has status set to open, stage unchanged."""
         runner = FakeRunner()
         runner.set_response(
             "wl list --stage idea",
@@ -308,10 +308,6 @@ class TestAutoComplete:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"wl update {SAMPLE_ITEM_A['id']} --stage",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
             f"wl comment add {SAMPLE_ITEM_A['id']}",
             stdout=json.dumps({"success": True}),
         )
@@ -319,14 +315,21 @@ class TestAutoComplete:
         engine = IntakeAllEngine(runner=runner)
         engine.run_all()
 
-        # Verify stage update command was issued
+        # Verify status update to open was issued (no stage change)
+        status_update_calls = [
+            cmd for cmd in runner.calls
+            if "wl" in cmd and "update" in cmd and "--status" in cmd
+        ]
+        assert len(status_update_calls) >= 1
+        # The last status update should be the completion (set to open)
+        last_status_cmd = " ".join(status_update_calls[-1])
+        assert "open" in last_status_cmd
+        # No --stage should appear in any update command (stage is not advanced)
         stage_update_calls = [
             cmd for cmd in runner.calls
             if "wl" in cmd and "update" in cmd and "--stage" in cmd
         ]
-        assert len(stage_update_calls) >= 1
-        stage_str = " ".join(stage_update_calls[0])
-        assert "intake_complete" in stage_str
+        assert len(stage_update_calls) == 0, "Auto-complete should not change stage"
 
 
 # ===========================================================================

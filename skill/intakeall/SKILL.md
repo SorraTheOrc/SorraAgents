@@ -11,9 +11,9 @@ Use this skill when asked to run batch intake on all `idea` stage work items. It
 
 1. Query `wl list --stage idea --status open --json` to discover all eligible work items
 2. For each item:
-   - If the item has sufficient detail (acceptance criteria + implementation guidance), auto-complete it to `intake_complete` without invoking `/intake`
+   - If the item has sufficient detail (acceptance criteria + implementation guidance), auto-complete it without invoking `/intake` (sets `status=open`, stage unchanged)
    - Otherwise, claim it (`wl update <id> --status in_progress --stage in_progress`) and invoke `/intake`
-   - After `/intake` completes successfully, update to `stage=intake_complete, status=open`
+   - After `/intake` completes successfully, reset to `stage=idea, status=open`
 3. Detect items needing producer input (unanswered questions, non-zero exit, or specific output patterns)
 4. On error, attempt recovery (reset item stage to `idea` and status to `open`) and record recovery outcome
 5. Continue processing remaining items even when one requires input or encounters an error
@@ -72,7 +72,7 @@ When `--json` is used, the output is a JSON object:
 
 ## Auto-complete criteria
 
-Items with sufficient detail are auto-completed to `stage=intake_complete, status=open` without invoking `/intake`:
+Items with sufficient detail are auto-completed (stage unchanged, status set to `open`) without invoking `/intake`:
 
 - Item is NOT an epic
 - Description contains measurable acceptance criteria (e.g., `## Acceptance Criteria` or `## Success Criteria`)
@@ -94,17 +94,17 @@ Items flagged as `needs_input` are not retried — the skill moves on to the nex
 
 - If `wl list` fails (non-zero exit or exception), returns an empty list gracefully
 - If claiming an item fails, logs a warning and marks the item as `error`
-- After `/intake` succeeds for an item, updates to `stage=intake_complete, status=open`
+- After `/intake` succeeds for an item, resets to `stage=idea, status=open` (revert the claim's stage change)
 - If `/intake` fails for an item, logs a warning, attempts recovery (resets item stage to `idea` and status to `open`), and continues to the next item
 - All errors and recovery actions are captured in the summary report
 - Recovery outcomes (success/failure) are included in per-item results
 
 ## Idempotence
 
-- IntakeAll processes only items currently in `idea` stage
-- Items that have already been intake-processed (moved past `idea`) are naturally excluded on subsequent runs
+- IntakeAll processes only items currently in `idea` stage with `status=open`
+- Items that have already been intake-processed or are in other stages are naturally excluded on subsequent runs
 - Re-running IntakeAll is safe and will only process remaining idea-stage items
-- Auto-completed items are advanced to `intake_complete` and excluded from future runs
+- Since stage is not advanced, items will be re-processed on subsequent runs (the intake command itself is idempotent)
 
 ## CLI flags
 

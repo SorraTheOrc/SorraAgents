@@ -186,10 +186,9 @@ class IntakeAllEngine:
                 )
                 return "error"
 
-            # Mark as intake_complete
+            # Reset to open (don't advance stage)
             complete_cmd = [
                 "wl", "update", item_id,
-                "--stage", "intake_complete",
                 "--status", "open",
                 "--json",
             ]
@@ -313,11 +312,11 @@ class IntakeAllEngine:
             result["error_detail"] = "Intake output contains unanswered questions"
             return result
 
-        # Mark the item as intake_complete
+        # Reset stage back to idea and status to open (revert the claim's stage change)
         if not self.dry_run:
             complete_cmd = [
                 "wl", "update", item_id,
-                "--stage", "intake_complete",
+                "--stage", "idea",
                 "--status", "open",
                 "--json",
             ]
