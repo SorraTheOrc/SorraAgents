@@ -633,7 +633,6 @@ class TestQualityEpicCreation:
         mod = self._import_module()
 
         # Just test that the main() function's dry-run path includes stage info
-        import io
         # The dry-run output currently prints findings and then JSON
         # We test the script's behavior directly by calling main with --dry-run
         exit_code = mod.main(["--findings", json.dumps(SAMPLE_FINDINGS_CRITICAL), "--dry-run"])
