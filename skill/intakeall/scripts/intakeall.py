@@ -120,6 +120,7 @@ class IntakeAllEngine:
         self.verbose = verbose
         # Track the item currently being processed for signal-handler recovery
         self._current_item_id: Optional[str] = None
+        self._total_discovered: int = 0
 
     # -----------------------------------------------------------------------
     # Discovery
@@ -673,6 +674,7 @@ class IntakeAllEngine:
 
         # Recover orphans before processing
         items = self._recover_orphans(items)
+        self._total_discovered = len(items)
 
         # Register signal handlers for graceful abort
         self._setup_signal_handlers()
@@ -766,7 +768,7 @@ class IntakeAllEngine:
             parent_id: If provided, post the summary as a comment on this item.
         """
         summary_md = _wrap_with_failure_notice_if_needed(
-            generate_summary(results, json_output=False),
+            generate_summary(results, json_output=False, total_discovered=self._total_discovered),
             results,
             script_name="intakeall.py",
         )
@@ -806,13 +808,16 @@ def _wrap_with_failure_notice_if_needed(report: str, results: list[dict],
     ).wrap(report)
 
 
-def generate_summary(results: list[dict], json_output: bool = False) -> str:
+def generate_summary(results: list[dict], json_output: bool = False,
+                     total_discovered: int | None = None) -> str:
     """Generate a summary report from processing results.
 
     Args:
         results: List of result dicts with id, title, outcome, error_detail,
                  recovery keys.
         json_output: If True, produce JSON instead of Markdown.
+        total_discovered: Total number of items discovered before processing.
+            If provided, a "remaining" count is included in the summary.
 
     Returns:
         A Markdown or JSON string.
@@ -826,6 +831,7 @@ def generate_summary(results: list[dict], json_output: bool = False) -> str:
                       if r.get("outcome") == "needs_input")
     errors = sum(1 for r in results
                  if r.get("outcome") == "error")
+    remaining = (total_discovered - total) if total_discovered is not None else 0
 
     if json_output:
         report: dict[str, Any] = {
@@ -845,6 +851,8 @@ def generate_summary(results: list[dict], json_output: bool = False) -> str:
                 for r in results
             ],
         }
+        if total_discovered is not None:
+            report["remaining"] = remaining
         return json.dumps(report, indent=2)
 
     lines = [
@@ -857,6 +865,9 @@ def generate_summary(results: list[dict], json_output: bool = False) -> str:
         f"**Errors**: {errors}",
         "",
     ]
+    if total_discovered is not None:
+        lines.insert(-1, f"**Remaining**: {remaining}")
+        lines.insert(-1, "")
     if results:
         lines.append("## Results")
         lines.append("")
@@ -968,7 +979,8 @@ def _main(argv: list[str] | None = None) -> int:
     results = engine.run_all()
 
     if args.json:
-        report = generate_summary(results, json_output=True)
+        report = generate_summary(results, json_output=True,
+                                 total_discovered=engine._total_discovered)
         print(report)
     else:
         engine.post_summary(results, parent_id=args.parent_id)

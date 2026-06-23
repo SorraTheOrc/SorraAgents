@@ -1005,6 +1005,18 @@ class TestSummaryEnhancements:
         assert len(results) == 1
         assert results[0]["id"] == "SA-PLAN-001"
 
-        discovered = engine.discover_items()
-        remaining = len(discovered) - len(results)
+        # Verify remaining count in engine state
+        assert engine._total_discovered == 3
+        remaining = engine._total_discovered - len(results)
         assert remaining == 2
+
+        # Verify remaining count appears in Markdown summary
+        summary = generate_summary(results, total_discovered=engine._total_discovered)
+        assert "**Remaining**: 2" in summary, \
+            f"Expected remaining count in summary, got: {summary}"
+
+        # Verify remaining count appears in JSON summary
+        json_summary = json.loads(generate_summary(results, json_output=True,
+                                                    total_discovered=engine._total_discovered))
+        assert json_summary.get("remaining") == 2, \
+            f"Expected remaining=2 in JSON, got: {json_summary}"

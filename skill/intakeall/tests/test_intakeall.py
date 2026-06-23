@@ -1933,3 +1933,58 @@ class TestItemTimeout:
         assert results[0]["outcome"] == "error"
         assert results[1]["outcome"] == "auto_completed"
         assert results[2]["outcome"] == "auto_completed"
+
+
+# ===========================================================================
+# Test: Summary enhancements (remaining items reporting)
+# ===========================================================================
+
+class TestSummaryEnhancements:
+    """Verify summary reports remaining items when processing is incomplete."""
+
+    def test_remaining_items_reported_when_max_limits(self):
+        """When --max limits processing, remaining count appears in summary."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=json.dumps({
+                "success": True,
+                "workItems": [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_C],
+            }),
+        )
+        # All three items auto-complete (have sufficient detail)
+        for item in [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_C]:
+            runner.set_response(
+                f"wl update {item['id']} --status",
+                stdout=json.dumps({"success": True}),
+            )
+            runner.set_response(
+                f"wl update {item['id']} --stage",
+                stdout=json.dumps({"success": True}),
+            )
+            runner.set_response(
+                f"wl comment add {item['id']}",
+                stdout=json.dumps({"success": True}),
+            )
+
+        engine = IntakeAllEngine(runner=runner, max_items=1)
+        results = engine.run_all()
+
+        assert len(results) == 1
+        assert results[0]["id"] == SAMPLE_ITEM_A["id"]
+
+        # Verify remaining count in engine state
+        assert engine._total_discovered == 3
+        remaining = engine._total_discovered - len(results)
+        assert remaining == 2
+
+        # Verify remaining count appears in Markdown summary
+        summary = generate_summary(results, total_discovered=engine._total_discovered)
+        assert "**Remaining**: 2" in summary, \
+            f"Expected remaining count in summary, got: {summary}"
+
+        # Verify remaining count appears in JSON summary
+        json_summary = json.loads(generate_summary(results, json_output=True,
+                                                    total_discovered=engine._total_discovered))
+        assert json_summary.get("remaining") == 2, \
+            f"Expected remaining=2 in JSON, got: {json_summary}"
