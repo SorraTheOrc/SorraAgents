@@ -361,11 +361,19 @@ class IntakeAllEngine:
         result["outcome"] = "intake_completed"
         return result
 
-    def _attempt_recovery(self, item_id: str) -> dict:
+    def _attempt_recovery(self, item_id: str, current_status: str = "") -> dict:
         """Attempt to recover from a failed intake by resetting the item status.
+
+        Distinguishes between two orphan scenarios:
+        - `completed+idea` → move to `stage=done` (item was already finished)
+        - `in_progress+idea` → reset to `status=open` (item was claimed but unfinished)
+        - Fallback (unknown status) → reset both `stage=idea` and `status=open`
 
         Args:
             item_id: The work item ID to recover.
+            current_status: The item's current status value. If "completed",
+                moves to stage=done. If "in_progress", resets to status=open.
+                Empty string uses the fallback (reset both).
 
         Returns:
             A dict with keys:
@@ -381,18 +389,51 @@ class IntakeAllEngine:
             recovery["success"] = True
             return recovery
 
-        reset_cmd = [
-            "wl", "update", item_id,
-            "--stage", "idea",
-            "--status", "open",
-            "--json",
-        ]
-        logger.debug("intakeall.recovery cmd=%s", " ".join(reset_cmd))
+        if current_status == "completed":
+            # completed+idea → stage=done (status stays completed)
+            cmd = [
+                "wl", "update", item_id,
+                "--stage", "done",
+                "--json",
+            ]
+            recovery["action"] = "move_to_done_stage"
+            logger.debug(
+                "intakeall.recovery.completed item=%s cmd=%s",
+                item_id, " ".join(cmd),
+            )
+        elif current_status == "in_progress":
+            # in_progress+idea → status=open (stage stays idea)
+            cmd = [
+                "wl", "update", item_id,
+                "--status", "open",
+                "--json",
+            ]
+            recovery["action"] = "reset_status_to_open"
+            logger.debug(
+                "intakeall.recovery.in_progress item=%s cmd=%s",
+                item_id, " ".join(cmd),
+            )
+        else:
+            # Fallback: reset both status and stage (e.g. signal handler)
+            cmd = [
+                "wl", "update", item_id,
+                "--stage", "idea",
+                "--status", "open",
+                "--json",
+            ]
+            recovery["action"] = "reset_status_to_open"
+            logger.debug(
+                "intakeall.recovery.fallback item=%s cmd=%s",
+                item_id, " ".join(cmd),
+            )
+
         try:
-            reset_result = self.runner(reset_cmd)
+            reset_result = self.runner(cmd)
         except Exception as exc:
-            logger.warning("intakeall.recovery.exception item=%s exc=%s", item_id, exc)
-            recovery["action"] = f"reset_status_failed: {exc}"
+            logger.warning(
+                "intakeall.recovery.exception item=%s exc=%s", item_id, exc,
+            )
+            recovery["action"] = f"{recovery['action']}_failed: {exc}"
             return recovery
 
         if reset_result.returncode != 0:
@@ -402,7 +443,9 @@ class IntakeAllEngine:
                 reset_result.returncode,
                 (reset_result.stderr or "").strip(),
             )
-            recovery["action"] = f"reset_status_failed (rc={reset_result.returncode})"
+            recovery["action"] = (
+                f"{recovery['action']}_failed (rc={reset_result.returncode})"
+            )
             return recovery
 
         recovery["success"] = True
@@ -492,16 +535,22 @@ class IntakeAllEngine:
     # -----------------------------------------------------------------------
 
     def _recover_orphans(self, items: list[dict]) -> list[dict]:
-        """Reset orphaned items in idea stage to open status.
+        """Recover orphaned items stuck in contradictory states.
 
         Items stuck in contradictory states (e.g. status=completed/
-        in_progress while stage=idea) are reset to status=open so they
-        can be discovered and processed on subsequent runs.
+        in_progress while stage=idea) are handled differently based on
+        their status:
+        - **completed+idea**: Moved to stage=done (item was already
+          finished). These items are **excluded** from the returned list
+          since they are complete and should not be processed.
+        - **in_progress+idea**: Reset to status=open (item was claimed
+          but never finished). These items are included in the returned
+          list so they can be processed on this run.
 
         Orphan detection is resilient:
-        - If wl rejects the status transition (e.g. completed->open),
-          the error is logged and the item is still included in the
-          returned list with its in-memory status updated to open.
+        - If wl rejects the transition, the error is logged and the item
+          is still either included (in_progress) or excluded (completed)
+          based on the expected behavior.
         - Items already at status=open pass through unchanged.
         - During dry-run, no actual wl calls are made.
 
@@ -509,23 +558,39 @@ class IntakeAllEngine:
             items: List of work item dicts from discover_items().
 
         Returns:
-            The same list with orphan statuses reset to 'open' in memory.
+            The filtered list with orphan statuses corrected. Items that
+            were completed+idea are excluded; in_progress+idea items are
+            included with status updated to 'open'.
         """
         remaining: list[dict] = []
         for item in items:
             status = item.get("status", "")
             stage = item.get("stage", "")
             if status in ("completed", "in_progress") and stage == "idea":
-                result = self._attempt_recovery(item["id"])
+                result = self._attempt_recovery(
+                    item["id"], current_status=status,
+                )
                 logger.info(
                     "intakeall.orphan_recovery item=%s success=%s action=%s",
                     item["id"],
                     result.get("success", False),
                     result.get("action", "unknown"),
                 )
-                # Update in-memory status regardless of wl success
-                item["status"] = "open"
-            remaining.append(item)
+                if status == "completed":
+                    # completed+idea → stage=done: exclude from processing
+                    # Update in-memory state to reflect the recovery
+                    item["stage"] = "done"
+                    logger.info(
+                        "intakeall.orphan_recovery.excluded item=%s "
+                        "reason=completed_idea_moved_to_done",
+                        item["id"],
+                    )
+                else:
+                    # in_progress+idea → status=open: include for processing
+                    item["status"] = "open"
+                    remaining.append(item)
+            else:
+                remaining.append(item)
         return remaining
 
     # -----------------------------------------------------------------------
