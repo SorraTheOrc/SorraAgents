@@ -18,11 +18,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import subprocess
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 # Add repo root to sys.path for shared utility access
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -64,11 +65,17 @@ class ImplementAllEngine:
 
     def __init__(self, runner: Runner | None = None,
                  dry_run: bool = False, max_items: int = 0,
-                 verbose: bool = False):
+                 item_timeout: int = 600, verbose: bool = False):
         self.runner = runner or _default_runner
         self.dry_run = dry_run
         self.max_items = max_items
+        self.item_timeout = item_timeout
         self.verbose = verbose
+        # Track the item currently being processed for signal-handler recovery
+        self._current_item_id: Optional[str] = None
+        # Saved original signal handlers for restore
+        self._original_sigint: Any = None
+        self._original_sigterm: Any = None
 
     # -----------------------------------------------------------------------
     # Discovery
@@ -280,6 +287,49 @@ class ImplementAllEngine:
         return False
 
     # -----------------------------------------------------------------------
+    # Signal handling
+    # -----------------------------------------------------------------------
+
+    def _setup_signal_handlers(self) -> None:
+        """Register SIGINT and SIGTERM handlers for graceful abort."""
+        self._original_sigint = signal.getsignal(signal.SIGINT)
+        self._original_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _restore_signal_handlers(self) -> None:
+        """Restore original signal handlers."""
+        if self._original_sigint is not None:
+            signal.signal(signal.SIGINT, self._original_sigint)
+        if self._original_sigterm is not None:
+            signal.signal(signal.SIGTERM, self._original_sigterm)
+        self._original_sigint = None
+        self._original_sigterm = None
+
+    def _signal_handler(self, signum: int, frame: Any) -> None:
+        """Handle SIGINT/SIGTERM by recovering the current item and exiting."""
+        logger.warning(
+            "implementall.signal received signum=%s current_item=%s",
+            signum,
+            self._current_item_id,
+        )
+        if self._current_item_id is not None:
+            recovery_result = self._attempt_recovery(self._current_item_id)
+            if recovery_result.get("success"):
+                logger.info(
+                    "implementall.signal.recovered item=%s",
+                    self._current_item_id,
+                )
+            else:
+                logger.warning(
+                    "implementall.signal.recovery.failed item=%s action=%s",
+                    self._current_item_id,
+                    recovery_result.get("action"),
+                )
+        self._restore_signal_handlers()
+        sys.exit(128 + signum)
+
+    # -----------------------------------------------------------------------
     # Run all
     # -----------------------------------------------------------------------
 
@@ -298,34 +348,42 @@ class ImplementAllEngine:
         results: list[dict] = []
         processed = 0
 
-        for item in items:
-            item_id = item.get("id", "")
-            if not item_id:
-                continue
+        self._setup_signal_handlers()
+        try:
+            for item in items:
+                item_id = item.get("id", "")
+                if not item_id:
+                    continue
 
-            # Check the max limit
-            if self.max_items > 0 and processed >= self.max_items:
-                break
+                # Check the max limit
+                if self.max_items > 0 and processed >= self.max_items:
+                    break
 
-            title = item.get("title", "")
+                title = item.get("title", "")
+                self._current_item_id = item_id
 
-            if self.dry_run:
-                results.append({
-                    "id": item_id,
-                    "title": title,
-                    "outcome": "implemented",
-                    "error_detail": None,
-                    "recovery": None,
-                })
-            else:
-                impl_result = self._invoke_implement(item_id)
-                results.append({
-                    "id": item_id,
-                    "title": title,
-                    **impl_result,
-                })
+                try:
+                    if self.dry_run:
+                        results.append({
+                            "id": item_id,
+                            "title": title,
+                            "outcome": "implemented",
+                            "error_detail": None,
+                            "recovery": None,
+                        })
+                    else:
+                        impl_result = self._invoke_implement(item_id)
+                        results.append({
+                            "id": item_id,
+                            "title": title,
+                            **impl_result,
+                        })
+                finally:
+                    self._current_item_id = None
 
-            processed += 1
+                processed += 1
+        finally:
+            self._restore_signal_handlers()
 
         return results
 
@@ -485,6 +543,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of items to process (0 = no limit)",
     )
     parser.add_argument(
+        "--item-timeout",
+        type=int,
+        default=600,
+        help="Timeout in seconds for each item's subprocess call (default: 600)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -528,6 +592,7 @@ def _main(argv: list[str] | None = None) -> int:
     engine = ImplementAllEngine(
         dry_run=args.dry_run,
         max_items=args.max,
+        item_timeout=args.item_timeout,
         verbose=args.verbose,
     )
     results = engine.run_all()

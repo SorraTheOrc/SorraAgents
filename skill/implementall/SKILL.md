@@ -129,6 +129,12 @@ python3 ./scripts/implementall.py --dry-run
 # Process at most 5 items
 python3 ./scripts/implementall.py --max 5
 
+# Set per-item timeout to 300 seconds
+python3 ./scripts/implementall.py --item-timeout 300
+
+# Combine --max and --item-timeout
+python3 ./scripts/implementall.py --max 3 --item-timeout 120
+
 # Post summary as a comment on a parent epic
 python3 ./scripts/implementall.py --parent-id SA-0MQO6YMZ3006N5MG
 ```
