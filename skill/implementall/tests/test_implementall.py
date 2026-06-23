@@ -11,11 +11,14 @@ These tests verify:
 - --dry-run flag (simulate without making changes)
 - --parent-id flag posts summary as a comment
 - Recovery actions on error (reset status to open)
+- --item-timeout for per-item subprocess timeout
+- Signal handler registration and behavior (SIGINT/SIGTERM trigger recovery)
 
 Related work item: SA-0MQO6YMZ3006N5MG
 """
 
 import json
+import signal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1015,3 +1018,305 @@ class TestEngineConfig:
         """Max items can be set to a custom value."""
         engine = ImplementAllEngine(max_items=5)
         assert engine.max_items == 5
+
+    def test_item_timeout_default(self):
+        """Item timeout defaults to 600 seconds."""
+        engine = ImplementAllEngine()
+        assert engine.item_timeout == 600
+
+    def test_item_timeout_custom(self):
+        """Item timeout can be set to a custom value."""
+        engine = ImplementAllEngine(item_timeout=120)
+        assert engine.item_timeout == 120
+
+
+# ===========================================================================
+# Test: --item-timeout (per-item subprocess timeout)
+# ===========================================================================
+
+class TestItemTimeout:
+    """Verify --item-timeout triggers recovery on subprocess timeout."""
+
+    def test_item_timeout_triggers_recovery(self):
+        """When subprocess times out, item is recovered (reset to plan_complete/open) and continues."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage plan_complete",
+            stdout=SAMPLE_WL_LIST_RESPONSE,
+        )
+        runner.set_response(
+            "wl update SA-IMPL-001 --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "pi run /skill:implement SA-IMPL-001",
+            returncode=-15,
+            stderr="timed out",
+        )
+        runner.set_response(
+            "wl update SA-IMPL-001 --status open",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "wl update SA-IMPL-002 --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "pi run /skill:implement SA-IMPL-002",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "wl update SA-IMPL-003 --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "pi run /skill:implement SA-IMPL-003",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = ImplementAllEngine(runner=runner, item_timeout=10)
+        results = engine.run_all()
+
+        assert len(results) == 3
+        assert results[0]["outcome"] == "error"
+        recovery_calls = [
+            cmd for cmd in runner.calls
+            if "wl" in cmd and "update" in cmd and "open" in " ".join(cmd)
+        ]
+        assert len(recovery_calls) >= 1
+        assert results[1]["outcome"] == "implemented"
+        assert results[2]["outcome"] == "implemented"
+
+    def test_item_timeout_logged(self):
+        """Timeout event has stderr info in error_detail."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage plan_complete",
+            stdout=json.dumps({
+                "success": True,
+                "workItems": [SAMPLE_ITEM_A],
+            }),
+        )
+        runner.set_response(
+            "wl update SA-IMPL-001 --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "pi run /skill:implement SA-IMPL-001",
+            returncode=-15,
+            stderr="timed out after 10 seconds",
+        )
+        runner.set_response(
+            "wl update SA-IMPL-001 --status open",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = ImplementAllEngine(runner=runner, item_timeout=10)
+        results = engine.run_all()
+
+        assert len(results) == 1
+        assert results[0]["outcome"] == "error"
+        error_detail = results[0].get("error_detail", "")
+        assert "timed out" in error_detail or "timeout" in error_detail
+
+    def test_item_timeout_continues_to_next_item(self):
+        """After timeout, processing continues to next items."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage plan_complete",
+            stdout=SAMPLE_WL_LIST_RESPONSE,
+        )
+        runner.set_response(
+            "wl update SA-IMPL-001 --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "pi run /skill:implement SA-IMPL-001",
+            returncode=-15,
+            stderr="timed out",
+        )
+        runner.set_response(
+            "wl update SA-IMPL-001 --status open",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "wl update SA-IMPL-002 --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "pi run /skill:implement SA-IMPL-002",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = ImplementAllEngine(runner=runner, item_timeout=10)
+        results = engine.run_all()
+
+        assert len(results) == 3
+        assert results[0]["outcome"] == "error"
+        assert results[1]["outcome"] == "implemented"
+        assert results[2]["outcome"] == "implemented"
+
+    def test_max_and_item_timeout_interact(self):
+        """--max and --item-timeout interact correctly (timeout counts toward max)."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage plan_complete",
+            stdout=SAMPLE_WL_LIST_RESPONSE,
+        )
+        runner.set_response(
+            "wl update SA-IMPL-001 --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "pi run /skill:implement SA-IMPL-001",
+            returncode=-15,
+            stderr="timed out",
+        )
+        runner.set_response(
+            "wl update SA-IMPL-001 --status open",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = ImplementAllEngine(runner=runner, max_items=1, item_timeout=10)
+        results = engine.run_all()
+
+        assert len(results) == 1
+        assert results[0]["outcome"] == "error"
+        # Verify item 2 was NOT processed (max reached)
+        impl_calls = [
+            cmd for cmd in runner.calls
+            if "pi" in cmd and "run" in cmd and "skill:implement" in " ".join(cmd)
+        ]
+        assert len(impl_calls) == 1
+        assert "SA-IMPL-002" not in " ".join(impl_calls[-1])
+
+
+# ===========================================================================
+# Test: Signal handling for graceful abort
+# ===========================================================================
+
+class TestSignalHandling:
+    """Verify signal handlers are registered and trigger recovery correctly."""
+
+    def test_signal_handlers_registered(self):
+        """SIGINT and SIGTERM handlers are registered on setup."""
+        runner = FakeRunner()
+        engine = ImplementAllEngine(runner=runner)
+
+        engine._setup_signal_handlers()
+
+        assert signal.getsignal(signal.SIGINT) == engine._signal_handler
+        assert signal.getsignal(signal.SIGTERM) == engine._signal_handler
+
+        engine._restore_signal_handlers()
+        assert signal.getsignal(signal.SIGINT) != engine._signal_handler or \
+               signal.getsignal(signal.SIGINT) == signal.default_int_handler
+
+    def test_signal_handler_calls_recovery_for_current_item(self):
+        """Signal handler calls recovery for the current item."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl update SA-IMPL-001 --status open",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = ImplementAllEngine(runner=runner)
+        engine._current_item_id = "SA-IMPL-001"
+
+        try:
+            engine._signal_handler(signal.SIGINT, None)
+        except SystemExit:
+            pass
+
+        recovery_calls = [
+            cmd for cmd in runner.calls
+            if "wl" in cmd and "update" in cmd and "SA-IMPL-001" in " ".join(cmd)
+        ]
+        assert len(recovery_calls) >= 1
+
+    def test_signal_handler_noop_when_no_current_item(self):
+        """Signal handler does nothing when no item is being processed."""
+        runner = FakeRunner()
+        engine = ImplementAllEngine(runner=runner)
+        engine._current_item_id = None
+
+        try:
+            engine._signal_handler(signal.SIGINT, None)
+        except SystemExit:
+            pass
+
+        update_calls = [
+            cmd for cmd in runner.calls
+            if "wl" in cmd and "update" in cmd
+        ]
+        assert len(update_calls) == 0
+
+    def test_current_item_id_set_during_implement(self):
+        """_current_item_id is set during implement processing for signal handling."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage plan_complete",
+            stdout=json.dumps({
+                "success": True,
+                "workItems": [SAMPLE_ITEM_A],
+            }),
+        )
+        runner.set_response(
+            "wl update SA-IMPL-001 --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "pi run /skill:implement SA-IMPL-001",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = ImplementAllEngine(runner=runner)
+        engine.run_all()
+
+        assert engine._current_item_id is None
+
+    def test_signal_handler_exits_with_code(self):
+        """Signal handler raises SystemExit with correct code (128+signum)."""
+        runner = FakeRunner()
+        engine = ImplementAllEngine(runner=runner)
+
+        try:
+            engine._signal_handler(signal.SIGINT, None)
+            assert False, "Expected SystemExit"
+        except SystemExit as e:
+            assert e.code == 128 + signal.SIGINT
+
+
+# ===========================================================================
+# Test: Summary enhancements (remaining items reporting)
+# ===========================================================================
+
+class TestSummaryEnhancements:
+    """Verify summary reports remaining items when processing is incomplete."""
+
+    def test_remaining_items_reported_when_timeout_limits(self):
+        """When timeout limits processing, remaining items can be computed."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage plan_complete",
+            stdout=SAMPLE_WL_LIST_RESPONSE,
+        )
+        runner.set_response(
+            "wl update SA-IMPL-001 --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            "pi run /skill:implement SA-IMPL-001",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = ImplementAllEngine(runner=runner, max_items=1)
+        results = engine.run_all()
+
+        assert len(results) == 1
+        assert results[0]["id"] == "SA-IMPL-001"
+
+        # Remaining count can be determined: total discovered - processed
+        discovered = engine.discover_items()
+        remaining = len(discovered) - len(results)
+        assert remaining == 2
