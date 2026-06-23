@@ -4,6 +4,9 @@
 Creates or reuses a "Quality Improvement - Refactoring" epic and adds child
 task items for each code quality finding, properly prioritised by severity.
 
+Newly created epics and child tasks are created at stage ``intake_complete``
+so that they are ready for planning without manual intake.
+
 Usage:
   python3 -m skill.code_review.scripts.create_quality_epics \\
       --findings '<json-array>' [--project-root <path>] [--dry-run]
@@ -188,6 +191,7 @@ def find_or_create_epic(
         ),
         "--issue-type", "epic",
         "--priority", "medium",
+        "--stage", "intake_complete",
         "--json",
     ])
 
@@ -254,6 +258,7 @@ def create_child_tasks(
                 "--description", description,
                 "--issue-type", "task",
                 "--priority", priority,
+                "--stage", "intake_complete",
                 "--tags", "Refactor",
                 "--json",
             ])
@@ -384,10 +389,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     if args.dry_run:
-        print(f"Dry run: would process {len(findings)} findings")
+        print(f"Dry run: would process {len(findings)} findings (stage: intake_complete)")
         for f in findings:
             print(f"  - {_finding_title(f)}")
-        print(json.dumps({"epic_id": "(dry-run)", "children_created": len(findings)}, indent=2))
+        print(json.dumps({
+            "epic_id": "(dry-run)",
+            "children_created": len(findings),
+            "stage": "intake_complete",
+        }, indent=2))
         return 0
 
     try:

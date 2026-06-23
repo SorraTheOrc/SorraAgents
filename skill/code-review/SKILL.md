@@ -60,7 +60,7 @@ The code quality pipeline runs automatically as part of an audit (via `audit_run
 2. **Linter Probing** (`detection.py`): Checks if recommended linters (ruff for Python, eslint for TypeScript) are available on `PATH`.
 3. **Linting** (`linter_runner.py`): Runs each available linter and parses its JSON output.
 4. **Severity Classification** (`linter_runner.py`): Maps raw linter output to standardised severity levels (critical, high, medium, low).
-5. **Work Item Creation** (`create_quality_epics.py`): Creates or reuses a "Quality Improvement - Refactoring" epic and adds child tasks for each finding.
+5. **Work Item Creation** (`create_quality_epics.py`): Creates or reuses a "Quality Improvement - Refactoring" epic and adds child tasks for each finding. Newly created epics and child tasks start at stage ``intake_complete`` so they are ready for planning without manual intake.
 
 ### Canonical Scripts
 
