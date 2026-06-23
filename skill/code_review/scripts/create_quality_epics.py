@@ -43,6 +43,9 @@ SEVERITY_TO_PRIORITY: dict[str, str] = {
     "low": "low",
 }
 
+# Priority order from highest to lowest
+PRIORITY_ORDER = ["critical", "high", "medium", "low"]
+
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
@@ -118,8 +121,31 @@ def _severity_to_priority(severity: str) -> str:
     return SEVERITY_TO_PRIORITY.get(severity, "medium")
 
 
+def _highest_priority(findings: list[dict[str, Any]]) -> str:
+    """Return the highest priority among findings.
+
+    Priority order: critical > high > medium > low.
+    Returns ``medium`` for empty findings.
+    """
+    if not findings:
+        return "medium"
+    highest_idx = len(PRIORITY_ORDER)  # sentinel: higher than any valid index
+    for f in findings:
+        sev = f.get("severity", "medium")
+        pri = _severity_to_priority(sev)
+        if pri in PRIORITY_ORDER:
+            idx = PRIORITY_ORDER.index(pri)
+            if idx < highest_idx:
+                highest_idx = idx
+    # If no finding had a valid priority, default to medium
+    if highest_idx >= len(PRIORITY_ORDER):
+        return "medium"
+    return PRIORITY_ORDER[highest_idx]
+
+
 def find_or_create_epic(
     runner: Runner,
+    priority: str = "medium",
 ) -> tuple[str, bool]:
     """Find an existing 'Quality Improvement - Refactoring' epic or create one.
 
@@ -128,8 +154,12 @@ def find_or_create_epic(
     filters by exact title and issueType="epic", and picks the oldest by
     creation date if multiple are found.
 
+    When creating a new epic, the *priority* parameter is used as the epic's
+    priority (by default "medium").
+
     Args:
         runner: Subprocess runner injection.
+        priority: Priority to use when creating a new epic.
 
     Returns:
         A tuple of (epic_id, was_created).
@@ -179,7 +209,7 @@ def find_or_create_epic(
                     )
                 return epic_id, False
 
-    # Create new epic
+    # Create new epic with the computed priority
     create_result = _run_wl(runner, [
         "wl", "create",
         "--title", EPIC_TITLE,
@@ -190,7 +220,7 @@ def find_or_create_epic(
             "a new epic is created if new findings arrive after closure."
         ),
         "--issue-type", "epic",
-        "--priority", "medium",
+        "--priority", priority,
         "--stage", "intake_complete",
         "--json",
     ])
@@ -308,11 +338,59 @@ def get_existing_child_titles(
 # ---------------------------------------------------------------------------
 
 
+def _update_epic_priority(
+    epic_id: str,
+    new_priority: str,
+    runner: Runner,
+) -> None:
+    """Update the epic's priority if *new_priority* is higher than the current.
+
+    Priority escalation only: the epic's priority is never reduced.
+    Current priority is retrieved via ``wl show <epic_id> --json``.
+
+    Args:
+        epic_id: The epic work item ID.
+        new_priority: The desired priority to escalate to.
+        runner: Subprocess runner injection.
+    """
+    try:
+        show_result = _run_wl(runner, [
+            "wl", "show", epic_id, "--json",
+        ])
+    except RuntimeError:
+        return  # If we can't read the epic, skip the update
+
+    work_item = show_result.get("workItem", {})
+    current_priority = work_item.get("priority", "medium")
+
+    # Only escalate: never reduce priority
+    if new_priority in PRIORITY_ORDER and current_priority in PRIORITY_ORDER:
+        if PRIORITY_ORDER.index(new_priority) < PRIORITY_ORDER.index(current_priority):
+            try:
+                _run_wl(runner, [
+                    "wl", "update", epic_id,
+                    "--priority", new_priority,
+                    "--json",
+                ])
+            except RuntimeError as exc:
+                print(
+                    f"Warning: failed to update epic {epic_id} priority "
+                    f"to {new_priority}: {exc}",
+                    file=sys.stderr,
+                )
+
+
 def create_epics_for_findings(
     findings: list[dict[str, Any]],
     runner: Runner | None = None,
 ) -> dict[str, Any]:
     """Create or reuse a Quality Improvement epic and add child tasks.
+
+    When creating a new epic, the epic's priority is set to the highest
+    severity among its child findings (critical > high > medium > low).
+    When reusing an existing epic and new child tasks are created, the
+    epic's priority is escalated to match the highest severity (priority
+    escalation only — never reduced).
 
     Args:
         findings: List of finding dicts (must have ``severity``, ``file``,
@@ -324,12 +402,16 @@ def create_epics_for_findings(
           - ``epic_id``: the epic work item ID
           - ``epic_created``: bool — True if a new epic was created
           - ``children_created``: int — number of child tasks created
+          - ``epic_priority``: str — the priority assigned to the epic
     """
     if runner is None:
         runner = _default_runner
 
-    # 1. Find or create epic
-    epic_id, was_created = find_or_create_epic(runner)
+    # 0. Compute the highest priority from findings
+    highest_priority = _highest_priority(findings)
+
+    # 1. Find or create epic (pass the computed priority for new epics)
+    epic_id, was_created = find_or_create_epic(runner, priority=highest_priority)
 
     # 2. Get existing child titles for idempotency
     existing_titles = get_existing_child_titles(epic_id, runner)
@@ -339,10 +421,16 @@ def create_epics_for_findings(
         epic_id, findings, runner, existing_titles=existing_titles,
     )
 
+    # 4. If reusing an existing epic and new children were created,
+    #    escalate the epic's priority if the computed priority is higher
+    if not was_created and children_created > 0:
+        _update_epic_priority(epic_id, highest_priority, runner)
+
     return {
         "epic_id": epic_id,
         "epic_created": was_created,
         "children_created": children_created,
+        "epic_priority": highest_priority,
     }
 
 
@@ -389,12 +477,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     if args.dry_run:
+        computed_priority = _highest_priority(findings)
         print(f"Dry run: would process {len(findings)} findings (stage: intake_complete)")
+        print(f"Computed epic priority: {computed_priority}")
         for f in findings:
             print(f"  - {_finding_title(f)}")
         print(json.dumps({
             "epic_id": "(dry-run)",
             "children_created": len(findings),
+            "epic_priority": computed_priority,
             "stage": "intake_complete",
         }, indent=2))
         return 0

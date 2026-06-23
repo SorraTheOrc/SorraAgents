@@ -729,3 +729,345 @@ class TestQualityEpicCreation:
         # Should create new epic because no epic-type matching was found
         assert result["epic_created"] is True
         assert result["epic_id"] == "SA-NEWEPIC"
+
+    # ------------------------------------------------------------------
+    # Priority matching: epic inherits highest child severity
+    # ------------------------------------------------------------------
+
+    def test_highest_priority_returns_critical(self):
+        """_highest_priority returns critical when a critical finding exists."""
+        mod = self._import_module()
+        assert mod._highest_priority(SAMPLE_FINDINGS_CRITICAL) == "critical"
+
+    def test_highest_priority_returns_high(self):
+        """_highest_priority returns high when highest severity is high."""
+        mod = self._import_module()
+        findings = [
+            {"severity": "low", "file": "a.py", "line": 1, "message": "x", "linter": "ruff", "code": "E101"},
+            {"severity": "high", "file": "b.py", "line": 2, "message": "y", "linter": "ruff", "code": "E201"},
+            {"severity": "medium", "file": "c.py", "line": 3, "message": "z", "linter": "ruff", "code": "E301"},
+        ]
+        assert mod._highest_priority(findings) == "high"
+
+    def test_highest_priority_returns_medium_default(self):
+        """_highest_priority returns medium for empty findings."""
+        mod = self._import_module()
+        assert mod._highest_priority([]) == "medium"
+
+    def test_highest_priority_handles_unknown_severity(self):
+        """_highest_priority defaults to medium for unknown severity values."""
+        mod = self._import_module()
+        findings = [
+            {"severity": "unknown", "file": "a.py", "line": 1, "message": "x", "linter": "ruff", "code": "E101"},
+        ]
+        # Unknown severity maps to medium priority
+        assert mod._highest_priority(findings) == "medium"
+
+    def test_new_epic_created_with_correct_priority(self):
+        """When creating a new epic, priority should match highest child severity."""
+        mod = self._import_module()
+
+        epic_create_calls: list[list[str]] = []
+
+        def fake_runner(cmd, **kwargs):
+            epic_create_calls.append(list(cmd))
+            cmd_str = " ".join(str(c) for c in cmd)
+
+            if "list" in cmd_str and "open" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True, "workItems": [],
+                }))
+            if "list" in cmd_str and "in_progress" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True, "workItems": [],
+                }))
+            if "create" in cmd_str and "Quality Improvement" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-EPIC01", "title": EXPECTED_EPIC_TITLE},
+                }))
+            if "create" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-CHILD", "title": "child"},
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        # Use findings with mixed severities (critical is highest)
+        result = mod.create_epics_for_findings(
+            SAMPLE_FINDINGS_MIXED,  # critical + medium
+            runner=fake_runner,
+        )
+
+        assert result["epic_created"] is True
+        # The epic create call should include --priority critical
+        epic_create = [c for c in epic_create_calls if "create" in str(c) and "Quality Improvement" in str(c)]
+        assert len(epic_create) >= 1
+        call_str = " ".join(str(a) for a in epic_create[0])
+        assert "--priority" in call_str
+        assert "critical" in call_str
+
+    def test_new_epic_uses_high_priority_when_highest_is_high(self):
+        """Epic created with findings whose highest severity is high gets high priority."""
+        mod = self._import_module()
+
+        epic_create_calls: list[list[str]] = []
+        findings = [
+            {"severity": "high", "file": "a.py", "line": 1, "message": "x", "linter": "ruff", "code": "E101"},
+            {"severity": "low", "file": "b.py", "line": 2, "message": "y", "linter": "ruff", "code": "E201"},
+        ]
+
+        def fake_runner(cmd, **kwargs):
+            epic_create_calls.append(list(cmd))
+            cmd_str = " ".join(str(c) for c in cmd)
+
+            if "list" in cmd_str and ("open" in cmd_str or "in_progress" in cmd_str):
+                return _fake_proc(stdout=json.dumps({
+                    "success": True, "workItems": [],
+                }))
+            if "create" in cmd_str and "Quality Improvement" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-EPIC02", "title": EXPECTED_EPIC_TITLE},
+                }))
+            if "create" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-CHILD", "title": "child"},
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        result = mod.create_epics_for_findings(findings, runner=fake_runner)
+
+        assert result["epic_created"] is True
+        epic_create = [c for c in epic_create_calls if "create" in str(c) and "Quality Improvement" in str(c)]
+        assert len(epic_create) >= 1
+        call_str = " ".join(str(a) for a in epic_create[0])
+        assert "--priority" in call_str
+        assert "high" in call_str
+
+    def test_reused_epic_priority_updated_when_new_children_created(self):
+        """When reusing an epic and new children are created, update epic priority to match."""
+        mod = self._import_module()
+
+        update_calls: list[list[str]] = []
+
+        def fake_runner(cmd, **kwargs):
+            nonlocal update_calls
+            result = _fake_proc(stdout=json.dumps({"success": True}))
+            cmd_str = " ".join(str(c) for c in cmd)
+
+            if "list" in cmd_str and "open" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItems": [{
+                        "id": "SA-EXISTING01",
+                        "title": EXPECTED_EPIC_TITLE,
+                        "status": "open",
+                        "issueType": "epic",
+                        "createdAt": "2026-01-01T00:00:00.000Z",
+                    }],
+                }))
+            # wl show to get current epic priority
+            if "show" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": "SA-EXISTING01",
+                        "title": EXPECTED_EPIC_TITLE,
+                        "priority": "medium",
+                    },
+                }))
+            # wl update to set priority
+            if "update" in cmd_str and "priority" in cmd_str:
+                update_calls.append(list(cmd))
+                return _fake_proc(stdout=json.dumps({"success": True}))
+            # wl create (child)
+            if "create" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-CHILD", "title": "child"},
+                }))
+            # wl show --children
+            if "children" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "children": [],
+                }))
+            return result
+
+        result = mod.create_epics_for_findings(
+            SAMPLE_FINDINGS_MIXED,  # critical + medium → highest is critical
+            runner=fake_runner,
+        )
+
+        assert result["epic_created"] is False
+        assert result["epic_id"] == "SA-EXISTING01"
+        # Should have called wl update to set priority to critical
+        assert len(update_calls) >= 1
+        update_str = " ".join(str(a) for a in update_calls[0])
+        assert "critical" in update_str
+
+    def test_reused_epic_priority_unchanged_when_no_new_children(self):
+        """When reusing an epic with no new children, priority should not be updated."""
+        mod = self._import_module()
+
+        update_calls: list[list[str]] = []
+
+        def fake_runner(cmd, **kwargs):
+            nonlocal update_calls
+            result = _fake_proc(stdout=json.dumps({"success": True}))
+            cmd_str = " ".join(str(c) for c in cmd)
+
+            if "list" in cmd_str and "open" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItems": [{
+                        "id": "SA-EXISTING01",
+                        "title": EXPECTED_EPIC_TITLE,
+                        "status": "open",
+                        "issueType": "epic",
+                        "createdAt": "2026-01-01T00:00:00.000Z",
+                    }],
+                }))
+            # wl show --children - return existing children that match all findings
+            if "children" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "children": [
+                        {"title": "[CRITICAL] src/main.py:42 \u2014 Unused variable `x` (F841)"},
+                    ],
+                }))
+            # Should NOT be called for update
+            if "update" in cmd_str and "priority" in cmd_str:
+                update_calls.append(list(cmd))
+                return _fake_proc(stdout=json.dumps({"success": True}))
+            if "create" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-CHILD"},
+                }))
+            return result
+
+        result = mod.create_epics_for_findings(
+            SAMPLE_FINDINGS_CRITICAL,  # single finding that already exists as child
+            runner=fake_runner,
+        )
+
+        assert result["epic_created"] is False
+        assert result["epic_id"] == "SA-EXISTING01"
+        # No children should be created (already exists), so no priority update
+        assert result["children_created"] == 0
+        assert len(update_calls) == 0
+
+    def test_priority_escalation_only_never_reduce(self):
+        """Epic priority is never reduced when findings have lower severity."""
+        mod = self._import_module()
+
+        update_calls: list[list[str]] = []
+        findings = [
+            {"severity": "low", "file": "a.py", "line": 1, "message": "x", "linter": "ruff", "code": "E101"},
+        ]
+
+        def fake_runner(cmd, **kwargs):
+            nonlocal update_calls
+            result = _fake_proc(stdout=json.dumps({"success": True}))
+            cmd_str = " ".join(str(c) for c in cmd)
+
+            if "list" in cmd_str and "open" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItems": [{
+                        "id": "SA-EXISTING01",
+                        "title": EXPECTED_EPIC_TITLE,
+                        "status": "open",
+                        "issueType": "epic",
+                        "createdAt": "2026-01-01T00:00:00.000Z",
+                    }],
+                }))
+            # wl show to get current priority
+            if "show" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": "SA-EXISTING01",
+                        "title": EXPECTED_EPIC_TITLE,
+                        "priority": "critical",
+                    },
+                }))
+            if "children" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "children": [],
+                }))
+            if "update" in cmd_str and "priority" in cmd_str:
+                update_calls.append(list(cmd))
+                return _fake_proc(stdout=json.dumps({"success": True}))
+            if "create" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-CHILD", "title": "child"},
+                }))
+            return result
+
+        result = mod.create_epics_for_findings(
+            findings,
+            runner=fake_runner,
+        )
+
+        assert result["epic_created"] is False
+        # Children created but priority should NOT be reduced from critical to low
+        assert result["children_created"] == 1
+        assert len(update_calls) == 0, "Priority should not be reduced from critical to low"
+
+    def test_dry_run_output_includes_computed_priority(self):
+        """The --dry-run output should reflect the computed priority."""
+        mod = self._import_module()
+        import io, contextlib
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            exit_code = mod.main(["--findings", json.dumps(SAMPLE_FINDINGS_MIXED), "--dry-run"])
+
+        assert exit_code == 0
+        output = buf.getvalue()
+        # Should mention the highest priority somewhere in the output
+        assert "critical" in output
+
+    def test_new_epic_with_only_low_findings_uses_low_priority(self):
+        """Epic created with only low-severity findings should get low priority."""
+        mod = self._import_module()
+
+        epic_create_calls: list[list[str]] = []
+        findings = [
+            {"severity": "low", "file": "a.py", "line": 1, "message": "x", "linter": "ruff", "code": "E101"},
+        ]
+
+        def fake_runner(cmd, **kwargs):
+            epic_create_calls.append(list(cmd))
+            cmd_str = " ".join(str(c) for c in cmd)
+
+            if "list" in cmd_str and ("open" in cmd_str or "in_progress" in cmd_str):
+                return _fake_proc(stdout=json.dumps({
+                    "success": True, "workItems": [],
+                }))
+            if "create" in cmd_str and "Quality Improvement" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-EPIC03", "title": EXPECTED_EPIC_TITLE},
+                }))
+            if "create" in cmd_str:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "SA-CHILD", "title": "child"},
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        result = mod.create_epics_for_findings(findings, runner=fake_runner)
+
+        assert result["epic_created"] is True
+        epic_create = [c for c in epic_create_calls if "create" in str(c) and "Quality Improvement" in str(c)]
+        assert len(epic_create) >= 1
+        call_str = " ".join(str(a) for a in epic_create[0])
+        assert "--priority" in call_str
+        assert "low" in call_str
