@@ -730,7 +730,13 @@ class TestMaxFlag:
         )
         runner.set_response(
             "pi -p --mode json /plan SA-PLAN-002",
-            stdout="What should we do? (yes/no):",
+            stdout=json.dumps({
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "text_end",
+                    "content": "What should we do? (yes/no):"
+                }
+            }),
             returncode=1,
         )
 

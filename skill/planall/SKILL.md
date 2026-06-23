@@ -22,8 +22,20 @@ PlanAll can be invoked in the following ways:
 - `/skill:planall` — Process all intake_complete items with markdown summary output
 - `/skill:planall --json` — JSON output for programmatic consumption
 - `/skill:planall --parent-id <id>` — Post the summary as a comment on the specified parent work item
+- `/skill:planall --max N` — Process at most N items, then stop
+- `/skill:planall --item-timeout N` — Set per-item subprocess timeout in seconds (default: 600)
 - `python3 ./scripts/planall.py` — Direct Python invocation
 - `pi run /planall` — Agent framework invocation
+
+### CLI flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | flag | off | Produce JSON output instead of Markdown |
+| `--parent-id` | str | None | Post the summary as a comment on the specified parent work item |
+| `--max` | int | 0 | Maximum number of items to process (0 = no limit) |
+| `--item-timeout` | int | 600 | Timeout in seconds for each item's subprocess call |
+| `--verbose` | flag | off | Enable verbose logging |
 
 ## Output
 
@@ -94,6 +106,15 @@ python3 ./scripts/planall.py --json
 
 # Post summary as a comment on a parent epic
 python3 ./scripts/planall.py --parent-id SA-0MQA6ECEU003GUKH
+
+# Process only the first 5 items
+python3 ./scripts/planall.py --max 5
+
+# Set per-item timeout to 300 seconds (5 minutes)
+python3 ./scripts/planall.py --item-timeout 300
+
+# Combine --max and --item-timeout
+python3 ./scripts/planall.py --max 3 --item-timeout 120
 ```
 
 ## Scripts
