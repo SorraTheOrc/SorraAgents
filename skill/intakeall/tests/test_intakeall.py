@@ -1096,6 +1096,26 @@ class TestEngineConfig:
         engine2 = IntakeAllEngine(dry_run=False)
         assert engine2.dry_run is False
 
+    def test_max_items_default(self):
+        """Max items defaults to 0 (no limit)."""
+        engine = IntakeAllEngine()
+        assert engine.max_items == 0
+
+    def test_max_items_custom(self):
+        """Max items can be set to a custom value."""
+        engine = IntakeAllEngine(max_items=5)
+        assert engine.max_items == 5
+
+    def test_item_timeout_default(self):
+        """Item timeout defaults to 600 seconds."""
+        engine = IntakeAllEngine()
+        assert engine.item_timeout == 600
+
+    def test_item_timeout_custom(self):
+        """Item timeout can be set to a custom value."""
+        engine = IntakeAllEngine(item_timeout=120)
+        assert engine.item_timeout == 120
+
 
 # ===========================================================================
 # Test: Orphan detection in discover_items
@@ -1635,3 +1655,281 @@ class TestSignalHandling:
         except SystemExit as e:
             # SIGINT = 2, so exit code should be 130
             assert e.code == 128 + signal.SIGINT
+
+
+# ===========================================================================
+# Test: --max flag
+# ===========================================================================
+
+class TestMaxFlag:
+    """Verify --max flag limits the number of items processed."""
+
+    def test_max_zero_processes_all(self):
+        """--max 0 (default) processes all items including auto-complete items."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=SAMPLE_WL_LIST_RESPONSE,
+        )
+        # A, B, D auto-complete; C needs intake
+        for item in [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_D]:
+            runner.set_response(
+                f"wl update {item['id']} --status",
+                stdout=json.dumps({"success": True}),
+            )
+            runner.set_response(
+                f"wl update {item['id']} --stage",
+                stdout=json.dumps({"success": True}),
+            )
+            runner.set_response(
+                f"wl comment add {item['id']}",
+                stdout=json.dumps({"success": True}),
+            )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner, max_items=0)
+        results = engine.run_all()
+        assert len(results) == 4
+
+    def test_max_positive_limits_processing(self):
+        """--max N processes at most N items."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=SAMPLE_WL_LIST_RESPONSE,
+        )
+        # Only need responses for first 2 items
+        for item in [SAMPLE_ITEM_A, SAMPLE_ITEM_B]:
+            runner.set_response(
+                f"wl update {item['id']} --status",
+                stdout=json.dumps({"success": True}),
+            )
+            runner.set_response(
+                f"wl update {item['id']} --stage",
+                stdout=json.dumps({"success": True}),
+            )
+            runner.set_response(
+                f"wl comment add {item['id']}",
+                stdout=json.dumps({"success": True}),
+            )
+
+        engine = IntakeAllEngine(runner=runner, max_items=2)
+        results = engine.run_all()
+        assert len(results) == 2
+
+    def test_max_auto_complete_respected(self):
+        """--max respects auto-complete vs intake split."""
+        runner = FakeRunner()
+        # Items 0 (A) auto-completes, item 1 (B) auto-completes, items 2-3 need intake
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=SAMPLE_WL_LIST_RESPONSE,
+        )
+        # First item (A) auto-completes
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_A['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_A['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl comment add {SAMPLE_ITEM_A['id']}",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner, max_items=1)
+        results = engine.run_all()
+
+        assert len(results) == 1
+        assert results[0]["outcome"] == "auto_completed"
+        assert results[0]["id"] == SAMPLE_ITEM_A["id"]
+        # Item B should NOT have been processed (max reached after auto-complete)
+        # (B is auto-completable too, but max stops before it)
+
+    def test_max_with_dry_run(self):
+        """--max works correctly with --dry-run."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=SAMPLE_WL_LIST_RESPONSE,
+        )
+
+        engine = IntakeAllEngine(runner=runner, dry_run=True, max_items=2)
+        results = engine.run_all()
+
+        assert len(results) == 2
+        assert results[0]["id"] == SAMPLE_ITEM_A["id"]
+        assert results[1]["id"] == SAMPLE_ITEM_B["id"]
+        # No updates should have been made in dry run
+        update_calls = [
+            cmd for cmd in runner.calls
+            if "wl update" in " ".join(cmd) or "pi -p" in " ".join(cmd)
+        ]
+        assert len(update_calls) == 0
+
+
+# ===========================================================================
+# Test: --item-timeout (per-item subprocess timeout)
+# ===========================================================================
+
+class TestItemTimeout:
+    """Verify --item-timeout triggers recovery on subprocess timeout."""
+
+    def test_item_timeout_triggers_recovery(self):
+        """When subprocess times out, item is recovered (reset to idea/open) and continues."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=json.dumps({
+                "success": True,
+                "workItems": [SAMPLE_ITEM_C, SAMPLE_ITEM_A],
+            }),
+        )
+        # Item C (vague epic) intake times out
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            returncode=-15,
+            stderr="timed out",
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        # Item A auto-completes
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_A['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_A['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl comment add {SAMPLE_ITEM_A['id']}",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner, item_timeout=10)
+        results = engine.run_all()
+
+        assert len(results) == 2
+        # First item (vague epic) should have error outcome
+        assert results[0]["outcome"] == "error"
+        assert results[0]["id"] == SAMPLE_ITEM_C["id"]
+        # Verify recovery was attempted (reset to idea/open)
+        recovery_calls = [
+            cmd for cmd in runner.calls
+            if "wl" in cmd and "update" in cmd
+            and SAMPLE_ITEM_C["id"] in " ".join(cmd)
+        ]
+        assert len(recovery_calls) >= 1
+        # Second item should have auto_completed
+        assert results[1]["outcome"] == "auto_completed"
+
+    def test_item_timeout_logged(self):
+        """Timeout event has stderr info in error_detail."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=json.dumps({
+                "success": True,
+                "workItems": [SAMPLE_ITEM_C],
+            }),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            returncode=-15,
+            stderr="timed out after 10 seconds",
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner, item_timeout=10)
+        results = engine.run_all()
+
+        assert len(results) == 1
+        assert results[0]["outcome"] == "error"
+        error_detail = results[0].get("error_detail", "")
+        assert "timed out" in error_detail or "timeout" in error_detail
+
+    def test_item_timeout_continues_to_next_item(self):
+        """After timeout, processing continues to the next item."""
+        runner = FakeRunner()
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=json.dumps({
+                "success": True,
+                "workItems": [SAMPLE_ITEM_C, SAMPLE_ITEM_A, SAMPLE_ITEM_B],
+            }),
+        )
+        # Item C intake times out
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            returncode=-15,
+            stderr="timed out",
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_C['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        # Item A auto-completes
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_A['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_A['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl comment add {SAMPLE_ITEM_A['id']}",
+            stdout=json.dumps({"success": True}),
+        )
+        # Item B auto-completes
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_B['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_B['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl comment add {SAMPLE_ITEM_B['id']}",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner, item_timeout=10)
+        results = engine.run_all()
+
+        assert len(results) == 3
+        assert results[0]["outcome"] == "error"
+        assert results[1]["outcome"] == "auto_completed"
+        assert results[2]["outcome"] == "auto_completed"
