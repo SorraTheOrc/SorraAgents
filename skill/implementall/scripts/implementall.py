@@ -34,18 +34,23 @@ from skill.scripts.failure_notice import FailureNotice
 
 logger = logging.getLogger("implementall")
 
-# Type alias for runners: a callable that accepts a command sequence and
-# returns an object with returncode, stdout, stderr attributes.
-Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
+# Type alias for runners: a callable that accepts a command sequence and an
+# optional timeout, returning an object with returncode, stdout, stderr attributes.
+Runner = Callable[..., subprocess.CompletedProcess]
 
 
 # ---------------------------------------------------------------------------
 # Default subprocess runner
 # ---------------------------------------------------------------------------
 
-def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
-    """Default runner: delegates to subprocess.run."""
-    return subprocess.run(list(cmd), capture_output=True, text=True, check=False)
+def _default_runner(cmd: Sequence[str], timeout: int | None = None) -> subprocess.CompletedProcess:
+    """Default runner: delegates to subprocess.run.
+
+    Args:
+        cmd: Command sequence to execute.
+        timeout: Optional timeout in seconds for the subprocess call.
+    """
+    return subprocess.run(list(cmd), capture_output=True, text=True, check=False, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +182,7 @@ class ImplementAllEngine:
         impl_cmd = ["pi", "run", f"/skill:implement {item_id}"]
         logger.debug("implementall.implement.invoke cmd=%s", " ".join(impl_cmd))
         try:
-            impl_result = self.runner(impl_cmd)
+            impl_result = self.runner(impl_cmd, timeout=self.item_timeout)
         except Exception as exc:
             logger.warning("implementall.implement.exception item=%s exc=%s", item_id, exc)
             result["outcome"] = "error"

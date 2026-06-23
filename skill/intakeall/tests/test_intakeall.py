@@ -66,7 +66,7 @@ class FakeRunner:
             stderr=stderr,
         )
 
-    def __call__(self, cmd):
+    def __call__(self, cmd, **kwargs):
         cmd = list(cmd)
         self.calls.append(cmd)
         cmd_str = " ".join(cmd)

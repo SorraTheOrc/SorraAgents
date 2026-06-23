@@ -34,18 +34,23 @@ from skill.scripts.pi_utils import extract_pi_text
 
 logger = logging.getLogger("planall")
 
-# Type alias for runners: a callable that accepts a command sequence and
-# returns an object with returncode, stdout, stderr attributes.
-Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
+# Type alias for runners: a callable that accepts a command sequence and an
+# optional timeout, returning an object with returncode, stdout, stderr attributes.
+Runner = Callable[..., subprocess.CompletedProcess]
 
 
 # ---------------------------------------------------------------------------
 # Default subprocess runner
 # ---------------------------------------------------------------------------
 
-def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
-    """Default runner: delegates to subprocess.run."""
-    return subprocess.run(list(cmd), capture_output=True, text=True, check=False)
+def _default_runner(cmd: Sequence[str], timeout: int | None = None) -> subprocess.CompletedProcess:
+    """Default runner: delegates to subprocess.run.
+
+    Args:
+        cmd: Command sequence to execute.
+        timeout: Optional timeout in seconds for the subprocess call.
+    """
+    return subprocess.run(list(cmd), capture_output=True, text=True, check=False, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +175,7 @@ class PlanAllEngine:
         plan_cmd = ["pi", "-p", "--mode", "json", f"/plan {item_id}"]
         logger.debug("planall.plan.invoke cmd=%s", " ".join(plan_cmd))
         try:
-            plan_result = self.runner(plan_cmd)
+            plan_result = self.runner(plan_cmd, timeout=self.item_timeout)
         except Exception as exc:
             logger.warning("planall.plan.exception item=%s exc=%s", item_id, exc)
             result["outcome"] = "error"

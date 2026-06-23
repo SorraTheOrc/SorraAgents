@@ -86,7 +86,7 @@ Items flagged as `needs_input` are not retried — the skill moves on to the nex
 - Recovery outcomes (success/failure) are included in per-item results
 - When any items report an error outcome, the summary report is wrapped with a
   **Script Execution Failure Notice** (first and last lines) using the shared
-  utility at `skill/scripts/failure_notice.py`. This provides a prominent visual
+  utility at `./scripts/failure_notice.py`. This provides a prominent visual
   signal that some items failed during batch implementation.
 
 ## `--max` flag

@@ -35,18 +35,23 @@ from skill.scripts.failure_notice import FailureNotice
 
 logger = logging.getLogger("intakeall")
 
-# Type alias for runners: a callable that accepts a command sequence and
-# returns an object with returncode, stdout, stderr attributes.
-Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
+# Type alias for runners: a callable that accepts a command sequence and an
+# optional timeout, returning an object with returncode, stdout, stderr attributes.
+Runner = Callable[..., subprocess.CompletedProcess]
 
 
 # ---------------------------------------------------------------------------
 # Default subprocess runner
 # ---------------------------------------------------------------------------
 
-def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
-    """Default runner: delegates to subprocess.run."""
-    return subprocess.run(list(cmd), capture_output=True, text=True, check=False)
+def _default_runner(cmd: Sequence[str], timeout: int | None = None) -> subprocess.CompletedProcess:
+    """Default runner: delegates to subprocess.run.
+
+    Args:
+        cmd: Command sequence to execute.
+        timeout: Optional timeout in seconds for the subprocess call.
+    """
+    return subprocess.run(list(cmd), capture_output=True, text=True, check=False, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +304,7 @@ class IntakeAllEngine:
         intake_cmd = ["pi", "-p", "--mode", "json", f"/intake {item_id}"]
         logger.debug("intakeall.intake.invoke cmd=%s", " ".join(intake_cmd))
         try:
-            intake_result = self.runner(intake_cmd)
+            intake_result = self.runner(intake_cmd, timeout=self.item_timeout)
         except Exception as exc:
             logger.warning("intakeall.intake.exception item=%s exc=%s", item_id, exc)
             result["outcome"] = "error"
