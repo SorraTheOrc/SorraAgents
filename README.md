@@ -65,6 +65,15 @@ python3 skill/planall/scripts/planall.py --json
 
 # Post summary as a comment on a parent epic
 python3 skill/planall/scripts/planall.py --parent-id SA-0MQA6ECEU003GUKH
+
+# Process at most 10 items
+python3 skill/planall/scripts/planall.py --max 10
+
+# Set per-item timeout to 300 seconds
+python3 skill/planall/scripts/planall.py --item-timeout 300
+
+# Combine --max and --item-timeout
+python3 skill/planall/scripts/planall.py --max 5 --item-timeout 120
 ```
 
 See [skill/planall/SKILL.md](skill/planall/SKILL.md) for full documentation.
@@ -88,6 +97,15 @@ python3 skill/intakeall/scripts/intakeall.py --dry-run
 
 # Post summary as a comment on a parent epic
 python3 skill/intakeall/scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
+
+# Process at most 10 items
+python3 skill/intakeall/scripts/intakeall.py --max 10
+
+# Set per-item timeout to 300 seconds
+python3 skill/intakeall/scripts/intakeall.py --item-timeout 300
+
+# Combine --max and --item-timeout
+python3 skill/intakeall/scripts/intakeall.py --max 5 --item-timeout 120
 ```
 
 See [skill/intakeall/SKILL.md](skill/intakeall/SKILL.md) for full documentation.
@@ -111,6 +129,12 @@ python3 skill/implementall/scripts/implementall.py --dry-run
 
 # Process at most 5 items
 python3 skill/implementall/scripts/implementall.py --max 5
+
+# Set per-item timeout to 300 seconds
+python3 skill/implementall/scripts/implementall.py --item-timeout 300
+
+# Combine --max and --item-timeout
+python3 skill/implementall/scripts/implementall.py --max 3 --item-timeout 120
 
 # Post summary as a comment on a parent epic
 python3 skill/implementall/scripts/implementall.py --parent-id SA-0MQO6YMZ3006N5MG
