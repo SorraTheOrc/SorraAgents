@@ -72,7 +72,7 @@ class TestFailureNoticeFormatLines:
         lines = notice.format_lines()
 
         # Should NOT include stderr section
-        stderr_lines = [l for l in lines if "Captured stderr" in l]
+        stderr_lines = [line for line in lines if "Captured stderr" in line]
         assert len(stderr_lines) == 0
 
 

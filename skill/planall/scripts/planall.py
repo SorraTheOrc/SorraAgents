@@ -28,8 +28,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.scripts.failure_notice import FailureNotice
-from skill.scripts.pi_utils import extract_pi_text
+from skill.scripts.failure_notice import FailureNotice  # noqa: E402
+from skill.scripts.pi_utils import extract_pi_text  # noqa: E402
 
 
 logger = logging.getLogger("planall")

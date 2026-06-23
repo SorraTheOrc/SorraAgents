@@ -7,7 +7,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.scripts.pi_utils import extract_pi_text, parse_pi_json_line
+from skill.scripts.pi_utils import extract_pi_text, parse_pi_json_line  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
