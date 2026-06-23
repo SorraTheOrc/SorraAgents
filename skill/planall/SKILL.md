@@ -48,6 +48,7 @@ After processing all items, PlanAll produces a summary report:
 **Planned**: 3
 **Needs input**: 1
 **Errors**: 1
+**Remaining**: 2
 
 ## Results
 
@@ -66,6 +67,7 @@ When `--json` is used, the output is a JSON object:
   "planned": 3,
   "needs_input": 1,
   "errors": 1,
+  "remaining": 2,
   "items": [
     {"id": "SA-ITEM-001", "title": "...", "outcome": "planned"}
   ]
@@ -86,8 +88,19 @@ Items flagged as `needs_input` are not retried — the skill moves on to the nex
 
 - If `wl list` fails (non-zero exit or exception), returns an empty list gracefully
 - If claiming an item fails, logs a warning and marks the item as `error`
-- If `/plan` fails for an item, logs a warning and continues to the next item
+- If `/plan` fails for an item, logs a warning, attempts recovery (resets item status to `open` and stage back to `intake_complete`), and continues to the next item
+- On per-item timeout (`subprocess.TimeoutExpired`), the item is recovered same as failure and processing continues
 - All errors are captured in the summary report
+
+## Signal handling
+
+PlanAll registers SIGINT and SIGTERM handlers for graceful abort. On receiving a signal:
+
+1. The currently in-progress item is recovered — its stage is reset to `intake_complete` and status to `open`
+2. Original signal handlers are restored
+3. The process exits with the signal code (128 + signum)
+
+This ensures no items are left in a stuck `in_progress` state if the batch process is interrupted.
 
 ## Idempotence
 

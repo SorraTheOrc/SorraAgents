@@ -45,6 +45,7 @@ After processing all items, IntakeAll produces a summary report:
 **Intake completed**: 1
 **Needs input**: 1
 **Errors**: 1
+**Remaining**: 0
 
 ## Results
 
@@ -54,7 +55,7 @@ After processing all items, IntakeAll produces a summary report:
 - **SA-ITEM-004**: `needs_input`
 - **SA-ITEM-005**: `error`
   - Error: Intake failed (rc=1): timeout exceeded
-  - Recovery: `reset_status_to_open` ✓
+  - Recovery: `reset_status_to_open_with_stage_idea` ✓
 ```
 
 When `--json` is used, the output is a JSON object:
@@ -66,9 +67,10 @@ When `--json` is used, the output is a JSON object:
   "intake_completed": 1,
   "needs_input": 1,
   "errors": 1,
+  "remaining": 0,
   "items": [
     {"id": "SA-ITEM-001", "title": "...", "outcome": "auto_completed", "error_detail": null, "recovery": null},
-    {"id": "SA-ITEM-005", "title": "...", "outcome": "error", "error_detail": "Intake failed (rc=1): timeout exceeded", "recovery": {"action": "reset_status_to_open", "success": true}}
+    {"id": "SA-ITEM-005", "title": "...", "outcome": "error", "error_detail": "Intake failed (rc=1): timeout exceeded", "recovery": {"action": "reset_status_to_open_with_stage_idea", "success": true}}
   ]
 }
 ```

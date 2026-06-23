@@ -78,7 +78,7 @@ any sensitive values before writing them to logs or comments.
 
 Execute the following steps in order. Do not skip steps. Use the live commands where applicable and record outputs in the work-item comments as you proceed.
 
-0. Set status and safety gate
+1. Set status and safety gate
 
 - **Before any other step**, claim the work item by running:
   `wl update <work-item-id> --status in_progress --json`

@@ -39,6 +39,7 @@ After processing all items, ImplementAll produces a summary report:
 **Implemented**: 3
 **Needs input**: 1
 **Errors**: 1
+**Remaining**: 0
 
 ## Results
 
@@ -48,7 +49,7 @@ After processing all items, ImplementAll produces a summary report:
 - **SA-ITEM-004**: `needs_input`
 - **SA-ITEM-005**: `error`
   - Error: Implement failed (rc=1): timeout exceeded
-  - Recovery: `reset_status_to_open` ✓
+  - Recovery: `reset_status_to_open_with_stage_plan_complete` ✓
 ```
 
 When `--json` is used, the output is a JSON object:
@@ -59,9 +60,10 @@ When `--json` is used, the output is a JSON object:
   "implemented": 3,
   "needs_input": 1,
   "errors": 1,
+  "remaining": 0,
   "items": [
     {"id": "SA-ITEM-001", "title": "...", "outcome": "implemented", "error_detail": null, "recovery": null},
-    {"id": "SA-ITEM-005", "title": "...", "outcome": "error", "error_detail": "Implement failed (rc=1): timeout exceeded", "recovery": {"action": "reset_status_to_open", "success": true}}
+    {"id": "SA-ITEM-005", "title": "...", "outcome": "error", "error_detail": "Implement failed (rc=1): timeout exceeded", "recovery": {"action": "reset_status_to_open_with_stage_plan_complete", "success": true}}
   ]
 }
 ```
@@ -80,7 +82,7 @@ Items flagged as `needs_input` are not retried — the skill moves on to the nex
 
 - If `wl list` fails (non-zero exit or exception), returns an empty list gracefully
 - If claiming an item fails, logs a warning and marks the item as `error`
-- If `/skill:implement` fails for an item, logs a warning, attempts recovery (resets item status to `open`), and continues to the next item
+- If `/skill:implement` fails for an item, logs a warning, attempts recovery (resets item status to `open` and stage to `plan_complete`), and continues to the next item
 - If `/skill:implement` output contains question patterns, marks the item as `needs_input` without recovery (status stays `in_progress` to preserve the question context)
 - All errors and recovery actions are captured in the summary report
 - Recovery outcomes (success/failure) are included in per-item results
@@ -88,6 +90,16 @@ Items flagged as `needs_input` are not retried — the skill moves on to the nex
   **Script Execution Failure Notice** (first and last lines) using the shared
   utility at `./scripts/failure_notice.py`. This provides a prominent visual
   signal that some items failed during batch implementation.
+
+## Signal handling
+
+ImplementAll registers SIGINT and SIGTERM handlers for graceful abort. On receiving a signal:
+
+1. The currently in-progress item is recovered — its stage is reset to `plan_complete` and status to `open`
+2. Original signal handlers are restored
+3. The process exits with the signal code (128 + signum)
+
+This ensures no items are left in a stuck `in_progress` state if the batch process is interrupted.
 
 ## `--max` flag
 
@@ -112,6 +124,7 @@ The count includes all processed items regardless of outcome (implemented, needs
 | `--dry-run` | Simulate processing without making any changes |
 | `--parent-id <id>` | Post the summary as a comment on the specified parent work item |
 | `--max N` | Maximum number of items to process (0 = no limit) |
+| `--item-timeout N` | Timeout in seconds for each item's subprocess call (default: 600) |
 | `--verbose` | Enable verbose logging |
 
 ## Examples

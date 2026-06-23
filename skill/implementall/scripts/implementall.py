@@ -234,7 +234,7 @@ class ImplementAllEngine:
                 - success: whether recovery succeeded
         """
         recovery: dict[str, Any] = {
-            "action": "reset_status_to_open",
+            "action": "reset_status_to_open_with_stage_plan_complete",
             "success": False,
         }
 
@@ -245,6 +245,7 @@ class ImplementAllEngine:
         reset_cmd = [
             "wl", "update", item_id,
             "--status", "open",
+            "--stage", "plan_complete",
             "--json",
         ]
         logger.debug("implementall.recovery cmd=%s", " ".join(reset_cmd))

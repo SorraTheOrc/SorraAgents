@@ -398,6 +398,7 @@ The following output was produced manually.
 ```
 
 This notice is:
+
 - **Purely informational/textual** — no workflow state changes are made
 - **Additive** — the existing report format sections (Ready to close, Summary,
   Acceptance Criteria Status, Children Status, Code Quality) are preserved
@@ -405,6 +406,7 @@ This notice is:
 - Propagated to JSON mode output via the ``script_failure`` key
 
 Failure types detected:
+
 - Non-zero exit code from subprocess calls (with captured stderr)
 - Timeout exceptions (subprocess.TimeoutExpired)
 - Unavailable dependencies (FileNotFoundError)
