@@ -670,12 +670,11 @@ def test_search_repo_scans_allowed_extensions(tmp_path):
 
 
 def test_skill_md_has_status_management_instructions():
-    """SKILL.md must include instructions for capturing and restoring status."""
+    """SKILL.md must include instructions for setting in_progress and open status."""
     skill_md = REPO_ROOT / "skill" / "find-related" / "SKILL.md"
     content = skill_md.read_text()
 
-    # Must contain the capture step
-    assert "wl show" in content, "SKILL.md must include wl show command for capturing status"
-    assert "status" in content.lower(), "SKILL.md must mention status"
+    # Must contain the status lifecycle steps
     assert "in_progress" in content, "SKILL.md must reference setting status to in_progress"
-    assert "original status" in content.lower() or "starting status" in content.lower() or "original" in content.lower(), "SKILL.md must reference restoring the original status"
+    assert "open --json" in content, "SKILL.md must reference setting status to open at end"
+    assert "status" in content.lower(), "SKILL.md must mention status"

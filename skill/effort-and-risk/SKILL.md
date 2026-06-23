@@ -12,6 +12,17 @@ Produce a concise, auditable engineering estimate (effort + risk) for a prepared
 - A machine-readable JSON object containing effort (effort_units, tshirt size (full-text, e.g. "Small", "Extra Large"), O/M/P, expected, recommended, range), risk (probability, impact, score, level, top drivers, mitigations), confidence, assumptions, and unknowns.
 - A human-readable summary generated and posted by the orchestrator; the posted content is included in the orchestrator output.
 
+## Status lifecycle
+
+This skill manages the work item status during execution to signal that the item is being processed.
+
+1. **Before any other step** (including the gating check below), claim the work item by running:
+   `wl update <issue-id> --status in_progress --json`
+2. **At the end of execution** (whether success or failure), set status to `open`:
+   `wl update <issue-id> --status open --json`
+
+> Stage is NOT modified by this skill. Only `--status` is used.
+
 Gating (mandatory)
 -------------------
 

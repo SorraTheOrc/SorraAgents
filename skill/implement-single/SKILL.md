@@ -78,7 +78,13 @@ is invoked.
 
 Execute the following steps in order. Do not skip steps.
 
-### Step 0 — Safety gate
+### Step 0 — Set status and safety gate
+
+- **Before any other step**, claim the work item by running:
+  `wl update <work-item-id> --status in_progress --json`
+  This must be the very first action — before any git checks, safety gates,
+  or preflight checks. The status signals to other agents that this item is
+  being worked on and prevents concurrent claims.
 
 - Detect whether the current directory is inside a git worktree:
   `git rev-parse --is-inside-work-tree` (returns `true` or `false`).
@@ -175,7 +181,8 @@ The following table documents the expected status and stage transitions at each 
 
 | Phase | Command | Status | Stage |
 |-------|---------|--------|-------|
-| Start (Step 1 - Claim) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
+| Start (Step 0 - Set status) | `wl update <id> --status in_progress --json` | in_progress | (unchanged) |
+| Claim (Step 1) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
 | Complete (Step 6) | `wl update <id> --status open --stage in_review --json` | open | in_review |
 | Abort - dirty tree (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
 | Abort - no_safe_path (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |

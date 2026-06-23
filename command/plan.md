@@ -46,6 +46,14 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 - This Hard requirements section is populated with the mandatory progression rule above; review the rest of the hard requirements for task-specific constraints.
 
+## Status lifecycle (first action)
+
+- **Before any other step**, claim the work item by running:
+  `wl update <work-item-id> --status in_progress --json`
+  This must be the very first action — before any pre-checks, context gathering, or
+  other preflight steps. The status signals to other agents that this item is
+  being processed and prevents concurrent claims.
+
 ## Seed context
 
 - Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for context.
@@ -235,16 +243,10 @@ Keep asking questions until the breakdown into features is clear.
 
 ## 8. Finishing (must do as the final step only)
 
--- On the parent work item set the work item's stage to `plan_complete`:
-`wl update <work-item-id> --stage plan_complete --status open --json`
-
+- On the parent work item set the work item's stage to `plan_complete` and status to `open`:
+  `wl update <work-item-id> --stage plan_complete --status open --json`
 - Run `wl sync` to sync work item changes.
 - Run `wl show <work-item-id>` (not --json) to show the entire work item.
-- End with: "This completes the Plan process for <work-item-id>".
-  - On the parent work item set the machine-readable `stage` field to `plan_complete`:
-    `wl update <work-item-id> --stage plan_complete --status open --json`
-- Run `wl sync` to sync work item changes.
-- Run `wl show <work-item-id>` (without `--json`) to display the entire work item.
 - End with: "This completes the Plan process for <work-item-id>".
 
 ## Examples

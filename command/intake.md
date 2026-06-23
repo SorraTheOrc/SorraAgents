@@ -44,6 +44,14 @@ The command implements the procedural workflow below. Each numbered step is part
 
 - Do not include procedural next steps (e.g., "Proceed to planning", "Break into sub-tasks") in the intake brief or work item description. Workflow progression is handled by the workflow system via stage transitions and delegation dispatch, not by the work item content.
 
+## Status lifecycle (first action)
+
+- **Before any other step**, claim the work item by running:
+  `wl update <work-item-id> --status in_progress --json`
+  This must be the very first action — before any evaluation, context gathering, or
+  other preflight checks. The status signals to other agents that this item is
+  being processed and prevents concurrent claims.
+
 ## Process (must follow)
 
 1. Evaluate whether intake is required (agent responsibility)
@@ -76,7 +84,8 @@ The command implements the procedural workflow below. Each numbered step is part
 1. Work Item prep (agent responsibility)
 
 - If a <work-item-id> was provided:
-  - Mark the work item as in progress and at stage idea by running `wl update $1 --stage idea --status in_progress --assignee Map --json`.
+  - Mark the work item at stage idea and assign it, by running `wl update $1 --stage idea --assignee Map --json`.
+  - Note: `status` was already set to `in_progress` at the start of this command (see Status lifecycle section above).
 - If no work item id was provided:
   - Extract a working title from the <seed-intent> (one line).
   - Create a new Worklog work item using `wl create --stage idea --status in_progress --title "<working-title>" --description "<seed-context>" --type epic --assignee Map --json`

@@ -87,10 +87,12 @@ The command implements the procedural workflow below. Each numbered step is part
 
 1. Manage work item status (agent responsibility)
 
-- **Capture** the current status of the canonical work item before making any changes: `wl show <work_item_id> --json` (extract the `status` field).
-- **Set** the status to `in_progress` to signal the item is being processed: `wl update <work_item_id> --status in_progress`.
-- At the end of the review (after cleanup steps), **reset** the status to the original status: `wl update <work_item_id> --status <original-status>`.
-- Stage is NOT modified by this command. Only `--status` is used.
+- **Before any other step**, set the status to `in_progress`:
+  `wl update <work_item_id> --status in_progress --json`
+- At the end of the review (after cleanup steps), **set** the status to `open`:
+  `wl update <work_item_id> --status open --json`
+- Stage is NOT modified by this command. Only `--status` is used. The new convention is:
+  `in_progress` at start → `open` at end (no longer restoring the original status).
 
 1. Ensure a Review child work item exists (agent responsibility)
 

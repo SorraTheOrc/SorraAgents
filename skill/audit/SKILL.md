@@ -41,15 +41,15 @@ The canonical audit runner automatically manages the work item's `status` field 
 ### Lifecycle
 
 1. **`in_progress`** — Set at the start of `cmd_issue()`, before any code quality checks, Pi calls, or report assembly.
-2. **`completed`** — Set after all audit logic completes, including persistence. This is guaranteed to run even on failure or unhandled exceptions via a `try/finally` block.
+2. **`open`** — Set after all audit logic completes, including persistence. This is guaranteed to run even on failure or unhandled exceptions via a `try/finally` block.
 
 ### Behavior
 
-- The status transition is `in_progress` → `completed` for every audit run, regardless of success or failure.
+- The status transition is `in_progress` → `open` for every audit run, regardless of success or failure.
 - The `--do-not-persist` flag does NOT affect status lifecycle — status changes occur regardless of persist mode.
 - Status changes are performed via the injectable `runner` using `wl update <id> --status <value>`.
 - The `stage` field is NOT modified by the status lifecycle.
-- If the `completed` status update fails (e.g., runner error), the failure is silently caught to avoid masking the main audit result.
+- If the `open` status update fails (e.g., runner error), the failure is silently caught to avoid masking the main audit result.
 
 ### Manual Fallback (Running Without the Runner)
 
@@ -62,17 +62,17 @@ status lifecycle must be managed by hand to match the runner's behavior:
    wl update <id> --status in_progress --json
    ```
 
-2. **After the audit completes** (whether successful or failed), set status to `completed`:
+2. **After the audit completes** (whether successful or failed), set status to `open`:
 
    ```bash
-   wl update <id> --status completed --json
+   wl update <id> --status open --json
    ```
 
 > **Important:** Always include the `--json` flag with `wl update` commands to
 > ensure machine-readable output. The audit runner's `_run_wl()` function
 > expects JSON output from all `wl` commands.
 
-This ensures the same `in_progress` → `completed` transition regardless of
+This ensures the same `in_progress` → `open` transition regardless of
 whether the automated runner or a manual process performs the audit.
 
 ### Rationale
@@ -82,7 +82,7 @@ The status lifecycle was added to solve the problem of concurrent audit attempts
 ## Safety and prompt design
 
 - Audit executions should be read-only except for the explicit, single persistence step that stores the structured audit into the associated work item and the automatic status lifecycle management performed by the runner. Use the designation `[READ-ONLY AUDIT]` in Pi prompts to mark read-only phases, and use `[PERSIST-AUDIT]` when performing the authorized persistence operation.
-- Do NOT close, create, or delete any work items during an audit. The ONLY permitted state-modifying actions for this skill are: (1) storing the audit text via the canonical persister (./scripts/persist_audit.py) or the runner's built-in persistence, and (2) the runner's automatic status lifecycle (in_progress → completed, see Status Lifecycle section). Do NOT perform other `wl`, `git`, or arbitrary state-modifying commands. Do NOT change work item stage — only the `status` field is managed by the lifecycle.
+- Do NOT close, create, or delete any work items during an audit. The ONLY permitted state-modifying actions for this skill are: (1) storing the audit text via the canonical persister (./scripts/persist_audit.py) or the runner's built-in persistence, and (2) the runner's automatic status lifecycle (in_progress → open, see Status Lifecycle section). Do NOT perform other `wl`, `git`, or arbitrary state-modifying commands. Do NOT change work item stage — only the `status` field is managed by the lifecycle.
 - When persisting, use the canonical persister script or the runner's built-in persistence option. If asked to run arbitrary `wl`, `git`, or other state-modifying commands outside the authorized persister flow, refuse and report the request to the operator.
 - The model should return a structured markdown report. If ambiguity prevents a reliable verdict on acceptance criteria, return immediately and do NOT persist the audit. Persistence must be an explicit, deliberate step — do not persist partial or ambiguous audits.
 - To aid debugging, the canonical runner supports a `--debug-log` flag which appends raw Pi output to a JSONL file (see Scripts section).

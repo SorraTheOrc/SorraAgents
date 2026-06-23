@@ -1367,7 +1367,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         }
 
     # ------------------------------------------------------------------
-    # Status lifecycle: set in_progress on entry
+    # Status lifecycle: set in_progress on entry (cleaned up to open in finally)
     # ------------------------------------------------------------------
     _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"])
 
@@ -1706,11 +1706,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
     finally:
         # ------------------------------------------------------------------
-        # Status lifecycle: set completed on exit (success or failure)
+        # Status lifecycle: set open on exit (success or failure)
         # Always runs because of try/finally — guarantees cleanup.
         # ------------------------------------------------------------------
         try:
-            _run_wl(runner, ["wl", "update", issue_id, "--status", "completed", "--json"])
+            _run_wl(runner, ["wl", "update", issue_id, "--status", "open", "--json"])
         except RuntimeError:
             pass  # Status update failure must not mask the main result
 

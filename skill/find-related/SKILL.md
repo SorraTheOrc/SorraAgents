@@ -32,11 +32,13 @@ that is inserted into the work item description under a clearly-marked section.
 
 This skill manages the work item status during execution to signal that the item is being processed.
 
-1. **Capture** the current status before making any changes: `wl show <id> --json` (extract the `status` field).
-2. **Set** the status to `in_progress` at the start of execution: `wl update <id> --status in_progress`.
-3. **Reset** the status to the original status at the end of execution (whether success or failure): `wl update <id> --status <original-status>`.
+1. **Set** the status to `in_progress` at the start of execution (before any other action):
+   `wl update <id> --status in_progress --json`
+2. **Set** the status to `open` at the end of execution (whether success or failure):
+   `wl update <id> --status open --json`
 
-> Stage is NOT modified by this skill. Only `--status` is used.
+> Stage is NOT modified by this skill. Only `--status` is used. The new convention is:
+> `in_progress` at start → `open` at end (no longer restoring the original status).
 
 ## Decision logic
 

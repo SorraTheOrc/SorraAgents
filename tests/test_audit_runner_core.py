@@ -954,7 +954,7 @@ class TestPiPromptSafetyInstructions:
 # ---------------------------------------------------------------------------
 
 class TestStatusLifecycle:
-    """Verify that cmd_issue manages work item status (in_progress -> completed)."""
+    """Verify that cmd_issue manages work item status (in_progress -> open)."""
 
     def _fake_runner_with_calls(self, calls: list, fail_show: bool = False):
         """Create a fake runner that records calls and optionally fails on ``wl show``."""
@@ -1006,8 +1006,8 @@ class TestStatusLifecycle:
             f"in_progress update must include --json, got: {in_progress_updates[0]}"
         )
 
-    def test_sets_completed_after_audit(self, monkeypatch):
-        """completed status must be set at the end of a successful audit."""
+    def test_sets_open_after_audit(self, monkeypatch):
+        """open status must be set at the end of a successful audit."""
         calls = []
 
         monkeypatch.setattr(
@@ -1018,13 +1018,13 @@ class TestStatusLifecycle:
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected at least one completed status update, got: {wl_updates}"
+        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
+        assert len(open_updates) >= 1, (
+            f"Expected at least one open status update, got: {wl_updates}"
         )
 
-    def test_completed_includes_json_flag(self, monkeypatch):
-        """completed wl update must include --json flag."""
+    def test_open_includes_json_flag(self, monkeypatch):
+        """open wl update must include --json flag."""
         calls = []
 
         monkeypatch.setattr(
@@ -1036,30 +1036,30 @@ class TestStatusLifecycle:
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-JSONFLAG2"]]
         assert len(wl_updates) >= 1, f"Expected at least one wl update call, got: {calls}"
-        # The completed update should include --json
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected completed update, got: {wl_updates}"
+        # The open update should include --json
+        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
+        assert len(open_updates) >= 1, (
+            f"Expected open update, got: {wl_updates}"
         )
-        assert "--json" in completed_updates[0], (
-            f"completed update must include --json, got: {completed_updates[0]}"
+        assert "--json" in open_updates[0], (
+            f"open update must include --json, got: {open_updates[0]}"
         )
 
-    def test_sets_completed_on_wl_show_failure(self):
-        """completed status must be set even when wl show fails."""
+    def test_sets_open_on_wl_show_failure(self):
+        """open status must be set even when wl show fails."""
         calls = []
 
         rc = cmd_issue("SA-FAIL", runner=self._fake_runner_with_calls(calls, fail_show=True), persist=False)
         assert rc == 1, f"Expected exit code 1 on wl show failure, got {rc}"
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-FAIL"]]
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected completed update even on failure, got: {wl_updates}"
+        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
+        assert len(open_updates) >= 1, (
+            f"Expected open update even on failure, got: {wl_updates}"
         )
 
-    def test_in_progress_before_completed(self, monkeypatch):
-        """in_progress must appear before completed in the call sequence."""
+    def test_in_progress_before_open(self, monkeypatch):
+        """in_progress must appear before open in the call sequence."""
         calls = []
 
         monkeypatch.setattr(
@@ -1072,13 +1072,13 @@ class TestStatusLifecycle:
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
         statuses = [" ".join(c[3:]) for c in wl_updates]
         in_progress_idx = next(i for i, s in enumerate(statuses) if "in_progress" in s)
-        completed_idx = next(i for i, s in enumerate(statuses) if "completed" in s)
-        assert in_progress_idx < completed_idx, (
-            f"in_progress (index {in_progress_idx}) must come before completed (index {completed_idx}): {statuses}"
+        open_idx = next(i for i, s in enumerate(statuses) if "--status open" in s)
+        assert in_progress_idx < open_idx, (
+            f"in_progress (index {in_progress_idx}) must come before open (index {open_idx}): {statuses}"
         )
 
-    def test_sets_completed_on_exception_in_main_logic(self, monkeypatch):
-        """completed must be set when an unhandled exception occurs in the main logic."""
+    def test_sets_open_on_exception_in_main_logic(self, monkeypatch):
+        """open must be set when an unhandled exception occurs in the main logic."""
         calls = []
 
         def fake_call_pi(prompt, model="x", pi_bin="x", **kwargs):
@@ -1092,7 +1092,7 @@ class TestStatusLifecycle:
         cmd_issue("SA-EXCEPT", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-EXCEPT"]]
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected completed update after exception, got: {wl_updates}"
+        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
+        assert len(open_updates) >= 1, (
+            f"Expected open update after exception, got: {wl_updates}"
         )
