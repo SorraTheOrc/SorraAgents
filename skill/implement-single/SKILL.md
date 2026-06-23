@@ -172,7 +172,7 @@ refactor step may be invoked to detect and remediate code smells:
 - Close your response to the operator with:
   `<work-item-id>: <concise-summary-of-changes>\n\nWork committed to dev`
 - Mark the work item as in-review:
-  `wl update <work-item-id> --status open --stage in_review --json`
+  `wl update <work-item-id> --status completed --stage in_review --json`
 - Do not create a PR or merge. Ralph will handle PR/merge externally.
 
 ## Status Transition Matrix
@@ -183,7 +183,7 @@ The following table documents the expected status and stage transitions at each 
 |-------|---------|--------|-------|
 | Start (Step 0 - Set status) | `wl update <id> --status in_progress --json` | in_progress | (unchanged) |
 | Claim (Step 1) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
-| Complete (Step 6) | `wl update <id> --status open --stage in_review --json` | open | in_review |
+| Complete (Step 6) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
 | Abort - dirty tree (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
 | Abort - no_safe_path (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
 
@@ -201,7 +201,7 @@ Usage (work-item example):
 wl show SA-0MPYMFZXO0004ZU4 --json --children
 
 # After completing implementation, mark the item in_review
-wl update SA-0MPYMFZXO0004ZU4 --status open --stage in_review --json
+wl update SA-0MPYMFZXO0004ZU4 --status completed --stage in_review --json
 ```
 
 End.
