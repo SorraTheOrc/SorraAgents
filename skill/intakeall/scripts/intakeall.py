@@ -106,9 +106,12 @@ class IntakeAllEngine:
     """
 
     def __init__(self, runner: Runner | None = None,
-                 dry_run: bool = False, verbose: bool = False):
+                 dry_run: bool = False, max_items: int = 0,
+                 item_timeout: int = 600, verbose: bool = False):
         self.runner = runner or _default_runner
         self.dry_run = dry_run
+        self.max_items = max_items
+        self.item_timeout = item_timeout
         self.verbose = verbose
         # Track the item currently being processed for signal-handler recovery
         self._current_item_id: Optional[str] = None
@@ -670,9 +673,14 @@ class IntakeAllEngine:
         self._setup_signal_handlers()
 
         results: list[dict] = []
+        processed = 0
 
         try:
             for item in items:
+                # Check the max limit
+                if self.max_items > 0 and processed >= self.max_items:
+                    break
+
                 item_id = item.get("id", "")
                 if not item_id:
                     continue
@@ -730,6 +738,7 @@ class IntakeAllEngine:
                         }
 
                 results.append(result)
+                processed += 1
 
                 # Clear current item now that it's done
                 self._current_item_id = None
@@ -893,6 +902,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Post the summary as a comment on the specified parent work item",
     )
     parser.add_argument(
+        "--max",
+        type=int,
+        default=0,
+        help="Maximum number of items to process (0 = no limit)",
+    )
+    parser.add_argument(
+        "--item-timeout",
+        type=int,
+        default=600,
+        help="Timeout in seconds for each item's subprocess call (default: 600)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -935,6 +956,8 @@ def _main(argv: list[str] | None = None) -> int:
 
     engine = IntakeAllEngine(
         dry_run=args.dry_run,
+        max_items=args.max,
+        item_timeout=args.item_timeout,
         verbose=args.verbose,
     )
     results = engine.run_all()

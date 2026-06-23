@@ -28,6 +28,8 @@ IntakeAll can be invoked in the following ways:
 - `/skill:intakeall --json` — JSON output for programmatic consumption
 - `/skill:intakeall --parent-id <id>` — Post the summary as a comment on the specified parent work item
 - `/skill:intakeall --dry-run` — Simulate processing without making any changes
+- `/skill:intakeall --max N` — Process at most N items, then stop
+- `/skill:intakeall --item-timeout N` — Set per-item subprocess timeout in seconds (default: 600)
 - `python3 ./scripts/intakeall.py` — Direct Python invocation
 - `pi run /intakeall` — Agent framework invocation
 
@@ -130,12 +132,14 @@ SIGINT (Ctrl+C) and SIGTERM handlers are registered at the start of `run_all()`:
 
 ## CLI flags
 
-| Flag | Description |
-|------|-------------|
-| `--json` | Produce JSON output instead of Markdown |
-| `--dry-run` | Simulate processing without making any changes |
-| `--parent-id <id>` | Post the summary as a comment on the specified parent work item |
-| `--verbose` | Enable verbose logging |
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | flag | off | Produce JSON output instead of Markdown |
+| `--dry-run` | flag | off | Simulate processing without making any changes |
+| `--parent-id <id>` | str | None | Post the summary as a comment on the specified parent work item |
+| `--max` | int | 0 | Maximum number of items to process (0 = no limit) |
+| `--item-timeout` | int | 600 | Timeout in seconds for each item's subprocess call |
+| `--verbose` | flag | off | Enable verbose logging |
 
 ## Examples
 
@@ -151,6 +155,15 @@ python3 ./scripts/intakeall.py --dry-run
 
 # Post summary as a comment on a parent epic
 python3 ./scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
+
+# Process only the first 5 items
+python3 ./scripts/intakeall.py --max 5
+
+# Set per-item timeout to 300 seconds
+python3 ./scripts/intakeall.py --item-timeout 300
+
+# Combine --max and --item-timeout
+python3 ./scripts/intakeall.py --max 3 --item-timeout 120
 ```
 
 ## Scripts
