@@ -28,6 +28,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from skill.scripts.failure_notice import FailureNotice
+from skill.scripts.pi_utils import extract_pi_text
 
 
 logger = logging.getLogger("planall")
@@ -142,8 +143,8 @@ class PlanAllEngine:
             )
             return "error"
 
-        # Invoke /plan via pi
-        plan_cmd = ["pi", "run", f"/plan {item_id}"]
+        # Invoke /plan via pi (non-interactive JSON-stream mode)
+        plan_cmd = ["pi", "-p", "--mode", "json", f"/plan {item_id}"]
         logger.debug("planall.plan.invoke cmd=%s", " ".join(plan_cmd))
         try:
             plan_result = self.runner(plan_cmd)
@@ -151,20 +152,22 @@ class PlanAllEngine:
             logger.warning("planall.plan.exception item=%s exc=%s", item_id, exc)
             return "error"
 
+        # Parse the JSON-stream output to extract plain text for question detection
+        plan_stdout = extract_pi_text(plan_result.stdout or "")
+
         if plan_result.returncode != 0:
             stderr = (plan_result.stderr or "").strip()
-            stdout = (plan_result.stdout or "").strip()
             logger.warning(
                 "planall.plan.failed item=%s rc=%s stderr=%s stdout=%s",
                 item_id,
                 plan_result.returncode,
                 stderr,
-                stdout[:500],
+                plan_stdout[:500],
             )
             # If the plan command stopped with non-zero exit, it likely
             # indicates unanswered questions (producer input needed).
             # Also check stdout for question-like patterns.
-            if self._contains_questions(plan_result.stdout or ""):
+            if self._contains_questions(plan_stdout):
                 return "needs_input"
             return "error"
 

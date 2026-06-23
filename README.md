@@ -306,7 +306,7 @@ The audit helper supports PR mode in addition to work-item mode:
 
 - Input can be a WL id (`SA-...`) or GitHub PR reference (`https://github.com/<owner>/<repo>/pull/<n>` or `<owner>/<repo>#<n>`).
 - In PR mode, the helper resolves the related WL item from PR title/body (or uses explicit `--wl-id`, or optionally `--allow-create-wl`).
-- The helper can prepare an ephemeral checkout, run autodetected build/tests, run audit via `pi run "/audit <wl-id>"`, and record audit text using `wl update --audit-text`.
+- The helper can prepare an ephemeral checkout, run autodetected build/tests, run audit via `pi -p --mode json "/audit <wl-id>"` (non-interactive, JSON-stream mode), and record audit text using `wl update --audit-text`.
 - If build/tests and audit pass, it can present a merge offer and only merges when explicitly confirmed.
 
 Daemon / scheduler note

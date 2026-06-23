@@ -179,7 +179,7 @@ class TestPlanInvocation:
                 stdout=json.dumps({"success": True}),
             )
             runner.set_response(
-                f"pi run /plan {item_id}",
+                f"pi -p --mode json /plan {item_id}",
                 stdout=json.dumps({"success": True}),
             )
 
@@ -187,11 +187,10 @@ class TestPlanInvocation:
         results = engine.run_all()
 
         assert len(results) == 3
-        # Verify pi run /plan was called for each item
+        # Verify pi -p --mode json /plan was called for each item
         plan_calls = [
             cmd for cmd in runner.calls
-            if any("plan" in part for part in cmd)
-            and "pi" in cmd and "run" in cmd
+            if "pi" in cmd and any("/plan" in part for part in cmd)
         ]
         assert len(plan_calls) == 3, f"Expected 3 plan calls, got {len(plan_calls)}: {runner.calls}"
         assert "SA-PLAN-001" in " ".join(plan_calls[0])
@@ -211,7 +210,7 @@ class TestPlanInvocation:
                 stdout=json.dumps({"success": True}),
             )
             runner.set_response(
-                f"pi run /plan {item_id}",
+                f"pi -p --mode json /plan {item_id}",
                 stdout=json.dumps({"success": True}),
             )
 
@@ -225,7 +224,7 @@ class TestPlanInvocation:
             cmd_str = " ".join(cmd)
             if "wl update" in cmd_str and "--status" in cmd_str:
                 claim_calls.append(cmd)
-            if "pi run /plan" in cmd_str:
+            if "pi -p --mode json /plan" in cmd_str:
                 plan_calls.append(cmd)
 
         assert len(claim_calls) == 3
@@ -257,7 +256,7 @@ class TestProducerInputDetection:
         )
         # Simulate pi output that indicates unanswered questions (e.g., contains "?" prompts)
         runner.set_response(
-            f"pi run /plan {SAMPLE_ITEM_A['id']}",
+            f"pi -p --mode json /plan {SAMPLE_ITEM_A['id']}",
             stdout=json.dumps({"success": True, "text": "Should feature X be behind a flag? (yes/no):"}),
             # Non-zero returncode could signal interactive stall
             returncode=1,
@@ -281,7 +280,7 @@ class TestProducerInputDetection:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi run /plan {SAMPLE_ITEM_B['id']}",
+            f"pi -p --mode json /plan {SAMPLE_ITEM_B['id']}",
             stdout=json.dumps({"success": True}),
         )
 
@@ -394,17 +393,17 @@ class TestErrorResilience:
             )
         # First item fails, second and third succeed
         runner.set_response(
-            "pi run /plan SA-PLAN-001",
+            "pi -p --mode json /plan SA-PLAN-001",
             returncode=1,
             stdout="",
             stderr="plan failed: timeout",
         )
         runner.set_response(
-            "pi run /plan SA-PLAN-002",
+            "pi -p --mode json /plan SA-PLAN-002",
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            "pi run /plan SA-PLAN-003",
+            "pi -p --mode json /plan SA-PLAN-003",
             stdout=json.dumps({"success": True}),
         )
 
@@ -436,7 +435,7 @@ class TestErrorResilience:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            "pi run /plan SA-PLAN-002",
+            "pi -p --mode json /plan SA-PLAN-002",
             stdout=json.dumps({"success": True}),
         )
         # Third item claim succeeds
@@ -445,7 +444,7 @@ class TestErrorResilience:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            "pi run /plan SA-PLAN-003",
+            "pi -p --mode json /plan SA-PLAN-003",
             stdout=json.dumps({"success": True}),
         )
 
@@ -483,7 +482,7 @@ class TestIdempotence:
                 stdout=json.dumps({"success": True}),
             )
             runner.set_response(
-                f"pi run /plan {item_id}",
+                f"pi -p --mode json /plan {item_id}",
                 stdout=json.dumps({"success": True}),
             )
 
@@ -504,7 +503,7 @@ class TestIdempotence:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi run /plan {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /plan {SAMPLE_ITEM_C['id']}",
             stdout=json.dumps({"success": True}),
         )
 
@@ -533,7 +532,7 @@ class TestCLI:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi run /plan {SAMPLE_ITEM_A['id']}",
+            f"pi -p --mode json /plan {SAMPLE_ITEM_A['id']}",
             stdout=json.dumps({"success": True}),
         )
 
@@ -554,7 +553,7 @@ class TestCLI:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi run /plan {SAMPLE_ITEM_A['id']}",
+            f"pi -p --mode json /plan {SAMPLE_ITEM_A['id']}",
             stdout=json.dumps({"success": True}),
         )
 

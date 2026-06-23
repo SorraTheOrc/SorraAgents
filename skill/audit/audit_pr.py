@@ -23,6 +23,8 @@ import sys
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any
 
+from skill.scripts.pi_utils import extract_pi_text
+
 WL_ID_RE = re.compile(r"\b([A-Z]+-[0-9A-Z]+)\b")
 PR_URL_RE = re.compile(r"https?://github.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)")
 OWNER_REPO_REF = re.compile(r"(?P<owner>[^/]+)/(?P<repo>[^#]+)#(?P<number>\d+)")
@@ -168,9 +170,10 @@ def run_build_test(path: str, build_cmd: str, timeout: int = 600, dry_run: bool 
 def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bool = True) -> Tuple[int, str]:
     """Run the audit command against the given worktree and return (exit_code, log_path).
 
-    By convention the audit command is invoked via `pi run "/audit <wl-id>"` and must be run
-    with the worktree as cwd so the audit skill can inspect the code. If `pi` is not available
-    the function returns an executable-not-found code in the audit log.
+    The audit command is invoked via `pi -p --mode json "/audit <wl-id>"` (non-interactive,
+    JSON-stream mode) so it does not wait for user input. The output is parsed from the
+    JSON-stream to extract the plain text audit report. If `pi` is not available the function
+    returns an executable-not-found code in the audit log.
     """
     logs_dir = os.path.abspath(os.path.join('.pi', 'tmp', 'logs'))
     os.makedirs(logs_dir, exist_ok=True)
@@ -179,15 +182,17 @@ def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bo
 
     if dry_run:
         with open(log_path, 'w') as f:
-            f.write(f'DRY-RUN: would run `pi run "/audit {wl_id}"` in {path}\n')
+            f.write(f'DRY-RUN: would run `pi -p --mode json "/audit {wl_id}"` in {path}\n')
         return 0, log_path
 
-    cmd = ['pi', 'run', f"/audit {wl_id}"]
+    cmd = ['pi', '-p', '--mode', 'json', f"/audit {wl_id}"]
     try:
         proc = subprocess.run(cmd, cwd=path, capture_output=True, text=True, timeout=timeout)
+        # Parse JSON-stream output to extract plain text before writing to log
+        extracted = extract_pi_text(proc.stdout or '')
         with open(log_path, 'w') as f:
-            f.write('STDOUT:\n')
-            f.write(proc.stdout or '')
+            f.write('STDOUT (extracted from JSON-stream):\n')
+            f.write(extracted)
             f.write('\nSTDERR:\n')
             f.write(proc.stderr or '')
         return proc.returncode, log_path
