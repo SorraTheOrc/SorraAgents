@@ -55,7 +55,7 @@ any sensitive values before writing them to logs or comments.
 - If the work item is not well-defined, do not proceed with implementation. Instead, run the intake interview to clarify and update the work item before implementing.
 - If the work item has blockers or dependencies, implement those first before proceeding with the main work item.
 - Never commit directly to `main`. Always create a feature or bug branch for implementation.
-- When implementing, create a worktree first, then branch inside it. See the canonical [[concepts/git-worktree-best-practices-for-agent-workflows]] wiki page for the worktree workflow.
+- When implementing, create a worktree from the `dev` branch, then branch inside it. See the canonical [[concepts/git-worktree-best-practices-for-agent-workflows]] wiki page for the worktree workflow.
 - When implementing a CLI or API always provide a way to obtain a JSON formatted output for agents to consume.
 - When creating branches, include the work item id in the branch name for traceability (e.g., `feature/WL-123-add-auth`).
 - When creating a commit message, review the diff and write a concise message summarizing the changes made and the reason for the change, referencing the work item id.
@@ -144,9 +144,9 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - If you ran the plan interview, convert this work item to an epic and inform the user that implementation should move to the first child work item created.
 - If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
 
-1. Create a working branch (inside a worktree)
+1. Create a worktree from dev and branch inside it
 
-- Create a worktree following the conventions in [[concepts/git-worktree-best-practices-for-agent-workflows]]:
+- Create a worktree from the `dev` branch following the conventions in [[concepts/git-worktree-best-practices-for-agent-workflows]]:
 
   ```bash
   git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-id>-<short-slug> dev
@@ -158,7 +158,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
   ```
 
-- This creates an isolated working directory with a new branch already checked out.
+- This creates an isolated working directory with a new branch already checked out and tracking `dev`.
   The branch name includes the work item id for traceability.
 - Never commit directly to `main`.
 - See [AGENTS.md](../../AGENTS.md#implement-the-work-item) for the top-level policy on worktree-first implementation.
