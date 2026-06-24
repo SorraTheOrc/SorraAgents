@@ -10,7 +10,7 @@ Use this skill when asked to run batch implementation on all `plan_complete` wor
 ## Behavior
 
 1. Query `wl list --stage plan_complete --status open --json` to discover all eligible work items
-2. For each item, claim it (`wl update <id> --status in_progress`) and invoke `/skill:implement <id>`
+2. For each item, claim it (`wl update <id> --status in_progress --stage in_progress`) and invoke `/skill:implement <id>`
 3. Detect items needing producer input (unanswered questions, non-zero exit, or specific output patterns)
 4. On error, attempt recovery (reset item status to `open`) and record recovery outcome
 5. Continue processing remaining items even when one requires input or encounters an error

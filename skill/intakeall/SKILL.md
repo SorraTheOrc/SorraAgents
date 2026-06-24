@@ -13,7 +13,7 @@ Use this skill when asked to run batch intake on all `idea` stage work items. It
 2. **Signal handler registration**: SIGINT and SIGTERM handlers are registered. If an external abort (Ctrl+C) occurs during processing, the currently-active item is recovered (reset to `status=open, stage=idea`) before the process exits.
 3. For each item:
    - If the item has sufficient detail (acceptance criteria + implementation guidance), auto-complete it to `intake_complete` without invoking `/intake`
-   - Otherwise, claim it (`wl update <id> --status in_progress --stage in_progress`) and invoke `/intake`
+   - Otherwise, claim it (`wl update <id> --status in_progress`) and invoke `/intake`
    - After `/intake` completes successfully, update to `stage=intake_complete, status=open`
 4. Detect items needing producer input (unanswered questions, non-zero exit, or specific output patterns)
 5. On error, attempt recovery (reset item stage to `idea` and status to `open`) and record recovery outcome
@@ -178,3 +178,12 @@ python3 ./scripts/intakeall.py --max 3 --item-timeout 120
 - `command/intake.md` — The `/intake` command that IntakeAll invokes for each item
 - `../planall/SKILL.md` — PlanAll: the batch planning skill that IntakeAll mirrors
 - `../ralph/SKILL.md` — Ralph orchestration loop that provides auto-intake for individual items
+
+## Known discrepancy with implementation
+
+> **Audit finding (WL-0MQQIK8OU0052YD0):** The `_invoke_intake()` method in `scripts/intakeall.py`
+> uses `--status in_progress --stage in_progress` (dual-set) when claiming items,
+> which is inconsistent with the documented status-only pattern above. The
+> dual-set pattern is semantically incorrect for intake (intake is not the
+> implementation phase). See
+> `docs/validation/stage-in-progress-usage-inventory.md` for the full audit report.
