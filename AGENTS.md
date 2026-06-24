@@ -408,7 +408,16 @@ When your changes create orphans:
 
 **The test:** Every changed line should trace directly to the user's request.
 
-### 4. Goal-Driven Execution
+### 4. Repository Boundaries
+
+**Stay in your lane. Don't modify the tooling.**
+
+- Do NOT edit files in `.pi/`, `skill/`, `command/`, or any agent-infrastructure directory unless explicitly instructed.
+- The skills and commands under these paths are part of the agent framework itself — modifying them is equivalent to modifying the tool you're holding.
+- If a skill or command behaves unexpectedly, report the issue to the operator via a work item or comment instead of patching it yourself.
+- If you are given permission to modify infrastructure, create a work item in the relevant project (e.g., SorraAgents) first to track the change.
+
+### 5. Goal-Driven Execution
 
 **Define success criteria. Loop until verified.**
 
