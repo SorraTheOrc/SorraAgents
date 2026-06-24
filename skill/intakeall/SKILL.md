@@ -179,11 +179,4 @@ python3 ./scripts/intakeall.py --max 3 --item-timeout 120
 - `../planall/SKILL.md` — PlanAll: the batch planning skill that IntakeAll mirrors
 - `../ralph/SKILL.md` — Ralph orchestration loop that provides auto-intake for individual items
 
-## Known discrepancy with implementation
-
-> **Audit finding (WL-0MQQIK8OU0052YD0):** The `_invoke_intake()` method in `scripts/intakeall.py`
-> uses `--status in_progress --stage in_progress` (dual-set) when claiming items,
-> which is inconsistent with the documented status-only pattern above. The
-> dual-set pattern is semantically incorrect for intake (intake is not the
-> implementation phase). See
-> `docs/validation/stage-in-progress-usage-inventory.md` for the full audit report.
+> **Implementation note:** The `_invoke_intake()` method previously used `--status in_progress --stage in_progress` (dual-set) when claiming items. This was fixed in SA-0MQS18ZOI005ER2V to use status-only (`--status in_progress`), matching the documented pattern.

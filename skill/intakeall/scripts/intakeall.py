@@ -280,7 +280,6 @@ class IntakeAllEngine:
         claim_cmd = [
             "wl", "update", item_id,
             "--status", "in_progress",
-            "--stage", "in_progress",
             "--json",
         ]
         logger.debug("intakeall.claim cmd=%s", " ".join(claim_cmd))

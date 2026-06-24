@@ -149,7 +149,6 @@ class PlanAllEngine:
         claim_cmd = [
             "wl", "update", item_id,
             "--status", "in_progress",
-            "--stage", "in_progress",
             "--json",
         ]
         logger.debug("planall.claim cmd=%s", " ".join(claim_cmd))
