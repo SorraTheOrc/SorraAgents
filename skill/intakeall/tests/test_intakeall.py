@@ -374,39 +374,24 @@ class TestAutoComplete:
 
 
 # ===========================================================================
-# Test: Sequential /intake invocation
+# Test: Sequential /intake invocation (direct method call)
 # ===========================================================================
 
 class TestIntakeInvocation:
-    """Verify that /intake is invoked for items needing intake."""
+    """Verify that /intake is invoked when _invoke_intake is called directly."""
+
+    def _make_engine(self, runner):
+        """Create an engine with the given runner for direct _invoke_intake tests."""
+        return IntakeAllEngine(runner=runner, dry_run=False)
 
     def test_intake_invoked_for_items_requiring_intake(self):
-        """/intake is invoked for items that are not auto-completed."""
+        """/intake is invoked when _invoke_intake is called directly."""
         runner = FakeRunner()
-        # Only SAMPLE_ITEM_C (epic) needs /intake; A, B, D are auto-completable
-        runner.set_response(
-            "wl list --stage idea",
-            stdout=SAMPLE_WL_LIST_RESPONSE,
-        )
         # Mock claim for the vague epic
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
         )
-        # Mock auto-complete responses for A, B, D
-        for item in [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_D]:
-            runner.set_response(
-                f"wl update {item['id']} --status",
-                stdout=json.dumps({"success": True}),
-            )
-            runner.set_response(
-                f"wl update {item['id']} --stage",
-                stdout=json.dumps({"success": True}),
-            )
-            runner.set_response(
-                f"wl comment add {item['id']}",
-                stdout=json.dumps({"success": True}),
-            )
         # Mock /intake for the vague epic
         runner.set_response(
             f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
@@ -418,11 +403,11 @@ class TestIntakeInvocation:
             stdout=json.dumps({"success": True}),
         )
 
-        engine = IntakeAllEngine(runner=runner)
-        results = engine.run_all()
+        engine = self._make_engine(runner)
+        result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
 
-        assert len(results) == 4
-        # Check /intake was called for the epic only
+        assert result["outcome"] == "intake_completed"
+        # Check /intake was called
         intake_calls = [
             cmd for cmd in runner.calls
             if "pi" in cmd and "-p" in cmd and "/intake" in " ".join(cmd)
@@ -433,13 +418,6 @@ class TestIntakeInvocation:
     def test_intake_items_claimed_before_intake(self):
         """Each item is claimed with wl update before /intake is invoked."""
         runner = FakeRunner()
-        runner.set_response(
-            "wl list --stage idea",
-            stdout=json.dumps({
-                "success": True,
-                "workItems": [SAMPLE_ITEM_C],
-            }),
-        )
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
@@ -453,8 +431,8 @@ class TestIntakeInvocation:
             stdout=json.dumps({"success": True}),
         )
 
-        engine = IntakeAllEngine(runner=runner)
-        engine.run_all()
+        engine = self._make_engine(runner)
+        engine._invoke_intake(SAMPLE_ITEM_C["id"])
 
         claim_calls = []
         intake_calls = []
@@ -478,18 +456,14 @@ class TestIntakeInvocation:
 # ===========================================================================
 
 class TestProducerInputDetection:
-    """Verify detection of items needing producer input."""
+    """Verify detection of items needing producer input via _invoke_intake."""
+
+    def _make_engine(self, runner):
+        return IntakeAllEngine(runner=runner, dry_run=False)
 
     def test_unanswered_questions_detected(self):
         """Items with unanswered questions are flagged as needing producer input."""
         runner = FakeRunner()
-        runner.set_response(
-            "wl list --stage idea",
-            stdout=json.dumps({
-                "success": True,
-                "workItems": [SAMPLE_ITEM_C],
-            }),
-        )
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
@@ -507,22 +481,13 @@ class TestProducerInputDetection:
             returncode=1,
         )
 
-        engine = IntakeAllEngine(runner=runner)
-        results = engine.run_all()
-        assert len(results) == 1
-        assert results[0]["outcome"] == "needs_input"
-        assert results[0]["id"] == SAMPLE_ITEM_C["id"]
+        engine = self._make_engine(runner)
+        result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
+        assert result["outcome"] == "needs_input"
 
     def test_successful_intake_not_needs_input(self):
         """Items that complete intake without questions are marked intake_completed."""
         runner = FakeRunner()
-        runner.set_response(
-            "wl list --stage idea",
-            stdout=json.dumps({
-                "success": True,
-                "workItems": [SAMPLE_ITEM_C],
-            }),
-        )
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
@@ -536,21 +501,13 @@ class TestProducerInputDetection:
             stdout=json.dumps({"success": True}),
         )
 
-        engine = IntakeAllEngine(runner=runner)
-        results = engine.run_all()
-        assert len(results) == 1
-        assert results[0]["outcome"] == "intake_completed"
+        engine = self._make_engine(runner)
+        result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
+        assert result["outcome"] == "intake_completed"
 
     def test_non_zero_exit_with_questions_detected(self):
         """Non-zero exit with question patterns is needs_input."""
         runner = FakeRunner()
-        runner.set_response(
-            "wl list --stage idea",
-            stdout=json.dumps({
-                "success": True,
-                "workItems": [SAMPLE_ITEM_C],
-            }),
-        )
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
@@ -567,37 +524,27 @@ class TestProducerInputDetection:
             returncode=0,  # Zero exit but still contains questions
         )
 
-        engine = IntakeAllEngine(runner=runner)
-        results = engine.run_all()
-        assert len(results) == 1
-        assert results[0]["outcome"] == "needs_input"
+        engine = self._make_engine(runner)
+        result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
+        assert result["outcome"] == "needs_input"
 
     def test_exception_during_intake_detected(self):
         """Exception during /intake is caught and flagged as error."""
         runner = FakeRunner()
         runner.set_response(
-            "wl list --stage idea",
-            stdout=json.dumps({
-                "success": True,
-                "workItems": [SAMPLE_ITEM_C],
-            }),
-        )
-        runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
         )
-        # Don't set response for /intake, causing exception in subprocess.run
-        # Our fake runner will return default "[]" response, but let's make it fail
+        # Intake fails
         runner.set_response(
             f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
             returncode=1,
             stderr="Connection refused",
         )
 
-        engine = IntakeAllEngine(runner=runner)
-        results = engine.run_all()
-        assert len(results) == 1
-        assert results[0]["outcome"] == "error"
+        engine = self._make_engine(runner)
+        result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
+        assert result["outcome"] == "error"
 
 
 # ===========================================================================
@@ -605,18 +552,14 @@ class TestProducerInputDetection:
 # ===========================================================================
 
 class TestErrorHandlingWithRecovery:
-    """Verify enhanced error handling: capture, recovery, action recording."""
+    """Verify enhanced error handling: capture, recovery, action recording via _invoke_intake."""
+
+    def _make_engine(self, runner):
+        return IntakeAllEngine(runner=runner, dry_run=False)
 
     def test_error_captures_stdout_and_stderr(self):
         """Error outcome includes stdout and stderr details."""
         runner = FakeRunner()
-        runner.set_response(
-            "wl list --stage idea",
-            stdout=json.dumps({
-                "success": True,
-                "workItems": [SAMPLE_ITEM_C],
-            }),
-        )
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
@@ -628,24 +571,16 @@ class TestErrorHandlingWithRecovery:
             stderr="Intake failed: timeout exceeded",
         )
 
-        engine = IntakeAllEngine(runner=runner)
-        results = engine.run_all()
+        engine = self._make_engine(runner)
+        result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
 
-        assert len(results) == 1
-        assert results[0]["outcome"] == "error"
-        error_detail = results[0].get("error_detail", "")
+        assert result["outcome"] == "error"
+        error_detail = result.get("error_detail", "")
         assert "timeout exceeded" in error_detail or "failed" in error_detail
 
     def test_recovery_attempts_reset_status_on_unrecoverable(self):
         """On unrecoverable error, item stage and status are reset to idea and open."""
         runner = FakeRunner()
-        runner.set_response(
-            "wl list --stage idea",
-            stdout=json.dumps({
-                "success": True,
-                "workItems": [SAMPLE_ITEM_C],
-            }),
-        )
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
@@ -662,10 +597,9 @@ class TestErrorHandlingWithRecovery:
             stdout=json.dumps({"success": True}),
         )
 
-        engine = IntakeAllEngine(runner=runner)
-        results = engine.run_all()
+        engine = self._make_engine(runner)
+        result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
 
-        assert len(results) == 1
         # Verify recovery was attempted (reset stage to idea, status to open)
         reset_calls = [
             cmd for cmd in runner.calls
@@ -677,13 +611,6 @@ class TestErrorHandlingWithRecovery:
     def test_recovery_actions_recorded_in_result(self):
         """Recovery actions are recorded in the result for reporting."""
         runner = FakeRunner()
-        runner.set_response(
-            "wl list --stage idea",
-            stdout=json.dumps({
-                "success": True,
-                "workItems": [SAMPLE_ITEM_C],
-            }),
-        )
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
@@ -698,12 +625,11 @@ class TestErrorHandlingWithRecovery:
             stdout=json.dumps({"success": True}),
         )
 
-        engine = IntakeAllEngine(runner=runner)
-        results = engine.run_all()
+        engine = self._make_engine(runner)
+        result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
 
-        assert len(results) == 1
         # Check recovery outcome field
-        recovery = results[0].get("recovery")
+        recovery = result.get("recovery")
         assert recovery is not None, "Recovery info should be recorded"
         assert "action" in recovery or "attempted" in str(recovery).lower()
 
@@ -718,8 +644,8 @@ class TestErrorResilience:
     def test_errors_do_not_stop_processing(self):
         """Processing continues to remaining items after an error."""
         runner = FakeRunner()
-        # Mix of items: one vague (needs intake), others auto-completable
-        items_list = [SAMPLE_ITEM_C, SAMPLE_ITEM_A, SAMPLE_ITEM_B]
+        # Mix of items: one auto-completable (but claim fails), others auto-completable
+        items_list = [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_D]
         runner.set_response(
             "wl list --stage idea",
             stdout=json.dumps({
@@ -727,32 +653,18 @@ class TestErrorResilience:
                 "workItems": items_list,
             }),
         )
-        # Claim all items
-        for item in items_list:
-            runner.set_response(
-                f"wl update {item['id']} --status",
-                stdout=json.dumps({"success": True}),
-            )
-        # First item (vague epic) intake fails
+        # First item (A) claim fails
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"wl update {SAMPLE_ITEM_A['id']} --status",
             returncode=1,
-            stderr="timeout",
+            stdout="",
+            stderr="wl: item not found",
         )
+        # Second item (B) claim succeeds, then auto-completes
         runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --stage",
+            f"wl update {SAMPLE_ITEM_B['id']} --status",
             stdout=json.dumps({"success": True}),
         )
-        # Second item (well-defined) auto-completes
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_A['id']} --stage",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"wl comment add {SAMPLE_ITEM_A['id']}",
-            stdout=json.dumps({"success": True}),
-        )
-        # Third item (well-defined) auto-completes
         runner.set_response(
             f"wl update {SAMPLE_ITEM_B['id']} --stage",
             stdout=json.dumps({"success": True}),
@@ -761,12 +673,25 @@ class TestErrorResilience:
             f"wl comment add {SAMPLE_ITEM_B['id']}",
             stdout=json.dumps({"success": True}),
         )
+        # Third item (D) claim succeeds, then auto-completes
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_D['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_D['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl comment add {SAMPLE_ITEM_D['id']}",
+            stdout=json.dumps({"success": True}),
+        )
 
         engine = IntakeAllEngine(runner=runner)
         results = engine.run_all()
 
         assert len(results) == 3
-        # First item has error (recovery applied), others auto-completed
+        # First item has error (claim failed), others auto-completed
         assert results[0]["outcome"] == "error"
         assert results[1]["outcome"] == "auto_completed"
         assert results[2]["outcome"] == "auto_completed"
@@ -959,16 +884,6 @@ class TestIdempotence:
             f"wl comment add {SAMPLE_ITEM_A['id']}",
             stdout=json.dumps({"success": True}),
         )
-        # SAMPLE_ITEM_C needs intake (epic)
-        runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --stage",
-            stdout=json.dumps({"success": True}),
-        )
-
         engine = IntakeAllEngine(runner=runner)
         results_first = engine.run_all()
         assert len(results_first) == 2
@@ -1494,7 +1409,7 @@ class TestOrphanRecovery:
             f"wl update {ORPHAN_ITEM_IN_PROGRESS['id']} --status",
             stdout=json.dumps({"success": True}),
         )
-        # Stage updates for items (A and orphan_in_progress auto-complete, C needs intake)
+        # Stage updates for items (A and orphan_in_progress auto-complete, C is needs_input)
         for item_id in [SAMPLE_ITEM_A["id"], ORPHAN_ITEM_IN_PROGRESS["id"]]:
             runner.set_response(
                 f"wl update {item_id} --stage",
@@ -1504,15 +1419,6 @@ class TestOrphanRecovery:
                 f"wl comment add {item_id}",
                 stdout=json.dumps({"success": True}),
             )
-        # C (epic) needs intake
-        runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --stage",
-            stdout=json.dumps({"success": True}),
-        )
 
         engine = IntakeAllEngine(runner=runner)
         results = engine.run_all()
@@ -1522,7 +1428,8 @@ class TestOrphanRecovery:
         # Check outcomes
         for r in results:
             if r["id"] == SAMPLE_ITEM_C["id"]:
-                assert r["outcome"] == "intake_completed"
+                assert r["outcome"] == "needs_input", \
+                    f"Expected needs_input for epic C, got {r['outcome']}"
             else:
                 assert r["outcome"] == "auto_completed"
         # Completed orphan should NOT be in results (excluded after recovery)
@@ -1615,25 +1522,26 @@ class TestSignalHandling:
         assert len(update_calls) == 0
 
     def test_current_item_id_set_during_intake(self):
-        """_current_item_id is set during intake processing for signal handling."""
+        """_current_item_id is set during processing for signal handling."""
         runner = FakeRunner()
         runner.set_response(
             "wl list --stage idea",
             stdout=json.dumps({
                 "success": True,
-                "workItems": [SAMPLE_ITEM_C],
+                "workItems": [SAMPLE_ITEM_C, SAMPLE_ITEM_A],
             }),
         )
+        # A auto-completes (C is needs_input, no responses needed)
         runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --status",
+            f"wl update {SAMPLE_ITEM_A['id']} --status",
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"wl update {SAMPLE_ITEM_A['id']} --stage",
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --stage",
+            f"wl comment add {SAMPLE_ITEM_A['id']}",
             stdout=json.dumps({"success": True}),
         )
 
@@ -1665,13 +1573,13 @@ class TestMaxFlag:
     """Verify --max flag limits the number of items processed."""
 
     def test_max_zero_processes_all(self):
-        """--max 0 (default) processes all items including auto-complete items."""
+        """--max 0 (default) processes all items."""
         runner = FakeRunner()
         runner.set_response(
             "wl list --stage idea",
             stdout=SAMPLE_WL_LIST_RESPONSE,
         )
-        # A, B, D auto-complete; C needs intake
+        # A, B, D auto-complete; C is skipped (needs_input, no /intake)
         for item in [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_D]:
             runner.set_response(
                 f"wl update {item['id']} --status",
@@ -1685,18 +1593,6 @@ class TestMaxFlag:
                 f"wl comment add {item['id']}",
                 stdout=json.dumps({"success": True}),
             )
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --status",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --stage",
-            stdout=json.dumps({"success": True}),
-        )
 
         engine = IntakeAllEngine(runner=runner, max_items=0)
         results = engine.run_all()
@@ -1786,18 +1682,11 @@ class TestMaxFlag:
 # ===========================================================================
 
 class TestItemTimeout:
-    """Verify --item-timeout triggers recovery on subprocess timeout."""
+    """Verify --item-timeout triggers recovery on subprocess timeout via _invoke_intake."""
 
     def test_item_timeout_triggers_recovery(self):
         """When subprocess times out, item is recovered (reset to idea/open) and continues."""
         runner = FakeRunner()
-        runner.set_response(
-            "wl list --stage idea",
-            stdout=json.dumps({
-                "success": True,
-                "workItems": [SAMPLE_ITEM_C, SAMPLE_ITEM_A],
-            }),
-        )
         # Item C (vague epic) intake times out
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
@@ -1812,27 +1701,12 @@ class TestItemTimeout:
             f"wl update {SAMPLE_ITEM_C['id']} --stage",
             stdout=json.dumps({"success": True}),
         )
-        # Item A auto-completes
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_A['id']} --status",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_A['id']} --stage",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"wl comment add {SAMPLE_ITEM_A['id']}",
-            stdout=json.dumps({"success": True}),
-        )
 
         engine = IntakeAllEngine(runner=runner, item_timeout=10)
-        results = engine.run_all()
+        result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
 
-        assert len(results) == 2
-        # First item (vague epic) should have error outcome
-        assert results[0]["outcome"] == "error"
-        assert results[0]["id"] == SAMPLE_ITEM_C["id"]
+        assert result["outcome"] == "error"
+        assert result.get("error_detail", "") != ""
         # Verify recovery was attempted (reset to idea/open)
         recovery_calls = [
             cmd for cmd in runner.calls
@@ -1840,19 +1714,10 @@ class TestItemTimeout:
             and SAMPLE_ITEM_C["id"] in " ".join(cmd)
         ]
         assert len(recovery_calls) >= 1
-        # Second item should have auto_completed
-        assert results[1]["outcome"] == "auto_completed"
 
     def test_item_timeout_logged(self):
         """Timeout event has stderr info in error_detail."""
         runner = FakeRunner()
-        runner.set_response(
-            "wl list --stage idea",
-            stdout=json.dumps({
-                "success": True,
-                "workItems": [SAMPLE_ITEM_C],
-            }),
-        )
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
@@ -1868,15 +1733,14 @@ class TestItemTimeout:
         )
 
         engine = IntakeAllEngine(runner=runner, item_timeout=10)
-        results = engine.run_all()
+        result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
 
-        assert len(results) == 1
-        assert results[0]["outcome"] == "error"
-        error_detail = results[0].get("error_detail", "")
+        assert result["outcome"] == "error"
+        error_detail = result.get("error_detail", "")
         assert "timed out" in error_detail or "timeout" in error_detail
 
     def test_item_timeout_continues_to_next_item(self):
-        """After timeout, processing continues to the next item."""
+        """After timeout, run_all still processes remaining items."""
         runner = FakeRunner()
         runner.set_response(
             "wl list --stage idea",
@@ -1885,52 +1749,28 @@ class TestItemTimeout:
                 "workItems": [SAMPLE_ITEM_C, SAMPLE_ITEM_A, SAMPLE_ITEM_B],
             }),
         )
-        # Item C intake times out
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --status",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
-            returncode=-15,
-            stderr="timed out",
-        )
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_C['id']} --stage",
-            stdout=json.dumps({"success": True}),
-        )
-        # Item A auto-completes
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_A['id']} --status",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_A['id']} --stage",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"wl comment add {SAMPLE_ITEM_A['id']}",
-            stdout=json.dumps({"success": True}),
-        )
-        # Item B auto-completes
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_B['id']} --status",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"wl update {SAMPLE_ITEM_B['id']} --stage",
-            stdout=json.dumps({"success": True}),
-        )
-        runner.set_response(
-            f"wl comment add {SAMPLE_ITEM_B['id']}",
-            stdout=json.dumps({"success": True}),
-        )
+        # Item C needs_input (skipped, no /intake), A and B auto-complete
+        # C is not auto-completable but we skip /intake
+        # A and B auto-complete
+        for item in [SAMPLE_ITEM_A, SAMPLE_ITEM_B]:
+            runner.set_response(
+                f"wl update {item['id']} --status",
+                stdout=json.dumps({"success": True}),
+            )
+            runner.set_response(
+                f"wl update {item['id']} --stage",
+                stdout=json.dumps({"success": True}),
+            )
+            runner.set_response(
+                f"wl comment add {item['id']}",
+                stdout=json.dumps({"success": True}),
+            )
 
         engine = IntakeAllEngine(runner=runner, item_timeout=10)
         results = engine.run_all()
 
         assert len(results) == 3
-        assert results[0]["outcome"] == "error"
+        assert results[0]["outcome"] == "needs_input"  # C skipped, needs input
         assert results[1]["outcome"] == "auto_completed"
         assert results[2]["outcome"] == "auto_completed"
 
@@ -1949,11 +1789,11 @@ class TestSummaryEnhancements:
             "wl list --stage idea",
             stdout=json.dumps({
                 "success": True,
-                "workItems": [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_C],
+                "workItems": [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_D],
             }),
         )
         # All three items auto-complete (have sufficient detail)
-        for item in [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_C]:
+        for item in [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_D]:
             runner.set_response(
                 f"wl update {item['id']} --status",
                 stdout=json.dumps({"success": True}),
@@ -1988,3 +1828,360 @@ class TestSummaryEnhancements:
                                                     total_discovered=engine._total_discovered))
         assert json_summary.get("remaining") == 2, \
             f"Expected remaining=2 in JSON, got: {json_summary}"
+
+
+# ===========================================================================
+# Test: _extract_pi_text type safety with non-string payloads
+# ===========================================================================
+
+class TestExtractPiText:
+    """Verify _extract_pi_text handles non-string payloads safely."""
+
+    def test_normal_text_delta(self):
+        """Normal text_delta events produce expected string."""
+        raw = json.dumps({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "Hello "},
+        }) + "\n" + json.dumps({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "world"},
+        }) + "\n" + json.dumps({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_end", "content": "Hello world"},
+        })
+        result = IntakeAllEngine._extract_pi_text(raw)
+        assert isinstance(result, str)
+        assert result == "Hello world"
+
+    def test_tool_call_part_with_list_text(self):
+        """Parts with list values for 'text' are handled without crashing."""
+        raw = json.dumps({
+            "type": "message_end",
+            "message": {
+                "content": "The response",
+                "parts": [
+                    {"type": "text", "text": "The response"},
+                    {"type": "tool_call", "text": ["arg1", "arg2"]},
+                ],
+            },
+        }) + "\n"
+        result = IntakeAllEngine._extract_pi_text(raw)
+        assert isinstance(result, str)
+        assert result == "The response"
+
+    def test_part_with_null_text(self):
+        """Parts where 'text' is None are safely skipped."""
+        raw = json.dumps({
+            "type": "turn_end",
+            "message": {
+                "content": "",
+                "parts": [
+                    {"type": "text", "text": None},
+                    {"type": "text", "text": "Final result"},
+                ],
+            },
+        }) + "\n"
+        result = IntakeAllEngine._extract_pi_text(raw)
+        assert isinstance(result, str)
+        assert result == "Final result"
+
+    def test_part_with_empty_string_text(self):
+        """Parts where 'text' is empty string are skipped."""
+        raw = json.dumps({
+            "type": "turn_end",
+            "message": {
+                "content": "",
+                "parts": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "Actual text"},
+                ],
+            },
+        }) + "\n"
+        result = IntakeAllEngine._extract_pi_text(raw)
+        assert isinstance(result, str)
+        assert result == "Actual text"
+
+    def test_part_with_integer_text(self):
+        """Parts where 'text' is an integer are safely converted."""
+        raw = json.dumps({
+            "type": "message_end",
+            "message": {
+                "content": "",
+                "parts": [
+                    {"type": "text", "text": 42},
+                ],
+            },
+        }) + "\n"
+        result = IntakeAllEngine._extract_pi_text(raw)
+        # Should still return a string (the detected non-string is converted)
+        assert isinstance(result, str)
+
+    def test_part_with_dict_text(self):
+        """Parts where 'text' is a dict are safely converted."""
+        raw = json.dumps({
+            "type": "message_end",
+            "message": {
+                "content": "",
+                "parts": [
+                    {"type": "tool_call", "text": {"args": ["x"]}},
+                ],
+            },
+        }) + "\n"
+        result = IntakeAllEngine._extract_pi_text(raw)
+        assert isinstance(result, str)
+
+    def test_empty_input_returns_empty_string(self):
+        """Empty input returns empty string."""
+        result = IntakeAllEngine._extract_pi_text("")
+        assert isinstance(result, str)
+        assert result == ""
+
+    def test_only_delta_parts_no_complete_block(self):
+        """Only text_delta events without a text_end/message_end still produce output."""
+        raw = json.dumps({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "Partial "},
+        }) + "\n" + json.dumps({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "output"},
+        }) + "\n"
+        result = IntakeAllEngine._extract_pi_text(raw)
+        assert isinstance(result, str)
+        assert result == "Partial output"
+
+    def test_non_json_lines_are_skipped(self):
+        """Non-JSON lines in the stream are safely ignored."""
+        raw = "not json\n" + json.dumps({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_end", "content": "Valid content"},
+        }) + "\n" + "also not json\n"
+        result = IntakeAllEngine._extract_pi_text(raw)
+        assert isinstance(result, str)
+        assert result == "Valid content"
+
+
+# ===========================================================================
+# Test: _contains_questions type safety
+# ===========================================================================
+
+class TestContainsQuestions:
+    """Verify _contains_questions handles non-string input safely."""
+
+    def test_list_input_returns_false(self):
+        """_contains_questions returns False for list input instead of crashing."""
+        assert IntakeAllEngine._contains_questions([]) is False
+
+    def test_none_input_returns_false(self):
+        """_contains_questions returns False for None input instead of crashing."""
+        assert IntakeAllEngine._contains_questions(None) is False
+
+    def test_dict_input_returns_false(self):
+        """_contains_questions returns False for dict input instead of crashing."""
+        assert IntakeAllEngine._contains_questions({"key": "value"}) is False
+
+    def test_integer_input_returns_false(self):
+        """_contains_questions returns False for integer input instead of crashing."""
+        assert IntakeAllEngine._contains_questions(42) is False
+
+    def test_normal_string_works(self):
+        """_contains_questions still works normally with string input."""
+        assert IntakeAllEngine._contains_questions("What should we do? (yes/no):") is True
+
+    def test_question_indicators_detected(self):
+        """Various question indicators are detected in normal strings."""
+        assert IntakeAllEngine._contains_questions("Please answer: Choose option A or B") is True
+        assert IntakeAllEngine._contains_questions("Should we proceed with implementation?") is True
+
+    def test_no_question_returns_false(self):
+        """Text without question indicators returns False."""
+        assert IntakeAllEngine._contains_questions("Everything looks good.") is False
+
+
+# ===========================================================================
+# Test: has_sufficient_detail broadened for Recommendation sections
+# ===========================================================================
+
+class TestHasSufficientDetailBroadened:
+    """Verify has_sufficient_detail recognizes ## Recommendation as implementation guidance."""
+
+    def test_item_with_recommendation_is_sufficient(self):
+        """Item with ## Recommendation section and reasonable length is auto-completable."""
+        description = (
+            "# Feature Request\n\n"
+            "## Issue\n"
+            "The current system lacks proper authentication for API endpoints. "
+            "This creates a security risk as unauthenticated users can access "
+            "sensitive data. We need to implement a comprehensive authentication "
+            "system.\n\n"
+            "## Recommendation\n"
+            "We should implement OAuth2 authentication using the auth library. "
+            "This involves adding middleware, creating a token service, and "
+            "updating the login flow. Estimated effort: 3 days. Priority: High. "
+            "The implementation should support multiple OAuth providers including "
+            "Google, GitHub, and Microsoft. Rate limiting and audit logging are "
+            "also required for compliance purposes.\n"
+        )
+        assert len(description) > 500, \
+            f"Test description must be > 500 chars, got {len(description)}"
+        item = {
+            "id": "SA-TEST-REC-001",
+            "title": "Item with Recommendation",
+            "status": "open",
+            "stage": "idea",
+            "issueType": "feature",
+            "description": description,
+        }
+        result = has_sufficient_detail(item)
+        assert result is True, "## Recommendation with long description should count as implementation guidance"
+
+    def test_short_item_with_recommendation_still_needs_ac(self):
+        """Short items (< 500 chars) with only ## Recommendation still need some AC."""
+        item = {
+            "id": "SA-TEST-REC-002",
+            "title": "Short Item",
+            "status": "open",
+            "stage": "idea",
+            "issueType": "feature",
+            "description": (
+                "## Recommendation\n"
+                "Add rate limiting.\n"
+            ),
+        }
+        # Short description (< 500 chars), no AC indicator → not sufficient
+        result = has_sufficient_detail(item)
+        assert result is False, "Short descriptions without AC should not auto-complete"
+
+    def test_long_recommendation_without_ac_is_sufficient(self):
+        """Long description (> 500 chars) with ## Recommendation counts as sufficient even without explicit AC."""
+        item = {
+            "id": "SA-TEST-REC-003",
+            "title": "Long Recommendation Item",
+            "status": "open",
+            "stage": "idea",
+            "issueType": "feature",
+            "description": (
+                "# Feature Request\n\n"
+                "## Issue\n"
+                "The current system lacks proper authentication for API endpoints. "
+                "This creates a security risk as unauthenticated users can access "
+                "sensitive data. We need to implement a comprehensive authentication "
+                "system that supports multiple auth providers and provides role-based "
+                "access control.\n\n"
+                "## Recommendation\n"
+                "We should implement OAuth2 authentication using industry best practices. "
+                "The implementation should include JWT token generation, refresh token "
+                "rotation, rate limiting per user, and comprehensive audit logging. "
+                "We recommend using the existing auth library with custom extensions "
+                "for our specific needs. The rollout should be phased, starting with "
+                "internal API endpoints before moving to public-facing ones.\n\n"
+                "## Evidence\n"
+                "Multiple security audits have identified this gap. Industry standards "
+                "recommend OAuth2 with PKCE for modern web applications. This approach "
+                "is widely adopted and well-documented.\n"
+            ),
+        }
+        assert len(item["description"]) > 500
+        result = has_sufficient_detail(item)
+        assert result is True, "Long description with ## Recommendation should be auto-completable"
+
+
+# ===========================================================================
+# Test: Items needing /intake are gracefully skipped and marked needs_input
+# ===========================================================================
+
+class TestIntakeSkipWhenNeedsInput:
+    """Verify items needing /intake are skipped and marked needs_input without blocking batch."""
+
+    def test_item_needing_intake_skipped_and_marked_needs_input(self):
+        """Items that fail has_sufficient_detail are marked needs_input and batch continues."""
+        runner = FakeRunner()
+        # Vague epic C (not auto-completable), A (auto-completable)
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=json.dumps({
+                "success": True,
+                "workItems": [SAMPLE_ITEM_C, SAMPLE_ITEM_A],
+            }),
+        )
+        # A auto-completes (no responses needed for C - it's skipped)
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_A['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_A['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl comment add {SAMPLE_ITEM_A['id']}",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner, item_timeout=10)
+        results = engine.run_all()
+
+        assert len(results) == 2
+        # C should be marked as needs_input (not error, not intake_completed)
+        c_result = [r for r in results if r["id"] == SAMPLE_ITEM_C["id"]][0]
+        assert c_result["outcome"] == "needs_input", \
+            f"Expected needs_input, got {c_result['outcome']}"
+        # A should still auto-complete
+        auto_results = [r for r in results if r["outcome"] == "auto_completed"]
+        assert len(auto_results) == 1
+
+        # Verify NO /intake subprocess was called
+        intake_calls = [
+            cmd for cmd in runner.calls
+            if "pi" in " ".join(cmd) and "/intake" in " ".join(cmd)
+        ]
+        assert len(intake_calls) == 0, "No /intake subprocess should be invoked"
+        # Verify no wl commands were issued for C (it should be untouched)
+        c_calls = [
+            cmd for cmd in runner.calls
+            if SAMPLE_ITEM_C["id"] in " ".join(cmd)
+        ]
+        assert len(c_calls) == 0, f"No wl commands should be issued for {SAMPLE_ITEM_C['id']}"
+
+    def test_batch_continues_after_needs_input(self):
+        """After marking an item as needs_input, processing continues to remaining items."""
+        runner = FakeRunner()
+        # Two items needing intake, one auto-completable
+        vague_1 = {**SAMPLE_ITEM_C, "id": "SA-VAGUE-001", "title": "Vague 1"}
+        vague_2 = {**SAMPLE_ITEM_C, "id": "SA-VAGUE-002", "title": "Vague 2"}
+        runner.set_response(
+            "wl list --stage idea",
+            stdout=json.dumps({
+                "success": True,
+                "workItems": [vague_1, SAMPLE_ITEM_A, vague_2],
+            }),
+        )
+        # A auto-completes (vague items need no responses - they are skipped)
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_A['id']} --status",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl update {SAMPLE_ITEM_A['id']} --stage",
+            stdout=json.dumps({"success": True}),
+        )
+        runner.set_response(
+            f"wl comment add {SAMPLE_ITEM_A['id']}",
+            stdout=json.dumps({"success": True}),
+        )
+
+        engine = IntakeAllEngine(runner=runner, item_timeout=10)
+        results = engine.run_all()
+
+        assert len(results) == 3
+        assert results[0]["outcome"] == "needs_input", \
+            f"Expected needs_input, got {results[0]['outcome']}"
+        assert results[1]["outcome"] == "auto_completed"
+        assert results[2]["outcome"] == "needs_input", \
+            f"Expected needs_input, got {results[2]['outcome']}"
+
+        # Verify no /intake calls
+        intake_calls = [
+            cmd for cmd in runner.calls
+            if "pi" in " ".join(cmd) and "/intake" in " ".join(cmd)
+        ]
+        assert len(intake_calls) == 0

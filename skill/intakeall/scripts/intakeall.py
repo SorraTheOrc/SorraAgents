@@ -64,6 +64,7 @@ SUFFICIENT_INDICATORS = [
     "## Implementation",
     "## Desired Change",
     "## Proposed Approach",
+    "## Recommendation",
 ]
 
 
@@ -468,6 +469,9 @@ class IntakeAllEngine:
         text_end, message_end, turn_end events). Returns the last complete
         block of text found, or accumulated delta text if no complete blocks.
 
+        Type-safe: non-string values in parts (e.g. tool-call responses where
+        text is a list) are safely skipped rather than appended as-is.
+
         Mirrors the canonical pattern from skill/audit/scripts/audit_runner.py.
         """
         delta_parts: list[str] = []
@@ -508,16 +512,31 @@ class IntakeAllEngine:
                     for part in (message.get("parts") or []):
                         if isinstance(part, dict):
                             part_text = part.get("text", "") or part.get("content", "")
-                            if part_text:
+                            # Type safety: only append string values to avoid
+                            # returning a list (e.g. tool-call responses where
+                            # text is a list of arguments)
+                            if isinstance(part_text, str) and part_text:
                                 complete_blocks.append(part_text)
 
         if complete_blocks:
-            return complete_blocks[-1]
+            last = complete_blocks[-1]
+            if isinstance(last, str):
+                return last
+            # Fallback: convert non-string (should not happen with the
+            # isinstance guard above, but be defensive)
+            return str(last) if last else ""
         return "".join(delta_parts)
 
     @staticmethod
     def _contains_questions(text: str) -> bool:
-        """Heuristic: detect if the intake output contains unanswered questions."""
+        """Heuristic: detect if the intake output contains unanswered questions.
+
+        Type-safe: non-string input (e.g. list from _extract_pi_text bug) is
+        handled gracefully by returning False instead of crashing with
+        AttributeError on .lower().
+        """
+        if not isinstance(text, str):
+            return False
         question_indicators = [
             "? (yes/no)",
             "? (y/n)",
@@ -727,22 +746,19 @@ class IntakeAllEngine:
                                 "recovery": None,
                             }
                 else:
-                    # Item needs /intake
-                    if self.dry_run:
-                        result = {
-                            "id": item_id,
-                            "title": title,
-                            "outcome": "intake_completed",
-                            "error_detail": None,
-                            "recovery": None,
-                        }
-                    else:
-                        intake_result = self._invoke_intake(item_id)
-                        result = {
-                            "id": item_id,
-                            "title": title,
-                            **intake_result,
-                        }
+                    # Item needs intake - in batch mode we skip the interactive
+                    # /intake subprocess (which blocks indefinitely waiting for
+                    # stdin) and mark the item as needing manual input instead.
+                    result = {
+                        "id": item_id,
+                        "title": title,
+                        "outcome": "needs_input",
+                        "error_detail": (
+                            "Item lacks sufficient detail for auto-complete. "
+                            "Requires manual intake processing."
+                        ),
+                        "recovery": None,
+                    }
 
                 results.append(result)
                 processed += 1
