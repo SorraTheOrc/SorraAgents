@@ -63,7 +63,7 @@ The command implements the procedural workflow below. Each numbered step is part
   - If the work item is small (type `task` or `bug` rather than `epic`) and the description contains explicit acceptance criteria and a minimal implementation sketch, prefer to mark intake complete.
   - If duplicate or parent/child relationships already express the required context (see earlier related-work checks), consider skipping a full intake.
 - If the checks indicate intake is not needed, update the work item to record the decision and advance the stage:
-  - `wl update <work-item-id> --stage intake_complete --json`
+  - `wl update <work-item-id> --stage intake_complete --status open --json`
   - Optionally add a comment documenting the reason: `wl comment add <work-item-id> "Intake auto-complete: work item appears sufficiently defined (acceptance criteria present / small task)." --actor Map --json`
 - If any heuristic is uncertain, fall back to running the normal intake process (do not auto-complete on borderline evidence).
 
