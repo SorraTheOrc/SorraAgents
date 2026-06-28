@@ -87,7 +87,9 @@ class TestRunRuffAutoFix:
         from skill.code_review.scripts.linter_runner import run_ruff
 
         runner = self._make_runner([])
-        result = run_ruff(str(REPO_ROOT), runner=runner, fix=True)
+        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["python"]):
+            with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": True}):
+                result = run_ruff(str(REPO_ROOT), runner=runner, fix=True)
 
         assert result["fixes_applied"] is True
 
