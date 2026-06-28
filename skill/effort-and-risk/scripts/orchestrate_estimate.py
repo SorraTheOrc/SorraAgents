@@ -31,6 +31,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from skill.scripts.failure_notice import FailureNotice  # noqa: E402
 
+from _shared import compute_omp, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
 
 
 def level_from_score(score):
@@ -41,33 +42,6 @@ def level_from_score(score):
     if score <= 19:
         return "High"
     return "Critical"
-
-
-def pick_tshirt(hours, thresholds):
-    for size, bounds in thresholds.items():
-        mn = bounds.get("min", 0)
-        mx = bounds.get("max")
-        if mx is None:
-            if hours >= mn:
-                return size
-        else:
-            if hours >= mn and hours < mx:
-                return size
-    return "XS"
-
-
-def compute_omp(data):
-    items = data.get("items")
-    if isinstance(items, list) and items:
-        o_sum = sum(float(i.get("o", 0)) for i in items)
-        m_sum = sum(float(i.get("m", 0)) for i in items)
-        p_sum = sum(float(i.get("p", 0)) for i in items)
-        return o_sum, m_sum, p_sum
-    return (
-        float(data.get("o", 0)),
-        float(data.get("m", 0)),
-        float(data.get("p", 0)),
-    )
 
 
 def main():
@@ -118,24 +92,11 @@ def main():
             tshirt_cfg = json.load(f)
             thresholds = tshirt_cfg.get("thresholds", {})
     except Exception:
-        thresholds = {
-            "XS": {"min": 0, "max": 4},
-            "S": {"min": 4, "max": 24},
-            "M": {"min": 24, "max": 80},
-            "L": {"min": 80, "max": 240},
-            "XL": {"min": 240, "max": None},
-        }
+        thresholds = DEFAULT_THRESHOLDS
 
     tshirt = pick_tshirt(recommended, thresholds)
     # Expand shorthand codes to full-text labels for clarity/auditability
-    tshirt_map = {
-        "XS": "Extra Small",
-        "S": "Small",
-        "M": "Medium",
-        "L": "Large",
-        "XL": "Extra Large",
-    }
-    tshirt = tshirt_map.get(tshirt, tshirt)
+    tshirt = TSHIRT_MAP.get(tshirt, tshirt)
 
     # risk aggregation
     parent = data.get("parent", {})
