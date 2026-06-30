@@ -1,6 +1,15 @@
 {
-  "llama_v3_2_3b_chat_8k": {
-    "base_url": "http://localhost:52243",
-    "api_key": "F7FCK9C-FYW4FF0-QZXM1YC-DZ7C1Q3"
+  "providers": {
+    "Local Proxy": {
+      "api": "openai-completions",
+      "baseUrl": "http://192.168.0.199:8000/v1",
+      "apiKey": "not_needed",
+      "models": [
+        { "id": "qwen3" },
+        { "id": "plan" },
+        { "id": "gemma4" },
+        { "id": "gpt120" }
+      ]
+    }
   }
 }

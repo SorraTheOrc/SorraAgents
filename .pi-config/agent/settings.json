@@ -1,9 +1,9 @@
 {
-  "lastChangelogVersion": "0.79.4",
+  "lastChangelogVersion": "0.80.2",
   "steeringMode": "one-at-a-time",
   "followUpMode": "one-at-a-time",
-  "defaultProvider": "opencode-go",
-  "defaultModel": "deepseek-v4-flash",
+  "defaultProvider": "Local Proxy",
+  "defaultModel": "plan",
   "defaultThinkingLevel": "high",
   "retry": {
     "enabled": true,
@@ -19,11 +19,12 @@
   "enabledModels": [
     "opencode/deepseek-v4-flash-free",
     "opencode-go/deepseek-v4-flash",
-    "openrouter/google/gemma-4-31b-it:free",
-    "openrouter/meta-llama/llama-3.3-70b-instruct:free",
-    "Proxy/qwen3",
-    "Proxy/gpt120",
-    "Proxy/gemma4"
+    "Local Proxy/qwen3",
+    "Local Proxy/plan",
+    "Local Proxy/gpt120"
   ],
-  "theme": "dark"
+  "theme": "dark",
+  "packages": [
+    "https://github.com/monotykamary/pi-retry"
+  ]
 }
