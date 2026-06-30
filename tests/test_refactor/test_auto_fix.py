@@ -432,6 +432,96 @@ class TestAutoFixIntegration:
             assert report["summary"]["auto_fixed"] == 1
 
 
+class TestRunLinterFixHelpers:
+    """Tests for the extracted _run_linter_fix helper and its parsers."""
+
+    def test_parse_ruff_fix_output_parses_correctly(self):
+        """_parse_ruff_fix_output extracts findings from ruff JSON."""
+        from skill.refactor.scripts.refactor import _parse_ruff_fix_output
+
+        raw = [
+            {
+                "code": "F401",
+                "filename": "/tmp/src/main.py",
+                "location": {"row": 1, "column": 0},
+                "message": "`os` imported but unused",
+            },
+            {
+                "code": "E302",
+                "filename": "/tmp/src/utils.py",
+                "location": {"row": 5, "column": 0},
+                "message": "Expected 2 blank lines",
+            },
+        ]
+        findings = _parse_ruff_fix_output(raw)
+
+        assert len(findings) == 2
+        assert findings[0]["file"] == "/tmp/src/main.py"
+        assert findings[0]["line"] == 1
+        assert findings[0]["code"] == "F401"
+        assert findings[0]["severity"] == "low"
+        assert findings[0]["smell_type"] == "unused_import"  # F4 prefix
+
+        assert findings[1]["code"] == "E302"
+        assert findings[1]["smell_type"] == "formatting"  # Non-F4 prefix
+
+    def test_parse_ruff_fix_output_empty_input(self):
+        """_parse_ruff_fix_output returns empty list for empty input."""
+        from skill.refactor.scripts.refactor import _parse_ruff_fix_output
+
+        assert _parse_ruff_fix_output([]) == []
+
+    def test_parse_eslint_fix_output_parses_correctly(self):
+        """_parse_eslint_fix_output extracts findings from eslint JSON."""
+        from skill.refactor.scripts.refactor import _parse_eslint_fix_output
+
+        raw = [
+            {
+                "filePath": "/tmp/src/app.js",
+                "messages": [
+                    {
+                        "ruleId": "no-unused-vars",
+                        "line": 5,
+                        "message": "'x' is assigned but never used",
+                        "severity": 2,
+                    }
+                ],
+            }
+        ]
+        findings = _parse_eslint_fix_output(raw)
+
+        assert len(findings) == 1
+        assert findings[0]["file"] == "/tmp/src/app.js"
+        assert findings[0]["line"] == 5
+        assert findings[0]["code"] == "no-unused-vars"
+        assert findings[0]["severity"] == "medium"
+        assert findings[0]["smell_type"] == "lint"
+
+    def test_parse_eslint_fix_output_empty_input(self):
+        """_parse_eslint_fix_output returns empty list for empty input."""
+        from skill.refactor.scripts.refactor import _parse_eslint_fix_output
+
+        assert _parse_eslint_fix_output([]) == []
+
+    def test_run_linter_fix_returns_empty_when_no_files(self):
+        """_run_linter_fix returns empty list when given no files."""
+        from skill.refactor.scripts.refactor import _run_linter_fix
+
+        result = _run_linter_fix([], "ruff", lambda f: ["ruff"] + f, lambda r: [{"mock": True}])
+        assert result == []
+
+    def test_run_linter_fix_skips_when_linter_unavailable(self):
+        """_run_linter_fix returns empty when linter is not available."""
+        patch_target = "skill.refactor.scripts.refactor.probe_linter"
+        with patch(patch_target) as mock_probe:
+            from skill.refactor.scripts.refactor import _run_linter_fix
+
+            mock_probe.return_value = {"available": False}
+
+            result = _run_linter_fix(["/tmp/test.py"], "ruff", lambda f: ["ruff"] + f, lambda r: [{"mock": True}])
+            assert result == []
+
+
 class TestAutoFixEdgeCases:
     """Tests for edge cases in auto-fix."""
 

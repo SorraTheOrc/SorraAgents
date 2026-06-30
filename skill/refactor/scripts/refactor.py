@@ -26,7 +26,7 @@ import logging
 import sys
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Add repo root to sys.path for shared utility access
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -58,7 +58,121 @@ DEFAULT_PARENT_BRANCH = "dev"
 
 
 # ---------------------------------------------------------------------------
-# Auto-fix helpers
+# Linter fix helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_ruff_fix_cmd(files: list[str]) -> list[str]:
+    """Build the ruff check --fix command for the given files."""
+    return ["ruff", "check", "--fix", "--output-format", "json", "--quiet"] + files
+
+
+def _build_eslint_fix_cmd(files: list[str]) -> list[str]:
+    """Build the eslint --fix command for the given files."""
+    return ["eslint", "--fix", "--format", "json", "--quiet"] + files
+
+
+def _parse_ruff_fix_output(raw: list[Any]) -> list[dict[str, Any]]:
+    """Parse ruff --fix JSON output into standard finding dicts.
+
+    Args:
+        raw: Parsed JSON list from ruff --fix output.
+
+    Returns:
+        A list of finding dicts.
+    """
+    findings: list[dict[str, Any]] = []
+    for item in raw:
+        findings.append({
+            "file": str(item.get("filename", "")),
+            "line": item.get("location", {}).get("row", 0) if isinstance(
+                item.get("location"), dict
+            ) else 0,
+            "code": str(item.get("code", "")),
+            "message": item.get("message", ""),
+            "severity": "low",
+            "source": "linter",
+            "smell_type": "unused_import" if str(item.get("code", "")).startswith("F4") else "formatting",
+        })
+    return findings
+
+
+def _parse_eslint_fix_output(raw: list[Any]) -> list[dict[str, Any]]:
+    """Parse eslint --fix JSON output into standard finding dicts.
+
+    Args:
+        raw: Parsed JSON list from eslint --fix output.
+
+    Returns:
+        A list of finding dicts.
+    """
+    findings: list[dict[str, Any]] = []
+    for file_result in raw:
+        file_path = file_result.get("filePath", "")
+        messages = file_result.get("messages", [])
+        if isinstance(messages, list):
+            for msg in messages:
+                findings.append({
+                    "file": file_path,
+                    "line": msg.get("line", 0),
+                    "code": str(msg.get("ruleId", "")),
+                    "message": msg.get("message", ""),
+                    "severity": "medium",
+                    "source": "linter",
+                    "smell_type": "lint",
+                })
+    return findings
+
+
+def _run_linter_fix(
+    files: list[str],
+    linter_name: str,
+    cmd_builder: Callable[[list[str]], list[str]],
+    finding_parser: Callable[[list[Any]], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Probe, run, and parse results for a single auto-fix linter.
+
+    Checks whether the linter is available, executes it with ``--fix``,
+    and parses the JSON output using the provided parser.
+
+    Args:
+        files: Files to pass to the linter (already filtered by language).
+        linter_name: Name for probing (e.g. ``"ruff"``, ``"eslint"``).
+        cmd_builder: Callable that builds the full command list from files.
+        finding_parser: Callable that parses raw JSON output into findings.
+
+    Returns:
+        A list of fixed finding dicts.
+    """
+    if not files:
+        return []
+
+    linter_probe = probe_linter(linter_name)
+    if not linter_probe.get("available"):
+        return []
+
+    try:
+        import subprocess
+        cmd = cmd_builder(files)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+        if proc.returncode in (0, 1):
+            output = proc.stdout.strip()
+            if output:
+                try:
+                    raw = json.loads(output)
+                    if isinstance(raw, list):
+                        return finding_parser(raw)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        LOG.warning("%s --fix failed: %s", linter_name, exc)
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Auto-fix public API
 # ---------------------------------------------------------------------------
 
 
@@ -100,69 +214,15 @@ def auto_fix_files(
     python_files = [f for f in files if f.endswith(".py")]
     js_ts_files = [f for f in files if f.endswith((".js", ".jsx", ".ts", ".tsx"))]
 
-    # --- Python: ruff check --fix ---
-    if python_files:
-        ruff_probe = probe_linter("ruff")
-        if ruff_probe.get("available"):
-            try:
-                import subprocess
-                cmd = ["ruff", "check", "--fix", "--output-format", "json", "--quiet"] + python_files
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    # Ruff --fix for Python files
+    fixed_findings.extend(
+        _run_linter_fix(python_files, "ruff", _build_ruff_fix_cmd, _parse_ruff_fix_output)
+    )
 
-                if proc.returncode in (0, 1):
-                    output = proc.stdout.strip()
-                    if output:
-                        try:
-                            raw = json.loads(output)
-                            if isinstance(raw, list):
-                                for item in raw:
-                                    fixed_findings.append({
-                                        "file": str(item.get("filename", "")),
-                                        "line": item.get("location", {}).get("row", 0) if isinstance(item.get("location"), dict) else 0,
-                                        "code": str(item.get("code", "")),
-                                        "message": item.get("message", ""),
-                                        "severity": "low",
-                                        "source": "linter",
-                                        "smell_type": "unused_import" if str(item.get("code", "")).startswith("F4") else "formatting",
-                                    })
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-            except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
-                LOG.warning("ruff --fix failed: %s", exc)
-
-    # --- JS/TS: eslint --fix ---
-    if js_ts_files:
-        eslint_probe = probe_linter("eslint")
-        if eslint_probe.get("available"):
-            try:
-                import subprocess
-                cmd = ["eslint", "--fix", "--format", "json", "--quiet"] + js_ts_files
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-
-                if proc.returncode in (0, 1):
-                    output = proc.stdout.strip()
-                    if output:
-                        try:
-                            raw = json.loads(output)
-                            if isinstance(raw, list):
-                                for file_result in raw:
-                                    file_path = file_result.get("filePath", "")
-                                    messages = file_result.get("messages", [])
-                                    if isinstance(messages, list):
-                                        for msg in messages:
-                                            fixed_findings.append({
-                                                "file": file_path,
-                                                "line": msg.get("line", 0),
-                                                "code": str(msg.get("ruleId", "")),
-                                                "message": msg.get("message", ""),
-                                                "severity": "medium",
-                                                "source": "linter",
-                                                "smell_type": "lint",
-                                            })
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-            except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
-                LOG.warning("eslint --fix failed: %s", exc)
+    # ESLint --fix for JS/TS files
+    fixed_findings.extend(
+        _run_linter_fix(js_ts_files, "eslint", _build_eslint_fix_cmd, _parse_eslint_fix_output)
+    )
 
     result["fixes_applied"] = len(fixed_findings) > 0
     result["fixed_findings"] = fixed_findings
