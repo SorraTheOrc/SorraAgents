@@ -112,6 +112,7 @@ If there are no ambiguities and the seed context and previously asked questions 
   - Constraints: any known constraints (technical, business, regulatory) that must be considered.
   - Existing state: brief summary of the current state of affairs related to the problem.
   - Desired change: brief summary of the likely changes needed.
+  - Key Files (predicted): list of files likely to be changed or added during implementation, predicted through LLM-based analysis of the work item and repository structure. Published in the work item description under a `**Key Files:**` header. Each entry is a bullet item with a file path (containing at least one `/` and a file extension) and a brief explanation of why it is expected to change, e.g. ``- `path/to/file.py` — Needs new function for X feature``. If a `**Key Files:**` section already exists in the work item description, update it rather than inserting a duplicate.
   - Related work: list of related documents or work items with brief descriptions and links/ids.
 - Present the draft brief to the user and invite feedback. Incorporate any edits or clarifications supplied by the user, but do not block progress waiting for an explicit approval. Apply edits when provided and proceed automatically to the review stages.
 
