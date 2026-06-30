@@ -39,6 +39,22 @@ from skill.code_review.scripts.linter_runner import (
 LOG = logging.getLogger("refactor.smell_detection")
 
 # ---------------------------------------------------------------------------
+# Linter runner dispatch and language extension mappings
+# ---------------------------------------------------------------------------
+
+# Mapping of linter name to its runner function.
+_LINTER_RUNNERS: dict[str, Any] = {
+    "ruff": run_ruff,
+    "eslint": run_eslint,
+}
+
+# File extensions associated with each linter.
+_LINTER_LANG_EXTS: dict[str, tuple[str, ...]] = {
+    "ruff": (".py",),
+    "eslint": (".js", ".jsx", ".ts", ".tsx"),
+}
+
+# ---------------------------------------------------------------------------
 # Default rules
 # ---------------------------------------------------------------------------
 
@@ -183,6 +199,87 @@ def detect_smells(
     return deduplicated
 
 
+def _process_linter_findings(
+    linter_name: str,
+    findings: list[dict[str, Any]],
+    session_file_set: set[str],
+) -> list[dict[str, Any]]:
+    """Filter linter findings to the session file set and normalize them.
+
+    Args:
+        linter_name: The linter name (e.g. ``"ruff"``, ``"eslint"``).
+        findings: Raw findings from the linter runner.
+        session_file_set: Set of absolute paths for the session's files.
+
+    Returns:
+        A list of normalized finding dicts with keys ``file``, ``line``,
+        ``severity``, ``message``, ``source``, ``smell_type``, ``code``.
+    """
+    result: list[dict[str, Any]] = []
+    for finding in findings:
+        finding_file = finding.get("file", "")
+        if os.path.abspath(finding_file) not in session_file_set:
+            continue
+        result.append({
+            "file": finding_file,
+            "line": finding.get("line", 0),
+            "severity": finding.get("severity", "medium"),
+            "message": finding.get("message", ""),
+            "source": "linter",
+            "smell_type": _linter_code_to_smell_type(
+                linter_name, finding.get("code", ""),
+            ),
+            "code": finding.get("code", ""),
+        })
+    return result
+
+
+def _run_single_linter(
+    linter_name: str,
+    existing_files: list[str],
+    project_root: str,
+    session_file_set: set[str],
+) -> list[dict[str, Any]]:
+    """Probe, run, and normalize findings for a single linter.
+
+    Checks whether the linter is available and whether any of the
+    existing files match the linter's language, then runs the linter
+    and returns normalized findings filtered to the session file set.
+
+    Args:
+        linter_name: The linter name (e.g. ``"ruff"``, ``"eslint"``).
+        existing_files: List of existing file paths to consider.
+        project_root: Common project root for the linter run.
+        session_file_set: Set of absolute paths for the session's files.
+
+    Returns:
+        A list of normalized finding dicts.
+    """
+    # Check if any files match this linter's language
+    exts = _LINTER_LANG_EXTS.get(linter_name, ())
+    lang_files = [f for f in existing_files if f.endswith(exts)]
+    if not lang_files:
+        return []
+
+    # Probe linter availability
+    linter_probe = probe_linter(linter_name)
+    if not linter_probe.get("available"):
+        return []
+
+    # Run the linter
+    runner = _LINTER_RUNNERS.get(linter_name)
+    if runner is None:
+        return []
+    result = runner(project_root)
+
+    # Filter and normalize findings
+    return _process_linter_findings(
+        linter_name,
+        result.get("findings", []),
+        session_file_set,
+    )
+
+
 def detect_linter_smells(
     files: list[str],
     rules: dict[str, Any] | None = None,
@@ -219,68 +316,24 @@ def detect_linter_smells(
     existing_files = [f for f in files if os.path.isfile(f)]
     if not existing_files:
         return []
-    else:
-        # Build a set of normalized session file paths for filtering
-        # ruff and eslint may report findings for files outside the
-        # current session's scope; we only keep findings that match
-        # files the caller explicitly asked about.
-        session_file_set = set(os.path.abspath(f) for f in files)
 
-        # Run actual linters on the project
-        project_root = _find_common_root(existing_files)
-        if project_root is None:
-            return []
+    # Build a set of normalized session file paths for filtering
+    # ruff and eslint may report findings for files outside the
+    # current session's scope; we only keep findings that match
+    # files the caller explicitly asked about.
+    session_file_set = set(os.path.abspath(f) for f in files)
 
-        # Run ruff if available and Python files are present
-        python_files = [f for f in existing_files if f.endswith(".py")]
-        if python_files:
-            ruff_probe = probe_linter("ruff")
-            if ruff_probe.get("available"):
-                ruff_result = run_ruff(project_root)
-                for rf in ruff_result.get("findings", []):
-                    rf_file = rf.get("file", "")
-                    # Only keep findings for files in the session file set
-                    if os.path.abspath(rf_file) not in session_file_set:
-                        continue
-                    finding = {
-                        "file": rf_file,
-                        "line": rf.get("line", 0),
-                        "severity": rf.get("severity", "medium"),
-                        "message": rf.get("message", ""),
-                        "source": "linter",
-                        "smell_type": _linter_code_to_smell_type(
-                            rf.get("linter", "ruff"),
-                            rf.get("code", ""),
-                        ),
-                        "code": rf.get("code", ""),
-                    }
-                    findings.append(finding)
+    # Run actual linters on the project
+    project_root = _find_common_root(existing_files)
+    if project_root is None:
+        return []
 
-        # Run eslint if available and JS/TS files are present
-        js_files = [f for f in existing_files
-                    if f.endswith((".js", ".jsx", ".ts", ".tsx"))]
-        if js_files:
-            eslint_probe = probe_linter("eslint")
-            if eslint_probe.get("available"):
-                eslint_result = run_eslint(project_root)
-                for ef in eslint_result.get("findings", []):
-                    ef_file = ef.get("file", "")
-                    # Only keep findings for files in the session file set
-                    if os.path.abspath(ef_file) not in session_file_set:
-                        continue
-                    finding = {
-                        "file": ef_file,
-                        "line": ef.get("line", 0),
-                        "severity": ef.get("severity", "medium"),
-                        "message": ef.get("message", ""),
-                        "source": "linter",
-                        "smell_type": _linter_code_to_smell_type(
-                            ef.get("linter", "eslint"),
-                            ef.get("code", ""),
-                        ),
-                        "code": ef.get("code", ""),
-                    }
-                    findings.append(finding)
+    for linter_name in ("ruff", "eslint"):
+        findings.extend(
+            _run_single_linter(
+                linter_name, existing_files, project_root, session_file_set
+            )
+        )
 
     # Deduplicate within linter findings
     return _deduplicate_findings(findings)

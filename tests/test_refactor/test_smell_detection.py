@@ -14,6 +14,7 @@ Related work item: SA-0MQA70XZB005O3Z4
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -202,6 +203,102 @@ def _import_smell_module():
 # ===================================================================
 # Linter-based detection tests
 # ===================================================================
+
+
+class TestProcessLinterFindings:
+    """Tests for the _process_linter_findings helper function."""
+
+    def test_process_linter_findings_filters_by_session_set(
+        self,
+    ):
+        """Only findings matching session_file_set are included."""
+        smell_mod = _import_smell_module()
+
+        findings = [
+            {"file": "/project/src/main.py", "line": 1, "severity": "critical", "message": "issue", "code": "F401"},
+            {"file": "/project/src/utils.py", "line": 5, "severity": "high", "message": "issue2", "code": "E302"},
+            {"file": "/other/external.py", "line": 10, "severity": "medium", "message": "issue3", "code": "F841"},
+        ]
+        session_set = {
+            os.path.abspath("/project/src/main.py"),
+            os.path.abspath("/project/src/utils.py"),
+        }
+
+        result = smell_mod._process_linter_findings("ruff", findings, session_set)
+
+        # Only main.py and utils.py findings should be present
+        file_set = {f["file"] for f in result}
+        assert "/project/src/main.py" in file_set
+        assert "/project/src/utils.py" in file_set
+        assert "/other/external.py" not in file_set
+
+    def test_process_linter_findings_normalizes_finding_keys(
+        self,
+    ):
+        """Each finding is normalized to the standard finding dict format."""
+        smell_mod = _import_smell_module()
+
+        raw_findings = [
+            {"file": "/project/src/main.py", "line": 10, "severity": "critical", "message": "test msg", "code": "F401"},
+        ]
+        session_set = {os.path.abspath("/project/src/main.py")}
+
+        result = smell_mod._process_linter_findings("ruff", raw_findings, session_set)
+
+        assert len(result) == 1
+        finding = result[0]
+        assert finding["file"] == "/project/src/main.py"
+        assert finding["line"] == 10
+        assert finding["severity"] == "critical"
+        assert finding["message"] == "test msg"
+        assert finding["source"] == "linter"
+        assert finding["smell_type"] is not None
+        assert finding["code"] == "F401"
+
+    def test_process_linter_findings_empty_input(
+        self,
+    ):
+        """Empty findings list returns empty list."""
+        smell_mod = _import_smell_module()
+
+        result = smell_mod._process_linter_findings("ruff", [], set())
+        assert result == []
+
+    def test_process_linter_findings_uses_linter_name_for_smell_type(
+        self,
+    ):
+        """The linter name is used for smell type mapping."""
+        smell_mod = _import_smell_module()
+
+        raw_findings = [
+            {"file": "/project/src/main.py", "line": 10, "severity": "critical", "message": "test", "code": "F401"},
+        ]
+        session_set = {os.path.abspath("/project/src/main.py")}
+
+        # Test with ruff
+        result = smell_mod._process_linter_findings("ruff", raw_findings, session_set)
+        assert result[0]["smell_type"] == smell_mod._linter_code_to_smell_type("ruff", "F401")
+
+        # Test with eslint
+        raw_findings[0]["code"] = "no-unused-vars"
+        result = smell_mod._process_linter_findings("eslint", raw_findings, session_set)
+        assert result[0]["smell_type"] == smell_mod._linter_code_to_smell_type("eslint", "no-unused-vars")
+
+    def test_process_linter_findings_handles_missing_fields(
+        self,
+    ):
+        """Findings with missing fields do not raise errors."""
+        smell_mod = _import_smell_module()
+
+        raw_findings = [
+            {},  # Completely empty
+            {"file": "/project/src/main.py"},  # Partial
+        ]
+        session_set = {os.path.abspath("/project/src/main.py")}
+
+        # Should not raise
+        result = smell_mod._process_linter_findings("ruff", raw_findings, session_set)
+        assert isinstance(result, list)
 
 
 class TestLinterDetection:
