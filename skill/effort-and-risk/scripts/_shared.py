@@ -12,6 +12,7 @@ Exports:
     TSHIRT_MAP: dict[str, str] - Maps t-shirt size codes to full-text labels
     DEFAULT_THRESHOLDS: dict[str, dict] - Fallback threshold definitions
     compute_omp(data: dict) -> tuple[float, float, float]
+    level_from_score(score: int | float) -> str
     pick_tshirt(hours: float, thresholds: dict | None = None) -> str
 """
 
@@ -87,3 +88,28 @@ def compute_omp(data: dict) -> tuple[float, float, float]:
         float(data.get("m", 0)),
         float(data.get("p", 0)),
     )
+
+
+def level_from_score(score: int | float) -> str:
+    """Return a risk level label for the given numeric score.
+
+    Maps a risk score (typically 1-25) to a human-readable level:
+
+    - score <= 5  -> "Low"
+    - score <= 12 -> "Medium"
+    - score <= 19 -> "High"
+    - score > 19  -> "Critical"
+
+    Args:
+        score: A numeric risk score (int or float).
+
+    Returns:
+        A string label: "Low", "Medium", "High", or "Critical".
+    """
+    if score <= 5:
+        return "Low"
+    if score <= 12:
+        return "Medium"
+    if score <= 19:
+        return "High"
+    return "Critical"

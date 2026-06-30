@@ -16,7 +16,7 @@ _SCRIPT_DIR = os.path.join(
 )
 sys.path.insert(0, _SCRIPT_DIR)
 
-from _shared import compute_omp, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
+from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
 
 
 class TestComputeOmp(unittest.TestCase):
@@ -178,5 +178,62 @@ class TestDefaultThresholds(unittest.TestCase):
         self.assertEqual(DEFAULT_THRESHOLDS["XS"]["min"], 0)
 
 
+class TestLevelFromScore(unittest.TestCase):
+    """Tests for level_from_score(score: int | float) -> str."""
+
+    def test_low_boundary_0(self):
+        """Score of 0 returns 'Low'."""
+        self.assertEqual(level_from_score(0), "Low")
+
+    def test_low_boundary_1(self):
+        """Score of 1 returns 'Low'."""
+        self.assertEqual(level_from_score(1), "Low")
+
+    def test_low_boundary_5(self):
+        """Score of 5 returns 'Low' (upper bound of Low)."""
+        self.assertEqual(level_from_score(5), "Low")
+
+    def test_medium_boundary_6(self):
+        """Score of 6 returns 'Medium' (lower bound of Medium)."""
+        self.assertEqual(level_from_score(6), "Medium")
+
+    def test_medium_boundary_12(self):
+        """Score of 12 returns 'Medium' (upper bound of Medium)."""
+        self.assertEqual(level_from_score(12), "Medium")
+
+    def test_high_boundary_13(self):
+        """Score of 13 returns 'High' (lower bound of High)."""
+        self.assertEqual(level_from_score(13), "High")
+
+    def test_high_boundary_19(self):
+        """Score of 19 returns 'High' (upper bound of High)."""
+        self.assertEqual(level_from_score(19), "High")
+
+    def test_critical_boundary_20(self):
+        """Score of 20 returns 'Critical' (lower bound of Critical)."""
+        self.assertEqual(level_from_score(20), "Critical")
+
+    def test_critical_high_score(self):
+        """Score of 25 returns 'Critical'."""
+        self.assertEqual(level_from_score(25), "Critical")
+
+    def test_float_low(self):
+        """Float score 5.5 returns 'Medium'."""
+        self.assertEqual(level_from_score(5.5), "Medium")
+
+    def test_float_medium_upper(self):
+        """Float score 12.0 returns 'Medium'."""
+        self.assertEqual(level_from_score(12.0), "Medium")
+
+    def test_float_high_upper(self):
+        """Float score 19.9 returns 'Critical' because 19.9 > 19 (same as original behavior)."""
+        self.assertEqual(level_from_score(19.9), "Critical")
+
+    def test_negative_score(self):
+        """Negative score (e.g., -1) returns 'Low' (same behavior as score <= 5)."""
+        self.assertEqual(level_from_score(-1), "Low")
+
+
 if __name__ == "__main__":
+
     unittest.main()

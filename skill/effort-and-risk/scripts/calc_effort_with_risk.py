@@ -20,7 +20,7 @@ import sys
 import json
 import math
 
-from _shared import compute_omp, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
+from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
 
 
 def approx_pi_from_score(score):
@@ -68,15 +68,7 @@ def main():
         probability, impact = 0, 0
         score = 0
 
-    level = "Low"
-    if score <= 5:
-        level = "Low"
-    elif score <= 12:
-        level = "Medium"
-    elif score <= 19:
-        level = "High"
-    else:
-        level = "Critical"
+    level = level_from_score(score)
 
     out = {
         "effort": {

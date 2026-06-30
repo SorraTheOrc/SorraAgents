@@ -31,17 +31,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from skill.scripts.failure_notice import FailureNotice  # noqa: E402
 
-from _shared import compute_omp, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
-
-
-def level_from_score(score):
-    if score <= 5:
-        return "Low"
-    if score <= 12:
-        return "Medium"
-    if score <= 19:
-        return "High"
-    return "Critical"
+from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
 
 
 def main():
