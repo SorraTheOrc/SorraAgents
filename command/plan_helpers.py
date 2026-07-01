@@ -306,10 +306,7 @@ def append_autoplan_decision_comment(
     marker = f"autoplan-decision-hash:{marker_hash}"
 
     # Check for existing comment with this marker
-    if runner is not None:
-        comment_list = _wl_comment_list(work_item_id, runner=runner)
-    else:
-        comment_list = _wl_comment_list(work_item_id)
+    comment_list = _wl_comment_list(work_item_id, runner=runner)
     for existing in comment_list:
         if marker in (existing.get("comment") or ""):
             logger.debug(
@@ -332,10 +329,7 @@ def append_autoplan_decision_comment(
         f"Decision: {decision}",
     ]
     comment = "\n".join(comment_parts)
-    if runner is not None:
-        _wl_comment_add(work_item_id, comment, author=author, runner=runner)
-    else:
-        _wl_comment_add(work_item_id, comment, author=author)
+    _wl_comment_add(work_item_id, comment, author=author, runner=runner)
 
 
 # ---------------------------------------------------------------------------
@@ -378,12 +372,9 @@ def make_autoplan_decision(
     if precomputed_item is not None:
         item = precomputed_item
         comments = precomputed_comments or []
-    elif runner is not None:
+    else:
         item = _wl_show(target_id, runner=runner)
         comments = _wl_comment_list(target_id, runner=runner)
-    else:
-        item = _wl_show(target_id)
-        comments = _wl_comment_list(target_id)
 
     # Idempotence check: skip re-computation if already computed
     if is_effort_risk_computed(item, comments):
@@ -402,10 +393,7 @@ def make_autoplan_decision(
 
     # Run effort-and-risk skill
     do_plan: bool = True
-    if runner is not None:
-        er_result = run_effort_and_risk(target_id, runner=runner)
-    else:
-        er_result = run_effort_and_risk(target_id)
+    er_result = run_effort_and_risk(target_id, runner=runner)
 
     if er_result is None:
         logger.info("plan_helpers.effort_risk_failed_defaults_to_plan target=%s", target_id)
@@ -425,10 +413,7 @@ def make_autoplan_decision(
     effort_risk = {"effort": tshirt, "risk": risk_level}
 
     # Post the decision comment idempotently
-    if runner is not None:
-        append_autoplan_decision_comment(target_id, tshirt, risk_level, risk_score, do_plan, runner=runner)
-    else:
-        append_autoplan_decision_comment(target_id, tshirt, risk_level, risk_score, do_plan)
+    append_autoplan_decision_comment(target_id, tshirt, risk_level, risk_score, do_plan, runner=runner)
 
     if do_plan:
         return True, "plan_complete", effort_risk

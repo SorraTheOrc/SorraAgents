@@ -596,7 +596,7 @@ class TestMakeAutoplanDecisionErrors:
             precomputed_comments=[],
         )
         assert do_plan is True
-        mock_er.assert_called_once_with("SA-TEST")
+        mock_er.assert_called_once_with("SA-TEST", runner=None)
 
     @patch("command.plan_helpers.run_effort_and_risk")
     def test_ambiguous_result_defaults_to_plan(self, mock_er):
