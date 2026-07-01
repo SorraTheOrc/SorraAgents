@@ -141,9 +141,9 @@ class WLAdapter:
             return []
 
     def post_comment(self, id: str, text: str) -> bool:
-        # quote the body and use wl comment add
-        # wl comment add <id> --body "text"
-        out = self._run(["comment", "add", id, "--body", text])
+        # Use --comment for consistency with other callers in the codebase.
+        # The wl CLI accepts both --comment and --body as aliases.
+        out = self._run(["comment", "add", id, "--comment", text])
         return out is not None
 
     def show(self, id: str) -> Optional[Dict[str, Any]]:
@@ -161,7 +161,7 @@ class WLAdapter:
             return False
         comments = w.get("comments") or []
         for c in comments:
-            if c.get("body") == text:
+            if c.get("comment") == text:
                 return True
         return False
 
