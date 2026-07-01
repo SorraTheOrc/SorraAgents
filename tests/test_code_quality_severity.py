@@ -217,3 +217,93 @@ class TestGeneralClassification:
         """None raw_severity should default to 'medium'."""
         result = self.classify("ruff", None)
         assert result in ("medium", "low")
+
+
+# ---------------------------------------------------------------------------
+# Tests for _run_linter_fix_mode and its linter-specific wrappers
+# ---------------------------------------------------------------------------
+
+
+class TestRunLinterFixMode:
+    """Tests for the _run_linter_fix_mode helper and wrappers."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self):
+        import skill.code_review.scripts.linter_runner as m
+        self.mod = m
+
+    def test_run_linter_fix_mode_no_fixes(self):
+        """Returns (empty, False) when no fixes are applied."""
+        from unittest.mock import MagicMock
+        from pathlib import Path
+        from subprocess import CompletedProcess
+
+        mock_runner = MagicMock()
+        # First call (fix) returns no issues
+        mock_runner.return_value = CompletedProcess(
+            args=["ruff"], returncode=0, stdout="", stderr="",
+        )
+
+        result = self.mod._run_linter_fix_mode(
+            "ruff", Path("/tmp"), mock_runner,
+            fix_cmd_builder=lambda p: ["ruff", "--fix", str(p)],
+            rescan_cmd_builder=lambda p: ["ruff", str(p)],
+            fixes_detected=lambda r, o: False,
+            rescan_parser=lambda r: [],
+            commit_after_fix=False,
+        )
+        assert result == ([], False)
+
+    def test_run_linter_fix_mode_with_fixes(self):
+        """Returns (findings, True) when fixes are applied."""
+        from unittest.mock import MagicMock
+        from pathlib import Path
+        from subprocess import CompletedProcess
+
+        mock_runner = MagicMock()
+        # Fix call: returncode 1 with output
+        mock_runner.return_value = CompletedProcess(
+            args=["ruff"], returncode=1,
+            stdout='[{"code": "F401"}]', stderr="",
+        )
+
+        def fixes_detected(result, output):
+            return True
+
+        def rescan_parser(result):
+            return [{"file": "/tmp/test.py", "line": 1, "code": "F401",
+                     "severity": "medium", "message": "test",
+                     "linter": "ruff"}]
+
+        findings, applied = self.mod._run_linter_fix_mode(
+            "ruff", Path("/tmp"), mock_runner,
+            fix_cmd_builder=lambda p: ["ruff", "--fix", str(p)],
+            rescan_cmd_builder=lambda p: ["ruff", str(p)],
+            fixes_detected=fixes_detected,
+            rescan_parser=rescan_parser,
+            commit_after_fix=False,
+        )
+        assert applied is True
+        assert len(findings) == 1
+        assert findings[0]["code"] == "F401"
+
+    def test_run_linter_fix_mode_error_returncode(self):
+        """Returns (empty, False) when the fix command returns an error code."""
+        from unittest.mock import MagicMock
+        from pathlib import Path
+        from subprocess import CompletedProcess
+
+        mock_runner = MagicMock()
+        mock_runner.return_value = CompletedProcess(
+            args=["ruff"], returncode=2, stdout="", stderr="error",
+        )
+
+        result = self.mod._run_linter_fix_mode(
+            "ruff", Path("/tmp"), mock_runner,
+            fix_cmd_builder=lambda p: ["ruff", "--fix", str(p)],
+            rescan_cmd_builder=lambda p: ["ruff", str(p)],
+            fixes_detected=lambda r, o: False,
+            rescan_parser=lambda r: [],
+            commit_after_fix=False,
+        )
+        assert result == ([], False)

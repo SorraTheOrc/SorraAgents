@@ -392,6 +392,157 @@ def _normalize_paths(root: Union[str, os.PathLike[str], None] = None) -> Path:
     return Path(root).resolve()
 
 
+def _run_linter_fix_mode(
+    linter_name: str,
+    root: Path,
+    runner: Callable,
+    *,
+    fix_cmd_builder: Callable[[Path], list[str]],
+    rescan_cmd_builder: Callable[[Path], list[str]],
+    fixes_detected: Callable[[Any, str], bool],
+    rescan_parser: Callable[[Any], list[dict[str, Any]]],
+    commit_after_fix: bool = False,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Run a linter in fix mode: fix → detect → optionally commit → rescan.
+
+    Args:
+        linter_name: The linter name (for logging/commit messages).
+        root: The project root path.
+        runner: Subprocess runner callable.
+        fix_cmd_builder: Builds the fix command from the project root.
+        rescan_cmd_builder: Builds the rescan (post-fix) command.
+        fixes_detected: Callable that checks if fixes were applied,
+                        receives (result, stdout_output) and returns bool.
+        rescan_parser: Parses the rescan output into finding dicts.
+        commit_after_fix: Whether to commit changes after fixing.
+
+    Returns:
+        A tuple of (findings, fixes_applied).
+    """
+    # Step 1: Run fix
+    cmd = fix_cmd_builder(root)
+    result = runner(cmd)
+
+    if result.returncode not in (0, 1):
+        return [], False
+
+    # Step 2: Detect if fixes were applied
+    output = result.stdout.strip() if hasattr(result, "stdout") else ""
+    applied = fixes_detected(result, output)
+
+    # Step 3: Optionally commit changes
+    if applied and commit_after_fix:
+        _commit_changes(root, linter_name, runner=runner)
+
+    # Step 4: Rescan
+    cmd = rescan_cmd_builder(root)
+    result = runner(cmd)
+
+    findings = rescan_parser(result)
+    return findings, bool(applied)
+
+
+def _run_ruff_fix_mode(
+    root: Path,
+    runner: Callable,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Run ruff check --fix and return remaining findings."""
+    def fix_cmd(root: Path) -> list[str]:
+        return ["ruff", "check", str(root), "--fix", "--output-format", "json", "--quiet"]
+
+    def rescan_cmd(root: Path) -> list[str]:
+        return ["ruff", "check", str(root), "--output-format", "json", "--quiet"]
+
+    def fixes_detected(result: Any, output: str) -> bool:
+        if result.returncode == 1:
+            return True
+        if output:
+            try:
+                raw = json.loads(output)
+                return isinstance(raw, list) and len(raw) > 0
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return False
+
+    def rescan_parser(result: Any) -> list[dict[str, Any]]:
+        findings: list[dict[str, Any]] = []
+        if result.returncode != 1:
+            return findings
+        output = result.stdout.strip() if hasattr(result, "stdout") else ""
+        if not output:
+            return findings
+        try:
+            raw = json.loads(output)
+        except json.JSONDecodeError:
+            return findings
+        if not isinstance(raw, list):
+            return findings
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("code", ""))
+            severity = classify_finding("ruff", code)
+            loc = item.get("location", {}) or {}
+            findings.append({
+                "file": str(item.get("filename", "")),
+                "line": loc.get("row", 0) if isinstance(loc, dict) else 0,
+                "severity": severity,
+                "message": item.get("message", ""),
+                "linter": "ruff",
+                "code": code,
+            })
+        return findings
+
+    return _run_linter_fix_mode(
+        "ruff", root, runner,
+        fix_cmd_builder=fix_cmd,
+        rescan_cmd_builder=rescan_cmd,
+        fixes_detected=fixes_detected,
+        rescan_parser=rescan_parser,
+        commit_after_fix=False,
+    )
+
+
+def _run_eslint_fix_mode(
+    root: Path,
+    runner: Callable,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Run eslint --fix and return remaining findings."""
+    def fix_cmd(root: Path) -> list[str]:
+        return ["eslint", str(root), "-f", "json", "--fix", "--no-eslintrc", "--quiet"]
+
+    def rescan_cmd(root: Path) -> list[str]:
+        return ["eslint", str(root), "-f", "json", "--no-eslintrc", "--quiet"]
+
+    def fixes_detected(result: Any, output: str) -> bool:
+        if result.returncode == 1:
+            return True
+        if output:
+            try:
+                raw = json.loads(output)
+                if isinstance(raw, list):
+                    for file_result in raw:
+                        if isinstance(file_result, dict):
+                            msgs = file_result.get("messages", [])
+                            if msgs:
+                                return True
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return False
+
+    def rescan_parser(result: Any) -> list[dict[str, Any]]:
+        return _run_eslint_findings(result)
+
+    return _run_linter_fix_mode(
+        "eslint", root, runner,
+        fix_cmd_builder=fix_cmd,
+        rescan_cmd_builder=rescan_cmd,
+        fixes_detected=fixes_detected,
+        rescan_parser=rescan_parser,
+        commit_after_fix=True,
+    )
+
+
 def run_ruff(
     project_root: Union[str, os.PathLike[str], None] = None,
     runner: Any = None,
@@ -411,12 +562,11 @@ def run_ruff(
 
     Returns:
         A dict with keys:
-          - ``findings``: list of finding dicts (same format as before)
+          - ``findings``: list of finding dicts
           - ``fixes_applied``: bool — True if any fixes were applied
         Returns empty findings and ``fixes_applied: False`` if ruff is not
         available or no Python files exist.
     """
-    # Check linter availability
     probe = probe_linter("ruff")
     if not probe["available"]:
         return {"findings": [], "fixes_applied": False}
@@ -430,62 +580,11 @@ def run_ruff(
     if runner is None:
         runner = _run_subprocess
 
-    fixes_applied = False
-
     if fix:
-        # Run ruff with --fix to auto-fix issues
-        cmd = ["ruff", "check", str(root), "--fix", "--output-format", "json", "--quiet"]
-        result = runner(cmd)
-
-        if result.returncode not in (0, 1):
-            # Ruff exits 0 for no issues, 1 for issues found, other = error
-            return {"findings": [], "fixes_applied": False}
-
-        # Check if any fixes were made by comparing file state
-        output = result.stdout.strip()
-        if result.returncode == 1:
-            # Issues found (some may have been fixed)
-            try:
-                raw = json.loads(output)
-            except json.JSONDecodeError:
-                raw = []
-            # If ruff reported issues, fixes were attempted/applied
-            if isinstance(raw, list) and len(raw) > 0:
-                fixes_applied = True
-            else:
-                fixes_applied = True
-
-        # Re-scan to get remaining (non-fixable) issues
-        cmd = ["ruff", "check", str(root), "--output-format", "json", "--quiet"]
-        result = runner(cmd)
-
-        findings: list[dict[str, Any]] = []
-        if result.returncode == 1:
-            output = result.stdout.strip()
-            if output:
-                try:
-                    raw = json.loads(output)
-                except json.JSONDecodeError:
-                    return {"findings": findings, "fixes_applied": fixes_applied}
-
-                if isinstance(raw, list):
-                    for item in raw:
-                        if not isinstance(item, dict):
-                            continue
-                        code = str(item.get("code", ""))
-                        severity = classify_finding("ruff", code)
-                        loc = item.get("location", {}) or {}
-                        findings.append({
-                            "file": str(item.get("filename", "")),
-                            "line": loc.get("row", 0) if isinstance(loc, dict) else 0,
-                            "severity": severity,
-                            "message": item.get("message", ""),
-                            "linter": "ruff",
-                            "code": code,
-                        })
+        findings, fixes_applied = _run_ruff_fix_mode(root, runner)
     else:
-        # Normal check mode (no fix)
         findings = _run_ruff_check(root, runner)
+        fixes_applied = False
 
     return {"findings": findings, "fixes_applied": fixes_applied}
 
@@ -510,7 +609,6 @@ def run_eslint(
           - ``findings``: list of finding dicts
           - ``fixes_applied``: bool — True if any fixes were applied
     """
-    # Check linter availability
     probe = probe_linter("eslint")
     if not probe["available"]:
         return {"findings": [], "fixes_applied": False}
@@ -524,46 +622,11 @@ def run_eslint(
     if runner is None:
         runner = _run_subprocess
 
-    fixes_applied = False
-
     if fix:
-        # Run eslint with --fix to auto-fix issues
-        cmd = ["eslint", str(root), "-f", "json", "--fix", "--no-eslintrc", "--quiet"]
-        result = runner(cmd)
-
-        if result.returncode not in (0, 1):
-            return {"findings": [], "fixes_applied": False}
-
-        # Check if eslint reported issues after fix attempt
-        output = result.stdout.strip()
-        if result.returncode == 1:
-            fixes_applied = True
-        elif output:
-            # eslint returned 0 but had output - check if messages exist
-            try:
-                raw = json.loads(output)
-                if isinstance(raw, list):
-                    for file_result in raw:
-                        if isinstance(file_result, dict):
-                            msgs = file_result.get("messages", [])
-                            if msgs:
-                                fixes_applied = True
-                                break
-            except json.JSONDecodeError:
-                pass
-
-        # Commit any changes
-        if fixes_applied:
-            _commit_changes(root, "eslint", runner=runner)
-
-        # Re-scan to get remaining (non-fixable) issues
-        cmd = ["eslint", str(root), "-f", "json", "--no-eslintrc", "--quiet"]
-        result = runner(cmd)
-
-        findings = _run_eslint_findings(result)
+        findings, fixes_applied = _run_eslint_fix_mode(root, runner)
     else:
-        # Normal check mode (no fix)
         findings = _run_eslint_findings_check(root, runner)
+        fixes_applied = False
 
     return {"findings": findings, "fixes_applied": fixes_applied}
 
