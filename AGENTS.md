@@ -175,6 +175,22 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - Use stages to track workflow progress
 - Do NOT clutter repo root with planning documents
 
+## Stage vs Status distinction
+
+Work items have two lifecycle axes that agents must manage independently:
+
+- **`status`** tracks the work-item lifecycle (open, in-progress, completed).
+  Only set `status` to `completed` when the work-item is formally closed
+  (post-release).
+- **`stage`** tracks workflow progress (idea, intake_complete, plan_complete,
+  in_progress, in_review). Advance `stage` to `in_review` as soon as
+  implementation is ready for human review — even if `status` remains
+  `in-progress`.
+- **Epics/parent items:** Once all children are in a terminal stage
+  (`in_review` or `completed`), advance the parent work-item's `stage`
+  to `in_review`. The parent's `status` should remain `in-progress`
+  until the formal post-release closure.
+
 ## work-item Types
 
 Track work-item types with `--issue-type`:

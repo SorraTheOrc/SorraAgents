@@ -170,6 +170,8 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
   - Recursively implement that work item as described in this procedure.
   - When a work item is completed, follow the mandatory build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit the work. Update the stage: `wl update <work-item-id> --status completed --stage in_review --json`
+  - After completing all children of a parent work-item and confirming they are in a terminal stage (in_review or completed), advance the parent work-item's stage to `in_review`:
+    `wl update <parent-id> --stage in_review --json`
 
 - If the work item has a recent audit record, review the audit notes and address any unmet acceptance criteria or other issues identified.
 - If there is no recent audit record, run `/skill:audit <work-item-id>` and use the resulting audit output to establish the work that needs to be done.
@@ -297,6 +299,7 @@ The following table documents the expected status and stage transitions at each 
 | Abort - dirty work tree (Step 0) | `wl update <id> --status open --json`, then abort | open | (unchanged) |
 | Abort - definition gate failure | Run intake/plan interview, update item | open | (unchanged) |
 | Under Ralph (Step 6 note) | Skip in_review step; Ralph handles transition | in_progress | in_progress |
+| Epic / parent: all children done | Check all children are in a terminal stage (in_review/completed); advance parent stage | in-progress | in_review |
 
 Abort/failure transitions use `--status open` while keeping the stage unchanged.
 
