@@ -95,6 +95,13 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      > ⚠️ **Do NOT close the work-item at this stage.**
      > Work-items are closed only after the `dev`→`main` release is complete.
      >
+     > **Clarification — what "close" means when an operator says it:**
+     > When a human operator tells you to "close a work item", they mean
+     > update the stage to `in_review` or mark it as `completed` — they do
+     > **not** mean initiate a dev→main release. Do not start a release
+     > unless the operator explicitly asks for it. Releasing is a separate,
+     > explicit action that requires explicit operator consent.
+     >
      > Agents SHOULD NOT push directly to `main` unless explicitly authorized.
      > The canonical `dev`→`main` release process is implemented by
      > `scripts/release/merge-dev-to-main.sh` (invoked via the Ship skill). Any
