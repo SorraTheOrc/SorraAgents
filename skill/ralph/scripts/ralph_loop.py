@@ -1024,9 +1024,10 @@ def _validate_pi_output(
 # Default thresholds for auto-plan decision
 # If effort t-shirt is in this set AND risk level is in the risk set,
 # skip /plan and proceed directly to implement.
-# Effort/risk threshold constants are now defined in command/plan_helpers.py
-# and imported above. The local definitions are kept as aliases for backward
-# compatibility, but new code should import from plan_helpers directly.
+# Effort/risk threshold constants are now defined in skill/plan/plan_helpers.py
+# (canonical) and imported via command.plan_helpers (delegation wrapper).
+# The local definitions are kept as aliases for backward compatibility,
+# but new code should import from the canonical module directly.
 
 # Maximum consecutive attempts on unchanged code before reporting a stall
 DEFAULT_MAX_CYCLES_NO_CHANGE: int = 3

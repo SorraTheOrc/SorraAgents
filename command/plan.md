@@ -10,6 +10,11 @@ agent: build
 subtask: true
 ---
 
+> **Note:** The canonical source for planning is now the ``/skill:plan`` skill at
+> ``skill/plan/SKILL.md``. This command file is a legacy adapter that delegates
+> to the skill. When the agent framework supports skill commands, prefer
+> ``/skill:plan <work-item-id>`` over this command.
+
 You are helping the team decompose a Worklog epic (or other Worklog work item) into **features** and **implementation tasks**.
 
 ## Inputs
@@ -66,10 +71,17 @@ You are helping the team decompose a Worklog epic (or other Worklog work item) i
 
 Before starting the planning process, check whether the work item is small enough
 that planning can be skipped. This uses the shared decision logic from
-``command/plan_helpers.py`` (the same logic used by Ralph's autoplan).
+``skill/plan/plan_helpers.py`` (the same logic used by Ralph's autoplan) —
+the canonical bundled copy. The legacy path ``command/plan_helpers.py`` is a
+delegation wrapper for backward compatibility.
 
 1. Run the effort/risk check:
 
+   ```bash
+   python3 skill/plan/plan_helpers.py plan-if-needed <work-item-id>
+   ```
+
+   For backward compatibility, the legacy path also works:
    ```bash
    python3 command/plan_helpers.py plan-if-needed <work-item-id>
    ```
@@ -88,7 +100,7 @@ that planning can be skipped. This uses the shared decision logic from
 
      ```bash
      wl update <work-item-id> --stage plan_complete --status open --json
-     wl comment add <work-item-id> --author "plan" --comment "Auto-plan skipped: effort and risk below threshold (checked via command/plan_helpers.py plan-if-needed). Proceeding directly to implementation." --json
+     wl comment add <work-item-id> --author "plan" --comment "Auto-plan skipped: effort and risk below threshold (checked via plan_helpers.py plan-if-needed). Proceeding directly to implementation." --json
      ```
 
      Then **exit** the planning command without proceeding to the Process steps.

@@ -118,20 +118,29 @@ See `docs/ralph.md` and `ralph --help` for full details of the features availabl
 ## Architecture: Shared Auto-Plan Decision Logic
 
 The auto-plan decision logic (effort/risk threshold checks) has been extracted
-from Ralph's inline code into a **shared module** at:
+from Ralph's inline code into a **shared module**, canonically bundled with the
+plan skill at:
 
-- `command/plan_helpers.py`
+- `skill/plan/plan_helpers.py` (canonical source)
+- `command/plan_helpers.py` (delegation wrapper for backward compatibility)
+
+The canonical source is ``skill/plan/plan_helpers.py``. The legacy path
+``command/plan_helpers.py`` is a thin delegation wrapper that loads the
+canonical module into the ``command.plan_helpers`` namespace so that all
+existing imports (Ralph, tests) continue to work without changes.
 
 This module is the single source of truth for autoplan decisions, shared by:
 
 - **Ralph** (`./scripts/ralph_loop.py`) — delegates decision logic to
-  `command.plan_helpers` functions while keeping its own I/O infrastructure
+  ``command.plan_helpers`` functions (which now load from the canonical
+  ``skill/plan/plan_helpers.py``), while keeping its own I/O infrastructure
   (runner, retry, fail-open) for backward compatibility.
-- **`/plan` command** (`command/plan.md`) — runs `python3 command/plan_helpers.py
-  plan-if-needed <id>` as a pre-check before the full planning decomposition.
-- **PlanAll** — benefits automatically since it shells out to `/plan <id>`.
+- **`/plan` command** (`command/plan.md`) — runs``python3 skill/plan/plan_helpers.py
+  plan-if-needed <id>`` (or the legacy path) as a pre-check before the full
+  planning decomposition.
+- **PlanAll** — benefits automatically since it shells out to ``/skill:plan <id>``.
 
-Key functions provided by `command/plan_helpers.py`:
+Key functions provided by ``skill/plan/plan_helpers.py``:
 
 | Function / Constant | Purpose |
 |---------------------|---------|
@@ -150,7 +159,7 @@ See `docs/ralph.md` for the full auto-plan decision flow.
 
 - Launcher wrapper: `./ralph` (preferred wrapper that records PID/start-time and handles background runs)
 - Foreground loop: `./scripts/ralph_loop.py` (python3)
-- Shared autoplan module: `command/plan_helpers.py`
+- Shared autoplan module: `skill/plan/plan_helpers.py` (canonical; legacy delegation at `command/plan_helpers.py`)
 - Helpers and control: `./scripts/ralph_control.py`, `./scripts/structured_response.py`
 
 Example (documentation):

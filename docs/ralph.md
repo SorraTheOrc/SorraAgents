@@ -617,15 +617,18 @@ If the implement step returns a structured `no_safe_path` response, Ralph stops 
 ## Auto-Plan Decision
 
 The auto-plan decision logic has been extracted from Ralph's inline code into
-a **shared module** at `command/plan_helpers.py`. This module is the single
-source of truth for effort/risk threshold decisions, used by:
+a **shared module**, canonically bundled with the plan skill at
+`skill/plan/plan_helpers.py`. This module is the single source of truth for
+effort/risk threshold decisions, used by:
 
 - **Ralph** — delegates decision logic to `command.plan_helpers` functions
-  while keeping its own I/O infrastructure (runner, retry, fail-open) for
-  backward compatibility.
-- **`/plan` command** — runs `python3 command/plan_helpers.py plan-if-needed <id>`
+  (which load from the canonical `skill/plan/plan_helpers.py`), while keeping
+  its own I/O infrastructure (runner, retry, fail-open) for backward
+  compatibility.
+- **`/plan` command** — runs `python3 skill/plan/plan_helpers.py plan-if-needed <id>`
+  (the legacy `command/plan_helpers.py` also works as a delegation wrapper)
   as a pre-check before the full planning decomposition.
-- **PlanAll** — benefits automatically since it shells out to `/plan <id>`.
+- **PlanAll** — benefits automatically since it shells out to `/skill:plan <id>`.
 
 When a work item is at stage `intake_complete`, ralph automatically runs an **auto-plan** decision before the first implementation pass:
 
