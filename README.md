@@ -82,8 +82,9 @@ See [skill/planall/SKILL.md](skill/planall/SKILL.md) for full documentation.
 
 The IntakeAll skill (`skill/intakeall/`) provides automated batch intake for work items
 in `idea` stage. It discovers all eligible items, auto-completes well-defined items,
-invokes `/intake` for each sequentially, detects items that require producer input,
-attempts error recovery, and produces a summary report.
+marks items lacking sufficient detail as `needs_input` (skipping the interactive
+`/intake` subprocess that would block in batch mode), attempts error recovery, and
+produces a summary report.
 
 ```bash
 # Process all idea-stage items

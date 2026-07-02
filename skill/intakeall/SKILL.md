@@ -13,12 +13,10 @@ Use this skill when asked to run batch intake on all `idea` stage work items. It
 2. **Signal handler registration**: SIGINT and SIGTERM handlers are registered. If an external abort (Ctrl+C) occurs during processing, the currently-active item is recovered (reset to `status=open, stage=idea`) before the process exits.
 3. For each item:
    - If the item has sufficient detail (acceptance criteria + implementation guidance), auto-complete it to `intake_complete` without invoking `/intake`
-   - Otherwise, claim it (`wl update <id> --status in_progress`) and invoke `/intake`
-   - After `/intake` completes successfully, update to `stage=intake_complete, status=open`
-4. Detect items needing producer input (unanswered questions, non-zero exit, or specific output patterns)
-5. On error, attempt recovery (reset item stage to `idea` and status to `open`) and record recovery outcome
-6. Continue processing remaining items even when one requires input or encounters an error
-7. Produce a summary report showing totals and per-item outcomes with error/recovery details
+   - Otherwise, **skip the interactive `/intake` subprocess** (which would block indefinitely waiting for stdin in batch mode) and mark the item as `needs_input` in the summary report. The item remains in `idea` stage for manual processing.
+4. On error, attempt recovery (reset item stage to `idea` and status to `open`) and record recovery outcome
+5. Continue processing remaining items even when one requires input or encounters an error
+6. Produce a summary report showing totals and per-item outcomes with error/recovery details
 
 ## Command invocation
 
@@ -85,9 +83,11 @@ Items with sufficient detail are auto-completed to `stage=intake_complete, statu
 
 This mirrors the PlanAll v2 auto-complete pattern (`has_sufficient_detail()`).
 
-## Producer-input detection
+## Needs-input detection
 
-IntakeAll detects items requiring producer intervention by:
+In batch mode, items that fail the `has_sufficient_detail()` check are marked as `needs_input` without invoking `/intake`. The interactive `/intake` subprocess (which blocks indefinitely waiting for stdin) is skipped to allow batch processing to continue.
+
+The `_invoke_intake()` method is still available for direct invocation and detects producer-input needs by:
 
 - Non-zero exit code from the `/intake` command
 - Presence of question-like patterns in the output (e.g., `? (yes/no)`, "What should", "Do you want")
@@ -119,9 +119,9 @@ SIGINT (Ctrl+C) and SIGTERM handlers are registered at the start of `run_all()`:
 ## Error handling and recovery
 
 - If `wl list` fails (non-zero exit or exception), returns an empty list gracefully
-- If claiming an item fails, logs a warning and marks the item as `error`
-- After `/intake` succeeds for an item, updates to `stage=intake_complete, status=open`
-- If `/intake` fails for an item, logs a warning, attempts recovery (resets item stage to `idea` and status to `open`), and continues to the next item
+- If an auto-complete claim fails, logs a warning and marks the item as `error`
+- Items lacking sufficient detail are marked as `needs_input` without invoking `/intake` — the item stays in `idea` stage and batch processing continues
+- If `_invoke_intake()` is called directly (not in batch mode) and `/intake` fails, a recovery attempt resets the item stage to `idea` and status to `open`
 - All errors and recovery actions are captured in the summary report
 - Recovery outcomes (success/failure) are included in per-item results
 
@@ -179,4 +179,7 @@ python3 ./scripts/intakeall.py --max 3 --item-timeout 120
 - `../planall/SKILL.md` — PlanAll: the batch planning skill that IntakeAll mirrors
 - `../ralph/SKILL.md` — Ralph orchestration loop that provides auto-intake for individual items
 
-> **Implementation note:** The `_invoke_intake()` method previously used `--status in_progress --stage in_progress` (dual-set) when claiming items. This was fixed in SA-0MQS18ZOI005ER2V to use status-only (`--status in_progress`), matching the documented pattern.
+> **Implementation notes:**
+>
+> - The `_invoke_intake()` method previously invoked `/intake` via `pi run /intake <id>` which blocked indefinitely waiting for stdin in batch mode. This was fixed in SA-0MQRAMZ4V0056K14 (type-safety and blocking subprocess skip) and SA-0MQP33ID9004OR5M (canonical `pi -p --mode json` invocation pattern). The batch `run_all()` flow now skips the interactive subprocess entirely and marks items as `needs_input` instead.
+> - The `_invoke_intake()` method previously used `--status in_progress --stage in_progress` (dual-set) when claiming items. This was fixed in SA-0MQS18ZOI005ER2V to use status-only (`--status in_progress`), matching the documented pattern.
