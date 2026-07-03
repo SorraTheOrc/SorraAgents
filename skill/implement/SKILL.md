@@ -258,7 +258,14 @@ refactor step may be invoked to detect and remediate code smells:
   ```bash
   git checkout dev
   git pull origin dev
+  # Rebuild if available (dist/ is gitignored, installed tool may run from dist/)
+  npm run build 2>/dev/null || echo "No build script, skipping rebuild"
   ```
+
+  > **Why rebuild?** `dist/` is gitignored, so a `git pull` does not update it.
+  > Without a rebuild, the installed tool (e.g., `wl`) would run from stale
+  > `dist/` code. The `2>/dev/null` makes the step safe for projects without
+  > a `build` script.
 
   This ensures subsequent operations begin from the current HEAD of the integration branch.
   See [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full worktree lifecycle.
