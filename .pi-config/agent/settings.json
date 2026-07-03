@@ -1,30 +1,14 @@
 {
-  "lastChangelogVersion": "0.80.2",
+  "lastChangelogVersion": "0.80.3",
   "steeringMode": "one-at-a-time",
   "followUpMode": "one-at-a-time",
   "defaultProvider": "Local Proxy",
-  "defaultModel": "plan",
+  "defaultModel": "code",
   "defaultThinkingLevel": "high",
-  "retry": {
-    "enabled": true,
-    "maxRetries": 3,
-    "baseDelayMs": 2000,
-    "provider": {
-      "timeoutMs": 10800000,
-      "maxRetries": 0,
-      "maxRetryDelayMs": 60000
-    }
-  },
   "httpIdleTimeoutMs": 1800000,
   "enabledModels": [
-    "opencode/deepseek-v4-flash-free",
-    "opencode-go/deepseek-v4-flash",
-    "Local Proxy/qwen3",
     "Local Proxy/plan",
-    "Local Proxy/gpt120"
+    "Local Proxy/code"
   ],
-  "theme": "dark",
-  "packages": [
-    "https://github.com/monotykamary/pi-retry"
-  ]
+  "theme": "dark"
 }

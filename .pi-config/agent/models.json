@@ -7,7 +7,7 @@
       "models": [
         { "id": "qwen3" },
         { "id": "plan" },
-        { "id": "gemma4" },
+        { "id": "code" },
         { "id": "gpt120" }
       ]
     }
