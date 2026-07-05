@@ -119,16 +119,23 @@ Ralph's autoplan).
 3. Act on the decision:
 
    - **If `decision == "skip"`**: The work item is small enough to implement
-     directly without decomposition. Mark it as `plan_complete` and record
-     a brief comment:
+     directly without decomposition. However, before marking it as
+     `plan_complete`, run the five automated review stages (see
+     **Automated review on existing content** below) against the existing
+     work item content (description and any existing child work items).
+     The review stages will identify and address any gaps before the work
+     item reaches `plan_complete`.
+
+     After the review stages complete and any identified issues have been
+     addressed (conservatively — only fixing clearly needed and unambiguous
+     gaps), output a summary to the console listing what each review stage
+     checked and what (if anything) was found or changed. Then mark the
+     work item as `plan_complete` and record a summary comment:
 
      ```bash
      wl update <work-item-id> --stage plan_complete --status open --json
-     wl comment add <work-item-id> --author "plan" --comment "Auto-plan skipped: effort and risk below threshold (checked via plan_helpers.py plan-if-needed). Proceeding directly to implementation." --json
+     wl comment add <work-item-id> --author "plan" --comment "Auto-plan completed with review: effort and risk below threshold. Review summary: [summarise what each stage checked and any changes made]" --json
      ```
-
-     Then **exit** the planning command without proceeding to the Process
-     steps.
 
    - **If `decision == "plan"`**: Proceed to the Process steps below. The
      work item is large or risky enough to warrant full decomposition.
@@ -140,6 +147,44 @@ Ralph's autoplan).
 4. **Idempotence**: If the work item's stage is already `plan_complete` or
    later, the pre-check will return `decision: "skip"` and the command will
    exit with the existing stage preserved (a warning comment is added).
+
+## Automated review on existing content (auto-complete path)
+
+When the pre-check returns `decision: "skip"`, the skill runs the five
+review stages against whatever content exists in the work item
+description and any existing child work items. Unlike Process step 6
+(which reviews a freshly generated feature plan), this auto-complete
+path reviews the existing content as-is.
+
+Each review stage MUST:
+- Run sequentially in the order listed below.
+- Operate on the existing work item content (description, child items).
+- Be conservative: only fix gaps that are clearly needed and unambiguous.
+- If an automated improvement could change intent, do NOT apply it
+  automatically; instead record an Open Question and continue.
+- After each stage, output exactly:
+  "Finished <Stage Name> review: <brief notes of improvements>"
+
+Review stages (adapted for existing content):
+1. **Completeness review** — Ensure the work item has all required fields
+   (description, acceptance criteria) and that any existing child items
+   are complete. Add missing fields if clearly definable from context.
+2. **Sequencing & dependencies review** — Verify any existing child item
+   dependencies are coherent. Check that test/verification items appear
+   before implementation items if both exist. Ensure test features come first
+   when ordering child items.
+3. **Scope sizing review** — Ensure any existing features are sized as
+   deliverable increments. If no child items exist, this stage is a no-op.
+4. **Acceptance & testability review** — Verify acceptance criteria are
+   pass/fail and testable. Improve vague or untestable criteria where
+   the intent is clear and unambiguous.
+5. **Polish & handoff review** — Ensure the work item description is
+   clear, well-formatted, and actionable.
+
+After all five stages complete, output a summary to the console listing
+what each review stage checked and what (if anything) was found or changed.
+Then proceed to mark the work item as `plan_complete` (see skip path
+instructions above).
 
 ## Process (must follow)
 
