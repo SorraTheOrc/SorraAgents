@@ -67,6 +67,17 @@ VERDICT_PARTIAL = "partial"
 VERDICT_ADJUSTED = "adjusted"
 _ACCEPTABLE_VERDICTS = {VERDICT_MET, VERDICT_ADJUSTED}
 
+# ---------------------------------------------------------------------------
+# Closing-sentence constants (AC1–3)
+# ---------------------------------------------------------------------------
+_CLOSING_READY = (
+    "Work item is ready to close, would you like me to close it?"
+)
+_CLOSING_NOT_READY = (
+    "Work item is not ready to close (see above), "
+    "would you like me to address the gaps in the audit?"
+)
+
 # Model / config constants (following Ralph's pattern)
 ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "ralph" / "assets" / ".ralph.json"
 DEFAULT_MODEL = "opencode-go/glm-5.1"
@@ -86,6 +97,28 @@ Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_closing_sentence(report: str) -> str:
+    """Determine the closing sentence based on the ready-to-close verdict.
+
+    Parses the first ``Ready to close:`` line in *report* and returns the
+    appropriate closing sentence. Defaults to *not ready* when the line is
+    not found or the verdict is not ``Yes``.
+
+    This function also handles reports that have been wrapped by a
+    ``FailureNotice`` (where the first line is ``═══`` rather than
+    ``Ready to close:``).
+    """
+    for line in report.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Ready to close:"):
+            verdict = stripped.split(":", 1)[1].strip()
+            if verdict.lower() == "yes":
+                return _CLOSING_READY
+            break
+    return _CLOSING_NOT_READY
+
 
 def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=False, text=True, capture_output=True)
@@ -1699,6 +1732,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
             print(json.dumps(payload, indent=2))
         else:
             print(report, end="")
+            # Print closing sentence (stdout UX – not persisted)
+            print()
+            print(_get_closing_sentence(report))
 
         if persist:
             return persist_audit(issue_id, report)

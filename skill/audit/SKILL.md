@@ -353,6 +353,25 @@ After producing a structured audit report, you MUST:
 
 5. **Only mark the audit as recorded** when all verification checks pass.
 
+6. **Append the closing sentence** (issue-level audits only). After persisting
+   and verifying the audit, append a single closing line to your final
+   user-facing output. This sentence is **not** part of the persisted audit
+   report — it is a UX affordance for the human or agent reading the output.
+
+   - If the report begins with ``Ready to close: Yes``:
+     ``Work item is ready to close, would you like me to close it?``
+   - Otherwise (``Ready to close: No``, wrapped reports, or no verdict line):
+     ``Work item is not ready to close (see above), would you like me to address the gaps in the audit?``
+
+   > **Constraints:**
+   > - The closing sentence must appear **outside** any structured-report
+   >   markers (``--- AUDIT REPORT START ---`` / ``--- AUDIT REPORT END ---``)
+   >   to avoid breaking the AMPA scheduler parser.
+   > - It must **not** be included in the text passed to ``persist_audit.py``
+   >   or ``wl audit-set``.
+   > - It applies **only to issue-level audits**; project-level audits are
+   >   unchanged.
+
 If you skip persistence, the audit will be invisible to downstream orchestrators (e.g., Ralph) and may cause infinite retry loops. Persistence is the FINAL step of every audit.
 
 > **Critical:** The `persist_audit.py` script and `wl audit-set` command have been observed returning exit code 0 or `success: true` even when the audit was not actually stored in the database. **Always verify with `wl audit-show`** — never trust the exit code alone.
