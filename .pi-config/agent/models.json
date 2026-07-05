@@ -4,6 +4,9 @@
       "api": "openai-completions",
       "baseUrl": "http://192.168.0.199:8000/v1",
       "apiKey": "not_needed",
+      "compat": {
+        "sendSessionAffinityHeaders": true
+      },
       "models": [
         { "id": "qwen3" },
         { "id": "plan" },
