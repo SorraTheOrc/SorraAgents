@@ -65,6 +65,40 @@ any sensitive values before writing them to logs or comments.
 - Do not escape content in commit messages or work-item descriptions; use markdown formatting as needed for clarity and readability.
 - After implementation is complete and the work-item is in `in_review`, use the cleanup skill to tidy up local feature branches. Do not clean up `dev` or `main`.
 
+## Status Safety & Abort Handling
+
+### Critical Rule: Always Reset Status on Abort
+
+When an implementation is aborted, interrupted, or fails before reaching the
+final commit/push step, the work item can remain stuck at `status: in_progress`,
+blocking other agents from claiming or processing it. **Every abort/failure path
+MUST reset status to `open`** to release the work item lock.
+
+### Mandatory Abort Pattern
+
+All abort paths follow the same two-step pattern:
+
+1. **Reset status to open:** `wl update <work-item-id> --status open --json`
+2. **Stop execution:** Return control to the operator with a clear explanation
+
+> **Why this matters:** Work items in `in_progress` status are filtered by `wl next`
+> and are invisible to other agents. An orphaned `in_progress` item blocks all
+> downstream work on that item until a human intervenes. Always resetting to `open`
+> on abort ensures the work item is visible and claimable by the next agent.
+
+### Abort Scenarios
+
+The implement skill covers **five** abort/failure scenarios, each with explicit
+status-reset instructions documented in the sections below:
+
+| # | Scenario | Description |
+|---|----------|-------------|
+| 1 | Dirty work tree abort | User aborts when uncommitted changes exist in the working tree |
+| 2 | Definition gate failure | Work item fails definition gate (unclear scope, untestable ACs) |
+| 3 | User-initiated abort | Operator cancels the implementation mid-process |
+| 4 | Error/exception during implementation | API failure, network error, or unexpected exception during coding |
+| 5 | Unexpected termination | Agent crash, network failure, or external interruption (covered by Final cleanup step) |
+
 ## Handling Assets
 
 - If the implementation requires the creation of assets such as graphics or audio files, create these assets in an appropriate subfolder of the `assets` directory (e.g., `assets/images/`, `assets/audio/`) and use a name that has the prefix "placeholder_" followed by a descriptive name (e.g., `placeholder_player_explosion_spritesheet.png` or `placeholder_player_jump.wav`).
@@ -198,6 +232,29 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Summarize changes made in the work item description or comments.
   - Do not proceed to the next step until the user confirms it is OK to do so.
 
+1. Error/exception handling (abort on unexpected errors)
+
+If an unexpected error occurs during implementation — API failure, network
+error, exception during code editing, or any other runtime error — follow these
+mandatory abort steps:
+
+1. **Reset status to open:** `wl update <work-item-id> --status open --json`
+2. **Log the error** in the work-item comment: `wl comment add <work-item-id> --comment "Error during implementation: <error-description>" --author "<AGENT>" --json`
+3. **Do NOT continue** — return control to the operator with the error details
+4. If the error is transient (e.g., network), the operator may retry; otherwise
+   the work item is back in the pool for another agent or manual review
+
+### User-initiated abort
+
+If the operator explicitly cancels or aborts the implementation at any point
+after Step 0 (claim), follow these mandatory abort steps:
+
+1. **Reset status to open:** `wl update <work-item-id> --status open --json`
+2. **Return control** to the operator — do NOT proceed with any further steps
+3. Document the abort in work-item comments: `wl comment add <work-item-id> --comment "Implementation aborted by operator" --author "<AGENT>" --json`
+
+---
+
 1. Optional refactor step
 
 After implementation completes and before the final commit, an automated
@@ -293,6 +350,30 @@ Pre-push blocking check
   4. Only then does Ralph proceed with the push
 - When running manually (not under Ralph), the agent should manually invoke the triage helper and fix any failing tests before pushing.
 
+Final cleanup (belt-and-suspenders)
+---------------------------------------
+
+Before exiting the implement skill at any point — whether completing successfully
+or aborting — the agent MUST check and reset the work item status as a final
+safety net. This catches unexpected termination, agent crash, or any abort path
+that was missed.
+
+Execute this check **before exiting** the implement skill:
+
+```bash
+wl show <work-item-id> --json
+```
+
+If the response shows `status: in_progress` and the work is **not** complete
+(i.e., you are NOT at Step 7 and have not pushed to dev yet), run:
+
+```bash
+wl update <work-item-id> --status open --json
+```
+
+This ensures the work item is never left stuck at `in_progress` if the agent
+encounters unexpected termination, crashes, or network failure.
+
 ## Status Transition Matrix
 
 The following table documents the expected status and stage transitions at each workflow phase for the `implement` skill.
@@ -303,12 +384,17 @@ The following table documents the expected status and stage transitions at each 
 | Claim (Step 1) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
 | Blocker complete (Step 4) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
 | Final (Step 6 - Mark in_review) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
-| Abort - dirty work tree (Step 0) | `wl update <id> --status open --json`, then abort | open | (unchanged) |
-| Abort - definition gate failure | Run intake/plan interview, update item | open | (unchanged) |
+| Abort - dirty work tree | `wl update <id> --status open --json`, then abort | open | (unchanged) |
+| Abort - definition gate failure | `wl update <id> --status open --json`, run intake/plan interview, update item | open | (unchanged) |
+| Abort - user-initiated | `wl update <id> --status open --json`, return control to operator | open | (unchanged) |
+| Abort - error/exception during implementation | `wl update <id> --status open --json`, log error to comment, return | open | (unchanged) |
+| Abort - unexpected termination (Final cleanup) | Check status; if `in_progress` and work incomplete, reset | open | (unchanged) |
 | Under Ralph (Step 6 note) | Skip in_review step; Ralph handles transition | in_progress | in_progress |
 | Epic / parent: all children done | Check all children are in a terminal stage (in_review/completed); advance parent stage | in-progress | in_review |
 
-Abort/failure transitions use `--status open` while keeping the stage unchanged.
+> **Abort/failure transitions always use `--status open` while keeping the stage unchanged.**
+> This pattern is mandatory — never leave a work item in `in_progress` status
+> unless actively implementing. See the "Status Safety & Abort Handling" section for details.
 
 ## Scripts (canonical runner & modules)
 
