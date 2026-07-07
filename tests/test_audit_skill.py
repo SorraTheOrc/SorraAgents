@@ -3,7 +3,6 @@ import json
 import sys
 from types import SimpleNamespace
 
-import pytest
 
 from skill.audit.scripts.persist_audit import persist_audit, main as persist_main
 

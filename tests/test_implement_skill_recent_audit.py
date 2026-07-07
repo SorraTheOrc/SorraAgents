@@ -67,7 +67,7 @@ class TestImplementSkillRecentAuditBootstrap:
     def test_step_3_fallback_uses_skill_audit_command(self) -> None:
         """Step 3 must explicitly invoke `/skill:audit <id>` when no recent audit exists."""
         content = _skill_content()
-        step3 = _find_step(content, "3. Implement")
+        step3 = _find_step(content, "1. Implement")
         assert step3 is not None, "Could not find the 'Implement' step"
 
         assert "/skill:audit <id>" in step3 or "/skill:audit <work-item-id>" in step3, (
@@ -81,7 +81,7 @@ class TestImplementSkillRecentAuditBootstrap:
     def test_step_3_preserves_existing_workflow_after_audit_selection(self) -> None:
         """The audit bootstrap must feed into the existing implementation flow."""
         content = _skill_content()
-        step3 = _find_step(content, "3. Implement")
+        step3 = _find_step(content, "1. Implement")
         assert step3 is not None, "Could not find the 'Implement' step"
 
         assert re.search(r"after audit selection|once.*audit.*addressed|continue to step 4", step3, re.IGNORECASE | re.DOTALL), (

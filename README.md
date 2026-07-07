@@ -3,6 +3,7 @@
 A lightweight collection of workflow guides, command patterns, and skill templates for building and operating small automation agents.
 
 ## Purpose
+
 - Centralize documentation and reusable "skills" for agent development and operational workflows.
 - Provide templates and checklists to guide feature implementation, testing, and release.
 
@@ -11,10 +12,14 @@ A lightweight collection of workflow guides, command patterns, and skill templat
 "Acceptance Criteria" is the canonical term for work-item requirements. "Success Criteria" is an accepted synonym and may be used interchangeably. Both terms are recognized by validation logic in the workflow invariants (`docs/workflow/workflow.json`, `docs/workflow/workflow.yaml`). When defining work items, prefer the heading **Acceptance Criteria** (synonym: Success Criteria) for consistency.
 
 ## Repository structure
+
 - agent/: workflow and agent-focused reference guides (e.g., [agent/forge.md](agent/forge.md), [agent/ship.md](agent/ship.md)).
 - command/: design, intake, implementation and review process documents (see [command/implement.md](command/implement.md)).
 - skill/: skill templates and utilities to scaffold and package agent skills (see [skill/skill-creator/SKILL.md](skill/skill-creator/SKILL.md)).
+  - [skill/skills-script-paths.md](skill/skills-script-paths.md): Best practices for referencing scripts and assets from skills.
   - [skill/planall/](skill/planall/): PlanAll — automated batch planning for intake_complete work items.
+  - [skill/intakeall/](skill/intakeall/): IntakeAll — automated batch intake for idea-stage work items.
+  - [skill/implementall/](skill/implementall/): ImplementAll — automated batch implementation for plan_complete work items.
 - plugins/: local agent framework plugins used by this repository (includes `ralph` compaction plugin).
 - docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)).
 - Workflow.md: high-level workflow for using this repository.
@@ -60,9 +65,83 @@ python3 skill/planall/scripts/planall.py --json
 
 # Post summary as a comment on a parent epic
 python3 skill/planall/scripts/planall.py --parent-id SA-0MQA6ECEU003GUKH
+
+# Process at most 10 items
+python3 skill/planall/scripts/planall.py --max 10
+
+# Set per-item timeout to 300 seconds
+python3 skill/planall/scripts/planall.py --item-timeout 300
+
+# Combine --max and --item-timeout
+python3 skill/planall/scripts/planall.py --max 5 --item-timeout 120
 ```
 
 See [skill/planall/SKILL.md](skill/planall/SKILL.md) for full documentation.
+
+## IntakeAll — Automated Batch Intake
+
+The IntakeAll skill (`skill/intakeall/`) provides automated batch intake for work items
+in `idea` stage. It discovers all eligible items, auto-completes well-defined items,
+marks items lacking sufficient detail as `needs_input` (skipping the interactive
+`/intake` subprocess that would block in batch mode), attempts error recovery, and
+produces a summary report.
+
+```bash
+# Process all idea-stage items
+python3 skill/intakeall/scripts/intakeall.py
+
+# JSON output for programmatic use
+python3 skill/intakeall/scripts/intakeall.py --json
+
+# Dry run (simulate without changes)
+python3 skill/intakeall/scripts/intakeall.py --dry-run
+
+# Post summary as a comment on a parent epic
+python3 skill/intakeall/scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
+
+# Process at most 10 items
+python3 skill/intakeall/scripts/intakeall.py --max 10
+
+# Set per-item timeout to 300 seconds
+python3 skill/intakeall/scripts/intakeall.py --item-timeout 300
+
+# Combine --max and --item-timeout
+python3 skill/intakeall/scripts/intakeall.py --max 5 --item-timeout 120
+```
+
+See [skill/intakeall/SKILL.md](skill/intakeall/SKILL.md) for full documentation.
+
+## ImplementAll — Automated Batch Implementation
+
+The ImplementAll skill (`skill/implementall/`) provides automated batch implementation
+for work items in `plan_complete` stage. It discovers all eligible items, invokes
+`/skill:implement` for each sequentially, detects items that require producer input,
+attempts error recovery on failures, and produces a summary report.
+
+```bash
+# Process all plan_complete items
+python3 skill/implementall/scripts/implementall.py
+
+# JSON output for programmatic use
+python3 skill/implementall/scripts/implementall.py --json
+
+# Dry run (simulate without changes)
+python3 skill/implementall/scripts/implementall.py --dry-run
+
+# Process at most 5 items
+python3 skill/implementall/scripts/implementall.py --max 5
+
+# Set per-item timeout to 300 seconds
+python3 skill/implementall/scripts/implementall.py --item-timeout 300
+
+# Combine --max and --item-timeout
+python3 skill/implementall/scripts/implementall.py --max 3 --item-timeout 120
+
+# Post summary as a comment on a parent epic
+python3 skill/implementall/scripts/implementall.py --parent-id SA-0MQO6YMZ3006N5MG
+```
+
+See [skill/implementall/SKILL.md](skill/implementall/SKILL.md) for full documentation.
 
 A useful debugging pattern is to focus Ralph on a single direct child work item:
 
@@ -89,6 +168,7 @@ This repository uses GitHub Actions to validate changes. The following workflows
 ### Release process
 
 The `dev-full-suite` workflow result is used as a gate in the release process:
+
 1. Changes are integrated into `dev` via feature branch pushes.
 2. The release manager triggers `dev-full-suite` manually on the release candidate.
 3. If the full suite passes, the release manager reviews uploaded artifacts and proceeds with the `dev` → `main` merge.
@@ -99,10 +179,10 @@ The `dev-full-suite` workflow result is used as a gate in the release process:
 The dev container commands (`wl ampa start-work`, `finish-work`, `list-containers`) require the following tools on the host:
 
 - **Podman** — container runtime (rootless mode)
-  - Install: https://podman.io/getting-started/installation
+  - Install: <https://podman.io/getting-started/installation>
 - **Distrobox** — manages dev containers on top of Podman
   - Install: `curl -s https://raw.githubusercontent.com/89luca89/distrobox/main/install | sudo sh`
-  - Alternative methods: https://github.com/89luca89/distrobox?tab=readme-ov-file#installation
+  - Alternative methods: <https://github.com/89luca89/distrobox?tab=readme-ov-file#installation>
 - **Git** and **wl** (Worklog CLI) — assumed to already be available
 
 Verify the installations:
@@ -111,6 +191,20 @@ Verify the installations:
 command -v podman && podman --version
 command -v distrobox && distrobox version
 ```
+
+### Code Quality Linters (Optional)
+
+The automated code quality review feature supports the following linters. Install them to enable quality scanning during audits:
+
+| Language | Linter | Install command |
+|----------|--------|-----------------|
+| Python | [ruff](https://docs.astral.sh/ruff/) | `pip install ruff` |
+| TypeScript/JavaScript | [ESLint](https://eslint.org/) | `npm install -g eslint` |
+| Markdown | [markdownlint-cli](https://github.com/igmpaul/markdownlint-cli) | `npm install -g markdownlint-cli` |
+| Shell | [ShellCheck](https://shellcheck.net/) | `apt install shellcheck` or `brew install shellcheck` |
+| C# | [dotnet-format](https://github.com/dotnet/format) | Install [.NET SDK](https://dotnet.microsoft.com/download) |
+
+If a linter is not available, the code quality check skips that language gracefully without errors.
 
 ### Podman runtime directory error
 
@@ -148,7 +242,7 @@ Pool state (`pool-state.json`, `pool-cleanup.json`, `pool-replenish.log`) is sto
 
 If the AMPA Containerfile has been modified since the image was last built, `warm-pool` will automatically tear down unclaimed pool containers and the template, rebuild the image, and re-fill the pool. Simply run `wl ampa warm-pool` again — no manual cleanup is needed.
 
-See the AMPA container pool reference for full details: https://github.com/opencode/ampa/blob/main/docs/ampa_container_pool.md
+See the AMPA container pool reference for full details: <https://github.com/opencode/ampa/blob/main/docs/ampa_container_pool.md>
 
 ### Browser test capability
 
@@ -179,6 +273,7 @@ The installer for the AMPA Worklog plugin will attempt to pre-warm the container
 If the installer cannot find `podman` or `distrobox`, it will continue installation but print one-line actionable guidance explaining how to install the missing tools and how to run `wl ampa warm-pool` manually. Warm-pool failures are treated as non-fatal by the installer; it records the decision and prints short guidance and where the captured output is stored.
 
 Installer output capture and logs:
+
 - When the installer runs warm-pool it captures stdout/stderr to `/tmp/ampa_warm_pool.out` and `/tmp/ampa_warm_pool.err` and prints a short snippet on completion or a one-line actionable error on failure.
 
 Examples:
@@ -225,6 +320,7 @@ After the gate passes, the script merges `dev` into `main`, pushes the result,
 and records an audit comment in the worklog.
 
 ## Getting started
+
 1. Read the main workflow: [Workflow.md](Workflow.md).
 2. Pick a folder to work in (e.g., `skill/` or `agent/`).
 3. Follow the appropriate guide (see files inside each folder) to implement, test, and package your work.
@@ -235,7 +331,7 @@ The audit helper supports PR mode in addition to work-item mode:
 
 - Input can be a WL id (`SA-...`) or GitHub PR reference (`https://github.com/<owner>/<repo>/pull/<n>` or `<owner>/<repo>#<n>`).
 - In PR mode, the helper resolves the related WL item from PR title/body (or uses explicit `--wl-id`, or optionally `--allow-create-wl`).
-- The helper can prepare an ephemeral checkout, run autodetected build/tests, run audit via `pi run "/audit <wl-id>"`, and record audit text using `wl update --audit-text`.
+- The helper can prepare an ephemeral checkout, run autodetected build/tests, run audit via `pi -p --mode json "/audit <wl-id>"` (non-interactive, JSON-stream mode), and record audit text using `wl update --audit-text`.
 - If build/tests and audit pass, it can present a merge offer and only merges when explicitly confirmed.
 
 Daemon / scheduler note
@@ -245,10 +341,11 @@ Daemon / scheduler note
   sends a single heartbeat and exits; to run the scheduler loop you must
   explicitly enable it (for example: use `--start-scheduler` or set an
   environment flag like `AMPA_RUN_SCHEDULER=1`). Check the AMPA repository
-  README at https://github.com/opencode/ampa for the exact flags and
+  README at <https://github.com/opencode/ampa> for the exact flags and
   environment variables.
 
 ## Contributing
+
 - Open an issue describing the change you'd like to make.
 - Follow the relevant guide under `command/` for design and review steps.
 - If adding a new skill, consider using the scripts in `skill/skill-creator/scripts` to scaffold and package it.
@@ -257,7 +354,7 @@ Daemon / scheduler note
 
 The AMPA Worklog plugin has been moved to its own independent repository:
 
-**https://github.com/opencode/ampa**
+**<https://github.com/opencode/ampa>**
 
 The `skill/install-ampa/resources/ampa.mjs` file in this repository is a runtime loader that delegates to the installed AMPA package. To develop or modify AMPA:
 
@@ -269,10 +366,12 @@ The `skill/install-ampa/resources/ampa.mjs` file in this repository is a runtime
 See the [Migration Guide](docs/AMPA_MIGRATION.md) for information about transitioning from the old bundled installation to the new repository-based installation.
 
 ## Next steps / Suggestions
+
 - Add a CI workflow to validate new skills and docs.
 - Add example usage for each skill in `skill/` to make onboarding easier.
 
 ## License
+
 See individual files for licenses. Some folders include a LICENSE.txt (for example: [skill/skill-creator/LICENSE.txt](skill/skill-creator/LICENSE.txt)).
 
 ---

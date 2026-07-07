@@ -5,11 +5,23 @@ description: "Produce engineering effort and risk estimates using WBS, three-poi
 
 Purpose
 -------
+
 Produce a concise, auditable engineering estimate (effort + risk) for a prepared work item. The skill's canonical outputs are:
 
 - A machine-readable JSON object containing effort (effort_units, tshirt size, O/M/P, expected, recommended, range), risk (probability, impact, score, level, top drivers, mitigations), confidence, assumptions, and unknowns.
- - A machine-readable JSON object containing effort (effort_units, tshirt size (full-text, e.g. "Small", "Extra Large"), O/M/P, expected, recommended, range), risk (probability, impact, score, level, top drivers, mitigations), confidence, assumptions, and unknowns.
+- A machine-readable JSON object containing effort (effort_units, tshirt size (full-text, e.g. "Small", "Extra Large"), O/M/P, expected, recommended, range), risk (probability, impact, score, level, top drivers, mitigations), confidence, assumptions, and unknowns.
 - A human-readable summary generated and posted by the orchestrator; the posted content is included in the orchestrator output.
+
+## Status lifecycle
+
+This skill manages the work item status during execution to signal that the item is being processed.
+
+1. **Before any other step** (including the gating check below), claim the work item by running:
+   `wl update <issue-id> --status in_progress --json`
+2. **At the end of execution** (whether success or failure), set status to `open`:
+   `wl update <issue-id> --status open --json`
+
+> Stage is NOT modified by this skill. Only `--status` is used.
 
 Gating (mandatory)
 -------------------
@@ -27,10 +39,12 @@ The `orchestrate_estimate.py` script accepts work items in either `intake_comple
 
 When to use
 -----------
+
 Use this skill only after the Producer has prepared a plan and set the work item's stage to `intake_complete` or `plan_complete`.
 
 Required inputs (what you must prepare before running the scripts)
 ----------------------------------------------------------------
+
 - issue id (string). Fetch the full issue and its children for auditability: wl show <issue-id> --json
 - A lightweight WBS. Use the issue's child work items as the WBS source (children are returned recursively by wl show --json). If the issue has no children and the scope is small, the parent issue itself can be treated as the WBS.
 - Provide Optimistic (O), Most Likely (M), and Pessimistic (P) estimates in effort_units for the overall work scope. Optionally (for traceability), provide O/M/P per WBS item or per child issue; the scripts will aggregate per-item inputs into the overall estimate when present.
@@ -41,6 +55,7 @@ Required inputs (what you must prepare before running the scripts)
 
 Principles (kept brief)
 -----------------------
+
 - Use effort_units as the canonical unit.
 - Use three-point (PERT) estimating for expected value: E = (O + 4*M + P) / 6.
 - Surface assumptions and unknowns explicitly so reviewers can decide if further planning (spikes) is needed.
@@ -48,7 +63,8 @@ Principles (kept brief)
 
 Canonical workflow (minimal, authoritative)
 -----------------------------------------
-Follow these steps from the project root (run commands from the repository root, not from the `skill/effort_and_risk` directory):
+
+Follow these steps from the project root (run commands from the repository root, not from the `../effort_and_risk` directory):
 
 1) Fetch the issue and its children (audit file):
 
@@ -70,7 +86,7 @@ Follow these steps from the project root (run commands from the repository root,
 3) Run the orchestrator. Prefer capturing output to a filename derived from the work-item id (avoid fixed names):
 
        ```sh
-       python3 skill/effort-and-risk/scripts/run_skill.py --issue <issue-id> <<'JSON' > final-<issue-id>.json
+       python3 ./scripts/run_skill.py --issue <issue-id> <<'JSON' > final-<issue-id>.json
        { ... }
        JSON
        ```
@@ -85,28 +101,30 @@ Follow these steps from the project root (run commands from the repository root,
 
 Outputs
 -------
+
 - `final-<issue-id>.json` (or captured stdout): canonical machine-readable estimate (as described above), plus orchestration metadata including human_text and comment_result. Prefer filenames generated from the work-item id to avoid fixed temporary filenames.
 
 References (bundled)
 --------------------
+
 - references/t-shirt_sizes.json — T-shirt thresholds used by scripts
-- skill/effort-and-risk/scripts/calc_effort.py
-- skill/effort-and-risk/scripts/calc_risk.py
-- skill/effort-and-risk/scripts/calc_effort_with_risk.py
-- skill/effort-and-risk/scripts/assemble_json.py
-- skill/effort-and-risk/scripts/json_to_human.py
-- skill/effort-and-risk/scripts/orchestrate_estimate.py
+- ./scripts/calc_effort.py
+- ./scripts/calc_risk.py
+- ./scripts/calc_effort_with_risk.py
+- ./scripts/assemble_json.py
+- ./scripts/json_to_human.py
+- ./scripts/orchestrate_estimate.py
 
 ## Scripts (canonical runner & modules)
 
-- Orchestrator: `skill/effort-and-risk/scripts/orchestrate_estimate.py` (invokes the local calc scripts and performs wl updates)
-- Helper CLI wrapper: `skill/effort-and-risk/scripts/run_skill.py`
+- Orchestrator: `./scripts/orchestrate_estimate.py` (invokes the local calc scripts and performs wl updates)
+- Helper CLI wrapper: `./scripts/run_skill.py`
 
 Example (recommended invocation using the repository Worklog id shown in documentation):
 
 ```sh
 # Using SA-0MPYMFZXO0004ZU4 as the work-item id for examples
-python3 skill/effort-and-risk/scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > final-SA-0MPYMFZXO0004ZU4.json
+python3 ./scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > final-SA-0MPYMFZXO0004ZU4.json
 { ... }
 JSON
 ```

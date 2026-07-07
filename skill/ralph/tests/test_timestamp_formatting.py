@@ -6,10 +6,8 @@ indicating activity recency is appended to the Recent Activity section.
 """
 
 import json
-import time
 from datetime import datetime, timezone
 
-import pytest
 
 from skill.ralph.scripts.ralph_control import (
     _format_log_line,
@@ -275,12 +273,12 @@ class TestFormatStatusConsistencyWithTimestamps:
         }
         output = format_status(snapshot)
         lines = output.split("\n")
-        header_idx = next(i for i, l in enumerate(lines) if l == "# Ralph Status")
-        active_idx = next(i for i, l in enumerate(lines) if "**Active Task**" in l)
-        counts_idx = next(i for i, l in enumerate(lines) if l == "## Status Counts")
-        activity_idx = next(i for i, l in enumerate(lines) if l == "## Recent Activity")
+        header_idx = next(i for i, line in enumerate(lines) if line == "# Ralph Status")
+        active_idx = next(i for i, line in enumerate(lines) if "**Active Task**" in line)
+        counts_idx = next(i for i, line in enumerate(lines) if line == "## Status Counts")
+        activity_idx = next(i for i, line in enumerate(lines) if line == "## Recent Activity")
         # Activity recency line comes after recent activity lines
-        activity_end_idx = next(i for i, l in enumerate(lines) if "Last recorded activity" in l)
+        activity_end_idx = next(i for i, line in enumerate(lines) if "Last recorded activity" in line)
         assert header_idx < active_idx < counts_idx < activity_idx < activity_end_idx
 
     def test_output_is_stable_across_repeated_calls(self):

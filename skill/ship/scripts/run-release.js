@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 // run-release.js — safe wrapper to invoke repository-level release script
-// Usage: node run-release.js [--dry-run] [--work-item-id <id>] [--force] [--skip-checks]
+// Usage: node run-release.js [--dry-run] [--work-item-id <id>] [--force] [--skip-checks] [--bump patch|minor|major]
+//
+// The --bump flag is passed through to the canonical release script
+// (merge-dev-to-main.sh) and controls which part of the semver is
+// incremented before the merge. Default is 'patch'.
 
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { spawnSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -225,11 +229,16 @@ export function runRelease(cliArgs = []) {
 
   const child = spawnSync('bash', [selectedScript, ...args], {
     encoding: 'utf-8',
-    stdio: ['pipe', 'inherit', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
 
   const exitCode = child.status || 0;
   const stdout = child.stdout || '';
+
+  // Print the release script output so the user can see progress
+  if (stdout) {
+    process.stdout.write(stdout);
+  }
 
   if (exitCode !== 0) {
     console.error(`Release script exited with code ${exitCode}.`);
@@ -268,8 +277,11 @@ export function runRelease(cliArgs = []) {
 // ── CLI Entry Point ──────────────────────────────────────────────────────────
 
 // Only run when executed directly, not when imported as a module
+// Use realpathSync on both sides to handle symlinked install paths:
+// import.meta.url resolves to the real path while process.argv[1]
+// may retain the symlink path.
 const isMainModule = process.argv[1] &&
-  (fileURLToPath(import.meta.url) === resolve(process.argv[1]));
+  (realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1])));
 
 if (isMainModule) {
   const exitCode = runRelease(process.argv.slice(2));

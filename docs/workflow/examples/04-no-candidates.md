@@ -46,6 +46,7 @@ No commands are executed. The engine enters idle state.
 | **Discord** | `"Agents are idle: no actionable items found"` (channel: `command`) |
 
 **Return Value:**
+
 ```json
 {
   "note": "Delegation: skipped (no wl next candidates)",
@@ -93,6 +94,7 @@ Rejected:
 ```
 
 **Return Value:**
+
 ```json
 {
   "note": "Delegation: skipped (all candidates rejected)",

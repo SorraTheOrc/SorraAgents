@@ -7,6 +7,7 @@ Each example traces a work item through state transitions, showing the workflow 
 ## Pattern
 
 The AMPA engine uses a **unidirectional delegation** pattern:
+
 1. AMPA selects a work item via `wl next`
 2. AMPA delegates with full context — Patch works autonomously
 3. AMPA audits on completion and closes or escalates
@@ -25,6 +26,7 @@ The AMPA engine uses a **unidirectional delegation** pattern:
 ## Structure
 
 Each example follows a consistent format:
+
 - **Scenario** description
 - **Initial State** of the work item
 - **Step-by-step flow** with state transition tables showing:

@@ -21,65 +21,55 @@ Output: final JSON block written to stdout
 
 import sys
 import json
+import traceback
+from pathlib import Path
+
+# Add repo root to sys.path for shared utility access
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from skill.scripts.failure_notice import FailureNotice  # noqa: E402
+
+from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
 
 
-def level_from_score(score):
-    if score <= 5:
-        return "Low"
-    if score <= 12:
-        return "Medium"
-    if score <= 19:
-        return "High"
-    return "Critical"
+# ---------------------------------------------------------------------------
+# Extracted helper functions
+# ---------------------------------------------------------------------------
 
 
-def pick_tshirt(hours, thresholds):
-    for size, bounds in thresholds.items():
-        mn = bounds.get("min", 0)
-        mx = bounds.get("max")
-        if mx is None:
-            if hours >= mn:
-                return size
-        else:
-            if hours >= mn and hours < mx:
-                return size
-    return "XS"
+def _load_thresholds() -> dict:
+    """Load t-shirt thresholds from references/t-shirt_sizes.json.
+
+    Falls back to DEFAULT_THRESHOLDS if the file is missing or unreadable.
+
+    Returns:
+        A dict mapping size codes to {"min": float, "max": float | None}.
+    """
+    try:
+        with open("references/t-shirt_sizes.json", "r") as f:
+            tshirt_cfg = json.load(f)
+            return tshirt_cfg.get("thresholds", {})
+    except Exception:
+        return DEFAULT_THRESHOLDS
 
 
-def compute_omp(data):
-    items = data.get("items")
-    if isinstance(items, list) and items:
-        o_sum = sum(float(i.get("o", 0)) for i in items)
-        m_sum = sum(float(i.get("m", 0)) for i in items)
-        p_sum = sum(float(i.get("p", 0)) for i in items)
-        return o_sum, m_sum, p_sum
-    return (
-        float(data.get("o", 0)),
-        float(data.get("m", 0)),
-        float(data.get("p", 0)),
-    )
+def _fetch_issue_stage(issue_id: str) -> str:
+    """Run ``wl show <issue_id> --json`` and return the issue stage.
 
+    Args:
+        issue_id: The work-item identifier to inspect.
 
-def main():
-    data = json.load(sys.stdin)
+    Returns:
+        The stage string (expected to be ``"plan_complete"`` or ``"intake_complete"``).
 
-    o, m, p = compute_omp(data)
-    overheads = data.get("overheads", {})
-
-    expected = (o + 4 * m + p) / 6.0
-    overheads_total = sum(float(v) for v in overheads.values()) if overheads else 0.0
-    recommended = expected + overheads_total
-    range_min = o + overheads_total
-    range_max = p + overheads_total
-
-    # Ensure an issue_id is provided so we can inspect its stage before computing risk
-    issue_id = data.get("issue_id")
-    if not issue_id:
-        print(json.dumps({"error": "missing required field: issue_id"}))
-        sys.exit(2)
-
-    # Verify the issue stage (accept plan_complete or intake_complete). If intake, we'll
-    # scale down the provided certainty so downstream calculations reflect less-detailed planning.
+    Raises:
+        The function calls ``sys.exit()`` with the following codes on failure:
+            3 – ``wl show`` subprocess returned a non-zero exit code.
+            4 – The issue stage is not ``plan_complete`` or ``intake_complete``.
+            5 – An unexpected exception occurred (e.g., JSON decode failure).
+    """
     try:
         import subprocess
 
@@ -87,55 +77,52 @@ def main():
             ["wl", "show", issue_id, "--json"], capture_output=True, text=True
         )
         if show_proc.returncode != 0:
-            print(json.dumps({"error": "wl show failed", "stdout": show_proc.stdout, "stderr": show_proc.stderr}))
+            print(json.dumps({
+                "error": "wl show failed",
+                "stdout": show_proc.stdout,
+                "stderr": show_proc.stderr,
+            }))
             sys.exit(3)
         show_json = json.loads(show_proc.stdout)
         stage = show_json.get("workItem", {}).get("stage", "")
         if stage not in ("plan_complete", "intake_complete"):
-            # Per SKILL gating, output single sentence refusal
             print(
                 f"The issue does not have a sufficiently detailed plan, to proceed it must be in the stage of `intake_complete` or `plan_complete`. Run the intake command with `/intake {issue_id}` or the plan command with `/plan {issue_id}`."
             )
             sys.exit(4)
-        input_stage = stage
+        return stage
     except Exception as e:
         print(json.dumps({"error": str(e)}))
         sys.exit(5)
 
-    # load tshirt thresholds
-    try:
-        with open("references/t-shirt_sizes.json", "r") as f:
-            tshirt_cfg = json.load(f)
-            thresholds = tshirt_cfg.get("thresholds", {})
-    except Exception:
-        thresholds = {
-            "XS": {"min": 0, "max": 4},
-            "S": {"min": 4, "max": 24},
-            "M": {"min": 24, "max": 80},
-            "L": {"min": 80, "max": 240},
-            "XL": {"min": 240, "max": None},
-        }
 
-    tshirt = pick_tshirt(recommended, thresholds)
-    # Expand shorthand codes to full-text labels for clarity/auditability
-    tshirt_map = {
-        "XS": "Extra Small",
-        "S": "Small",
-        "M": "Medium",
-        "L": "Large",
-        "XL": "Extra Large",
-    }
-    tshirt = tshirt_map.get(tshirt, tshirt)
+def _compute_tshirt(recommended: float, thresholds: dict) -> str:
+    """Compute the full-text t-shirt size label for the given recommended hours.
 
-    # risk aggregation
+    Args:
+        recommended: The recommended hours (expected + overheads total).
+        thresholds: A dict mapping size codes to {"min": float, "max": float | None}.
+
+    Returns:
+        A human-readable t-shirt size label (e.g. "Small", "Extra Large").
+    """
+    tshirt_code = pick_tshirt(recommended, thresholds)
+    return TSHIRT_MAP.get(tshirt_code, tshirt_code)
+
+
+def _compute_risk(data: dict, certainty: float) -> dict:
+    """Aggregate risk from parent/children data with the given certainty.
+
+    Args:
+        data: The full input data dict containing ``parent``, ``children`` keys.
+        certainty: The (potentially stage-adjusted) certainty percentage.
+
+    Returns:
+        A risk dict with keys: probability, impact, score, level,
+        top_drivers, mitigations.
+    """
     parent = data.get("parent", {})
     children = data.get("children", [])
-    certainty = float(data.get("certainty", 100))
-
-    # If the issue is only at intake, scale certainty down to reflect lower confidence
-    original_certainty = certainty
-    if input_stage == "intake_complete":
-        certainty = certainty * 0.6
 
     probs = [parent.get("probability", 0)] + [c.get("probability", 0) for c in children]
     imps = [parent.get("impact", 0)] + [c.get("impact", 0) for c in children]
@@ -147,13 +134,11 @@ def main():
 
     drivers = []
     for c in children:
-        drivers.append(
-            (
-                c.get("id", ""),
-                c.get("probability", 0) * c.get("impact", 0),
-                c.get("title", ""),
-            )
-        )
+        drivers.append((
+            c.get("id", ""),
+            c.get("probability", 0) * c.get("impact", 0),
+            c.get("title", ""),
+        ))
     drivers.sort(key=lambda x: x[1], reverse=True)
     top = [d[2] or d[0] for d in drivers[:3]]
 
@@ -163,7 +148,7 @@ def main():
         "Schedule extra review for risky components",
     ]
 
-    risk = {
+    return {
         "probability": round(agg_prob, 2),
         "impact": round(agg_imp, 2),
         "score": score,
@@ -172,6 +157,169 @@ def main():
         "mitigations": mitigations,
     }
 
+
+def _update_work_item(issue_id: str, wl_effort: str, wl_risk: str) -> dict:
+    """Run ``wl update`` to set effort and risk fields on the work item.
+
+    Args:
+        issue_id: The work-item identifier.
+        wl_effort: The effort label string (e.g. "Small").
+        wl_risk: The risk label string (e.g. "Medium", "Severe").
+
+    Returns:
+        A result dict with keys ``success``, ``returncode``, ``stdout``,
+        ``stderr`` on success, or ``success`` and ``error`` on exception.
+    """
+    try:
+        import subprocess
+
+        update_cmd = [
+            "wl",
+            "update",
+            issue_id,
+            "--effort",
+            str(wl_effort),
+            "--risk",
+            str(wl_risk),
+            "--json",
+        ]
+        update_proc = subprocess.run(update_cmd, capture_output=True, text=True)
+        return {
+            "success": update_proc.returncode == 0,
+            "returncode": update_proc.returncode,
+            "stdout": update_proc.stdout,
+            "stderr": update_proc.stderr,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _render_human_text(data: dict, final: dict) -> str:
+    """Generate human-readable narrative using ``json_to_human.py`` subprocess.
+
+    Side effects: sets ``final["human_text"]``, ``final["human_render_rc"]``,
+    and ``final["human_render_stderr"]``.
+
+    Args:
+        data: The original input data dict (for wbs_items/wbs_children).
+        final: The output dict being built (for effort, risk, etc.).
+
+    Returns:
+        The rendered human text string (may be empty on failure).
+    """
+    try:
+        import subprocess
+        import os
+
+        # Build a sanitized object for rendering to avoid contaminating the
+        # human text. Include WBS data (items and children) for narrative generation.
+        wbs_items = data.get("items", [])
+        wbs_children = data.get("children", [])
+        sanitized = {
+            "effort": final.get("effort"),
+            "risk": final.get("risk"),
+            "confidence_percent": final.get("confidence_percent"),
+            "assumptions": final.get("assumptions"),
+            "unknowns": final.get("unknowns"),
+            "wbs_items": wbs_items,
+            "wbs_children": wbs_children,
+        }
+
+        script_dir = os.path.dirname(__file__)
+        json_to_human_path = os.path.join(script_dir, "json_to_human.py")
+        sj = json.dumps(sanitized)
+        p = subprocess.run(
+            ["python3", json_to_human_path], input=sj, text=True, capture_output=True
+        )
+        human_text = p.stdout or ""
+        final["human_text"] = human_text
+        final["human_render_rc"] = p.returncode
+        final["human_render_stderr"] = p.stderr
+
+        return human_text
+    except Exception as e:
+        final["human_text"] = ""
+        final["human_render_rc"] = -1
+        final["human_render_stderr"] = str(e)
+        return ""
+
+
+def _post_comment(issue_id: str, combined_text: str) -> dict:
+    """Post a rendered comment to the work item via ``wl comment add``.
+
+    Args:
+        issue_id: The work-item identifier.
+        combined_text: The full comment body (human text + JSON block).
+
+    Returns:
+        A result dict with keys ``returncode``, ``stdout``, ``stderr``,
+        ``success`` on success, or ``success`` and ``error`` on exception.
+    """
+    try:
+        import subprocess
+
+        comment_cmd = [
+            "wl",
+            "comment",
+            "add",
+            issue_id,
+            "--author",
+            "effort_and_risk_skill",
+            "--comment",
+            combined_text,
+            "--json",
+        ]
+        comment_proc = subprocess.run(comment_cmd, capture_output=True, text=True)
+        return {
+            "returncode": comment_proc.returncode,
+            "stdout": comment_proc.stdout,
+            "stderr": comment_proc.stderr,
+            "success": comment_proc.returncode == 0,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Main orchestrator
+# ---------------------------------------------------------------------------
+
+
+def main():
+    data = json.load(sys.stdin)
+
+    # 1. Compute O/M/P estimates and basic effort metrics
+    o, m, p = compute_omp(data)
+    overheads = data.get("overheads", {})
+
+    expected = (o + 4 * m + p) / 6.0
+    overheads_total = sum(float(v) for v in overheads.values()) if overheads else 0.0
+    recommended = expected + overheads_total
+    range_min = o + overheads_total
+    range_max = p + overheads_total
+
+    # 2. Validate issue_id early
+    issue_id = data.get("issue_id")
+    if not issue_id:
+        print(json.dumps({"error": "missing required field: issue_id"}))
+        sys.exit(2)
+
+    # 3. Fetch the issue stage (exits with codes 3-5 on failure)
+    input_stage = _fetch_issue_stage(issue_id)
+
+    # 4. Load t-shirt thresholds and compute the t-shirt size label
+    thresholds = _load_thresholds()
+    tshirt = _compute_tshirt(recommended, thresholds)
+
+    # 5. Compute certainty (stage-adjusted) and build the risk dict
+    certainty = float(data.get("certainty", 100))
+    original_certainty = certainty
+    if input_stage == "intake_complete":
+        certainty = certainty * 0.6
+
+    risk = _compute_risk(data, certainty)
+
+    # 6. Build the final output dict
     final = {
         "effort": {
             "unit": "hours",
@@ -196,42 +344,7 @@ def main():
     final["original_certainty"] = original_certainty
     final["adjusted_certainty"] = certainty
 
-    # The orchestration script MUST update the issue's effort and risk fields.
-    issue_id = data.get("issue_id")
-    if not issue_id:
-        print(json.dumps({"error": "missing required field: issue_id"}))
-        sys.exit(2)
-
-    # Verify the issue is in intake_complete or plan_complete stage before applying updates
-    try:
-        import subprocess
-
-        show_proc = subprocess.run(
-            ["wl", "show", issue_id, "--json"], capture_output=True, text=True
-        )
-        if show_proc.returncode != 0:
-            final["update_result"] = {
-                "success": False,
-                "error": "wl show failed",
-                "stdout": show_proc.stdout,
-                "stderr": show_proc.stderr,
-            }
-            print(json.dumps(final))
-            sys.exit(3)
-        show_json = json.loads(show_proc.stdout)
-        stage = show_json.get("workItem", {}).get("stage", "")
-        if stage not in ("plan_complete", "intake_complete"):
-            # Per SKILL gating, output single sentence refusal
-            print(
-                f"The issue does not have a sufficiently detailed plan, to proceed it must be in the stage of `intake_complete` or `plan_complete`. Run the intake command with `/intake {issue_id}` or the plan command with `/plan {issue_id}`."
-            )
-            sys.exit(4)
-    except Exception as e:
-        final["update_result"] = {"success": False, "error": str(e)}
-        print(json.dumps(final))
-        sys.exit(5)
-
-    # Map risk.level to wl's risk label (Critical -> Severe)
+    # 7. Map risk.level to wl's risk label (Critical -> Severe)
     risk_level = risk.get("level", "")
     wl_risk_map = {
         "Low": "Low",
@@ -241,114 +354,51 @@ def main():
         "Severe": "Severe",
     }
     wl_risk = wl_risk_map.get(risk_level, "Medium")
-
-    # Use tshirt as effort value (full-text, e.g. "Small", "Extra Large")
     wl_effort = tshirt
 
-    # Run wl update to set effort and risk; this is mandatory
-    try:
-        import subprocess
+    # 8. Update the work-item's effort and risk fields via wl update
+    final["update_result"] = _update_work_item(issue_id, wl_effort, wl_risk)
 
-        update_cmd = [
-            "wl",
-            "update",
-            issue_id,
-            "--effort",
-            str(wl_effort),
-            "--risk",
-            str(wl_risk),
-            "--json",
-        ]
-        update_proc = subprocess.run(update_cmd, capture_output=True, text=True)
-        update_out = update_proc.stdout
-        update_err = update_proc.stderr
-        update_success = update_proc.returncode == 0
-        # attach the raw results
-        final["update_result"] = {
-            "success": update_success,
-            "returncode": update_proc.returncode,
-            "stdout": update_out,
-            "stderr": update_err,
-        }
-    except Exception as e:
-        final["update_result"] = {"success": False, "error": str(e)}
+    # 9. Render human-readable narrative
+    human_text = _render_human_text(data, final)
 
-    # Now render the human-readable table and post it as a comment (mandatory)
-    try:
-        import subprocess
-        import tempfile
-
-        # Build a sanitized object for rendering to avoid contaminating the human text
-        sanitized = {
+    # 10. Post the combined narrative + JSON as a comment
+    if human_text.strip():
+        skill_json = {
             "effort": final.get("effort"),
             "risk": final.get("risk"),
             "confidence_percent": final.get("confidence_percent"),
             "assumptions": final.get("assumptions"),
             "unknowns": final.get("unknowns"),
         }
-
-        import os
-
-        script_dir = os.path.dirname(__file__)
-        json_to_human_path = os.path.join(script_dir, "json_to_human.py")
-        sj = json.dumps(sanitized)
-        p = subprocess.run(
-            ["python3", json_to_human_path], input=sj, text=True, capture_output=True
-        )
-        human_text = p.stdout or ""
-        final["human_text"] = human_text
-        final["human_render_rc"] = p.returncode
-        final["human_render_stderr"] = p.stderr
-
-        if not human_text.strip():
-            final["comment_result"] = {
-                "success": False,
-                "error": "empty rendered human text",
-                "human_render_stderr": p.stderr,
-            }
-        else:
-            # Build the JSON block to include after the human text
-            skill_json = {
-                "effort": final.get("effort"),
-                "risk": final.get("risk"),
-                "confidence_percent": final.get("confidence_percent"),
-                "assumptions": final.get("assumptions"),
-                "unknowns": final.get("unknowns"),
-            }
-            skill_json_str = json.dumps(skill_json, indent=2)
-
-            combined_text = human_text + "\n\n```json\n" + skill_json_str + "\n```"
-
-            # Pass the combined text directly to `wl comment add` as an argument
-            # Avoid using shell or temporary files with fixed names.
-            try:
-                comment_cmd = [
-                    "wl",
-                    "comment",
-                    "add",
-                    issue_id,
-                    "--author",
-                    "effort_and_risk_skill",
-                    "--comment",
-                    combined_text,
-                    "--json",
-                ]
-                comment_proc = subprocess.run(
-                    comment_cmd, capture_output=True, text=True
-                )
-                final["comment_result"] = {
-                    "returncode": comment_proc.returncode,
-                    "stdout": comment_proc.stdout,
-                    "stderr": comment_proc.stderr,
-                    "success": comment_proc.returncode == 0,
-                }
-            except Exception as e:
-                final["comment_result"] = {"success": False, "error": str(e)}
-    except Exception as e:
-        final["comment_result"] = {"success": False, "error": str(e)}
+        skill_json_str = json.dumps(skill_json, indent=2)
+        combined_text = human_text + "\n\n```json\n" + skill_json_str + "\n```"
+        final["comment_result"] = _post_comment(issue_id, combined_text)
+    else:
+        final["comment_result"] = {
+            "success": False,
+            "error": "empty rendered human text",
+            "human_render_stderr": final.get("human_render_stderr", ""),
+        }
 
     print(json.dumps(final))
 
 
+def _run() -> None:
+    """Entry point with failure notice wrapping."""
+    try:
+        main()
+    except Exception as exc:
+        notice = FailureNotice(
+            script_name="orchestrate_estimate.py",
+            reason=f"Unhandled exception: {exc}",
+            stderr_context=traceback.format_exc(),
+        )
+        print(notice.wrap(
+            json.dumps({"error": str(exc)})
+        ))
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    main()
+    _run()

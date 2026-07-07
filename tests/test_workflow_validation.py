@@ -33,14 +33,13 @@ _SCHEMA_PATH = _REPO_ROOT / "docs" / "workflow" / "workflow-schema.json"
 # Reusable validator functions (from validate_state_machine.py)
 # ---------------------------------------------------------------------------
 
-from tests.validate_state_machine import (
+from tests.validate_state_machine import (  # noqa: E402
     ValidationResult,
-    resolve_state_ref,
     validate_delegation,
     validate_invariants,
     validate_roles,
     validate_state_machine,
-)
+)  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -116,7 +115,7 @@ class TestSchemaValidation:
     ) -> None:
         """T-SV-01: Valid canonical descriptor passes schema validation."""
         errors = _schema_errors(canonical_json, schema)
-        assert errors == [], f"Expected no errors, got:\n" + "\n".join(errors)
+        assert errors == [], "Expected no errors, got:\n" + "\n".join(errors)
 
     @pytest.mark.parametrize(
         "field",
@@ -226,7 +225,7 @@ class TestStateMachineValidation:
         result = ValidationResult()
         validate_state_machine(canonical_json, result)
         sm1_errors = [e for e in result.errors if "V-SM1" in e]
-        assert sm1_errors == [], f"Expected no V-SM1 errors, got:\n" + "\n".join(
+        assert sm1_errors == [], "Expected no V-SM1 errors, got:\n" + "\n".join(
             sm1_errors
         )
 
@@ -262,7 +261,7 @@ class TestStateMachineValidation:
         result = ValidationResult()
         validate_state_machine(canonical_json, result)
         sm3_warnings = [w for w in result.warnings if "V-SM3" in w]
-        assert sm3_warnings == [], f"Expected no V-SM3 warnings, got:\n" + "\n".join(
+        assert sm3_warnings == [], "Expected no V-SM3 warnings, got:\n" + "\n".join(
             sm3_warnings
         )
 
@@ -290,7 +289,7 @@ class TestStateMachineValidation:
         result = ValidationResult()
         validate_state_machine(canonical_json, result)
         sm4_errors = [e for e in result.errors if "V-SM4" in e]
-        assert sm4_errors == [], f"Expected no V-SM4 errors, got:\n" + "\n".join(
+        assert sm4_errors == [], "Expected no V-SM4 errors, got:\n" + "\n".join(
             sm4_errors
         )
 
@@ -322,7 +321,7 @@ class TestStateMachineValidation:
         result = ValidationResult()
         validate_state_machine(canonical_json, result)
         sm5_errors = [e for e in result.errors if "V-SM5" in e]
-        assert sm5_errors == [], f"Expected no V-SM5 errors, got:\n" + "\n".join(
+        assert sm5_errors == [], "Expected no V-SM5 errors, got:\n" + "\n".join(
             sm5_errors
         )
 
@@ -342,7 +341,7 @@ class TestStateMachineValidation:
         result = ValidationResult()
         validate_state_machine(canonical_json, result)
         sm6_errors = [e for e in result.errors if "V-SM6" in e]
-        assert sm6_errors == [], f"Expected no V-SM6 errors, got:\n" + "\n".join(
+        assert sm6_errors == [], "Expected no V-SM6 errors, got:\n" + "\n".join(
             sm6_errors
         )
 
@@ -372,7 +371,7 @@ class TestInvariantValidation:
         result = ValidationResult()
         validate_invariants(canonical_json, result)
         i1_errors = [e for e in result.errors if "V-I1" in e]
-        assert i1_errors == [], f"Expected no V-I1 errors, got:\n" + "\n".join(
+        assert i1_errors == [], "Expected no V-I1 errors, got:\n" + "\n".join(
             i1_errors
         )
 
@@ -398,7 +397,7 @@ class TestInvariantValidation:
         result = ValidationResult()
         validate_invariants(canonical_json, result)
         i2_errors = [e for e in result.errors if "V-I2" in e]
-        assert i2_errors == [], f"Expected no V-I2 errors, got:\n" + "\n".join(
+        assert i2_errors == [], "Expected no V-I2 errors, got:\n" + "\n".join(
             i2_errors
         )
 
@@ -407,7 +406,7 @@ class TestInvariantValidation:
         result = ValidationResult()
         validate_invariants(canonical_json, result)
         i3_warnings = [w for w in result.warnings if "V-I3" in w]
-        assert i3_warnings == [], f"Expected no V-I3 warnings, got:\n" + "\n".join(
+        assert i3_warnings == [], "Expected no V-I3 warnings, got:\n" + "\n".join(
             i3_warnings
         )
 
@@ -443,7 +442,7 @@ class TestRoleValidation:
         result = ValidationResult()
         validate_roles(canonical_json, result)
         r1_errors = [e for e in result.errors if "V-R1" in e]
-        assert r1_errors == [], f"Expected no V-R1 errors, got:\n" + "\n".join(
+        assert r1_errors == [], "Expected no V-R1 errors, got:\n" + "\n".join(
             r1_errors
         )
 
@@ -468,7 +467,7 @@ class TestRoleValidation:
         result = ValidationResult()
         validate_roles(canonical_json, result)
         r2_errors = [e for e in result.errors if "V-R2" in e]
-        assert r2_errors == [], f"Expected no V-R2 errors, got:\n" + "\n".join(
+        assert r2_errors == [], "Expected no V-R2 errors, got:\n" + "\n".join(
             r2_errors
         )
 
@@ -490,7 +489,7 @@ class TestDelegationValidation:
         d_errors = [
             e for e in result.errors if any(f"V-D{i}" in e for i in range(1, 4))
         ]
-        assert d_errors == [], f"Expected no V-D1/V-D2/V-D3 errors, got:\n" + "\n".join(
+        assert d_errors == [], "Expected no V-D1/V-D2/V-D3 errors, got:\n" + "\n".join(
             d_errors
         )
 
@@ -514,7 +513,7 @@ class TestDelegationValidation:
         result = ValidationResult()
         validate_delegation(canonical_json, result)
         d4_errors = [e for e in result.errors if "V-D4" in e]
-        assert d4_errors == [], f"Expected no V-D4 errors, got:\n" + "\n".join(
+        assert d4_errors == [], "Expected no V-D4 errors, got:\n" + "\n".join(
             d4_errors
         )
 
@@ -525,7 +524,7 @@ class TestDelegationValidation:
         result = ValidationResult()
         validate_delegation(canonical_json, result)
         d5_errors = [e for e in result.errors if "V-D5" in e]
-        assert d5_errors == [], f"Expected no V-D5 errors, got:\n" + "\n".join(
+        assert d5_errors == [], "Expected no V-D5 errors, got:\n" + "\n".join(
             d5_errors
         )
 
@@ -534,7 +533,7 @@ class TestDelegationValidation:
         result = ValidationResult()
         validate_delegation(canonical_json, result)
         d6_errors = [e for e in result.errors if "V-D6" in e]
-        assert d6_errors == [], f"Expected no V-D6 errors, got:\n" + "\n".join(
+        assert d6_errors == [], "Expected no V-D6 errors, got:\n" + "\n".join(
             d6_errors
         )
 
@@ -543,7 +542,7 @@ class TestDelegationValidation:
         result = ValidationResult()
         validate_delegation(canonical_json, result)
         d7_errors = [e for e in result.errors if "V-D7" in e]
-        assert d7_errors == [], f"Expected no V-D7 errors, got:\n" + "\n".join(
+        assert d7_errors == [], "Expected no V-D7 errors, got:\n" + "\n".join(
             d7_errors
         )
 
@@ -560,13 +559,13 @@ class TestCanonicalDescriptor:
     def test_tcd01_json_passes_schema(self, canonical_json: dict, schema: dict) -> None:
         """T-CD-01: workflow.json passes JSON Schema validation."""
         errors = _schema_errors(canonical_json, schema)
-        assert errors == [], f"Schema errors:\n" + "\n".join(errors)
+        assert errors == [], "Schema errors:\n" + "\n".join(errors)
 
     def test_tcd02_json_passes_state_machine(self, canonical_json: dict) -> None:
         """T-CD-02: workflow.json passes state machine validation (no errors)."""
         result = ValidationResult()
         validate_state_machine(canonical_json, result)
-        assert result.errors == [], f"State machine errors:\n" + "\n".join(
+        assert result.errors == [], "State machine errors:\n" + "\n".join(
             result.errors
         )
 
@@ -574,13 +573,13 @@ class TestCanonicalDescriptor:
         """T-CD-03: workflow.json passes invariant validation (no errors)."""
         result = ValidationResult()
         validate_invariants(canonical_json, result)
-        assert result.errors == [], f"Invariant errors:\n" + "\n".join(result.errors)
+        assert result.errors == [], "Invariant errors:\n" + "\n".join(result.errors)
 
     def test_tcd04_json_passes_role_validation(self, canonical_json: dict) -> None:
         """T-CD-04: workflow.json passes role validation (no errors)."""
         result = ValidationResult()
         validate_roles(canonical_json, result)
-        assert result.errors == [], f"Role errors:\n" + "\n".join(result.errors)
+        assert result.errors == [], "Role errors:\n" + "\n".join(result.errors)
 
     def test_tcd05_json_passes_delegation_validation(
         self, canonical_json: dict
@@ -588,7 +587,7 @@ class TestCanonicalDescriptor:
         """T-CD-05: workflow.json passes delegation validation (no errors)."""
         result = ValidationResult()
         validate_delegation(canonical_json, result)
-        assert result.errors == [], f"Delegation errors:\n" + "\n".join(result.errors)
+        assert result.errors == [], "Delegation errors:\n" + "\n".join(result.errors)
 
     @pytest.mark.xfail(
         reason="Known drift: workflow.json has extra 'delegated' stage not in workflow.yaml. "

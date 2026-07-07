@@ -46,7 +46,7 @@ Describe the command's canonical execution flow and responsibilities. Use number
 
 Note: use `$ARGUMENTS` as the authoritative seed intent when no explicit id is provided.
 
-2. Context discovery (agent responsibility)
+1. Context discovery (agent responsibility)
 
 - Use derived keywords to search the repo and related systems for relevant docs, work items, and code.
 - Output clearly labeled lists:
@@ -56,7 +56,7 @@ Note: use `$ARGUMENTS` as the authoritative seed intent when no explicit id is p
 
 Prefer short lists and one-line summaries to keep prompts focused and performant.
 
-3. Plan & safety checks (agent responsibility)
+1. Plan & safety checks (agent responsibility)
 
 - Draft a concise proposed plan of automated steps (1–4 bullets) that the agent intends to run.
 - Run a safety checklist: identify irreversible actions, required credentials, permissions, and potential risks.
@@ -64,7 +64,7 @@ Prefer short lists and one-line summaries to keep prompts focused and performant
 
 Document any required credentials or external permissions and do not assume they exist.
 
-4. Execute incremental steps (agent responsibility; prefer small, reversible actions)
+1. Execute incremental steps (agent responsibility; prefer small, reversible actions)
 
 - When possible, run actions in dry-run mode (`--dry-run`) first and present results.
 - Apply changes incrementally and produce artifacts under `.opencode/tmp/` with descriptive names.
@@ -72,12 +72,12 @@ Document any required credentials or external permissions and do not assume they
 
 Always show the exact commands the agent ran (or would run in dry-run) using fenced code blocks so the user can reproduce steps.
 
-5. Human approval (required for nontrivial changes)
+1. Human approval (required for nontrivial changes)
 
 - Present final artifact(s) and a 1–2 sentence headline for user approval.
 - Offer: approve and apply, request edits, or abort. If approved, proceed to finalization.
 
-6. Finalize changes (agent responsibility)
+1. Finalize changes (agent responsibility)
 
 - Make final updates to persistent artifacts (work items, files, PRs) idempotently.
 - Run any sync commands required (e.g. `wl sync`) and show results.
@@ -85,7 +85,7 @@ Always show the exact commands the agent ran (or would run in dry-run) using fen
 
 If publishing changes to the repository, show the `git` commands used (e.g. `git add`, `git commit`) and do not push unless explicitly requested.
 
-7. Completion
+1. Completion
 
 - Output: final artifact ids, one-line headline, and a short list of next recommended steps.
 - End with a fixed closing line: "This completes the <command-name> process for <<work-item-id>>"

@@ -9,10 +9,8 @@ is driven by a precise contract rather than being inferred from prose.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -28,6 +26,7 @@ from skill.audit.scripts.audit_runner import (
     _resolve_model_for_phase,
     _normalize_model_source,
     _deep_merge,
+    CALL_PI_TIMEOUT,
     DEFAULT_MODEL,
     DEFAULT_MODEL_SOURCE,
 )
@@ -415,6 +414,10 @@ class TestPersistenceDelegation:
             "skill.audit.scripts.audit_runner.persist_audit",
             fake_persist,
         )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
+        )
 
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
@@ -481,7 +484,12 @@ class TestReportStructure:
         assert "The API must return 200 for valid requests." in captured.out
         assert "unmet" in captured.out
 
-    def test_report_no_ac_fallback(self, capsys):
+    def test_report_no_ac_fallback(self, capsys, monkeypatch):
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "unmet", "evidence": ""},
+        )
+
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
                 stdout=json.dumps(_load_fixture("wi_without_ac.json")),
@@ -568,6 +576,39 @@ class TestDebugLogging:
 
 
 # ---------------------------------------------------------------------------
+# Timeout constant tests
+# ---------------------------------------------------------------------------
+
+class TestCallPiTimeoutConstant:
+    """Verify the CALL_PI_TIMEOUT constant exists and is generously sized.
+
+    The per-call timeout is a safety net for individual Pi model calls.
+    The primary protection against the parent bash-tool timeout (~120s)
+    is the cumulative elapsed-time guard in cmd_issue (110s threshold
+    for skipping remaining child audits), not this per-call timeout.
+    """
+
+    def test_call_pi_timeout_constant_exists(self):
+        """CALL_PI_TIMEOUT must be defined."""
+        assert CALL_PI_TIMEOUT is not None
+        assert isinstance(CALL_PI_TIMEOUT, int)
+
+    def test_call_pi_timeout_generous_for_large_prompts(self):
+        """Timeout must be generous (>= 300s) so large audit prompts complete."""
+        assert CALL_PI_TIMEOUT >= 300, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} must be >= 300s "
+            "to allow large audit prompts to complete"
+        )
+
+    def test_call_pi_timeout_not_excessive(self):
+        """Timeout should still have a reasonable upper bound."""
+        assert CALL_PI_TIMEOUT <= 900, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 900s "
+            "to bound the original indefinite-hang risk"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Project-mode report tests
 # ---------------------------------------------------------------------------
 
@@ -614,6 +655,10 @@ class TestExitCodes:
 
     def test_issue_wl_failure_returns_1(self, capsys):
         def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            # Let status updates succeed, only fail on wl show
+            if "--status" in cmd_list:
+                return _fake_proc(stdout=json.dumps({"success": True}))
             return _fake_proc(returncode=1, stderr="work item not found")
 
         rc = cmd_issue("SA-MISSING", runner=fake_runner)
@@ -902,3 +947,152 @@ class TestPiPromptSafetyInstructions:
     def test_project_prompt_has_structured_object_instruction(self):
         """Project summary prompt must instruct to return structured JSON object."""
         assert "Return ONLY a structured JSON object" in self.SOURCE
+
+
+# ---------------------------------------------------------------------------
+# Status lifecycle tests
+# ---------------------------------------------------------------------------
+
+class TestStatusLifecycle:
+    """Verify that cmd_issue manages work item status (in_progress -> open)."""
+
+    def _fake_runner_with_calls(self, calls: list, fail_show: bool = False):
+        """Create a fake runner that records calls and optionally fails on ``wl show``."""
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            calls.append(cmd_list)
+            # If fail_show is True and this is a "wl show" call, return failure
+            if fail_show and "show" in cmd_list:
+                return _fake_proc(returncode=1, stderr="wl: work item not found")
+            # All other calls succeed with valid JSON
+            return _fake_proc(stdout=json.dumps({"success": True}))
+        return fake_runner
+
+    def test_sets_in_progress_before_audit(self, monkeypatch):
+        """in_progress status must be set before wl show (first operation)."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+        )
+
+        cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        # The first wl update call should be for status in_progress
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
+        assert len(wl_updates) >= 1, f"Expected at least one wl update call, got: {calls}"
+        assert wl_updates[0][:5] == ["wl", "update", "SA-LIFECYCLE", "--status", "in_progress"], (
+            f"First update should be in_progress, got: {wl_updates[0]}"
+        )
+
+    def test_in_progress_includes_json_flag(self, monkeypatch):
+        """in_progress wl update must include --json flag."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+        )
+
+        cmd_issue("SA-JSONFLAG", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-JSONFLAG"]]
+        assert len(wl_updates) >= 1, f"Expected at least one wl update call, got: {calls}"
+        # The first wl update call should include --json as the 6th argument
+        in_progress_updates = [c for c in wl_updates if "--status" in c and "in_progress" in c]
+        assert len(in_progress_updates) >= 1, f"Expected in_progress update, got: {wl_updates}"
+        assert "--json" in in_progress_updates[0], (
+            f"in_progress update must include --json, got: {in_progress_updates[0]}"
+        )
+
+    def test_sets_open_after_audit(self, monkeypatch):
+        """open status must be set at the end of a successful audit."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+        )
+
+        cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
+        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
+        assert len(open_updates) >= 1, (
+            f"Expected at least one open status update, got: {wl_updates}"
+        )
+
+    def test_open_includes_json_flag(self, monkeypatch):
+        """open wl update must include --json flag."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+        )
+
+        cmd_issue("SA-JSONFLAG2", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-JSONFLAG2"]]
+        assert len(wl_updates) >= 1, f"Expected at least one wl update call, got: {calls}"
+        # The open update should include --json
+        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
+        assert len(open_updates) >= 1, (
+            f"Expected open update, got: {wl_updates}"
+        )
+        assert "--json" in open_updates[0], (
+            f"open update must include --json, got: {open_updates[0]}"
+        )
+
+    def test_sets_open_on_wl_show_failure(self):
+        """open status must be set even when wl show fails."""
+        calls = []
+
+        rc = cmd_issue("SA-FAIL", runner=self._fake_runner_with_calls(calls, fail_show=True), persist=False)
+        assert rc == 1, f"Expected exit code 1 on wl show failure, got {rc}"
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-FAIL"]]
+        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
+        assert len(open_updates) >= 1, (
+            f"Expected open update even on failure, got: {wl_updates}"
+        )
+
+    def test_in_progress_before_open(self, monkeypatch):
+        """in_progress must appear before open in the call sequence."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+        )
+
+        cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
+        statuses = [" ".join(c[3:]) for c in wl_updates]
+        in_progress_idx = next(i for i, s in enumerate(statuses) if "in_progress" in s)
+        open_idx = next(i for i, s in enumerate(statuses) if "--status open" in s)
+        assert in_progress_idx < open_idx, (
+            f"in_progress (index {in_progress_idx}) must come before open (index {open_idx}): {statuses}"
+        )
+
+    def test_sets_open_on_exception_in_main_logic(self, monkeypatch):
+        """open must be set when an unhandled exception occurs in the main logic."""
+        calls = []
+
+        def fake_call_pi(prompt, model="x", pi_bin="x", **kwargs):
+            raise RuntimeError("Pi crashed")
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        cmd_issue("SA-EXCEPT", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-EXCEPT"]]
+        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
+        assert len(open_updates) >= 1, (
+            f"Expected open update after exception, got: {wl_updates}"
+        )

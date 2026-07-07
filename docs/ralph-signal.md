@@ -125,8 +125,10 @@ The webhook POST body follows the [Discord Embed](https://discord.com/developers
 ```
 
 The embed title is constructed as follows:
+
 - When a work-item title is available (resolved from the work item), the title is `"Ralph: <work-item-title>"`.
 - When no title can be resolved (e.g., fetch failure or no single work-item ID), it falls back to `"Ralph Event: <event_type>"` (e.g., `"Ralph Event: Completed"`).
+
 ```
 
 ### Behaviour
@@ -242,6 +244,7 @@ Below is a ready-to-copy work item description for implementing Pi-side integrat
 **Summary**: Implement periodic polling of Ralph's signal file in Pi to automatically relay `ralph status` output to the user when a significant event occurs.
 
 **Acceptance Criteria**:
+
 1. Pi reads the `signal_file_path` from Ralph's runtime context (`.worklog/ralph/current.json`).
 2. Pi checks the signal file at a configurable interval (default: 30 seconds).
 3. When a new signal event is detected, Pi runs `ralph status` and relays the output to the user.
@@ -255,6 +258,7 @@ Below is a ready-to-copy work item description for implementing Pi-side integrat
 **Dependencies**: Depends on SA-0MPLQVA45002BOAR (Notify ralph manager when a significant change has occurred)
 
 **Related Files**:
+
 - `docs/ralph-signal.md` — signal file format and integration spec
 - `.worklog/ralph/current.json` — runtime context with `signal_file_path` field
 - `.ralph/event.pending` — signal file (default path)

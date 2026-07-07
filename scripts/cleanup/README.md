@@ -34,7 +34,6 @@ Dry-run stale remote cleanup (90 days):
 python scripts/cleanup/cleanup_stale_remote_branches.py --days 90 --dry-run --report /tmp/cleanup/remote.json
 ```
 
-
 ## Behavior notes vs cleanup skill
 
 - These scripts are non-interactive by default, controlled via `--dry-run` and `--yes`.

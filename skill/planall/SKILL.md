@@ -22,8 +22,20 @@ PlanAll can be invoked in the following ways:
 - `/skill:planall` — Process all intake_complete items with markdown summary output
 - `/skill:planall --json` — JSON output for programmatic consumption
 - `/skill:planall --parent-id <id>` — Post the summary as a comment on the specified parent work item
-- `python3 skill/planall/scripts/planall.py` — Direct Python invocation
+- `/skill:planall --max N` — Process at most N items, then stop
+- `/skill:planall --item-timeout N` — Set per-item subprocess timeout in seconds (default: 600)
+- `python3 ./scripts/planall.py` — Direct Python invocation
 - `pi run /planall` — Agent framework invocation
+
+### CLI flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--json` | flag | off | Produce JSON output instead of Markdown |
+| `--parent-id` | str | None | Post the summary as a comment on the specified parent work item |
+| `--max` | int | 0 | Maximum number of items to process (0 = no limit) |
+| `--item-timeout` | int | 600 | Timeout in seconds for each item's subprocess call |
+| `--verbose` | flag | off | Enable verbose logging |
 
 ## Output
 
@@ -36,6 +48,7 @@ After processing all items, PlanAll produces a summary report:
 **Planned**: 3
 **Needs input**: 1
 **Errors**: 1
+**Remaining**: 2
 
 ## Results
 
@@ -54,6 +67,7 @@ When `--json` is used, the output is a JSON object:
   "planned": 3,
   "needs_input": 1,
   "errors": 1,
+  "remaining": 2,
   "items": [
     {"id": "SA-ITEM-001", "title": "...", "outcome": "planned"}
   ]
@@ -74,8 +88,19 @@ Items flagged as `needs_input` are not retried — the skill moves on to the nex
 
 - If `wl list` fails (non-zero exit or exception), returns an empty list gracefully
 - If claiming an item fails, logs a warning and marks the item as `error`
-- If `/plan` fails for an item, logs a warning and continues to the next item
+- If `/plan` fails for an item, logs a warning, attempts recovery (resets item status to `open` and stage back to `intake_complete`), and continues to the next item
+- On per-item timeout (`subprocess.TimeoutExpired`), the item is recovered same as failure and processing continues
 - All errors are captured in the summary report
+
+## Signal handling
+
+PlanAll registers SIGINT and SIGTERM handlers for graceful abort. On receiving a signal:
+
+1. The currently in-progress item is recovered — its stage is reset to `intake_complete` and status to `open`
+2. Original signal handlers are restored
+3. The process exits with the signal code (128 + signum)
+
+This ensures no items are left in a stuck `in_progress` state if the batch process is interrupted.
 
 ## Idempotence
 
@@ -87,21 +112,30 @@ Items flagged as `needs_input` are not retried — the skill moves on to the nex
 
 ```bash
 # Process all intake_complete items
-python3 skill/planall/scripts/planall.py
+python3 ./scripts/planall.py
 
 # JSON output
-python3 skill/planall/scripts/planall.py --json
+python3 ./scripts/planall.py --json
 
 # Post summary as a comment on a parent epic
-python3 skill/planall/scripts/planall.py --parent-id SA-0MQA6ECEU003GUKH
+python3 ./scripts/planall.py --parent-id SA-0MQA6ECEU003GUKH
+
+# Process only the first 5 items
+python3 ./scripts/planall.py --max 5
+
+# Set per-item timeout to 300 seconds (5 minutes)
+python3 ./scripts/planall.py --item-timeout 300
+
+# Combine --max and --item-timeout
+python3 ./scripts/planall.py --max 3 --item-timeout 120
 ```
 
 ## Scripts
 
-- Canonical runner: `skill/planall/scripts/planall.py`
-- Tests: `skill/planall/tests/test_planall.py`
+- Canonical runner: `./scripts/planall.py`
+- Tests: `./tests/test_planall.py`
 
 ## Related skills
 
 - `command/plan.md` — The `/plan` command that PlanAll invokes for each item
-- `skill/ralph/SKILL.md` — Ralph orchestration loop that provides auto-planning for individual items
+- `../ralph/SKILL.md` — Ralph orchestration loop that provides auto-planning for individual items

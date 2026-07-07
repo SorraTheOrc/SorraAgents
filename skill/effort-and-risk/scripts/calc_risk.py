@@ -15,15 +15,7 @@ Output: risk object with aggregated probability, impact, score, level, top_drive
 import sys
 import json
 
-
-def level_from_score(score):
-    if score <= 5:
-        return "Low"
-    if score <= 12:
-        return "Medium"
-    if score <= 19:
-        return "High"
-    return "Critical"
+from _shared import level_from_score
 
 
 def main():

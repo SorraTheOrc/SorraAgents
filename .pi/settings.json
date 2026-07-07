@@ -1,4 +1,7 @@
 {
+  "llm-wiki": {
+    "notices": false
+  },
   "httpIdleTimeoutMs": 1800000,
   "retry": {
     "provider": {

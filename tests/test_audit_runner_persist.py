@@ -10,20 +10,18 @@ All tests use injectable runners to avoid real subprocess calls.
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 
 # Ensure repo root is on path
 REPO_ROOT = Path(__file__).resolve().parent / ".."
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts.audit_runner import cmd_issue
-from skill.audit.scripts.persist_audit import persist_audit
+from skill.audit.scripts.audit_runner import cmd_issue  # noqa: E402
+from skill.audit.scripts.persist_audit import persist_audit  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +244,10 @@ class TestAuditRunnerReportOnPersistFailure:
     def test_wl_failure_returns_1(self):
         """When wl show fails, cmd_issue returns 1."""
         def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            # Let status lifecycle updates succeed
+            if "--status" in cmd_list:
+                return _fake_proc(stdout=json.dumps({"success": True}))
             return _fake_proc(returncode=1, stderr="work item not found")
 
         rc = cmd_issue("SA-MISSING", runner=fake_runner)
@@ -325,6 +327,10 @@ class TestExitCodes:
 
     def test_wl_failure_returns_1(self):
         def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            # Let status lifecycle updates succeed
+            if "--status" in cmd_list:
+                return _fake_proc(stdout=json.dumps({"success": True}))
             return _fake_proc(returncode=1, stderr="wl not found")
         rc = cmd_issue("SA-MISSING", runner=fake_runner)
         assert rc == 1

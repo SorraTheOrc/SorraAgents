@@ -29,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.signal_system import resolve_signal_path
+from skill.ralph.scripts.signal_system import resolve_signal_path  # noqa: E402
 
 logger = logging.getLogger("ralph")
 
@@ -472,7 +472,7 @@ def format_status(snapshot: dict[str, object]) -> str:
     state = snapshot.get("state") or "unknown"
     pid = snapshot.get("pid", 0)
     target = snapshot.get("target_id", "unknown")
-    lines.append(f"# Ralph Status")
+    lines.append("# Ralph Status")
     lines.append("")
     lines.append(f"**State**: `{state}` | **PID**: `{pid}` | **Target**: `{target}`")
 
@@ -522,7 +522,6 @@ def format_status(snapshot: dict[str, object]) -> str:
             since_str = _humanize_time_delta(delta_seconds)
         else:
             since_str = ""
-        state_word = "running" if state == "running" else "stopped"
         if since_str:
             if state == "running":
                 lines.append(f"Ralph is running. Last recorded activity was {since_str}.")

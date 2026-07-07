@@ -3,13 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.ralph_loop import RalphLoop, _build_implement_prompt
+from skill.ralph.scripts.ralph_loop import RalphLoop, _build_implement_prompt  # noqa: E402
 
 
 class SingleItemLoop(RalphLoop):

@@ -1,0 +1,1 @@
+"""IntakeAll scripts package."""

@@ -1,0 +1,34 @@
+{
+  "enabled": true,
+  "linter": {
+    "enabled": true,
+    "severity_overrides": {
+      "F841": "low"
+    }
+  },
+  "llm": {
+    "enabled": true,
+    "model": "default",
+    "temperature": 0.1,
+    "max_tokens": 2000
+  },
+  "severity_mapping": {
+    "critical": { "priority": "critical", "color": "red" },
+    "high": { "priority": "high", "color": "orange" },
+    "medium": { "priority": "medium", "color": "yellow" },
+    "low": { "priority": "low", "color": "green" }
+  },
+  "smell_types": [
+    "unused_import",
+    "unused_variable",
+    "unused_function",
+    "complex_function",
+    "magic_number",
+    "duplicate_code",
+    "long_method",
+    "god_class",
+    "feature_envy",
+    "inappropriate_intimacy",
+    "shotgun_surgery"
+  ]
+}

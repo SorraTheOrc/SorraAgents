@@ -19,14 +19,14 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.ralph_loop import (
+from skill.ralph.scripts.ralph_loop import (  # noqa: E402
     RalphLoop,
     _extract_text_from_assistant_message,
     _extract_text_from_content,
     _extract_text_from_json_output,
     _extract_last_assistant_message_text,
     _parse_pi_json_line,
-)
+)  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

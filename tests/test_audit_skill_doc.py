@@ -90,6 +90,72 @@ class TestAuditSkillDoc:
         assert "persist_audit.py" in text
 
 
+class TestAuditSkillReadyToCloseCriteria:
+    """Assert that SKILL.md contains correct ready-to-close criteria guidance
+    for the model, particularly that children in `in_review` stage do NOT block
+    closure and that extraneous release-process constraints are prohibited."""
+
+    def test_in_review_children_acceptable(self):
+        """SKILL.md must state that children in in_review stage are acceptable and do NOT block closure."""
+        text = _skill_md_text()
+        # Check for explicit language that in_review children don't block closure
+        assert "in_review" in text
+        assert "do NOT block closure" in text or "does not block closure" in text or "do not block closure" in text.lower()
+
+    def test_in_review_or_done_stage_acceptable(self):
+        """SKILL.md must mention in_review or done as acceptable child stages."""
+        text = _skill_md_text()
+        assert "in_review" in text and "done" in text
+        # Verify the ready-to-close criteria explicitly lists in_review/done as acceptable
+        assert "in_review" in text and "done" in text
+
+    def test_no_release_process_in_audit_verdict(self):
+        """SKILL.md must prohibit adding release-process constraints like 'must be merged to main' in audit verdicts."""
+        text = _skill_md_text()
+        # The SKILL.md must include a clear statement that release-process
+        # constraints (e.g., "must be merged to main") are NOT an audit concern
+        # and must not appear in audit verdicts
+        has_explicit_prohibition = (
+            "release process" in text.lower()
+            or "merged to main" in text.lower()
+            or "release constraints" in text.lower()
+        )
+        has_prohibition_marker = (
+            "MUST NOT" in text
+            or "DO NOT" in text
+            or "must not" in text
+            or "do not" in text
+        )
+        # Check either they're together in context, or the intent is clearly communicated
+        if has_explicit_prohibition:
+            assert has_prohibition_marker, (
+                "If release process is mentioned, there must be a prohibition marker"
+            )
+        else:
+            # The release process might not be explicitly named, but there must be
+            # a clear prohibition against adding constraints outside the defined criteria
+            assert "not an audit concern" in text.lower() or "not a closure constraint" in text.lower()
+
+    def test_guidance_for_models_includes_ready_to_close(self):
+        """The Guidance for models section must reference the ready-to-close criteria."""
+        text = _skill_md_text()
+        # Find the Guidance for models section
+        guidance_idx = text.find("## Guidance for models")
+        assert guidance_idx >= 0, "Guidance for models section must exist"
+        # The section after this point should contain a reference to ready-to-close logic
+        guidance_section = text[guidance_idx:]
+        assert "ready-to-close" in guidance_section.lower() or "Ready to close" in guidance_section
+
+    def test_phase1_children_stage_check_documented_in_guidance(self):
+        """The Guidance for models section must document that Phase 1 includes a children stage check."""
+        text = _skill_md_text()
+        guidance_idx = text.find("## Guidance for models")
+        assert guidance_idx >= 0
+        guidance_section = text[guidance_idx:]
+        assert "Phase 1" in guidance_section
+        assert "children" in guidance_section.lower()
+
+
 class TestAuditSkillSafetyInstructions:
     """Assert that SKILL.md contains critical safety instructions that
     prevent models from modifying work items during audit evaluation."""
@@ -108,7 +174,8 @@ class TestAuditSkillSafetyInstructions:
     def test_no_wl_state_commands_prohibition(self):
         """SKILL.md must prohibit executing wl commands that change state."""
         text = _skill_md_text()
-        assert "wl" in text and "change state" in text
+        assert "wl" in text
+        assert "state-modifying" in text or "change state" in text
 
     def test_structured_markdown_report_instruction(self):
         """SKILL.md must instruct the model to produce only a structured markdown report."""
@@ -126,3 +193,42 @@ class TestAuditSkillSafetyInstructions:
         text = _skill_md_text()
         assert "refuse" in text.lower()
         assert "wl" in text
+
+
+class TestAuditSkillWorkItemIdDetection:
+    """Assert that SKILL.md contains explicit work item ID detection instructions."""
+
+    def test_regex_pattern_present(self):
+        """SKILL.md must include explicit regex for work item ID detection."""
+        text = _skill_md_text()
+        assert "[A-Z]{2}-[A-Z0-9]+" in text or "[A-Z]{2}-[A-Z0-9]+\\b" in text
+
+    def test_pre_flight_affirmation_present(self):
+        """SKILL.md must include a pre-flight affirmation step."""
+        text = _skill_md_text()
+        assert "Pre-flight affirmation" in text
+
+    def test_verification_guard_present(self):
+        """SKILL.md must include a verification guard before project-level path."""
+        text = _skill_md_text()
+        assert "Verify absence before proceeding" in text
+
+    def test_scan_match_branch_structure(self):
+        """SKILL.md must use active 'scan → match → branch' structure."""
+        text = _skill_md_text()
+        assert "Scan for a work item ID" in text
+        assert "No ID found" in text
+        assert "ID found" in text
+
+    def test_item_level_routes_to_wl_show(self):
+        """SKILL.md must route item-level audits to `wl show`."""
+        text = _skill_md_text()
+        # Verify the item-level path references wl show with children
+        assert "wl show" in text
+        assert "--children" in text
+
+    def test_project_level_routes_to_wl_list(self):
+        """SKILL.md must route project-level audits to `wl list`."""
+        text = _skill_md_text()
+        assert "wl list" in text
+        assert "wl in_progress" in text

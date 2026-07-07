@@ -16,14 +16,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.ralph_loop import (
+from skill.ralph.scripts.ralph_loop import (  # noqa: E402
     DEFAULT_MODEL,
-    DEFAULT_MODEL_SOURCE,
     RalphLoop,
     _extract_phase_model_config,
     _resolve_complexity_tier,
     _resolve_phase_model_value,
-)
+)  # noqa: E402
 
 
 class _FakeProc:
@@ -99,13 +98,13 @@ class TestResolveComplexityTier:
         """Missing risk -> defaults to Medium for tier resolution."""
         assert _resolve_complexity_tier(self._default_config(), {"effort": "Small"}) == "medium"
 
-    def test_both_missing_defaults_to_medium(self):
-        """Both missing -> medium tier."""
-        assert _resolve_complexity_tier(self._default_config(), {}) == "medium"
+    def test_both_missing_defaults_to_low(self):
+        """Both missing -> low tier."""
+        assert _resolve_complexity_tier(self._default_config(), {}) == "low"
 
-    def test_none_values_defaults_to_medium(self):
-        """None values -> medium tier."""
-        assert _resolve_complexity_tier(self._default_config(), {"effort": None, "risk": None}) == "medium"
+    def test_none_values_defaults_to_low(self):
+        """None values -> low tier."""
+        assert _resolve_complexity_tier(self._default_config(), {"effort": None, "risk": None}) == "low"
 
     def test_unknown_values_defaults_to_medium(self):
         """Unknown values -> defaults to Medium -> medium tier."""

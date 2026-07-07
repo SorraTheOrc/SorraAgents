@@ -9,11 +9,10 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
-from skill.ralph.scripts.ralph_loop import RalphLoop
+from skill.ralph.scripts.ralph_loop import RalphLoop  # noqa: E402
 
 
 def _make_mock_process(

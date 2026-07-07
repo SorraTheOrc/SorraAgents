@@ -60,17 +60,17 @@ Where `<action>` is one of:
 
 ## Scripts and Modules
 
-- `skill/ship/scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, `checkUnmergedBranches`, and re-exports from `git-helpers.js`)
-- `skill/ship/scripts/git-helpers.js` — Branch naming and policy helpers (exports: `makeBranchName`, `validateBranchName`, `isBranchBlocked`, `BLOCKED_BRANCHS`, `BRANCH_NAME_PATTERN`)
-- `skill/ship/scripts/check-unmerged-branches.js` — Unmerged branch detection module (exports: `checkUnmergedBranches`, `getUnmergedBranchNames`, `extractWorkItemId`, `getWorkItemStatus`)
-- `skill/ship/scripts/run-release.js` — Safe wrapper to invoke the release process (exports: `runRelease`, `syncDevWithMain`, `parsePRUrl`, `waitForPRMerge`; includes unmerged branches gating check, post-release dev sync)
-- `skill/ship/scripts/release/merge-dev-to-main.sh` — Canonical release merge script (installed in the skill directory)
+- `./scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, `checkUnmergedBranches`, and re-exports from `git-helpers.js`)
+- `./scripts/git-helpers.js` — Branch naming and policy helpers (exports: `makeBranchName`, `validateBranchName`, `isBranchBlocked`, `BLOCKED_BRANCHS`, `BRANCH_NAME_PATTERN`)
+- `./scripts/check-unmerged-branches.js` — Unmerged branch detection module (exports: `checkUnmergedBranches`, `getUnmergedBranchNames`, `extractWorkItemId`, `getWorkItemStatus`)
+- `./scripts/run-release.js` — Safe wrapper to invoke the release process (exports: `runRelease`, `syncDevWithMain`, `parsePRUrl`, `waitForPRMerge`; includes unmerged branches gating check, post-release dev sync)
+- `./scripts/release/merge-dev-to-main.sh` — Canonical release merge script (installed in the skill directory)
 
 ## Usage
 
 ```javascript
 // Push completed work into dev
-import { pushToDev } from 'skill/ship/scripts/ship.js';
+import { pushToDev } from './scripts/ship.js';
 
 const result = pushToDev('origin');
 if (!result.success) {
@@ -78,7 +78,7 @@ if (!result.success) {
 }
 
 // Generate a canonical branch name
-import { makeBranchName, validateBranchName, isBranchBlocked } from 'skill/ship/scripts/git-helpers.js';
+import { makeBranchName, validateBranchName, isBranchBlocked } from './scripts/git-helpers.js';
 
 const branchName = makeBranchName('SA-001', 'fix-login-bug');
 // Returns: 'wl-SA-001-fix-login-bug'
@@ -98,6 +98,7 @@ into `dev`. This is a **gating step** to prevent accidentally pushing when there
 are unmerged feature branches that should be dealt with first.
 
 The check works as follows:
+
 1. Runs `git branch --no-merged dev` to list all local branches not merged into `dev`.
 2. Excludes `dev` itself, protected branches (`main`, `master`), and the
    **current branch** (the branch being worked on).
@@ -107,6 +108,7 @@ The check works as follows:
    work item details.
 
 If unmerged branches are found, the operation is blocked with a report that shows:
+
 - The branch name
 - The associated work item title and ID (if the branch follows the canonical pattern)
 - The work item's status and stage
@@ -114,7 +116,7 @@ If unmerged branches are found, the operation is blocked with a report that show
 ### Using checkUnmergedBranches Programmatically
 
 ```javascript
-import { checkUnmergedBranches } from 'skill/ship/scripts/check-unmerged-branches.js';
+import { checkUnmergedBranches } from './scripts/check-unmerged-branches.js';
 
 const report = checkUnmergedBranches();
 
@@ -161,18 +163,20 @@ before executing the release script. If unmerged branches are found, the release
 is aborted. To bypass, use the `--skip-checks` flag:
 
 ```bash
-node skill/ship/scripts/run-release.js --skip-checks
+node ./scripts/run-release.js --skip-checks
 ```
 
 ## Push-to-Dev Workflow
 
-Agents work in feature branches and push completed work into the `dev` integration branch. This is the canonical integration action.
+Agents work in worktrees with feature branches and push completed work into the `dev` integration branch. This is the canonical integration action.
 
-1. **Create a feature branch** using `makeBranchName(workItemId, shortDesc)` from `skill/ship/scripts/git-helpers.js`. 
-2. **Make changes and commit** on the feature branch.
+See [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full worktree workflow (create, use, push, clean up) and [AGENTS.md](../../AGENTS.md#implement-the-work-item) for the top-level policy.
+
+1. **Create a worktree with a feature branch** inside `.worklog/worktrees/` using the naming convention from `makeBranchName(workItemId, shortDesc)` in `./scripts/git-helpers.js`.
+2. **Make changes and commit** inside the worktree.
 3. **Validate** the current branch name with `validateBranchName(name)`.
 4. **Check for unmerged branches** using `checkUnmergedBranches()` (also run automatically by `pushToDev()`).
-5. **Push to dev** using `pushToDev()` from `skill/ship/scripts/ship.js`. This:
+5. **Push to dev** from inside the worktree using `pushToDev()` from `./scripts/ship.js`. This:
    - Validates the push target is not a protected branch
    - Rejects force-push
    - Checks for unmerged branches (gating step)
@@ -182,6 +186,7 @@ Agents work in feature branches and push completed work into the `dev` integrati
 ### Protected Branches
 
 Agents MUST NOT push directly to:
+
 - `main`
 - `master`
 - `HEAD`
@@ -205,11 +210,13 @@ wl-<work-item-id>-<short-description>
 ```
 
 Where:
+
 - `wl-` is a literal prefix
 - `<work-item-id>` is the Worklog identifier (e.g., `SA-0MPDZDPZB00121IE`)
 - `<short-description>` is a lowercase, hyphen-separated slug
 
 Examples:
+
 - `wl-SA-0MPDZDPZB00121IE-branch-naming-policy`
 - `wl-SA-001-fix-login-bug`
 
@@ -232,7 +239,7 @@ Force-push (`git push --force` / `git push -f`) is prohibited.
 Execute the release using the canonical merge script:
 
 ```bash
-node skill/ship/scripts/run-release.js
+node ./scripts/run-release.js
 ```
 
 The script performs the following steps:
@@ -268,6 +275,12 @@ The script performs the following steps:
    - Runs `git merge origin/main`
    - Runs `git push origin dev`
 
+   **Note**: Release operations run from the **main checkout** (not a
+   worktree). Implementation agents use worktrees for feature work; the
+   release/ship process operates on the canonical `dev` branch in the main
+   checkout. After pushing from a worktree, agents should clean up the
+   worktree and return to the main checkout.
+
 ### Fallback: Human Release Manager
 
 For repositories where the automated merge is not suitable, a **human Release Manager** can perform the release
@@ -278,7 +291,7 @@ The human fallback supports three approaches:
 
 | Approach | Description | When to use |
 |----------|-------------|-------------|
-| **Automated script** | Run `node skill/ship/scripts/run-release.js` manually | Script is available in the skill directory |
+| **Automated script** | Run `node ./scripts/run-release.js` manually | Script is available in the skill directory |
 | **Direct merge** | `git checkout main && git merge origin/dev --no-ff` | No branch protection on main |
 | **Manual PR** | Create a temp branch with merge result and open a PR | Want human review before merge |
 
@@ -297,7 +310,7 @@ test commands to run locally.
 
 ## Preferred execution behaviour (policy)
 
-- The agent should invoke `skill/ship/scripts/run-release.js`
+- The agent should invoke `./scripts/run-release.js`
   to perform the dev → main merge.
 - The agent MUST NOT perform the merge by substituting its own ad-hoc git
   commands for the canonical script during normal operation.
@@ -322,12 +335,14 @@ test commands to run locally.
 
 ## Integration with AGENTS.md
 
-The per-work-item merge workflow in AGENTS.md (step 6) describes PR-based merging into `main`. This skill's `pushToDev()` function handles the **dev integration step** that happens *before* the final PR to `main`:
+The per-work-item merge workflow in [AGENTS.md](../../AGENTS.md) describes PR-based merging into `main`. This skill's `pushToDev()` function handles the **dev integration step** that happens *before* the final PR to `main`:
 
-1. Agent implements work on a feature branch → commits → builds → tests
-2. Agent calls `pushToDev()` to integrate into `dev`
-3. CI runs on `dev`
-4. Release Manager merges `dev` → `main` via PR (see AGENTS.md step 6)
+1. Agent implements work inside a worktree → commits → builds → tests
+2. Agent calls `pushToDev()` from within the worktree to integrate into `dev`
+3. After pushing, the agent cleans up the worktree (see [[concepts/git-worktree-best-practices-for-agent-workflows]])
+4. Agent switches to the main checkout's `dev` branch
+5. CI runs on `dev`
+6. Release Manager merges `dev` → `main` via PR (see AGENTS.md step 6)
 
 ## Outputs
 
