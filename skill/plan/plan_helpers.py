@@ -17,6 +17,9 @@ The module provides:
   - A high-level ``make_autoplan_decision()`` orchestrator
   - ``run_effort_and_risk()`` wrapper for the effort-and-risk skill
   - ``append_autoplan_decision_comment()`` for idempotent comment posting
+  - ``validate_key_files_format()`` for syntactic validation of ``**Key Files:**``
+  - ``validate_key_files_in_description()`` for validating key files within
+    a full work item description
   - CLI entry points ``plan-if-needed`` and ``check-effort-risk``
 """
 
@@ -37,6 +40,135 @@ logger = logging.getLogger("plan_helpers")
 # skip /plan and proceed directly to implement.
 DEFAULT_AUTOPLAN_EFFORT_SKIP: frozenset[str] = frozenset({"Extra Small", "Small"})
 DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
+
+
+# ---------------------------------------------------------------------------
+# Key Files validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_key_files_section(text: str) -> list[str]:
+    """Extract file paths from the ``**Key Files:**`` section of a work item description.
+
+    Looks for a line starting with ``**Key Files:**``, then collects bullet
+    items (lines starting with ``- ``) that follow. From each bullet, extracts
+    the file path by looking for content between backticks, or falling back to
+    the first whitespace-delimited token after the ``- `` marker.
+
+    Returns a list of extracted file paths (empty if no section found).
+    """
+    lines = text.split("\n")
+    paths: list[str] = []
+    in_section = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("**Key Files:**"):
+            in_section = True
+            continue
+        if in_section:
+            # Stop at the next heading or blank-line break before another section
+            if stripped.startswith("**") and stripped != "**":
+                break
+            if stripped.startswith("- "):
+                bullet = stripped[2:].strip()
+                # Try to extract path from backticks first
+                path = _extract_path_from_bullet(bullet)
+                if path:
+                    paths.append(path)
+    return paths
+
+
+def _extract_path_from_bullet(bullet: str) -> str | None:
+    """Extract a file path from a bullet item.
+
+    Looks for content between backticks; if none found, takes the first
+    whitespace-delimited token (before ``---`` or ``—`` if present).
+    Returns None if no path-like content is found (e.g. the bullet is a
+    free-text note rather than a path reference).
+    """
+    # Try backtick content first
+    if "`" in bullet:
+        # Find content between backticks
+        start = bullet.find("`")
+        end = bullet.find("`", start + 1)
+        if end != -1:
+            return bullet[start + 1:end].strip()
+
+    # Fallback: first token before a separator or end
+    for sep in [" — ", " -- ", " - "]:
+        if sep in bullet:
+            token = bullet.split(sep)[0].strip()
+            if token and not token.startswith("#"):
+                return token
+
+    # Take first word
+    first = bullet.split()[0] if bullet.split() else None
+    if first and not first.startswith("#"):
+        # Heuristic: real file paths typically contain "/" or ".". If the
+        # extracted token looks like a sentence fragment (no / or .), skip
+        # it to avoid false positives from free-text bullets like
+        # "- This is just a note".
+        if "/" in first or "." in first:
+            return first
+    return None
+
+
+def _is_valid_file_path(path: str) -> tuple[bool, str | None]:
+    """Check whether a file path is syntactically valid.
+
+    Returns (True, None) if valid, or (False, reason) if invalid.
+
+    Valid paths must:
+    - Contain at least one ``/`` (directory separator)
+    - Have a file extension (a ``.`` followed by characters after the last ``/``)
+    """
+    if "/" not in path:
+        return False, f"Path '{path}' is missing a directory separator ('/')"
+
+    # Get the filename part (after last /)
+    filename = path.rsplit("/", 1)[-1]
+    if "." not in filename or filename.endswith("."):
+        return False, f"Path '{path}' is missing a file extension"
+
+    return True, None
+
+
+def validate_key_files_format(text: str) -> list[str]:
+    """Validate the ``**Key Files:**`` section in a work item description for syntactic correctness.
+
+    Checks:
+    - Each file path contains at least one ``/`` (directory separator)
+    - Each file path has a file extension
+    - The section is not empty (if present)
+
+    Returns a list of issue descriptions (empty list if all valid).
+    """
+    issues: list[str] = []
+    paths = _parse_key_files_section(text)
+
+    if not paths:
+        # Check whether the section header exists at all
+        if "**Key Files:**" in text:
+            issues.append("**Key Files:** section is present but contains no valid file paths")
+        return issues
+
+    for path in paths:
+        valid, reason = _is_valid_file_path(path)
+        if not valid:
+            issues.append(reason)
+
+    return issues
+
+
+def validate_key_files_in_description(description: str) -> list[str]:
+    """Higher-level wrapper that validates ``**Key Files:**`` within a full work item description.
+
+    Delegates to ``validate_key_files_format()`` for the actual validation.
+
+    Returns a list of issue descriptions (empty if all valid or no section).
+    """
+    return validate_key_files_format(description)
 
 
 # ---------------------------------------------------------------------------

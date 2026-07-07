@@ -107,7 +107,7 @@ Ralph's autoplan).
    Or use the canonical bundled script directly:
 
    ```bash
-   python3 skill/plan/plan_helpers.py plan-if-needed <work-item-id>
+   python3 ./plan_helpers.py plan-if-needed <work-item-id>
    ```
 
 2. Parse the JSON result. Expected keys:
@@ -169,6 +169,22 @@ Review stages (adapted for existing content):
 1. **Completeness review** — Ensure the work item has all required fields
    (description, acceptance criteria) and that any existing child items
    are complete. Add missing fields if clearly definable from context.
+
+   Additionally, if the work item contains a ``**Key Files:**`` section
+   (predicted during intake), validate the listed file paths:
+
+   - **Syntactic validity**: every path should contain at least one ``/``
+     (directory separator) and have a file extension. The helper
+     ``validate_key_files_format()`` can be used to check this programmatically.
+   - **Completeness**: flag any obviously missing files relative to the
+     work item scope (e.g. if the description mentions modifying a module
+     but no file in that module is listed).
+   - **Accuracy**: flag any obviously irrelevant or incorrect files in the
+     list.
+
+   Any corrections (additions, removals, or corrections) to the ``**Key
+   Files:**`` list identified during this review should be reflected in the
+   work item description before the plan process completes.
 2. **Sequencing & dependencies review** — Verify any existing child item
    dependencies are coherent. Check that test/verification items appear
    before implementation items if both exist. Ensure test features come first
@@ -318,6 +334,22 @@ instructions above).
 
    Review stages and expected behavior:
    1. Completeness review — Ensure every feature has all required fields.
+
+      Additionally, if the work item contains a ``**Key Files:**`` section
+      (predicted during intake), validate the listed file paths:
+
+      - **Syntactic validity**: every path should contain at least one ``/``
+        (directory separator) and have a file extension. The helper
+        ``validate_key_files_format()`` can be used to check this programmatically.
+      - **Completeness**: flag any obviously missing files relative to the
+        work item scope (e.g. if the description mentions modifying a module
+        but no file in that module is listed).
+      - **Accuracy**: flag any obviously irrelevant or incorrect files in the
+        list.
+
+      Any corrections (additions, removals, or corrections) to the ``**Key
+      Files:**`` list identified during this review should be reflected in the
+      work item description before the plan process completes.
    2. Sequencing & dependencies review — Ensure dependencies are coherent
       and actionable. Verify that test/verification features appear before
       implementation features.
@@ -389,8 +421,8 @@ instructions above).
 
   Usage:
   ```bash
-  python3 skill/plan/plan_helpers.py plan-if-needed <work-item-id>
-  python3 skill/plan/plan_helpers.py check-effort-risk <work-item-id>
+  python3 ./plan_helpers.py plan-if-needed <work-item-id>
+  python3 ./plan_helpers.py check-effort-risk <work-item-id>
   ```
 
   Import:
@@ -401,6 +433,8 @@ instructions above).
       is_effort_risk_computed,
       run_effort_and_risk,
       append_autoplan_decision_comment,
+      validate_key_files_format,
+      validate_key_files_in_description,
       plan_if_needed,
       check_effort_risk,
       DEFAULT_AUTOPLAN_EFFORT_SKIP,

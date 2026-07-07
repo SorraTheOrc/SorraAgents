@@ -149,6 +149,22 @@ Review stages (adapted for existing content):
 1. **Completeness review** — Ensure the work item has all required fields
    (description, acceptance criteria) and that any existing child items
    are complete. Add missing fields if clearly definable from context.
+
+   Additionally, if the work item contains a ``**Key Files:**`` section
+   (predicted during intake), validate the listed file paths:
+
+   - **Syntactic validity**: every path should contain at least one ``/``
+     (directory separator) and have a file extension. The helper
+     ``validate_key_files_format()`` can be used to check this programmatically.
+   - **Completeness**: flag any obviously missing files relative to the
+     work item scope (e.g. if the description mentions modifying a module
+     but no file in that module is listed).
+   - **Accuracy**: flag any obviously irrelevant or incorrect files in the
+     list.
+
+   Any corrections (additions, removals, or corrections) to the ``**Key
+   Files:**`` list identified during this review should be reflected in the
+   work item description before the plan process completes.
 2. **Sequencing & dependencies review** — Verify any existing child item
    dependencies are coherent. Check that test/verification items appear
    before implementation items if both exist. Ensure test features come first
@@ -247,6 +263,23 @@ Keep asking questions until the breakdown into features is clear.
 - Review stages and expected behavior:
   1. Completeness review
   - Purpose: Ensure every feature has all required fields.
+
+  - **Key Files validation** (if present): If the work item contains a
+    ``**Key Files:**`` section (predicted during intake), validate the listed
+    file paths:
+
+    - **Syntactic validity**: every path should contain at least one ``/``
+      (directory separator) and have a file extension. The helper
+      ``validate_key_files_format()`` can be used to check this programmatically.
+    - **Completeness**: flag any obviously missing files relative to the
+      work item scope (e.g. if the description mentions modifying a module
+      but no file in that module is listed).
+    - **Accuracy**: flag any obviously irrelevant or incorrect files in the
+      list.
+
+    Any corrections (additions, removals, or corrections) to the ``**Key
+    Files:**`` list identified during this review should be reflected in the
+    work item description before the plan process completes.
   - Actions: Add missing placeholders only when obvious; otherwise add Open Questions.
   1. Sequencing & dependencies review
   - Purpose: Ensure dependencies are coherent and actionable.
