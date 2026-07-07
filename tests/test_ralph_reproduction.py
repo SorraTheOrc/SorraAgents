@@ -7,7 +7,7 @@ per-child iteration issues.
 """
 
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from skill.ralph.scripts.ralph_loop import RalphLoop
 from skill.ralph.scripts.ralph_loop import RalphError
 
@@ -68,7 +68,7 @@ def test_reproduce_file_not_found_error():
     This simulates the CI failure when wl CLI was not available in runner environment.
     """
     with patch('skill.ralph.scripts.ralph_loop.RalphLoop._wl_show') as mock_wl_show, \
-         patch('skill.ralph.scripts.ralph_loop.RalphLoop._run_pi') as mock_run_pi:
+         patch('skill.ralph.scripts.ralph_loop.RalphLoop._run_pi') as _mock_run_pi:
         
         # Setup mock to raise FileNotFoundError (simulating missing wl CLI)
         mock_wl_show.side_effect = FileNotFoundError("wl: command not found")

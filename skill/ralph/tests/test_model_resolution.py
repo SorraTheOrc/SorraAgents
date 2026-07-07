@@ -7,7 +7,6 @@ shipped asset config.
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -17,20 +16,19 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.ralph_loop import (
+from skill.ralph.scripts.ralph_loop import (  # noqa: E402
     DEFAULT_MODEL,
     DEFAULT_MODEL_SOURCE,
     MODEL_PHASES,
     RalphLoop,
     _extract_phase_model_config,
     _load_asset_config,
-    _load_config,
     _normalize_model_source,
     _preprocess_args,
     _resolve_model,
     _resolve_phase_model_value,
     build_parser,
-)
+)  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

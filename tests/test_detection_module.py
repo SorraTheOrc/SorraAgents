@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from plan import detection
+from plan import detection  # noqa: E402
 
 
 def test_choose_blocker_prefers_sortindex_then_createdat():

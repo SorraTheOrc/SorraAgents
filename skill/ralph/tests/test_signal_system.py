@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.signal_system import EventType, SignalWriter, resolve_signal_path
+from skill.ralph.scripts.signal_system import EventType, SignalWriter, resolve_signal_path  # noqa: E402
 
 
 # ── EventType constants ──────────────────────────────────────────────────────

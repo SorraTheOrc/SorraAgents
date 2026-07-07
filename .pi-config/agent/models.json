@@ -1,63 +1,77 @@
 {
   "providers": {
-    "Proxy": {
+    "Local Proxy": {
       "api": "openai-completions",
-      "baseUrl": "http://100.79.231.101:8000/v1",
+      "baseUrl": "http://192.168.0.199:8000/v1",
       "apiKey": "not_needed",
       "compat": {
-        "supportsDeveloperRole": false,
-        "supportsUsageInStreaming": true,
         "sendSessionAffinityHeaders": true
       },
-      "options": {
-        "timeout": 600000
-      },
+      "models": [
+        { "id": "plan" },
+        { "id": "code" },
+        { "id": "qwen3" },
+        { "id": "gpt120" }
+      ]
+    },
+"deepseek": {
+      "baseUrl": "https://api.deepseek.com",
+      "api": "openai-completions",
+      "apiKey": "$DEEPSEEK_API_KEY",
       "models": [
         {
-          "id": "qwen3",
-          "name": "Qwen3 Coder Next",
+          "id": "deepseek-v4-pro",
+          "name": "DeepSeek V4 Pro",
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          "input": ["text"],
           "reasoning": true,
-          "contextWindow": 131072,
-          "maxTokens": 32768,
+          "thinkingLevelMap": { "minimal": null, "low": null, "medium": null, "high": "high", "xhigh": "max" },
+          "cost": {
+            "input": 1.74,
+            "output": 3.48,
+            "cacheRead": 0.145,
+            "cacheWrite": 0
+          },
           "compat": {
-            "thinkingFormat": "qwen"
+            "requiresReasoningContentOnAssistantMessages": true,
+            "thinkingFormat": "deepseek",
+            "reasoningEffortMap": {
+              "minimal": "high",
+              "low": "high",
+              "medium": "high",
+              "high": "high",
+              "xhigh": "max"
+            }
           }
         },
         {
-          "id": "gemma4",
-          "name": "Gemma 4",
+          "id": "deepseek-v4-flash",
+          "name": "DeepSeek V4 Flash",
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          "input": ["text"],
           "reasoning": true,
-          "contextWindow": 131072,
-          "maxTokens": 32768
-        },
-        {
-          "id": "gpt120",
-          "name": "GPT-OSS 120B (Casey)",
-          "reasoning": true,
-          "contextWindow": 131072,
-          "maxTokens": 32768
+          "thinkingLevelMap": { "minimal": null, "low": null, "medium": null, "high": "high", "xhigh": "max" },
+          "cost": {
+            "input": 0.14,
+            "output": 0.28,
+            "cacheRead": 0.028,
+            "cacheWrite": 0
+          },
+          "compat": {
+            "requiresReasoningContentOnAssistantMessages": true,
+            "thinkingFormat": "deepseek",
+            "reasoningEffortMap": {
+              "minimal": "high",
+              "low": "high",
+              "medium": "high",
+              "high": "high",
+              "xhigh": "max"
+            }
+          }
         }
       ]
-    },
-    "LocalNPU": {
-      "api": "openai-completions",
-      "baseUrl": "http://100.73.107.128:52243/api/v1/openai",
-      "apiKey": "F7FCK9C-FYW4FF0-QZXM1YC-DZ7C1Q3",
-      "options": {
-        "timeout": 1200000
-      },
-      "models": [
-        {
-          "id": "sorra-orchestrator",
-          "name": "AnythingLLM Orchestrator",
-          "reasoning": true
-        }
-       ]
-    },
-    "LocalAI": {
-      "api": "openai-completions",
-      "baseUrl": "http://localhost:52243/api/v1",
-      "apiKey": "F7FCK9C-FYW4FF0-QZXM1YC-DZ7C1Q3"
     }
   }
 }

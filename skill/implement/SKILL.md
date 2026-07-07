@@ -44,9 +44,10 @@ any sensitive values before writing them to logs or comments.
 ## Best Practices
 
 - Follow the steps in order and do not skip steps.
+- **Write tests before implementation code.** Always create at least one test file before modifying or adding implementation code (test-driven development). Tests created first may fail on the initial run; implementation code is then written to make them pass. When external constraints prevent writing complete tests, create harnesses or mocks that allow the tests-first flow to proceed and document the limitation as a temporary placeholder.
 - Do not use search tools such as grep, ripgrep, or code search in the implementation process. Rely on the context provided in the work item, linked documentation, and your understanding of the codebase. If you find that you do not have enough context to implement, use the intake interview to gather more information and update the work item before proceeding.
 - Keep implementation focused on meeting acceptance criteria with minimal changes.
-- Never edit code outside of the src/, tests/ and docs/ for this project unless they are essential configuration files. 
+- Never edit code outside of the src/, tests/ and docs/ for this project unless they are essential configuration files.
 - Never edit code in bundled libraries such as dist/ and node_modules/.
 - When implementing a CLI or API always provide a way to obtain a JSON formatted output for agents to consume.
 - Use work item comments to document your process, decisions, and next steps.
@@ -54,6 +55,7 @@ any sensitive values before writing them to logs or comments.
 - If the work item is not well-defined, do not proceed with implementation. Instead, run the intake interview to clarify and update the work item before implementing.
 - If the work item has blockers or dependencies, implement those first before proceeding with the main work item.
 - Never commit directly to `main`. Always create a feature or bug branch for implementation.
+- When implementing, create a worktree from the `dev` branch, then branch inside it. See the canonical [[concepts/git-worktree-best-practices-for-agent-workflows]] wiki page for the worktree workflow.
 - When implementing a CLI or API always provide a way to obtain a JSON formatted output for agents to consume.
 - When creating branches, include the work item id in the branch name for traceability (e.g., `feature/WL-123-add-auth`).
 - When creating a commit message, review the diff and write a concise message summarizing the changes made and the reason for the change, referencing the work item id.
@@ -62,6 +64,40 @@ any sensitive values before writing them to logs or comments.
 - When writing work-item comments or commit messages, include a concise summary of the goal, work done, and any important review notes.
 - Do not escape content in commit messages or work-item descriptions; use markdown formatting as needed for clarity and readability.
 - After implementation is complete and the work-item is in `in_review`, use the cleanup skill to tidy up local feature branches. Do not clean up `dev` or `main`.
+
+## Status Safety & Abort Handling
+
+### Critical Rule: Always Reset Status on Abort
+
+When an implementation is aborted, interrupted, or fails before reaching the
+final commit/push step, the work item can remain stuck at `status: in_progress`,
+blocking other agents from claiming or processing it. **Every abort/failure path
+MUST reset status to `open`** to release the work item lock.
+
+### Mandatory Abort Pattern
+
+All abort paths follow the same two-step pattern:
+
+1. **Reset status to open:** `wl update <work-item-id> --status open --json`
+2. **Stop execution:** Return control to the operator with a clear explanation
+
+> **Why this matters:** Work items in `in_progress` status are filtered by `wl next`
+> and are invisible to other agents. An orphaned `in_progress` item blocks all
+> downstream work on that item until a human intervenes. Always resetting to `open`
+> on abort ensures the work item is visible and claimable by the next agent.
+
+### Abort Scenarios
+
+The implement skill covers **five** abort/failure scenarios, each with explicit
+status-reset instructions documented in the sections below:
+
+| # | Scenario | Description |
+|---|----------|-------------|
+| 1 | Dirty work tree abort | User aborts when uncommitted changes exist in the working tree |
+| 2 | Definition gate failure | Work item fails definition gate (unclear scope, untestable ACs) |
+| 3 | User-initiated abort | Operator cancels the implementation mid-process |
+| 4 | Error/exception during implementation | API failure, network error, or unexpected exception during coding |
+| 5 | Unexpected termination | Agent crash, network failure, or external interruption (covered by Final cleanup step) |
 
 ## Handling Assets
 
@@ -76,11 +112,44 @@ any sensitive values before writing them to logs or comments.
 
 Execute the following steps in order. Do not skip steps. Use the live commands where applicable and record outputs in the work-item comments as you proceed.
 
-0. Safety gate: handle dirty working tree
+1. Set status and safety gate
 
-- Inspect `git status --porcelain=v1 -b`.
-- If uncommitted changes are limited to `.worklog/`, carry them into the new working branch and commit there.
-- If other uncommitted changes exist, pause and present explicit choices: carry them into the work item branch, commit first, stash (and optionally pop later), revert/discard (explicit confirmation), or abort.
+- **Before any other step**, claim the work item by running:
+  `wl update <work-item-id> --status in_progress --json`
+  This must be the very first action — before any git checks, safety gates,
+  or preflight checks. The status signals to other agents that this item is
+  being worked on and prevents concurrent claims.
+
+1. Safety gate: handle dirty working tree
+
+- Detect whether the current directory is inside a git worktree:
+  `git rev-parse --is-inside-work-tree` (returns `true` or `false`).
+  Inside a worktree, `git status` is inherently scoped to that worktree's
+  working tree — files from other checkouts do not appear.
+
+- **Inside a worktree** — use the standard rules:
+  - Run `git status --porcelain=v1 -b`.
+  - If uncommitted changes are limited to `.worklog/`, carry them into the
+    new working branch and commit there.
+  - If other uncommitted changes exist, pause and present explicit choices:
+    carry them into the work item branch, commit first, stash (and optionally
+    pop later), revert/discard (explicit confirmation), or abort. If abort is
+    chosen, first run `wl update <work-item-id> --status open --json` to mark
+    the item as open.
+
+- **In the main checkout** (not inside a worktree):
+  - Run `git status --porcelain=v1 -b`.
+  - If uncommitted changes are limited to `.worklog/`, carry them forward as
+    usual.
+  - If other uncommitted changes exist, these may be stale files from a
+    previous agent session or another worktree. The agent should:
+    1. Report the dirty files and note they may be stale.
+    2. Proceed to create a worktree (Step 3). The worktree provides an
+       isolated working directory where `git status` reflects only the
+       worktree's branch, bypassing stale files in the main checkout.
+    3. If the dirty files would prevent worktree creation (e.g., `HEAD` is
+       not at `dev` or local changes block checkout), follow the existing
+       choices prompt (carry, commit, stash, revert, abort).
 
 1. Understand the work item
 
@@ -102,32 +171,51 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Concrete, testable acceptance criteria.
   - Constraints and compatibility expectations.
   - Unknowns captured as explicit questions.
-- If the work item is not well-defined, run the intake interview to update the existing work item (see `command/intake.md`) and update the work item `description` or `acceptance` fields with the intake output.
-- If the work item is too large to implement in one pass, run plan interview (see `command/plan.md`) to break it into smaller work items, create those work items, link them as blockers/dependencies, and pick the highest-priority work item to implement next.
-- If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
-- If you ran the plan interview, convert this work item to an epic and inform the user that implementation should move to the first child work item created.
+- If the work item fails the definition gate, first run `wl update <work-item-id> --status open --json` to mark the item as open, then take the appropriate action:
+  - If the work item is not well-defined, run the intake interview to update the existing work item (see `command/intake.md`) and update the work item `description` or `acceptance` fields with the intake output.
+  - If the work item is too large to implement in one pass, run plan interview (see `command/plan.md`) to break it into smaller work items, create those work items, link them as blockers/dependencies, and pick the highest-priority work item to implement next.
+  - If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
+  - If you ran the plan interview, convert this work item to an epic and inform the user that implementation should move to the first child work item created.
 - If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
 
-2. Create a working branch
+1. Create a worktree from dev and branch inside it
 
-- Inspect the current branch name via `git rev-parse --abbrev-ref HEAD`.
-- If the current branch was created for a work item that is an ancestor of <work-item-id>, continue on that branch (that is if the name has an ancestor work item id).
-- Otherwise create or switch to a branch named `feature/<work-item-id>-<short>` or `bug/<work-item-id>-<short>` (include the work item id).
+- Create a worktree from the `dev` branch following the conventions in [[concepts/git-worktree-best-practices-for-agent-workflows]]:
+
+  ```bash
+  git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-id>-<short-slug> dev
+  ```
+
+- Change into the worktree directory:
+
+  ```bash
+  cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
+  ```
+
+- This creates an isolated working directory with a new branch already checked out and tracking `dev`.
+  The branch name includes the work item id for traceability.
 - Never commit directly to `main`.
+- See [AGENTS.md](../../AGENTS.md#implement-the-work-item) for the top-level policy on worktree-first implementation.
 
-3. Implement
+1. Implement
 
 - If the work item has any open or in_progress blockers or dependencies:
   - Select the most appropriate work item to work on next (blocker > dependency; most critical first).
   - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
   - Recursively implement that work item as described in this procedure.
-  - When a work item is completed, follow the mandatory build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit the work. Update the stage: `wl update <work-item-id> --status in_progress --stage in_review --json`
+  - When a work item is completed, follow the mandatory build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit the work. Update the stage: `wl update <work-item-id> --status completed --stage in_review --json`
+  - After completing all children of a parent work-item and confirming they are in a terminal stage (in_review or completed), advance the parent work-item's stage to `in_review`:
+    `wl update <parent-id> --stage in_review --json`
 
 - If the work item has a recent audit record, review the audit notes and address any unmet acceptance criteria or other issues identified.
 - If there is no recent audit record, run `/skill:audit <work-item-id>` and use the resulting audit output to establish the work that needs to be done.
 - Once the audit selection is complete, continue to step 4 and write tests and code to ensure all acceptance criteria defined in or related to the current work item are met:
   - Make minimal, focused changes that satisfy acceptance criteria.
-  - Follow a test-driven development approach where applicable.
+  - Write tests first (test-driven development approach):
+    - Create at least one new test file before adding or editing implementation code. These tests must be recorded in the run artifacts and visible in the commit history.
+    - Tests created in this step are allowed to fail on first run; the agent must then implement code to make them pass before committing.
+    - If tests cannot be completed due to external constraints (e.g., unavailable external service, missing infrastructure), create harnesses or mocks that enable the tests to run. The tests should fail due to the external constraint, not because of missing implementation logic.
+    - When a harness, mock, or test placeholder is used, include an explicit note in the work item comment and in the test file header stating the reason for the limitation and marking it as a temporary placeholder.
   - Ensure code follows project style and conventions.
   - Add comments to the work item describing any significant design decisions, code edits or tradeoffs.
   - If additional work is discovered, create linked work items: `wl create "<title>" --deps discovered-from:<work-item-id> --json`
@@ -137,14 +225,64 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
     - Report the results.
     - Fix any failing tests before continuing.
     - If the test run discovers failing tests that appear to be outside the scope or ownership of the current work item (e.g., failures in files not modified by this branch), invoke the triage helper with `parent_work_item_id` to create a **blocking child work item**:
-      - Example: `python3 skill/triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`
+      - Example: `python3 ../triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`
       - If `check_or_create` returns that it created a NEW critical issue, or matched an existing incomplete one, the agent should implement that child work item to fix the test failure, commit the fix, and re-run tests until all pass before proceeding.
       - If running under Ralph, failing tests are automatically handled: Ralph will create child work items, implement fixes, and ensure all tests pass before marking the parent as `in_review`.
   - Update or create relevant documentation.
   - Summarize changes made in the work item description or comments.
   - Do not proceed to the next step until the user confirms it is OK to do so.
 
-4. Automated self-review
+1. Error/exception handling (abort on unexpected errors)
+
+If an unexpected error occurs during implementation — API failure, network
+error, exception during code editing, or any other runtime error — follow these
+mandatory abort steps:
+
+1. **Reset status to open:** `wl update <work-item-id> --status open --json`
+2. **Log the error** in the work-item comment: `wl comment add <work-item-id> --comment "Error during implementation: <error-description>" --author "<AGENT>" --json`
+3. **Do NOT continue** — return control to the operator with the error details
+4. If the error is transient (e.g., network), the operator may retry; otherwise
+   the work item is back in the pool for another agent or manual review
+
+### User-initiated abort
+
+If the operator explicitly cancels or aborts the implementation at any point
+after Step 0 (claim), follow these mandatory abort steps:
+
+1. **Reset status to open:** `wl update <work-item-id> --status open --json`
+2. **Return control** to the operator — do NOT proceed with any further steps
+3. Document the abort in work-item comments: `wl comment add <work-item-id> --comment "Implementation aborted by operator" --author "<AGENT>" --json`
+
+---
+
+1. Optional refactor step
+
+After implementation completes and before the final commit, an automated
+refactor step may be invoked to detect and remediate code smells:
+
+- The refactor step analyzes only files modified in the current session
+  (git diff against parent branch).
+- It uses a hybrid approach: linters for mechanical issues + LLM for
+  design/architectural smells.
+- **Session-introduced smells** are fixed immediately in the same run.
+- **Pre-existing smells** create Worklog work items with structured
+  REFACTOR comments in the source files.
+- The step can be skipped with the ``--no-refactor`` flag:
+
+  ```
+  implement <work-item-id> --no-refactor
+  ```
+
+- The canonical orchestrator can also be invoked directly:
+
+  ```bash
+  python3 ../refactor/scripts/refactor.py <work-item-id>
+  python3 ../refactor/scripts/refactor.py <work-item-id> --json
+  ```
+
+- See ``../refactor/SKILL.md`` for full documentation.
+
+1. Automated self-review
 
 - Build and lint the code to catch basic issues, fix any issues raised before proceeding.
 - Run all tests again using quiet test commands to ensure nothing is broken, fix any failing tests before proceeding.
@@ -155,43 +293,108 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 - Run the entire test suite using the shared quiet test helper or quiet project commands.
   - Fix any failing tests before continuing.
 
-5. Commit, Push to dev and mark in_review
+1. Commit, Push to dev and mark in_review
 
 - Before committing, follow the mandatory build → test → commit order: build the project and verify no errors, then run all tests and verify they pass, and only then commit changes.
 - Ensure all work has been committed on the feature branch.
 - Do NOT create a Pull Request to `main`. Work is integrated into `dev`; the `dev`→`main` promotion is handled separately by the release process.
 - Push the feature branch into `dev` using one of the following:
-  - Using the ship skill: `pushToDev()` from `skill/ship/scripts/ship.js` (preferred)
+  - Using the ship skill: `pushToDev()` from `../ship/scripts/ship.js` (preferred)
   - Direct git command: `git push origin HEAD:refs/heads/dev`
   - The push target `dev` is **not** a protected branch; the `.githooks/pre-push` hook only blocks `main`, `master`, and `HEAD`.
-- After pushing, switch to the `dev` branch locally and pull the latest:
+- After pushing, clean up the worktree:
+
+  ```bash
+  cd /path/to/repo/root
+  git worktree remove .worklog/worktrees/wl-<WIP-id>-<short-slug>
+  git worktree prune
+  ```
+
+  Then switch to the `dev` branch in the main checkout and pull the latest:
+
   ```bash
   git checkout dev
   git pull origin dev
+  # Rebuild if available (dist/ is gitignored, installed tool may run from dist/)
+  npm run build 2>/dev/null || echo "No build script, skipping rebuild"
   ```
+
+  > **Why rebuild?** `dist/` is gitignored, so a `git pull` does not update it.
+  > Without a rebuild, the installed tool (e.g., `wl`) would run from stale
+  > `dist/` code. The `2>/dev/null` makes the step safe for projects without
+  > a `build` script.
+
   This ensures subsequent operations begin from the current HEAD of the integration branch.
+  See [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full worktree lifecycle.
 - Add a work-item comment recording the commit hash and that the work has been pushed to dev:
   `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>. The work-item stays open until the release process merges dev to main." --author "<AGENT>" --json`
-- Close your response to the operator with a suggested commit message:
-  `If you want to commit this work now I suggest the following commit message:\n\n<work-item-id>: <concise-summary-of-changes>`
+- Close your response to the operator with:
+  `<work-item-id>: <concise-summary-of-changes>\n\nWork committed to dev`
 
   > **Note:** When running under **Ralph** (the target work item's stage is `in_progress` or `plan_complete`), **do NOT** mark the work item as `in_review`. Ralph will handle the stage transition after the audit passes. When running manually (not under Ralph), mark the work item as `in_review` after pushing to dev:
 
   > **When running under Ralph:** Skip the `wl update --stage in_review` step. Ralph will mark the item as `in_review` after a successful audit.
   > **When running manually:** Mark the work item as `in_review` (do **NOT** close it):
-  `wl update <work-item-id> --stage in_review --json`
+  `wl update <work-item-id> --status completed --stage in_review --json`
 
-  > **Important:** The work-item is **not closed** at this stage. It remains `in_review` until the release process promotes `dev` to `main`. Agents may perform the release by invoking the Ship skill's release command (`skill/ship/scripts/run-release.js`), or a Release Manager may perform it manually. Agents should not push directly to `main` unless explicitly authorized.
-  > See `skill/ship/SKILL.md` for the push-to-dev workflow and `skill/ship/scripts/run-release.js` (safe wrapper) for the release process. The wrapper detects when a repository lacks `scripts/release/merge-dev-to-main.sh` and prints a clear human fallback message.
+  > **Important:** The work-item is **not closed** at this stage. It remains `in_review` until the release process promotes `dev` to `main`. Agents may perform the release by invoking the Ship skill's release command (`../ship/scripts/run-release.js`), or a Release Manager may perform it manually. Agents should not push directly to `main` unless explicitly authorized.
+  > See `../ship/SKILL.md` for the push-to-dev workflow and `../ship/scripts/run-release.js` (safe wrapper) for the release process. The wrapper detects when a repository lacks `scripts/release/merge-dev-to-main.sh` and prints a clear human fallback message.
 
 Pre-push blocking check
 -----------------------
+
 - Before pushing to `dev`, the Ralph orchestration loop automatically ensures all tests pass. If tests fail:
   1. Child work items are created via triage helper (with `parent_work_item_id`)
   2. Fixes are implemented via `implement-single`
   3. Tests are re-run until all pass
   4. Only then does Ralph proceed with the push
 - When running manually (not under Ralph), the agent should manually invoke the triage helper and fix any failing tests before pushing.
+
+Final cleanup (belt-and-suspenders)
+---------------------------------------
+
+Before exiting the implement skill at any point — whether completing successfully
+or aborting — the agent MUST check and reset the work item status as a final
+safety net. This catches unexpected termination, agent crash, or any abort path
+that was missed.
+
+Execute this check **before exiting** the implement skill:
+
+```bash
+wl show <work-item-id> --json
+```
+
+If the response shows `status: in_progress` and the work is **not** complete
+(i.e., you are NOT at Step 7 and have not pushed to dev yet), run:
+
+```bash
+wl update <work-item-id> --status open --json
+```
+
+This ensures the work item is never left stuck at `in_progress` if the agent
+encounters unexpected termination, crashes, or network failure.
+
+## Status Transition Matrix
+
+The following table documents the expected status and stage transitions at each workflow phase for the `implement` skill.
+
+| Phase | Command | Status | Stage |
+|-------|---------|--------|-------|
+| Start (Step 0 - Set status) | `wl update <id> --status in_progress --json` | in_progress | (unchanged) |
+| Claim (Step 1) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
+| Blocker complete (Step 4) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
+| Final (Step 6 - Mark in_review) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
+| Abort - dirty work tree | `wl update <id> --status open --json`, then abort | open | (unchanged) |
+| Abort - definition gate failure | `wl update <id> --status open --json`, run intake/plan interview, update item | open | (unchanged) |
+| Abort - user-initiated | `wl update <id> --status open --json`, return control to operator | open | (unchanged) |
+| Abort - error/exception during implementation | `wl update <id> --status open --json`, log error to comment, return | open | (unchanged) |
+| Abort - unexpected termination (Final cleanup) | Check status; if `in_progress` and work incomplete, reset | open | (unchanged) |
+| Under Ralph (Step 6 note) | Skip in_review step; Ralph handles transition | in_progress | in_progress |
+| Epic / parent: all children done | Check all children are in a terminal stage (in_review/completed); advance parent stage | in-progress | in_review |
+
+> **Abort/failure transitions always use `--status open` while keeping the stage unchanged.**
+> This pattern is mandatory — never leave a work item in `in_progress` status
+> unless actively implementing. See the "Status Safety & Abort Handling" section for details.
 
 ## Scripts (canonical runner & modules)
 
@@ -204,12 +407,12 @@ Example Worklog-oriented commands using SA-0MPYMFZXO0004ZU4 (documentation examp
 wl show SA-0MPYMFZXO0004ZU4 --json
 
 # After implementing locally, push to dev (preferred via ship skill):
-# (JS example) node -e "require('./skill/ship/scripts/ship.js').pushToDev('origin')"
+# (JS example) node -e "require('../ship/scripts/ship.js').pushToDev('origin')"
 # or direct push
 git push origin HEAD:refs/heads/dev
 
 # Mark in_review
-wl update SA-0MPYMFZXO0004ZU4 --stage in_review --json
+wl update SA-0MPYMFZXO0004ZU4 --status completed --stage in_review --json
 ```
 
 End.

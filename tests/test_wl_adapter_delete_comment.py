@@ -1,6 +1,5 @@
 import json
-import subprocess
-from plan.wl_adapter import WLAdapter
+from plan.wl_adapter import WLAdapter, _normalize_comment_ref, _extract_comments_from_response, _match_comment_id
 
 
 class DummyWL(WLAdapter):
@@ -14,6 +13,87 @@ class DummyWL(WLAdapter):
             return self.responses[key]
         # simulate CLI success with empty output
         return json.dumps({})
+
+
+# ---------------------------------------------------------------------------
+# Tests for extracted helper functions
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_comment_ref_short_form():
+    """_normalize_comment_ref combines work_id and short comment_id."""
+    result = _normalize_comment_ref("SA-TEST-1", "C1")
+    assert result == "SA-TEST-1-C1"
+
+
+def test_normalize_comment_ref_full_form():
+    """_normalize_comment_ref returns full ref unchanged."""
+    result = _normalize_comment_ref("SA-TEST-1", "SA-TEST-1-C1")
+    assert result == "SA-TEST-1-C1"
+
+
+def test_normalize_comment_ref_full_form_with_sa_prefix():
+    """_normalize_comment_ref prepends work_id for full refs from other work items."""
+    result = _normalize_comment_ref("SA-TEST-1", "SA-OTHER-2-C1")
+    assert result == "SA-TEST-1-SA-OTHER-2-C1"
+
+
+def test_extract_comments_from_response_top_level():
+    """_extract_comments_from_response extracts from top-level comments key."""
+    w = {"comments": [{"id": "C1"}, {"id": "C2"}]}
+    result = _extract_comments_from_response(w)
+    assert len(result) == 2
+    assert result[0]["id"] == "C1"
+
+
+def test_extract_comments_from_response_work_item_key():
+    """_extract_comments_from_response extracts from workItem sub-key."""
+    w = {"workItem": {"comments": [{"id": "C1"}]}}
+    result = _extract_comments_from_response(w)
+    assert len(result) == 1
+    assert result[0]["id"] == "C1"
+
+
+def test_extract_comments_from_response_data_key():
+    """_extract_comments_from_response extracts from data sub-key."""
+    w = {"data": {"items": [{"id": "C1"}]}}
+    result = _extract_comments_from_response(w)
+    assert len(result) == 1
+    assert result[0]["id"] == "C1"
+
+
+def test_extract_comments_from_response_empty():
+    """_extract_comments_from_response returns empty list for empty/None input."""
+    assert _extract_comments_from_response({}) == []
+    assert _extract_comments_from_response(None) == []
+
+
+def test_match_comment_id_by_id():
+    """_match_comment_id matches by id key."""
+    assert _match_comment_id({"id": "C1"}, "C1") is True
+    assert _match_comment_id({"id": "C1"}, "C2") is False
+
+
+def test_match_comment_id_by_comment_id_key():
+    """_match_comment_id matches by commentId key."""
+    assert _match_comment_id({"commentId": "C1"}, "C1") is True
+
+
+def test_match_comment_id_by_ref():
+    """_match_comment_id matches by ref key with the ref parameter."""
+    assert _match_comment_id({"ref": "SA-TEST-1-C1"}, "C1", "SA-TEST-1-C1") is True
+    assert _match_comment_id({"reference": "SA-TEST-1-C1"}, "C1", "SA-TEST-1-C1") is True
+
+
+def test_match_comment_id_no_match():
+    """_match_comment_id returns False when no key matches."""
+    assert _match_comment_id({"body": "hello"}, "C1") is False
+    assert _match_comment_id({}, "C1") is False
+
+
+# ---------------------------------------------------------------------------
+# Integration tests (existing)
+# ---------------------------------------------------------------------------
 
 
 def test_delete_comment_success_and_verify_absent():

@@ -5,13 +5,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.ralph_loop import _preprocess_args, build_parser, MODEL_SOURCES
+from skill.ralph.scripts.ralph_loop import _preprocess_args, build_parser  # noqa: E402
 
 
 class TestPreprocessArgs:
@@ -95,7 +94,6 @@ class TestMainIntegration:
 
     def test_main_with_preprocessed_args(self):
         """Test that _preprocess_args correctly converts shorthand to flag."""
-        from skill.ralph.scripts.ralph_loop import main
 
         # Test that preprocessed args work correctly
         args = _preprocess_args(["SA-123", "remote"])
@@ -106,7 +104,6 @@ class TestMainIntegration:
 
     def test_main_with_explicit_flag(self):
         """Test that explicit --model-source flag still works."""
-        from skill.ralph.scripts.ralph_loop import main
 
         args = _preprocess_args(["SA-123", "--model-source", "remote"])
         parser = build_parser()

@@ -37,7 +37,7 @@ field in new critical issues.
 
 ## Scripts
 
-- `skill/owner-inference/scripts/infer_owner.py` — CLI entrypoint and library functions.
+- `./scripts/infer_owner.py` — CLI entrypoint and library functions.
 
 ## Configuration
 
@@ -47,7 +47,7 @@ field in new critical issues.
 ## Example invocation
 
 ```bash
-python3 skill/owner-inference/scripts/infer_owner.py --repo . --file tests/test_foo.py --commit abc123
+python3 ./scripts/infer_owner.py --repo . --file tests/test_foo.py --commit abc123
 
 # Worklog / triage context (documentation example):
 wl show SA-0MPYMFZXO0004ZU4 --json
@@ -55,5 +55,5 @@ wl show SA-0MPYMFZXO0004ZU4 --json
 
 ## References
 
-- Triage skill: `skill/triage/SKILL.md`
-- Runbook: `skill/triage/resources/runbook-test-failure.md`
+- Triage skill: `../triage/SKILL.md`
+- Runbook: `../triage/resources/runbook-test-failure.md`

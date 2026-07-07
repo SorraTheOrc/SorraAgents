@@ -427,7 +427,7 @@ Specification-only — describe expected behavior for engine implementation test
 
 | Field | Value |
 |---|---|
-| **Initial State** | `audit_failed` (in_progress/audit_failed) |
+| **Initial State** | `audit_failed` (open/audit_failed) |
 | **Commands** | escalate → de_escalate → delegate |
 | **Expected States** | audit_failed → escalated → plan → delegated |
 | **Reference** | `docs/workflow/examples/06-escalation.md` |

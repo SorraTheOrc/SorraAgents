@@ -20,14 +20,14 @@ If you want to stop a particular work item from being delegated there are three 
 
 - This is auditable: the tag remains on the work item and appears in `wl show` and WL history.
 
-2) Set an unsupported stage (quick manual stop)
+1) Set an unsupported stage (quick manual stop)
 
 - Change the work item's `stage` to anything other than the actionable stages above (for example `backlog` or `closed`).
 - Examples:
   - Interactive: `wl edit <WORK_ID>` and set `stage` to `backlog`.
   - Non-interactive (if supported): `wl update <WORK_ID> --stage backlog`
 
-3) Set per-item metadata to block delegation
+1) Set per-item metadata to block delegation
 
 - Add `do_not_delegate` (or `no_delegation`) to the work-item metadata and set it truthy (`true`, `1`, etc.).
 - Example payload: `{"do_not_delegate": true}` (how to supply depends on your WL client).
@@ -77,4 +77,3 @@ When the timeout expires the scheduler:
 4. Logs a `WARNING` message with the command ID and timeout value, and sends a Discord error notification when configured.
 
 The `running` flag is always cleared via `Scheduler._record_run` whether the process exits normally, crashes, or times out.
-

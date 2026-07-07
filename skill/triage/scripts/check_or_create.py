@@ -15,19 +15,20 @@ attach a comment to the most recent candidate and alert triage.
 """
 
 import json
-import os
 import re
 import shlex
 import subprocess
 import sys
+import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.test_runner import canonicalize_quiet_pytest_command
+from skill.scripts.failure_notice import FailureNotice  # noqa: E402
+from skill.test_runner import canonicalize_quiet_pytest_command  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -460,19 +461,50 @@ def check_or_create(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def main():
+    try:
+        _main()
+    except Exception as exc:
+        notice = FailureNotice(
+            script_name="check_or_create.py",
+            reason=f"Unhandled exception: {exc}",
+            stderr_context=traceback.format_exc(),
+        )
+        print(notice.wrap(
+            f"An unexpected error occurred: {exc}"
+        ))
+        sys.exit(2)
+
+
+def _main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "expected JSON argument"}))
+        err = json.dumps({"error": "expected JSON argument"})
+        notice = FailureNotice(
+            script_name="check_or_create.py",
+            reason="Missing JSON argument",
+        )
+        print(notice.wrap(err))
         sys.exit(2)
     try:
         payload = json.loads(sys.argv[1])
     except Exception:
-        print(json.dumps({"error": "invalid JSON"}))
+        err = json.dumps({"error": "invalid JSON"})
+        notice = FailureNotice(
+            script_name="check_or_create.py",
+            reason="Invalid JSON argument",
+            stderr_context=traceback.format_exc(),
+        )
+        print(notice.wrap(err))
         sys.exit(2)
 
     result = check_or_create(payload)
-    print(json.dumps(result))
     if "error" in result:
+        notice = FailureNotice(
+            script_name="check_or_create.py",
+            reason=result["error"],
+        )
+        print(notice.wrap(json.dumps(result)))
         sys.exit(2)
+    print(json.dumps(result))
 
 
 if __name__ == "__main__":

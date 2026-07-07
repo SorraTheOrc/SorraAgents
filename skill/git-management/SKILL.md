@@ -13,12 +13,12 @@ for AI agents and human operators.
 Provide a deterministic, safe, and auditable set of git operations covering the
 complete feature-branch lifecycle:
 
-1. **Branch creation** — generate canonical branch names and create/check out branches.
+1. **Worktree creation** — create a worktree with a feature branch for isolated agent work.
 2. **Commit** — stage changes and create conventional, Worklog-linked commit messages.
 3. **Push** — push to remote with safety checks (no force-push, no direct-to-main).
 4. **PR creation** — create GitHub Pull Requests from feature branches.
 5. **Merge** — guarded merge with CI status verification.
-6. **Cleanup** — post-merge branch pruning via existing cleanup infrastructure.
+6. **Cleanup** — post-merge branch pruning and worktree cleanup via existing infrastructure.
 7. **Workflow orchestration** — single entry point for the full lifecycle.
 
 ## When To Use
@@ -46,12 +46,12 @@ Where `<action>` is one of:
 
 | Action | Description |
 |--------|-------------|
-| `create-branch <work-item-id> <short-desc>` | Create and check out a canonical feature branch |
+| `create-branch <work-item-id> <short-desc>` | Create a worktree with a canonical feature branch (see [[concepts/git-worktree-best-practices-for-agent-workflows]]) |
 | `commit --message <msg> --work-item <id> [--all] [--dry-run]` | Stage and commit with conventional format |
 | `push [--remote <name>] [--into-dev] [--dry-run]` | Push current branch with safety checks |
 | `create-pr [--base <branch>] [--title <title>]` | Create a GitHub PR from the current branch |
 | `merge-pr <pr-number> [--delete-source]` | Merge an approved PR with CI checks |
-| `cleanup [--dry-run] [--days <n>]` | Post-merge branch pruning |
+| `cleanup [--dry-run] [--days <n>]` | Post-merge branch pruning and worktree cleanup |
 | `workflow <work-item-id> <short-desc> [--dry-run] [--phase <name>]` | Full lifecycle orchestration |
 | `help` | Print this documentation |
 
@@ -66,13 +66,19 @@ Where `<action>` is one of:
 
 - Direct pushes to `main`, `master`, or `HEAD` are always rejected.
 - Branch deletion of protected branches is always skipped.
-- Use `isBranchBlocked()` from `skill/ship/scripts/git-helpers.js` for validation.
+- Use `isBranchBlocked()` from `../ship/scripts/git-helpers.js` for validation.
 
 ### Branch naming
 
 - All agent-created branches MUST follow `wl-<work-item-id>-<short-desc>`.
-- Use `makeBranchName()` from `skill/ship/scripts/git-helpers.js` for generation.
+- Use `makeBranchName()` from `../ship/scripts/git-helpers.js` for generation.
 - Use `validateBranchName()` for validation.
+
+### Worktree naming
+
+- Worktree names follow the same pattern as branch names: `wl-<work-item-id>-<slug>`.
+- Worktrees are created under `.worklog/worktrees/`.
+- See [[concepts/git-worktree-best-practices-for-agent-workflows]] for the naming and lifecycle conventions, and [AGENTS.md](../../AGENTS.md) for the top-level policy.
 
 ### CI gate for merges
 
@@ -81,7 +87,7 @@ Where `<action>` is one of:
 
 ## Script Contract
 
-All scripts in `skill/git-management/scripts/` follow these conventions:
+All scripts in `./scripts/` follow these conventions:
 
 ### Exit codes
 
@@ -124,9 +130,9 @@ Each script checks its prerequisites before performing operations:
 
 This skill delegates to existing scripts where possible:
 
-- **Branch naming/policy**: `skill/ship/scripts/git-helpers.js` (`makeBranchName`, `validateBranchName`, `isBranchBlocked`)
-- **Push validation**: `skill/ship/scripts/ship.js` (`validatePushTarget`, `validateForcePush`, `pushToDev`, `pushToBranch`)
-- **Post-merge cleanup**: `skill/cleanup/scripts/` (Python cleanup scripts)
+- **Branch naming/policy**: `../ship/scripts/git-helpers.js` (`makeBranchName`, `validateBranchName`, `isBranchBlocked`)
+- **Push validation**: `../ship/scripts/ship.js` (`validatePushTarget`, `validateForcePush`, `pushToDev`, `pushToBranch`)
+- **Post-merge cleanup**: `../cleanup/scripts/` (Python cleanup scripts)
 
 This skill does NOT duplicate the logic in these modules; it wraps and orchestrates them.
 

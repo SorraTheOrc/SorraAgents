@@ -1,6 +1,5 @@
 ---
 description: Refactoring session - discovers opportunities to improves code quality without changing behavior
-agent: patch
 subtask: true
 ---
 

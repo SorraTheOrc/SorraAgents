@@ -100,7 +100,7 @@
       "stage": "audit_passed"
     },
     "audit_failed": {
-      "status": "in_progress",
+      "status": "open",
       "stage": "audit_failed"
     },
     "escalated": {

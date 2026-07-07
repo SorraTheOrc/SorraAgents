@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import subprocess
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 
@@ -89,7 +88,7 @@ class TestCallPi:
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
 
-        result = _call_pi("review this criterion", model="test/model", pi_bin="pi")
+        _result = _call_pi("review this criterion", model="test/model", pi_bin="pi")
         assert len(captured_cmds) == 1
         cmd = captured_cmds[0]
         assert cmd[0] == "pi"
@@ -144,6 +143,74 @@ class TestCallPi:
 
         with pytest.raises(RuntimeError, match="pi binary not found"):
             _call_pi("some criterion", model="test/model", pi_bin="/nonexistent/pi")
+
+
+    def test_call_pi_timeout_expired_returns_structured_error(self, monkeypatch):
+        """When communicate times out, _call_pi should return a structured error
+        with a clear diagnostic message indicating timeout and manual audit needed."""
+        call_count = [0]
+
+        def fake_popen(cmd, **kwargs):
+            def timed_out_communicate(timeout=None):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    raise subprocess.TimeoutExpired(cmd="pi", timeout=timeout or 100)
+                return ("", "")  # second call after kill returns empty
+
+            return SimpleNamespace(
+                communicate=timed_out_communicate,
+                kill=lambda: None,
+                stdout=None,
+                stderr=None,
+            )
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+        result = _call_pi("test prompt", model="test/model")
+
+        assert result["verdict"] == "unmet"
+        evidence = result.get("evidence", "")
+        assert evidence, "Evidence should not be empty when timeout occurs"
+        assert "timed out" in evidence.lower() or "timeout" in evidence.lower(), (
+            f"Evidence should mention timeout: {evidence}"
+        )
+        assert "manual audit" in evidence.lower(), (
+            f"Evidence should mention manual audit: {evidence}"
+        )
+
+    def test_call_pi_timeout_is_generous(self, monkeypatch):
+        """The communicate timeout should be generous (>= 300s) for large prompts."""
+        captured_timeout = [None]
+        call_count = [0]
+
+        def fake_popen(cmd, **kwargs):
+            def capture_communicate(timeout=None):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    captured_timeout[0] = timeout
+                    raise subprocess.TimeoutExpired(cmd="pi", timeout=timeout or 0)
+                return ("", "")  # second call after kill succeeds
+
+            return SimpleNamespace(
+                communicate=capture_communicate,
+                kill=lambda: None,
+                stdout=None,
+                stderr=None,
+            )
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+        _call_pi("test prompt", model="test/model")
+
+        assert captured_timeout[0] is not None, "communicate should receive a timeout value"
+        assert captured_timeout[0] >= 300, (
+            f"communicate timeout {captured_timeout[0]}s should be >= 300s "
+            "to allow large audit prompts to complete"
+        )
+        assert captured_timeout[0] <= 900, (
+            f"communicate timeout {captured_timeout[0]}s should be <= 900s "
+            "(not exceed the original value)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +346,7 @@ class TestAssembleIssueReport:
             {"text": "Criterion 1", "verdict": "adjusted", "evidence": "file.py:1 — reason"},
         ]
         child_results = []
-        report = _assemble_issue_report(issue, ac_results, child_results)
+        _report = _assemble_issue_report(issue, ac_results, child_results)
         # The verdict should appear as 
 
     def test_yes_when_children_in_review_stage(self):
@@ -567,6 +634,34 @@ class TestCmdIssueWithPi:
         captured = capsys.readouterr()
         assert captured.out.startswith("Ready to close: Yes")
 
+    def test_timeout_diagnostic_in_report(self, monkeypatch, capsys):
+        """When _call_pi returns a timeout diagnostic, the report should contain it."""
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            # Simulate a timeout result with clear diagnostic
+            return {
+                "verdict": "unmet",
+                "evidence": "Pi model call timed out after 100s. Manual audit required.",
+                "extracted_text": "",
+                "raw_stdout": "",
+                "raw_stderr": "",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(
+                stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
+            )
+
+        cmd_issue("SA-TIMEOUT", runner=fake_runner, persist=False)
+        captured = capsys.readouterr()
+        # The report should contain the timeout diagnostic
+        assert "timed out" in captured.out.lower() or "timeout" in captured.out.lower()
+        assert "manual audit" in captured.out.lower()
+
 
 # ---------------------------------------------------------------------------
 # Integration: cmd_project with Pi integration
@@ -838,6 +933,11 @@ class TestCmdProjectJsonMode:
     """Verify cmd_project emits structured JSON when json_mode=True."""
 
     def test_json_output_has_expected_keys(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
+        )
+
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
                 stdout=json.dumps({"success": True, "workItems": []}),
@@ -852,6 +952,11 @@ class TestCmdProjectJsonMode:
         assert payload["ready_to_close"] is False
 
     def test_default_mode_still_emits_markdown(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": ""},
+        )
+
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
                 stdout=json.dumps({"success": True, "workItems": []}),

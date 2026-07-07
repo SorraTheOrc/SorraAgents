@@ -11,18 +11,16 @@ import subprocess
 from pathlib import Path
 import sys
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.ralph_loop import (
+from skill.ralph.scripts.ralph_loop import (  # noqa: E402
     RalphLoop,
-    RalphError,
     parse_audit_report,
     _build_remediation_prompt,
-)
+)  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────

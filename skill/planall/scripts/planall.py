@@ -16,25 +16,41 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import subprocess
 import sys
+import traceback
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence, Optional
+
+# Add repo root to sys.path for shared utility access
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from skill.scripts.failure_notice import FailureNotice  # noqa: E402
+from skill.scripts.pi_utils import extract_pi_text  # noqa: E402
+
 
 logger = logging.getLogger("planall")
 
-# Type alias for runners: a callable that accepts a command sequence and
-# returns an object with returncode, stdout, stderr attributes.
-Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
+# Type alias for runners: a callable that accepts a command sequence and an
+# optional timeout, returning an object with returncode, stdout, stderr attributes.
+Runner = Callable[..., subprocess.CompletedProcess]
 
 
 # ---------------------------------------------------------------------------
 # Default subprocess runner
 # ---------------------------------------------------------------------------
 
-def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
-    """Default runner: delegates to subprocess.run."""
-    return subprocess.run(list(cmd), capture_output=True, text=True, check=False)
+def _default_runner(cmd: Sequence[str], timeout: int | None = None) -> subprocess.CompletedProcess:
+    """Default runner: delegates to subprocess.run.
+
+    Args:
+        cmd: Command sequence to execute.
+        timeout: Optional timeout in seconds for the subprocess call.
+    """
+    return subprocess.run(list(cmd), capture_output=True, text=True, check=False, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -50,9 +66,19 @@ class PlanAllEngine:
         verbose: Enable verbose logging.
     """
 
-    def __init__(self, runner: Runner | None = None, verbose: bool = False):
+    def __init__(self, runner: Runner | None = None,
+                 max_items: int = 0, item_timeout: int = 600,
+                 verbose: bool = False):
         self.runner = runner or _default_runner
+        self.max_items = max_items
+        self.item_timeout = item_timeout
         self.verbose = verbose
+        # Track the item currently being processed for signal-handler recovery
+        self._current_item_id: Optional[str] = None
+        self._total_discovered: int = 0
+        # Saved original signal handlers for restore
+        self._original_sigint: Any = None
+        self._original_sigterm: Any = None
 
     # -----------------------------------------------------------------------
     # Discovery
@@ -101,20 +127,28 @@ class PlanAllEngine:
     # Plan invocation
     # -----------------------------------------------------------------------
 
-    def _invoke_plan(self, item_id: str) -> str:
+    def _invoke_plan(self, item_id: str) -> dict:
         """Claim an item and invoke /plan for it.
 
         Args:
             item_id: The work item ID to process.
 
         Returns:
-            One of "planned", "needs_input", or "error".
+            A dict with keys:
+                - outcome: "planned", "needs_input", or "error"
+                - error_detail: str or None
+                - recovery: dict or None (with keys action, success)
         """
+        result: dict[str, Any] = {
+            "outcome": "",
+            "error_detail": None,
+            "recovery": None,
+        }
+
         # Claim the item
         claim_cmd = [
             "wl", "update", item_id,
             "--status", "in_progress",
-            "--stage", "in_progress",
             "--json",
         ]
         logger.debug("planall.claim cmd=%s", " ".join(claim_cmd))
@@ -122,7 +156,9 @@ class PlanAllEngine:
             claim_result = self.runner(claim_cmd)
         except Exception as exc:
             logger.warning("planall.claim.exception item=%s exc=%s", item_id, exc)
-            return "error"
+            result["outcome"] = "error"
+            result["error_detail"] = f"Claim exception: {exc}"
+            return result
 
         if claim_result.returncode != 0:
             logger.warning(
@@ -131,35 +167,138 @@ class PlanAllEngine:
                 claim_result.returncode,
                 (claim_result.stderr or "").strip(),
             )
-            return "error"
+            result["outcome"] = "error"
+            result["error_detail"] = f"Claim failed (rc={claim_result.returncode})"
+            return result
 
-        # Invoke /plan via pi
-        plan_cmd = ["pi", "run", f"/plan {item_id}"]
+        # Invoke /plan via pi (non-interactive JSON-stream mode)
+        plan_cmd = ["pi", "-p", "--mode", "json", f"/plan {item_id}"]
         logger.debug("planall.plan.invoke cmd=%s", " ".join(plan_cmd))
         try:
-            plan_result = self.runner(plan_cmd)
+            plan_result = self.runner(plan_cmd, timeout=self.item_timeout)
         except Exception as exc:
             logger.warning("planall.plan.exception item=%s exc=%s", item_id, exc)
-            return "error"
+            result["outcome"] = "error"
+            result["error_detail"] = f"Plan exception: {exc}"
+            result["recovery"] = self._attempt_recovery(item_id)
+            return result
+
+        # Parse the JSON-stream output to extract plain text for question detection
+        plan_stdout = extract_pi_text(plan_result.stdout or "")
 
         if plan_result.returncode != 0:
             stderr = (plan_result.stderr or "").strip()
-            stdout = (plan_result.stdout or "").strip()
             logger.warning(
                 "planall.plan.failed item=%s rc=%s stderr=%s stdout=%s",
                 item_id,
                 plan_result.returncode,
                 stderr,
-                stdout[:500],
+                plan_stdout[:500],
             )
             # If the plan command stopped with non-zero exit, it likely
             # indicates unanswered questions (producer input needed).
             # Also check stdout for question-like patterns.
-            if self._contains_questions(plan_result.stdout or ""):
-                return "needs_input"
-            return "error"
+            if self._contains_questions(plan_stdout):
+                result["outcome"] = "needs_input"
+                result["error_detail"] = f"Plan needs input (rc={plan_result.returncode}): {stderr}"
+                return result
+            # Otherwise it's an error - attempt recovery
+            result["outcome"] = "error"
+            result["error_detail"] = f"Plan failed (rc={plan_result.returncode}): {stderr}"
+            result["recovery"] = self._attempt_recovery(item_id)
+            return result
 
-        return "planned"
+        # Check for question patterns even on zero exit
+        if self._contains_questions(plan_stdout):
+            result["outcome"] = "needs_input"
+            result["error_detail"] = "Plan output contains unanswered questions"
+            return result
+
+        result["outcome"] = "planned"
+        return result
+
+    def _attempt_recovery(self, item_id: str) -> dict:
+        """Attempt to recover from a failed plan by resetting the item status.
+
+        Args:
+            item_id: The work item ID to recover.
+
+        Returns:
+            A dict with keys:
+                - action: description of recovery action taken
+                - success: whether recovery succeeded
+        """
+        recovery: dict[str, Any] = {
+            "action": "reset_status_to_open_with_stage_intake_complete",
+            "success": False,
+        }
+
+        # Reset status to open and stage back to intake_complete
+        cmd = [
+            "wl", "update", item_id,
+            "--status", "open",
+            "--stage", "intake_complete",
+            "--json",
+        ]
+        logger.debug("planall.recovery cmd=%s", " ".join(cmd))
+        try:
+            recovery_result = self.runner(cmd)
+        except Exception as exc:
+            logger.warning("planall.recovery.exception item=%s exc=%s", item_id, exc)
+            recovery["action"] = f"recovery_failed: {exc}"
+            return recovery
+
+        if recovery_result.returncode != 0:
+            logger.warning(
+                "planall.recovery.failed item=%s rc=%s stderr=%s",
+                item_id,
+                recovery_result.returncode,
+                (recovery_result.stderr or "").strip(),
+            )
+            recovery["action"] = f"recovery_failed (rc={recovery_result.returncode})"
+            return recovery
+
+        recovery["success"] = True
+        return recovery
+
+    def _setup_signal_handlers(self) -> None:
+        """Register SIGINT and SIGTERM handlers for graceful abort."""
+        self._original_sigint = signal.getsignal(signal.SIGINT)
+        self._original_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _restore_signal_handlers(self) -> None:
+        """Restore original signal handlers."""
+        if self._original_sigint is not None:
+            signal.signal(signal.SIGINT, self._original_sigint)
+        if self._original_sigterm is not None:
+            signal.signal(signal.SIGTERM, self._original_sigterm)
+        self._original_sigint = None
+        self._original_sigterm = None
+
+    def _signal_handler(self, signum: int, frame: Any) -> None:
+        """Handle SIGINT/SIGTERM by recovering the current item and exiting."""
+        logger.warning(
+            "planall.signal received signum=%s current_item=%s",
+            signum,
+            self._current_item_id,
+        )
+        if self._current_item_id is not None:
+            recovery_result = self._attempt_recovery(self._current_item_id)
+            if recovery_result.get("success"):
+                logger.info(
+                    "planall.signal.recovered item=%s",
+                    self._current_item_id,
+                )
+            else:
+                logger.warning(
+                    "planall.signal.recovery.failed item=%s action=%s",
+                    self._current_item_id,
+                    recovery_result.get("action"),
+                )
+        self._restore_signal_handlers()
+        sys.exit(128 + signum)
 
     @staticmethod
     def _contains_questions(text: str) -> bool:
@@ -197,22 +336,40 @@ class PlanAllEngine:
                 - id: work item ID
                 - title: work item title (or empty string if not available)
                 - outcome: "planned", "needs_input", or "error"
+                - error_detail: str or None
+                - recovery: dict or None
         """
         items = self.discover_items()
+        self._total_discovered = len(items)
         results: list[dict] = []
+        processed = 0
 
-        for item in items:
-            item_id = item.get("id", "")
-            if not item_id:
-                continue
+        self._setup_signal_handlers()
+        try:
+            for item in items:
+                item_id = item.get("id", "")
+                if not item_id:
+                    continue
 
-            title = item.get("title", "")
-            outcome = self._invoke_plan(item_id)
-            results.append({
-                "id": item_id,
-                "title": title,
-                "outcome": outcome,
-            })
+                # Check the max limit
+                if self.max_items > 0 and processed >= self.max_items:
+                    break
+
+                title = item.get("title", "")
+                self._current_item_id = item_id
+                try:
+                    plan_result = self._invoke_plan(item_id)
+                    results.append({
+                        "id": item_id,
+                        "title": title,
+                        **plan_result,
+                    })
+                finally:
+                    self._current_item_id = None
+
+                processed += 1
+        finally:
+            self._restore_signal_handlers()
 
         return results
 
@@ -227,7 +384,11 @@ class PlanAllEngine:
             results: The list of processing results.
             parent_id: If provided, post the summary as a comment on this item.
         """
-        summary_md = generate_summary(results, json_output=False)
+        summary_md = _wrap_with_failure_notice_if_needed(
+            generate_summary(results, json_output=False, total_discovered=self._total_discovered),
+            results,
+            script_name="planall.py",
+        )
         print(summary_md)
 
         if parent_id:
@@ -252,12 +413,27 @@ class PlanAllEngine:
 # Summary generation
 # ---------------------------------------------------------------------------
 
-def generate_summary(results: list[dict], json_output: bool = False) -> str:
+def _wrap_with_failure_notice_if_needed(report: str, results: list[dict],
+                                       script_name: str = "planall.py") -> str:
+    """Wrap the report with a FailureNotice if any results have errors."""
+    errors = sum(1 for r in results if r.get("outcome") == "error")
+    if errors == 0:
+        return report
+    return FailureNotice(
+        script_name=script_name,
+        reason=f"{errors} item(s) failed during batch planning",
+    ).wrap(report)
+
+
+def generate_summary(results: list[dict], json_output: bool = False,
+                     total_discovered: int | None = None) -> str:
     """Generate a summary report from processing results.
 
     Args:
         results: List of result dicts with id, title, outcome keys.
         json_output: If True, produce JSON instead of Markdown.
+        total_discovered: Total number of items discovered before processing.
+            If provided, a "remaining" count is included in the summary.
 
     Returns:
         A Markdown or JSON string.
@@ -266,9 +442,10 @@ def generate_summary(results: list[dict], json_output: bool = False) -> str:
     planned = sum(1 for r in results if r.get("outcome") == "planned")
     needs_input = sum(1 for r in results if r.get("outcome") == "needs_input")
     errors = sum(1 for r in results if r.get("outcome") == "error")
+    remaining = (total_discovered - total) if total_discovered is not None else 0
 
     if json_output:
-        report = {
+        report: dict[str, Any] = {
             "total": total,
             "planned": planned,
             "needs_input": needs_input,
@@ -278,6 +455,8 @@ def generate_summary(results: list[dict], json_output: bool = False) -> str:
                 for r in results
             ],
         }
+        if total_discovered is not None:
+            report["remaining"] = remaining
         return json.dumps(report, indent=2)
 
     lines = [
@@ -289,6 +468,9 @@ def generate_summary(results: list[dict], json_output: bool = False) -> str:
         f"**Errors**: {errors}",
         "",
     ]
+    if total_discovered is not None:
+        lines.insert(-1, f"**Remaining**: {remaining}")
+        lines.insert(-1, "")
     if results:
         lines.append("## Results")
         lines.append("")
@@ -324,6 +506,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Post the summary as a comment on the specified parent work item",
     )
     parser.add_argument(
+        "--max",
+        type=int,
+        default=0,
+        help="Maximum number of items to process (0 = no limit)",
+    )
+    parser.add_argument(
+        "--item-timeout",
+        type=int,
+        default=600,
+        help="Timeout in seconds for each item's subprocess call (default: 600)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging",
@@ -340,6 +534,21 @@ def main(argv: list[str] | None = None) -> int:
     Returns:
         Exit code (0 for success, 1 for error).
     """
+    try:
+        return _main(argv)
+    except Exception as exc:
+        notice = FailureNotice(
+            script_name="planall.py",
+            reason=f"Unhandled exception: {exc}",
+            stderr_context=traceback.format_exc(),
+        )
+        print(notice.wrap(
+            f"An unexpected error occurred: {exc}"
+        ))
+        return 1
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -349,11 +558,16 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s:%(name)s:%(message)s",
     )
 
-    engine = PlanAllEngine(verbose=args.verbose)
+    engine = PlanAllEngine(
+        max_items=args.max,
+        item_timeout=args.item_timeout,
+        verbose=args.verbose,
+    )
     results = engine.run_all()
 
     if args.json:
-        report = generate_summary(results, json_output=True)
+        report = generate_summary(results, json_output=True,
+                                 total_discovered=engine._total_discovered)
         print(report)
     else:
         engine.post_summary(results, parent_id=args.parent_id)

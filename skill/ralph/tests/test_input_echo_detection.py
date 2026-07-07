@@ -5,20 +5,18 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.ralph_loop import (
+from skill.ralph.scripts.ralph_loop import (  # noqa: E402
     PiInputEchoError,
     _detect_input_echo,
     _detect_raw_skill_content,
     _normalize_text_for_comparison,
     _validate_pi_output,
-    _MIN_VALID_OUTPUT_LENGTH,
-)
+)  # noqa: E402
 
 
 class TestNormalizeTextForComparison:

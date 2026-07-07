@@ -4,16 +4,14 @@ separator between them."""
 
 import io
 import json
-import subprocess
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
-from skill.ralph.scripts.ralph_loop import RalphLoop
+from skill.ralph.scripts.ralph_loop import RalphLoop  # noqa: E402
 
 
 def _fake_process(lines: list[str], returncode: int = 0) -> MagicMock:
@@ -74,10 +72,10 @@ def test_stream_pi_adds_newline_between_thought_blocks():
     loop = RalphLoop(pi_bin="pi", stream=True, verbose=False)
 
     with (
-        patch("subprocess.Popen", return_value=proc) as mock_popen,
+        patch("subprocess.Popen", return_value=proc) as _mock_popen,
         redirect_stdout(io.StringIO()) as buf,
     ):
-        result = loop._stream_pi(["pi", "-p", "--mode", "json", "prompt"], "prompt")
+        _result = loop._stream_pi(["pi", "-p", "--mode", "json", "prompt"], "prompt")
 
     output = buf.getvalue()
     # Should have a newline between the two thought blocks

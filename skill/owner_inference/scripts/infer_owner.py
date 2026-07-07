@@ -1,6 +1,5 @@
 # Compatibility shim: delegate to the implementation in skill/owner-inference/scripts/infer_owner.py
 import importlib.util
-import sys
 from pathlib import Path
 
 orig = Path(__file__).resolve().parents[3] / 'skill' / 'owner-inference' / 'scripts' / 'infer_owner.py'

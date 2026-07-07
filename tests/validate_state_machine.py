@@ -31,11 +31,11 @@ Usage:
     python tests/validate_state_machine.py --descriptor path/to/workflow.json
 """
 
-import argparse
-import json
-import sys
-from pathlib import Path
-from typing import Any
+import argparse  # noqa: E402
+import json  # noqa: E402
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
 
 
 def load_json(path: Path) -> dict:

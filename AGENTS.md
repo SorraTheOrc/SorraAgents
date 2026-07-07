@@ -22,7 +22,7 @@ Follow thhe steps below when completing tasks. If you are already working on a s
 2. **Ensure the work-item is clearly defined**:
    - retrieve the work-item details with `wl show <id> --children --json`
    - Read the the work-item and any related files/paths/work-items identified within
-   - If the work-item is not clearly defined (it _MUST_ included a clear description of the goal and how it will change behaviour, preferably in the form of a user story, along with acceptance criteria that can be used to verify completion and references to important specifications, user-stories, designs, or other important context):
+   - If the work-item is not clearly defined (it *MUST* included a clear description of the goal and how it will change behaviour, preferably in the form of a user story, along with acceptance criteria that can be used to verify completion and references to important specifications, user-stories, designs, or other important context):
      - Search the worklog (`wl search <search-terms> --json` and `wl show <id> --children --json`) and repository for any existing information that may clarify the requirements
      - If the operator has allowed further questions ask for clarification on specific requirements, acceptance criteria, and context. Where possible provide suggested responses, but always allow for a free form text response.
      - If the operator has not allowed further questions attempt to clarify the requirements based on the existing information in the repository and worklog.
@@ -55,7 +55,7 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      - If the operator has allowed further questions ask for clarification on specific requirements, acceptance criteria, and context. Where possible provide suggested responses, but always allow for a free form text response.
      - If the operator has not allowed further questions attempt to clarify the requirements based on the existing information in the repository and worklog.
      - Update the work-item description and acceptance criteria with any clarifications found with `wl update <WIP-id> --description "<updated-description>"`. DO NOT remove existing content unless it is incorrect, ONLY add to it with appropriate clarifications.
-   - Create a new branch for the work-item following the branch naming conventions (e.g. `wl-<WIP-id>-short-description`)
+   - Create a worktree for the work-item with a new branch following the naming conventions (e.g., `wl-<WIP-id>-short-description`). See the canonical [[concepts/git-worktree-best-practices-for-agent-workflows]] wiki page for the worktree workflow (create, use, push, clean up).
    - Complete all work required to meet the acceptance criteria (code, tests, documentation, etc.)
      - If new work-items are discovered during implementation create new work-items using `wl create "<work-item-title>" --description "<detailed-description-of-goals-and-context>" --issue-type <type-of-work-item> --json`. If the item must be completed in order to satisfy the requirements of the parent work-item, make the new item a child of the parent work-item using `--parent <parent-id>`. If it is an optional item make it a sibling of the <base-item-id> and add a reference to the base item in the description using `discovered-from:<base-item-id>`.
      - Regularly build the project and run all tests and checks to ensure nothing is broken. Always follow the build → test → commit order: build first, then test, then commit.
@@ -67,22 +67,40 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      `git push origin HEAD:refs/heads/dev`
      This makes your changes available in `dev` — the primary working branch.
      Only the release process (ship agent / release manager) promotes changes
-     from `dev` to `main`. See [skill/ship/SKILL.md](skill/ship/SKILL.md) for
+     from `dev` to `main`. See [skills/ship/SKILL.md](skills/ship/SKILL.md) for
      the push-to-dev workflow and `scripts/release/merge-dev-to-main.sh` for
      the dev→main release process.
-   - After pushing, switch to the `dev` branch locally and pull the latest:
+   - After pushing, clean up the worktree:
+
      ```bash
+     git worktree remove .worklog/worktrees/<worktree-name>
+     git worktree prune
+     ```
+
+     This keeps the repository free of stale worktrees between sessions.
+     Then switch to the `dev` branch in the main checkout and pull the latest:
+
+     ```bash
+     cd /path/to/repo/root
      git checkout dev
      git pull origin dev
      ```
+
      This ensures subsequent operations (e.g., starting the next work-item)
      begin from the current HEAD of the integration branch.
    - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
-   - After committing and pushing changes, close your response to the operator with: "If you want to commit this work now I suggest the following commit message:\n\n`<WIP-id>: <concise-summary>`"
+   - After committing and pushing changes, close your response to the operator with: "`<WIP-id>: <concise-summary>`\n\nWork committed to dev"
    - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
 
      > ⚠️ **Do NOT close the work-item at this stage.**
      > Work-items are closed only after the `dev`→`main` release is complete.
+     >
+     > **Clarification — what "close" means when an operator says it:**
+     > When a human operator tells you to "close a work item", they mean
+     > update the stage to `in_review` or mark it as `completed` — they do
+     > **not** mean initiate a dev→main release. Do not start a release
+     > unless the operator explicitly asks for it. Releasing is a separate,
+     > explicit action that requires explicit operator consent.
      >
      > Agents SHOULD NOT push directly to `main` unless explicitly authorized.
      > The canonical `dev`→`main` release process is implemented by
@@ -90,7 +108,7 @@ Follow thhe steps below when completing tasks. If you are already working on a s
      > agent may perform the release by invoking the Ship skill's release command,
      > or a designated Release Manager may perform it manually. The process creates
      > a PR, waits for CI, and merges via `gh pr merge`. See
-     > [skill/ship/SKILL.md](skill/ship/SKILL.md) and
+     > [skills/ship/SKILL.md](skills/ship/SKILL.md) and
      > [docs/dev/release-process.md](docs/dev/release-process.md) for details.
 
    - Report back to the operator summarising the work completed and proceed to the next step.
@@ -105,6 +123,15 @@ Follow thhe steps below when completing tasks. If you are already working on a s
    - If the operator wishes to address any remaining tasks, return to the `Claim the work-item` with the selected work-item id as the new <base-item-id>.
    - When the operator indicates that the session is complete, ensure all work-items created or worked on during the session are in the `in_review` or `done` stage.
    - Provide a final summary to the operator of all work completed during the session, including work-item ids, commit hashes, and any relevant links.
+   - Clean up the worktree if not already removed:
+
+     ```bash
+     git worktree prune
+     rm -rf .worklog/worktrees/<worktree-name>
+     ```
+
+     See the [[concepts/git-worktree-best-practices-for-agent-workflows]]
+     wiki page for the full worktree lifecycle.
    - Thank the operator and end the session.
    <!-- WORKFLOW: end -->
 
@@ -115,7 +142,7 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 ## CRITICAL RULES
 
 - Use Worklog (wl), described below, for ALL task tracking, do NOT use markdown TODOs, task lists, or other tracking methods
-- _NEVER_ write directly to `.worklog/worklog-data.jsonl` unless you are given permission to do so by a Producer, and you have confirmed the correct format and structure of the data to be added. Use `wl` commands to interact with the worklog data. All manipulation of work items must be done through `wl` commands to ensure data integrity and consistency.
+- *NEVER* write directly to `.worklog/worklog-data.jsonl` unless you are given permission to do so by a Producer, and you have confirmed the correct format and structure of the data to be added. Use `wl` commands to interact with the worklog data. All manipulation of work items must be done through `wl` commands to ensure data integrity and consistency.
 - A child work-item may be closed independently; however, a parent work-item can only be closed once all of its child work-items are closed, all blocking dependencies are resolved, and a Producer has reviewed and approved the work
 - Always ensure that work-items are kept up to date and accurately reflect the current state of the work. This includes updating descriptions, acceptance criteria, stages, and comments as needed throughout the lifecycle of the work.
 - Always ensure that any work-item created is associated with a clear goal and context, preferably in the form of a user story, along with measurable and testable acceptance criteria. If the requirements are not clear, seek clarification and update the work-item accordingly before proceeding with implementation.
@@ -147,6 +174,22 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - Use priorities to indicate the importance of work items
 - Use stages to track workflow progress
 - Do NOT clutter repo root with planning documents
+
+## Stage vs Status distinction
+
+Work items have two lifecycle axes that agents must manage independently:
+
+- **`status`** tracks the work-item lifecycle (open, in-progress, completed).
+  Only set `status` to `completed` when the work-item is formally closed
+  (post-release).
+- **`stage`** tracks workflow progress (idea, intake_complete, plan_complete,
+  in_progress, in_review). Advance `stage` to `in_review` as soon as
+  implementation is ready for human review — even if `status` remains
+  `in-progress`.
+- **Epics/parent items:** Once all children are in a terminal stage
+  (`in_review` or `completed`), advance the parent work-item's `stage`
+  to `in_review`. The parent's `status` should remain `in-progress`
+  until the formal post-release closure.
 
 ## work-item Types
 
@@ -207,8 +250,8 @@ Worklog does not enforce these relationships but they can be used for planning a
 
 ## Test-failure triage policy
 
-- When an agent discovers a failing test that appears to be outside its ownership/scope, it should call the triage helper `skill/triage/scripts/check_or_create.py` with structured evidence (test name, stdout excerpt, optional stack trace/commit/CI URL).
-- Any incomplete (open or in_progress) work item tagged `test-failure` that matches the failing test name in title or body should be considered a match and will be linked/updated. If no match exists the helper will create a `critical` work item using the repository template `skill/triage/resources/test-failure-template.md`.
+- When an agent discovers a failing test that appears to be outside its ownership/scope, it should call the triage helper `skills/triage/scripts/check_or_create.py` with structured evidence (test name, stdout excerpt, optional stack trace/commit/CI URL).
+- Any incomplete (open or in_progress) work item tagged `test-failure` that matches the failing test name in title or body should be considered a match and will be linked/updated. If no match exists the helper will create a `critical` work item using the repository template `skills/triage/resources/test-failure-template.md`.
 - **Extension (SA-0MQ7WR2MT004U82N):** When test failures are detected during the implement workflow:
   1. The triage helper is invoked with `parent_work_item_id` to create a **blocking child work item**.
   2. The child work item is implemented using `implement-single` to fix the failure.
@@ -217,6 +260,7 @@ Worklog does not enforce these relationships but they can be used for planning a
 - Agents may continue to use `gh` or other tooling directly; this policy is enforced by agent workflow conventions and the implement skill.
 
 **Test-failure fix workflow (automated via Ralph):**
+
 - When `ralph run` completes successfully and tests are run, any failing tests trigger:
   - Creation of a child work item via triage helper (with `parent_work_item_id`)
   - Implementation of the fix using `implement-single`
@@ -230,8 +274,8 @@ Worklog does not enforce these relationships but they can be used for planning a
 
 - `wl create "Found bug" --priority high --tags "discovered-from:<parent-id>"`
 
-5. Complete: `wl close <id> --reason "PR #123 merged"`
-6. Sync: run `wl sync` before ending the session
+1. Complete: `wl close <id> --reason "PR #123 merged"`
+2. Sync: run `wl sync` before ending the session
 
 ## Work-Item Management
 
@@ -337,3 +381,83 @@ Depending on your setup, you may have additional wl plugins installed. Check ava
 
 Run `wl --help` to see general help text and available commands.
 Run `wl <command> --help` to see help text and all available flags for any command.
+
+## Coding Disciplines
+
+> Source: [Karpathy-Inspired Claude Code Guidelines](https://github.com/multica-ai/andrej-karpathy-skills) — derived from [Andrej Karpathy's observations](https://x.com/karpathy/status/2015883857489522876) on LLM coding pitfalls.
+
+These four principles complement the workflow and core principles above by addressing common LLM coding pitfalls: making unchecked assumptions, overcomplicating solutions, making unnecessary side-effect edits, and executing vague goals without verifiable success criteria. They bias toward **caution over speed** — for trivial tasks (simple typo fixes, obvious one-liners) use judgment; not every change needs the full rigor.
+
+### 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+LLMs often pick an interpretation silently and run with it. This principle forces explicit reasoning:
+
+- **State assumptions explicitly** — If uncertain, ask rather than guess
+- **Present multiple interpretations** — Don't pick silently when ambiguity exists
+- **Push back when warranted** — If a simpler approach exists, say so
+- **Stop when confused** — Name what's unclear and ask for clarification
+
+### 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+Combat the tendency toward overengineering:
+
+- No features beyond what was asked
+- No abstractions for single-use code
+- No "flexibility" or "configurability" that wasn't requested
+- No error handling for impossible scenarios
+- If 200 lines could be 50, rewrite it
+
+**The test:** Would a senior engineer say this is overcomplicated? If yes, simplify.
+
+### 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+
+- Don't "improve" adjacent code, comments, or formatting
+- Don't refactor things that aren't broken
+- Match existing style, even if you'd do it differently
+- If you notice unrelated dead code, mention it — don't delete it
+
+When your changes create orphans:
+
+- Remove imports/variables/functions that YOUR changes made unused
+- Don't remove pre-existing dead code unless asked
+
+**The test:** Every changed line should trace directly to the user's request.
+
+### 4. Repository Boundaries
+
+**Stay in your lane. Don't modify the tooling.**
+
+- Do NOT edit files in `.pi/`, `skill/`, `command/`, or any agent-infrastructure directory unless explicitly instructed.
+- The skills and commands under these paths are part of the agent framework itself — modifying them is equivalent to modifying the tool you're holding.
+- If a skill or command behaves unexpectedly, report the issue to the operator via a work item or comment instead of patching it yourself.
+- If you are given permission to modify infrastructure, create a work item in the relevant project (e.g., SorraAgents) first to track the change.
+
+### 5. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform imperative tasks into verifiable goals:
+
+| Instead of... | Transform to... |
+|--------------|-----------------|
+| "Add validation" | "Write tests for invalid inputs, then make them pass" |
+| "Fix the bug" | "Write a test that reproduces it, then make them pass" |
+| "Refactor X" | "Ensure tests pass before and after" |
+
+For multi-step tasks, state a brief plan:
+
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let the LLM loop independently. Weak criteria ("make it work") require constant clarification.

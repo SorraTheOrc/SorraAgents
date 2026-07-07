@@ -37,7 +37,7 @@ The engine's triage audit cycle picks up WL-EXAMPLE-002 in `in_review` state.
 | **Command** | `audit_fail` |
 | **Actor** | QA (AMPA via audit skill) |
 | **State Before** | `in_progress / in_review` (alias: `review`) |
-| **State After** | `in_progress / audit_failed` (alias: `audit_failed`) |
+| **State After** | `open / audit_failed` (alias: `audit_failed`) |
 | **Pre Invariants** | |
 
 | Invariant | Check | Result |
@@ -48,6 +48,7 @@ The engine's triage audit cycle picks up WL-EXAMPLE-002 in `in_review` state.
 **Effects:** `add_tags: [audit_failed]`
 
 **Audit Output (recorded as comment):**
+
 ```
 # AMPA Audit Result
 
@@ -75,8 +76,9 @@ This item cannot be closed: 2 acceptance criteria are unmet (rate limit headers,
 ```
 
 **Engine Action:**
+
 ```bash
-wl update WL-EXAMPLE-002 --stage audit_failed
+wl update WL-EXAMPLE-002 --status open --stage audit_failed
 wl comment add WL-EXAMPLE-002 --comment "..." --author "ampa-scheduler"
 ```
 
@@ -88,7 +90,7 @@ The engine decides to retry (first failure, below escalation threshold).
 |---|---|
 | **Command** | `retry_delegation` |
 | **Actor** | PM (AMPA scheduler) |
-| **State Before** | `in_progress / audit_failed` (alias: `audit_failed`) |
+| **State Before** | `open / audit_failed` (alias: `audit_failed`) |
 | **State After** | `open / plan_complete` (alias: `plan`) |
 | **Effects** | `remove_tags: [audit_failed]` |
 
@@ -109,6 +111,7 @@ Next scheduler cycle picks up WL-EXAMPLE-002 at stage `plan_complete`.
 | **Engine Action** | `opencode run "work on WL-EXAMPLE-002 using the implement skill"` |
 
 Patch reads the audit comment, addresses the gaps:
+
 - Adds X-RateLimit-* response headers
 - Implements Redis-backed rate limit storage
 
@@ -129,6 +132,7 @@ Patch reads the audit comment, addresses the gaps:
 | **State After** | `completed / audit_passed` (alias: `audit_passed`) |
 
 **Audit Output:**
+
 ```
 # AMPA Audit Result
 

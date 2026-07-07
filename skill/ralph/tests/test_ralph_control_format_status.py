@@ -5,7 +5,6 @@ has a consistent section ordering and structure, ensuring that repeated
 calls with the same input produce identical output.
 """
 
-import pytest
 from skill.ralph.scripts.ralph_control import format_status
 
 
@@ -184,12 +183,12 @@ class TestFormatStatusConsistency:
         output = format_status(snapshot)
         lines = output.split("\n")
         # Find section markers
-        header_idx = next(i for i, l in enumerate(lines) if l == "# Ralph Status")
-        active_idx = next(i for i, l in enumerate(lines) if "**Active Task**" in l)
-        counts_idx = next(i for i, l in enumerate(lines) if l == "## Status Counts")
-        activity_idx = next(i for i, l in enumerate(lines) if l == "## Recent Activity")
-        exit_idx = next(i for i, l in enumerate(lines) if "**Exit Code**" in l)
-        final_idx = next(i for i, l in enumerate(lines) if "**Final Status**" in l)
+        header_idx = next(i for i, line in enumerate(lines) if line == "# Ralph Status")
+        active_idx = next(i for i, line in enumerate(lines) if "**Active Task**" in line)
+        counts_idx = next(i for i, line in enumerate(lines) if line == "## Status Counts")
+        activity_idx = next(i for i, line in enumerate(lines) if line == "## Recent Activity")
+        exit_idx = next(i for i, line in enumerate(lines) if "**Exit Code**" in line)
+        final_idx = next(i for i, line in enumerate(lines) if "**Final Status**" in line)
         # Verify order
         assert header_idx < active_idx < counts_idx < activity_idx < exit_idx < final_idx
 

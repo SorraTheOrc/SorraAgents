@@ -28,6 +28,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -35,12 +36,29 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts.persist_audit import persist_audit
+from skill.audit.scripts.persist_audit import persist_audit  # noqa: E402
+from skill.scripts.failure_notice import FailureNotice  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
+
+CALL_PI_TIMEOUT = 600
+"""Internal timeout (seconds) for each Pi model subprocess call.
+
+This is a generous safety net for individual Pi model calls during audit
+processing. Large audit prompts can take several minutes, so the timeout
+must be high enough to not interrupt normal operation.
+
+The cumulative elapsed-time guard in ``cmd_issue`` (110s threshold for
+child audit skipping) provides the primary protection against the parent
+bash-tool execution timeout (~120s), not this per-call timeout.
+
+If the Pi model itself takes longer than this value, something is likely
+wrong (model hang, provider issue) and the timeout diagnostic should be
+produced rather than blocking indefinitely.
+"""
 
 # Verdict constants
 VERDICT_MET = "met"
@@ -48,6 +66,17 @@ VERDICT_UNMET = "unmet"
 VERDICT_PARTIAL = "partial"
 VERDICT_ADJUSTED = "adjusted"
 _ACCEPTABLE_VERDICTS = {VERDICT_MET, VERDICT_ADJUSTED}
+
+# ---------------------------------------------------------------------------
+# Closing-sentence constants (AC1–3)
+# ---------------------------------------------------------------------------
+_CLOSING_READY = (
+    "Work item is ready to close, would you like me to close it?"
+)
+_CLOSING_NOT_READY = (
+    "Work item is not ready to close (see above), "
+    "would you like me to address the gaps in the audit?"
+)
 
 # Model / config constants (following Ralph's pattern)
 ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "ralph" / "assets" / ".ralph.json"
@@ -68,6 +97,28 @@ Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_closing_sentence(report: str) -> str:
+    """Determine the closing sentence based on the ready-to-close verdict.
+
+    Parses the first ``Ready to close:`` line in *report* and returns the
+    appropriate closing sentence. Defaults to *not ready* when the line is
+    not found or the verdict is not ``Yes``.
+
+    This function also handles reports that have been wrapped by a
+    ``FailureNotice`` (where the first line is ``═══`` rather than
+    ``Ready to close:``).
+    """
+    for line in report.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Ready to close:"):
+            verdict = stripped.split(":", 1)[1].strip()
+            if verdict.lower() == "yes":
+                return _CLOSING_READY
+            break
+    return _CLOSING_NOT_READY
+
 
 def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=False, text=True, capture_output=True)
@@ -285,10 +336,21 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         raise RuntimeError(f"pi binary not found: {pi_bin}")
 
     try:
-        stdout, stderr = process.communicate(timeout=900)
+        stdout, stderr = process.communicate(timeout=CALL_PI_TIMEOUT)
     except subprocess.TimeoutExpired:
         process.kill()
         stdout, stderr = process.communicate()
+        return {
+            "verdict": "unmet",
+            "evidence": (
+                f"Pi model call timed out after {CALL_PI_TIMEOUT}s. "
+                "Manual audit required."
+            ),
+            "raw_stdout": stdout,
+            "raw_stderr": stderr,
+            "extracted_text": "",
+            "_timeout": True,
+        }
 
     raw = stdout or ""
     if not raw:
@@ -536,13 +598,35 @@ def _extract_acs(description: str) -> list[str]:
 # Report assembly
 # ---------------------------------------------------------------------------
 
+# Sentinel to detect when model/model_source were not explicitly passed
+_MISSING = object()
+
+
 def _assemble_issue_report(issue: dict, ac_results: list[dict],
-                           child_results: list[dict]) -> str:
+                           child_results: list[dict],
+                           code_quality_findings: list[dict] | None = None,
+                           code_quality_fixes_applied: int = 0,
+                           code_quality_skipped_reason: str | None = None,
+                           model: str | None = _MISSING,
+                           model_source: str | None = _MISSING,
+                           phase2_completed: bool = False) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
     *child_results* is a list of child review dicts with keys:
       ``title``, ``id``, ``status``, ``stage``, ``ac_results``.
+    *code_quality_findings* is an optional list of finding dicts from
+      code quality checks. Each dict has ``severity``, ``file``, ``line``,
+      ``message``, ``linter``, ``code`` keys.
+    *code_quality_skipped_reason* is an optional string explaining why
+      code quality was not run (e.g., no linters available).
+    *model* is the name of the model used for the audit (e.g.,
+      ``"opencode-go/deepseek-v4-flash"``). When not provided, no model
+      line is emitted (backward compatibility). When provided as ``None``
+      or empty string, the fallback ``Model: manual (no provider)`` is used.
+    *model_source* is the source of the model (``"local"`` or ``"remote"``).
+      When provided alongside *model*, produces
+      ``Model: <model> (provider: <source>)``.
 
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
@@ -550,6 +634,9 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       - All non-deleted children must be in ``in_review`` or ``done`` stage.
         Children with ``status: in_progress`` but ``stage: in_review`` are
         acceptable and do NOT block closure.
+      - Code quality findings: critical or high severity findings block closure
+        ("Ready to close: No"). Medium and low findings produce warnings
+        but do NOT block closure.
     """
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
@@ -561,13 +648,35 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         c.get("stage") in ("in_review", "done")
         for c in active_children
     )
-    ready = "Yes" if (all_ac_acceptable and all_children_reviewed) else "No"
 
-    lines = [f"Ready to close: {ready}", "", "## Summary", ""]
+    # Code quality blocking: critical or high findings block closure
+    cq_findings = code_quality_findings or []
+    has_blocking_cq = any(
+        f.get("severity") in ("critical", "high")
+        for f in cq_findings
+    )
+
+    ready_before_cq = "Yes" if (all_ac_acceptable and all_children_reviewed) else "No"
+    if ready_before_cq == "Yes" and has_blocking_cq:
+        ready = "No"
+    else:
+        ready = ready_before_cq
+
+    # Build model line (only when model/model_source was explicitly provided)
+    if model is not _MISSING:
+        effective_model = (model or "").strip() or "manual"
+        effective_source = ((model_source or "") if model_source is not _MISSING else "").strip()
+        if effective_source:
+            model_line = f"Model: {effective_model} (provider: {effective_source})"
+        else:
+            model_line = f"Model: {effective_model} (no provider)"
+        lines = [f"Ready to close: {ready}", "", model_line, "", "## Summary", ""]
+    else:
+        lines = [f"Ready to close: {ready}", "", "## Summary", ""]
 
     # Count verdicts across all criteria (parent + children)
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
-    met_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_MET)
+    _met_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_MET)
     adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
     partial_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_PARTIAL)
@@ -577,18 +686,36 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if c.get("stage") not in ("in_review", "done", "")
     ]
 
-    if ready == "Yes":
-        parts = []
-        parts.append(
-            f"All {len(ac_results)} acceptance criteria for work item "
-            f"{issue.get('id', '?')} are acceptable"
-        )
-        if adjusted_count > 0:
-            parts.append(f"({adjusted_count} with acceptable variance)")
-        parts.append(". All children are in in_review or done stage.")
-        lines.append(" ".join(parts))
+    if ready_before_cq == "Yes":
+        if has_blocking_cq:
+            lines.append(
+                "All acceptance criteria are met and children are reviewed, "
+                "but code quality findings block closure."
+            )
+        else:
+            parts = []
+            parts.append(
+                f"All {len(ac_results)} acceptance criteria for work item "
+                f"{issue.get('id', '?')} are acceptable"
+            )
+            if adjusted_count > 0:
+                parts.append(f"({adjusted_count} with acceptable variance)")
+            parts.append(". All children are in in_review or done stage.")
+            if phase2_completed:
+                parts.append(" Deep code analysis (Phase 2) completed and confirmed all verdicts.")
+            lines.append(" ".join(parts))
     else:
-        if unmet_count > 0 and not_reviewed:
+        if not phase2_completed and any(
+            r["verdict"] == VERDICT_PARTIAL
+            and "pending deep code review" in r.get("evidence", "")
+            for r in ac_results
+        ):
+            lines.append(
+                "Phase 1 automated screening detected blocking issues. "
+                "All 'met' verdicts have been demoted to 'partial' (pending deep code review). "
+                "Phase 2 deep analysis was skipped. Resolve Phase 1 blockers and re-audit."
+            )
+        elif unmet_count > 0 and not_reviewed:
             lines.append(
                 f"{unmet_count} acceptance criteria not met AND "
                 f"{len(not_reviewed)} children not yet in in_review/done stage."
@@ -690,14 +817,59 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             )
 
     lines.append("")
+    lines.append("### Code Quality")
+    lines.append("")
+
+    cq_findings = code_quality_findings or []
+    cq_fixes = code_quality_fixes_applied
+
+    if code_quality_skipped_reason:
+        lines.append(f"Code quality check skipped: {code_quality_skipped_reason}")
+    elif not cq_findings and cq_fixes == 0:
+        lines.append("No code quality issues found.")
+    elif not cq_findings and cq_fixes > 0:
+        lines.append(f"All issues auto-fixed by **{cq_fixes}** linter(s).")
+        lines.append("No remaining issues.")
+    else:
+        has_critical_or_high = any(
+            f.get("severity") in ("critical", "high") for f in cq_findings
+        )
+        if has_critical_or_high:
+            lines.append(
+                "**Critical and/or high severity findings detected — "
+                "these block closure.**"
+            )
+        else:
+            lines.append(
+                "**Medium/low severity findings detected — "
+                "these are reported as warnings and do not block closure.**"
+            )
+        lines.append("")
+        lines.append("| # | Severity | File | Line | Message | Linter | Code |")
+        lines.append("|---|----------|------|------|---------|--------|------|")
+        for i, f in enumerate(cq_findings, 1):
+            lines.append(
+                f"| {i} | {f.get('severity', '?')} | "
+                f"{f.get('file', '?')} | {f.get('line', 0)} | "
+                f"{f.get('message', '')} | {f.get('linter', '?')} | "
+                f"{f.get('code', '')} |"
+            )
+
+    lines.append("")
     return "\n".join(lines)
 
 
-def _assemble_child_audit_report(child: dict, ac_results: list[dict]) -> str:
+def _assemble_child_audit_report(child: dict, ac_results: list[dict],
+                                 model: str | None = _MISSING,
+                                 model_source: str | None = _MISSING) -> str:
     """Assemble an audit report for a single child work item.
 
     *child* is a dict with keys ``title``, ``id``, ``status``, ``stage``.
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
+    *model* is the name of the model used for the audit. When not provided,
+      no model line is emitted. When ``None`` or empty, the fallback
+      ``Model: manual (no provider)`` is used.
+    *model_source* is the source of the model (``"local"`` or ``"remote"``).
 
     Ready-to-close logic:
       - All acceptance criteria must be ``met`` or ``adjusted``.
@@ -709,6 +881,19 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict]) -> str:
     lines = [
         f"Ready to close: {ready}",
         "",
+    ]
+
+    # Build model line (only when model was explicitly provided)
+    if model is not _MISSING:
+        effective_model = (model or "").strip() or "manual"
+        effective_source = ((model_source or "") if model_source is not _MISSING else "").strip()
+        if effective_source:
+            lines.append(f"Model: {effective_model} (provider: {effective_source})")
+        else:
+            lines.append(f"Model: {effective_model} (no provider)")
+        lines.append("")
+
+    lines.extend([
         "## Summary",
         "",
         f"Child work item audit for {child['title']} ({child['id']}). "
@@ -718,7 +903,7 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict]) -> str:
         "",
         "| # | Criterion | Verdict | Evidence |",
         "|---|-----------|---------|----------|",
-    ]
+    ])
 
     if not ac_results:
         lines.append("")
@@ -760,8 +945,13 @@ def _persist_child_audit(
     child_stage: str,
     ac_results: list[dict],
     pi_bin: str = "pi",
+    model: str | None = None,
+    model_source: str | None = None,
 ) -> tuple[bool, str]:
     """Assemble and persist an audit report for a single child work item.
+
+    *model* and *model_source* are passed through to
+    ``_assemble_child_audit_report()`` for inclusion in the child report.
 
     Returns (success, report_text).
     On failure the report text is still returned so callers can log it.
@@ -772,7 +962,7 @@ def _persist_child_audit(
         "status": child_status,
         "stage": child_stage,
     }
-    report = _assemble_child_audit_report(child, ac_results)
+    report = _assemble_child_audit_report(child, ac_results, model=model, model_source=model_source)
 
     rc = persist_audit(child_id, report)
     success = rc == 0
@@ -863,13 +1053,61 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
 # Subcommand: issue
 # ---------------------------------------------------------------------------
 
+def _demote_met_to_partial(results: list[dict]) -> list[dict]:
+    """Demote any 'met' verdicts to 'partial' with a pending deep review note.
+
+    Used when Phase 1 (automated screening) detects blocking issues,
+    preventing Phase 2 (deep code analysis) from running.
+    """
+    demoted: list[dict] = []
+    for r in results:
+        if r["verdict"] == VERDICT_MET:
+            demoted.append({
+                "text": r["text"],
+                "verdict": VERDICT_PARTIAL,
+                "evidence": "pending deep code review (Phase 1 blocked)",
+            })
+        else:
+            demoted.append(dict(r))
+    return demoted
+
+
+def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict]) -> tuple[bool, str]:
+    """Check whether Phase 1 automated screening has blocking issues.
+
+    Returns (blocked, reason). If blocked, Phase 2 deep analysis should be
+    skipped and all 'met' verdicts demoted to 'partial'.
+    """
+    # Check code quality findings
+    for f in cq_findings:
+        if f.get("severity") in ("critical", "high"):
+            return True, f"Critical/high code quality finding: {f.get('file', '?')}:{f.get('line', 0)} — {f.get('message', '')}"
+
+    # Check children stages
+    active_children = [c for c in child_results if c.get("stage") not in ("", None)]
+    blocked_children = [
+        c for c in active_children
+        if c.get("stage") not in ("in_review", "done")
+    ]
+    if blocked_children:
+        names = ", ".join(f"{c.get('title', '?')} ({c.get('stage', '?')})" for c in blocked_children[:3])
+        return True, f"Children not in in_review/done stage: {names}"
+
+    return False, ""
+
+
+
 def _build_issue_json(issue: dict, ac_results: list[dict],
-                      child_results: list[dict]) -> dict:
+                      child_results: list[dict],
+                      code_quality_findings: list[dict] | None = None,
+                      code_quality_fixes_applied: int = 0,
+                      phase2_completed: bool = False) -> dict:
     """Build structured JSON payload for issue-mode audit.
 
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
         ``adjusted`` criteria represent acceptable variance and do not block closure.
+      - Critical/high code quality findings block closure.
     """
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
@@ -881,23 +1119,32 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         c.get("stage") in ("in_review", "done")
         for c in active_children
     )
-    ready = all_ac_acceptable and all_children_reviewed
+
+    # Code quality blocking
+    cq_findings = code_quality_findings or []
+    has_blocking_cq = any(
+        f.get("severity") in ("critical", "high")
+        for f in cq_findings
+    )
+
+    ready = all_ac_acceptable and all_children_reviewed and not has_blocking_cq
 
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
     adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
 
+    phase2_note = " Deep analysis completed." if phase2_completed else " Phase 2 skipped."
     if all_ac_acceptable:
         if adjusted_count > 0:
             summary = (
                 f"All {len(ac_results)} acceptance criteria acceptable "
-                f"({adjusted_count} with acceptable variance)."
+                f"({adjusted_count} with acceptable variance).{phase2_note}"
             )
         else:
-            summary = f"All {len(ac_results)} acceptance criteria met."
+            summary = f"All {len(ac_results)} acceptance criteria met.{phase2_note}"
     else:
         summary = (
-            f"{unmet_count} of {len(ac_results)} acceptance criteria not met."
+            f"{unmet_count} of {len(ac_results)} acceptance criteria not met.{phase2_note}"
         )
 
     return {
@@ -905,7 +1152,204 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         "summary": summary,
         "acceptance_criteria": ac_results,
         "children": child_results,
+        "code_quality": {
+            "total_findings": len(cq_findings),
+            "fixes_applied": code_quality_fixes_applied,
+            "findings": cq_findings,
+        },
+        "pipeline": {
+            "phase1_completed": True,
+            "phase2_completed": phase2_completed,
+        },
     }
+
+
+def _run_phase2_deep_analysis(
+    issue: dict,
+    ac_results: list[dict],
+    child_results: list[dict],
+    resolved_model: str,
+    pi_bin: str = "pi",
+    debug_log: str | None = None,
+    script_failure_callback=None,
+) -> tuple[list[dict], list[dict]]:
+    """Run Phase 2 deep code analysis.
+
+    Calls Pi with a detailed prompt asking the model to read the actual
+    implementation files and verify each acceptance criterion against
+    what the code actually does.
+
+    Returns (updated_ac_results, updated_child_results).
+    """
+    # Build a detailed prompt for deep analysis
+    ac_list_json = json.dumps([
+        {"index": i, "text": r["text"], "initial_verdict": r["verdict"]}
+        for i, r in enumerate(ac_results)
+    ])
+
+    prompt = (
+        "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS] "
+        "You are performing a deep code analysis. "
+        "Do NOT close, modify, create, or delete any work items. "
+        "Do NOT execute any wl, git, or other state-modifying commands. "
+        "Return ONLY a structured JSON array.\n\n"
+        "Phase 1 automated screening has PASSED. You must now perform deep code analysis.\n\n"
+        "For each acceptance criterion:\n"
+        "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
+        "2. **Verify the code actually does what the criterion claims.**\n"
+        "3. **Check for gaps between documented behavior and actual behavior.**\n"
+        "4. **Provide a specific file:line reference** as evidence.\n\n"
+        "Instructions:\n"
+        "- Use 'met' ONLY if the code genuinely satisfies the criterion.\n"
+        "- Use 'unmet' if the criterion is not satisfied at all.\n"
+        "- Use 'partial' if the criterion is partially satisfied (e.g., documented but not implemented, or implemented with gaps).\n"
+        "- Use 'adjusted' if the implementation differs from the original specification but the user story intent is preserved.\n"
+        "- Evidence MUST include a file path and line number. If no line number is available, state why.\n"
+        "- If a criterion says 'X is implemented' but the code only has scaffolding/stubs, use 'partial' not 'met'.\n\n"
+        f"Criteria: {ac_list_json}"
+    )
+
+    try:
+        issue_id = issue.get("id", "")
+        result = _call_pi_and_maybe_log(
+            issue_id, "phase2_deep", prompt,
+            model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+        )
+    except RuntimeError as exc:
+        # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
+        print(f"Warning: Phase 2 deep analysis failed: {exc}", file=sys.stderr)
+        if script_failure_callback:
+            script_failure_callback("pi (Phase 2 deep analysis)", exc)
+        return ac_results, child_results
+
+    # Parse the batched result
+    raw_text = (
+        result.get("extracted_text", "")
+        or result.get("evidence", "")
+        or result.get("text", "")
+    )
+    batch = _extract_json_array(raw_text)
+    if batch is None:
+        try:
+            batch = json.loads(raw_text)
+        except json.JSONDecodeError:
+            batch = []
+
+    updated_ac = list(ac_results)
+    if isinstance(batch, list):
+        reviewed = {
+            item["index"]: item
+            for item in batch
+            if isinstance(item, dict) and "index" in item
+        }
+        for i in range(len(updated_ac)):
+            item = reviewed.get(i, {})
+            deep_verdict = item.get("verdict", "")
+            deep_evidence = item.get("evidence", "")
+            if deep_verdict:
+                # Final verdict = Phase 1 passes AND Phase 2 confirms
+                initial = updated_ac[i]["verdict"]
+                if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
+                    updated_ac[i] = {
+                        "text": updated_ac[i]["text"],
+                        "verdict": VERDICT_MET,
+                        "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
+                    }
+                elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
+                    # Phase 1 said met, Phase 2 disagrees → downgrade
+                    updated_ac[i] = {
+                        "text": updated_ac[i]["text"],
+                        "verdict": deep_verdict,
+                        "evidence": f"Phase 1: {updated_ac[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
+                    }
+                else:
+                    # Use Phase 2 verdict (deep override for initial non-met)
+                    updated_ac[i] = {
+                        "text": updated_ac[i]["text"],
+                        "verdict": deep_verdict,
+                        "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
+                    }
+
+    # Also run deep analysis on active children
+    updated_children = list(child_results)
+    for ci, child in enumerate(updated_children):
+        if child.get("status") == "completed" and child.get("stage") == "done":
+            continue  # Skip already-closed children
+
+        child_acs = child.get("ac_results", [])
+        if not child_acs:
+            continue
+
+        child_ac_list = json.dumps([
+            {"index": i, "text": r["text"], "initial_verdict": r["verdict"]}
+            for i, r in enumerate(child_acs)
+        ])
+        child_prompt = (
+            "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — CHILD] "
+            "Do NOT close, modify, create, or delete any work items. "
+            "Return ONLY a structured JSON array.\n\n"
+            f"Deep code analysis for child: {child.get('title', '')} ({child.get('id', '')})\n\n"
+            "For each criterion, read the actual implementation files and verify "
+            "the code genuinely satisfies the stated requirements. "
+            "Use the same verdict guidance as the parent deep analysis.\n\n"
+            f"Criteria: {child_ac_list}"
+        )
+
+        try:
+            child_result = _call_pi_and_maybe_log(
+                child.get("id", ""), f"phase2_child:{ci}", child_prompt,
+                model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+            )
+        except RuntimeError:
+            continue
+
+        child_raw = (
+            child_result.get("extracted_text", "")
+            or child_result.get("evidence", "")
+            or child_result.get("text", "")
+        )
+        child_batch = _extract_json_array(child_raw)
+        if child_batch is None:
+            try:
+                child_batch = json.loads(child_raw)
+            except json.JSONDecodeError:
+                child_batch = []
+
+        if isinstance(child_batch, list):
+            reviewed = {
+                item["index"]: item
+                for item in child_batch
+                if isinstance(item, dict) and "index" in item
+            }
+            updated_child_acs = list(child_acs)
+            for i in range(len(updated_child_acs)):
+                item = reviewed.get(i, {})
+                deep_verdict = item.get("verdict", "")
+                deep_evidence = item.get("evidence", "")
+                if deep_verdict:
+                    initial = updated_child_acs[i]["verdict"]
+                    if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": VERDICT_MET,
+                            "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
+                        }
+                    elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": deep_verdict,
+                            "evidence": f"Phase 1: {updated_child_acs[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
+                        }
+                    else:
+                        updated_child_acs[i] = {
+                            "text": updated_child_acs[i]["text"],
+                            "verdict": deep_verdict,
+                            "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
+                        }
+            updated_children[ci] = dict(child)
+            updated_children[ci]["ac_results"] = updated_child_acs
+
+    return updated_ac, updated_children
 
 
 def cmd_issue(issue_id: str, persist: bool = True,
@@ -914,6 +1358,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
               runner: Runner | None = None, json_mode: bool = False,
               debug_log: str | None = None) -> int:
     """Audit a single work item.
+
+    The resolved model name and source are included as a metadata line
+    in the audit report output (issue-level and child reports).
 
     Model resolution order (highest first):
       1. --model CLI flag (explicit override)
@@ -929,173 +1376,379 @@ def cmd_issue(issue_id: str, persist: bool = True,
     if runner is None:
         runner = _default_runner
 
+    # Track script execution failures for prominent surfacing
+    script_failure: dict | None = None
+
+    def _record_script_failure(script_name: str, exc: Exception) -> None:
+        """Record a script execution failure into the enclosing scope.
+
+        Only records the first failure; subsequent failures are suppressed
+        to avoid overwriting the root cause.
+        """
+        nonlocal script_failure
+        if script_failure is not None:
+            return
+        reason = str(exc)
+        if isinstance(exc, subprocess.TimeoutExpired):
+            reason = f"Timeout after {exc.timeout}s"
+        elif isinstance(exc, FileNotFoundError):
+            reason = f"File not found: {exc.filename}"
+        script_failure = {
+            "script_name": script_name,
+            "reason": reason,
+            "stderr": str(exc),
+        }
+
+    # ------------------------------------------------------------------
+    # Status lifecycle: set in_progress on entry (cleaned up to open in finally)
+    # ------------------------------------------------------------------
+    _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"])
+
     try:
-        data = _run_wl(runner, ["wl", "show", issue_id, "--children", "--json"])
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    work_item = data.get("workItem", {})
-    children = data.get("children", [])
-    description = work_item.get("description", "")
-    acs = _extract_acs(description)
-
-    # Review parent ACs via Pi (batched into a single call for performance)
-    ac_results = []
-    if acs and acs[0] != "No acceptance criteria defined.":
-        ac_list_json = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(acs)])
-        prompt = (
-            f"[READ-ONLY AUDIT] You are performing a read-only audit. "
-            f"Do NOT close, modify, create, or delete any work items. "
-            f"Do NOT execute any wl, git, or other state-modifying commands. "
-            f"Return ONLY a structured JSON array.\n\n"
-            f"Review the following acceptance criteria against the codebase. "
-            f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
-            f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
-            f"(a one-line note with file:line reference).\n\n"
-            f"Evaluate criteria against user story intent and actual implementation quality, "
-            f"not just literal matching of the original specification. "
-            f"If a criterion has acceptable variance (implementation differs from original "
-            f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
-            f"Include justification in the evidence field.\n\n"
-            f"Criteria: {ac_list_json}"
-        )
         try:
-            result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
+            data = _run_wl(runner, ["wl", "show", issue_id, "--children", "--json"])
         except RuntimeError as exc:
-            print(str(exc), file=sys.stderr)
+            _record_script_failure("wl show", exc)
+            print(f"Warning: wl show failed: {exc}", file=sys.stderr)
+            # Build a minimal failure report
+            fail_notice = FailureNotice(
+                script_name="wl show",
+                reason=str(exc),
+                stderr_context=str(exc),
+            )
+            fail_report = fail_notice.wrap(
+                f"Could not fetch work item {issue_id}. "
+                "No audit report could be generated."
+            )
+            if json_mode:
+                payload = {"error": str(exc), "script_failure": {"script_name": "wl show", "reason": str(exc)}}
+                print(json.dumps(payload, indent=2))
+            else:
+                print(fail_report)
             return 1
-        # Parse the batched result - try to extract JSON array from text
-        # Use extracted_text (full response) instead of evidence (may be truncated)
-        raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
-        batch = _extract_json_array(raw_text)
-        if batch is None:
-            # Fallback: try direct JSON parse
-            try:
-                batch = json.loads(raw_text)
-            except json.JSONDecodeError:
-                batch = []
-        if isinstance(batch, list):
-            reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
-            for i, ac in enumerate(acs):
-                item = reviewed.get(i, {})
-                ac_results.append({
-                    "text": ac,
-                    "verdict": item.get("verdict", "unmet"),
-                    "evidence": item.get("evidence", ""),
-                })
-        else:
-            # Fallback: treat single result as covering all ACs equally
-            verdict = result.get("verdict", "unmet")
-            evidence = result.get("evidence", "")
-            for ac in acs:
-                ac_results.append({"text": ac, "verdict": verdict, "evidence": evidence})
-    else:
-        ac_results = [{"text": "No acceptance criteria defined.", "verdict": "unmet", "evidence": ""}]
 
-    # Review children (depth 1 only, skip completed/done, ignore deleted)
-    # Pass ALL active children to the assembler; it handles the cap.
-    child_results = []
-    active_children = [
-        c for c in children
-        if not c.get("deletedBy") and c.get("status") != "completed"
-    ]
-    for child in active_children:
-        child_desc = child.get("description", "")
-        child_acs = _extract_acs(child_desc)
-        child_ac_results = []
-        if child_acs and child_acs[0] != "No acceptance criteria defined.":
-            # Batch child ACs into a single pi call
-            child_ac_list = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(child_acs)])
+        work_item = data.get("workItem", {})
+        children = data.get("children", [])
+        description = work_item.get("description", "")
+
+        # ------------------------------------------------------------------
+        # Code quality check (before AC verification)
+        # ------------------------------------------------------------------
+        cq_findings: list[dict] = []
+        cq_fixes_applied: int = 0
+        cq_skipped_reason: str | None = None
+        try:
+            from skill.code_review.scripts.code_quality import run_code_quality
+            cq_result = run_code_quality(project_root=REPO_ROOT, runner=runner, fix=True)
+            if cq_result.get("success", False):
+                cq_findings = cq_result.get("findings", [])
+                cq_fixes_applied = cq_result.get("fixes_applied", 0)
+            else:
+                cq_skipped_reason = cq_result.get("error", "Code quality check failed")
+        except ImportError:
+            # code_quality module not available — skip gracefully
+            cq_skipped_reason = "code_quality module not available"
+        except Exception as exc:
+            cq_skipped_reason = str(exc)
+
+        acs = _extract_acs(description)
+
+        # Track elapsed time so we can skip remaining child audits if we
+        # approach the parent bash-tool timeout (~120s). This ensures a
+        # graceful degradation instead of a silent external kill.
+        _audit_start = time.monotonic()
+
+        def _elapsed():
+            return time.monotonic() - _audit_start
+
+        # Review parent ACs via Pi (batched into a single call for performance)
+        ac_results = []
+        if acs and acs[0] != "No acceptance criteria defined.":
+            ac_list_json = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(acs)])
             prompt = (
                 f"[READ-ONLY AUDIT] You are performing a read-only audit. "
                 f"Do NOT close, modify, create, or delete any work items. "
                 f"Do NOT execute any wl, git, or other state-modifying commands. "
                 f"Return ONLY a structured JSON array.\n\n"
-                f"Review the following acceptance criteria for child work item '{child.get('title', '')}' "
-                f"against the codebase. "
+                f"Review the following acceptance criteria against the codebase. "
                 f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
                 f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
                 f"(a one-line note with file:line reference).\n\n"
+                f"Evaluate criteria against user story intent and actual implementation quality, "
+                f"not just literal matching of the original specification. "
                 f"If a criterion has acceptable variance (implementation differs from original "
                 f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
                 f"Include justification in the evidence field.\n\n"
-                f"Criteria: {child_ac_list}"
+                f"Criteria: {ac_list_json}"
             )
             try:
-                result = _call_pi_and_maybe_log(issue_id, f"child:{child.get('id', '')}", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
+                result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
             except RuntimeError as exc:
-                print(str(exc), file=sys.stderr)
-                return 1
+                _record_script_failure("pi (parent AC review)", exc)
+                print(f"Warning: Pi call failed for parent AC review: {exc}", file=sys.stderr)
+                result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
+            # Parse the batched result - try to extract JSON array from text
             # Use extracted_text (full response) instead of evidence (may be truncated)
             raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
             batch = _extract_json_array(raw_text)
             if batch is None:
+                # Fallback: try direct JSON parse
                 try:
                     batch = json.loads(raw_text)
                 except json.JSONDecodeError:
                     batch = []
-            if isinstance(batch, list):
+            if isinstance(batch, list) and batch:
                 reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
-                for i, ac in enumerate(child_acs):
+                for i, ac in enumerate(acs):
                     item = reviewed.get(i, {})
-                    child_ac_results.append({
+                    ac_results.append({
                         "text": ac,
                         "verdict": item.get("verdict", "unmet"),
                         "evidence": item.get("evidence", ""),
                     })
             else:
+                # Fallback: treat single result as covering all ACs equally.
+                # This path is reached when the Pi response was not a parseable
+                # JSON array (e.g., a timeout diagnostic). Preserve the root-level
+                # evidence so the diagnostic is visible in the report.
                 verdict = result.get("verdict", "unmet")
                 evidence = result.get("evidence", "")
-                for ac in child_acs:
-                    child_ac_results.append({"text": ac, "verdict": verdict, "evidence": evidence})
-        child_results.append({
-            "title": child.get("title", ""),
-            "id": child.get("id", ""),
-            "status": child.get("status", ""),
-            "stage": child.get("stage", ""),
-            "ac_results": child_ac_results,
-        })
+                for ac in acs:
+                    ac_results.append({"text": ac, "verdict": verdict, "evidence": evidence})
+        else:
+            ac_results = [{"text": "No acceptance criteria defined.", "verdict": "unmet", "evidence": ""}]
 
-    # Initialize child_persist_results for reporting
-    child_persist_results = []
-
-    # Persist child audits to individual child work items (if persist is True)
-    if persist:
-        for child in child_results:
-            child_success, child_report = _persist_child_audit(
-                child_id=child["id"],
-                child_title=child["title"],
-                child_status=child["status"],
-                child_stage=child["stage"],
-                ac_results=child["ac_results"],
-                pi_bin=pi_bin,
-            )
-            child_persist_results.append({
-                "id": child["id"],
-                "title": child["title"],
-                "success": child_success,
-            })
-            if not child_success:
+        # Review children (depth 1 only, skip completed/done, ignore deleted)
+        # Pass ALL active children to the assembler; it handles the cap.
+        child_results = []
+        active_children = [
+            c for c in children
+            if not c.get("deletedBy") and c.get("status") != "completed"
+        ]
+        for child in active_children:
+            # Skip remaining children if we're too close to the parent
+            # timeout (~120s). This prevents a silent external kill and
+            # instead produces a clear diagnostic for skipped audits.
+            if _elapsed() >= 110:
                 print(
-                    f"Warning: Failed to persist audit for child {child['id']} "
-                    f"({child['title']}): wl returned exit code {1}",
+                    f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
+                    f"Skipping child {child.get('id', '')} ({child.get('title', '')}). "
+                    "Manual audit required for this child.",
                     file=sys.stderr,
                 )
+                child_results.append({
+                    "title": child.get("title", ""),
+                    "id": child.get("id", ""),
+                    "status": child.get("status", ""),
+                    "stage": child.get("stage", ""),
+                    "ac_results": [{
+                        "text": "Skipped due to audit timeout. Manual audit required.",
+                        "verdict": "unmet",
+                        "evidence": (
+                            f"Audit runner skipped this child after "
+                            f"{_elapsed():.0f}s total elapsed time to avoid "
+                            f"the parent process timeout (~120s). "
+                            "Manual audit required."
+                        ),
+                    }],
+                })
+                continue
 
-    # Assemble and output report
-    report = _assemble_issue_report(work_item, ac_results, child_results)
+            child_desc = child.get("description", "")
+            child_acs = _extract_acs(child_desc)
+            child_ac_results = []
+            if child_acs and child_acs[0] != "No acceptance criteria defined.":
+                # Batch child ACs into a single pi call
+                child_ac_list = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(child_acs)])
+                prompt = (
+                    f"[READ-ONLY AUDIT] You are performing a read-only audit. "
+                    f"Do NOT close, modify, create, or delete any work items. "
+                    f"Do NOT execute any wl, git, or other state-modifying commands. "
+                    f"Return ONLY a structured JSON array.\n\n"
+                    f"Review the following acceptance criteria for child work item '{child.get('title', '')}' "
+                    f"against the codebase. "
+                    f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
+                    f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
+                    f"(a one-line note with file:line reference).\n\n"
+                    f"If a criterion has acceptable variance (implementation differs from original "
+                    f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
+                    f"Include justification in the evidence field.\n\n"
+                    f"Criteria: {child_ac_list}"
+                )
+                try:
+                    result = _call_pi_and_maybe_log(issue_id, f"child:{child.get('id', '')}", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
+                except RuntimeError as exc:
+                    _record_script_failure("pi (child AC review)", exc)
+                    print(f"Warning: Pi call failed for child AC review: {exc}", file=sys.stderr)
+                    result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
+                # Use extracted_text (full response) instead of evidence (may be truncated)
+                raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
+                batch = _extract_json_array(raw_text)
+                if batch is None:
+                    try:
+                        batch = json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        batch = []
+                if isinstance(batch, list) and batch:
+                    reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
+                    for i, ac in enumerate(child_acs):
+                        item = reviewed.get(i, {})
+                        child_ac_results.append({
+                            "text": ac,
+                            "verdict": item.get("verdict", "unmet"),
+                            "evidence": item.get("evidence", ""),
+                        })
+                else:
+                    # Fallback: preserve root-level evidence from the Pi
+                    # result (e.g., a timeout diagnostic) when batched
+                    # parsing produced an empty or unparseable result.
+                    verdict = result.get("verdict", "unmet")
+                    evidence = result.get("evidence", "")
+                    for ac in child_acs:
+                        child_ac_results.append({"text": ac, "verdict": verdict, "evidence": evidence})
+            child_results.append({
+                "title": child.get("title", ""),
+                "id": child.get("id", ""),
+                "status": child.get("status", ""),
+                "stage": child.get("stage", ""),
+                "ac_results": child_ac_results,
+            })
 
-    if json_mode:
-        payload = _build_issue_json(work_item, ac_results, child_results)
-        payload["child_persist_results"] = child_persist_results
-        print(json.dumps(payload, indent=2))
-    else:
-        print(report, end="")
+        # Initialize child_persist_results for reporting
+        child_persist_results = []
 
-    if persist:
-        return persist_audit(issue_id, report)
-    return 0
+        # Persist child audits to individual child work items (if persist is True)
+        if persist:
+            for child in child_results:
+                child_success, child_report = _persist_child_audit(
+                    child_id=child["id"],
+                    child_title=child["title"],
+                    child_status=child["status"],
+                    child_stage=child["stage"],
+                    ac_results=child["ac_results"],
+                    pi_bin=pi_bin,
+                    model=resolved_model,
+                    model_source=model_source,
+                )
+                child_persist_results.append({
+                    "id": child["id"],
+                    "title": child["title"],
+                    "success": child_success,
+                })
+                if not child_success:
+                    print(
+                        f"Warning: Failed to persist audit for child {child['id']} "
+                        f"({child['title']}): wl returned exit code {1}",
+                        file=sys.stderr,
+                    )
+
+        # ------------------------------------------------------------------
+        # Phase 2 gate: check if Phase 1 automated screening has blocking issues
+        # ------------------------------------------------------------------
+        phase1_blocked, phase1_reason = _has_phase1_blocking_issues(
+            cq_findings, child_results
+        )
+        phase2_completed = False
+
+        if phase1_blocked:
+            # Phase 1 blocked → demote all "met" verdicts to "partial"
+            ac_results = _demote_met_to_partial(ac_results)
+            for ci, child in enumerate(child_results):
+                child_results[ci]["ac_results"] = _demote_met_to_partial(
+                    child.get("ac_results", [])
+                )
+            print(
+                f"Phase 1 blocked ({phase1_reason}): demoting 'met' verdicts to 'partial', "
+                "skipping Phase 2 deep analysis.",
+                file=sys.stderr,
+            )
+        elif not acs or acs[0] == "No acceptance criteria defined.":
+            # No ACs defined — nothing to deep-analyze; skip Phase 2
+            print(
+                "No acceptance criteria defined: skipping Phase 2 deep analysis.",
+                file=sys.stderr,
+            )
+        else:
+            # Phase 1 passed → run Phase 2 deep code analysis
+            print("Phase 1 passed: running Phase 2 deep code analysis...", file=sys.stderr)
+            ac_results, child_results = _run_phase2_deep_analysis(
+                work_item, ac_results, child_results,
+                resolved_model=resolved_model,
+                pi_bin=pi_bin,
+                debug_log=debug_log,
+                script_failure_callback=_record_script_failure,
+            )
+            phase2_completed = True
+
+        # ------------------------------------------------------------------
+        # Create quality epics for findings (before report assembly)
+        # ------------------------------------------------------------------
+        if cq_findings:
+            try:
+                from skill.code_review.scripts.create_quality_epics import (
+                    create_epics_for_findings
+                )
+                _epic_result = create_epics_for_findings(cq_findings, runner=runner)
+            except ImportError:
+                _epic_result = {"epic_id": None, "error": "create_quality_epics module not available"}
+            except Exception as exc:
+                _epic_result = {"epic_id": None, "error": str(exc)}
+
+        # Assemble and output report
+        report = _assemble_issue_report(
+            work_item, ac_results, child_results,
+            code_quality_findings=cq_findings,
+            code_quality_fixes_applied=cq_fixes_applied,
+            code_quality_skipped_reason=cq_skipped_reason,
+            model=resolved_model,
+            model_source=model_source,
+            phase2_completed=phase2_completed,
+        )
+
+        # Wrap report with failure notice if any subprocess calls failed
+        if script_failure:
+            notice = FailureNotice(
+                script_name=script_failure["script_name"],
+                reason=script_failure["reason"],
+                stderr_context=script_failure["stderr"],
+            )
+            report = notice.wrap(report)
+
+        if json_mode:
+            payload = _build_issue_json(
+                work_item, ac_results, child_results,
+                code_quality_findings=cq_findings,
+                code_quality_fixes_applied=cq_fixes_applied,
+                phase2_completed=phase2_completed,
+            )
+            payload["child_persist_results"] = child_persist_results
+            # Include script failure info in JSON output
+            if script_failure:
+                payload["script_failure"] = {
+                    "script_name": script_failure["script_name"],
+                    "reason": script_failure["reason"],
+                    "stderr": script_failure.get("stderr", ""),
+                }
+            print(json.dumps(payload, indent=2))
+        else:
+            print(report, end="")
+            # Print closing sentence (stdout UX – not persisted)
+            print()
+            print(_get_closing_sentence(report))
+
+        if persist:
+            return persist_audit(issue_id, report)
+        return 0
+
+    finally:
+        # ------------------------------------------------------------------
+        # Status lifecycle: set open on exit (success or failure)
+        # Always runs because of try/finally — guarantees cleanup.
+        # ------------------------------------------------------------------
+        try:
+            _run_wl(runner, ["wl", "update", issue_id, "--status", "open", "--json"])
+        except RuntimeError:
+            pass  # Status update failure must not mask the main result
 
 
 # ---------------------------------------------------------------------------
@@ -1131,12 +1784,45 @@ def cmd_project(pi_bin: str = "pi", model: str | None = None,
     if runner is None:
         runner = _default_runner
 
+    # Track script execution failures
+    script_failure: dict | None = None
+
+    def _record_script_failure(script_name: str, exc: Exception) -> None:
+        nonlocal script_failure
+        if script_failure is not None:
+            return
+        reason = str(exc)
+        if isinstance(exc, subprocess.TimeoutExpired):
+            reason = f"Timeout after {exc.timeout}s"
+        elif isinstance(exc, FileNotFoundError):
+            reason = f"File not found: {exc.filename}"
+        script_failure = {
+            "script_name": script_name,
+            "reason": reason,
+            "stderr": str(exc),
+        }
+
     try:
         data = _run_wl(runner, ["wl", "list", "--json"])
     except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+        _record_script_failure("wl list", exc)
+        fail_notice = FailureNotice(
+            script_name="wl list",
+            reason=str(exc),
+            stderr_context=str(exc),
+        )
+        fail_report = fail_notice.wrap(
+            "Could not fetch work items from Worklog. "
+            "No project audit could be generated."
+        )
+        if json_mode:
+            payload = {"error": str(exc), "script_failure": {"script_name": "wl list", "reason": str(exc)}}
+            print(json.dumps(payload, indent=2))
+        else:
+            print(fail_report)
         return 1
 
+    script_failure = None
     work_items = data.get("workItems", data) if isinstance(data, dict) else data
     in_progress = [w for w in work_items if w.get("status") == "in_progress"] if isinstance(work_items, list) else []
     blocked = [w for w in work_items if w.get("status") == "blocked"] if isinstance(work_items, list) else []
@@ -1170,14 +1856,28 @@ def cmd_project(pi_bin: str = "pi", model: str | None = None,
         if pi_result.get("verdict") == "met" and pi_result.get("evidence"):
             # Use Pi's response if parseable
             pass  # Could enhance this in future
-    except RuntimeError:
-        pass  # Pi failure is non-fatal for project mode
+    except RuntimeError as exc:
+        _record_script_failure("pi (project-level summary)", exc)
+        print(f"Warning: Pi call failed for project summary: {exc}", file=sys.stderr)
 
     if json_mode:
         payload = _build_project_json(summary, recommendation)
+        if script_failure:
+            payload["script_failure"] = {
+                "script_name": script_failure["script_name"],
+                "reason": script_failure["reason"],
+                "stderr": script_failure.get("stderr", ""),
+            }
         print(json.dumps(payload, indent=2))
     else:
         report = _assemble_project_report(summary, recommendation)
+        if script_failure:
+            notice = FailureNotice(
+                script_name=script_failure["script_name"],
+                reason=script_failure["reason"],
+                stderr_context=script_failure["stderr"],
+            )
+            report = notice.wrap(report)
         print(report, end="")
     return 0
 

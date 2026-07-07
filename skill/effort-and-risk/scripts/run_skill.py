@@ -67,6 +67,25 @@ def main():
         title = c.get("title", "")
         children_info.append({"id": cid, "title": title, "probability": 2, "impact": 1})
 
+    # Build WBS items from child work items (with proportionate O/M/P distribution)
+    items = []
+    if children_nodes:
+        # Distribute O/M/P proportionally across children when we have O/M/P totals
+        total_omp = args.o + args.m + args.p
+        if total_omp > 0:
+            for c in children_nodes:
+                cid = c.get("id", "")
+                title = c.get("title", "")
+                # Equal split as default when no per-item estimates provided
+                weight = 1.0 / len(children_nodes)
+                items.append({
+                    "id": cid,
+                    "title": title,
+                    "o": round(args.o * weight, 2),
+                    "m": round(args.m * weight, 2),
+                    "p": round(args.p * weight, 2),
+                })
+
     payload = {
         "o": args.o,
         "m": args.m,
@@ -79,6 +98,7 @@ def main():
         },
         "parent": {"probability": args.parent_prob, "impact": args.parent_imp},
         "children": children_info,
+        "items": items,
         "certainty": args.certainty,
         "assumptions": json.loads(args.assumptions),
         "unknowns": json.loads(args.unknowns),
@@ -89,6 +109,9 @@ def main():
         try:
             stdin_payload = json.load(sys.stdin)
             if isinstance(stdin_payload, dict):
+                # Allow stdin override to replace items if provided
+                if "items" in stdin_payload:
+                    payload["items"] = stdin_payload["items"]
                 payload.update(stdin_payload)
         except Exception:
             pass

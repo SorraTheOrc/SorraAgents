@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,10 +31,21 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.ralph.scripts.signal_system import EventType, SignalWriter, resolve_signal_path
-from skill.ralph.scripts.structured_response import StructuredResponse, parse_structured_response
-from skill.ralph.scripts.webhook_notifier import WebhookNotifier, resolve_webhook_url
-from skill.test_runner import canonicalize_quiet_test_command
+from skill.ralph.scripts.signal_system import EventType, SignalWriter, resolve_signal_path  # noqa: E402
+from skill.ralph.scripts.structured_response import StructuredResponse, parse_structured_response  # noqa: E402
+from skill.ralph.scripts.webhook_notifier import WebhookNotifier, resolve_webhook_url  # noqa: E402
+from skill.test_runner import canonicalize_quiet_test_command  # noqa: E402
+
+# Shared autoplan decision logic (extracted from this module)
+from command.plan_helpers import (  # noqa: E402
+    is_effort_risk_computed,
+    resolve_complexity_tier,
+    make_autoplan_decision,
+    run_effort_and_risk,
+    append_autoplan_decision_comment,
+    DEFAULT_AUTOPLAN_EFFORT_SKIP,
+    DEFAULT_AUTOPLAN_RISK_SKIP,
+)
 
 logger = logging.getLogger("ralph")
 
@@ -207,51 +219,10 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def _resolve_complexity_tier(config: dict, item: dict) -> str:
     """Resolve the complexity tier (low, medium, high) for a work item.
 
-    Mapping:
-    - Low: Effort XS or S AND risk Low
-    - Medium: Effort M OR risk Medium
-    - High: Effort L or XL OR risk High
-
-    Thresholds are configurable via config["complexity_tier"].
-    Defaults to 'medium' if mapping cannot be determined.
+    Delegates to ``command.plan_helpers.resolve_complexity_tier``.
+    Kept as a local function for backward compatibility.
     """
-    effort = item.get("effort")
-    risk = item.get("risk")
-
-    # Load thresholds from config
-    tier_cfg = config.get("complexity_tier", {})
-    low_cfg = tier_cfg.get("low", {})
-    high_cfg = tier_cfg.get("high", {})
-
-    low_max_effort = low_cfg.get("max_effort", "Small")
-    low_max_risk = low_cfg.get("max_risk", "Low")
-    high_min_effort = high_cfg.get("min_effort", "Large")
-    high_min_risk = high_cfg.get("min_risk", "High")
-
-    # T-shirt size order for comparison
-    effort_order = {"Extra Small": 0, "Small": 1, "Medium": 2, "Large": 3, "Extra Large": 4}
-    risk_order = {"Low": 0, "Medium": 1, "High": 2}
-
-    item_effort_val = effort_order.get(effort)
-    item_risk_val = risk_order.get(risk)
-
-    # Fallback for missing values: treat as Medium (safe middle ground)
-    if item_effort_val is None:
-        item_effort_val = effort_order["Medium"]
-    if item_risk_val is None:
-        item_risk_val = risk_order["Medium"]
-
-    # High tier check (OR)
-    if item_effort_val >= effort_order.get(high_min_effort, 3) or \
-       item_risk_val >= risk_order.get(high_min_risk, 2):
-        return "high"
-
-    # Low tier check (AND)
-    if item_effort_val <= effort_order.get(low_max_effort, 1) and \
-       item_risk_val <= risk_order.get(low_max_risk, 0):
-        return "low"
-
-    return "medium"
+    return resolve_complexity_tier(item, config)
 
 
 def _load_asset_config() -> dict:
@@ -1053,8 +1024,10 @@ def _validate_pi_output(
 # Default thresholds for auto-plan decision
 # If effort t-shirt is in this set AND risk level is in the risk set,
 # skip /plan and proceed directly to implement.
-DEFAULT_AUTOPLAN_EFFORT_SKIP: frozenset[str] = frozenset({"Extra Small", "Small"})
-DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
+# Effort/risk threshold constants are now defined in skill/plan/plan_helpers.py
+# (canonical) and imported via command.plan_helpers (delegation wrapper).
+# The local definitions are kept as aliases for backward compatibility,
+# but new code should import from the canonical module directly.
 
 # Maximum consecutive attempts on unchanged code before reporting a stall
 DEFAULT_MAX_CYCLES_NO_CHANGE: int = 3
@@ -1097,7 +1070,7 @@ def _extract_failing_test_names(output: str) -> list[str]:
             failing_tests.append(match.group(1))
         # Match short format: "FAILED test_name"
         match = re.match(r'(FAILED|ERROR)\s+([^\s]+)$', line)
-        if match and not "::" in match.group(2):
+        if match and "::" not in match.group(2):
             failing_tests.append(match.group(2))
     # Deduplicate while preserving order
     return list(dict.fromkeys(failing_tests))
@@ -1498,9 +1471,20 @@ class RalphLoop:
         self._call_with_retry(cmd, category="wl", expect_json=True)
 
     def _wl_update_stage(self, work_item_id: str, stage: str) -> None:
-        """Update the work item's stage via wl update."""
-        cmd = [self.wl_bin, "update", work_item_id, "--stage", stage]
-        logger.info("ralph.cmd.wl.update_stage target=%s stage=%s", work_item_id, stage)
+        """Update the work item's stage via wl update.
+
+        When transitioning to in_review, also set status to open
+        (work is ready for review, not actively being worked on).
+        """
+        if stage == "in_review":
+            cmd = [self.wl_bin, "update", work_item_id, "--status", "open", "--stage", stage]
+            logger.info(
+                "ralph.cmd.wl.update_stage target=%s status=open stage=in_review",
+                work_item_id,
+            )
+        else:
+            cmd = [self.wl_bin, "update", work_item_id, "--stage", stage]
+            logger.info("ralph.cmd.wl.update_stage target=%s stage=%s", work_item_id, stage)
         self._call_with_retry(cmd, category="wl", expect_json=False)
         # Notify about the stage change
         self._notify_event(
@@ -2095,7 +2079,7 @@ class RalphLoop:
                 self._last_implement_output = impl_output
                 
                 # Run audit on the child to ensure fix is complete
-                audit_output = self._run_pi(
+                _audit_output = self._run_pi(
                     f"/skill:audit {child_id}",
                     phase="audit",
                     work_item_ids=[child_id],
@@ -2311,118 +2295,74 @@ class RalphLoop:
         return raw
 
     def _is_effort_risk_computed(self, target_id: str) -> bool:
-        """Check whether effort and risk have already been set on the work item."""
+        """Check whether effort and risk have already been set on the work item.
+
+        Delegates the pure logic to ``command.plan_helpers.is_effort_risk_computed``
+        while fetching data via Ralph's runner for backward compatibility.
+        """
         item = self._wl_show(target_id).get("workItem", {})
-        effort = (item.get("effort") or "").strip()
-        risk = (item.get("risk") or "").strip()
-        if effort and risk:
-            logger.info("ralph.autoplan.already_computed target=%s effort=%s risk=%s", target_id, effort, risk)
-            return True
-        # Also check for an existing autoplan decision comment
-        for comment in self._wl_comment_list(target_id):
-            comment_text = comment.get("comment") or ""
-            if "autoplan-decision-hash:" in comment_text:
-                logger.info("ralph.autoplan.decision_comment_exists target=%s", target_id)
-                return True
-        return False
+        comments = self._wl_comment_list(target_id)
+        result = is_effort_risk_computed(item, comments)
+        if result:
+            logger.info(
+                "ralph.autoplan.already_computed target=%s effort=%s risk=%s",
+                target_id, item.get("effort", ""), item.get("risk", ""),
+            )
+        return result
 
     def _run_effort_and_risk(self, target_id: str) -> dict | None:
         """Run the effort-and-risk skill for the target work item.
 
+        Delegates to ``command.plan_helpers.run_effort_and_risk``, passing
+        the runner for test compatibility or using direct subprocess for
+        production.
+
         Returns the parsed JSON result, or None on failure/ambiguity.
         """
-        payload = json.dumps({
-            "issue_id": target_id,
-            "o": 0, "m": 0, "p": 0,
-            "certainty": 100,
-            "assumptions": ["Auto-generated by ralph autoplan"],
-            "unknowns": [],
-        })
-
-                # Resolve the effort-and-risk orchestrator relative to the skills root so the
-        # script works even when invoked from a different repository CWD.
-        skill_root = Path(__file__).resolve().parents[2]
-        orchestrate_script = skill_root / "effort-and-risk" / "scripts" / "orchestrate_estimate.py"
-        py = "python3"
-        cmd = [py, str(orchestrate_script)]
         logger.info("ralph.autoplan.effort_risk.start target=%s", target_id)
 
-        # Use wrapper to support retries and fail-open behaviour.
         if self.runner == _default_runner:
-            proc = self._call_with_retry(cmd, category="effort_and_risk", expect_json=False, input_data=payload)
+            result = run_effort_and_risk(target_id)
         else:
-            proc = self._call_with_retry(cmd + [payload], category="effort_and_risk", expect_json=False)
+            result = run_effort_and_risk(target_id, runner=self.runner)
 
-        if getattr(proc, 'returncode', 0) != 0:
-            logger.warning(
-                "ralph.autoplan.effort_risk.failed target=%s rc=%s stderr=%s",
-                target_id, getattr(proc, 'returncode', None), (getattr(proc, 'stderr', '') or "")[:500],
-            )
-            return None
-
-        try:
-            result = json.loads(getattr(proc, 'stdout', '') or "")
-            if not isinstance(result, dict):
-                logger.warning(
-                    "ralph.autoplan.effort_risk.unexpected_type target=%s type=%s",
-                    target_id, type(result).__name__,
-                )
-                return None
-            # Check for error key in result
-            if "error" in result:
-                logger.warning(
-                    "ralph.autoplan.effort_risk.error target=%s error=%s",
-                    target_id, result["error"][:200],
-                )
-                return None
+        if result is not None:
+            tshirt = result.get("effort", {}).get("tshirt", "unknown")
+            risk_level = result.get("risk", {}).get("level", "unknown")
             logger.info(
                 "ralph.autoplan.effort_risk.complete target=%s tshirt=%s risk=%s",
-                target_id,
-                result.get("effort", {}).get("tshirt", "unknown"),
-                result.get("risk", {}).get("level", "unknown"),
+                target_id, tshirt, risk_level,
             )
-            return result
-        except (json.JSONDecodeError, ValueError) as exc:
-            logger.warning(
-                "ralph.autoplan.effort_risk.parse_error target=%s exc=%s",
-                target_id, exc,
-            )
-            return None
+        else:
+            logger.warning("ralph.autoplan.effort_risk.failed target=%s", target_id)
+
+        return result
 
     def _append_autoplan_comment_once(self, work_item_id: str, tshirt: str, risk_level: str, risk_score: int | float, do_plan: bool) -> None:
-        """Post an auto-plan decision comment, idempotently."""
-        # Build a deterministic marker from the decision values
-        marker_key = f"autoplan-decision:{tshirt}:{risk_level}:{risk_score}"
-        marker_hash = hashlib.sha256(marker_key.encode("utf-8")).hexdigest()[:16]
-        marker = f"autoplan-decision-hash:{marker_hash}"
+        """Post an auto-plan decision comment, idempotently.
 
-        # Check for existing comment with this marker
-        for existing in self._wl_comment_list(work_item_id):
-            if marker in (existing.get("comment") or ""):
-                logger.debug(
-                    "ralph.autoplan.comment_exists target=%s marker=%s",
-                    work_item_id, marker,
-                )
-                return
-
-        decision = (
-            "run /plan (effort or risk above threshold)"
-            if do_plan
-            else "proceed to implement (effort and risk below threshold)"
+        Delegates to ``command.plan_helpers.append_autoplan_decision_comment``,
+        passing the runner for test compatibility or using direct subprocess
+        for production.
+        """
+        logger.debug(
+            "ralph.autoplan.comment target=%s tshirt=%s risk=%s do_plan=%s",
+            work_item_id, tshirt, risk_level, do_plan,
         )
-        comment_parts = [
-            "# Ralph Auto-Plan Decision",
-            marker,
-            "",
-            f"Effort: {tshirt}",
-            f"Risk: {risk_level} (score: {risk_score})",
-            f"Decision: {decision}",
-        ]
-        comment = "\n".join(comment_parts)
-        self._wl_comment_add(work_item_id, comment)
+
+        if self.runner == _default_runner:
+            append_autoplan_decision_comment(work_item_id, tshirt, risk_level, risk_score, do_plan)
+        else:
+            append_autoplan_decision_comment(
+                work_item_id, tshirt, risk_level, risk_score, do_plan,
+                runner=self.runner,
+            )
 
     def _run_autoplan(self, target_id: str) -> tuple[bool, str]:
         """Run the auto-plan decision for a work item at intake_complete.
+
+        Delegates decision logic to ``command.plan_helpers.make_autoplan_decision``,
+        then handles Ralph-specific plan invocation if needed.
 
         Returns (do_plan, updated_stage):
         - do_plan: True if /plan should be invoked
@@ -2430,69 +2370,48 @@ class RalphLoop:
         """
         logger.info("ralph.autoplan.start target=%s", target_id)
 
-        # Idempotence check: if effort/risk already computed, skip re-computation
-        if self._is_effort_risk_computed(target_id):
-            logger.info("ralph.autoplan.already_computed_skipping target=%s", target_id)
-            # Use the existing values to determine the decision
-            item = self._wl_show(target_id).get("workItem", {})
-            effort = (item.get("effort") or "").strip()
-            risk = (item.get("risk") or "").strip()
-            do_plan = not (effort in self.autoplan_effort_skip and risk in self.autoplan_risk_skip)
+        # Fetch work item data (via runner for test compatibility)
+        item = self._wl_show(target_id).get("workItem", {})
+        comments = self._wl_comment_list(target_id)
 
-            # Resolve tier for planning phase
-            tier = _resolve_complexity_tier(self.model_config, item)
+        # Determine tier for model routing before delegation (if already computed)
+        # or from effort-and-risk result after delegation (if fresh computation).
+        computed_tier: str | None = None
+        if is_effort_risk_computed(item, comments):
+            computed_tier = resolve_complexity_tier(item, self.model_config)
             logger.info(
-                "ralph.autoplan.cached_decision target=%s effort=%s risk=%s tier=%s do_plan=%s",
-                target_id, effort, risk, tier, do_plan,
+                "ralph.autoplan.cached_tier target=%s tier=%s",
+                target_id, computed_tier,
             )
-            if do_plan:
-                stage = item.get("stage", "unknown")
-                if stage == "plan_complete":
-                    # Plan was already completed
-                    return False, "plan_complete"
-                # Need to run plan
-                logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
-                # Use pi to run the plan skill so the configured model is used.
-                try:
-                    self._run_pi(f"/skill:plan {target_id}", phase="planning", tier=tier)
-                except RalphError as e:
-                    raise RalphError(f"plan command failed: {e}") from e
-                logger.info("ralph.autoplan.plan_complete target=%s", target_id)
-                return True, "plan_complete"
-            return False, "intake_complete"
 
-        # Run effort-and-risk skill
-        er_result = self._run_effort_and_risk(target_id)
-        
-        # Resolve tier using the effort-and-risk result
-        if er_result is None:
-            # Failure or ambiguity: default to running /plan (safety-first)
-            logger.info("ralph.autoplan.effort_risk_failed_defaults_to_plan target=%s", target_id)
-            do_plan = True
-            tshirt = "unknown"
-            risk_level = "unknown"
-            risk_score = 0
-            tier = "medium"  # Default to medium tier on failure
+        # Delegate to shared decision logic
+        if self.runner == _default_runner:
+            do_plan, stage, effort_risk = make_autoplan_decision(
+                target_id, config=self.model_config,
+                effort_skip=self.autoplan_effort_skip, risk_skip=self.autoplan_risk_skip,
+            )
         else:
-            tshirt = er_result.get("effort", {}).get("tshirt", "")
-            risk_level = er_result.get("risk", {}).get("level", "")
-            risk_score = er_result.get("risk", {}).get("score", 0)
-            # Create a synthetic item dict from the effort-and-risk result for tier resolution
-            synthetic_item = {"effort": tshirt, "risk": risk_level}
-            tier = _resolve_complexity_tier(self.model_config, synthetic_item)
-            do_plan = not (tshirt in self.autoplan_effort_skip and risk_level in self.autoplan_risk_skip)
-            logger.info(
-                "ralph.autoplan.result target=%s tshirt=%s risk=%s tier=%s do_plan=%s",
-                target_id, tshirt, risk_level, tier, do_plan,
+            do_plan, stage, effort_risk = make_autoplan_decision(
+                target_id, config=self.model_config,
+                effort_skip=self.autoplan_effort_skip, risk_skip=self.autoplan_risk_skip,
+                runner=self.runner,
             )
 
-        # Post the decision comment idempotently
-        self._append_autoplan_comment_once(target_id, tshirt, risk_level, risk_score, do_plan)
+        # Determine tier for /skill:plan invocation
+        if computed_tier is not None:
+            tier = computed_tier
+        elif effort_risk is not None:
+            tier = resolve_complexity_tier(effort_risk, self.model_config)
+        else:
+            tier = "medium"
+
+        logger.info(
+            "ralph.autoplan.result target=%s do_plan=%s stage=%s tier=%s",
+            target_id, do_plan, stage, tier,
+        )
 
         if do_plan:
-            # Invoke plan and wait for completion
             logger.info("ralph.autoplan.plan_invoked target=%s", target_id)
-            # Use pi to run the plan skill so the configured model is used.
             try:
                 self._run_pi(f"/skill:plan {target_id}", phase="planning", tier=tier)
             except RalphError as e:
@@ -2949,7 +2868,7 @@ class RalphLoop:
         Additional keyword args are accepted for compatibility (e.g. force_fresh_audit).
         """
         max_attempts = max(1, int(self.max_attempts))
-        force_fresh_audit = bool(kwargs.get("force_fresh_audit", False))
+        _force_fresh_audit = bool(kwargs.get("force_fresh_audit", False))
 
         # Evaluate complexity tier for this item
         item = self._wl_show(item_id)
@@ -3452,15 +3371,15 @@ class RalphLoop:
                 raise RalphError(f"No persisted audit found for {focus_id} after running /skill:audit and fallback persistence; expected an audit_results row for the work item.")
 
             structured_audit = None
-            lines = [l.strip() for l in audit_text.splitlines() if l.strip()]
-            if not any(l.lower().startswith("ready to close:") for l in lines):
+            lines = [line.strip() for line in audit_text.splitlines() if line.strip()]
+            if not any(line.lower().startswith("ready to close:") for line in lines):
                 structured_audit = parse_structured_response(audit_text)
                 if structured_audit:
                     audit_text = structured_audit.render()
                     self._last_structured_response = structured_audit
-                    lines = [l.strip() for l in audit_text.splitlines() if l.strip()]
+                    lines = [line.strip() for line in audit_text.splitlines() if line.strip()]
 
-            if not any(l.lower().startswith("ready to close:") for l in lines):
+            if not any(line.lower().startswith("ready to close:") for line in lines):
                 excerpt = audit_text.strip().replace("\n", " ")[:200]
                 raise RalphError(f"No 'Ready to close:' header found in persisted audit for {focus_id}. Excerpt: {excerpt}")
             audit = parse_audit_report(audit_text)
@@ -3639,7 +3558,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="Suppress console progress output and pi streaming (only print final JSON result)")
     parser.add_argument("--verbose", action="store_true", help="Show detailed delegation commands and subprocess output")
     parser.add_argument("--no-stream", action="store_true", help="Don't stream pi subprocess output to console (use buffered capture instead)")
-    parser.add_argument("--model", default=None, help=f"Legacy single model for all phases (default from skill/ralph/assets/.ralph.json, or string 'model' key in .ralph.json)")
+    parser.add_argument("--model", default=None, help="Legacy single model for all phases (default from skill/ralph/assets/.ralph.json, or string 'model' key in .ralph.json)")
     parser.add_argument("--model-source", choices=sorted(MODEL_SOURCES), default=None, help="Model source for phase defaults/config (remote|local). Default is local.")
     parser.add_argument("--model-intake", default=None, help="Override intake phase model")
     parser.add_argument("--model-planning", default=None, help="Override planning phase model")
@@ -3780,4 +3699,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _repo_root = Path(__file__).resolve().parents[3]
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+    from skill.scripts.failure_notice import FailureNotice
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        notice = FailureNotice(
+            script_name="ralph_loop.py",
+            reason=f"Unhandled exception: {exc}",
+            stderr_context=traceback.format_exc(),
+        )
+        print(notice.wrap(
+            json.dumps({"error": str(exc), "status": "error"})
+        ))
+        raise SystemExit(1)

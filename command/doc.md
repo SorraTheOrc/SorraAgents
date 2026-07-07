@@ -89,7 +89,7 @@ Process (must follow)
   - `docs/…` (user)
   - `docs/dev/…` (developer)
 
-2. Interview (only as needed)
+1. Interview (only as needed)
 
 Ask questions only if the work item/PRD does not fully specify what must be documented. Focus on:
 
@@ -101,7 +101,7 @@ Ask questions only if the work item/PRD does not fully specify what must be docu
 
 Keep asking until the documentation is actionable.
 
-3. Draft the documentation (agent responsibility)
+1. Draft the documentation (agent responsibility)
 
 - Write the new/updated documentation content in the temp draft file first.
 - The docs must read as if they are the best specification available right now.
@@ -165,7 +165,7 @@ Use this outline when creating a new developer-facing doc page:
 
 ## Open Questions
 
-4. User review (must do)
+1. User review (must do)
 
 - Present the proposed file list and draft content blocks to the user for review.
 - For each file, show:
@@ -175,7 +175,7 @@ Use this outline when creating a new developer-facing doc page:
 - Ask for feedback and requested changes.
 - Iterate drafting and review until the user approves all changes.
 
-5. Automated review stages (must follow; no human intervention required)
+1. Automated review stages (must follow; no human intervention required)
 
 Once the user approves the draft, run four review iterations (see below). Each review MAY make changes to the draft and MUST output exactly:
 
@@ -208,7 +208,7 @@ Review stages:
 - Ensure all docs in the repo cross-link appropriately (from user doc to user doc and from developer doc to user doc or developer doc).
 - If there is an obvious existing index page in `docs/` and/or `docs/dev/`, add a link to the new page.
 
-6. Write back to the work item (agent responsibility)
+1. Write back to the work item (agent responsibility)
 
 - Update the docs task work item (`$1`) description by adding or updating a well-marked block titled "Documentation" with:
   - The list of updated/created files
@@ -216,7 +216,7 @@ Review stages:
   - Open Questions
   - A small changelog with timestamps
 
-7. Finishing steps (must do)
+1. Finishing steps (must do)
 
 - Set the docs task work item's stage to indicate docs drafting is complete:
   `wl update $1 --stage docs_drafted --json` (leave other fields intact).

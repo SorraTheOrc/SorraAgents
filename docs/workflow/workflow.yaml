@@ -98,7 +98,7 @@ states:
   # to distinguish delegated items from manually-started ones.
   delegated:     { status: in-progress, stage: in_progress }
   audit_passed:  { status: completed, stage: audit_passed }
-  audit_failed:  { status: in_progress, stage: audit_failed }
+  audit_failed:  { status: open, stage: audit_failed }
   escalated:     { status: blocked, stage: escalated }
 
   # --- Blocking states ---

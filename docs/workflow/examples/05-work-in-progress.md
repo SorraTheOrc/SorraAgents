@@ -8,7 +8,7 @@ The AMPA scheduler runs its delegation cycle but finds that another work item is
 
 | Work Item | Status | Stage | Assignee |
 |---|---|---|---|
-| WL-200 | in-progress | delegated | Patch | 
+| WL-200 | in-progress | delegated | Patch |
 | WL-201 | open | plan_complete | (none) |
 | WL-202 | open | intake_complete | (none) |
 
@@ -43,6 +43,7 @@ The engine does not proceed to candidate selection. No commands are executed.
 | **Discord** | (no notification — silent skip to avoid noise) |
 
 **Engine Inspection Result:**
+
 ```json
 {
   "status": "in_progress",
@@ -59,6 +60,7 @@ The engine does not proceed to candidate selection. No commands are executed.
 ```
 
 **Return Value from `_run_idle_delegation`:**
+
 ```
 "Delegation: skipped (in_progress items)"
 ```

@@ -25,6 +25,7 @@ test -f docs/dev/release-process.md && echo "PASS: release-process.md exists" ||
 ```
 
 Verify the document contains:
+
 - [ ] Role definition (Release Manager)
 - [ ] Pre-merge checklist
 - [ ] Merge procedure (automated and manual)
@@ -58,6 +59,7 @@ bash scripts/release/merge-dev-to-main.sh --dry-run
 ```
 
 Expected behaviour:
+
 - The script runs pre-flight checks (gh auth, wl availability, clean tree).
 - It checks CI status for `dev-full-suite` on `dev`.
   - If CI is not green, the script will **abort** (hard gate). In dry-run
@@ -77,6 +79,7 @@ test -f .github/workflows/ci.yml && echo "PASS: ci.yml exists" || echo "FAIL: ci
 ```
 
 Verify `dev-full-suite.yml` contains:
+
 - [ ] `workflow_dispatch` trigger (allows manual pre-merge runs)
 - [ ] `full-suite` job that runs `pytest`
 - [ ] Test results uploaded as artifacts

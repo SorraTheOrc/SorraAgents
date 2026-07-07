@@ -1,28 +1,14 @@
 {
-  "lastChangelogVersion": "0.67.68",
+  "lastChangelogVersion": "0.80.3",
   "steeringMode": "one-at-a-time",
   "followUpMode": "one-at-a-time",
-  "defaultProvider": "github-copilot",
-  "defaultModel": "gpt-5-mini",
-  "defaultThinkingLevel": "medium",
-  "retry": {
-    "enabled": true,
-    "maxRetries": 3,
-    "baseDelayMs": 2000,
-    "provider": {
-      "timeoutMs": 10800000,
-      "maxRetries": 0,
-      "maxRetryDelayMs": 60000
-    }
-  },
+  "defaultProvider": "Local Proxy",
+  "defaultModel": "code",
+  "defaultThinkingLevel": "high",
   "httpIdleTimeoutMs": 1800000,
   "enabledModels": [
-    "Proxy/qwen3",
-    "Proxy/gpt120",
-    "Proxy/gemma4",
-    "github-copilot/claude-sonnet-4.6",
-    "github-copilot/gpt-5.3-codex",
-    "github-copilot/claude-opus-4.6",
-    "github-copilot/gpt-5-mini"
-  ]
+    "Local Proxy/plan",
+    "Local Proxy/code"
+  ],
+  "theme": "dark"
 }

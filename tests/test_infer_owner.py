@@ -1,9 +1,6 @@
 """Unit tests for the owner-inference skill (infer_owner.py)."""
 
-import json
-import os
 import subprocess
-import tempfile
 
 import skill.owner_inference.scripts.infer_owner as io
 
