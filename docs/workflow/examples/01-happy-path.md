@@ -176,7 +176,7 @@ AMPA Audit Result
 **Engine Action:**
 
 ```bash
-wl update WL-EXAMPLE-001 --status completed --stage in_review
+wl update WL-EXAMPLE-001 --status open --stage in_review
 ```
 
 ### Step 11: Producer Approves — `approve` Command
