@@ -115,6 +115,23 @@ elif [[ "$DRY_RUN" == "true" ]]; then
   echo "Dry-run: version bump would be applied with --bump $BUMP"
 fi
 
+# ── Generate CHANGELOG.md (only on actual release) ─────────────────
+if [[ "$DRY_RUN" != "true" && -n "${NEW_VERSION:-}" ]]; then
+  CHANGELOG_SCRIPT="${SCRIPT_DIR}/generate-changelog.js"
+  if [[ -f "$CHANGELOG_SCRIPT" ]]; then
+    node "$CHANGELOG_SCRIPT" "$NEW_VERSION" 2>&1 || {
+      echo "Warning: CHANGELOG.md generation failed (continuing with release)" >&2
+    }
+    if [[ -f "$(git rev-parse --show-toplevel)/CHANGELOG.md" ]]; then
+      git add "$(git rev-parse --show-toplevel)/CHANGELOG.md"
+      git commit -m "Update CHANGELOG.md for v${NEW_VERSION}"
+      echo "CHANGELOG.md updated for v${NEW_VERSION}"
+    fi
+  fi
+elif [[ "$DRY_RUN" == "true" ]]; then
+  echo "Dry-run: CHANGELOG.md would be generated for v<version>"
+fi
+
 # Merge origin/dev into the release branch
 if git merge --no-ff origin/dev -m "Merge origin/dev into main (automated)"; then
   echo "Created merge commit on $BRANCH"
@@ -144,7 +161,7 @@ fi
 
 # Create a PR
 PR_TITLE="Merge dev → main (automated)"
-PR_BODY="Automated release created by ship skill."
+PR_BODY="Automated release created by ship skill.\n\nIncludes CHANGELOG.md with work-item summaries from this release."
 PR_URL=""
 
 # Create PR and capture output

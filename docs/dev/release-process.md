@@ -71,9 +71,11 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
    - All blocking work-items related to the release are closed.
    - No unresolved merge conflicts exist on `dev`.
 
-7. **Verify changelog / release notes**
-   - Confirm that any user-facing changes have been documented.
-   - Use the changelog generator skill if needed.
+7. **Verify CHANGELOG.md is up to date**
+   - The release script now generates `CHANGELOG.md` automatically from
+     worklog items (completed / in_review) during the release flow.
+   - Verify that the generated `CHANGELOG.md` section reflects the correct
+     release version and contains all expected entries.
 
 ## CI Jobs
 
@@ -103,13 +105,16 @@ The script will:
 2. Fetch the latest `dev` and `main` from origin.
 3. **Automatically increment** the version in `package.json` (default: patch
    bump; use `--bump minor` or `--bump major` to override) and commit it.
-4. Merge `dev` into the release branch (`dev` → `main`).
-5. Create an **annotated git tag** `v<new-version>` on the merge commit.
-6. Push the merge branch and the tag to `origin`.
-7. Create a **GitHub Pull Request** from the temp branch to `main`.
-8. Wait for required status checks to pass on the PR.
-9. Merge the PR using `gh pr merge --merge --delete-branch`.
-10. Record an audit comment in the worklog with the merge commit hash,
+4. **Generate `CHANGELOG.md`** by querying worklog for completed / in_review
+   work items, categorising by issue_type, and prepending a new release
+   section. The updated file is committed.
+5. Merge `dev` into the release branch (`dev` → `main`).
+6. Create an **annotated git tag** `v<new-version>` on the merge commit.
+7. Push the merge branch and the tag to `origin`.
+8. Create a **GitHub Pull Request** from the temp branch to `main`.
+9. Wait for required status checks to pass on the PR.
+10. Merge the PR using `gh pr merge --merge --delete-branch`.
+11. Record an audit comment in the worklog with the merge commit hash,
     CI run IDs, PR number, and approver identity.
 
 Example with custom bump:

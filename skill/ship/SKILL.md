@@ -303,7 +303,9 @@ The following must be verified before merging `dev` into `main`:
 2. **CI — `dev-smoke` is green** on the current `dev` HEAD.
 3. **No open merge conflicts** between `dev` and `main`.
 4. **No open critical work items** that would block the release.
-5. **Changelog / release notes** are updated for user-facing changes.
+5. **CHANGELOG.md** is generated automatically by the release script from
+   completed / in_review work items. Verify the generated section covers all
+   relevant user-facing changes.
 
 See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md) for the
 test commands to run locally.
