@@ -11,6 +11,7 @@ import { spawnSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
+import { checkAuditReadyToClose } from './check-audit-gate.js';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -165,16 +166,17 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * Main orchestrator for the release process.
  *
  * Steps:
- * 1. Check for unmerged branches (gating)
- * 2. Find and execute the release script
- * 3. Parse PR URL from release script output
- * 4. Wait for PR merge (if not already merged with --force)
- * 5. Sync dev with main
+ * 1. Check for unmerged branches (gating, exit code 3)
+ * 2. Check audit readiness (gating, exit code 6)
+ * 3. Find and execute the release script
+ * 4. Parse PR URL from release script output
+ * 5. Wait for PR merge (if not already merged with --force)
+ * 6. Sync dev with main
  *
  * @param {string[]} [cliArgs=[]] - Command-line arguments.
  * @returns {number} Exit code (0 = success).
  */
-export function runRelease(cliArgs = []) {
+export async function runRelease(cliArgs = []) {
   const args = [...cliArgs];
   const skipChecks = args.includes('--skip-checks');
   const isDryRun = args.includes('--dry-run');
@@ -190,6 +192,19 @@ export function runRelease(cliArgs = []) {
       console.error(report.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
       return 3;
+    }
+  }
+
+  // ── Step 2: Check audit readiness (gating step) ────────────────────────
+  if (!skipChecks) {
+    const auditReport = await checkAuditReadyToClose();
+    if (auditReport.hasBlockingItems) {
+      console.error(
+        '⚠️  Audit gate check failed — some work items are not ready to close:\n',
+      );
+      console.error(auditReport.message);
+      console.error('\nTo bypass this check, re-run with --skip-checks.');
+      return 6;
     }
   }
 
@@ -284,7 +299,8 @@ const isMainModule = process.argv[1] &&
   (realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1])));
 
 if (isMainModule) {
-  const exitCode = runRelease(process.argv.slice(2));
-  process.exitCode = exitCode;
-  process.exit(exitCode);
+  runRelease(process.argv.slice(2)).then((exitCode) => {
+    process.exitCode = exitCode;
+    process.exit(exitCode);
+  });
 }

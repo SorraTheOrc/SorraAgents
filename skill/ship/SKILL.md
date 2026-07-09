@@ -60,10 +60,11 @@ Where `<action>` is one of:
 
 ## Scripts and Modules
 
-- `./scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, `checkUnmergedBranches`, and re-exports from `git-helpers.js`)
+- `./scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, `checkUnmergedBranches`, `checkAuditReadyToClose`, and re-exports from `git-helpers.js`)
 - `./scripts/git-helpers.js` — Branch naming and policy helpers (exports: `makeBranchName`, `validateBranchName`, `isBranchBlocked`, `BLOCKED_BRANCHS`, `BRANCH_NAME_PATTERN`)
 - `./scripts/check-unmerged-branches.js` — Unmerged branch detection module (exports: `checkUnmergedBranches`, `getUnmergedBranchNames`, `extractWorkItemId`, `getWorkItemStatus`)
-- `./scripts/run-release.js` — Safe wrapper to invoke the release process (exports: `runRelease`, `syncDevWithMain`, `parsePRUrl`, `waitForPRMerge`; includes unmerged branches gating check, post-release dev sync)
+- `./scripts/check-audit-gate.js` — Audit readiness gating module (exports: `checkAuditReadyToClose`, `getAuditStatus`, `getCandidateItems`, `deduplicateItems`)
+- `./scripts/run-release.js` — Safe wrapper to invoke the release process (exports: `runRelease`, `syncDevWithMain`, `parsePRUrl`, `waitForPRMerge`; includes unmerged branches gating check, audit readiness gating, post-release dev sync)
 - `./scripts/release/merge-dev-to-main.sh` — Canonical release merge script (installed in the skill directory)
 
 ## Usage
@@ -156,11 +157,81 @@ are found, the push is rejected with the report in the error message.
 
 To bypass the gating check, resolve or merge the unmerged branches first.
 
+### Audit Readiness Gating
+
+In addition to the unmerged branches check, the ship skill includes an **audit
+readiness gate** that verifies all `in_review` and `completed` work items have
+passing audits before a release is performed.
+
+This gate:
+
+1. Queries `wl list --status completed --json` and `wl list --stage in_review --json`
+   to collect candidate work items.
+2. Deduplicates the result set by work item ID (an item may match both filters).
+3. For each item, calls `wl audit-show <id> --json` and checks `audit.readyToClose`.
+4. Items where `audit.readyToClose` is `false`, `audit` is `null` (no audit
+   exists), or the audit is otherwise absent are flagged as **blocking**.
+5. If any blocking items are found, the release is aborted with exit code 6
+   and a structured report is printed showing which items block and why.
+6. If all queried items have `audit.readyToClose: true`, the gate passes
+   silently and the release proceeds.
+
+The gate respects the existing `--skip-checks` flag to bypass when explicitly
+requested.
+
+#### Using checkAuditReadyToClose Programmatically
+
+```javascript
+import { checkAuditReadyToClose } from './scripts/check-audit-gate.js';
+
+const report = await checkAuditReadyToClose();
+
+if (report.hasBlockingItems) {
+  console.log(report.message);
+  // Example output:
+  //   ⚠️  Audit gate check failed — 1 of 3 work item(s) are not ready to close:
+  //
+  //   1. My Feature (SA-001)
+  //      Reason: No audit found
+  //      Remediation:
+  //        # Re-run audit for SA-001:
+  //        wl audit-show SA-001 --json
+  //        python3 skill/audit/scripts/audit_runner.py issue SA-001
+}
+```
+
+The report contains:
+
+```javascript
+// report.blockingItems is an array of:
+// {
+//   workItemId: string,          // The work item ID
+//   title: string,               // The work item title
+//   reason: string,               // Why the item is blocking ("No audit found" or "Audit verdict: not ready to close")
+//   summary: string|null,         // The audit summary (if available)
+//   remediation: string           // Actionable shell commands to re-run the audit
+// }
+```
+
+#### Exit Code
+
+The audit gate uses exit code 6 to distinguish from other failure modes:
+
+| Code | Meaning |
+|------|---------|
+| 1 | General error |
+| 2 | Missing release script |
+| 3 | Unmerged branches found |
+| 4 | PR merge failed |
+| 5 | Dev sync failed |
+| **6** | **Audit gate failure (items not ready to close)** |
+
 ### Gating in run-release.js
 
-The release wrapper (`run-release.js`) also runs the unmerged branches check
-before executing the release script. If unmerged branches are found, the release
-is aborted. To bypass, use the `--skip-checks` flag:
+The release wrapper (`run-release.js`) runs both the unmerged branches check
+(exit code 3) and the audit readiness gate (exit code 6) before executing the
+release script. If either check fails, the release is aborted. To bypass both,
+use the `--skip-checks` flag:
 
 ```bash
 node ./scripts/run-release.js --skip-checks

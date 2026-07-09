@@ -28,6 +28,7 @@
 import { execSync } from 'node:child_process';
 import { isBranchBlocked, validateBranchName, makeBranchName } from './git-helpers.js';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
+import { checkAuditReadyToClose } from './check-audit-gate.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -251,3 +252,4 @@ export function pushToBranch(targetBranch, opts = {}) {
 
 export { makeBranchName, validateBranchName, isBranchBlocked };
 export { checkUnmergedBranches, getUnmergedBranchNames, extractWorkItemId, getWorkItemStatus, getCurrentBranch } from './check-unmerged-branches.js';
+export { checkAuditReadyToClose, getAuditStatus, getCandidateItems, deduplicateItems } from './check-audit-gate.js';
