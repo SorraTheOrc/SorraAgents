@@ -185,10 +185,10 @@ Work items have two lifecycle axes that agents must manage independently:
 - **`stage`** tracks workflow progress (idea, intake_complete, plan_complete,
   in_progress, in_review). Advance `stage` to `in_review` as soon as
   implementation is ready for human review — even if `status` remains
-  `open`.
+  `in-progress`.
 - **Epics/parent items:** Once all children are in a terminal stage
   (`in_review` or `completed`), advance the parent work-item's `stage`
-  to `in_review`. The parent's `status` should remain `open`
+  to `in_review`. The parent's `status` should remain `in-progress`
   until the formal post-release closure.
 
 ## work-item Types

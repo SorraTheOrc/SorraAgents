@@ -203,9 +203,9 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Select the most appropriate work item to work on next (blocker > dependency; most critical first).
   - Claim the work item by running `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
   - Recursively implement that work item as described in this procedure.
-  - When a work item is completed, follow the mandatory build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit the work. Update the stage: `wl update <work-item-id> --status open --stage in_review --json`
+  - When a work item is completed, follow the mandatory build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit the work. Update the stage: `wl update <work-item-id> --status completed --stage in_review --json`
   - After completing all children of a parent work-item and confirming they are in a terminal stage (in_review or completed), advance the parent work-item's stage to `in_review`:
-    `wl update <parent-id> --status open --stage in_review --json`
+    `wl update <parent-id> --stage in_review --json`
 
 - If the work item has a recent audit record, review the audit notes and address any unmet acceptance criteria or other issues identified.
 - If there is no recent audit record, run `/skill:audit <work-item-id>` and use the resulting audit output to establish the work that needs to be done.
@@ -335,7 +335,7 @@ refactor step may be invoked to detect and remediate code smells:
 
   > **When running under Ralph:** Skip the `wl update --stage in_review` step. Ralph will mark the item as `in_review` after a successful audit.
   > **When running manually:** Mark the work item as `in_review` (do **NOT** close it):
-  `wl update <work-item-id> --status open --stage in_review --json`
+  `wl update <work-item-id> --status completed --stage in_review --json`
 
   > **Important:** The work-item is **not closed** at this stage. It remains `in_review` until the release process promotes `dev` to `main`. Agents may perform the release by invoking the Ship skill's release command (`../ship/scripts/run-release.js`), or a Release Manager may perform it manually. Agents should not push directly to `main` unless explicitly authorized.
   > See `../ship/SKILL.md` for the push-to-dev workflow and `../ship/scripts/run-release.js` (safe wrapper) for the release process. The wrapper detects when a repository lacks `scripts/release/merge-dev-to-main.sh` and prints a clear human fallback message.
@@ -382,15 +382,15 @@ The following table documents the expected status and stage transitions at each 
 |-------|---------|--------|-------|
 | Start (Step 0 - Set status) | `wl update <id> --status in_progress --json` | in_progress | (unchanged) |
 | Claim (Step 1) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
-| Blocker complete (Step 4) | `wl update <id> --status open --stage in_review --json` | open | in_review |
-| Final (Step 6 - Mark in_review) | `wl update <id> --status open --stage in_review --json` | open | in_review |
+| Blocker complete (Step 4) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
+| Final (Step 6 - Mark in_review) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
 | Abort - dirty work tree | `wl update <id> --status open --json`, then abort | open | (unchanged) |
 | Abort - definition gate failure | `wl update <id> --status open --json`, run intake/plan interview, update item | open | (unchanged) |
 | Abort - user-initiated | `wl update <id> --status open --json`, return control to operator | open | (unchanged) |
 | Abort - error/exception during implementation | `wl update <id> --status open --json`, log error to comment, return | open | (unchanged) |
 | Abort - unexpected termination (Final cleanup) | Check status; if `in_progress` and work incomplete, reset | open | (unchanged) |
 | Under Ralph (Step 6 note) | Skip in_review step; Ralph handles transition | in_progress | in_progress |
-| Epic / parent: all children done | Check all children are in a terminal stage (in_review/completed); advance parent stage | open | in_review |
+| Epic / parent: all children done | Check all children are in a terminal stage (in_review/completed); advance parent stage | in-progress | in_review |
 
 > **Abort/failure transitions always use `--status open` while keeping the stage unchanged.**
 > This pattern is mandatory — never leave a work item in `in_progress` status
@@ -412,7 +412,7 @@ wl show SA-0MPYMFZXO0004ZU4 --json
 git push origin HEAD:refs/heads/dev
 
 # Mark in_review
-wl update SA-0MPYMFZXO0004ZU4 --status open --stage in_review --json
+wl update SA-0MPYMFZXO0004ZU4 --status completed --stage in_review --json
 ```
 
 End.

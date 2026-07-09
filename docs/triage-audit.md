@@ -50,7 +50,7 @@ The scheduler's `start_command()` routes `wl-audit` commands through `poll_and_h
 
 6. Auto-complete check (optional)
    - The `close_with_audit` handler verifies `audit_recommends_closure` via the `InvariantEvaluator` pre-invariant, extracts PR URLs (from comments/text), optionally verifies merge status using `gh pr view` (configurable via `verify_pr_with_gh`), and checks that there are no open direct children via `wl show --children --json`.
-   - On success the handler issues `wl update --status open --stage in_review --needs-producer-review true`, applies the `audit_closed` tag, and sends configured notifications.
+   - On success the handler issues `wl update --status completed --stage in_review --needs-producer-review true`, applies the `audit_closed` tag, and sends configured notifications.
 
 ## Cooldown logic
 
