@@ -1473,13 +1473,13 @@ class RalphLoop:
     def _wl_update_stage(self, work_item_id: str, stage: str) -> None:
         """Update the work item's stage via wl update.
 
-        When transitioning to in_review, also set status to open
-        (work is ready for review, not actively being worked on).
+        When transitioning to in_review, also set status to completed
+        (work is ready for review and marked as done in the lifecycle).
         """
         if stage == "in_review":
-            cmd = [self.wl_bin, "update", work_item_id, "--status", "open", "--stage", stage]
+            cmd = [self.wl_bin, "update", work_item_id, "--status", "completed", "--stage", stage]
             logger.info(
-                "ralph.cmd.wl.update_stage target=%s status=open stage=in_review",
+                "ralph.cmd.wl.update_stage target=%s status=completed stage=in_review",
                 work_item_id,
             )
         else:

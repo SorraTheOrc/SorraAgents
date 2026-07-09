@@ -205,7 +205,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Recursively implement that work item as described in this procedure.
   - When a work item is completed, follow the mandatory build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit the work. Update the stage: `wl update <work-item-id> --status completed --stage in_review --json`
   - After completing all children of a parent work-item and confirming they are in a terminal stage (in_review or completed), advance the parent work-item's stage to `in_review`:
-    `wl update <parent-id> --stage in_review --json`
+    `wl update <parent-id> --status completed --stage in_review --json`
 
 - If the work item has a recent audit record, review the audit notes and address any unmet acceptance criteria or other issues identified.
 - If there is no recent audit record, run `/skill:audit <work-item-id>` and use the resulting audit output to establish the work that needs to be done.
@@ -390,7 +390,7 @@ The following table documents the expected status and stage transitions at each 
 | Abort - error/exception during implementation | `wl update <id> --status open --json`, log error to comment, return | open | (unchanged) |
 | Abort - unexpected termination (Final cleanup) | Check status; if `in_progress` and work incomplete, reset | open | (unchanged) |
 | Under Ralph (Step 6 note) | Skip in_review step; Ralph handles transition | in_progress | in_progress |
-| Epic / parent: all children done | Check all children are in a terminal stage (in_review/completed); advance parent stage | in-progress | in_review |
+| Epic / parent: all children done | Check all children are in a terminal stage (in_review/completed); advance parent stage | completed | in_review |
 
 > **Abort/failure transitions always use `--status open` while keeping the stage unchanged.**
 > This pattern is mandatory — never leave a work item in `in_progress` status
