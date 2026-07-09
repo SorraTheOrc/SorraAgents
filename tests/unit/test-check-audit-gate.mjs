@@ -37,50 +37,10 @@ test('check-audit-gate: exports expected functions', async () => {
   assert.equal(typeof mod.checkAuditReadyToClose, 'function');
   assert.equal(typeof mod.getAuditStatus, 'function');
   assert.equal(typeof mod.getCandidateItems, 'function');
-  assert.equal(typeof mod.deduplicateItems, 'function');
 });
 
 // ---------------------------------------------------------------------------
-// 3. Pure function: deduplicateItems
-// ---------------------------------------------------------------------------
-describe('deduplicateItems', () => {
-  test('removes duplicate items by id', async () => {
-    const mod = await import(MODULE_PATH);
-    const items = [
-      { id: 'SA-001', title: 'Item A' },
-      { id: 'SA-002', title: 'Item B' },
-      { id: 'SA-001', title: 'Item A (duplicate)' },
-    ];
-    const result = mod.deduplicateItems(items);
-    assert.equal(result.length, 2);
-    assert.equal(result[0].id, 'SA-001');
-    assert.equal(result[1].id, 'SA-002');
-  });
-
-  test('returns empty array for empty input', async () => {
-    const mod = await import(MODULE_PATH);
-    const result = mod.deduplicateItems([]);
-    assert.equal(result.length, 0);
-  });
-
-  test('preserves order of first occurrence', async () => {
-    const mod = await import(MODULE_PATH);
-    const items = [
-      { id: 'SA-003', title: 'Item C' },
-      { id: 'SA-001', title: 'Item A' },
-      { id: 'SA-002', title: 'Item B' },
-      { id: 'SA-001', title: 'Item A dup' },
-    ];
-    const result = mod.deduplicateItems(items);
-    assert.equal(result.length, 3);
-    assert.equal(result[0].id, 'SA-003');
-    assert.equal(result[1].id, 'SA-001');
-    assert.equal(result[2].id, 'SA-002');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 4. Pure function: isBlockingAudit (tested indirectly via checkAuditReadyToClose)
+// 3. Pure function: isBlockingAudit (tested indirectly via checkAuditReadyToClose)
 //    Tests the buildBlockingMessage helper to verify report structure
 // ---------------------------------------------------------------------------
 describe('getAuditStatus - blocking condition detection', () => {
@@ -242,6 +202,6 @@ describe('check-audit-gate module structure', () => {
     assert.ok(mod.checkAuditReadyToClose);
     assert.ok(mod.getAuditStatus);
     assert.ok(mod.getCandidateItems);
-    assert.ok(mod.deduplicateItems);
+    assert.ok(mod.getCandidateItems);
   });
 });

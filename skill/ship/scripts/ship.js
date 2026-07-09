@@ -252,4 +252,4 @@ export function pushToBranch(targetBranch, opts = {}) {
 
 export { makeBranchName, validateBranchName, isBranchBlocked };
 export { checkUnmergedBranches, getUnmergedBranchNames, extractWorkItemId, getWorkItemStatus, getCurrentBranch } from './check-unmerged-branches.js';
-export { checkAuditReadyToClose, getAuditStatus, getCandidateItems, deduplicateItems } from './check-audit-gate.js';
+export { checkAuditReadyToClose, getAuditStatus, getCandidateItems } from './check-audit-gate.js';

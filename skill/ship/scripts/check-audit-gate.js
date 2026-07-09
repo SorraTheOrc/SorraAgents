@@ -1,10 +1,10 @@
 /**
  * check-audit-gate.js — Audit readiness gating step for the ship skill.
  *
- * Checks all `in_review` and `completed` work items for their audit
- * readiness. For each item, the gate calls `wl audit-show <id> --json`
- * and checks `audit.readyToClose`. Items with no audit or with
- * `readyToClose: false` are flagged as blocking.
+ * Checks all `in_review` work items for their audit readiness. For each
+ * item, the gate calls `wl audit-show <id> --json` and checks
+ * `audit.readyToClose`. Items with no audit or with `readyToClose: false`
+ * are flagged as blocking.
  *
  * This is intended as a gating step in the release process: before a
  * dev → main merge, agents should call `checkAuditReadyToClose()` to
@@ -26,72 +26,24 @@ import { execSync } from 'node:child_process';
 // ── getCandidateItems ────────────────────────────────────────────────────────
 
 /**
- * Query Worklog for work items with `status: completed` or `stage: in_review`.
- *
- * Calls two separate `wl list` queries and merges the results, returning
- * a combined list that may contain duplicates (which deduplicateItems()
- * will resolve).
+ * Query Worklog for all work items in `in_review` stage.
  *
  * @returns {Array<{ id: string, title: string }>}
  */
 export function getCandidateItems() {
-  const items = [];
-
-  // Query items with status: completed
   try {
-    const completedOutput = execSync('wl list --status completed --json', {
+    const output = execSync('wl list --stage in_review --json', {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    const completedData = JSON.parse(completedOutput);
-    if (completedData.workItems && Array.isArray(completedData.workItems)) {
-      for (const item of completedData.workItems) {
-        items.push({ id: item.id, title: item.title || item.id });
-      }
-    }
-  } catch (err) {
-    // If the query fails, log but continue — the in_review query may still work
-    console.error(`Warning: Failed to query completed items: ${err.message}`);
-  }
-
-  // Query items with stage: in_review
-  try {
-    const inReviewOutput = execSync('wl list --stage in_review --json', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const inReviewData = JSON.parse(inReviewOutput);
-    if (inReviewData.workItems && Array.isArray(inReviewData.workItems)) {
-      for (const item of inReviewData.workItems) {
-        items.push({ id: item.id, title: item.title || item.id });
-      }
+    const data = JSON.parse(output);
+    if (data.workItems && Array.isArray(data.workItems)) {
+      return data.workItems.map(item => ({ id: item.id, title: item.title || item.id }));
     }
   } catch (err) {
     console.error(`Warning: Failed to query in_review items: ${err.message}`);
   }
-
-  return items;
-}
-
-// ── deduplicateItems ─────────────────────────────────────────────────────────
-
-/**
- * Deduplicate an array of items by their `id` field. The first occurrence
- * of each ID is kept; subsequent duplicates are discarded.
- *
- * @param {Array<{ id: string }>} items - The items to deduplicate.
- * @returns {Array<{ id: string }>} Deduplicated array, preserving order.
- */
-export function deduplicateItems(items) {
-  const seen = new Set();
-  const result = [];
-  for (const item of items) {
-    if (!seen.has(item.id)) {
-      seen.add(item.id);
-      result.push(item);
-    }
-  }
-  return result;
+  return [];
 }
 
 // ── getAuditStatus ───────────────────────────────────────────────────────────
@@ -179,18 +131,15 @@ export function buildRemediationCommand(workItemId) {
  */
 export async function checkAuditReadyToClose() {
   // Step 1: Collect candidate items
-  const rawItems = getCandidateItems();
+  const items = getCandidateItems();
 
-  if (rawItems.length === 0) {
+  if (items.length === 0) {
     return {
       hasBlockingItems: false,
       blockingItems: [],
-      message: 'No completed or in_review work items found. Audit gate passed.',
+      message: 'No in_review work items found. Audit gate passed.',
     };
   }
-
-  // Step 2: Deduplicate
-  const items = deduplicateItems(rawItems);
 
   // Step 3: Check audit status for each item
   const blockingItems = [];

@@ -63,7 +63,7 @@ Where `<action>` is one of:
 - `./scripts/ship.js` — Push-to-dev behaviour module (exports: `pushToDev`, `pushToBranch`, `validatePushTarget`, `validateForcePush`, `DEV_BRANCH`, `PROTECTED_BRANCHES`, `checkUnmergedBranches`, `checkAuditReadyToClose`, and re-exports from `git-helpers.js`)
 - `./scripts/git-helpers.js` — Branch naming and policy helpers (exports: `makeBranchName`, `validateBranchName`, `isBranchBlocked`, `BLOCKED_BRANCHS`, `BRANCH_NAME_PATTERN`)
 - `./scripts/check-unmerged-branches.js` — Unmerged branch detection module (exports: `checkUnmergedBranches`, `getUnmergedBranchNames`, `extractWorkItemId`, `getWorkItemStatus`)
-- `./scripts/check-audit-gate.js` — Audit readiness gating module (exports: `checkAuditReadyToClose`, `getAuditStatus`, `getCandidateItems`, `deduplicateItems`)
+- `./scripts/check-audit-gate.js` — Audit readiness gating module (exports: `checkAuditReadyToClose`, `getAuditStatus`, `getCandidateItems`)
 - `./scripts/run-release.js` — Safe wrapper to invoke the release process (exports: `runRelease`, `syncDevWithMain`, `parsePRUrl`, `waitForPRMerge`; includes unmerged branches gating check, audit readiness gating, post-release dev sync)
 - `./scripts/release/merge-dev-to-main.sh` — Canonical release merge script (installed in the skill directory)
 
@@ -160,20 +160,18 @@ To bypass the gating check, resolve or merge the unmerged branches first.
 ### Audit Readiness Gating
 
 In addition to the unmerged branches check, the ship skill includes an **audit
-readiness gate** that verifies all `in_review` and `completed` work items have
-passing audits before a release is performed.
+readiness gate** that verifies all `in_review` work items have passing audits
+before a release is performed.
 
 This gate:
 
-1. Queries `wl list --status completed --json` and `wl list --stage in_review --json`
-   to collect candidate work items.
-2. Deduplicates the result set by work item ID (an item may match both filters).
-3. For each item, calls `wl audit-show <id> --json` and checks `audit.readyToClose`.
-4. Items where `audit.readyToClose` is `false`, `audit` is `null` (no audit
+1. Queries `wl list --stage in_review --json` to collect candidate work items.
+2. For each item, calls `wl audit-show <id> --json` and checks `audit.readyToClose`.
+3. Items where `audit.readyToClose` is `false`, `audit` is `null` (no audit
    exists), or the audit is otherwise absent are flagged as **blocking**.
-5. If any blocking items are found, the release is aborted with exit code 6
+4. If any blocking items are found, the release is aborted with exit code 6
    and a structured report is printed showing which items block and why.
-6. If all queried items have `audit.readyToClose: true`, the gate passes
+5. If all queried items have `audit.readyToClose: true`, the gate passes
    silently and the release proceeds.
 
 The gate respects the existing `--skip-checks` flag to bypass when explicitly
