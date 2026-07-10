@@ -208,7 +208,7 @@ export async function runRelease(cliArgs = []) {
     }
   }
 
-  // ── Step 2: Find the release script ───────────────────────────────────
+  // ── Step 3: Find the release script ───────────────────────────────────
   let selectedScript = null;
   if (existsSync(SKILL_RELEASE_SCRIPT)) {
     selectedScript = SKILL_RELEASE_SCRIPT;
@@ -239,7 +239,7 @@ export async function runRelease(cliArgs = []) {
     return 2;
   }
 
-  // ── Step 3: Execute the release script ─────────────────────────────────
+  // ── Step 4: Execute the release script ─────────────────────────────────
   console.log('Executing release script...\n');
 
   const child = spawnSync('bash', [selectedScript, ...args], {
@@ -266,7 +266,7 @@ export async function runRelease(cliArgs = []) {
     return 0;
   }
 
-  // ── Step 4: Post-release - wait for PR merge and sync dev ──────────────
+  // ── Step 5: Post-release - wait for PR merge and sync dev ──────────────
   const prUrl = parsePRUrl(stdout);
 
   if (prUrl && !isForce) {
@@ -279,7 +279,7 @@ export async function runRelease(cliArgs = []) {
     console.log('\nNo PR URL detected in release output. Skipping PR merge wait.');
   }
 
-  // ── Step 5: Sync dev with main ─────────────────────────────────────────
+  // ── Step 6: Sync dev with main ─────────────────────────────────────────
   const syncResult = syncDevWithMain();
   if (!syncResult.success) {
     console.error(`\n⚠️  ${syncResult.message}`);

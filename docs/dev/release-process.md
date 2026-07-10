@@ -71,7 +71,20 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
    - All blocking work-items related to the release are closed.
    - No unresolved merge conflicts exist on `dev`.
 
-7. **Verify CHANGELOG.md is up to date**
+7. **Audit readiness gate — all `in_review` and `completed` items have passing audits**
+   - The automated release script (`run-release.js`) enforces this gate at exit code 6.
+   - Run the gate manually to check:
+     ```bash
+     node skill/ship/scripts/run-release.js --dry-run
+     ```
+   - If the gate fails, run `wl audit-show <blocking-item-id> --json` to inspect
+     the audit status, then re-run the audit with:
+     ```bash
+     python3 skill/audit/scripts/audit_runner.py issue <blocking-item-id>
+     ```
+   - Use `--skip-checks` to bypass the gate in exceptional circumstances.
+
+8. **Verify CHANGELOG.md is up to date**
    - The release script now generates `CHANGELOG.md` automatically from
      worklog items (completed / in_review) during the release flow.
    - Verify that the generated `CHANGELOG.md` section reflects the correct

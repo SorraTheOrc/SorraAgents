@@ -160,12 +160,14 @@ To bypass the gating check, resolve or merge the unmerged branches first.
 ### Audit Readiness Gating
 
 In addition to the unmerged branches check, the ship skill includes an **audit
-readiness gate** that verifies all `in_review` work items have passing audits
-before a release is performed.
+readiness gate** that verifies all `in_review` and `completed` work items have
+passing audits before a release is performed.
 
 This gate:
 
-1. Queries `wl list --stage in_review --json` to collect candidate work items.
+1. Queries `wl list --stage in_review --json` and `wl list --status completed --json`
+   (deduplicating by ID, excluding items already in `stage: done`) to collect
+   candidate work items.
 2. For each item, calls `wl audit-show <id> --json` and checks `audit.readyToClose`.
 3. Items where `audit.readyToClose` is `false`, `audit` is `null` (no audit
    exists), or the audit is otherwise absent are flagged as **blocking**.

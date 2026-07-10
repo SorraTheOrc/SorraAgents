@@ -26,11 +26,19 @@ import { execSync } from 'node:child_process';
 // ── getCandidateItems ────────────────────────────────────────────────────────
 
 /**
- * Query Worklog for all work items in `in_review` stage.
+ * Query Worklog for candidate work items.
+ *
+ * Fetches items with `stage: in_review` OR `status: completed`, deduplicating
+ * by ID. Items in `status: completed` with `stage: done` are already released
+ * and are excluded from the candidate set.
  *
  * @returns {Array<{ id: string, title: string }>}
  */
 export function getCandidateItems() {
+  const seen = new Set();
+  const items = [];
+
+  // Query 1: items in in_review stage (main case — about to be released)
   try {
     const output = execSync('wl list --stage in_review --json', {
       encoding: 'utf-8',
@@ -38,12 +46,41 @@ export function getCandidateItems() {
     });
     const data = JSON.parse(output);
     if (data.workItems && Array.isArray(data.workItems)) {
-      return data.workItems.map(item => ({ id: item.id, title: item.title || item.id }));
+      for (const item of data.workItems) {
+        if (!seen.has(item.id)) {
+          seen.add(item.id);
+          items.push({ id: item.id, title: item.title || item.id });
+        }
+      }
     }
   } catch (err) {
     console.error(`Warning: Failed to query in_review items: ${err.message}`);
   }
-  return [];
+
+  // Query 2: items with status completed (catches edge cases where an item
+  // is completed but its stage is not yet in_review). Items already in
+  // stage: done are excluded since they have already been released.
+  // Use a large maxBuffer to handle potentially large output sets.
+  try {
+    const output = execSync('wl list --status completed --json', {
+      encoding: 'utf-8',
+      maxBuffer: 5 * 1024 * 1024, // 5 MB
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const data = JSON.parse(output);
+    if (data.workItems && Array.isArray(data.workItems)) {
+      for (const item of data.workItems) {
+        if (!seen.has(item.id) && item.stage !== 'done') {
+          seen.add(item.id);
+          items.push({ id: item.id, title: item.title || item.id });
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`Warning: Failed to query completed items: ${err.message}`);
+  }
+
+  return items;
 }
 
 // ── getAuditStatus ───────────────────────────────────────────────────────────
