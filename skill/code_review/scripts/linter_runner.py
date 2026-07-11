@@ -192,7 +192,7 @@ def _run_eslint_findings_check(
     Returns:
         A list of finding dicts.
     """
-    cmd = ["eslint", str(root), "-f", "json", "--no-eslintrc", "--quiet"]
+    cmd = ["eslint", str(root), "-f", "json", "--quiet"]
     result = runner(cmd)
 
     if result.returncode not in (0, 1):
@@ -509,10 +509,10 @@ def _run_eslint_fix_mode(
 ) -> tuple[list[dict[str, Any]], bool]:
     """Run eslint --fix and return remaining findings."""
     def fix_cmd(root: Path) -> list[str]:
-        return ["eslint", str(root), "-f", "json", "--fix", "--no-eslintrc", "--quiet"]
+        return ["eslint", str(root), "-f", "json", "--fix", "--quiet"]
 
     def rescan_cmd(root: Path) -> list[str]:
-        return ["eslint", str(root), "-f", "json", "--no-eslintrc", "--quiet"]
+        return ["eslint", str(root), "-f", "json", "--quiet"]
 
     def fixes_detected(result: Any, output: str) -> bool:
         if result.returncode == 1:

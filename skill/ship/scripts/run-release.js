@@ -11,6 +11,7 @@ import { spawnSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
+import { checkAuditReadyToClose } from './check-audit-gate.js';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -165,16 +166,17 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * Main orchestrator for the release process.
  *
  * Steps:
- * 1. Check for unmerged branches (gating)
- * 2. Find and execute the release script
- * 3. Parse PR URL from release script output
- * 4. Wait for PR merge (if not already merged with --force)
- * 5. Sync dev with main
+ * 1. Check for unmerged branches (gating, exit code 3)
+ * 2. Check audit readiness (gating, exit code 6)
+ * 3. Find and execute the release script
+ * 4. Parse PR URL from release script output
+ * 5. Wait for PR merge (if not already merged with --force)
+ * 6. Sync dev with main
  *
  * @param {string[]} [cliArgs=[]] - Command-line arguments.
  * @returns {number} Exit code (0 = success).
  */
-export function runRelease(cliArgs = []) {
+export async function runRelease(cliArgs = []) {
   const args = [...cliArgs];
   const skipChecks = args.includes('--skip-checks');
   const isDryRun = args.includes('--dry-run');
@@ -193,7 +195,20 @@ export function runRelease(cliArgs = []) {
     }
   }
 
-  // ── Step 2: Find the release script ───────────────────────────────────
+  // ── Step 2: Check audit readiness (gating step) ────────────────────────
+  if (!skipChecks) {
+    const auditReport = await checkAuditReadyToClose();
+    if (auditReport.hasBlockingItems) {
+      console.error(
+        '⚠️  Audit gate check failed — some work items are not ready to close:\n',
+      );
+      console.error(auditReport.message);
+      console.error('\nTo bypass this check, re-run with --skip-checks.');
+      return 6;
+    }
+  }
+
+  // ── Step 3: Find the release script ───────────────────────────────────
   let selectedScript = null;
   if (existsSync(SKILL_RELEASE_SCRIPT)) {
     selectedScript = SKILL_RELEASE_SCRIPT;
@@ -224,7 +239,7 @@ export function runRelease(cliArgs = []) {
     return 2;
   }
 
-  // ── Step 3: Execute the release script ─────────────────────────────────
+  // ── Step 4: Execute the release script ─────────────────────────────────
   console.log('Executing release script...\n');
 
   const child = spawnSync('bash', [selectedScript, ...args], {
@@ -251,7 +266,7 @@ export function runRelease(cliArgs = []) {
     return 0;
   }
 
-  // ── Step 4: Post-release - wait for PR merge and sync dev ──────────────
+  // ── Step 5: Post-release - wait for PR merge and sync dev ──────────────
   const prUrl = parsePRUrl(stdout);
 
   if (prUrl && !isForce) {
@@ -264,7 +279,7 @@ export function runRelease(cliArgs = []) {
     console.log('\nNo PR URL detected in release output. Skipping PR merge wait.');
   }
 
-  // ── Step 5: Sync dev with main ─────────────────────────────────────────
+  // ── Step 6: Sync dev with main ─────────────────────────────────────────
   const syncResult = syncDevWithMain();
   if (!syncResult.success) {
     console.error(`\n⚠️  ${syncResult.message}`);
@@ -284,7 +299,8 @@ const isMainModule = process.argv[1] &&
   (realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1])));
 
 if (isMainModule) {
-  const exitCode = runRelease(process.argv.slice(2));
-  process.exitCode = exitCode;
-  process.exit(exitCode);
+  runRelease(process.argv.slice(2)).then((exitCode) => {
+    process.exitCode = exitCode;
+    process.exit(exitCode);
+  });
 }

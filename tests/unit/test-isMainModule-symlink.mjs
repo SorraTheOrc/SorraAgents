@@ -50,12 +50,17 @@ const BUMP_VERSION_SRC = join(
 function runBumpVersionViaSymlink(opts = {}) {
   const { version = '0.1.0', args = ['--dry-run'] } = opts;
 
-  // Create a temp directory with a minimal package.json
+  // Create a temp directory with a minimal package.json and a git repo
+  // (bump-version.js now uses `git rev-parse --show-toplevel` to find the
+  // repository root, so the temp dir must be a valid git repository)
   const tmpDir = mkdtempSync(join(tmpdir(), 'bump-version-symlink-test-'));
   writeFileSync(
     join(tmpDir, 'package.json'),
     JSON.stringify({ name: 'test-pkg', version }) + '\n',
   );
+
+  // Initialise a git repo so `git rev-parse --show-toplevel` succeeds
+  spawnSync('git', ['init', '--quiet'], { cwd: tmpDir, stdio: 'ignore' });
 
   // Create the symlink to bump-version.js
   const symlinkPath = join(tmpDir, 'bump-version.js');

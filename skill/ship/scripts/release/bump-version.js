@@ -21,13 +21,15 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
+import { resolve } from 'node:path';
+import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 // ── Resolve repo root ──────────────────────────────────────────────────────
-// The script is at <repo>/skill/ship/scripts/release/bump-version.js
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(__dirname, '../../../../');
+// Use `git rev-parse --show-toplevel` so the script works regardless of
+// where it is installed — locally inside a repo tree or globally via a
+// skill manager at ~/.pi/agent/skills/ship/…
+const REPO_ROOT = execSync('git rev-parse --show-toplevel', { encoding: 'utf-8' }).trim();
 const PKG_PATH = resolve(REPO_ROOT, 'package.json');
 
 // ── bumpVersion ────────────────────────────────────────────────────────────
