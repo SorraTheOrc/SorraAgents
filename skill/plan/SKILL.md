@@ -390,6 +390,11 @@ instructions above).
 - If the skill makes changes, include a changelog block in the parent work
   item (labelled "Plan: changelog") summarising actions and timestamps.
 
+  > **Note:** This "Plan: changelog" block is for **work-item-level traceability** —
+  > recording agent actions in the parent work item. It is **not** the repository
+  > `CHANGELOG.md`, which is managed automatically by the ship skill's release pipeline.
+  > Implementing agents should never manually update the repository `CHANGELOG.md`.
+
 ## Editing rules & safety
 
 - Preserve author intent; where the agent is uncertain, create an Open

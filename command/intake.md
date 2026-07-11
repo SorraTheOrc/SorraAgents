@@ -178,6 +178,8 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
 
   Always include the criteria "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries." If this criterion is not already present, add it.
 
+  > **Note:** CHANGELOG.md is **excluded** from this list. It is managed automatically by the ship skill's release pipeline (`skill/ship/scripts/release/generate-changelog.js`). Implementing agents should not manually update CHANGELOG.md.
+
   Always include the criteria "Full project test suite must pass with the new changes." If this criterion is not already present, add it.
 
   Do not include tests related to continuous integration or deployment pipelines as acceptance criteria.

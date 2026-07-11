@@ -107,6 +107,7 @@ status-reset instructions documented in the sections below:
   - you can discover assets on the web as part of your implementation, but ensure that you have the right to use and distribute any assets you include in the project. Always provide proper attribution if required by the asset's license.
 - If the implementation requires changes to documentation, update the relevant markdown files in the `docs` directory and reference these changes in the work item comments and PR description.
   - ensure that documentation changes are clear, concise, and accurately reflect the implementation changes. Include examples or screenshots if they help clarify the documentation.
+  - **Exception:** `CHANGELOG.md` is **excluded** from manual documentation updates. It is managed automatically by the ship skill's release pipeline (`skill/ship/scripts/release/generate-changelog.js`). Implementing agents should never manually edit `CHANGELOG.md`.
 
 ## Steps
 
@@ -228,7 +229,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
       - Example: `python3 ../triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`
       - If `check_or_create` returns that it created a NEW critical issue, or matched an existing incomplete one, the agent should implement that child work item to fix the test failure, commit the fix, and re-run tests until all pass before proceeding.
       - If running under Ralph, failing tests are automatically handled: Ralph will create child work items, implement fixes, and ensure all tests pass before marking the parent as `in_review`.
-  - Update or create relevant documentation.
+  - Update or create relevant documentation (excluding `CHANGELOG.md`, which is managed automatically by the ship skill's release pipeline).
   - Summarize changes made in the work item description or comments.
   - Do not proceed to the next step until the user confirms it is OK to do so.
 
