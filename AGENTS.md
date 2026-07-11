@@ -385,7 +385,7 @@ Run `wl <command> --help` to see help text and all available flags for any comma
 
 ## Coding Disciplines
 
-> Source: [Karpathy-Inspired Claude Code Guidelines](https://github.com/multica-ai/andrej-karpathy-skills) — derived from [Andrej Karpathy's observations](https://x.com/karpathy/status/2015883857489522876) on LLM coding pitfalls.
+> Source: [Karpathy-Inspired Claude Code Guidelines](https://github.com/multica-ai/andrej-karpathy-skills) on LLM coding pitfalls.
 
 These four principles complement the workflow and core principles above by addressing common LLM coding pitfalls: making unchecked assumptions, overcomplicating solutions, making unnecessary side-effect edits, and executing vague goals without verifiable success criteria. They bias toward **caution over speed** — for trivial tasks (simple typo fixes, obvious one-liners) use judgment; not every change needs the full rigor.
 
