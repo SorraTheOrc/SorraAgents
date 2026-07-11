@@ -86,9 +86,16 @@ The command implements the procedural workflow below. Each numbered step is part
 - If a <work-item-id> was provided:
   - Mark the work item at stage idea and assign it, by running `wl update $1 --stage idea --assignee Map --json`.
   - Note: `status` was already set to `in_progress` at the start of this command (see Status lifecycle section above).
+  - Review the existing item's `issueType` (retrieved from `wl show <work-item-id> --json`). If it does not match the actual nature of the work described (bug for a problem/fix, feature for a new capability, chore for maintenance, task for general work, epic for large scope with subtasks), update it using `wl update <work-item-id> --issue-type <correct-type> --json`.
 - If no work item id was provided:
   - Extract a working title from the <seed-intent> (one line).
-  - Create a new Worklog work item using `wl create --stage idea --status in_progress --title "<working-title>" --description "<seed-context>" --type epic --assignee Map --json`
+  - Infer the most appropriate issue type from the seed intent using your judgment:
+    - If the context describes a bug, error, or defect → `--issue-type bug`
+    - If the context describes a new or improved feature/capability → `--issue-type feature`
+    - If the context describes maintenance, refactoring, or chore work → `--issue-type chore`
+    - If the context describes a large scope that likely requires multiple subtasks → `--issue-type epic`
+    - Default (ambiguous or general context) → `--issue-type task`
+  - Create a new Worklog work item using `wl create --stage idea --status in_progress --title "<working-title>" --description "<seed-context>" --issue-type <inferred-type> --assignee Map --json`
   - Remember the returned <work-item-id> for later steps.
 
 1. Interview
