@@ -196,7 +196,7 @@ if (report.hasBlockingItems) {
   //      Remediation:
   //        # Re-run audit for SA-001:
   //        wl audit-show SA-001 --json
-  //        python3 skill/audit/scripts/audit_runner.py issue SA-001
+  //        python3 ../audit/scripts/audit_runner.py issue SA-001
 }
 ```
 
