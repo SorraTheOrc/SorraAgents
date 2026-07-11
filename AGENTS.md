@@ -1,139 +1,55 @@
 Core principles for AI Agents working with work-items tracked in Worklog (wl) and the workflow to follow when completing tasks.
 
-- Tasks will either be provided with an associated work-item id, or if not, the agent must ask for one to be created or permission to create one. This ensures all work is tracked in Worklog (wl) and can be properly managed and referenced.
-- When asked to complete a task, the agent MUST follow the workflow outlined below, which includes claiming work-items, ensuring they are clearly defined, planning the work, deciding what to work on next, implementing the work-item, merging changes, updating the operator, and repeating this process until all work is complete.
-- Do NOT ask unnecessary questions. The goal is to complete a task without furtherr interaction with the operator. Only ask questions if you need information that is not already available in the worklog or repository to clarify requirements, acceptance criteria, or context. Always check existing information first before asking the operator.
-- Always write tests *before* writing code to help guide your implementation. If the requirements are not clear enough to write tests, seek clarification before proceeding with implementation.
-- It is OK to make reasonable assumptions to fill in gaps in information, but these assumptions should be clearly documented in the work-item description or comments and should be concisely and clearly communicated to the operator upon completion of the task.
-- Do not stop working on a task until you hit an explicit gating step in the workflow.
-- A task is not complete until all acceptance criteria are satisfied, all tests pass, and the work-item is ready for review. Use the `audit` skill to verify that all acceptance criteria are satisfied and all tests pass before marking a work-item as ready for review.
-- If you encounter an issue that blocks completion of the current work-item, create a new work-item to address that issue, record the blocking relationship, report to the user and start working on the blocking item.
-- When you have completed a task, report back to the operator with a concise summary of the work completed, including any relevant links (work-item id, commit hashes, PR links, etc.)
+- Tasks require a work-item id; if not provided, ask for one to be created or get permission to create one.
+- When asked to complete a task, follow the workflow below: claim, define, plan, decide, implement, update, repeat, end.
+- Do NOT ask unnecessary questions. Check existing information first before asking.
+- Write tests *before* writing code. If requirements are unclear, seek clarification before proceeding.
+- Reasonable assumptions are OK but must be documented in the work-item and communicated upon completion.
+- Do not stop working on a task until you hit an explicit gating step.
+- A task is not complete until all acceptance criteria are satisfied, all tests pass, and the work-item is ready for review. Use the `audit` skill to verify before marking as ready.
+- If you discover a blocker, create a new work-item, record the blocking relationship, and start working on it.
+- When complete, report back concisely with relevant links (work-item id, commits, PRs).
 
 <!-- WORKFLOW: start -->
 
 ## Workflow for AI Agents
 
-Follow thhe steps below when completing tasks. If you are already working on a specific work item and are not provided with a different id then continue to use that work item. However, if you do not have a current work-item id and one is not provided you must stop and ask the user to either create one for you or give you permission to create one for the request. If the user gives you permission to skip work-item creation for a requestyou can proceed and ignore any work-item update steps below.
+Follow the steps below when completing tasks. If you already have a current work-item id, continue using it. Otherwise, ask the operator to create one or give permission to create one. If the operator allows skipping work-item creation, proceed without tracking steps.
 
-1. **Claim the work-item** created by the operator:
-   - If you do not have a work-item id for the task you have been given and it is not a trivial task, ask the operator to create on, provide a work-item-id or give you permission to create a work-item yourself. The work-item must include a clear description of the goal and how it will change behaviour, preferably in the form of a user story, along with acceptance criteria that can be used to verify completion and references to important specifications, user-stories, designs, or other important context.
-   - Claim the work-item with `wl update <id> --status in_progress --assignee <your-agent-name>`
-2. **Ensure the work-item is clearly defined**:
-   - retrieve the work-item details with `wl show <id> --children --json`
-   - Read the the work-item and any related files/paths/work-items identified within
-   - If the work-item is not clearly defined (it *MUST* included a clear description of the goal and how it will change behaviour, preferably in the form of a user story, along with acceptance criteria that can be used to verify completion and references to important specifications, user-stories, designs, or other important context):
-     - Search the worklog (`wl search <search-terms> --json` and `wl show <id> --children --json`) and repository for any existing information that may clarify the requirements
-     - If the operator has allowed further questions ask for clarification on specific requirements, acceptance criteria, and context. Where possible provide suggested responses, but always allow for a free form text response.
-     - If the operator has not allowed further questions attempt to clarify the requirements based on the existing information in the repository and worklog.
-       - If there are still ambiguities or missing information after this process record them as open questions in the description of the item.
-     - Update the work-item description and acceptance criteria with any clarifications made or open questions remaining using `wl update <id> --description "<updated-description>"`. DO NOT remove existing content unless it is incorrect, ONLY add to it with appropriate clarifications.
-   - Once the work-item is clearly defined update its stage to `intake_complete` using `wl update <id> --stage intake_complete`
-   - Report back to the operator summarising any clarifications made and proceed to the next step.
-3. **Plan the work**:
-   - Break down the work into smaller sub-tasks if necessary
-   - Each sub-task should be a discrete unit of work that can be completed independently, if a sub-task is still too large break it down further with sub-tasks of its own
-   - Verify and if possible improve the description of the goal and how it will change behaviour, preferably in the form of a user story
-   - Verify and if possible improve the references to important specifications, user-stories, designs, or other important context. A work-item should not reference itself.
-   - Verify and if possible improve the acceptance criteria so they are clear, measurable, and testable
-   - Create child work-items for each sub-task using `wl create -t "<sub-task-title>" -d "<detailed-description>" --parent <base-item-id> --issue-type <type-of-work-item> --priority <critical|high|medium|low> --json`
-   - Once planning is complete update the parent work-item stage to `plan_complete` using `wl update <base-item-id> --stage plan_complete`
-   - Report back to the operator summarising the plan using `wl show <base-item-id> --children` and proceed to the next step.
-4. **Decide what to work on next**:
-   - Use `wl next --json` to get a recommendation for the next work-item to work on. The id of this item will be referred to below as <WIP-id>.
-   - If the recommended work-item has no children proceed to the next step.
-   - If the recommended work-item has children claim this work-item and mark it as in progress using `wl update <WIP-id> --status in_progress --assignee <your-agent-name>`
-   - Repeat this step to get the next recommended work-item until a leaf work-item (one with no children) is reached.
-   - if there are no descendents of <base-item-id> left to work on go to the `End session` step.
-   - Report back to the operator summarising the selected work-item and proceed to the next step.
-5. **Implement the work-item**:
-   - Review the content of the selected work-item
-   - Review the description, acceptance criteria, and any related files/paths in the work item description and comments (retrieved with `wl show <WIP-id> --children --json`)
-   - Review any existing work-items in the repository that may be related to this work-item (`wl search <search-terms> --json` and `wl show <id> --children --json`).
-   - If the work-item is not clearly defined:
-     - Search the worklog (`wl search <search-terms> --json` and `wl show <id> --children --json`) and repository for any existing information that may clarify the requirements
-     - If the operator has allowed further questions ask for clarification on specific requirements, acceptance criteria, and context. Where possible provide suggested responses, but always allow for a free form text response.
-     - If the operator has not allowed further questions attempt to clarify the requirements based on the existing information in the repository and worklog.
-     - Update the work-item description and acceptance criteria with any clarifications found with `wl update <WIP-id> --description "<updated-description>"`. DO NOT remove existing content unless it is incorrect, ONLY add to it with appropriate clarifications.
-   - Create a worktree for the work-item with a new branch following the naming conventions (e.g., `wl-<WIP-id>-short-description`). See the canonical [[concepts/git-worktree-best-practices-for-agent-workflows]] wiki page for the worktree workflow (create, use, push, clean up).
-   - Complete all work required to meet the acceptance criteria (code, tests, documentation, etc.)
-     - If new work-items are discovered during implementation create new work-items using `wl create "<work-item-title>" --description "<detailed-description-of-goals-and-context>" --issue-type <type-of-work-item> --json`. If the item must be completed in order to satisfy the requirements of the parent work-item, make the new item a child of the parent work-item using `--parent <parent-id>`. If it is an optional item make it a sibling of the <base-item-id> and add a reference to the base item in the description using `discovered-from:<base-item-id>`.
-     - Regularly build the project and run all tests and checks to ensure nothing is broken. Always follow the build → test → commit order: build first, then test, then commit.
-       - If the build or any tests/checks fail, fix the issues and repeat until all tests/checks pass
-     - Commit changes only after the build completes without errors and all tests pass. Before committing, always run the build first, then the test suite, and only commit if both succeed. Never commit before verifying that the build and tests pass. When committing, use clear commit messages that reference the WIP id and summarise the changes made.
-   - If a particularly complex issue is identified or a significant design decisions or assumption is made record this in a comment on the work-item using `wl comment add <WIP-id> --comment "<detailed-comment>" --author <your-agent-name> --json`
-   - Once the acceptance criteria of <WIP-id> has been satisfied, follow the mandatory build → test → commit order: first build the project (verify no errors), then run all tests (verify all pass), and only then commit final changes to the branch with a message such as `<WIP-id>: Completed work to satisfy acceptance criteria: <acceptance-criteria-summary>`
-   - Push the feature branch into `dev` as the integration step:
-     `git push origin HEAD:refs/heads/dev`
-     This makes your changes available in `dev` — the primary working branch.
-     Only the release process (ship agent / release manager) promotes changes
-     from `dev` to `main`. See [skills/ship/SKILL.md](skills/ship/SKILL.md) for
-     the push-to-dev workflow and `scripts/release/merge-dev-to-main.sh` for
-     the dev→main release process.
-   - After pushing, clean up the worktree:
+1. **Claim the work-item** — Run `wl update <id> --status in_progress --assignee <agent>`.
+2. **Ensure the work-item is clearly defined** — Fetch with `wl show <id> --children --json`. Verify it has a clear goal (user story) and testable acceptance criteria. If unclear, search worklog/repo for context, clarify with the operator, or document open questions. Advance stage: `wl update <id> --stage intake_complete`. See [skill/intakeall/SKILL.md](skill/intakeall/SKILL.md).
+3. **Plan the work** — Break into sub-tasks. Verify descriptions and ACs are clear, measurable, and testable. Create child work-items: `wl create -t "<title>" -d "<description>" --parent <id> --issue-type <type> --priority <level> --json`. Advance stage: `wl update <id> --stage plan_complete`. See [skill/plan/SKILL.md](skill/plan/SKILL.md).
+4. **Decide what to work on next** — Use `wl next --json`. If the recommended item has children, claim it and recurse until reaching a leaf item. If no descendants remain, go to End session.
+5. **Implement the work-item** — Review ACs and description. Create a worktree from `dev`:
 
-     ```bash
-     git worktree remove .worklog/worktrees/<worktree-name>
-     git worktree prune
-     ```
+   ```bash
+   git worktree add --track -b wl-<WIP-id>-<slug> .worklog/worktrees/wl-<WIP-id>-<slug> dev
+   cd .worklog/worktrees/wl-<WIP-id>-<slug>
+   ```
 
-     This keeps the repository free of stale worktrees between sessions.
-     Then switch to the `dev` branch in the main checkout and pull the latest:
+   Write tests first, then code. Follow build → test → commit order (never reverse). Push to `dev`: `git push origin HEAD:refs/heads/dev`. Clean up after:
 
-     ```bash
-     cd /path/to/repo/root
-     git checkout dev
-     git pull origin dev
-     ```
+   ```bash
+   cd /path/to/repo/root
+   git worktree remove .worklog/worktrees/<name> && git worktree prune
+   git checkout dev && git pull origin dev
+   ```
 
-     This ensures subsequent operations (e.g., starting the next work-item)
-     begin from the current HEAD of the integration branch.
-   - When work is complete record a comment on the work-item summarising the changes made and the reason for them, including the commit hash using `wl comment add <id> --comment "Completed work, see commit <commit-hash> for details." --author <your-agent-name> --json`
-   - After committing and pushing changes, close your response to the operator with: "`<WIP-id>: <concise-summary>`\n\nWork committed to dev"
-   - Update the work-item stage to `in_review` using `wl update <WIP-id> --stage in_review`
+   After committing and pushing changes, close your response to the operator with: `<WIP-id>: <concise-summary>`
 
-     > ⚠️ **Do NOT close the work-item at this stage.**
-     > Work-items are closed only after the `dev`→`main` release is complete.
-     >
-     > **Clarification — what "close" means when an operator says it:**
-     > When a human operator tells you to "close a work item", they mean
-     > update the stage to `in_review` or mark it as `completed` — they do
-     > **not** mean initiate a dev→main release. Do not start a release
-     > unless the operator explicitly asks for it. Releasing is a separate,
-     > explicit action that requires explicit operator consent.
-     >
-     > Agents SHOULD NOT push directly to `main` unless explicitly authorized.
-     > The canonical `dev`→`main` release process is implemented by
-     > `scripts/release/merge-dev-to-main.sh` (invoked via the Ship skill). Any
-     > agent may perform the release by invoking the Ship skill's release command,
-     > or a designated Release Manager may perform it manually. The process creates
-     > a PR, waits for CI, and merges via `gh pr merge`. See
-     > [skills/ship/SKILL.md](skills/ship/SKILL.md) and
-     > [docs/dev/release-process.md](docs/dev/release-process.md) for details.
+   Work committed to dev
 
-   - Report back to the operator summarising the work completed and proceed to the next step.
-6. **Update the operator**:
-   - Provide the operator a summary of the work completed, including any relevant links (work-item id, commit hashes, PR links, etc.)
-   - Do not suggest next steps at this point, simply report what has been done and proceed to the next step.
-7. **Repeat**:
-   - Go back to the `Decide what to work on next` step.
-8. **End session**:
-   - When there are no descendents of <base-item-id> left to work on, inform the operator that all required work is complete and summarize any discovered tasks, or pre-existing tasks in the worklog (`wl list --json`).
-   - Ask the operator if they would like to address any of these remaining tasks now or if they would like to end the session.
-   - If the operator wishes to address any remaining tasks, return to the `Claim the work-item` with the selected work-item id as the new <base-item-id>.
-   - When the operator indicates that the session is complete, ensure all work-items created or worked on during the session are in the `in_review` or `done` stage.
-   - Provide a final summary to the operator of all work completed during the session, including work-item ids, commit hashes, and any relevant links.
-   - Clean up the worktree if not already removed:
+   See [skill/implement/SKILL.md](skill/implement/SKILL.md) for the full implementation workflow (test-driven development, commit discipline, worktree lifecycle, error handling).
 
-     ```bash
-     git worktree prune
-     rm -rf .worklog/worktrees/<worktree-name>
-     ```
+6. **Update the operator** — Provide a concise summary with relevant links (id, commits, PRs). Do not suggest next steps.
+7. **Repeat** — Return to step 4.
+8. **End session** — When no descendants remain, inform operator, summarize remaining tasks, clean up worktrees. See [skill/cleanup/SKILL.md](skill/cleanup/SKILL.md).
 
-     See the [[concepts/git-worktree-best-practices-for-agent-workflows]]
-     wiki page for the full worktree lifecycle.
-   - Thank the operator and end the session.
-   <!-- WORKFLOW: end -->
+> **Push policy:** Push only to `dev` — never to `main`. The release process ([skill/ship/SKILL.md](skill/ship/SKILL.md) / `skill/ship/scripts/release/merge-dev-to-main.sh`) promotes `dev` to `main`. See also [docs/dev/release-process.md](docs/dev/release-process.md).
+
+> **Do NOT close the work-item at this stage.** Work-items are closed only after the `dev`→`main` release is complete. When a human operator says "close a work item", they mean update the stage to `in_review` or mark as `completed` — NOT initiate a release. Agents may perform the release by invoking the Ship skill, or a Release Manager may do it manually. Agents SHOULD NOT push directly to `main` unless explicitly authorized.
+
+<!-- WORKFLOW: end -->
 
 ## work-item Tracking with Worklog (wl)
 
@@ -141,247 +57,179 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 
 ## CRITICAL RULES
 
-- Use Worklog (wl), described below, for ALL task tracking, do NOT use markdown TODOs, task lists, or other tracking methods
-- *NEVER* write directly to `.worklog/worklog-data.jsonl` unless you are given permission to do so by a Producer, and you have confirmed the correct format and structure of the data to be added. Use `wl` commands to interact with the worklog data. All manipulation of work items must be done through `wl` commands to ensure data integrity and consistency.
-- A child work-item may be closed independently; however, a parent work-item can only be closed once all of its child work-items are closed, all blocking dependencies are resolved, and a Producer has reviewed and approved the work
-- Always ensure that work-items are kept up to date and accurately reflect the current state of the work. This includes updating descriptions, acceptance criteria, stages, and comments as needed throughout the lifecycle of the work.
-- Always ensure that any work-item created is associated with a clear goal and context, preferably in the form of a user story, along with measurable and testable acceptance criteria. If the requirements are not clear, seek clarification and update the work-item accordingly before proceeding with implementation.
-- When writing content for work-item descriptions, comments, or commit messages, do not escape special character EXCEPT backticks. Use markdown formatting as needed for clarity and readability, but do not add unnecessary escaping that could reduce readability or cause confusion.
-- Never commit changes without associating them with a work item
-- Never commit changes without ensuring the build completes without errors and all tests and quality checks pass
-- Always follow the build → test → commit order: first build the project and verify no errors, then run all tests and verify they pass, and only then commit changes. Never reverse this order or skip steps.
-- Before reporting coding work as done (for example marking a work-item ready for review or closing it locally), agents MUST rebuild the application and run the full test suite locally, confirming the build completes successfully and there are no failing tests or runtime errors.
-- Always record the commit message and hash of any commits made in a comment on the relevant work item(s)
-- Whenever a comment is made add a comment to impacted the work item(s) describing the changes, the files affected, and including the commit hash.
-- If push fails, resolve and retry until it succeeds
-- When using backticks in arguments to shell commands, ALWAYS escape them properly to avoid errors
-- Do not escape content in the commit comments, PR body, or work-item description or comment body; use markdown formatting as needed for clarity and readability.
-- Never close an work item without ensuring all acceptance criteria are met, all child items are closed, all blockers resolved, and a Producer has reviewed and approved the work and any associated PRs have been merged.
-- Whenever displaying a work-item ID in any output (report, comment, summary, commit message, status update, etc.), always include the item title alongside the ID using the format `Title Text (ID)`. For example: `Per-project isolation for .env and scheduler_store.json with global installs (SA-0MLU57S7D1KX8CU7)`. This ensures every reference to a work item is self-describing and immediately understandable without requiring the reader to look up the ID.
+- Use wl for ALL task tracking — never markdown TODOs, task lists, or other methods.
+- Never write directly to `.worklog/worklog-data.jsonl`. Use `wl` commands to interact with worklog data to ensure data integrity and consistency.
+- A child work-item may be closed independently; a parent work-item can only be closed once all children are closed, all blockers resolved, and a Producer has reviewed and approved.
+- Keep work-items up to date — update descriptions, ACs, stages, and comments throughout the lifecycle.
+- Every work-item must have a clear goal (preferably a user story) with measurable, testable ACs. Seek clarification if unclear.
+- When writing content for work-items, do not escape special characters EXCEPT backticks. Use markdown formatting as needed. Do not add unnecessary escaping.
+- Never commit changes without associating them with a work item.
+- Never commit without ensuring the build completes without errors and all tests pass.
+- Always follow build → test → commit order. Never reverse or skip steps.
+- Before reporting work as done, rebuild and run the full test suite. Confirm the build succeeds and no tests fail.
+- Always record the commit message and hash in a comment on the relevant work item(s).
+- When making comments, include the changes made, files affected, and the commit hash.
+- If push fails, resolve and retry until it succeeds.
+- When using backticks in shell command arguments, ALWAYS escape them properly.
+- Never close a work item without ensuring all ACs are met, all children closed, all blockers resolved, and a Producer has reviewed/approved.
+- When displaying a work-item ID in any output, always include the item title alongside the ID using the format `Title Text (ID)` (e.g., `Per-project isolation for .env and scheduler_store.json with global installs (SA-0MLU57S7D1KX8CU7)`). This ensures every reference is self-describing.
 
 ## Important Rules
 
-- Use wl as a primary source of truth, only the source code is more authoritative
-- Always use `--json` flag for programmatic use
-- When new work items are discovered or prompted while working on an existing item create a new work item with `wl create`
-  - If the item must be completed before the current work item can be completed add it as a child of the current item (`wl create --parent <current-work-item-id>`)
-  - If the item is related to the current work item but not blocking its completion add a reference to the current item in the description (`discovered-from:<current-work-item-id>`)
-- Check `wl next` before asking "what should I work on?" and always offer the response as a next steps suggestion, with an explanation
-- Run `wl --help` and `wl <cmd> --help` to learn about the capabilities of WorkLog (wl) and discover available flags
-- Use work items to track all significant work, including bugs, features, tasks, epics, chores
-- Use clear, concise titles and detailed descriptions for all work items
-- Use parent/child relationships to track dependencies and subtasks
-- Use priorities to indicate the importance of work items
-- Use stages to track workflow progress
-- Do NOT clutter repo root with planning documents
+- Use wl as the primary source of truth; only source code is more authoritative.
+- Always use `--json` for programmatic use of wl commands.
+- When new work items are discovered during work, create them with `wl create`:
+  - If it must be completed before the current item, add as child (`wl create --parent <current-id>`)
+  - If related but not blocking, add `discovered-from:<current-id>` in the description
+- Check `wl next` before asking "what should I work on?" and offer the result as a suggestion with explanation.
+- Run `wl --help` and `wl <cmd> --help` to discover available wl flags and capabilities.
+- Use work items for all significant work: bugs, features, tasks, epics, chores.
+- Use clear, concise titles and detailed descriptions.
+- Use parent/child relationships for dependencies and subtasks.
+- Use priorities to indicate importance.
+- Use stages to track workflow progress.
+- Do NOT clutter repo root with planning documents.
 
 ## Stage vs Status distinction
 
 Work items have two lifecycle axes that agents must manage independently:
 
-- **`status`** tracks the work-item lifecycle (open, in-progress, completed).
-  Only set `status` to `completed` when the work-item is formally closed
-  (post-release).
-- **`stage`** tracks workflow progress (idea, intake_complete, plan_complete,
-  in_progress, in_review). Advance `stage` to `in_review` as soon as
-  implementation is ready for human review. When advancing to `in_review`,
-  set `status` to `completed` to leave the work item in a consistent
-  `completed/in_review` state ready for the release process.
-- **Epics/parent items:** Once all children are in a terminal stage
-  (`in_review` or `completed`), advance the parent work-item's `stage`
-  to `in_review`. The parent's `status` should remain `in-progress`
-  until the formal post-release closure.
+- **`status`** tracks the work-item lifecycle (open, in-progress, completed). Only set `status` to `completed` when the work-item is formally closed (post-release).
+- **`stage`** tracks workflow progress (idea, intake_complete, plan_complete, in_progress, in_review). Advance `stage` to `in_review` as soon as implementation is ready for human review. When advancing to `in_review`, set `status` to `completed` to leave the work item in a consistent `completed/in_review` state.
+- **Epics/parent items:** Once all children are in a terminal stage (`in_review` or `completed`), advance the parent's `stage` to `in_review`. The parent's `status` should remain `in-progress` until formal post-release closure.
 
 ## work-item Types
 
-Track work-item types with `--issue-type`:
+Track with `--issue-type`:
 
-- bug - Something broken
-- feature - New functionality
-- task - Work item (tests, docs, refactoring)
-- epic - Large feature with subtasks
-- chore - Maintenance (dependencies, tooling)
+- bug — Something broken
+- feature — New functionality
+- task — Work item (tests, docs, refactoring)
+- epic — Large feature with subtasks
+- chore — Maintenance (dependencies, tooling)
 
 ## Work Item Descriptions
 
 - Use clear, concise titles summarizing the work item.
-- Do not escape special characters
-- The description must provide sufficient context for understanding and implementing the work item.
-- All work‑item descriptions **must be written in Markdown** and any comments generated by agents or commands must also use Markdown formatting.
+- Do not escape special characters.
+- The description must provide sufficient context for understanding and implementing.
+- All descriptions **must be written in Markdown**; comments must also use Markdown formatting.
 - At a minimum include:
-  - A summary of the problem or feature.
-  - Example User Stories if applicable.
-  - Expected behaviour and outcomes.
-  - Steps to reproduce (for bugs).
-  - Suggested implementation approach if relevant.
-  - Links to related work items or documentation.
-  - Measurable and testable acceptance criteria.
+  - A summary of the problem or feature
+  - Example User Stories if applicable
+  - Expected behaviour and outcomes
+  - Steps to reproduce (for bugs)
+  - Suggested implementation approach if relevant
+  - Links to related work items or documentation
+  - Measurable and testable acceptance criteria
 
 ## Priorities
 
-Worklog uses named priorities:
-
-- critical - Security, data loss, broken builds
-- high - Major features, important bugs
-- medium - Default, nice-to-have
-- low - Polish, optimization
+- critical — Security, data loss, broken builds
+- high — Major features, important bugs
+- medium — Default, nice-to-have
+- low — Polish, optimization
 
 ## Dependencies
 
 Use parent/child relationships to track blocking dependencies.
 
 - Child items must be completed before the parent can be closed.
-- If a work item blocks another, make it a child of the blocked item.
-- If a work item blocks multiple items, create the parent/child relationships with the highest priority item as the parent unless one of the items is in_progress, in which case that item should be the parent.
-  - If in doubt raise for product manager review.
+- If an item blocks another, make it a child of the blocked item.
+- If an item blocks multiple items, create the parent/child relationships with the highest priority item as the parent unless one is in_progress (that item becomes the parent). If in doubt, raise for product manager review.
 
-Other types of dependencies can be tracked in descriptions, for example `discovered-from:<work-item-id>`, `related-to:<work-item-id>`, `blocked-by:<work-item-id>`.
-
-Worklog does not enforce these relationships but they can be used for planning and tracking.
+Other dependency types can be tracked in descriptions: `discovered-from:<id>`, `related-to:<id>`, `blocked-by:<id>`. Worklog does not enforce these but they help with planning.
 
 ## Workflow management
 
-- Use the `--stage` flag to track workflow stages according to your particular process,
-  - e.g. `idea`, `intake_complete`, `plan_complete`, `in_progress`, `done`.
-- Use the `--assignee` flag to assign work items to agents.
-- Use the `--tags` flag to add arbitrary tags for filtering and organization. Though avoid over-tagging.
+- Use `--stage` to track workflow stages (e.g., idea, intake_complete, plan_complete, in_progress, done).
+- Use `--assignee` to assign items to agents.
+- Use `--tags` for filtering and organization (avoid over-tagging).
 - Use comments to document progress, decisions, and context.
-- Use `risk` and `effort` fields to track complexity and potential issues.
-  - If available use the `effort_and_risk` agent skill to estimate these values.
+- Use `risk` and `effort` fields for complexity tracking. If available, use the `effort_and_risk` agent skill to estimate.
 
 ## Test-failure triage policy
 
-- When an agent discovers a failing test that appears to be outside its ownership/scope, it should call the triage helper `skills/triage/scripts/check_or_create.py` with structured evidence (test name, stdout excerpt, optional stack trace/commit/CI URL).
-- Any incomplete (open or in_progress) work item tagged `test-failure` that matches the failing test name in title or body should be considered a match and will be linked/updated. If no match exists the helper will create a `critical` work item using the repository template `skills/triage/resources/test-failure-template.md`.
-- **Extension (SA-0MQ7WR2MT004U82N):** When test failures are detected during the implement workflow:
-  1. The triage helper is invoked with `parent_work_item_id` to create a **blocking child work item**.
-  2. The child work item is implemented using `implement-single` to fix the failure.
-  3. The agent commits the fix and re-runs tests before marking the parent as `in_review`.
-  4. **All tests must pass** before a work item reaches `in_review` status — including pre-existing failures.
-- Agents may continue to use `gh` or other tooling directly; this policy is enforced by agent workflow conventions and the implement skill.
+When an agent discovers a failing test outside its ownership/scope, call the triage helper script:
 
-**Test-failure fix workflow (automated via Ralph):**
+```bash
+python3 skill/triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<current-id>"}'
+```
 
-- When `ralph run` completes successfully and tests are run, any failing tests trigger:
-  - Creation of a child work item via triage helper (with `parent_work_item_id`)
-  - Implementation of the fix using `implement-single`
-  - Re-checking tests until all pass
-  - Only then marking the parent as `in_review`
-
-1. Check ready work: `wl next`
-2. Claim your task: `wl update <id> --status in_progress`
-3. Work on it: implement, test, document
-4. Discover new work? Create a linked issue:
-
-- `wl create "Found bug" --priority high --tags "discovered-from:<parent-id>"`
-
-1. Complete: `wl close <id> --reason "PR #123 merged"`
-2. Sync: run `wl sync` before ending the session
+- Any incomplete work item tagged `test-failure` matching the test name is linked/updated.
+- If no match exists, a `critical` work item is created using the template at `skill/triage/resources/test-failure-template.md`.
+- The child is then implemented via `implement-single`, fixed, committed, and tests re-run.
+- **All tests must pass** before a work item reaches `in_review` — including pre-existing failures.
 
 ## Work-Item Management
 
+Use `wl --help` and `wl <cmd> --help` for full documentation. Common operations:
+
 ```bash
 # Create work items
-wl create --help  # Show help for creating work items
 wl create --title "Bug title" --description "<details>" --priority high --issue-type bug --json
-wl create --title "Feature title" --description "<details>" --priority medium --issue-type feature --json
-wl create --title "Epic title" --description "<details>" --priority high --issue-type epic --json
 wl create --title "Subtask" --parent <parent-id> --priority medium --json
-wl create --title "Found bug" --priority high --tags "discovered-from:WL-123" --json
 
-# Update work items
-wl update --help  # Show help for updating work items
-wl update <work-item-id> --status in_progress --json
-wl update <work-item-id> --priority high --json
+# Update
+wl update <id> --status in_progress --json
+wl update <id> --priority high --json
 
 # Comments
-wl comment --help  # Show help for comment commands
-wl comment list <work-item-id> --json
-wl comment show <work-item-id>-C1 --json
-wl comment update <work-item-id>-C1 --comment "Revised" --json
-wl comment delete <work-item-id>-C1 --json
+wl comment list <id> --json
+wl comment add <id> --comment "<text>" --author "<name>" --json
 
-# Close or delete
-# wl close: provide -r reason for closing; can close multiple ids
-wl close <work-item-id> --reason "PR #123 merged" --json
-wl close <work-item-id-1> <work-item-id-2> --json
-
-# *Destructive command ask for confirmation before running* Dekete a work item permanently
-wl delete <work-item-id> --json
+# Close
+wl close <id> --reason "PR #123 merged" --json
 
 # Dependencies
-wl dep --help  # Show help for dependency commands
-wl dep add <dependent-work-item-id> <prereq-work-item-id>
-wl dep list <work-item-id> --json
-wl dep remove <dependent-work-item-id> <prereq-work-item-id>
+wl dep add <dependent-id> <prereq-id>
 ```
 
 ## Project Status
 
 ```bash
-# Show the next ready work items (JSON output)
-# Display a recommendation for the next item to work on in JSON
+# Next ready work item (recommendation)
 wl next --json
-# Display a recommendation for the next item assigned to `agent-name` to work on
-wl next --assignee "<agent-name>" --json
-# Display a recommendation for the next item to work on that matches a keyword (in title/description/comments)
-wl next --search "keyword" --json
 
-# Show all items with status `in_progress` in JSON
+# In progress items
 wl in_progress --json
-# Show in_progress items assigned to `agent-name`
-wl in_progress --assignee "<agent-name>" --json
+wl in_progress --assignee "<agent>" --json
 
-# Show recently created or updated work items
+# Recently created or updated
 wl recent --json
-# Show the 10 most recently created or updated items
-wl recent --number 10 --json
-# Include child/subtask items when showing recent items
-wl recent --children --json
+wl recent --number 10 --children --json
 
-# List all work items except those in a completed state
+# List items (default excludes completed)
 wl list --json
-# Limit list output
-wl list -n 5 --json
-# List items filtered by status (open, in_progress, closed, etc.)
 wl list --status open --json
-# List items filtered by priority (critical, high, medium, low)
 wl list --priority high --json
-# List items filtered by comma-separated tags
 wl list --tags "frontend,bug" --json
-# List items filtered by assignee (short or full name)
-wl list --assignee "<assignee-name>" --json
-# List items filtered by stage (e.g. triage, review, done)
+wl list --assignee "<name>" --json
 wl list --stage review --json
 
-# Full-text search across all work items (title, description, comments, tags)
+# Search
 wl search <keywords> --json
-# Search with status filter
 wl search <keywords> --status open --json
 
-# Show full details for a specific work item
-wl show <work-item-id> --format full --json
+# Show details
+wl show <id> --format full --json
 ```
 
 ### Team
 
 ```bash
- # Sync local worklog data with the remote (shares changes)
- wl sync
- # Import issues from GitHub into the worklog (GitHub -> worklog)
- wl github import
- # Push worklog changes to GitHub issues (worklog -> GitHub)
- wl github push
+wl sync                          # Sync local data with remote
+wl github import                 # Import issues from GitHub into worklog
+wl github push                   # Push worklog changes to GitHub issues
 ```
 
 ### Plugins
 
-Depending on your setup, you may have additional wl plugins installed. Check available plugins with `wl --help` (See plugins section) to view more information about the features provided by each plugin run `wl <plugin-command> --help`
+Check available plugins with `wl --help` (See plugins section). For plugin features run `wl <plugin-command> --help`.
 
 ### Help
 
-Run `wl --help` to see general help text and available commands.
-Run `wl <command> --help` to see help text and all available flags for any command.
+Run `wl --help` for general help and available commands. Run `wl <command> --help` for help on any specific command.
 
 ## Coding Disciplines
 
