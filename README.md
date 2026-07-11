@@ -314,9 +314,14 @@ bash scripts/release/merge-dev-to-main.sh [--work-item-id <id>]
 bash scripts/release/merge-dev-to-main.sh --force [--work-item-id <id>]
 ```
 
-The script enforces a **hard gate** on the `dev-full-suite` CI job — it will
-abort if CI is not green. Use `--force` to bypass in exceptional circumstances.
-After the gate passes, the script merges `dev` into `main`, pushes the result,
+The script enforces **two hard gates** before executing the release:
+
+1. **`dev-full-suite` CI gate** — aborts if CI is not green (use `--force` to
+   bypass in exceptional circumstances).
+2. **Audit readiness gate** — checks all `in_review` / `completed` work items
+   for passing audits (exit code 6; use `--skip-checks` to bypass).
+
+After both gates pass, the script merges `dev` into `main`, pushes the result,
 and records an audit comment in the worklog.
 
 ## Getting started
