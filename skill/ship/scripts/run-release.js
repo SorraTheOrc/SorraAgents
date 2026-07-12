@@ -11,7 +11,7 @@ import { spawnSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
-import { checkAuditReadyToClose } from './check-audit-gate.js';
+import { checkAuditReadyToClose, getCandidateItems } from './check-audit-gate.js';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -34,6 +34,89 @@ export function parsePRUrl(output) {
   if (!output) return null;
   const match = output.match(/https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/);
   return match ? match[0] : null;
+}
+
+// ── closeWorkItemsAfterRelease ──────────────────────────────────────────────
+
+/**
+ * Close all candidate work items after a successful release.
+ *
+ * Uses `getCandidateItems()` from check-audit-gate.js to find items in
+ * `in_review` stage or `completed` status (excluding `stage: done`). For
+ * each candidate item, runs `wl close <id> --reason "Shipped in v<version>"`.
+ *
+ * This is a non-blocking step: individual close failures are logged as
+ * warnings and do not affect the return value. Empty candidate sets
+ * are handled gracefully.
+ *
+ * @param {string|null} version - The released semver version (e.g., "0.2.0").
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number }}
+ */
+export function closeWorkItemsAfterRelease(version) {
+  if (!version) {
+    return {
+      success: false,
+      message: 'No version provided; skipping close work items step.',
+      closedCount: 0,
+      errorCount: 0,
+    };
+  }
+
+  console.log('\nClosing work items shipped in this release...');
+
+  const items = getCandidateItems();
+
+  if (items.length === 0) {
+    const message = 'No work items to close — no in_review or completed items found.';
+    console.log(message);
+    return {
+      success: true,
+      message,
+      closedCount: 0,
+      errorCount: 0,
+    };
+  }
+
+  console.log(`Found ${items.length} work item(s) to close.`);
+
+  let closedCount = 0;
+  let errorCount = 0;
+  const errors = [];
+
+  for (const item of items) {
+    try {
+      const reason = `Shipped in v${version}`;
+      execSync(`wl close ${item.id} --reason "${reason}" --json`, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      console.log(`  ✓ ${item.title || item.id} — closed with reason: "${reason}"`);
+      closedCount++;
+    } catch (err) {
+      const errorMsg = err.stderr?.toString()?.trim() || err.message;
+      console.warn(`  ⚠ Failed to close ${item.id} (${item.title}): ${errorMsg}`);
+      errors.push({ id: item.id, title: item.title, error: errorMsg });
+      errorCount++;
+    }
+  }
+
+  let summary;
+  if (errorCount === 0) {
+    summary = `All ${closedCount} work item(s) closed successfully.`;
+  } else {
+    summary = `Closed ${closedCount} work item(s); ${errorCount} error(s) (non-fatal).`;
+  }
+
+  console.log(`\n${summary}`);
+
+  return {
+    success: errorCount === 0,
+    message: errors.length > 0
+      ? `${summary}\nErrors: ${errors.map(e => `${e.id}: ${e.error}`).join('; ')}`
+      : summary,
+    closedCount,
+    errorCount,
+  };
 }
 
 // ── syncDevWithMain ──────────────────────────────────────────────────────────
@@ -172,6 +255,7 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * 4. Parse PR URL from release script output
  * 5. Wait for PR merge (if not already merged with --force)
  * 6. Sync dev with main
+ * 7. Close work items shipped in this release (non-blocking)
  *
  * @param {string[]} [cliArgs=[]] - Command-line arguments.
  * @returns {number} Exit code (0 = success).
@@ -284,6 +368,36 @@ export async function runRelease(cliArgs = []) {
   if (!syncResult.success) {
     console.error(`\n⚠️  ${syncResult.message}`);
     return 5;
+  }
+
+  // ── Step 7: Close work items shipped in this release (non-blocking) ────
+  // Read the released version from the git tag created by the release script
+  let version = null;
+  try {
+    version = execSync('git describe --tags --abbrev=0', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim().replace(/^v/, '');
+  } catch {
+    // Fallback: read from package.json
+    try {
+      const pkg = JSON.parse(
+        execSync('cat package.json', {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+        })
+      );
+      version = pkg.version;
+    } catch {
+      console.warn('⚠ Unable to determine released version. Skipping close work items step.');
+    }
+  }
+
+  if (version) {
+    const closeResult = closeWorkItemsAfterRelease(version);
+    if (!closeResult.success && closeResult.errorCount > 0) {
+      console.warn(`\n⚠ Non-critical: ${closeResult.message}`);
+    }
   }
 
   return 0;

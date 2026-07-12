@@ -181,19 +181,25 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
 
 1. Verify `main` is green — confirm the `ci` workflow passes on the merge
    commit.
-2. Version numbering, tagging, and tag pushing are **now automated** as part
+2. **Work items are automatically closed** — After a successful release via
+   `run-release.js`, all work items that passed the audit readiness gate
+   (items in `in_review` stage or `completed` status, excluding `stage: done`)
+   are closed with the reason `"Shipped in v<version>"`. This is a
+   non-blocking step — individual close failures are logged as warnings but
+   do not affect the release outcome.
+3. Version numbering, tagging, and tag pushing are **now automated** as part
    of the merge script (`merge-dev-to-main.sh`). Before merging, the script:
    - Increments the version in `package.json` (default: patch bump).
    - Commits the version change.
    - Creates an annotated git tag `v<new-version>` on the merge commit.
    - Pushes the tag to `origin`.
-3. Customize the bump type with the `--bump` flag:
+4. Customize the bump type with the `--bump` flag:
 
    ```bash
    bash scripts/release/merge-dev-to-main.sh --bump minor
    ```
 
-4. Update any downstream consumers or deployment targets.
+5. Update any downstream consumers or deployment targets.
 
 > **Note:** If you need to see the current version, run:
 >

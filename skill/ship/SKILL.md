@@ -352,6 +352,27 @@ The script performs the following steps:
    checkout. After pushing from a worktree, agents should clean up the
    worktree and return to the main checkout.
 
+9. **Close work items (non-blocking)**: After syncing `dev` with `main`, the
+   script closes all work items that were validated by the audit readiness
+   gate (Step 2). It reads the released version from the git tag (created by
+   `merge-dev-to-main.sh`) or falls back to `package.json`, then runs
+   `wl close <id> --reason "Shipped in v<version>" --json` for each
+   candidate item.
+
+   This step is **non-blocking** — if closing an individual item fails (e.g.,
+   permission issue), the error is logged as a warning and the script
+   continues with the remaining items. The release exit code is not affected
+   by close failures. Empty candidate sets (no items to close) are handled
+   gracefully.
+
+   The close step is performed by `closeWorkItemsAfterRelease(version)`
+   which:
+   - Calls `getCandidateItems()` from `check-audit-gate.js` to get items in
+     `in_review` stage or `completed` status (excluding `stage: done`).
+   - Iterates over each item and runs `wl close` with the shipped version.
+   - Logs successes and warnings.
+   - Returns a structured result `{ success, message, closedCount, errorCount }`.
+
 ### Fallback: Human Release Manager
 
 For repositories where the automated merge is not suitable, a **human Release Manager** can perform the release
