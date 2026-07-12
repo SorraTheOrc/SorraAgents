@@ -413,6 +413,71 @@ class TestPlaybackFallback:
 
 
 # ===================================================================
+# Stream mode tests
+# ===================================================================
+
+
+class TestStreamMode:
+    """--stream flag writes raw audio to stdout, no file ops."""
+
+    def test_stream_outputs_audio_to_stdout(self, mock_env, tmp_path):
+        """--stream sends raw audio to stdout."""
+        log_file = tmp_path / "mock.log"
+        log_file.write_text("")
+
+        result = subprocess.run(
+            ["bash", str(SCRIPT_PATH), "--stream", "Hello stream"],
+            capture_output=True, text=True, env=mock_env,
+        )
+
+        assert result.returncode == 0, (
+            f"--stream should exit 0, got {result.returncode}: stderr={result.stderr}"
+        )
+        # stdout should contain the mock audio content from mock curl
+        assert "mock-wav-content" in result.stdout, (
+            f"stdout should contain audio content, got: {result.stdout[:200]}"
+        )
+
+    def test_stream_does_not_create_speak_dir(self, mock_env, tmp_path):
+        """--stream does not create .pi/speak/ directory."""
+        result = subprocess.run(
+            ["bash", str(SCRIPT_PATH), "--stream", "No file"],
+            capture_output=True, text=True, env=mock_env,
+        )
+        speak_dir = tmp_path / ".pi" / "speak"
+        assert not speak_dir.exists(), (
+            "--stream should not create .pi/speak/ directory"
+        )
+
+    def test_stream_no_args_shows_error(self, mock_env):
+        """--stream without text argument prints error."""
+        result = subprocess.run(
+            ["bash", str(SCRIPT_PATH), "--stream"],
+            capture_output=True, text=True, env=mock_env,
+        )
+        assert result.returncode != 0, (
+            "--stream without text should exit non-zero"
+        )
+        output = result.stdout + result.stderr
+        assert "Error" in output, (
+            "--stream without text should show error"
+        )
+
+    def test_stream_still_uses_correct_endpoint(self, mock_env, tmp_path):
+        """--stream still calls the correct TTS API endpoint."""
+        log_file = tmp_path / "mock.log"
+        log_file.write_text("")
+        subprocess.run(
+            ["bash", str(SCRIPT_PATH), "--stream", "Check API"],
+            capture_output=True, text=True, env=mock_env,
+        )
+        log_content = log_file.read_text()
+        assert "100.79.231.101" in log_content, (
+            f"Expected API endpoint in curl args, got: {log_content}"
+        )
+
+
+# ===================================================================
 # AC7: Documentation exists
 # ===================================================================
 

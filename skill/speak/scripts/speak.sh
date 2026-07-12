@@ -8,6 +8,7 @@
 #
 # Usage:
 #   ./skill/speak/scripts/speak.sh "Text to speak"
+#   ./skill/speak/scripts/speak.sh --stream "Text to speak"
 #   ./skill/speak/scripts/speak.sh --help
 #
 # Dependencies:
@@ -50,15 +51,18 @@ SPEAK_DIR="${SPEAK_DIR:-$REPO_ROOT/.pi/speak}"
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") <text>
+Usage: $(basename "$0") [options] <text>
 
 Convert text to speech using the TTS API and play the resulting audio.
+Pipe to aplay on a remote client: ssh host "$(basename "$0") --stream ..." | aplay
 
 Arguments:
   text    Text string to be spoken (enclose in quotes for multi-word phrases)
 
 Options:
-  --help  Show this help message and exit
+  --stream  Write raw audio to stdout instead of saving to file.
+            Useful for piping over SSH to a remote audio player.
+  --help    Show this help message and exit
 
 Environment variables:
   SPEAK_DIR    Override the output directory (default: <repo-root>/.pi/speak/)
@@ -67,6 +71,8 @@ Environment variables:
 Examples:
   $(basename "$0") "Hello, world!"
   $(basename "$0") 'The TTS system is now working.'
+  $(basename "$0") --stream "Hello" | aplay
+  ssh user@host "cd /project && ./skill/speak/scripts/speak.sh --stream 'hi'" | aplay
   TTS_API_URL="http://localhost:8000/v1/audio/speech" $(basename "$0") "Test"
 EOF
 }
@@ -74,6 +80,8 @@ EOF
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
+
+STREAM_MODE=false
 
 if [[ $# -eq 0 ]]; then
     echo "Error: No text argument provided." >&2
@@ -86,30 +94,84 @@ if [[ "$1" == "--help" ]]; then
     exit 0
 fi
 
+if [[ "$1" == "--stream" ]]; then
+    STREAM_MODE=true
+    shift
+fi
+
+if [[ $# -eq 0 ]]; then
+    echo "Error: No text argument provided." >&2
+    usage >&2
+    exit 1
+fi
+
 TEXT="$1"
 
+# Build JSON payload (OpenAI-compatible audio/speech format)
+# (needed before any curl call, so hoisted here)
+JSON_PAYLOAD=$(cat <<EOF
+{
+  "model": "tts-1",
+  "input": $(echo "$TEXT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))"),
+  "voice": "alloy"
+}
+EOF
+)
+
 # ---------------------------------------------------------------------------
-# Ensure speak directory exists
+# Stream mode: write raw audio to stdout, no file ops
 # ---------------------------------------------------------------------------
 
+if $STREAM_MODE; then
+    echo "Generating speech for: $TEXT" >&2
+    echo "Calling TTS API: $TTS_API_URL" >&2
+
+    set +e
+    # Write body to a temp file so we can verify HTTP status before emitting
+    TMP_FILE="$(mktemp)"
+    HTTP_STATUS=$(curl -s -w "%{http_code}" -X POST "$TTS_API_URL" \
+        -H "Content-Type: application/json" \
+        -d "$JSON_PAYLOAD" \
+        --max-time "$CURL_TIMEOUT" \
+        -o "$TMP_FILE" 2>/dev/null)
+    CURL_EXIT=$?
+    set -e
+
+    if [[ $CURL_EXIT -ne 0 ]]; then
+        echo "Error: curl failed (exit code $CURL_EXIT)" >&2
+        rm -f "$TMP_FILE"
+        exit 1
+    fi
+
+    if [[ -z "$HTTP_STATUS" || "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
+        echo "Error: TTS API returned HTTP $HTTP_STATUS" >&2
+        rm -f "$TMP_FILE"
+        exit 1
+    fi
+
+    # Output raw audio to stdout (for piping over SSH, etc.)
+    BYTES=$(stat -c%s "$TMP_FILE" 2>/dev/null || echo "unknown")
+    cat "$TMP_FILE"
+    rm -f "$TMP_FILE"
+    echo "Streamed $BYTES bytes" >&2
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Save-to-file mode: rotate buffer, save, play
+# ---------------------------------------------------------------------------
+
+# Ensure speak directory exists
 mkdir -p "$SPEAK_DIR"
 
-# ---------------------------------------------------------------------------
 # Rotate rolling buffer (max 5 files)
-# ---------------------------------------------------------------------------
-# The buffer supports: speech.wav (newest), speech.1.wav, ..., speech.4.wav (oldest)
-# Rotation: speech.3.wav → speech.4.wav, speech.2.wav → speech.3.wav,
-#           speech.1.wav → speech.2.wav, speech.wav → speech.1.wav
-
 _rotate_buffer() {
     local dir="$1"
 
-    # Remove oldest file if it exists (speech.4.wav)
     if [[ -f "$dir/speech.4.wav" ]]; then
         rm -f "$dir/speech.4.wav"
     fi
 
-    # Shift files up: 3→4, 2→3, 1→2, wav→1 (in reverse order to avoid overwrites)
     if [[ -f "$dir/speech.3.wav" ]]; then
         mv "$dir/speech.3.wav" "$dir/speech.4.wav"
     fi
@@ -126,27 +188,11 @@ _rotate_buffer() {
 
 _rotate_buffer "$SPEAK_DIR"
 
-# ---------------------------------------------------------------------------
-# Generate speech via TTS API
-# ---------------------------------------------------------------------------
-
 OUTPUT_FILE="$SPEAK_DIR/speech.wav"
 
 echo "Generating speech for: $TEXT" >&2
 echo "Calling TTS API: $TTS_API_URL" >&2
 
-# Build JSON payload (OpenAI-compatible audio/speech format)
-JSON_PAYLOAD=$(cat <<EOF
-{
-  "model": "tts-1",
-  "input": $(echo "$TEXT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))"),
-  "voice": "alloy"
-}
-EOF
-)
-
-# Use curl to call the TTS API
-# Temporarily disable set -e for the curl call to handle failures gracefully
 set +e
 HTTP_STATUS=$(curl -s -w "%{http_code}" -X POST "$TTS_API_URL" \
     -H "Content-Type: application/json" \
@@ -162,19 +208,15 @@ if [[ $CURL_EXIT -ne 0 ]]; then
     exit 1
 fi
 
-# Check HTTP status
 if [[ -z "$HTTP_STATUS" || "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
     echo "Error: TTS API returned HTTP $HTTP_STATUS" >&2
-    # Remove empty output file if request failed
     rm -f "$OUTPUT_FILE"
     exit 1
 fi
 
 echo "Speech generated: $OUTPUT_FILE ($(stat -c%s "$OUTPUT_FILE" 2>/dev/null || echo "unknown") bytes)" >&2
 
-# ---------------------------------------------------------------------------
-# Playback
-# ---------------------------------------------------------------------------
+# Playback (non-fatal)
 # Try pw-play first (PipeWire), fall back to aplay (ALSA)
 
 # Playback (non-fatal — WAV file is still generated even if playback fails)

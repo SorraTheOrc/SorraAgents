@@ -28,6 +28,7 @@ TTS_API_URL="http://localhost:8000/v1/audio/speech" ./skill/speak/scripts/speak.
 | Argument | Description |
 |----------|-------------|
 | `text`   | Text string to be spoken (enclose in quotes for multi-word phrases) |
+| `--stream` | Write raw audio to stdout (pipe over SSH to a remote player) |
 | `--help` | Show usage instructions and exit |
 
 ## Environment Variables
@@ -91,6 +92,7 @@ A 60-second timeout is applied to the API call.
 |------|------------------------------------------------|
 | 0    | Success (WAV generated; playback may have failed) |
 | 1    | Error (missing argument, API failure, curl error) |
+| 0    | Stream mode: audio written to stdout (pipe to aplay etc.) |
 
 ## Examples
 
@@ -100,6 +102,10 @@ A 60-second timeout is applied to the API call.
 
 # Multi-word phrase
 ./skill/speak/scripts/speak.sh 'The TTS system is now working.'
+
+# Stream raw audio to stdout (pipe over SSH to local player)
+./skill/speak/scripts/speak.sh --stream "Hello" | aplay
+ssh user@host "cd /project && ./skill/speak/scripts/speak.sh --stream 'hi'" | aplay
 
 # Custom API endpoint
 TTS_API_URL="http://localhost:8000/v1/audio/speech" ./skill/speak/scripts/speak.sh "Test"
