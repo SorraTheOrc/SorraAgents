@@ -180,12 +180,21 @@ echo "Speech generated: $OUTPUT_FILE ($(stat -c%s "$OUTPUT_FILE" 2>/dev/null || 
 # Playback (non-fatal — WAV file is still generated even if playback fails)
 set +e
 _play_audio() {
+    # Termux (Android): try built-in media player first
+    if command -v termux-media-player &>/dev/null; then
+        echo "Playing via termux-media-player (Termux)..." >&2
+        termux-media-player play "$1" &>/dev/null && return 0
+        echo "Warning: termux-media-player playback failed" >&2
+    fi
+
+    # PipeWire (modern Linux desktops)
     if command -v pw-play &>/dev/null; then
         echo "Playing via pw-play..." >&2
         pw-play "$1" &>/dev/null && return 0
         echo "Warning: pw-play playback failed" >&2
     fi
 
+    # ALSA (older Linux / minimal environments)
     if command -v aplay &>/dev/null; then
         echo "Playing via aplay..." >&2
         aplay "$1" &>/dev/null && return 0

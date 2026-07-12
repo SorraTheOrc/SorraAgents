@@ -373,6 +373,44 @@ class TestPlaybackFallback:
             f"exit code: {result.returncode}, stderr: {result.stderr}"
         )
 
+    def test_termux_playback_takes_priority(self, tmp_path):
+        """Termux: termux-media-player is preferred over pw-play when available."""
+        bindir = tmp_path / "bin_termux"
+        bindir.mkdir()
+
+        # Create mock termux-media-player
+        tmux_script = bindir / "termux-media-player"
+        tmux_script.write_text(
+            "#!/bin/bash\n"
+            'echo "TERMUX_MEDIA_PLAYER:$*" >> "$MOCK_LOG"\n'
+            "exit 0\n"
+        )
+        tmux_script.chmod(0o755)
+
+        # Also provide pw-play (should NOT be called since termux-media-player is found first)
+        _make_mock_pw_play(bindir)
+        _make_mock_curl(bindir)
+
+        speak_dir = tmp_path / ".pi" / "speak"
+        mock_log = tmp_path / "mock.log"
+        mock_log.write_text("")
+        env = _env_with_bindir(bindir, speak_dir, mock_log)
+
+        subprocess.run(
+            ["bash", str(SCRIPT_PATH), "Hello termux"],
+            capture_output=True, text=True, env=env,
+        )
+
+        log_content = mock_log.read_text()
+        assert "TERMUX_MEDIA_PLAYER" in log_content, (
+            f"Expected termux-media-player to be called first, got: {log_content}"
+        )
+        # pw-play should not be called since termux-media-player succeeded
+        assert "PW_PLAY" not in log_content, (
+            f"pw-play should not be called when termux-media-player succeeds, "
+            f"got: {log_content}"
+        )
+
 
 # ===================================================================
 # AC7: Documentation exists

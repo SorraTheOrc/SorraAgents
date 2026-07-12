@@ -54,10 +54,11 @@ most 5 files are retained at any time.
 
 The script attempts playback in the following order:
 
-1. `pw-play` (PipeWire) -- preferred on modern Linux desktops
-2. `aplay` (ALSA) -- fallback for older Linux or minimal environments
-3. `powershell.exe` (WSL) -- fallback when running under WSL
-4. `cmd.exe /c start` (WSL) -- final fallback under WSL
+1. `termux-media-player` (Termux/Android) -- preferred when running under Termux
+2. `pw-play` (PipeWire) -- preferred on modern Linux desktops
+3. `aplay` (ALSA) -- fallback for older Linux or minimal environments
+4. `powershell.exe` (WSL) -- fallback when running under WSL
+5. `cmd.exe /c start` (WSL) -- final fallback under WSL
 
 Playback failure is **non-fatal**: the WAV file is still generated and saved
 even if no audio player is available or playback fails.
@@ -65,6 +66,7 @@ even if no audio player is available or playback fails.
 ## Dependencies
 
 - **curl** (required) -- for making the TTS API request
+- **termux-media-player** (optional) -- for audio playback on Termux/Android
 - **pw-play** or **aplay** (optional) -- for audio playback on Linux
 - **powershell.exe** or **cmd.exe** (optional) -- for audio playback under WSL
 
