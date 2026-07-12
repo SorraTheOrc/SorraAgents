@@ -55,3 +55,6 @@ ampa/scheduler_store.json
 
 # Ralph config with secrets
 .ralph.json
+
+# Speak skill runtime directory
+.pi/speak/
