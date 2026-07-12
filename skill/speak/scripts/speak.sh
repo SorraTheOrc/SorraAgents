@@ -7,8 +7,8 @@
 # attempts playback.
 #
 # Usage:
-#   ./scripts/speak.sh "Text to speak"
-#   ./scripts/speak.sh --help
+#   ./skill/speak/scripts/speak.sh "Text to speak"
+#   ./skill/speak/scripts/speak.sh --help
 #
 # Dependencies:
 #   - curl (required for API call)
@@ -41,7 +41,7 @@ CURL_TIMEOUT=60
 
 # Determine script directory and repository root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 SPEAK_DIR="${SPEAK_DIR:-$REPO_ROOT/.pi/speak}"
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 ---
 name: speak
-description: Generate audible speech from text using a TTS API and play it back. Invokes scripts/speak.sh to convert text to a WAV file, manages a rolling buffer of 5 recent audio files, and plays the result.
+description: Generate audible speech from text using a TTS API and play it back. Invokes skill/speak/scripts/speak.sh to convert text to a WAV file, manages a rolling buffer of 5 recent audio files, and plays the result.
 ---
 
 # Speak Skill
@@ -14,13 +14,13 @@ of 5 files, and attempt playback.
 Invoke the underlying bash script directly:
 
 ```bash
-./scripts/speak.sh "Text to convert to speech"
+./skill/speak/scripts/speak.sh "Text to convert to speech"
 ```
 
 Or set the `TTS_API_URL` environment variable to use a different endpoint:
 
 ```bash
-TTS_API_URL="http://localhost:8000/v1/audio/speech" ./scripts/speak.sh "Hello"
+TTS_API_URL="http://localhost:8000/v1/audio/speech" ./skill/speak/scripts/speak.sh "Hello"
 ```
 
 ## Arguments
@@ -94,18 +94,18 @@ A 60-second timeout is applied to the API call.
 
 ```bash
 # Basic usage
-./scripts/speak.sh "Hello, world!"
+./skill/speak/scripts/speak.sh "Hello, world!"
 
 # Multi-word phrase
-./scripts/speak.sh 'The TTS system is now working.'
+./skill/speak/scripts/speak.sh 'The TTS system is now working.'
 
 # Custom API endpoint
-TTS_API_URL="http://localhost:8000/v1/audio/speech" ./scripts/speak.sh "Test"
+TTS_API_URL="http://localhost:8000/v1/audio/speech" ./skill/speak/scripts/speak.sh "Test"
 
 # Custom output directory
-SPEAK_DIR="/tmp/my-speech" ./scripts/speak.sh "Custom output"
+SPEAK_DIR="/tmp/my-speech" ./skill/speak/scripts/speak.sh "Custom output"
 ```
 
 ## See Also
 
-- `scripts/speak.sh` -- the underlying implementation script
+- `skill/speak/scripts/speak.sh` -- the underlying implementation script

@@ -26,7 +26,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPT_PATH = REPO_ROOT / "scripts" / "speak.sh"
+SCRIPT_PATH = REPO_ROOT / "skill" / "speak" / "scripts" / "speak.sh"
 _SYSTEM_PATH = os.environ.get("PATH", "")
 
 
