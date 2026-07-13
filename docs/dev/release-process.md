@@ -63,15 +63,27 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
    - Ensure `dev` has no unresolved conflicts with `main`.
    - Run `git diff main...dev --name-only` to inspect divergent files.
 
-5. **Review outstanding worklog items**
-   - Run `wl list --status open --priority high --json` to check for any
-     critical or high-priority items that may block the release.
+5. **Critical-priority items gate — all critical items are in terminal state**
+   - The automated release script (`run-release.js`) now enforces this check
+     automatically at exit code 7. No critical-priority work items should be
+     in a non-terminal state (i.e., not `completed`/`in_review` or `completed`/`done`).
+   - Run the gate manually to check:
+     ```bash
+     node skill/ship/scripts/run-release.js --dry-run
+     ```
+   - If the gate fails, review the blocking items and either resolve them or
+     use `--skip-checks` to bypass in exceptional circumstances.
 
-6. **No open blockers**
+6. **Review outstanding worklog items**
+   - Run `wl list --status open --priority high --json` to check for any
+     high-priority items that may block the release (critical items are
+     already checked automatically by the gate above).
+
+7. **No open blockers**
    - All blocking work-items related to the release are closed.
    - No unresolved merge conflicts exist on `dev`.
 
-7. **Audit readiness gate — all `in_review` and `completed` items have passing audits**
+8. **Audit readiness gate — all `in_review` and `completed` items have passing audits**
    - The automated release script (`run-release.js`) enforces this gate at exit code 6.
    - Run the gate manually to check:
      ```bash
@@ -84,7 +96,7 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
      ```
    - Use `--skip-checks` to bypass the gate in exceptional circumstances.
 
-8. **Verify CHANGELOG.md is up to date**
+9. **Verify CHANGELOG.md is up to date**
    - The release script now generates `CHANGELOG.md` automatically from
      worklog items (completed / in_review) during the release flow.
    - Verify that the generated `CHANGELOG.md` section reflects the correct

@@ -225,13 +225,90 @@ The audit gate uses exit code 6 to distinguish from other failure modes:
 | 4 | PR merge failed |
 | 5 | Dev sync failed |
 | **6** | **Audit gate failure (items not ready to close)** |
+| **7** | **Critical-items gate failure (critical items not in terminal state)** |
+
+### Critical-Item Gating
+
+In addition to the unmerged branches check and audit readiness gate, the ship
+skill includes a **critical-priority item gate** that checks whether any
+critical-priority work items are not yet in a terminal state before a release
+is performed.
+
+A terminal state is defined as:
+- `status === 'completed'` AND (`stage === 'in_review'` OR `stage === 'done'`)
+
+Any critical-priority item that does not match this condition is considered
+**blocking** and will abort the release with exit code 7.
+
+This gate:
+
+1. Queries `wl list --priority critical --json` to fetch all critical-priority
+   work items.
+2. For each item, checks `isTerminalState(item)`: status must be `completed`
+   and stage must be `in_review` or `done`.
+3. Items not in a terminal state are flagged as **blocking**.
+4. If any blocking items are found, the release is aborted with exit code 7
+   and a structured report is printed showing each blocking item's ID, title,
+   current status, and current stage.
+5. If all critical items are in a terminal state (or no critical items exist),
+   the gate passes silently and the release proceeds.
+
+The gate respects the existing `--skip-checks` flag to bypass when explicitly
+requested.
+
+#### Using checkCriticalItems Programmatically
+
+```javascript
+import { checkCriticalItems } from './scripts/check-critical-items.js';
+
+const report = checkCriticalItems();
+
+if (report.hasBlockingItems) {
+  console.error(report.message);
+  // Example output:
+  //   ⚠️  Critical-items gate check failed — 1 of 3 critical-priority
+  //   work item(s) are not in a terminal state:
+  //
+  //   1. Critical bug in production (SA-BLOCKING-0000001)
+  //      Status: in-progress | Stage: in_progress
+  //
+  //   A terminal state requires: status=completed AND (stage=in_review OR stage=done).
+  //   To bypass this check, re-run with --skip-checks.
+}
+```
+
+The report contains:
+
+```javascript
+// report.blockingItems is an array of:
+// {
+//   workItemId: string,          // The work item ID
+//   title: string,               // The work item title
+//   currentStatus: string,        // The work item's current status
+//   currentStage: string          // The work item's current stage
+// }
+```
+
+#### Exit Code
+
+The critical-items gate uses exit code 7 to distinguish from other failure
+modes:
+
+| Code | Meaning |
+|------|---------|
+| **7** | **Critical-items gate failure (critical items not in terminal state)** |
 
 ### Gating in run-release.js
 
-The release wrapper (`run-release.js`) runs both the unmerged branches check
-(exit code 3) and the audit readiness gate (exit code 6) before executing the
-release script. If either check fails, the release is aborted. To bypass both,
-use the `--skip-checks` flag:
+The release wrapper (`run-release.js`) runs three gating checks before
+executing the release script:
+
+1. Unmerged branches check (exit code 3)
+2. Audit readiness gate (exit code 6)
+3. Critical-priority items gate (exit code 7)
+
+If any check fails, the release is aborted. To bypass all checks, use the
+`--skip-checks` flag:
 
 ```bash
 node ./scripts/run-release.js --skip-checks
@@ -320,22 +397,26 @@ The script performs the following steps:
    release is aborted with a report. Use `--skip-checks` to bypass.
 2. **Pre-flight checks**: Verifies `gh` authentication, `wl` availability,
    and a clean working tree.
-3. **CI verification**: Checks that the `dev-full-suite` workflow is green
+3. **Critical-priority items check**: Runs `checkCriticalItems()` to verify
+   no critical-priority work items are in a non-terminal state. If blocking
+   items are found, the release is aborted with exit code 7. Use `--skip-checks`
+   to bypass.
+4. **CI verification**: Checks that the `dev-full-suite` workflow is green
    on the `dev` branch via the GitHub Actions API. This is a **hard gate**
    — the script aborts if CI is not green (use `--force` to bypass in
    exceptional circumstances).
-4. **Merge commit creation**: Fetches latest `dev` and `main`, creates a
+5. **Merge commit creation**: Fetches latest `dev` and `main`, creates a
    merge commit locally (`dev` → `main` with `--no-ff`).
-5. **PR creation**: Pushes the merge commit to a temporary
+6. **PR creation**: Pushes the merge commit to a temporary
    `release/dev-to-main-<timestamp>` branch and creates a GitHub Pull
    Request targeting `main`.
-6. **Status check wait & PR merge**: Waits for required status checks to pass
+7. **Status check wait & PR merge**: Waits for required status checks to pass
    on the PR (configurable timeout, default 10 minutes), then merges the PR
    using `gh pr merge --merge --delete-branch`. When using `--force`, the PR
    is merged immediately without waiting.
-7. **Audit logging**: Records the merge commit hash, CI run IDs, PR URL,
+8. **Audit logging**: Records the merge commit hash, CI run IDs, PR URL,
    and approver identity in the worklog.
-8. **Sync dev with main**: After the release is complete, the script
+9. **Sync dev with main**: After the release is complete, the script
    automatically switches back to the `dev` branch, merges `origin/main` into
    it (fast-forward), and pushes the updated `dev` to origin. This ensures
    `dev` stays in sync with `main` after each release.
@@ -352,7 +433,7 @@ The script performs the following steps:
    checkout. After pushing from a worktree, agents should clean up the
    worktree and return to the main checkout.
 
-9. **Close work items (non-blocking)**: After syncing `dev` with `main`, the
+10. **Close work items (non-blocking)**: After syncing `dev` with `main`, the
    script closes all work items that were validated by the audit readiness
    gate (Step 2). It reads the released version from the git tag (created by
    `merge-dev-to-main.sh`) or falls back to `package.json`, then runs
@@ -394,7 +475,9 @@ The following must be verified before merging `dev` into `main`:
 1. **CI — `dev-full-suite` is green** on the current `dev` HEAD.
 2. **CI — `dev-smoke` is green** on the current `dev` HEAD.
 3. **No open merge conflicts** between `dev` and `main`.
-4. **No open critical work items** that would block the release.
+4. **No open critical work items** that would block the release. This check
+   is now **automated** by the critical-items gate in `run-release.js` (exit
+   code 7). The gate can be bypassed with `--skip-checks` if necessary.
 5. **CHANGELOG.md** is generated automatically by the release script from
    completed / in_review work items. Verify the generated section covers all
    relevant user-facing changes.

@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
 import { checkAuditReadyToClose, getCandidateItems } from './check-audit-gate.js';
+import { checkCriticalItems } from './check-critical-items.js';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -251,11 +252,12 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * Steps:
  * 1. Check for unmerged branches (gating, exit code 3)
  * 2. Check audit readiness (gating, exit code 6)
- * 3. Find and execute the release script
- * 4. Parse PR URL from release script output
- * 5. Wait for PR merge (if not already merged with --force)
- * 6. Sync dev with main
- * 7. Close work items shipped in this release (non-blocking)
+ * 3. Check critical-priority items (gating, exit code 7)
+ * 4. Find and execute the release script
+ * 5. Parse PR URL from release script output
+ * 6. Wait for PR merge (if not already merged with --force)
+ * 7. Sync dev with main
+ * 8. Close work items shipped in this release (non-blocking)
  *
  * @param {string[]} [cliArgs=[]] - Command-line arguments.
  * @returns {number} Exit code (0 = success).
@@ -292,7 +294,20 @@ export async function runRelease(cliArgs = []) {
     }
   }
 
-  // ── Step 3: Find the release script ───────────────────────────────────
+  // ── Step 3: Check critical-priority items (gating step) ────────────────
+  if (!skipChecks) {
+    const criticalReport = checkCriticalItems();
+    if (criticalReport.hasBlockingItems) {
+      console.error(
+        '⚠️  Critical-items gate check failed — some critical items are not in a terminal state:\n',
+      );
+      console.error(criticalReport.message);
+      console.error('\nTo bypass this check, re-run with --skip-checks.');
+      return 7;
+    }
+  }
+
+  // ── Step 4: Find the release script ───────────────────────────────────
   let selectedScript = null;
   if (existsSync(SKILL_RELEASE_SCRIPT)) {
     selectedScript = SKILL_RELEASE_SCRIPT;
@@ -323,7 +338,7 @@ export async function runRelease(cliArgs = []) {
     return 2;
   }
 
-  // ── Step 4: Execute the release script ─────────────────────────────────
+  // ── Step 5: Execute the release script ─────────────────────────────────
   console.log('Executing release script...\n');
 
   const child = spawnSync('bash', [selectedScript, ...args], {
@@ -350,7 +365,7 @@ export async function runRelease(cliArgs = []) {
     return 0;
   }
 
-  // ── Step 5: Post-release - wait for PR merge and sync dev ──────────────
+  // ── Step 6: Post-release - wait for PR merge and sync dev ──────────────
   const prUrl = parsePRUrl(stdout);
 
   if (prUrl && !isForce) {
@@ -363,14 +378,14 @@ export async function runRelease(cliArgs = []) {
     console.log('\nNo PR URL detected in release output. Skipping PR merge wait.');
   }
 
-  // ── Step 6: Sync dev with main ─────────────────────────────────────────
+  // ── Step 7: Sync dev with main ─────────────────────────────────────────
   const syncResult = syncDevWithMain();
   if (!syncResult.success) {
     console.error(`\n⚠️  ${syncResult.message}`);
     return 5;
   }
 
-  // ── Step 7: Close work items shipped in this release (non-blocking) ────
+  // ── Step 8: Close work items shipped in this release (non-blocking) ────
   // Read the released version from the git tag created by the release script
   let version = null;
   try {
