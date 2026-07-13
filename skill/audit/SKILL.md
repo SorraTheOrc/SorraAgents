@@ -284,7 +284,7 @@ The audit skill ships a canonical runner and a persister. Use these from CI, loc
 
 The audit runner automatically performs code quality checks alongside acceptance criteria verification. The pipeline is:
 
-1. **Code quality check** runs before AC verification (invokes `../code_review/scripts/code_quality.py`)
+1. **Code quality check** runs before AC verification (invokes `../code-review/scripts/code_quality.py`)
 2. **Language detection** scans for Python, TypeScript, Markdown, Shell, JavaScript/Node.js, and C# files
 3. **Linter probing** checks for available linters (ruff, eslint, markdownlint, shellcheck, dotnet-format)
 4. **Findings classified** by severity (critical, high, medium, low)

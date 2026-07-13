@@ -1,5 +1,2 @@
-"""skill.code_review - Automated code quality tooling.
-
-This package extends the code-review skill with automated linting,
-severity classification, and integration with the audit workflow.
-"""
+# Compatibility shim package for imports expecting `skill.code_review`
+# The canonical implementation now lives in skill/code-review/scripts/

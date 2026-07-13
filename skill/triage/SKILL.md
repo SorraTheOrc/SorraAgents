@@ -35,7 +35,7 @@ References
 
 - Templates: `./resources/test-failure-template.md`
 - Runbook: `./resources/runbook-test-failure.md`
-- Owner inference: `../owner_inference/SKILL.md`
+- Owner inference: `../owner-inference/SKILL.md`
 
 Scripts
 -------
