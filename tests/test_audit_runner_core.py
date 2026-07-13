@@ -29,6 +29,7 @@ from skill.audit.scripts.audit_runner import (
     CALL_PI_TIMEOUT,
     DEFAULT_MODEL,
     DEFAULT_MODEL_SOURCE,
+    AUDIT_FRESHNESS_BUFFER_SECONDS,
 )
 
 
@@ -146,6 +147,33 @@ class TestCLIParsing:
         parser = build_parser()
         args = parser.parse_args(["project"])
         assert args.model_source == "local"
+
+    # ------------------------------------------------------------------
+    # --force flag tests
+    # ------------------------------------------------------------------
+
+    def test_issue_force_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--force"])
+        assert args.force is True
+
+    def test_issue_force_defaults_false(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123"])
+        assert args.force is False
+
+    def test_issue_force_with_other_flags(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--force", "--do-not-persist", "--json"])
+        assert args.force is True
+        assert args.do_not_persist is True
+        assert args.json is True
+
+    def test_project_no_force_flag(self):
+        """--force should NOT be a valid flag for the project subcommand."""
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["project", "--force"])
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +634,29 @@ class TestCallPiTimeoutConstant:
             f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 900s "
             "to bound the original indefinite-hang risk"
         )
+
+
+# ---------------------------------------------------------------------------
+# Freshness gate constant tests
+# ---------------------------------------------------------------------------
+
+class TestAuditFreshnessBufferConstant:
+    """Verify the AUDIT_FRESHNESS_BUFFER_SECONDS constant exists and is 60."""
+
+    def test_constant_exists(self):
+        """AUDIT_FRESHNESS_BUFFER_SECONDS must be defined."""
+        assert AUDIT_FRESHNESS_BUFFER_SECONDS is not None
+        assert isinstance(AUDIT_FRESHNESS_BUFFER_SECONDS, int)
+
+    def test_constant_is_60(self):
+        """The buffer must be exactly 60 seconds."""
+        assert AUDIT_FRESHNESS_BUFFER_SECONDS == 60, (
+            f"Expected 60, got {AUDIT_FRESHNESS_BUFFER_SECONDS}"
+        )
+
+    def test_constant_is_positive(self):
+        """The buffer must be positive."""
+        assert AUDIT_FRESHNESS_BUFFER_SECONDS > 0
 
 
 # ---------------------------------------------------------------------------
@@ -1096,3 +1147,279 @@ class TestStatusLifecycle:
         assert len(open_updates) >= 1, (
             f"Expected open update after exception, got: {wl_updates}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Freshness gate behavior tests
+# ---------------------------------------------------------------------------
+
+
+# Sentinel to distinguish "not provided" from "explicitly None"
+_AUDIT_RAW_DEFAULT = object()  # noqa: E402
+
+
+def _audit_fresh_runner(audit_audited_at: str | None = None,
+                        audit_raw_output: object = _AUDIT_RAW_DEFAULT,
+                        wi_updated_at: str | None = None,
+                        fail_audit_show: bool = False,
+                        calls: list | None = None) -> "Runner":
+    """Create a fake runner that returns appropriate responses for freshness gate tests.
+
+    Handles three command types:
+    - ``wl audit-show``: returns audit data with given auditedAt/rawOutput
+    - ``wl show``: returns work item data with given updatedAt
+    - All others: returns ``{"success": true}``
+
+    When ``audit_raw_output`` is the sentinel ``_AUDIT_RAW_DEFAULT`` (default),
+    a canned default report is used. When explicitly set to ``None``, the
+    ``rawOutput`` in the response will be ``None``. When set to a string, that
+    string is used.
+    """
+    _calls = calls if calls is not None else []
+
+    def _runner(cmd, **kwargs):
+        cmd_list = list(cmd)
+        _calls.append(cmd_list)
+        if "audit-show" in cmd_list:
+            if fail_audit_show:
+                return _fake_proc(returncode=1, stderr="audit not found")
+            if audit_audited_at is None:
+                # No prior audit
+                audit_response = {"success": True, "workItemId": "SA-TEST", "audit": None}
+            else:
+                # Use the provided raw output or default
+                if audit_raw_output is _AUDIT_RAW_DEFAULT:
+                    rawo = "Ready to close: Yes\n\n## Summary\nPrevious audit."
+                else:
+                    rawo = audit_raw_output  # may be None or a string
+                audit_response = {
+                    "success": True,
+                    "workItemId": "SA-TEST",
+                    "audit": {
+                        "workItemId": "SA-TEST",
+                        "auditedAt": audit_audited_at,
+                        "rawOutput": rawo,
+                    },
+                }
+            return _fake_proc(stdout=json.dumps(audit_response))
+        if "show" in cmd_list and "--children" in cmd_list:
+            # wl show --children
+            wi = _load_fixture("wi_with_numbered_ac.json")
+            if wi_updated_at:
+                wi["workItem"]["updatedAt"] = wi_updated_at
+            return _fake_proc(stdout=json.dumps(wi))
+        if "show" in cmd_list:
+            # wl show (without --children)
+            wi = _load_fixture("wi_with_numbered_ac.json")
+            if wi_updated_at:
+                wi["workItem"]["updatedAt"] = wi_updated_at
+            return _fake_proc(stdout=json.dumps(wi))
+        return _fake_proc(stdout=json.dumps({"success": True}))
+
+    return _runner
+
+
+class TestFreshnessGate:
+    """Verify the recent-audit freshness gate in cmd_issue.
+
+    The gate checks if a recent audit already exists before running the full
+    audit pipeline. If fresh, it skips the audit and prints the existing report.
+    """
+
+    def _call_with_runner(self, runner, **kwargs):
+        """Call cmd_issue with sensible defaults and an injectable runner."""
+        return cmd_issue("SA-GATE", runner=runner, persist=False, **kwargs)
+
+    def test_fresh_audit_skips_and_exits_zero(self):
+        """When audit is fresh, exit with code 0 without running audit logic."""
+        # auditedAt is well after updatedAt + 60s buffer
+        runner = _audit_fresh_runner(
+            audit_audited_at="2026-07-13T15:00:00.000Z",
+            wi_updated_at="2026-07-13T14:00:00.000Z",
+        )
+        rc = self._call_with_runner(runner)
+        assert rc == 0
+
+    def test_fresh_audit_prints_skipping_message(self, capsys):
+        """When skipping, print 'Skipping: audit still fresh'."""
+        runner = _audit_fresh_runner(
+            audit_audited_at="2026-07-13T15:00:00.000Z",
+            wi_updated_at="2026-07-13T14:00:00.000Z",
+        )
+        self._call_with_runner(runner)
+        captured = capsys.readouterr()
+        assert "Skipping: audit still fresh" in captured.out
+
+    def test_fresh_audit_displays_existing_report(self, capsys):
+        """When skipping, print the existing audit rawOutput."""
+        existing_report = "Ready to close: Yes\n\n## Summary\nExisting audit output."
+        runner = _audit_fresh_runner(
+            audit_audited_at="2026-07-13T15:00:00.000Z",
+            wi_updated_at="2026-07-13T14:00:00.000Z",
+            audit_raw_output=existing_report,
+        )
+        self._call_with_runner(runner)
+        captured = capsys.readouterr()
+        assert existing_report in captured.out
+
+    def test_no_prior_audit_proceeds(self, capsys, monkeypatch):
+        """When no prior audit exists (audit is None), proceed with full audit."""
+        pi_called = {"count": 0}
+
+        def fake_call_pi(prompt, **kw):
+            pi_called["count"] += 1
+            return {"verdict": "met", "evidence": "ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        runner = _audit_fresh_runner(audit_audited_at=None, wi_updated_at="2026-07-13T14:00:00.000Z")
+        rc = self._call_with_runner(runner)
+        assert rc == 0
+        # Pi should have been called (full audit ran)
+        assert pi_called["count"] > 0
+
+    def test_stale_audit_proceeds(self, capsys, monkeypatch):
+        """When audit is stale (auditedAt before updatedAt + buffer), proceed with full audit."""
+        pi_called = {"count": 0}
+
+        def fake_call_pi(prompt, **kw):
+            pi_called["count"] += 1
+            return {"verdict": "met", "evidence": "ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        # auditedAt is less than 60s after updatedAt (within buffer → stale)
+        runner = _audit_fresh_runner(
+            audit_audited_at="2026-07-13T14:00:30.000Z",
+            wi_updated_at="2026-07-13T14:00:00.000Z",
+        )
+        rc = self._call_with_runner(runner)
+        assert rc == 0
+        assert pi_called["count"] > 0
+
+    def test_audit_older_than_updated_proceeds(self, capsys, monkeypatch):
+        """When audit is older than the work item update, proceed with full audit."""
+        pi_called = {"count": 0}
+
+        def fake_call_pi(prompt, **kw):
+            pi_called["count"] += 1
+            return {"verdict": "met", "evidence": "ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        # auditedAt is BEFORE updatedAt
+        runner = _audit_fresh_runner(
+            audit_audited_at="2026-07-13T13:00:00.000Z",
+            wi_updated_at="2026-07-13T14:00:00.000Z",
+        )
+        rc = self._call_with_runner(runner)
+        assert rc == 0
+        assert pi_called["count"] > 0
+
+    def test_audit_show_failure_falls_through(self, capsys, monkeypatch):
+        """When wl audit-show fails, gracefully fall through to normal pipeline."""
+        pi_called = {"count": 0}
+
+        def fake_call_pi(prompt, **kw):
+            pi_called["count"] += 1
+            return {"verdict": "met", "evidence": "ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        runner = _audit_fresh_runner(fail_audit_show=True, wi_updated_at="2026-07-13T14:00:00.000Z")
+        rc = self._call_with_runner(runner)
+        assert rc == 0
+        assert pi_called["count"] > 0
+
+    def test_force_flag_bypasses_gate(self, capsys, monkeypatch):
+        """When --force is True, run full audit even if fresh audit exists."""
+        pi_called = {"count": 0}
+
+        def fake_call_pi(prompt, **kw):
+            pi_called["count"] += 1
+            return {"verdict": "met", "evidence": "ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        runner = _audit_fresh_runner(
+            audit_audited_at="2026-07-13T15:00:00.000Z",
+            wi_updated_at="2026-07-13T14:00:00.000Z",
+        )
+        rc = self._call_with_runner(runner, force=True)
+        assert rc == 0
+        assert pi_called["count"] > 0
+
+    def test_status_lifecycle_not_entered_on_skip(self):
+        """When gate short-circuits, NO wl update --status calls are made."""
+        calls = []
+        runner = _audit_fresh_runner(
+            audit_audited_at="2026-07-13T15:00:00.000Z",
+            wi_updated_at="2026-07-13T14:00:00.000Z",
+            calls=calls,
+        )
+        self._call_with_runner(runner)
+        # No wl update --status calls should appear (no in_progress → no open)
+        wl_updates = [c for c in calls if "update" in c and "--status" in c]
+        assert len(wl_updates) == 0, (
+            f"Expected no status lifecycle calls, got: {wl_updates}"
+        )
+
+    def test_no_skip_when_raw_output_is_null(self, capsys, monkeypatch):
+        """When audit exists but rawOutput is null, proceed normally (not fresh)."""
+        pi_called = {"count": 0}
+
+        def fake_call_pi(prompt, **kw):
+            pi_called["count"] += 1
+            return {"verdict": "met", "evidence": "ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        calls = []
+        runner = _audit_fresh_runner(
+            audit_audited_at="2026-07-13T15:00:00.000Z",
+            wi_updated_at="2026-07-13T14:00:00.000Z",
+            audit_raw_output=None,
+            calls=calls,
+        )
+        rc = self._call_with_runner(runner)
+        assert rc == 0
+        assert pi_called["count"] > 0
+
+    def test_only_applies_to_issue_not_project(self, monkeypatch, capsys):
+        """The gate should NOT apply to project-level audits."""
+        pi_called = {"count": 0}
+
+        def fake_call_pi(prompt, **kw):
+            pi_called["count"] += 1
+            return {"verdict": "met", "evidence": ""}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(stdout=json.dumps({"success": True, "workItems": []}))
+
+        rc = cmd_project(runner=fake_runner)
+        assert rc == 0
+        # Project audit should still run (no gate)
+        assert pi_called["count"] > 0

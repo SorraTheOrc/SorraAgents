@@ -79,6 +79,59 @@ whether the automated runner or a manual process performs the audit.
 
 The status lifecycle was added to solve the problem of concurrent audit attempts and visibility into audit state. Before this feature, there was no way to determine whether an audit was in progress. The deterministic `try/finally` approach guarantees cleanup regardless of outcome.
 
+## Freshness Gate
+
+The audit runner includes a **recent-audit freshness gate** that short-circuits
+item-level audits when a recent, valid audit already exists. This prevents
+unnecessary model calls and reduces audit time for unchanged work items.
+
+### Behavior
+
+1. Before setting any status lifecycle, `cmd_issue()` fetches the latest audit
+   via ``wl audit-show <id> --json`` and compares the audit's ``auditedAt``
+   timestamp against the work item's ``updatedAt`` timestamp plus a
+   60-second buffer.
+2. If the audit's ``auditedAt`` is more recent than ``updatedAt + 60s``, the
+   runner prints ``Skipping: audit still fresh``, displays the existing audit
+   report (``rawOutput``), and exits with code 0 **without** entering the
+   status lifecycle (no ``in_progress`` transition).
+3. If no prior audit exists, the audit is stale, or the freshness check fails
+   (e.g., ``wl audit-show`` command error), the runner falls through to the
+   normal full audit pipeline.
+4. The ``--force`` flag bypasses the freshness gate and always runs a full
+   audit, even if a recent audit exists.
+
+The gate applies **only to item-level audits** (``cmd_issue``). Project-level
+audits (``cmd_project``) are unaffected.
+
+### Configuration
+
+The freshness buffer is a hardcoded constant:
+
+```python
+AUDIT_FRESHNESS_BUFFER_SECONDS = 60
+```
+
+This is unlikely to change. If needed, modify the constant in
+``skill/audit/scripts/audit_runner.py``.
+
+### Failure handling
+
+If ``wl audit-show`` fails (e.g., no audit data, network error), the gate
+gracefully falls through to the normal pipeline. The freshness check never
+introduces new failure modes.
+
+### Skip indicator
+
+When the gate short-circuits, the runner prints:
+
+```
+Skipping: audit still fresh
+<existing rawOutput>
+```
+
+No status lifecycle transitions occur, and no persistence is performed.
+
 ## Safety and prompt design
 
 - Audit executions should be read-only except for the explicit, single persistence step that stores the structured audit into the associated work item and the automatic status lifecycle management performed by the runner. Use the designation `[READ-ONLY AUDIT]` in Pi prompts to mark read-only phases, and use `[PERSIST-AUDIT]` when performing the authorized persistence operation.
@@ -255,7 +308,7 @@ No code quality issues found.
 The audit skill ships a canonical runner and a persister. Use these from CI, local automation, or orchestrators.
 
 - Runner: `./scripts/audit_runner.py`
-  - Usage: `python3 ./scripts/audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--model-source <remote|local>] [--debug-log <file>]`
+  - Usage: `python3 ./scripts/audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--model-source <remote|local>] [--debug-log <file>] [--force]`
   - Usage: `python3 ./scripts/audit_runner.py project [--pi-bin pi] [--model <name>] [--model-source <remote|local>] [--debug-log <file>]`
   - Flags:
     - `--do-not-persist` — do not run persistence (useful for dry runs)
@@ -264,6 +317,7 @@ The audit skill ships a canonical runner and a persister. Use these from CI, loc
     - `--model-source` — model source: `remote` or `local` (default: `local`)
     - `--debug-log` — append Pi debug output to a JSONL file (helpful for triage)
     - `--json` — emit machine-readable JSON output
+    - `--force` — bypass the freshness gate and force a full audit even if a recent audit exists (item-level only)
 
   **Timeout behavior:**
   - Each internal Pi model call has a default timeout of `CALL_PI_TIMEOUT`=600s

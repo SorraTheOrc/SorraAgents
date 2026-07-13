@@ -827,6 +827,33 @@ class TestBuildParserJsonFlag:
         assert args.json is False
 
 
+class TestBuildParserForceFlag:
+    """Verify --force is accepted only by the issue subcommand."""
+
+    def test_issue_parses_force_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--force"])
+        assert args.force is True
+
+    def test_issue_defaults_force_false(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123"])
+        assert args.force is False
+
+    def test_force_can_combine_with_other_flags(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--force", "--json", "--do-not-persist"])
+        assert args.force is True
+        assert args.json is True
+        assert args.do_not_persist is True
+
+    def test_project_rejects_force_flag(self):
+        """--force is only for issue subcommand; project should reject it."""
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["project", "--force"])
+
+
 class TestCmdIssueJsonMode:
     """Verify cmd_issue emits structured JSON when json_mode=True."""
 

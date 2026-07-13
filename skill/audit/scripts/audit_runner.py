@@ -60,6 +60,14 @@ wrong (model hang, provider issue) and the timeout diagnostic should be
 produced rather than blocking indefinitely.
 """
 
+AUDIT_FRESHNESS_BUFFER_SECONDS = 60
+"""Freshness buffer (seconds) for the recent-audit gate.
+
+When the audit's ``auditedAt`` timestamp is more recent than the work item's
+``updatedAt`` timestamp plus this buffer, the audit is considered fresh and
+the runner skips the full audit pipeline.
+"""
+
 # Verdict constants
 VERDICT_MET = "met"
 VERDICT_UNMET = "unmet"
@@ -140,6 +148,80 @@ def _run_wl(runner: Runner, cmd: Sequence[str]) -> dict:
             f"Worklog command failed: {data.get('error', 'unknown error')}"
         )
     return data
+
+
+# ---------------------------------------------------------------------------
+# Freshness gate
+# ---------------------------------------------------------------------------
+
+
+def _check_audit_freshness(runner: Runner, issue_id: str) -> str | None:
+    """Check if there's a fresh audit for the work item.
+
+    Fetches the latest audit via ``wl audit-show <id> --json`` and compares
+    the audit's ``auditedAt`` timestamp against the work item's ``updatedAt``
+    timestamp plus ``AUDIT_FRESHNESS_BUFFER_SECONDS``.
+
+    Returns the ``rawOutput`` of the existing audit if still fresh, ``None``
+    otherwise (no prior audit, stale audit, or command failure).
+
+    The gate gracefully falls through on any failure (no audit data, command
+    error, parse error) so that the normal audit pipeline always runs when
+    freshness cannot be determined.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"])
+    except RuntimeError:
+        return None  # No audit data or command failure
+
+    if not isinstance(data, dict) or data.get("success") is False:
+        return None
+
+    audit = data.get("audit")
+    if not audit:
+        return None  # No prior audit
+
+    audited_at = audit.get("auditedAt")
+    raw_output = audit.get("rawOutput")
+    if not audited_at or not raw_output:
+        return None
+
+    # Get the work item's updatedAt
+    try:
+        wi_data = _run_wl(runner, ["wl", "show", issue_id, "--json"])
+    except RuntimeError:
+        return None
+
+    work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
+    updated_at = work_item.get("updatedAt")
+    if not updated_at:
+        return None
+
+    # Compare ISO-8601 timestamps
+    try:
+        # Normalize Z suffix for Python 3.10 compatibility
+        audit_time_str = str(audited_at).replace("Z", "+00:00")
+        update_time_str = str(updated_at).replace("Z", "+00:00")
+
+        audit_time = datetime.fromisoformat(audit_time_str)
+        update_time = datetime.fromisoformat(update_time_str)
+
+        # Ensure both are timezone-aware for comparison
+        if audit_time.tzinfo is None:
+            audit_time = audit_time.replace(tzinfo=timezone.utc)
+        if update_time.tzinfo is None:
+            update_time = update_time.replace(tzinfo=timezone.utc)
+
+        freshness_threshold = update_time + timedelta(seconds=AUDIT_FRESHNESS_BUFFER_SECONDS)
+
+        if audit_time > freshness_threshold:
+            return raw_output
+    except (ValueError, TypeError):
+        return None
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1356,7 +1438,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
               pi_bin: str = "pi", model: str | None = None,
               model_source: str = DEFAULT_MODEL_SOURCE,
               runner: Runner | None = None, json_mode: bool = False,
-              debug_log: str | None = None) -> int:
+              debug_log: str | None = None,
+              force: bool = False) -> int:
     """Audit a single work item.
 
     The resolved model name and source are included as a metadata line
@@ -1366,6 +1449,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
       1. --model CLI flag (explicit override)
       2. Config-driven: model.audit from .ralph.json resolved via model_source
       3. Hardcoded fallback: DEFAULT_MODEL
+
+    When *force* is ``True``, the freshness gate is bypassed and a full
+    audit pipeline is always run, even if a recent audit already exists.
     """
     # Resolve the effective model from config + CLI
     config = _load_config()
@@ -1375,6 +1461,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
     if runner is None:
         runner = _default_runner
+
+    # ------------------------------------------------------------------
+    # Freshness gate: skip if a recent audit already exists
+    # (before status lifecycle to avoid unnecessary in_progress transitions)
+    # ------------------------------------------------------------------
+    if not force:
+        fresh_report = _check_audit_freshness(runner, issue_id)
+        if fresh_report is not None:
+            print("Skipping: audit still fresh")
+            print(fresh_report)
+            return 0
 
     # Track script execution failures for prominent surfacing
     script_failure: dict | None = None
@@ -1904,6 +2001,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Emit machine-readable JSON output instead of markdown")
     p_issue.add_argument("--debug-log", default=None,
                          help="Append Pi debug output to this file (JSONL)")
+    p_issue.add_argument("--force", action="store_true",
+                         help="Bypass the freshness gate and force a full audit")
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
@@ -1932,7 +2031,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_issue(args.issue_id, persist=not args.do_not_persist,
                          pi_bin=args.pi_bin, model=args.model,
                          model_source=args.model_source, json_mode=args.json,
-                         debug_log=args.debug_log)
+                         debug_log=args.debug_log,
+                         force=args.force)
     elif args.command == "project":
         return cmd_project(pi_bin=args.pi_bin, model=args.model,
                            model_source=args.model_source, json_mode=args.json,
