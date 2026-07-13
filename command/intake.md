@@ -6,165 +6,135 @@ tags:
 agent: build
 ---
 
-You are coordinating an intake brief for a new Worklog work item.
-
-## Description
-
-You are authoring a new Worklog work item that describes a feature or a bug fix to be implemented. You will ensure that the details in the Worklog work item are sufficient to allow a developer to complete the work.
-You will follow an interview-driven approach to gather requirements, constraints, Acceptance Criteria (synonym: Success Criteria), and related work.
+You are authoring a new Worklog work item for a feature or bug fix, following an interview-driven approach to gather requirements, constraints, Acceptance Criteria (synonym: Success Criteria), and related work — ensuring sufficient detail for a developer to complete the work.
 
 ## Inputs
 
-- The supplied <work-item-id> is $1.
-  - If a valid <work-item-id> is provided (ids are formatted as '<prefix>-<hash>'), fetch and use it. If no work-item id is provided or the id is not valid, the command may still proceed: treat `$ARGUMENTS` as the authoritative seed intent and create a new work item as needed. If the user intended to reference an existing work item but provided an invalid id, ask the user to provide one.
-- Optional additional freeform arguments may be provided to guide your work. Freeform arguments are found in the arguments string "$ARGUMENTS" after the <work-item-id> ($1).
+- `$1` — The work-item-id (format `<prefix>-<hash>`). If valid, fetch and use it. If missing or invalid, treat `$ARGUMENTS` as the seed intent and create a new work item as needed. If the user intended to reference an existing item but provided an invalid id, ask for a valid one.
+- `$ARGUMENTS` — Optional freeform arguments after `<work-item-id>` to guide your work.
 
 ## Results and Outputs
 
-- A 1–2 sentence headline summary of the intake brief.
-- Final intake brief text and the new or updated work item $1.
-- Idempotence: Rerunning `/intake` reuses existing work items when they are considered to be the same item.
+- A 1–2 sentence headline summary of the intake brief
+- Final brief text and the new or updated work item
+- Idempotence: rerunning `/intake` reuses existing work items when they represent the same item
 
 ## Behavior
 
-The command implements the procedural workflow below. Each numbered step is part of the canonical execution path; substeps describe concrete checks or commands that implementors or automation should run.
+The command implements the procedural workflow below. Each numbered step is part of the canonical execution path; substeps describe concrete checks or commands to run.
 
 ## Hard requirements
 
-- Do not create a work item for this intake process itself; the output of this command is the completion of a description for the work item of interest.
-- Use an interview style if additional information is needed: concise, high-signal questions grouped to a soft-maximum of three per iteration.
-- Do not invent requirements or constraints; if unknown, ask the user.
-- Do not ask leading questions that bias the user towards a particular answer.
-- Do not ask unnecessary questions, if an obvious answer exists, use it.
-- If a response is unclear or ambiguous, ask for clarification rather than guessing or asking a largely similar question.
-- Respect ignore boundaries: do not include or quote content from files excluded by `.gitignore` or the agent framework's ignore rules.
-- Prefer short multiple-choice suggestions where possible, but always allow freeform responses.
-- All work‑item descriptions and comments **must be written in Markdown** format.
-- The goal is not to capture an exhaustive spec, but to gather sufficient detail to create a clear Worklog work item that will be used to either seed a PRD, update an existing one, or if the work is small and well-defined, be implemented directly from the Worklog work item.
-
-- Do not include procedural next steps (e.g., "Proceed to planning", "Break into sub-tasks") in the intake brief or work item description. Workflow progression is handled by the workflow system via stage transitions and delegation dispatch, not by the work item content.
+- Do not create a work item for this intake process itself; the output is a completed description for the target work item.
+- If additional information is needed, use an interview style: concise, high-signal questions, max three per round.
+- Do not invent requirements — ask the user. Do not ask leading questions or unnecessary questions if an obvious answer exists.
+- If a response is unclear or ambiguous, ask for clarification rather than guessing.
+- Respect `.gitignore` and agent framework ignore rules.
+- Prefer short multiple-choice suggestions, but always allow freeform responses.
+- All work-item descriptions and comments **must be written in Markdown**.
+- The goal is sufficient detail to create a clear work item — not an exhaustive spec.
+- Do not include procedural next steps (e.g., "Proceed to planning") in the intake brief or work item description. Workflow progression is handled by stage transitions, not by work item content.
 
 ## Status lifecycle (first action)
 
-- **Before any other step**, claim the work item by running:
+- **Before any other step**, claim the work item:
   `wl update <work-item-id> --status in_progress --json`
-  This must be the very first action — before any evaluation, context gathering, or
-  other preflight checks. The status signals to other agents that this item is
-  being processed and prevents concurrent claims.
+  This must be done before any evaluation, context gathering, or preflight checks. The status signals that this item is being processed and prevents concurrent claims.
 
 ## Process (must follow)
 
 1. Evaluate whether intake is required (agent responsibility)
 
-- Before performing the full intake, run a lightweight evaluation to determine whether the work item already contains sufficient information to skip the interview/draft process and simply mark intake as complete.
-- Suggested checks (conservative, idempotent heuristics):
-  - If the work item `stage` is already `intake_complete` or a later stage, skip intake.
-  - If the work item description contains a clear one-line headline, a short "## Acceptance Criteria" section with 1–3 measurable bullets, and a concise "Desired change" or implementation notes (for example <= ~200 words of implementation guidance), then it is likely sufficiently well-defined to skip a full intake.
-  - If the work item is small (type `task` or `bug` rather than `epic`) and the description contains explicit acceptance criteria and a minimal implementation sketch, prefer to mark intake complete.
-  - If duplicate or parent/child relationships already express the required context (see earlier related-work checks), consider skipping a full intake.
-- If the checks indicate intake is not needed, update the work item to record the decision and advance the stage:
+- Before performing full intake, run a lightweight evaluation to determine whether the work item already contains sufficient information to skip the interview/draft process.
+- Suggested heuristics (conservative, idempotent):
+  - If `stage` is already `intake_complete` or later, skip.
+  - If the description has a clear one-line headline, an "## Acceptance Criteria" section with 1–3 measurable bullets, and concise implementation notes (≤~200 words), it is likely well-defined enough to skip.
+  - If the item is small (`task` or `bug`, not `epic`) with explicit ACs and a minimal implementation sketch, prefer to mark intake complete.
+  - If parent/child relationships already express the required context, consider skipping.
+- If intake is not needed:
   - `wl update <work-item-id> --stage intake_complete --status open --json`
-  - Optionally add a comment documenting the reason: `wl comment add <work-item-id> "Intake auto-complete: work item appears sufficiently defined (acceptance criteria present / small task)." --actor Map --json`
-- If any heuristic is uncertain, fall back to running the normal intake process (do not auto-complete on borderline evidence).
+  - Optionally add a comment: `wl comment add <work-item-id> "Intake auto-complete: work item appears sufficiently defined (ACs present / small task)." --actor Map --json`
+- If uncertain, fall back to the normal intake process (do not auto-complete on borderline evidence).
 
 1. Gather context (agent responsibility)
 
-- Derive 2–6 keywords from the <seed-context> and user input to guide repository.
-- Use derived keywords to search work items (`wl search <keywords> --json`) and the repository for additional context.
-  - ignore data directories such as `node_modules`, `.git` and most "." named folders.
-- If any likely duplicates are found:
-  - Highlight them to the user and ask if any represent the work to be done.
-  - If they are confirmed as duplicates ask the user to resolve the duplicate instead of proceeding.
-  - if any are confirmed as a parent/child work item, remember this and, when creating work items, create the appropriate parent/child relationship.
-- Output clearly labelled lists with single line summaries:
+- Derive 2–6 keywords from `<seed-context>` and user input.
+- Search work items (`wl search <keywords> --json`) and the repository for additional context (ignore `node_modules`, `.git`, and most `.`-prefixed folders).
+- If duplicates are found:
+  - Highlight them and ask if any represent the work to be done.
+  - If confirmed as duplicates, ask the user to resolve instead of proceeding.
+  - If confirmed as parent/child, create the appropriate relationship when creating work items.
+- Output labelled lists:
   - "Potentially related docs" (file paths)
-  - "Potentially related work items" (titles followed by ID)
-- Read and summarize each of these related artifacts for later reference.
+  - "Potentially related work items" (titles + IDs)
+- Read and summarize each related artifact for later reference.
 
 1. Work Item prep (agent responsibility)
 
-- If a <work-item-id> was provided:
-  - Mark the work item at stage idea and assign it, by running `wl update $1 --stage idea --assignee Map --json`.
-  - Note: `status` was already set to `in_progress` at the start of this command (see Status lifecycle section above).
-  - Review the existing item's `issueType` (retrieved from `wl show <work-item-id> --json`). If it does not match the actual nature of the work described (bug for a problem/fix, feature for a new capability, chore for maintenance, task for general work, epic for large scope with subtasks), update it using `wl update <work-item-id> --issue-type <correct-type> --json`.
-- If no work item id was provided:
-  - Extract a working title from the <seed-intent> (one line).
-  - Infer the most appropriate issue type from the seed intent using your judgment:
-    - If the context describes a bug, error, or defect → `--issue-type bug`
-    - If the context describes a new or improved feature/capability → `--issue-type feature`
-    - If the context describes maintenance, refactoring, or chore work → `--issue-type chore`
-    - If the context describes a large scope that likely requires multiple subtasks → `--issue-type epic`
-    - Default (ambiguous or general context) → `--issue-type task`
-  - Create a new Worklog work item using `wl create --stage idea --status in_progress --title "<working-title>" --description "<seed-context>" --issue-type <inferred-type> --assignee Map --json`
-  - Remember the returned <work-item-id> for later steps.
+- If `<work-item-id>` was provided:
+  - `wl update $1 --stage idea --assignee Map --json` (status was already set to `in_progress` — see Status lifecycle above)
+  - Review the item's `issueType`. If it doesn't match the nature of the work, update: `wl update <work-item-id> --issue-type <correct-type> --json`
+    - `bug` — problem/fix | `feature` — new capability | `chore` — maintenance | `task` — general work | `epic` — large scope with subtasks
+- If no id was provided:
+  - Extract a working title from `<seed-intent>` (one line).
+  - Infer the issue type from context (bug/feature/chore/epic/task).
+  - Create: `wl create --stage idea --status in_progress --title "<title>" --description "<seed-context>" --issue-type <type> --assignee Map --json`
+  - Remember the returned id.
 
 1. Interview
 
-If there are no ambiguities and the seed context and previously asked questions are sufficient to draft a clear intake brief, you may skip this step. However, if there are any gaps in understanding or if the seed context is vague, proceed with the interview.
+If the seed context is sufficient to draft a clear intake brief, skip this step. Otherwise, proceed with the interview.
 
-- A user interview consistes of 1 or more iterations, with a soft limit of 3 questions per round.
-- Do not ask questions that can be easily answered by searching the repo or related work items; instead, use the context you have gathered to answer those questions yourself. If you find that you do not have enough context to answer a question, ask the user for that specific piece of information.
-- The goal is to build a full understanding of the work, by asking clear and concise questions, and offering suggested answers and examples informed by repo context where possible.
+- Soft limit of 3 questions per round, 1 or more rounds as needed.
+- Do not ask questions answerable by repo search — use gathered context. If context is insufficient, ask for the specific missing piece.
+- Goal: build sufficient understanding to draft a problem definition with user stories, ACs, and related work — not a complete spec.
 - If anything is ambiguous, ask for clarification rather than guessing.
-- Keep asking the user questions until all core information is captured and no important ambiguities remain.
-  - The goal is not a complete spec but a sufficient understanding to draft a problem definition with user stories, acceptance criteria, and related work.
-- Do not proceed until you have gathered sufficient information to draft an intake brief.
+- Do not proceed until sufficient information is gathered.
 
 1. Draft intake brief (agent responsibility)
 
-- Write a clear intake brief to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` containing the following sections:
-  - Problem statement: one or two sentences summarizing the problem to be solved.
-  - Users: who will benefit from or use the feature and examples of their user stories.
-  - Acceptance Criteria (synonym: Success Criteria): 3–5 concise, measurable bullets describing how success will be evaluated.
-  - Constraints: any known constraints (technical, business, regulatory) that must be considered.
-  - Existing state: brief summary of the current state of affairs related to the problem.
-  - Desired change: brief summary of the likely changes needed.
-  - Key Files (predicted): list of files likely to be changed or added during implementation, predicted through LLM-based analysis of the work item and repository structure. Published in the work item description under a `**Key Files:**` header. Each entry is a bullet item with a file path (containing at least one `/` and a file extension) and a brief explanation of why it is expected to change, e.g. ``- `path/to/file.py` — Needs new function for X feature``. If a `**Key Files:**` section already exists in the work item description, update it rather than inserting a duplicate.
-  - Related work: list of related documents or work items with brief descriptions and links/ids.
-- Present the draft brief to the user and invite feedback. Incorporate any edits or clarifications supplied by the user, but do not block progress waiting for an explicit approval. Apply edits when provided and proceed automatically to the review stages.
+- Write a brief to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` with these sections:
+  - **Problem statement:** 1–2 sentences summarizing the problem.
+  - **Users:** who benefits, with example user stories.
+  - **Acceptance Criteria:** 3–5 measurable bullets describing success.
+  - **Constraints:** technical, business, or regulatory.
+  - **Existing state:** current state of affairs.
+  - **Desired change:** likely changes needed.
+  - **Key Files (predicted):** files likely to change, with brief explanations. Published as a `**Key Files:**` section in the work item description; update if it already exists (e.g., ``- `path/to/file.py` — Needs new function for X feature``).
+  - **Related work:** related docs or work items with descriptions and links/ids.
+- Present the draft to the user and invite feedback. Incorporate edits when supplied, but don't block waiting for approval — proceed automatically to review stages.
 
 1. Five mini-review stages (agent responsibility; must follow)
 
-Run five review iterations automatically on the draft brief; each review will make any necessary conservative edits to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
+Run five conservative review iterations on the draft brief. If a proposed change could alter intent, ask a clarifying question first.
 
-In each review stage apply only conservative edits. If a proposed change could alter intent, ask a clarifying question before making any changes.
+After each stage: "Finished <type> review: <changes>" or "Finished <type> review: no changes needed"
 
-After each stage output: "Finished <review-type> review: <brief notes of changes>" or "Finished <review-type> review: no changes needed"
-
-- The five Intake review types are:
-  1. Completeness
-     - Ensure Problem, Acceptance Criteria, and Constraints are present and actionable. Add missing bullets or concise placeholders when obvious.
-  2. Capture fidelity
-     - Verify the user's answers are accurately and neutrally represented. Shorten or rephrase only for clarity; do not change meaning.
-  3. Related-work & traceability
-  - Confirm related docs/work items are correctly referenced.
-  1. Risks & assumptions
-     - Add missing risks and mitigations, failure modes, and assumptions in short bullets.
-     - Ensure that a risk addressing scope screep is present. The mitigaation is to record opportunities for additional features/refactorings as work items linked to the main item, rather than expanding the scope of the current item.
-     - Do not invent mitigations beyond note-level comments.
-  2. Polish & handoff
-  - Tighten language for reading speed, ensure copy-paste-ready commands, and produce the final 1–2 sentence summary used as the work item body headline.
+1. **Completeness** — Ensure Problem, ACs, and Constraints are present and actionable. Add missing bullets or concise placeholders when obvious.
+2. **Capture fidelity** — Verify user answers are accurately and neutrally represented. Shorten only for clarity; don't change meaning.
+3. **Related-work & traceability** — Confirm related docs/work items are correctly referenced.
+4. **Risks & assumptions** — Add missing risks, mitigations, failure modes, and assumptions in short bullets. Include a scope-creep risk: record extra opportunities as linked work items rather than expanding scope. Don't invent mitigations beyond note-level.
+5. **Polish & handoff** — Tighten language, ensure copy-paste-ready commands, produce the final 1–2 sentence headline.
 
 1. Call the `find_related` skill to collect related work and add a report to the work item description.
 
-2. Review the new issue in the overall context of the project and consider:
+2. Review the new issue in project context and consider:
+- Adding dependencies: `wl comment add <work-item-id> --comment "Blocks:<blocked-id>" --json` / `--comment "Blocked-by:<blocking-id>" --json`
+- Adjusting priority: `wl update <work-item-id> --priority <level> --json`
 
-- Adding dependencies with `wl comment add <work-item-id> --comment "Blocks:<blocked-item-id>" --json` and `wl comment add <work-item-id> --comment "Blocked-by:<blocking-item-id>" --json`
-- Adjusting priority to better match the new understanding of scope and impact using `wl update <work-item-id> --priority <level> --json`
-
-1. Update the work item with the final brief using `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --stage intake_complete --status open --json`
+1. Update the work item: `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --stage intake_complete --status open --json`
 
 2. Calculate Effort and Risk (agent responsibility; must follow)
 
-- Call the `effort_and_risk` skill with the new or updated work item to produce an effort and risk estimate.
+- Call the `effort_and_risk` skill on the new or updated work item to produce an estimate.
 
 1. Finishing (must do as the final step only)
 
-- change the issue to state "open" (wl update <work-item-id> --status open --json). DO NOT close the issue
-- Run `wl sync` to sync work item changes.
-- Run `wl show <work-item-id>` (not --json) to show the entire work item.
-- Remove all temporary files created during the process, including `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`.
-- Output the new work item id and a structured summary containing the following sections exactly:
+- Set status to open (DO NOT close): `wl update <work-item-id> --status open --json`
+- `wl sync` to sync changes.
+- `wl show <work-item-id>` (not --json) to display the full work item.
+- Remove temporary files: `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`
+- Output a structured summary:
 
 # Objective
 
@@ -172,61 +142,59 @@ After each stage output: "Finished <review-type> review: <brief notes of changes
 
 # Acceptance Criteria
 
-  Complete list of acceptance criteria which *must* be measurable. If any acceptance criteria are not measurable, add a clarifying question to the Appendix asking for clarification and mark that criterion as "TBD pending clarification".
+  Complete list of measurable acceptance criteria. If any are not measurable, add a clarifying question to the Appendix and mark as "TBD pending clarification".
 
-  Always include at least one acceptance criterion related to testing and validation of the work.
-
-  Always include the criteria "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries." If this criterion is not already present, add it.
+  Always include:
+  - At least one criterion related to testing and validation.
+  - "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries."
+  - "Full project test suite must pass with the new changes."
 
   > **Note:** CHANGELOG.md is **excluded** from this list. It is managed automatically by the ship skill's release pipeline (`skill/ship/scripts/release/generate-changelog.js`). Implementing agents should not manually update CHANGELOG.md.
 
-  Always include the criteria "Full project test suite must pass with the new changes." If this criterion is not already present, add it.
-
-  Do not include tests related to continuous integration or deployment pipelines as acceptance criteria.
+  Do not include CI/CD pipeline tests.
 
 # Effort and Risk
 
-  T-shirt sizing and one line description of the biggest risks
+  T-shirt sizing and one-line description of the biggest risks
 
 - Finish with "This completes the Intake process for <work-item-id> <work-item-title>"
 
 ## Traceability & idempotence
 
-- When the agent updates or creates a Worklog work item, it must do so idempotently: running the command again should not create duplicate links or duplicate clarifying-question entries.
+- All work item updates or creations must be idempotent: rerunning `/intake` must not create duplicate links or clarifying-question entries.
 
 ## Editing rules & safety
 
-- Preserve author intent; where the agent is uncertain, add a clarifying question instead of making assumptions.
+- Preserve author intent; if uncertain, add a clarifying question instead of assuming.
 - Keep edits minimal and conservative.
 - Respect `.gitignore` and other ignore rules when searching the repo.
-- If any automated step fails or is ambiguous, surface an explicit Open Question and pause for human guidance.
+- If any automated step fails or is ambiguous, surface an explicit Open Question and pause for guidance.
 
 ## Appendix: Clarifying questions & answers (must include)
 
-- Purpose: Every interview-driven intake must produce an auditable Appendix that lists all clarifying questions the agent asked during the intake interview and the answers provided by the user (or other authoritative source). This Appendix must be appended to the final intake brief that is written to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` and must also be included in the Worklog work item description when the agent runs the final `wl update`.
+- **Purpose:** Every interview-driven intake must produce an auditable Appendix listing all clarifying questions asked and the answers provided. Append the complete Appendix to the final draft file AND include it in the work item description when running `wl update --description-file`.
 
-- Required contents for each entry (one line per item is acceptable, but the Appendix may include short context paragraphs where needed):
-  - The question text exactly as asked.
-  - The answer provided and the answering party (user, stakeholder, or agent inference) and any short evidence or link (work item id, file path, or PR) used to support the answer.
-  - If the answer changed during the process, record the earlier answer(s) and mark the final accepted answer.
-  - If the question resulted in a discussion and/or research, include a concise summary of what was discussed, the research performed, findings, and any links to supporting artifacts (files, PRs, issues). Keep summaries short and focused (1–6 sentences).
+- **Required contents per entry** (one line acceptable; context paragraphs where needed):
+  - The question text as asked.
+  - The answer, answering party, and evidence/link (work item id, file path, PR).
+  - If the answer changed, record earlier answers and the final accepted answer.
+  - If the question led to research, include a concise summary (1–6 sentences) with links.
 
-- Example format:
+- **Example format:**
+  - Q: "Who is the primary user?" — Answer (user@acme): "Internal support engineers". Source: interactive reply.
+  - Q: "Is migration required?" — Answer (user@acme): "No, data model unchanged". Source: interactive reply.
+  - Q: "Can we reuse service X?" — Answer (engineer@acme): "Partially; need a small wrapper. Research: inspected services/x, found no adapter — created follow-up wl-789".
 
-  - Q: "Who is the primary user for this feature?" — Answer (user@acme): "Internal support engineers". Source: interactive reply. Final: yes.
-  - Q: "Is a migration required? (yes/no)" — Answer (user@acme): "No, data model is unchanged". Source: interactive reply.
-  - Q: "Can we reuse service X?" — Answer (engineer@acme): "Partially; we need a small wrapper. Research: checked repo path services/x and PR #42; wrapper required to adapt interface." (Research summary: inspected services/x, found no adapter — created follow-up task wl-789)
+- **Behavior and placement:**
+  - Append the complete Appendix to the draft file before final approval.
+  - Include it in the `wl update --description-file` content.
+  - **Idempotent:** rerunning `/intake` must not duplicate earlier entries — update existing records instead.
+  - Open questions: mark as "OPEN QUESTION" with context.
+  - Respect `.gitignore` and agent framework ignore rules.
 
-- Behavior and placement rules:
-  - The agent MUST append the complete Appendix to the final draft file `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` before presenting it for final human approval.
-  - When updating the Worklog work item with `wl update --description-file`, ensure the Appendix is included in the description content pushed to the work item (so the full Q&A and any summarized research is archived with the work item).
-  - Maintain idempotence: re-running `/intake` MUST NOT duplicate earlier Appendix entries. If a question/answer pair already exists, update its record (for example, add a short revision note) rather than creating a duplicate entry.
-  - If a clarifying question was asked but never answered (open question), include it in the Appendix marked as "OPEN QUESTION" with brief context (who it was directed to and why it matters).
-  - Do not include or quote content from files excluded by `.gitignore` or other the agent framework's ignore rules as part of the Appendix.
+- **Privacy & scope:**
+  - Record only information provided by the user or authorized stakeholders. Redact secrets with a note (e.g., "[REDACTED sensitive snippet]").
+  - If a user pastes sensitive content by mistake, redact and note.
 
-- Privacy & scope:
-  - Only record information that the user or an authorized stakeholder provided during the intake. Do not record secrets or sensitive data.
-  - If a user pastes sensitive content by mistake, redact it from the Appendix and record the redaction with a short note (e.g., "[REDACTED sensitive snippet] - user asked to remove").
-
-- Traceability:
-  - Each Appendix entry should be linkable from the work item (either in the work item body or in a wl comment). When practical, include `related-to:<work-item-id>` or file path references to aid future discovery.
+- **Traceability:**
+  - Each entry should be linkable from the work item. When practical, include `related-to:<work-item-id>` or file path references.
