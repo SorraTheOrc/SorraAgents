@@ -1,82 +1,57 @@
 ---
-description: Refactoring session - discovers opportunities to improves code quality without changing behavior
+description: Refactoring session - discovers opportunities to improve code quality without changing behavior
 subtask: true
 ---
 
 # Refactor Mode - Code Quality Improvement
 
-Your mission is to identify opportunities to improve code quality, readability, and maintainability WITHOUT changing external behavior.
+Identify opportunities to improve code quality, readability, and maintainability WITHOUT changing external behavior.
 
 ## Refactoring Target
 
-Use `$ARGUMENTS` to specify the target code or module for refactoring. If no target is specified, analyze the entire codebase for refactoring opportunities.
+Use `$ARGUMENTS` to specify the target code or module. Default: entire codebase.
 
 ## The Golden Rule
 
 > **Refactoring changes HOW code works internally, never WHAT it does externally.**
 
-You will not edit any files during the assessment. Instead you will try to identify opportunities for improvements that improve code quality and maintainability but ensures that existing behavior remains identical. If unsure, do not record the proposed change.
+Do not edit files during the assessment. Only record changes when confident behavior remains identical.
 
 ## Results and Outputs
 
-- An Epic with children that each represent a specific refactoring opportunity
-- Idempotence: When re-run, the command detects previously created refactor items and avoids creating duplicates; it may update descriptions instead.
+- An Epic with children, each representing a specific refactoring opportunity
+- Idempotence: re-running detects existing items and avoids duplicates (may update descriptions)
 
 ## Hard requirements
 
-- Whenever you are recommending next steps you MUST make the first one a progression to the next step in the process defined below, with a summary of what that step involves.
-
-This command will create zero or more Worklog work items at the root of the project, each describing a specific refactoring opportunity.
+- Next-step recommendations MUST always progress to the next step in the protocol below, with a summary of what that step involves.
+- Creates zero or more Worklog work items at project root, each describing a specific refactoring opportunity.
 
 ## Refactoring Protocol
 
 ### Phase 1: Assess
 
 1. **Understand current behavior**
-   - Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for product context.
-   - What does this code do?
-   - What are its inputs and outputs?
-   - What are the edge cases?
+   - Read `docs/` (exclude `docs/dev`), `README.md`, and other high-level files for product context.
+   - What does this code do, what are its inputs/outputs, what are the edge cases?
 
-2. **Identify code smells**
-   - Long methods/functions
-   - Duplicated code
-   - Complex conditionals
-   - Poor naming
-   - Large classes
-   - Feature envy
-   - Data clumps
-   - Unnecessary comments
+2. **Identify code smells** — Look for: long methods, duplicated code, complex conditionals, poor naming, large classes, feature envy, data clumps, unnecessary comments.
 
-   The following are not considered refactoring opportunities (and should be ignored):
-   - Public API signatures
-   - New features
-   - Large sweeping changes
+   Ignore (not refactoring opportunities): public API signatures, new features, large sweeping changes.
 
-3. **Check test coverage**
-   - Are there existing tests?
-   - Do they cover the code to be refactored?
-   - Are the tests reliable and fast?
+3. **Check test coverage** — Are there existing tests? Do they cover the code to be refactored? Are they reliable and fast?
 
 ### Phase 2: Plan
 
-1. **Prioritize improvements**
-   - Impact vs effort analysis
-   - Risk assessment
-   - Dependencies between changes
-   - Priority will be set to:
-   - `1` for critical maintainability issues that hinder future work
-   - `2` for high-impact improvements that enhance clarity and reduce complexity
-   - `3` for minor improvements that have low impact
+1. **Prioritize improvements** — Assess impact vs effort, risk, and dependencies. Assign priority:
+   - `1` — Critical maintainability issues that hinder future work
+   - `2` — High-impact improvements that enhance clarity and reduce complexity
+   - `3` — Minor improvements with low impact
 
-2. **Record** - Create a Worklog work item for each refactoring opportunity with:
-   - A title in the form "REFACTOR: <summary>"
-   - A clear description of the code smell to be addressed. Including:
-     - Location (file, class, method)
-     - Explanation of why it is a problem
-     - The specific refactoring technique to be applied (e.g., Extract Method, Rename Variable, etc.).
-   - Tests that will validate behavior remains unchanged.
-     - Recommendations for improving existing tests if coverage is insufficient.
-   - A rationale explaining why this change improves the code.
-   - Tags: `refactor` plus any relevant module/component tags.
-   - Priority (1, 2, or 3).
+2. **Record** — Create a Worklog work item per opportunity with:
+   - Title: `REFACTOR: <summary>`
+   - Description including location (file, class, method), why it's a problem, the refactoring technique (e.g., Extract Method, Rename Variable)
+   - Tests to validate unchanged behavior (or recommendations to improve coverage)
+   - Rationale explaining why this change improves the code
+   - Tags: `refactor` plus relevant module/component tags
+   - Priority (1, 2, or 3)
