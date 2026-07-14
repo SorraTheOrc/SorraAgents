@@ -13,7 +13,7 @@ import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _INTAKE_MD = _REPO_ROOT / "command" / "intake.md"
-_PLAN_MD = _REPO_ROOT / "command" / "plan.md"
+_PLAN_MD = _REPO_ROOT / "skill" / "plan" / "SKILL.md"
 _AUDIT_SKILL = _REPO_ROOT / "skill" / "audit" / "SKILL.md"
 _WORKFLOW_JSON = _REPO_ROOT / "docs" / "workflow" / "workflow.json"
 _WORKFLOW_YAML = _REPO_ROOT / "docs" / "workflow" / "workflow.yaml"
@@ -27,7 +27,7 @@ def test_intake_uses_acceptance_criteria_as_canonical_term() -> None:
     assert "Acceptance Criteria (synonym: Success Criteria)" in content
 
 
-def test_plan_mentions_success_criteria_as_synonym() -> None:
+def test_skill_mentions_both_terms() -> None:
     content = _PLAN_MD.read_text(encoding="utf-8")
 
     assert "Acceptance Criteria" in content
