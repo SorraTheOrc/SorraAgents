@@ -92,7 +92,7 @@ For smaller features, the plan may be a simple implementation outline. For large
 
 Agent Commands:
 
-1. Decompose epics into features and tasks: `/plan <Epic ID>`
+1. Decompose epics into features and tasks: `/skill:plan <Epic ID>`
 
 Summary: features make epics executable and testable in small increments.
 

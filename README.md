@@ -52,7 +52,7 @@ See `docs/ralph.md` for the full command reference and operational guidance.
 ## PlanAll — Automated Batch Planning
 
 The PlanAll skill (`skill/planall/`) provides automated batch planning for work items
-in `intake_complete` status. It discovers all eligible items, invokes `/plan` for
+in `intake_complete` status. It discovers all eligible items, invokes `/skill:plan` for
 each sequentially, detects items that require producer input, and produces a
 summary report.
 

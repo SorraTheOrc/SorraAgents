@@ -174,7 +174,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   - Unknowns captured as explicit questions.
 - If the work item fails the definition gate, first run `wl update <work-item-id> --status open --json` to mark the item as open, then take the appropriate action:
   - If the work item is not well-defined, run the intake interview to update the existing work item (see `command/intake.md`) and update the work item `description` or `acceptance` fields with the intake output.
-  - If the work item is too large to implement in one pass, run plan interview (see `command/plan.md`) to break it into smaller work items, create those work items, link them as blockers/dependencies, and pick the highest-priority work item to implement next.
+  - If the work item is too large to implement in one pass, run the plan interview (`/skill:plan`) to break it into smaller work items, create those work items, link them as blockers/dependencies, and pick the highest-priority work item to implement next.
   - If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.
   - If you ran the plan interview, convert this work item to an epic and inform the user that implementation should move to the first child work item created.
 - If you ran the intake interview, update the current work item with the new definition and inform the user of your actions and ask if you should restart the implementation review.

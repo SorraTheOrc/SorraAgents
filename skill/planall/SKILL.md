@@ -137,5 +137,5 @@ python3 ./scripts/planall.py --max 3 --item-timeout 120
 
 ## Related skills
 
-- `command/plan.md` — The `/plan` command that PlanAll invokes for each item
+- `skill/plan/SKILL.md` — The `/skill:plan` command that PlanAll invokes for each item
 - `../ralph/SKILL.md` — Ralph orchestration loop that provides auto-planning for individual items

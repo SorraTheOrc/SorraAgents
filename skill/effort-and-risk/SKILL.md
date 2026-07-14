@@ -28,7 +28,7 @@ Gating (mandatory)
 
 Before doing any work the issue MUST be in the `intake_complete` or `plan_complete` stage. If it is not, refuse and output ONLY this single sentence (replace <issue-id> with the actual id):
 
-The issue does not have a sufficiently detailed plan, to proceed it must be in the stage of `intake_complete` or `plan_complete`. Run the intake command with `/intake <issue-id>` or the plan command with `/plan <issue-id>`.
+The issue does not have a sufficiently detailed plan, to proceed it must be in the stage of `intake_complete` or `plan_complete`. Run the intake command with `/intake <issue-id>` or the plan command with `/skill:plan <issue-id>`.
 
 Do not output any other text when refusing.
 

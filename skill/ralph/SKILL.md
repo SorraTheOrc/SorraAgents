@@ -135,7 +135,7 @@ This module is the single source of truth for autoplan decisions, shared by:
   ``command.plan_helpers`` functions (which now load from the canonical
   ``../plan/plan_helpers.py``), while keeping its own I/O infrastructure
   (runner, retry, fail-open) for backward compatibility.
-- **`/plan` command** (`command/plan.md`) — runs``python3 ../plan/plan_helpers.py
+- **`/skill:plan` command** (`skill/plan/SKILL.md`) — runs ``python3 ../plan/plan_helpers.py
   plan-if-needed <id>`` (or the legacy path) as a pre-check before the full
   planning decomposition.
 - **PlanAll** — benefits automatically since it shells out to ``/skill:plan <id>``.

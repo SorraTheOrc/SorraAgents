@@ -1023,7 +1023,7 @@ def _validate_pi_output(
 
 # Default thresholds for auto-plan decision
 # If effort t-shirt is in this set AND risk level is in the risk set,
-# skip /plan and proceed directly to implement.
+# skip /skill:plan and proceed directly to implement.
 # Effort/risk threshold constants are now defined in skill/plan/plan_helpers.py
 # (canonical) and imported via command.plan_helpers (delegation wrapper).
 # The local definitions are kept as aliases for backward compatibility,
@@ -1138,7 +1138,7 @@ class RalphLoop:
         # runner is used instead.
         self.stream = stream
         # Auto-plan thresholds: effort t-shirt sizes and risk levels that
-        # allow skipping /plan and proceeding directly to implement.
+        # allow skipping /skill:plan and proceeding directly to implement.
         self.autoplan_effort_skip = autoplan_effort_skip or DEFAULT_AUTOPLAN_EFFORT_SKIP
         self.autoplan_risk_skip = autoplan_risk_skip or DEFAULT_AUTOPLAN_RISK_SKIP
         # When True, disable the auto-plan step and proceed directly to implement
@@ -2365,7 +2365,7 @@ class RalphLoop:
         then handles Ralph-specific plan invocation if needed.
 
         Returns (do_plan, updated_stage):
-        - do_plan: True if /plan should be invoked
+        - do_plan: True if /skill:plan should be invoked
         - updated_stage: the effective stage after autoplan
         """
         logger.info("ralph.autoplan.start target=%s", target_id)
@@ -3192,7 +3192,7 @@ class RalphLoop:
 
             if target_stage == "intake_complete" and attempt == 1 and not self.no_autoplan:
                 # Auto-plan step: evaluate effort/risk and decide whether
-                # to invoke /plan or proceed directly to implement.
+                # to invoke /skill:plan or proceed directly to implement.
                 try:
                     do_plan, new_stage = self._run_autoplan(focus_id)
                     if new_stage == "plan_complete":
@@ -3201,14 +3201,14 @@ class RalphLoop:
                         self._notify_event(
                             EventType.PHASE_CHANGE,
                             work_item_ids=scope_ids,
-                            description="Auto-plan invoked /plan phase",
+                            description="Auto-plan invoked /skill:plan phase",
                         )
                     else:
                         # Phase change: intake -> implementation (skipped plan)
                         self._notify_event(
                             EventType.PHASE_CHANGE,
                             work_item_ids=scope_ids,
-                            description="Auto-plan skipped /plan, proceeding to implementation",
+                            description="Auto-plan skipped /skill:plan, proceeding to implementation",
                         )
                 except RalphError:
                     raise
@@ -3567,8 +3567,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pi-bin", default="pi")
     parser.add_argument("--wl-bin", default="wl")
     parser.add_argument("--no-autoplan", action="store_true", help="Disable the auto-plan step for intake_complete items (proceed directly to implement)")
-    parser.add_argument("--autoplan-effort-skip", nargs="*", help="Effort t-shirt sizes that skip /plan (default: Extra Small Small)")
-    parser.add_argument("--autoplan-risk-skip", nargs="*", help="Risk levels that skip /plan (default: Low)")
+    parser.add_argument("--autoplan-effort-skip", nargs="*", help="Effort t-shirt sizes that skip /skill:plan (default: Extra Small Small)")
+    parser.add_argument("--autoplan-risk-skip", nargs="*", help="Risk levels that skip /skill:plan (default: Low)")
     parser.add_argument("--fail-open", action="store_true", help="Continue on delegated command failures (non-fatal) when possible")
     parser.add_argument("--retry", type=int, default=0, help="Number of additional retries for delegated commands (default: 0)")
     parser.add_argument("--retry-delay", type=float, default=1.0, help="Delay in seconds between retries")
