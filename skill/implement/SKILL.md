@@ -107,7 +107,7 @@ status-reset instructions documented in the sections below:
   - you can discover assets on the web as part of your implementation, but ensure that you have the right to use and distribute any assets you include in the project. Always provide proper attribution if required by the asset's license.
 - If the implementation requires changes to documentation, update the relevant markdown files in the `docs` directory and reference these changes in the work item comments and PR description.
   - ensure that documentation changes are clear, concise, and accurately reflect the implementation changes. Include examples or screenshots if they help clarify the documentation.
-  - **Exception:** `CHANGELOG.md` is **excluded** from manual documentation updates. It is managed automatically by the ship skill's release pipeline (`skill/ship/scripts/release/generate-changelog.js`). Implementing agents should never manually edit `CHANGELOG.md`.
+  - **Exception:** `CHANGELOG.md` is **excluded** from manual documentation updates. It is managed automatically by the ship skill's release pipeline (`../ship/scripts/release/generate-changelog.js`). Implementing agents should never manually edit `CHANGELOG.md`.
 
 ## Steps
 

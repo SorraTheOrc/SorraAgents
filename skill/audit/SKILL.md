@@ -113,7 +113,7 @@ AUDIT_FRESHNESS_BUFFER_SECONDS = 60
 ```
 
 This is unlikely to change. If needed, modify the constant in
-``skill/audit/scripts/audit_runner.py``.
+``./scripts/audit_runner.py``.
 
 ### Failure handling
 
