@@ -7,48 +7,44 @@ description: "Authors a brand new command for the agent framework following proj
 
 ## Overview
 
-You are authoring a new command for the agent framework that implements a specific functionality as requested by the user. You will ensure that the command follows project best practices and conventions, and that it is well-documented and tested.
+Author a new command for the agent framework following project best practices and conventions.
 
 ## When To Use
 
-- User requests the creation of a new command (e.g., "Create a new command to <do something>", "Author a command that <does something>", "I need a command that <does something>").
+User requests a new command ("Create a command to <do something>", "I need a command that...").
 
 ## Behavior
 
-1. Review command authoring documentation at <https://opencode.ai/docs/commands>
-2. Review example commands at <https://claude.ai/public/artifacts/e2725e41-cca5-48e5-9c15-6eab92012e75>
-3. Gather requirements from the user about the desired command functionality, inputs, outputs, and any specific constraints or considerations.
-4. Draft the command code in markdown format, ensuring it adheres to project coding standards and conventions. Use the format in the examples at in <https://claude.ai/public/artifacts/e2725e41-cca5-48e5-9c15-6eab92012e75>
-5. Review the command markdown with the user for feedback and make necessary revisions. Do not proceed until the user approves the draft.
-6. Once approved, finalize the command markdown and place in the `.opencode/commands` directory
-7. Document the command in the README.md file and any other relevant documentation.
+1. Review [command authoring docs](https://opencode.ai/docs/commands) and [examples](https://claude.ai/public/artifacts/e2725e41-cca5-48e5-9c15-6eab92012e75)
+2. Gather requirements: functionality, inputs, outputs, constraints
+3. Draft command in markdown following example format
+4. Review with user, revise until approved (do not proceed without approval)
+5. Place final command in `.opencode/commands/` directory
+6. Document in README.md
 
-## Special placeholders supported by the agent framework
+## Framework placeholders
 
-- `$ARGUMENTS` — the full argument string passed to the command.
-- `$1`, `$2`, ... — individual positional arguments.
-- `!`command`` — runs a shell command and injects its stdout into the prompt. Use sparingly and document side effects.
-- `@path/to/file` — includes the contents of a repository file in the prompt.
+- `$ARGUMENTS` — full argument string
+- `$1`, `$2`... — positional arguments
+- `!command` — inject command stdout into prompt (use sparingly)
+- `@path/to/file` — include file contents in prompt
 
-## Scripts (canonical runner & modules)
+## Scripts
 
-This skill does not ship a canonical CLI runner script. The recommended invocation is via Pi prompts or the agent command framework using the provided templates.
+No CLI runner script. Use Pi prompt invocation or agent command framework.
 
 - Template: `./assets/command-template.md`
 
-Preferred execution behaviour (policy)
+### Policy
 
-- Agents SHOULD prefer using the repository's canonical scripts when available. For skills that do not provide scripts, use the documented prompt invocation or command framework.
-- Do NOT perform ad-hoc commits, pushes, or repository edits without explicit human approval.
+- Prefer canonical scripts where available
+- No ad-hoc commits/pushes without explicit approval
 
-Usage examples
+### Examples
 
-- Prompt-based (recommended):
-
-  /skill:author-command "Create a command to format dates for display"
-
-- Worklog context example (use this example Worklog id in documentation):
-
-  wl show SA-0MPYMFZXO0004ZU4 --json
+```
+/skill:author-command "Create a command to format dates for display"
+wl show SA-0MPYMFZXO0004ZU4 --json
+```
 
 End.

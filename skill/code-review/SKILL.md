@@ -11,144 +11,97 @@ This skill guides the agent in conducting professional and thorough code reviews
 
 ## Workflow
 
-### 1. Determine Review Target
+### 1. Review Target
 
-**Local Changes**: Target the current local file system states (staged and unstaged changes).
+**Local Changes**: Target staged and unstaged changes in the working tree.
 
 ### 2. Preparation
 
-1. **Identify Changes**:
-    * Check status: `git status`
-    * Read diffs: `git diff` (working tree) and/or `git diff --staged` (staged).
+- **Identify Changes**: `git status` to check state; `git diff` and `git diff --staged` to read diffs.
 
-### 3. In-Depth Analysis
+### 3. Analysis
 
-Analyze the code changes based on the following pillars:
+Evaluate changes against:
 
-* **Correctness**: Does the code achieve its stated purpose without bugs or logical errors?
-* **Maintainability**: Is the code clean, well-structured, and easy to understand and modify in the future? Consider factors like code clarity, modularity, and adherence to established design patterns.
-* **Readability**: Is the code well-commented (where necessary) and consistently formatted according to our project's coding style guidelines?
-* **Efficiency**: Are there any obvious performance bottlenecks or resource inefficiencies introduced by the changes?
-* **Security**: Are there any potential security vulnerabilities or insecure coding practices?
-* **Edge Cases and Error Handling**: Does the code appropriately handle edge cases and potential errors?
-* **Testability**: Is the new or modified code adequately covered by tests (even if preflight checks pass)? Suggest additional test cases that would improve coverage or robustness.
+- **Correctness**: Does the code achieve its purpose without bugs?
+- **Maintainability**: Clean, well-structured, easy to modify?
+- **Readability**: Well-commented and consistently formatted?
+- **Efficiency**: Any performance bottlenecks?
+- **Security**: Any vulnerabilities or insecure practices?
+- **Edge Cases & Error Handling**: Appropriate handling?
+- **Testability**: Adequately covered by tests?
 
-### 4. Provide Feedback
+### 4. Feedback
 
-Structure:
-**Summary**: A high-level overview of the review.
-**Findings**:
+**Summary**: High-level overview.
+**Findings**: Critical (bugs, security), Smells (quality/performance), Nitpicks (formatting, optional).
 
-* **Critical**: Bugs, security issues, or breaking changes.
-* **Smells**: Suggestions for better code quality or performance.
-* **Nitpicks**: Formatting or minor style issues (optional).
-
-#### Tone
-
-* Be constructive, professional, and friendly.
-* Explain *why* a change is requested.
+**Tone**: Constructive, professional, friendly. Explain *why* a change is requested.
 
 ## Automated Linting (Code Quality)
 
-In addition to AI-driven analysis, this skill provides **automated linting** through a set of canonical Python scripts in `../code-review/scripts/`. These scripts detect project languages, probe for available linters, run them, and classify findings by severity.
+Provides **automated linting** via canonical Python scripts in `../code-review/scripts/`. Runs as part of an audit or standalone.
 
 ### Pipeline
 
-The code quality pipeline runs automatically as part of an audit (via `audit_runner.py`) but can also be invoked standalone:
+1. **Language Detection** (`detection.py`) — Scans file extensions (`.py`→Python, `.ts`→TypeScript)
+2. **Linter Probing** (`detection.py`) — Checks linter availability (ruff, eslint)
+3. **Linting** (`linter_runner.py`) — Runs linters, parses JSON output
+4. **Severity Classification** (`linter_runner.py`) — Maps to critical/high/medium/low
+5. **Work Item Creation** (`create_quality_epics.py`) — Creates/reuses "Quality Improvement" epic
 
-1. **Language Detection** (`detection.py`): Scans the project tree for known file extensions (`.py` → Python, `.ts`/`.tsx` → TypeScript).
-2. **Linter Probing** (`detection.py`): Checks if recommended linters (ruff for Python, eslint for TypeScript) are available on `PATH`.
-3. **Linting** (`linter_runner.py`): Runs each available linter and parses its JSON output.
-4. **Severity Classification** (`linter_runner.py`): Maps raw linter output to standardised severity levels (critical, high, medium, low).
-5. **Work Item Creation** (`create_quality_epics.py`): Creates or reuses a "Quality Improvement - Refactoring" epic and adds child tasks for each finding. Newly created epics and child tasks start at stage ``intake_complete`` so they are ready for planning without manual intake.
-
-### Canonical Scripts
+### Scripts
 
 | Script | Purpose |
 |--------|---------|
-| `../code-review/scripts/code_quality.py` | Orchestrator — runs the full pipeline and outputs JSON |
-| `../code-review/scripts/detection.py` | Language detection and linter probing |
-| `../code-review/scripts/linter_runner.py` | Linter execution and severity classification |
-| `../code-review/scripts/create_quality_epics.py` | Work item creation for findings |
+| `code_quality.py` | Orchestrator — runs full pipeline |
+| `detection.py` | Language + linter detection |
+| `linter_runner.py` | Linter execution + severity |
+| `create_quality_epics.py` | Work item creation |
 
-### Standalone Usage
-
-Run the full code quality check on a project:
+### Usage
 
 ```bash
-python3 ../code-review/scripts/code_quality.py --path /path/to/project --json
-```
-
-Filter to specific languages:
-
-```bash
-python3 ../code-review/scripts/code_quality.py --languages python --json
-```
-
-Dry-run quality epic creation:
-
-```bash
-python3 ../code-review/scripts/create_quality_epics.py \
-    --findings '<json-array>' --dry-run
+python3 ../code-review/scripts/code_quality.py --path . --json
+python3 ../code-review/scripts/create_quality_epics.py --findings '<json>' --dry-run
 ```
 
 ### Linter Prerequisites
 
-| Language | Linter | Requirement |
-|----------|--------|-------------|
-| Python | [ruff](https://docs.astral.sh/ruff/) | `ruff` on PATH (install via pip) |
-| TypeScript | [ESLint](https://eslint.org/) | `eslint` on PATH (install via npm) |
-| Markdown | [markdownlint-cli](https://github.com/igmpaul/markdownlint-cli) | `markdownlint` on PATH (install via npm) |
-| Shell | [ShellCheck](https://shellcheck.net/) | `shellcheck` on PATH (install via apt/brew) |
-| JavaScript/Node | [ESLint](https://eslint.org/) | `eslint` on PATH (install via npm) |
-| C# | [dotnet-format](https://github.com/dotnet/format) | `dotnet` on PATH (install via dotnet SDK) |
+| Language | Linter |
+|----------|--------|
+| Python | [ruff](https://docs.astral.sh/ruff/) |
+| TypeScript/JS | [ESLint](https://eslint.org/) |
+| Markdown | [markdownlint-cli](https://github.com/igmpaul/markdownlint-cli) |
+| Shell | [ShellCheck](https://shellcheck.net/) |
+| C# | [dotnet-format](https://github.com/dotnet/format) |
 
-If a linter is not available, the corresponding language is skipped gracefully with empty findings (no error).
+If a linter is unavailable, the corresponding language is skipped gracefully.
 
 ### Severity Classification
 
-| Linter | Raw Severity | Normalised |
-|--------|-------------|------------|
-| ruff | F (Pyflakes error) | critical |
-| ruff | E (pycodestyle error), S (security) | high |
-| ruff | W (warning), D (docstring), N (naming), UP, ANN, B, SIM, T20, PL, RUF | medium |
-| ruff | C (complexity), ISC, PIE, COM | low |
-| eslint | 2 / "error" | high |
-| eslint | 1 / "warn" | medium |
-| eslint | 0 / "off" | low |
-| markdownlint | "error" | high |
-| markdownlint | "warning" | medium |
-| shellcheck | "error" | high |
-| shellcheck | "warning" | medium |
-| dotnet-format | (any) | medium |
+| Linter | Critical | High | Medium | Low |
+|--------|----------|------|--------|-----|
+| ruff | F | E, S | W, D, N, UP, ANN… | C, ISC, PIE |
+| eslint | — | 2/"error" | 1/"warn" | 0/"off" |
+| markdownlint | — | "error" | "warning" | — |
+| shellcheck | — | "error" | "warning" | — |
+| dotnet-format | — | — | (any) | — |
 
 ### Audit Integration
 
-When used via the audit runner (`../audit/scripts/audit_runner.py`):
+Via `../audit/scripts/audit_runner.py`: Critical/high findings block closure ("Ready to close: No"); medium/low are warnings only. Findings auto-create/reuse a quality epic. If module unavailable, audit continues with warning.
 
-* The code quality check runs **before** acceptance criteria verification.
-* **Critical and high** severity findings block closure ("Ready to close: No").
-* **Medium and low** findings are reported as warnings but do not block closure.
-* Findings automatically create/reuse a "Quality Improvement - Refactoring" epic with child tasks.
-* If the `code_quality` module is unavailable, the audit continues with a warning.
+## Policy
 
-## Scripts (canonical runner & modules)
+- **Prefer canonical scripts** over ad-hoc linting commands.
+- **Do NOT** auto-commit or push without explicit approval.
 
-This skill now ships several canonical in-repo CLI scripts (see [Canonical Scripts](#canonical-scripts) above). Agents should prefer these over ad-hoc linting commands.
+## Worklog context
 
-Preferred execution behaviour (policy)
-
-* Agents SHOULD prefer running the repository's canonical linters and test scripts rather than issuing ad-hoc checks.
-* Do NOT make automatic commits or push changes without explicit human approval.
-
-Usage example (worklog context)
-
-* To fetch the work item context before a review:
-
-  wl show SA-0MPYMFZXO0004ZU4 --json
-
-* To run code quality checks programmatically (e.g., from an audit):
-
-  python3 ../code-review/scripts/code_quality.py --path . --json
+```bash
+wl show SA-0MPYMFZXO0004ZU4 --json
+python3 ../code-review/scripts/code_quality.py --path . --json
+```
 
 End.

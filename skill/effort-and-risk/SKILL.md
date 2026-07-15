@@ -6,136 +6,79 @@ description: "Produce engineering effort and risk estimates using WBS, three-poi
 Purpose
 -------
 
-Produce a concise, auditable engineering estimate (effort + risk) for a prepared work item. The skill's canonical outputs are:
+Produce a machine-readable engineering estimate (effort + risk) and human-readable summary for a prepared work item.
 
-- A machine-readable JSON object containing effort (effort_units, tshirt size, O/M/P, expected, recommended, range), risk (probability, impact, score, level, top drivers, mitigations), confidence, assumptions, and unknowns.
-- A machine-readable JSON object containing effort (effort_units, tshirt size (full-text, e.g. "Small", "Extra Large"), O/M/P, expected, recommended, range), risk (probability, impact, score, level, top drivers, mitigations), confidence, assumptions, and unknowns.
-- A human-readable summary generated and posted by the orchestrator; the posted content is included in the orchestrator output.
+**Outputs**: JSON object with effort (units, t-shirt size, O/M/P, expected, recommended, range), risk (probability, impact, score, level, drivers, mitigations), confidence, assumptions, unknowns. Human summary posted by orchestrator.
 
 ## Status lifecycle
 
-This skill manages the work item status during execution to signal that the item is being processed.
+1. **Claim**: `wl update <issue-id> --status in_progress --json` (before any other step)
+2. **Release**: `wl update <issue-id> --status open --json` (end of execution, success or failure)
 
-1. **Before any other step** (including the gating check below), claim the work item by running:
-   `wl update <issue-id> --status in_progress --json`
-2. **At the end of execution** (whether success or failure), set status to `open`:
-   `wl update <issue-id> --status open --json`
+> Stage is NOT modified. Only `--status` is used.
 
-> Stage is NOT modified by this skill. Only `--status` is used.
+## Gating
 
-Gating (mandatory)
--------------------
+Issue MUST be in `intake_complete` or `plan_complete` stage. If not, refuse with: "The issue does not have a sufficiently detailed plan... Run the intake command with `/intake <issue-id>` or the plan command with `/skill:plan <issue-id>`." No other output on refusal.
 
-Before doing any work the issue MUST be in the `intake_complete` or `plan_complete` stage. If it is not, refuse and output ONLY this single sentence (replace <issue-id> with the actual id):
+## Orchestrator
 
-The issue does not have a sufficiently detailed plan, to proceed it must be in the stage of `intake_complete` or `plan_complete`. Run the intake command with `/intake <issue-id>` or the plan command with `/skill:plan <issue-id>`.
+`orchestrate_estimate.py` accepts items in `intake_complete` or `plan_complete` stages. Estimates can be applied early and refined later.
 
-Do not output any other text when refusing.
+## When to use
 
-Orchestrator behavior
----------------------
+After Producer sets stage to `intake_complete` or `plan_complete`.
 
-The `orchestrate_estimate.py` script accepts work items in either `intake_complete` or `plan_complete` stages when applying effort and risk updates. This allows estimates to be applied early in the intake phase and refined later if needed. The script uses the same stage validation for both calculation and update phases.
+## Required inputs
 
-When to use
------------
+- Issue ID (fetch with `wl show <id> --json`)
+- WBS from child work items (or parent item itself for small scope)
+- O/M/P estimates (overall, optionally per-item; scripts aggregate)
+- Overheads: coordination, review, testing, risk buffer (listed separately)
+- Risk: Probability (1–5) and Impact (1–5) for parent and each child, with short titles
+- Certainty % (0–100)
+- Assumptions and unknowns (short strings each)
 
-Use this skill only after the Producer has prepared a plan and set the work item's stage to `intake_complete` or `plan_complete`.
+## Principles
 
-Required inputs (what you must prepare before running the scripts)
-----------------------------------------------------------------
+- Canonical unit: effort_units
+- Estimate: E = (O + 4M + P) / 6 (PERT)
+- Surface assumptions and unknowns explicitly
+- T-shirt boundaries from `references/t-shirt_sizes.json`
 
-- issue id (string). Fetch the full issue and its children for auditability: wl show <issue-id> --json
-- A lightweight WBS. Use the issue's child work items as the WBS source (children are returned recursively by wl show --json). If the issue has no children and the scope is small, the parent issue itself can be treated as the WBS.
-- Provide Optimistic (O), Most Likely (M), and Pessimistic (P) estimates in effort_units for the overall work scope. Optionally (for traceability), provide O/M/P per WBS item or per child issue; the scripts will aggregate per-item inputs into the overall estimate when present.
-- Explicit additive overheads (effort_units): coordination, review, testing/integration, risk buffer. These MUST be listed separately (do not hide them inside O/M/P).
-- Parent and child risk inputs: for the parent issue and for each child, a Probability (1–5) and Impact (1–5). Include short titles for children to aid triage.
-- Certainty % (0–100) representing the assessor's confidence in the provided inputs.
-- Clear lists of assumptions and unknowns (each as short strings).
+## Workflow (from repo root)
 
-Principles (kept brief)
------------------------
+1. Fetch issue: `wl show <issue-id> --json`
+2. Prepare JSON input with items, O/M/P, overheads, risk, certainty, assumptions, unknowns
+3. Run orchestrator, capture output to `<issue-id>`-based filename:
 
-- Use effort_units as the canonical unit.
-- Use three-point (PERT) estimating for expected value: E = (O + 4*M + P) / 6.
-- Surface assumptions and unknowns explicitly so reviewers can decide if further planning (spikes) is needed.
-- T-shirt sizing boundaries are defined in references/t-shirt_sizes.json; scripts use that file to pick sizes.
+   ```sh
+   python3 ./scripts/run_skill.py --issue <id> <<'JSON' > final-<id>.json
+   { "items": [...], "o": ..., "m": ..., "p": ..., "overheads": {...}, "parent": {...}, "children": [...], "certainty": 85, "assumptions": [...], "unknowns": [...] }
+   JSON
+   ```
 
-Canonical workflow (minimal, authoritative)
------------------------------------------
+   The script gates, computes, updates issue metadata, and posts a comment. Returns JSON with `human_text` and `comment_result`.
 
-Follow these steps from the project root (run commands from the repository root, not from the `../effort_and_risk` directory):
+4. Verify: `wl show <issue-id> --format full`
 
-1) Fetch the issue and its children (audit file):
+## Scripts
 
-   wl show <issue-id> --json
+- Orchestrator: `./scripts/orchestrate_estimate.py`
+- CLI wrapper: `./scripts/run_skill.py`
+- Calculators: `calc_effort.py`, `calc_risk.py`, `calc_effort_with_risk.py`
+- Formatters: `assemble_json.py`, `json_to_human.py`
 
-2) Prepare the inputs (JSON) using the plan and WBS. The input should include keys such as:
+### Policy
 
-   {
-     "items": [{"id":"CHILD-1","title":"Design","o":2,"m":4,"p":6}, ...],
-     "o": <effort_units>, "m": <effort_units>, "p": <effort_units>,
-     "overheads": {"coordination": <h>, "review": <h>, "testing": <h>, "risk_buffer": <h>},
-     "parent": {"probability": <1-5>, "impact": <1-5>},
-     "children": [{"id":"ISSUE-1","probability":2,"impact":1,"title":"child A"}, ...],
-     "certainty": 85,
-     "assumptions": ["..."],
-     "unknowns": ["..."]
-   }
+- **Prefer orchestrator script** over ad-hoc commands
+- If script missing/fails, request human guidance
 
-3) Run the orchestrator. Prefer capturing output to a filename derived from the work-item id (avoid fixed names):
-
-       ```sh
-       python3 ./scripts/run_skill.py --issue <issue-id> <<'JSON' > final-<issue-id>.json
-       { ... }
-       JSON
-       ```
-
-    The orchestrator enforces gating, computes effort and risk, updates issue metadata, and posts the comment. The script returns a single JSON object that includes:
-   - human_text (the content of the posted comment)
-   - comment_result (CLI response details)
-
-4) Verify what was posted by inspecting the generated output file (for example `final-<issue-id>.json`) or, if needed, the issue itself:
-
-   wl show <issue-id> --format full
-
-Outputs
--------
-
-- `final-<issue-id>.json` (or captured stdout): canonical machine-readable estimate (as described above), plus orchestration metadata including human_text and comment_result. Prefer filenames generated from the work-item id to avoid fixed temporary filenames.
-
-References (bundled)
---------------------
-
-- references/t-shirt_sizes.json — T-shirt thresholds used by scripts
-- ./scripts/calc_effort.py
-- ./scripts/calc_risk.py
-- ./scripts/calc_effort_with_risk.py
-- ./scripts/assemble_json.py
-- ./scripts/json_to_human.py
-- ./scripts/orchestrate_estimate.py
-
-## Scripts (canonical runner & modules)
-
-- Orchestrator: `./scripts/orchestrate_estimate.py` (invokes the local calc scripts and performs wl updates)
-- Helper CLI wrapper: `./scripts/run_skill.py`
-
-Example (recommended invocation using the repository Worklog id shown in documentation):
+### Example
 
 ```sh
-# Using SA-0MPYMFZXO0004ZU4 as the work-item id for examples
 python3 ./scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > final-SA-0MPYMFZXO0004ZU4.json
 { ... }
 JSON
-```
-
-Preferred execution behaviour (policy)
-
-- Agents MUST prefer the repository's listed orchestrator script when applying estimates and updates to Worklog. Do not attempt to replace the orchestrator with ad-hoc commands.
-- If the script is missing or fails, request human guidance before proceeding.
-
-Verification example
-
-```sh
 wl show SA-0MPYMFZXO0004ZU4 --format full
 ```

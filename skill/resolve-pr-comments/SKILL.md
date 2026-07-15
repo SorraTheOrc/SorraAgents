@@ -37,272 +37,98 @@ Provide one of:
 
 ## Workflow
 
+## Workflow
+
 ### Phase 1: Discovery (Read-Only)
 
-#### Step 1.1: Get PR metadata
-
-```bash
-gh pr view <PR_NUMBER> --repo <OWNER/REPO> --json headRefName,baseRefName,title,url
-```
-
-#### Step 1.2: Fetch all review comments
-
-```bash
-gh api repos/<OWNER>/<REPO>/pulls/<PR_NUMBER>/comments
-```
-
-This returns an array of review comments with:
-
-- `id`: Comment ID for replies
-- `body`: The review comment text
-- `path`: File path
-- `line` / `original_line`: Line number(s)
-- `diff_hunk`: Code context
-- `user.login`: Reviewer username
-
-#### Step 1.3: Fetch general PR comments (non-code)
-
-```bash
-gh api repos/<OWNER>/<REPO>/issues/<PR_NUMBER>/comments
-```
-
-#### Step 1.4: Checkout the PR branch
-
-```bash
-git fetch origin <branch_name>
-git checkout <branch_name>
-```
-
-#### Step 1.5: Read referenced code
-
-For each code review comment, read the file and surrounding context:
-
-```bash
-# Use Read tool to examine the file at the specified line
-```
-
----
+1. **Get PR metadata**: `gh pr view <PR_NUMBER> --repo <OWNER/REPO> --json headRefName,baseRefName,title,url`
+2. **Fetch review comments**: `gh api repos/<OWNER>/<REPO>/pulls/<PR_NUMBER>/comments` — returns comments with `id`, `body`, `path`, `line`, `diff_hunk`, `user.login`.
+3. **Fetch general PR comments**: `gh api repos/<OWNER>/<REPO>/issues/<PR_NUMBER>/comments`
+4. **Checkout the PR branch**: `git fetch origin <branch_name> && git checkout <branch_name>`
+5. **Read referenced code**: For each comment, read the file at the specified line.
 
 ### Phase 2: Analysis & Planning
 
-#### Step 2.1: Categorize each comment
+Categorize each **code review comment** as: (1) **Actionable fix**, (2) **Suggestion to evaluate**, (3) **Question**, or (4) **Disagreement**. General PR comments are not actioned automatically — propose a response in chat.
 
-For each **code review comment**, categorize as one of:
-
-1. **Actionable fix**: Clear code change requested
-2. **Suggestion to evaluate**: Proposed improvement that needs consideration
-3. **Question**: Needs a response but no code change
-4. **Disagreement**: The comment suggests a change that would be incorrect or harmful
-
-For each **general PR comment** (non-code):
-
-- These will NOT be actioned automatically
-- Propose a response in chat for the user to review
-
-#### Step 2.2: Present the plan
-
-Output a structured plan in this format:
+Present a structured plan:
 
 ```
 ## PR Review Resolution Plan
-
-**PR:** #<number> - <title>
-**Branch:** <branch_name>
-**Comments found:** <X> code review comments, <Y> general comments
-
----
+**PR:** #<number> - <title> | **Branch:** <branch_name> | **Comments:** <X> code, <Y> general
 
 ### Code Review Comments
+#### [<file>:<line>] by @<reviewer>
+> <quoted comment>
+**Category:** Actionable fix | **Action:** <description> | **Files:** <list>
 
-#### Comment 1: [<file>:<line>] by @<reviewer>
-> <quoted comment body>
+#### [<file>:<line>] by @<reviewer>
+> <quoted comment>
+**Category:** Disagreement | **Reasoning:** <explanation> | **Response:** <reply>
 
-**Category:** Actionable fix
-**Proposed action:** <description of the fix>
-**Files to modify:** <list of files>
+### General PR Comments
+#### by @<reviewer>
+> <quoted comment> | **Proposed response:** <suggested reply>
 
----
-
-#### Comment 2: [<file>:<line>] by @<reviewer>
-> <quoted comment body>
-
-**Category:** Disagreement
-**Reasoning:** <explanation of why the suggested change is incorrect>
-**Proposed response:** <reply to post explaining the disagreement>
-
----
-
-### General PR Comments (No automatic action)
-
-#### Comment A: by @<reviewer>
-> <quoted comment body>
-
-**Proposed response:** <suggested reply for user to review>
-
----
-
-## Summary
-
-- **Fixes to implement:** <N>
-- **Disagreements to explain:** <N>
-- **Questions to answer:** <N>
-- **General comments needing response:** <N>
-
-**Ready to proceed?** Reply "yes" to implement fixes and post responses, or provide feedback on specific items.
+**Summary:** <N> fixes, <N> disagreements, <N> questions, <N> general responses
+**Ready to proceed?** Reply "yes" to implement, or provide feedback.
 ```
-
----
 
 ### Phase 3: Execution (After Approval)
 
 Only proceed after user confirms the plan.
 
-#### Step 3.1: Implement code fixes
+1. **Implement fixes**: Edit files for each approved actionable fix; track addressed comment IDs.
+2. **Build, test, commit**: Follow build → test → commit order. Never commit without passing tests.
 
-For each approved actionable fix:
+   ```bash
+   npm run build && npm --silent test && git add <files> \
+     && git commit -m "Address PR review feedback\n\n- <summary of fix 1>\n- <summary of fix 2>" \
+     && git push origin <branch_name>
+   ```
 
-1. Use Edit tool to make the change
-2. Track which comment IDs were addressed
+   Capture the commit hash for replies.
 
-#### Step 3.2: Build, test, commit and push
+3. **Reply to threads**:
 
-Before committing, follow the mandatory build → test → commit order: build the project and verify no errors, then run all tests and verify they pass, and only then commit changes. Never commit before verifying that the build and tests pass.
+   ```bash
+   gh api repos/<OWNER>/<REPO>/pulls/<PR_NUMBER>/comments \
+     -X POST -f body="<action or explanation>" -F in_reply_to=<COMMENT_ID>
+   ```
 
-```bash
-# Build the project first
-npm run build  # or the project's build command
+   - Fixes: `Fixed in <hash>. <description>`
+   - Disagreements: `Current implementation is correct because <reasoning>.`
 
-# Then run all tests
-npm --silent test  # or the project's quiet test command
+4. **Resolve threads**: Fetch thread IDs via GraphQL, then resolve each:
 
-# Only commit after build and tests pass
-git add <modified_files>
-git commit -m "Address PR review feedback
+   ```bash
+   # Get thread IDs
+   gh api graphql -f query='query { repository(owner:"<OWNER>", name:"<REPO>") { pullRequest(number: <N>) { reviewThreads(first:100) { nodes { id isResolved comments(first:1) { nodes { databaseId } } } } } } }'
+   # Resolve each addressed thread
+   gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "<THREAD_ID>"}) { thread { isResolved } } }'
+   ```
 
-- <summary of fix 1>
-- <summary of fix 2>
-..."
-git push origin <branch_name>
-```
+5. **Report completion**: Output a summary with commit hash, fixes applied, disagreements explained, threads resolved, and pending items.
 
-Capture the commit hash for reference in replies.
+## Guidelines
 
-#### Step 3.3: Reply to code review comment threads
-
-For each comment addressed (fix or disagreement):
-
-```bash
-gh api repos/<OWNER>/<REPO>/pulls/<PR_NUMBER>/comments \
-  -X POST \
-  -f body="<description of action taken or disagreement explanation>" \
-  -F in_reply_to=<COMMENT_ID>
-```
-
-**Reply templates:**
-
-For fixes:
-
-```
-Fixed in <commit_hash>. <brief description of what was changed>
-```
-
-For disagreements:
-
-```
-After review, I believe the current implementation is correct because <reasoning>.
-<optional: suggest alternative or offer to discuss further>
-```
-
-#### Step 3.4: Resolve review threads
-
-First, get thread IDs:
-
-```bash
-gh api graphql -f query='
-query {
-  repository(owner: "<OWNER>", name: "<REPO>") {
-    pullRequest(number: <PR_NUMBER>) {
-      reviewThreads(first: 100) {
-        nodes {
-          id
-          isResolved
-          comments(first: 1) {
-            nodes {
-              databaseId
-            }
-          }
-        }
-      }
-    }
-  }
-}'
-```
-
-Map comment IDs to thread IDs, then resolve each addressed thread:
-
-```bash
-gh api graphql -f query='
-mutation {
-  resolveReviewThread(input: {threadId: "<THREAD_ID>"}) {
-    thread {
-      isResolved
-    }
-  }
-}'
-```
-
-#### Step 3.5: Report completion
-
-Output a summary:
-
-```
-## PR Review Resolution Complete
-
-**Commit:** <hash>
-**Fixes applied:** <N>
-**Disagreements explained:** <N>
-**Threads resolved:** <N>
-
-### Actions taken:
-1. [<file>:<line>] - <action taken>
-2. [<file>:<line>] - <action taken>
-...
-
-### Threads resolved:
-- Comment by @<reviewer>: <brief description>
-...
-
-### Pending (requires manual action):
-- General comment by @<reviewer>: <proposed response provided above>
-```
-
----
-
-## Important guidelines
-
-1. **Never auto-execute**: Always present the plan and wait for approval before making changes
-2. **Respect disagreements**: It's valid to disagree with a review comment - explain why clearly and professionally
-3. **Group related fixes**: If multiple comments relate to the same issue, address them together
-4. **Reference commits**: Always include commit hashes in replies so reviewers can verify
-5. **Don't resolve questions**: Only resolve threads where you've taken action or explained a disagreement
-6. **Verify push access**: Before making changes, ensure the branch can be pushed to
-7. **Handle conflicts**: If the branch has conflicts or is behind, notify the user before proceeding
+1. **Never auto-execute** — present the plan and wait for approval
+2. **Respect disagreements** — explain why clearly and professionally
+3. **Group related fixes** from multiple comments on the same issue
+4. **Reference commits** in replies so reviewers can verify
+5. **Don't resolve questions** — only threads where action was taken
+6. **Verify push access** before making changes
+7. **Handle conflicts** — notify user if the branch is behind
 
 ## Error handling
 
-- **Comment on outdated code**: Note this in the plan; the fix may need adjustment
-- **Ambiguous requests**: Ask for clarification in the plan rather than guessing
-- **Permission denied**: Report the error and suggest the user check repository access
-- **Branch not found**: Verify the PR is still open and the branch exists
+- **Comment on outdated code**: Note in the plan; fix may need adjustment
+- **Ambiguous requests**: Ask for clarification rather than guessing
+- **Permission denied**: Report and suggest checking repository access
+- **Branch not found**: Verify the PR is still open
 
-## Scripts (canonical runner & modules)
+## Scripts
 
-- This skill does not ship a multi-step orchestrator script. The recommended flow uses `gh` + local edit/build/test steps as documented above.
-
-## Worklog example (documentation)
-
-- To fetch a work item that may be referenced in a PR description or branch name:
-
-  wl show SA-0MPYMFZXO0004ZU4 --json
+This skill does not ship an orchestrator script. Use `gh` + local edit/build/test steps as documented above.
 
 End.

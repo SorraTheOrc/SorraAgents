@@ -9,177 +9,93 @@ Use this skill when asked to run batch intake on all `idea` stage work items. It
 
 ## Behavior
 
-1. **Pre-processing — orphan recovery**: Query `wl list --stage idea --json` (no status filter) to discover ALL items in `idea` stage. Orphaned items in contradictory states (`status=completed` + `stage=idea` or `status=in_progress` + `stage=idea`) are automatically reset to `status=open` via `_recover_orphans()` before any processing begins.
-2. **Signal handler registration**: SIGINT and SIGTERM handlers are registered. If an external abort (Ctrl+C) occurs during processing, the currently-active item is recovered (reset to `status=open, stage=idea`) before the process exits.
+1. **Orphan recovery**: Query `wl list --stage idea --json` to find items in `idea` stage. Orphans (`status=completed` + `stage=idea` or `status=in_progress` + `stage=idea`) are reset to `status=open` via `_recover_orphans()` before processing.
+2. **Signal registration**: SIGINT/SIGTERM handlers recover the active item (reset to `status=open, stage=idea`) on abort.
 3. For each item:
-   - If the item has sufficient detail (acceptance criteria + implementation guidance), auto-complete it to `intake_complete` without invoking `/intake`
-   - Otherwise, **skip the interactive `/intake` subprocess** (which would block indefinitely waiting for stdin in batch mode) and mark the item as `needs_input` in the summary report. The item remains in `idea` stage for manual processing.
-4. On error, attempt recovery (reset item stage to `idea` and status to `open`) and record recovery outcome
-5. Continue processing remaining items even when one requires input or encounters an error
-6. Produce a summary report showing totals and per-item outcomes with error/recovery details
+   - If sufficient detail (ACs + implementation guidance), auto-complete to `intake_complete` without invoking `/intake`
+   - Otherwise, **skip the interactive `/intake` subprocess** (blocks indefinitely waiting for stdin) and mark as `needs_input`
+4. On error, attempt recovery (reset to `stage=idea, status=open`) and record outcome
+5. Continue processing remaining items despite errors/input-needs
+6. Produce summary report
 
-## Command invocation
+## Invocation
 
-IntakeAll can be invoked in the following ways:
-
-- `/skill:intakeall` — Process all idea-stage items with markdown summary output
-- `/skill:intakeall --json` — JSON output for programmatic consumption
-- `/skill:intakeall --parent-id <id>` — Post the summary as a comment on the specified parent work item
-- `/skill:intakeall --dry-run` — Simulate processing without making any changes
-- `/skill:intakeall --max N` — Process at most N items, then stop
-- `/skill:intakeall --item-timeout N` — Set per-item subprocess timeout in seconds (default: 600)
-- `python3 ./scripts/intakeall.py` — Direct Python invocation
-- `pi run /intakeall` — Agent framework invocation
+```
+/skill:intakeall [--json] [--parent-id <id>] [--dry-run] [--max N] [--item-timeout N]
+python3 ./scripts/intakeall.py [same flags]
+pi run /intakeall
+```
 
 ## Output
 
-After processing all items, IntakeAll produces a summary report:
-
+### Markdown summary
 ```
 # IntakeAll Summary
-
-**Total processed**: 5
-**Auto-completed**: 2
-**Intake completed**: 1
-**Needs input**: 1
-**Errors**: 1
-**Remaining**: 0
-
-## Results
-
+**Total**: 5 | **Auto-completed**: 2 | **Intake completed**: 1 | **Needs input**: 1 | **Errors**: 1
 - **SA-ITEM-001**: `auto_completed`
-- **SA-ITEM-002**: `auto_completed`
-- **SA-ITEM-003**: `intake_completed`
-- **SA-ITEM-004**: `needs_input`
-- **SA-ITEM-005**: `error`
-  - Error: Intake failed (rc=1): timeout exceeded
-  - Recovery: `reset_status_to_open_with_stage_idea` ✓
+- **SA-ITEM-005**: `error` — Intake failed (rc=1): timeout exceeded | Recovery: reset_status_to_open_with_stage_idea ✓
 ```
 
-When `--json` is used, the output is a JSON object:
-
+### JSON output (`--json`)
 ```json
 {
-  "total": 5,
-  "auto_completed": 2,
-  "intake_completed": 1,
-  "needs_input": 1,
-  "errors": 1,
-  "remaining": 0,
+  "total": 5, "auto_completed": 2, "intake_completed": 1, "needs_input": 1, "errors": 1,
   "items": [
-    {"id": "SA-ITEM-001", "title": "...", "outcome": "auto_completed", "error_detail": null, "recovery": null},
-    {"id": "SA-ITEM-005", "title": "...", "outcome": "error", "error_detail": "Intake failed (rc=1): timeout exceeded", "recovery": {"action": "reset_status_to_open_with_stage_idea", "success": true}}
+    {"id": "SA-ITEM-001", "outcome": "auto_completed"},
+    {"id": "SA-ITEM-005", "outcome": "error", "error_detail": "...", "recovery": {"action": "reset_status_to_open_with_stage_idea", "success": true}}
   ]
 }
 ```
 
 ## Auto-complete criteria
 
-Items with sufficient detail are auto-completed to `stage=intake_complete, status=open` without invoking `/intake`:
-
-- Item is NOT an epic
-- Description contains measurable acceptance criteria (e.g., `## Acceptance Criteria` or `## Success Criteria`)
-- Description has an implementation section (e.g., `## Implementation`, `## Desired Change`, `## Proposed Approach`)
-
-This mirrors the PlanAll v2 auto-complete pattern (`has_sufficient_detail()`).
+Item is auto-completed to `stage=intake_complete, status=open` if: NOT an epic, description has measurable ACs (`## Acceptance Criteria` or `## Success Criteria`), and has an implementation section. Mirrors PlanAll's `has_sufficient_detail()`.
 
 ## Needs-input detection
 
-In batch mode, items that fail the `has_sufficient_detail()` check are marked as `needs_input` without invoking `/intake`. The interactive `/intake` subprocess (which blocks indefinitely waiting for stdin) is skipped to allow batch processing to continue.
+Items failing `has_sufficient_detail()` are marked `needs_input` without invoking `/intake` (the interactive subprocess blocks in batch mode). Direct `_invoke_intake()` detects needs by non-zero exit, question patterns, or exceptions.
 
-The `_invoke_intake()` method is still available for direct invocation and detects producer-input needs by:
+## Error handling
 
-- Non-zero exit code from the `/intake` command
-- Presence of question-like patterns in the output (e.g., `? (yes/no)`, "What should", "Do you want")
-- Any exception during the intake invocation
-
-Items flagged as `needs_input` are not retried — the skill moves on to the next item.
-
-## Orphan recovery
-
-Before processing any items, `_recover_orphans()` scans all discovered items for orphaned states:
-
-- Any item in `stage=idea` with `status=completed` is detected as an orphan
-- Any item in `stage=idea` with `status=in_progress` is detected as an orphan
-- Each orphan is reset via `wl update <id> --stage idea --status open --json`
-- If `wl` rejects the status transition (e.g., `completed→open` is not allowed), the error is logged and processing continues — the item's in-memory status is still set to `open`
-- Items already at `status=open` are unaffected
-- During dry-run mode, no actual `wl` calls are made
-
-## Signal handling (abort recovery)
-
-SIGINT (Ctrl+C) and SIGTERM handlers are registered at the start of `run_all()`:
-
-- The handler tracks which work item is currently being processed via `_current_item_id`
-- On signal, the handler calls `_attempt_recovery()` for the current item (reset to `status=open, stage=idea`)
-- After recovery, the process exits with code `128 + signum`
-- If no item is being processed when the signal arrives, no recovery is attempted
-- Handlers are restored to their original values in the `finally` block of `run_all()`
-
-## Error handling and recovery
-
-- If `wl list` fails (non-zero exit or exception), returns an empty list gracefully
-- If an auto-complete claim fails, logs a warning and marks the item as `error`
-- Items lacking sufficient detail are marked as `needs_input` without invoking `/intake` — the item stays in `idea` stage and batch processing continues
-- If `_invoke_intake()` is called directly (not in batch mode) and `/intake` fails, a recovery attempt resets the item stage to `idea` and status to `open`
-- All errors and recovery actions are captured in the summary report
-- Recovery outcomes (success/failure) are included in per-item results
+- `wl list` failure: empty list returned gracefully
+- Auto-complete claim failure: logged as warning, marked `error`
+- Insufficient detail items: marked `needs_input` (no recovery needed)
+- Direct `/intake` failure: recovered to `stage=idea, status=open`
+- All errors/recoveries captured in summary report
 
 ## Idempotence
 
-- IntakeAll processes only items currently in `idea` stage
-- Items that have already been intake-processed (moved past `idea`) are naturally excluded on subsequent runs
-- Re-running IntakeAll is safe and will only process remaining idea-stage items
-- Auto-completed items are advanced to `intake_complete` and excluded from future runs
+Only processes items in `idea` stage. Already-processed items excluded. Safe to re-run.
 
 ## CLI flags
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--json` | flag | off | Produce JSON output instead of Markdown |
-| `--dry-run` | flag | off | Simulate processing without making any changes |
-| `--parent-id <id>` | str | None | Post the summary as a comment on the specified parent work item |
-| `--max` | int | 0 | Maximum number of items to process (0 = no limit) |
-| `--item-timeout` | int | 600 | Timeout in seconds for each item's subprocess call |
-| `--verbose` | flag | off | Enable verbose logging |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--json` | off | JSON output |
+| `--dry-run` | off | Simulate only |
+| `--parent-id <id>` | None | Post summary as parent comment |
+| `--max` | 0 | Max items (0 = all) |
+| `--item-timeout` | 600 | Per-item timeout in seconds |
+| `--verbose` | off | Verbose logging |
 
 ## Examples
 
 ```bash
-# Process all idea-stage items
-python3 ./scripts/intakeall.py
-
-# JSON output
-python3 ./scripts/intakeall.py --json
-
-# Dry run (simulate without changes)
-python3 ./scripts/intakeall.py --dry-run
-
-# Post summary as a comment on a parent epic
+python3 ./scripts/intakeall.py --json --max 5 --item-timeout 300
 python3 ./scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
-
-# Process only the first 5 items
-python3 ./scripts/intakeall.py --max 5
-
-# Set per-item timeout to 300 seconds
-python3 ./scripts/intakeall.py --item-timeout 300
-
-# Combine --max and --item-timeout
-python3 ./scripts/intakeall.py --max 3 --item-timeout 120
 ```
 
 ## Scripts
 
-- Canonical runner: `./scripts/intakeall.py`
+- Runner: `./scripts/intakeall.py`
 - Tests: `./tests/test_intakeall.py`
 
 ## Related skills
 
-- `command/intake.md` — The `/intake` command that IntakeAll invokes for each item
-- `../planall/SKILL.md` — PlanAll: the batch planning skill that IntakeAll mirrors
-- `../ralph/SKILL.md` — Ralph orchestration loop that provides auto-intake for individual items
+- `command/intake.md` — Per-item intake command
+- `../planall/SKILL.md` — Sibling batch planning skill
+- `../ralph/SKILL.md` — Auto-intake for individual items
 
 > **Implementation notes:**
->
-> - The `_invoke_intake()` method previously invoked `/intake` via `pi run /intake <id>` which blocked indefinitely waiting for stdin in batch mode. This was fixed in SA-0MQRAMZ4V0056K14 (type-safety and blocking subprocess skip) and SA-0MQP33ID9004OR5M (canonical `pi -p --mode json` invocation pattern). The batch `run_all()` flow now skips the interactive subprocess entirely and marks items as `needs_input` instead.
-> - The `_invoke_intake()` method previously used `--status in_progress --stage in_progress` (dual-set) when claiming items. This was fixed in SA-0MQS18ZOI005ER2V to use status-only (`--status in_progress`), matching the documented pattern.
+> - The `_invoke_intake()` previously invoked `/intake` via `pi run /intake <id>` which blocked indefinitely in batch mode. Fixed in SA-0MQRAMZ4V0056K14 (type-safety) and SA-0MQP33ID9004OR5M (JSON invocation). Batch flow now skips interactive subprocess.
+> - Status claim was fixed in SA-0MQS18ZOI005ER2V to use status-only (`--status in_progress`), matching documented pattern.
