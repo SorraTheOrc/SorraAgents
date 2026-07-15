@@ -163,6 +163,22 @@ See [AGENTS.md](../../AGENTS.md#implement-the-work-item) for the top-level polic
 1. Implement
 
 - If the work item has open/in_progress blockers or dependencies, implement them first (recursively via this procedure).
+
+4.1. Parent-advancement check (epic/parent items only)
+
+After all recursive child implementations are complete, check whether this work item has children:
+
+- Use `wl show <work-item-id> --children --json` to inspect children.
+- **If all children are in a terminal stage** (`in_review`/`completed`/`done`):
+  - Advance the parent: `wl update <work-item-id> --status completed --stage in_review --json`
+- **If any children are NOT in a terminal stage**:
+  - Set to open: `wl update <work-item-id> --status open --json`
+  - Add a comment flagging the gap for producer attention:
+    `wl comment add <work-item-id> --comment "Not all children are in a terminal stage. Needs producer review." --author "<AGENT>" --json`
+  - Return control to the operator.
+
+> **Under Ralph:** parent advancement is handled by Ralph's `_wl_update_stage()`. Skip the manual advancement above when operating under Ralph orchestration.
+
 - Check for a recent audit record; if none, run `/skill:audit <work-item-id>` to establish work needed.
 - Write tests and code to meet acceptance criteria:
   - Make minimal, focused changes.
@@ -246,8 +262,9 @@ After implementation completes and before final commit, an automated refactor st
   `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>." --author "<AGENT>" --json`
 - Close your response with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
 
+  > **Parent/epic items already advanced at Step 4.1:** if this item has children and parent advancement was already performed, skip the `wl update` below.
   > **Under Ralph:** do NOT mark `in_review` — Ralph handles it after the audit.
-  > **Manual:** mark `in_review` (do **NOT** close): `wl update <work-item-id> --status completed --stage in_review --json`
+  > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `wl update <work-item-id> --status completed --stage in_review --json`
 
   > The work-item stays `in_review` until the release process promotes `dev` to `main`. See `../ship/SKILL.md` for push-to-dev workflow and `../ship/scripts/run-release.js` for release.
 
@@ -282,7 +299,7 @@ The following table documents the expected status and stage transitions at each 
 |-------|---------|--------|-------|
 | Start (Step 0 - Set status) | `wl update <id> --status in_progress --json` | in_progress | (unchanged) |
 | Claim (Step 1) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
-| Blocker complete (Step 4) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
+| Epic / parent: all children done (Step 4.1) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
 | Final (Step 6 - Mark in_review) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
 | Abort - dirty work tree | `wl update <id> --status open --json`, then abort | open | (unchanged) |
 | Abort - definition gate failure | `wl update <id> --status open --json`, run intake/plan interview, update item | open | (unchanged) |
@@ -290,7 +307,6 @@ The following table documents the expected status and stage transitions at each 
 | Abort - error/exception during implementation | `wl update <id> --status open --json`, log error to comment, return | open | (unchanged) |
 | Abort - unexpected termination (Final cleanup) | Check status; if `in_progress` and work incomplete, reset | open | (unchanged) |
 | Under Ralph (Step 6 note) | Skip in_review step; Ralph handles transition | in_progress | in_progress |
-| Epic / parent: all children done | Check all children are in a terminal stage (in_review/completed); advance parent stage | completed | in_review |
 
 > **Abort/failure transitions always use `--status open` while keeping the stage unchanged.**
 > This pattern is mandatory — never leave a work item in `in_progress` status
