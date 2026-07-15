@@ -28,68 +28,29 @@ by Ralph's autoplan).
 
 ## Hard requirements
 
-- Terminology policy: use **Acceptance Criteria** as the canonical term;
-  **Success Criteria** is an accepted synonym when referencing legacy
-  wording.
-- Do not create a work item for the planning process itself; the output of
-  this skill is the generated feature work items and updates to the parent
-  work item.
-- Provide guidance on how each feature can be delivered as a minimal,
-  end-to-end slice (code, tests, docs, infra, observability).
-- Where possible identify existing implementations details that are related
-  to the feature.
-- Where possible identify existing features or tasks that can be reused
-  instead of creating duplicates.
-- Use an interview style: concise, high-signal questions grouped to a
-  soft-maximum of three per iteration.
-- Do not invent requirements, commitments (dates), or owners - propose
-  options and ask the user to confirm.
-- Respect ignore boundaries: do not include or quote content from files
-  excluded by `.gitignore` or the agent framework's ignore rules.
-- Prefer short multiple-choice suggestions where possible, but always allow
-  freeform responses.
-- If the user indicates uncertainty, add clarifying questions rather than
-  guessing.
-- **Test-first ordering**: When creating child work items, test/verification
-  work items must always be created before implementation work items. This
-  ensures a test-driven development approach is followed - tests are defined
-  first and implementation follows. The feature plan must list test features
-  before implementation features, and the `wl create` commands for test items
-  must be issued before those for implementation items.
-- **Vertical slice phasing**: When phasing large work items into multiple
-  integration phases, use the **tracer bullet** approach. Each phase should
-  be a thin vertical slice that cuts through ALL integration layers end-to-end
-  (code, tests, docs, infra, observability), NOT a horizontal slice of a
-  single layer. This ensures each phase delivers end-to-end user value and
-  can be integrated independently. Between each phase, review the next work
-  items and update their descriptions if they depend on completed work or
-  come next in the schedule.
-- Whenever you are recommending next steps you MUST make the first one a
-  progression to the next step in the process defined below, with a summary
-  of what that step involves.
+- Use **Acceptance Criteria** as the canonical term; **Success Criteria** is an accepted synonym for legacy references.
+- Do not create a work item for the planning process itself; the output is feature work items and parent updates.
+- Each feature must be deliverable as a minimal end-to-end slice (code, tests, docs, infra, observability).
+- Identify existing implementations or features that can be reused.
+- Use concise interview style: ≤3 high-signal questions per iteration. Prefer multiple-choice but allow freeform.
+- Do not invent requirements, dates, or owners — propose options and ask for confirmation.
+- Respect `.gitignore` and agent ignore rules.
+- If the user is uncertain, add clarifying questions rather than guessing.
+- **Test-first ordering**: create test/verification work items before implementation work items.
+- **Vertical slice phasing**: use tracer-bullet approach — each phase cuts through ALL layers end-to-end, not a single horizontal layer. Between phases, review and update next items' descriptions.
+- When recommending next steps, the first must progress to the next process step with a summary.
 
 ## Status lifecycle (first action)
 
-- **Before any other step**, claim the work item by running:
-  `wl update <work-item-id> --status in_progress --json`
-  This must be the very first action — before any pre-checks, context
-  gathering, or other preflight steps. The status signals to other agents
-  that this item is being processed and prevents concurrent claims.
+See [AGENTS.md](../../AGENTS.md#workflow-for-ai-agents) for the standard claim-first pattern.
 
 ## Seed context
 
-- Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level
-  files for context.
-- Fetch and read the work item details using Worklog CLI:
-  `wl show <work-item-id> --json` and treat the work item description and
-  any referenced artifacts as authoritative seed intent.
-- Pay particular attention to any PRD referenced in this work item or any
-  of its parent work items.
-- If `wl` is unavailable or the work item cannot be found, fail fast and
-  ask the user to provide a valid `<work-item-id>` or paste the work item
-  content.
-- Prepend a short "Seed Context" block to the interview that includes the
-  fetched work item title, type, current tags, and one-line description.
+- Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for context.
+- Run `wl show <work-item-id> --json` — treat description and referenced artifacts as authoritative seed intent.
+- Pay attention to any PRD referenced in this work item or parent items.
+- If `wl` is unavailable or the work item cannot be found, fail fast and ask for a valid id.
+- Prepend a short "Seed Context" block to the interview with the fetched title, type, tags, and description.
 
 ## Pre-check: Effort/Risk Threshold (must do before Process step 1)
 
@@ -206,117 +167,60 @@ instructions above).
 
 1. Evaluate whether planning is required (agent responsibility)
 
-   - Before starting the full planning interview and decomposition, run a
-     quick assessment to determine whether the work item already has a
-     sufficient plan or is too small to require decomposition.
-   - Suggested checks (conservative, idempotent heuristics):
-     - If the work item's `stage` is `plan_complete` or later, planning is
-       already complete - skip with a no-op.
-     - If the work item is not an `epic` (for example `task` or `bug`) and
-       the description already contains measurable acceptance criteria and a
-       minimal implementation sketch, consider it "ready" and mark planning
-       complete.
-     - If the work item already has child features/tasks that cover the
-       intended scope (use `wl list --parent <work-item-id> --json` and
-       compare), and those children are adequate and idempotent, skip full
-       planning and mark `plan_complete`.
-     - If a concise plan block already exists in the work item (for example
-       a labeled "Plan:" or a short numbered feature list with acceptance
-       criteria), treat that as sufficient evidence to skip the full
-       interview.
-   - If the checks indicate planning is not needed, update the work item to
-     record the decision and advance the stage:
-     - `wl update <work-item-id> --stage plan_complete --status open --json`
-     - Add a comment documenting the reason:
-       `wl comment add <work-item-id> "Plan auto-complete: work item appears sufficiently sized/defined for direct implementation." --actor Map --json`
-   - If evidence is borderline or key uncertainties remain, err on the side
-     of progress and auto-complete (update stage and record a comment). Only
-     fall back to the normal planning process (asking clarifying questions)
-     when there is clear evidence that the item genuinely needs
-     decomposition and the heuristics cannot make a determination.
+   Before starting the full interview, assess if the item already has a sufficient plan:
+   - If `stage` is `plan_complete` or later → no-op skip.
+   - If not an `epic` and description has measurable ACs and a minimal implementation sketch → mark complete.
+   - If existing child items already cover the scope (`wl list --parent <id> --json`) → skip.
+   - If a concise plan block exists → treat as sufficient.
+
+   If planning is not needed:
+   - `wl update <work-item-id> --stage plan_complete --status open --json`
+   - Add comment: `wl comment add <work-item-id> "Plan auto-complete: sufficiently sized/defined for direct implementation." --actor Map --json`
+
+   When borderline, err toward auto-complete. Only fall back to clarifying questions when decomposition is clearly needed.
 
 2. Fetch & summarise (agent responsibility)
 
-   - Run `wl show <work-item-id> --json` and summarise the work item in one
-     paragraph: title, type (epic/feature/task), headline, and any existing
-     child tasks and plan info.
-   - Validate readiness by examining the work item's `stage` value:
-     - `intake_complete` indicates it is ready for planning.
-     - `plan_complete` or later stages indicate planning has already been
-       completed; skip planning entirely and record a no-op comment.
-     - Any other `stage` value suggests the work item is not currently at
-       the intake_complete stage. Run the planning heuristics to determine
-       whether the item is sufficiently small/well-defined to auto-complete.
-       If so, auto-complete. If the heuristics genuinely cannot determine,
-       ask the user how to proceed.
-   - Read any PRD linked in the work item or any of its parents to extract
-     key details for later reference.
-   - Derive 3-6 keywords from the work item title/description to search the
-     repo and work items for related work. Present any likely duplicates or
-     parent/child relationships.
+   - Run `wl show <work-item-id> --json` and summarise the work item: title, type, headline, existing children and plan info.
+   - Validate readiness by `stage`:
+     - `intake_complete` → ready for planning
+     - `plan_complete` or later → skip, record no-op comment
+     - Other → run heuristics to auto-complete if small/well-defined; if genuinely stuck, ask the user.
+   - Read any linked PRD for key details.
+   - Derive 3-6 keywords from title/description to search for related work; present likely duplicates or relationships.
 
 3. Interview
 
-   In interview iterations (≤ 3 questions each), gather the minimum
-   information needed to produce an actionable feature plan in which each
-   feature is large enough to be meaningful but small enough to be delivered
-   as an end-to-end slice. For each feature capture:
+   In iterations (≤3 questions each), gather the minimum information for an actionable feature plan. For each feature capture:
+   - **Target outcome**: what user-visible capability must exist?
+   - **Definition of done**: pass/fail acceptance checks (checklist + automated tests where possible).
+   - **Constraints**: performance, compatibility, rollout/feature-flag, timeline.
+   - **Risky assumptions**: where is a prototype/experiment needed (mock API, spike) and what does "success" mean?
 
-   - Target outcome: what user-visible capability must exist when this epic
-     is "done"?
-   - Definition of done: what are the pass/fail acceptance checks (a short
-     manual checklist and automated tests if possible)?
-   - Constraints: performance, compatibility, rollout/feature-flag
-     expectations, or timeline constraints.
-   - Risky assumptions: identify where a prototype/experiment is needed
-     (fake API, mock UI, spike) and what "success" means.
+   Keep iterating until feature breakdown is clear.
 
-   Keep asking questions until the breakdown into features is clear.
-
-   - Review existing Appendix entries first: the agent MUST NOT ask any
-     question that already appears in the Appendix of the parent work item
-     or the current work item unless further clarification is required. If
-     further clarification is required, reference the existing Appendix
-     entry in the question and explain what additional detail is needed
-     before re-asking.
+   - Review existing Appendix entries first: do NOT re-ask questions already answered unless further clarification is needed (reference the existing entry).
 
 4. Propose feature plan (agent responsibility + user confirmation)
 
-   - Produce a draft plan (soft guide: 3-12 features) where each feature
-     includes:
-     - **Short Title** (canonical, stable, ≤ 7 words)
-     - **Summary** (one sentence)
-     - **Acceptance Criteria** (2-6 concise bullets; measurable/testable)
-     - **Minimal Implementation** (2-6 bullets; smallest end-to-end slice)
-     - **Prototype / Experiment** (optional; include success thresholds)
-     - **Dependencies** (other features or explicit external factors)
-     - **Deliverables** (artifacts: docs, tests, demo script, telemetry)
+   Produce a draft plan (guide: 3-12 features) where each feature includes:
+   - **Short Title** (≤7 words) | **Summary** (one sentence) | **Acceptance Criteria** (2-6 measurable bullets)
+   - **Minimal Implementation** (2-6 bullets, smallest end-to-end slice)
+   - **Prototype/Experiment** (optional; success thresholds)
+   - **Dependencies** | **Deliverables** (artifacts)
 
-   - Each of the features should clearly identify how the user experience
-     will be changed by the feature and what acceptance criteria are
-     required to validate it.
+   Each feature must describe how the user experience changes and what ACs validate it.
 
-   - **Test-first ordering**: Test and verification features must be listed
-     before implementation features in the proposed plan. This ensures that
-     when work items are created from the plan, test tasks are created first
-     and establish the validation criteria that implementation tasks must
-     satisfy.
-
-   - Present the draft as a numbered list and ask the user to: accept, edit
-     titles/scopes, reorder, or split/merge features.
-   - If the user requests changes, iterate until the feature list is
-     approved.
+   - **Test-first ordering**: test/verification features before implementation features.
+   - Present as numbered list and ask user to accept, edit, reorder, or split/merge.
+   - Iterate until approved.
 
 5. Verify vertical slice phasing (agent responsibility)
 
-   - Review the proposed feature plan to ensure each phase represents a
-     vertical slice that cuts through ALL integration layers end-to-end.
-   - If any phase appears to be a horizontal slice (focused on a single
-     layer), ask the user to refactor it into vertical slices.
-   - Verify that between-phase guidance is included: implementation should
-     review next work items and update descriptions as needed.
-   - If the work item is small enough to not require phasing, document this
-     decision and proceed to the automated review stages.
+   Ensure each phase is a vertical slice through ALL layers (code, tests, docs, infra, observability).
+   - If a phase is a horizontal slice, ask the user to refactor.
+   - Include between-phase guidance: review next items, update descriptions.
+   - If the item is small enough to not require phasing, document the decision and proceed to review stages.
 
 6. Automated review stages (must follow; no human intervention required)
 
@@ -362,21 +266,13 @@ instructions above).
 
 7. Update work items (agent)
 
-   - **Test-first creation**: When creating child work items, always create
-     test/verification work items before implementation work items.
-   - Create child work items for each feature with a parent link to the
-     original work item:
-     `wl create --title "<Short Title>" --description "<Full feature description>" --parent <work-item-id> --priority P2 --stage intake_complete --json`
-   - Create dependency edges between feature work items where the plan
-     specifies dependencies:
-     `wl dep add <DependentFeatureId> <PrereqFeatureId>`
-   - When creating child work items, ensure idempotence: if a child work
-     item with the same canonical name already exists, reuse it instead of
-     creating a duplicate.
-   - Add a comment to the planned work item:
-     `wl comments add $1 "Planning Complete. <Summary>" --actor <your-agent-name> --json`
-   - Update the planned work item's stage to indicate planning is complete:
-     `wl update $1 --stage plan_complete --status open --json`
+   - **Test-first creation**: create test/verification items before implementation items.
+   - Create child work items for each feature:
+     `wl create --title "<Short Title>" --description "<Full description>" --parent <work-item-id> --priority P2 --stage intake_complete --json`
+   - Add dependency edges: `wl dep add <DependentId> <PrereqId>`
+   - Ensure idempotence: if a child with the same canonical name exists, reuse it.
+   - Add completion comment: `wl comments add $1 "Planning Complete. <Summary>" --actor <agent> --json`
+   - Update stage: `wl update $1 --stage plan_complete --status open --json`
 
 8. Calculate Effort and Risk (agent responsibility; must follow)
 
@@ -385,37 +281,26 @@ instructions above).
 
 ## Traceability & idempotence
 
-- Re-running this skill on a work item should not create duplicate child
-  work items or duplicate generated plan blocks in the parent work item.
-- If the skill makes changes, include a changelog block in the parent work
-  item (labelled "Plan: changelog") summarising actions and timestamps.
+- Re-running this skill must not create duplicate child work items or duplicate plan blocks.
+- If changes are made, include a "Plan: changelog" block in the parent work item summarising actions and timestamps.
 
-  > **Note:** This "Plan: changelog" block is for **work-item-level traceability** —
-  > recording agent actions in the parent work item. It is **not** the repository
+  > **Note:** This changelog block is for **work-item-level traceability** — it is **not** the repository
   > `CHANGELOG.md`, which is managed automatically by the ship skill's release pipeline.
-  > Implementing agents should never manually update the repository `CHANGELOG.md`.
 
 ## Editing rules & safety
 
-- Preserve author intent; where the agent is uncertain, create an Open
-  Question entry rather than making assumptions.
-- Keep changes minimal and conservative.
-- Respect `.gitignore` and other ignore rules when scanning files for
-  context.
-- **Worklog validation**: when creating `feature` or `task` work items
-  ensure the description includes a `## Acceptance Criteria` section.
-- **JSON parsing**: `wl ... --json` output may be either an object or an
-  array; when extracting ids with `jq`, handle both shapes.
-- If any automated step fails or is ambiguous, surface an explicit Open
-  Question and pause for human guidance.
+- Preserve author intent; when uncertain, create an Open Question entry rather than assuming.
+- Keep changes minimal and conservative. Respect `.gitignore`.
+- **Worklog validation**: `feature` or `task` work items must include a `## Acceptance Criteria` section.
+- **JSON parsing**: `wl ... --json` output may be an object or an array; handle both shapes when parsing.
+- If any automated step fails or is ambiguous, surface an Open Question and pause for guidance.
 
 ## 8. Finishing (must do as the final step only)
 
-- On the parent work item set the work item's stage to `plan_complete` and
-  status to `open`:
+- Set stage to `plan_complete` and status to `open`:
   `wl update <work-item-id> --stage plan_complete --status open --json`
-- Run `wl sync` to sync work item changes.
-- Run `wl show <work-item-id>` (not --json) to show the entire work item.
+- Run `wl sync` to sync changes.
+- Run `wl show <work-item-id>` (not --json) to display the work item.
 - End with: "This completes the Plan process for <work-item-id>".
 
 ## Bundled Resources
@@ -449,51 +334,21 @@ instructions above).
 
 ## Appendix: Clarifying questions & answers (must include)
 
-- Purpose: Every interview-driven planning session must produce an auditable
-  Appendix that lists all clarifying questions the agent asked during the
-  planning interview and the answers provided by the user or stakeholders.
-  This Appendix must be appended to any plan content written into the parent
-  work item or temporary draft files and must also be included in the Worklog
-  work item description or a comment when the plan is finalized.
+Every planning session must produce an auditable Appendix of questions asked and answers received, appended to the plan content in the parent work item (description or comment).
 
-- Required contents for each entry:
-  - The question text exactly as asked.
-  - The answer provided and the answering party (user, stakeholder, or agent
-    inference) and any supporting evidence or references (work item id, file
-    path, PR link).
-  - If the answer changed during the process, record prior answers and mark
-    the final accepted answer.
-  - If the question resulted in a discussion and/or research, include a
-    concise summary (1-6 sentences) describing the discussion, research
-    performed, findings, and any links to supporting artifacts (files, PRs,
-    issues).
+Required per entry:
+- Question text exactly as asked.
+- Answer provided, the answering party, and supporting evidence (work-item id, file path, PR link).
+- If the answer changed, record prior answers and mark the final accepted answer.
+- If the question led to discussion/research, include a concise summary (1-6 sentences) with links to artifacts.
 
-- Example format:
+Behavior:
+- Append the complete Appendix to any temporary draft file and include it in the parent work item.
+- Idempotence: re-running must not create duplicate entries — append revision notes instead.
+- Open questions must be labelled "OPEN QUESTION" with context (directed to whom and why it matters).
+- Privacy: only record authorized participants' information; redact inadvertent secrets.
+- Traceability: each entry should be linkable from the work item.
 
-  - Q: "Should feature X be behind a feature flag? (yes/no/ask)"
-    Answer (product@acme): "Yes, gradual rollout behind flag".
-    Source: interactive reply. Final: yes.
-  - Q: "Can we reuse library Y?"
-    Answer (eng@acme): "Partially. Research: reviewed `libs/y` and PR #88;
-    requires adapter wrapper. Follow-up: created wl-789 to implement adapter."
-    (Research summary: adapter required; library lacks needed API surface.)
-
-- Behavior and placement rules:
-  - The agent MUST append the complete Appendix to any temporary draft file
-    used for the plan and include it in the parent work item's description or
-    as a `wl comment` when calling `wl update` or `wl comment add`.
-  - Preserve idempotence: re-running the skill MUST NOT create duplicate
-    Appendix entries. If a Q/A pair exists, either skip re-recording it or
-    append a short revision note rather than duplicating the original entry.
-  - Open questions that remain unanswered must be included and clearly
-    labelled as "OPEN QUESTION" with brief context (who it was directed to
-    and why it matters).
-
-- Privacy & scope:
-  - Only record information provided by authorized participants. Redact any
-    inadvertent secrets and note the redaction.
-
-- Traceability:
-  - Each Appendix entry should be linkable from the work item (either
-    embedded in the work item body or referenced in a comment) and include
-    related item references for discovery.
+**Example format:**
+- Q: "Should feature X be behind a feature flag?" Answer (product): "Yes, gradual rollout". Final: yes.
+- Q: "Can we reuse library Y?" Answer (eng): "Partially; requires adapter." Research: reviewed `libs/y` and PR #88.

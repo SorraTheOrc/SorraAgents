@@ -45,34 +45,14 @@ is invoked.
 
 ## Best Practices
 
-- Follow the steps in order and do not skip steps.
-- Keep implementation focused on meeting acceptance criteria with minimal changes.
-- Never edit code outside of `src/`, `tests/` and `docs/` for this project unless
-  they are essential configuration files.
-- Never edit code in bundled libraries such as `dist/` and `node_modules`.
-- When implementing a CLI or API always provide a way to obtain a JSON
-  formatted output for agents to consume.
-- Use work item comments to document your process, decisions, and next steps.
-- If the work item is not well-defined, do not proceed with implementation.
-  Instead, first run `wl update <work-item-id> --status open --json` to mark
-  the item as open, then return a `no_safe_path` response describing the
-  missing information.
-- Never commit directly to `main`. Always create a feature or bug branch for
-  implementation.
-- The required order of operations before any commit is always:
-  **build → test → commit**. First build the project and verify no errors, then
-  run all tests and verify they pass, and only then commit.
-- When creating branches, include the work item id in the branch name for
-  traceability (e.g., `feature/WL-123-add-auth`).
-- When creating a commit message, review the diff and write a concise message
-  summarizing the changes made and the reason for the change, referencing the
-  work item id.
-- When committing add a comment to the work item with the commit message and hash.
-- Only create a PR when all acceptance criteria have been met, all tests have
-  passed and the implementation is ready for review. Do not create PRs for
-  work in progress.
-- Do not escape content in the PR or work-item description; use markdown
-  formatting as needed for clarity and readability.
+- Follow the steps in order; do not skip.
+- Keep implementation focused on meeting ACs with minimal changes.
+- Never edit code outside `src/`, `tests/`, `docs/` unless essential config files.
+- Never edit bundled libraries (`dist/`, `node_modules`).
+- When implementing a CLI or API, provide JSON formatted output.
+- Use work item comments to document process, decisions, and next steps.
+- If not well-defined, mark as open and return a `no_safe_path` response.
+- Follow AGENTS.md policies for branch naming, commit discipline, build→test→commit order, and PR policy. See [AGENTS.md](../../AGENTS.md#implement-the-work-item).
 
 ## Steps
 
@@ -80,48 +60,25 @@ Execute the following steps in order. Do not skip steps.
 
 ### Step 0 — Set status and safety gate
 
-- **Before any other step**, claim the work item by running:
+- **Before any other step**, claim the work item:
   `wl update <work-item-id> --status in_progress --json`
-  This must be the very first action — before any git checks, safety gates,
-  or preflight checks. The status signals to other agents that this item is
-  being worked on and prevents concurrent claims.
-
-- Detect whether the current directory is inside a git worktree:
-  `git rev-parse --is-inside-work-tree` (returns `true` or `false`).
-  Inside a worktree, `git status` is inherently scoped to that worktree's
-  working tree — files from other checkouts do not appear.
-
-- **Inside a worktree** — use the standard rules:
-  - Run `git status --porcelain=v1 -b`.
-  - If uncommitted changes are limited to `.worklog/`, carry them into the
-    work item branch and commit there.
-  - If other uncommitted changes exist, abort: first run
-    `wl update <work-item-id> --status open --json` to mark the item as open,
-    then return a structured `no_safe_path` response.
-
-- **In the main checkout** (not inside a worktree):
-  - Run `git status --porcelain=v1 -b`.
-  - If uncommitted changes are limited to `.worklog/`, carry them forward as
-    usual.
-  - If other uncommitted changes exist, these may be stale files from a
-    previous agent session or another worktree. The agent should:
-    1. Report the dirty files and note they may be stale.
-    2. Proceed to create a working branch (Step 2). The worktree or new
-       branch provides an isolated working directory where `git status`
-       reflects only the worktree's state, bypassing stale files in the
-       main checkout.
-    3. If the dirty files would prevent branch creation, abort via
-       `wl update <work-item-id> --status open --json` and return a
-       structured `no_safe_path` response.
+- Detect git context: `git rev-parse --is-inside-work-tree`
+- Run `git status --porcelain=v1 -b`.
+- **Inside a worktree:**
+  - `.worklog/` changes only → carry forward.
+  - Other changes → abort via `wl update <work-item-id> --status open --json` and return `no_safe_path`.
+- **In the main checkout:**
+  - `.worklog/` changes only → carry forward.
+  - Other stale files → report, proceed to Step 2 for isolation.
+  - If dirty files prevent branch creation → abort via `wl update ... --status open --json`.
 
 ### Step 1 — Understand the work item
 
-- Claim the work item by running
-  `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`.
-- Fetch the work item details: `wl show <work-item-id> --json --children`
-- Restate acceptance criteria and current status along with any constraints.
-- Surface blockers, dependencies and missing requirements.
-- Inspect linked PRDs, plans or docs referenced in the work item.
+- Claim: `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
+- Fetch details: `wl show <work-item-id> --json --children`
+- Restate ACs, current status, constraints.
+- Surface blockers, dependencies, missing requirements.
+- Inspect linked PRDs, plans, or docs.
 
 ### Step 2 — Create a working branch
 
@@ -136,15 +93,11 @@ Execute the following steps in order. Do not skip steps.
 
 ### Step 3 — Implement
 
-- Write tests first (test-driven development approach):
-  - Create at least one new test file before adding or editing implementation code.
-  - Tests created in this step are allowed to fail on first run; the agent must then implement code to make them pass before committing.
-  - If tests cannot be completed due to external constraints (e.g., unavailable external service, missing infrastructure), create harnesses or mocks that enable the tests to run. The tests should fail due to the external constraint, not because of missing implementation logic.
-  - When a harness, mock, or test placeholder is used, include an explicit note in the work item comment and in the test file header stating the reason for the limitation and marking it as a temporary placeholder.
-- Write implementation code to meet acceptance criteria.
+- **Write tests first** (TDD): create at least one test file before editing implementation code. Tests may fail initially; implement code to make them pass. If external constraints prevent complete tests, use harnesses/mocks and document the limitation.
+- Write implementation code to meet ACs.
 - Make minimal, focused changes.
 - Follow project style and conventions.
-- Add comments to the work item describing any significant design decisions.
+- Comment on significant design decisions in the work item.
 
 ### Step 4 — Optional refactor step
 
@@ -169,39 +122,30 @@ refactor step may be invoked to detect and remediate code smells:
 ### Step 6 — Push and mark in-review
 
 - Push the branch to `origin`.
-- Close your response to the operator with:
-  `<work-item-id>: <concise-summary-of-changes>\n\nWork committed to dev`
-- Mark the work item as in-review:
-  `wl update <work-item-id> --status completed --stage in_review --json`
-- Do not create a PR or merge. Ralph will handle PR/merge externally.
+- Respond with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
+- Mark in-review: `wl update <work-item-id> --status completed --stage in_review --json`
+- Do NOT create a PR or merge. Ralph handles PR/merge externally.
 
 ## Status Transition Matrix
 
-The following table documents the expected status and stage transitions at each workflow phase for the `implement-single` skill.
-
 | Phase | Command | Status | Stage |
 |-------|---------|--------|-------|
-| Start (Step 0 - Set status) | `wl update <id> --status in_progress --json` | in_progress | (unchanged) |
-| Claim (Step 1) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
+| Start (Step 0) | `wl update <id> --status in_progress --json` | in_progress | (unchanged) |
+| Claim (Step 1) | `wl update <id> --status in_progress --stage in_progress ...` | in_progress | in_progress |
 | Complete (Step 6) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
-| Abort - dirty tree (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
-| Abort - no_safe_path (Step 0) | `wl update <id> --status open --json` | open | (unchanged) |
+| Abort (dirty/no_safe_path) | `wl update <id> --status open --json` | open | (unchanged) |
 
-Abort/failure transitions use `--status open` while keeping the stage unchanged.
+Abort/failure transitions always use `--status open`.
 
-## Scripts (canonical runner & modules)
+## Scripts
 
-This skill does not ship a canonical CLI runner. When present, prefer any
-repository-provided implement helper script to ensure deterministic behavior.
-
-Usage (work-item example):
+This skill does not ship a canonical CLI runner. Prefer any repository-provided implement helper script.
 
 ```bash
-# Fetch the single work item for context
-wl show SA-0MPYMFZXO0004ZU4 --json --children
-
-# After completing implementation, mark the item in_review
-wl update SA-0MPYMFZXO0004ZU4 --status completed --stage in_review --json
+# Fetch work item
+wl show <work-item-id> --json --children
+# Mark in_review when complete
+wl update <work-item-id> --status completed --stage in_review --json
 ```
 
 End.

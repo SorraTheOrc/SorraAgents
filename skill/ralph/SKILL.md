@@ -11,32 +11,21 @@ When invoked as `ralph <work-item-id>`, do not perform general Worklog discovery
 
 ## Command invocation and ID detection
 
-The skill accepts a work-item id provided inline in the user's command. Supported invocation forms include:
+Detect a work-item id inline. Supported forms:
 
-- `/ralph <WORKITEM>`
-- `ralph <WORKITEM>`
-- `run ralph <WORKITEM>`
-- `ralph loop <WORKITEM>`
+- `/ralph <WORKITEM>`, `ralph <WORKITEM>`, `run ralph <WORKITEM>`, `ralph loop <WORKITEM>`
 
-A work-item id is any short token matching the Worklog id pattern used in your environment (for example `WL-1234`, `CG-0MP12H40Q003Y7OU`, or an 8+ char identifier). When an id is present in the command the skill will use it and will not prompt for an id. If no id is detected, the skill will ask the operator to provide one or abort, except for `ralph status`, which is an intentional no-id exception.
+A work-item id matches the Worklog pattern (e.g., `WL-1234` or `SA-0MP12...`). If found, use it without prompting. If not found, ask the operator or abort — except `ralph status` (intentional no-id exception).
 
 ## Behavior
 
-1. Detect a work-item id in the invocation if present; otherwise ask the operator for an id or abort, except for `ralph status`, which intentionally runs without a work-item id.
-2. For `ralph <work-item-id>`, immediately run the deterministic loop through the `./ralph` wrapper so the run starts under `nohup` and the launcher records the PID, start time, and log path needed by `ralph status`.
-3. Do not create, claim, update, or reprioritize work items as part of the Ralph launcher itself. The wrapper/script owns the loop.
-4. Use `ralph status` to inspect the current background run without needing the original work-item id.
-5. After launching the background Ralph loop, the agent MUST follow this **post-launch behavior**:
-   - Wait exactly **20 seconds** (once, not in a loop) to allow Ralph to initialize.
-   - Check the Ralph status **one time only** using `./ralph status --json`.
-   - If Ralph is running: Report the loop started successfully and inform the operator they can use `ralph status` to monitor progress.
-   - If Ralph has stopped or failed: Provide a **Root Cause Analysis (RCA)** using available log evidence from the status output.
-   - **Do NOT** enter any polling loop — let the operator decide when to check status next.
+1. Detect a work-item id in the invocation; otherwise ask or abort (except `ralph status` which runs without one).
+2. For `ralph <work-item-id>`, launch via `./ralph` wrapper so the run starts under `nohup` with PID/start-time/log-path capture.
+3. Do NOT create, claim, update, or reprioritize work items from the launcher — the wrapper owns the loop.
+4. Use `ralph status` to inspect the background run without needing the work-item id.
+5. **Post-launch:** Wait 20s once, check status once via `./ralph status --json`. If running, report success. If stopped/failed, provide RCA from status output. Do NOT poll.
 
-For direct foreground debugging, run the script locally:
-
-- Use `--child <id>` only when you explicitly want to focus Ralph on a single direct child work item while keeping the parent as context.
-- Use `--debug-persist` when you need to save raw Pi payloads for `no_text_extracted` debugging.
+For direct foreground debugging: use `--child <id>` to focus on a single child, `--debug-persist` to save raw Pi payloads for debugging.
 
 Delegated `pi` and `wl` commands are logged before execution in both normal console output and `--json` output, so operators and automation can see the exact command Ralph ran.
 If streamed `pi` output stops producing stdout and keeps the pipe open too long, Ralph will terminate the run with a clear stall error instead of hanging indefinitely.
@@ -45,191 +34,102 @@ If streamed `pi` output stops producing stdout and keeps the pipe open too long,
 
 When Ralph's implement→audit loop ends (whether by success, cancellation, max attempts, or producer-input-required), it runs a deterministic cleanup step for any lingering Pi subprocess:
 
-1. **Graceful shutdown**: Sends SIGTERM to the Pi process and waits up to the configured grace period (default 5 seconds).
-2. **Escalation**: If the process has not exited within the grace period, sends SIGKILL (via `process.kill()`) and waits up to 1 second for it to drain.
-3. **Observability**: Every step is logged with distinct event names so operators can distinguish normal completion (`ralph.cleanup.pi.graceful_exit`) from forced termination (`ralph.cleanup.pi.forced_kill`) in the log output.
+1. **Graceful shutdown**: SIGTERM + wait (default 5s).
+2. **Escalation**: SIGKILL if not exited within grace period + 1s drain.
+3. **Observability**: Distinct event names (`ralph.cleanup.pi.graceful_exit` vs `ralph.cleanup.pi.forced_kill`).
 
-The cleanup is safe to call even if the process has already exited — it checks `process.poll()` before sending any signals.
+Safe to call even if the process has already exited (checks `process.poll()` first).
 
 ### Worktree for child iterations
 
-When Ralph processes a parent work item with children, it creates a single worktree with a feature branch at the start of the run and all child iterations reuse that worktree and branch. This ensures:
-
-- All changes from child iterations are isolated in a dedicated worktree
-- Branch names follow the canonical pattern: `wl-<parent-id>-<short-desc>`
-- The main checkout remains clean — no staged changes, no in-progress edits
-- Child implementations are serialized (one-at-a-time) on the shared branch
-- Commits are traceable to child work-item IDs via commit messages
-
-The worktree and branch are created once before the first child iteration:
+Ralph creates a single worktree for all child iterations of a parent work item. All children share it (serialized one-at-a-time):
 
 ```bash
 git worktree add --track -b wl-<parent-id>-<short-slug> .worklog/worktrees/wl-<parent-id>-<short-slug> dev
-```
-
-The worktree path is passed to all subsequent child implementations as the working directory. After the loop completes, the worktree is cleaned up:
-
-```bash
+# ... work happens ...
 git worktree remove .worklog/worktrees/wl-<parent-id>-<short-slug>
 git worktree prune
 ```
 
-See [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full worktree lifecycle and [AGENTS.md](../../AGENTS.md) for the top-level policy.
+See [[concepts/git-worktree-best-practices-for-agent-workflows]] and [AGENTS.md](../../AGENTS.md) for the full lifecycle.
 
 ### Per-phase model routing
 
-Ralph supports phase-specific model selection for `intake`, `planning`, `implementation`, and `audit`.
+Supports phase-specific models for `intake`, `planning`, `implementation`, `audit`.
 
-- Source toggle: `--model-source <remote|local>` (default: `local`)
-- Shorthand: `ralph <id> remote` or `ralph <id> local` (equivalent to `--model-source`)
-- Per-phase CLI overrides:
-  - `--model-intake`
-  - `--model-planning`
-  - `--model-implementation`
-  - `--model-audit`
-- Config supports `model_source` plus `model.<phase>` keys (nested object or dotted keys).
-- No implicit remote↔local fallback is attempted by Ralph.
-- Backward compatibility remains: when per-phase inputs are not used, Ralph continues the legacy single-model path (`--model` / string `model` config / `./assets/.ralph.json` defaults).
-- Default per-phase models are shipped in `./assets/.ralph.json`. Values in that file are overridden by a `.ralph.json` in the current working directory, which in turn are overridden by CLI flags.
+- Source toggle: `--model-source <remote|local>` (default: `local`); shorthand `ralph <id> remote|local`
+- Per-phase overrides: `--model-intake`, `--model-planning`, `--model-implementation`, `--model-audit`
+- Config: `model_source` + `model.<phase>` keys (nested object or dotted keys).
+- No implicit remote↔local fallback.
+- When per-phase inputs are absent, falls back to legacy single-model path (`--model` / `./assets/.ralph.json` defaults).
+- Override order: `./assets/.ralph.json` < `.ralph.json` (CWD) < CLI flags.
 
 ```bash
-# Launch a background Ralph run from the skill installation.
-# The wrapper handles nohup plus PID/start-time capture for status reporting.
-# Preferred (skill-relative):
+# Background run (preferred):
 ./ralph <work-item-id> --json
 
-# Inspect the current background run (no work item id required):
+# Inspect background run:
 ./ralph status --json
 
-# If you need to run the foreground loop directly for debugging:
+# Foreground debugging:
 # python3 ./scripts/ralph_loop.py <work-item-id> --json
-#
-# To focus on a single direct child while keeping the parent for context:
 # python3 ./scripts/ralph_loop.py <parent-id> --child <child-id> --json
-
-# If your skills are installed at a different location (for example a
-# project-level skills directory), run the script using the full path to
-# that skill directory instead, e.g.:
-# python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id> --json
 ```
 
-See `docs/ralph.md` and `ralph --help` for full details of the features available.
+See `docs/ralph.md` and `ralph --help` for full details.
 
 ## Architecture: Shared Auto-Plan Decision Logic
 
-The auto-plan decision logic (effort/risk threshold checks) has been extracted
-from Ralph's inline code into a **shared module**, canonically bundled with the
-plan skill at:
+The auto-plan decision logic is extracted into a shared module at ``../plan/plan_helpers.py`` (canonical) with legacy delegation at ``command/plan_helpers.py``.
 
-- `../plan/plan_helpers.py` (canonical source)
-- `command/plan_helpers.py` (delegation wrapper for backward compatibility)
+Shared by:
+- **Ralph** — delegates to ``command.plan_helpers`` (maintains own I/O infrastructure for backward compat).
+- **`/skill:plan`** — invokes ``python3 ../plan/plan_helpers.py plan-if-needed <id>``.
+- **PlanAll** — shells out to ``/skill:plan <id>``.
 
-The canonical source is ``../plan/plan_helpers.py``. The legacy path
-``command/plan_helpers.py`` is a thin delegation wrapper that loads the
-canonical module into the ``command.plan_helpers`` namespace so that all
-existing imports (Ralph, tests) continue to work without changes.
-
-This module is the single source of truth for autoplan decisions, shared by:
-
-- **Ralph** (`./scripts/ralph_loop.py`) — delegates decision logic to
-  ``command.plan_helpers`` functions (which now load from the canonical
-  ``../plan/plan_helpers.py``), while keeping its own I/O infrastructure
-  (runner, retry, fail-open) for backward compatibility.
-- **`/skill:plan` command** (`skill/plan/SKILL.md`) — runs ``python3 ../plan/plan_helpers.py
-  plan-if-needed <id>`` (or the legacy path) as a pre-check before the full
-  planning decomposition.
-- **PlanAll** — benefits automatically since it shells out to ``/skill:plan <id>``.
-
-Key functions provided by ``../plan/plan_helpers.py``:
+Key exports:
 
 | Function / Constant | Purpose |
 |---------------------|---------|
 | `make_autoplan_decision()` | Top-level orchestrator returning `(do_plan, stage)` |
 | `resolve_complexity_tier()` | Resolve low/medium/high from effort+risk |
-| `is_effort_risk_computed()` | Idempotence check (pure function) |
+| `is_effort_risk_computed()` | Idempotence check |
 | `run_effort_and_risk()` | Invoke the effort-and-risk orchestrator |
 | `append_autoplan_decision_comment()` | Idempotent decision comment posting |
 | `plan_if_needed()` | CLI entry point returning JSON `{decision, effort, risk}` |
-| `DEFAULT_AUTOPLAN_EFFORT_SKIP` | Default threshold: `{Extra Small, Small}` |
-| `DEFAULT_AUTOPLAN_RISK_SKIP` | Default threshold: `{Low}` |
+| `DEFAULT_AUTOPLAN_EFFORT_SKIP` | Default effort threshold: `{Extra Small, Small}` |
+| `DEFAULT_AUTOPLAN_RISK_SKIP` | Default risk threshold: `{Low}` |
 
 See `docs/ralph.md` for the full auto-plan decision flow.
 
-## Scripts (canonical runner & modules)
+## Scripts
 
-- Launcher wrapper: `./ralph` (preferred wrapper that records PID/start-time and handles background runs)
-- Foreground loop: `./scripts/ralph_loop.py` (python3)
-- Shared autoplan module: `../plan/plan_helpers.py` (canonical; legacy delegation at `command/plan_helpers.py`)
-- Helpers and control: `./scripts/ralph_control.py`, `./scripts/structured_response.py`
-
-Example (documentation):
+- Launcher: `./ralph` (preferred — records PID/start-time for background runs)
+- Foreground loop: `./scripts/ralph_loop.py`
+- Shared autoplan: `../plan/plan_helpers.py` (canonical)
+- Helpers: `./scripts/ralph_control.py`, `./scripts/structured_response.py`
 
 ```bash
-# Start a background Ralph run for work item SA-0MPYMFZXO0004ZU4
-./ralph SA-0MPYMFZXO0004ZU4 --json
-
-# For direct debugging (foreground)
-python3 ./scripts/ralph_loop.py SA-0MPYMFZXO0004ZU4 --json
-
-# Inspect status (no work item id required)
-./ralph status --json
+./ralph SA-0MPYMFZXO0004ZU4 --json          # background
+python3 ./scripts/ralph_loop.py SA-0MPYMFZXO0004ZU4 --json  # foreground
+./ralph status --json                       # inspect
 ```
 
 ## Ralph Status
 
-When the operator runs `ralph status`, the script produces a **structured markdown report** that must be emitted **directly to the operator without reinterpretation or reformatting**. Do NOT summarize, rephrase, or re-interpret the output.
-
-### How to run
+When the operator runs `ralph status`, output the script's structured markdown report **verbatim** without reinterpretation or reformatting.
 
 ```bash
-# Human-readable markdown output (recommended):
-./ralph status
-
-# JSON output for programmatic use:
-./ralph status --json
+./ralph status        # human-readable markdown
+./ralph status --json # programmatic
 ```
 
-### What the script reports
+Report sections:
+1. **Header**: State, PID, target work-item id
+2. **Active Task**: Current child being processed (if any)
+3. **Status Counts**: Work items grouped by status with deltas
+4. **Recent Activity**: Last 20 log lines
+5. **Exit Code** (if stopped)
+6. **Final Summary** (if available)
 
-The `ralph status` command produces a markdown report with the following consistent sections:
-
-1. **Header**: State (running/stopped), PID, and target work-item id
-2. **Active Task**: The current child work item being processed (if any)
-3. **Status Counts**: A table showing work item counts grouped by Worklog `status`, with deltas since the last status check
-4. **Recent Activity**: Up to the last 20 log lines from the Ralph run
-5. **Exit Code**: If the run has stopped, the exit code
-6. **Final Summary**: Status and summary from the loop's final result (if available)
-
-### Critical instructions
-
-- **Output the script's markdown report verbatim**. Do NOT add your own summaries, interpretations, or reformatting.
-- The script's `format_status()` function produces the canonical markdown output. Forward it directly.
-- Do NOT use phrases like "I have reviewed the logs" or "Summary of work completed" – the markdown report itself is the summary.
-- Keep any remembered values needed for status reporting (log cursor, status counts) in the control-loop context. Do not persist them between runs.
-- Do not require a work-item id for status, and do not perform broader Worklog inspection unless the operator asks for it.
-
-### Example output
-
-```
-# Ralph Status
-
-**State**: `running` | **PID**: `12345` | **Target**: `SA-0MPYMFZXO0004ZU4`
-
-**Active Task**: `SA-0MPYMFZXO0004ZU5`
-
-## Status Counts
-
-| Status | Count | Delta |
-|--------|-------|-------|
-| `completed` | 3 | +1 |
-| `open` | 5 | -1 |
-
-## Recent Activity
-
-- child_focus parent=SA-0MPYMFZXO0004ZU4 child=SA-0MPYMFZXO0004ZU5
-- implementing work item SA-0MPYMFZXO0004ZU5
-
-**Exit Code**: `0`
-```
-
-Keep any remembered values needed for status reporting, such as issue counts and the last log cursor, in the control-loop context. Do not persist them between runs.
+**Critical:** Forward the script's output directly. Do NOT add summaries, interpretations, or reformatting. Do NOT use phrases like "I have reviewed the logs" or ask for a work-item id for status.
