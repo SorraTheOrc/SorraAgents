@@ -50,7 +50,7 @@ from command.plan_helpers import (  # noqa: E402
 logger = logging.getLogger("ralph")
 
 ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent / "assets" / ".ralph.json"
-DEFAULT_MODEL = "opencode-go/glm-5.1"
+DEFAULT_MODEL = "Proxy/qwen3"
 DEFAULT_MODEL_SOURCE = "local"
 MODEL_SOURCES = frozenset({"remote", "local"})
 DEFAULT_PI_STREAM_TIMEOUT_SECONDS = 1800.0

@@ -1266,7 +1266,7 @@ def test_debug_persist_writes_raw_payload_for_no_text_stream(tmp_path):
     assert payload["metadata"]["focus_id"] == "SA-CHILD"
     assert payload["metadata"]["child_id"] == "SA-CHILD"
     assert payload["metadata"]["attempt"] == 4
-    assert payload["metadata"]["model"] == "opencode-go/glm-5.1"
+    assert payload["metadata"]["model"] == "Proxy/qwen3"
     assert payload["metadata"]["session_id"] == "session-123"
     assert "agent_end" in payload["raw_output"]
     assert payload["truncated"] is False
@@ -1443,7 +1443,7 @@ def test_model_passed_to_pi_commands():
     """The --model flag is passed through to pi commands."""
     runner = FakeRunner()
     runner.audit_outputs = [AUDIT_PASS]
-    loop = RalphLoop(runner=runner, stream=False, model="opencode-go/glm-5.1")
+    loop = RalphLoop(runner=runner, stream=False, model="Proxy/qwen3")
     loop.run("SA-TARGET")
 
     pi_calls = [c for c in runner.calls if c[0] == "pi" and "-p" in c]
@@ -1452,7 +1452,7 @@ def test_model_passed_to_pi_commands():
     for call in pi_calls:
         assert "--model" in call, f"Expected --model in pi call: {call[:6]}"
         model_idx = call.index("--model")
-        assert call[model_idx + 1] == "opencode-go/glm-5.1"
+        assert call[model_idx + 1] == "Proxy/qwen3"
         assert "--mode" in call, f"Expected --mode in pi call: {call[:6]}"
         mode_idx = call.index("--mode")
         assert call[mode_idx + 1] == "json"
@@ -1463,7 +1463,7 @@ def test_default_model_is_used_when_none_specified():
     from skill.ralph.scripts.ralph_loop import DEFAULT_MODEL
     loop = RalphLoop(runner=FakeRunner(), stream=False)
     assert loop.model == DEFAULT_MODEL
-    assert DEFAULT_MODEL == "opencode-go/glm-5.1"
+    assert DEFAULT_MODEL == "Proxy/qwen3"
 
 
 def test_config_file_model_resolved():
@@ -1474,7 +1474,7 @@ def test_config_file_model_resolved():
     # Config file is used when CLI is None
     assert _resolve_model(None, "config-model") == "config-model"
     # Default is used when both are None
-    assert _resolve_model(None, None) == "opencode-go/glm-5.1"
+    assert _resolve_model(None, None) == "Proxy/qwen3"
 
 
 def test_load_config_from_json_file(tmp_path):
@@ -1735,7 +1735,7 @@ def test_autoplan_skips_plan_for_small_low():
 
     result = loop.run("SA-TARGET")
     assert result["status"] == "success"
-    # ensure no plan invocation (opencode run /plan)
+    # ensure no plan invocation (pi /skill:plan)
     assert not any(c[0] == "pi" and c[-1].startswith("/skill:plan") for c in runner.calls)
     # ensure implement was invoked (pi with implement prompt)
     assert any(c[0] == "pi" and c[-1].startswith("implement") for c in runner.calls)

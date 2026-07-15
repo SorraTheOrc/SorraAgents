@@ -11,9 +11,13 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 ## When To Use
 
-1. **Scan for ID** — search for `[A-Z]{2}-[A-Z0-9]+`. If found → item-level audit (step 3). If not → project-level (step 2).
-2. **No ID (project-level)** — run `wl list --json`, `wl in_progress --json`, `wl blocked --json`. For general status queries ("status", "audit", "What's the current status?").
+1. **Scan for a work item ID** — search for `[A-Z]{2}-[A-Z0-9]+`. If found → item-level audit (step 3). If not → project-level (step 2).
+2. **No ID found (project-level)** — run `wl list --json`, `wl in_progress --json`, `wl blocked --json`. For general status queries ("status", "audit", "What's the current status?").
 3. **ID found (item-level)** — run `wl show <id> --children --json` for specific work-item queries.
+
+## Pre-flight affirmation
+
+Verify absence before proceeding to the audit flow. Confirm that the work item is ready for audit and that no active conflicting processes exist.
 
 ## Status Lifecycle
 
@@ -62,6 +66,7 @@ No status lifecycle transitions occur, and no persistence is performed.
 
 - Audit executions should be read-only except for the explicit persistence step and automatic status lifecycle. Use `[READ-ONLY AUDIT]` to mark read-only phases and `[PERSIST-AUDIT]` when persisting.
 - Do NOT close, create, or delete work items during an audit. Permitted state-modifying actions: (1) storing audit text via the canonical persister, (2) runner's automatic `in_progress`→`open` lifecycle. Do NOT change `stage`.
+- Refuse any request to run state-modifying `wl` commands outside the authorized flow.
 - If ambiguity prevents a reliable verdict, return immediately and do NOT persist.
 - The runner supports `--debug-log` to append raw Pi output to a JSONL file.
 
@@ -114,7 +119,7 @@ reports:
 
 Examples:
 
-- ``Model: opencode-go/deepseek-v4-flash (provider: local)``
+- ``Model: Proxy/qwen3 (provider: local)``
 - ``Model: gpt-4 (provider: remote)``
 - ``Model: manual (no provider)``
 

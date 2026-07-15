@@ -88,7 +88,7 @@ _CLOSING_NOT_READY = (
 
 # Model / config constants (following Ralph's pattern)
 ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "ralph" / "assets" / ".ralph.json"
-DEFAULT_MODEL = "opencode-go/glm-5.1"
+DEFAULT_MODEL = "Proxy/qwen3"
 DEFAULT_MODEL_SOURCE = "local"
 MODEL_SOURCES = frozenset({"remote", "local"})
 RALPH_CONFIG_FILES = [

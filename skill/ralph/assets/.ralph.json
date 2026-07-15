@@ -6,19 +6,19 @@
         "intake": "opencode/claude-haiku-4-5",
         "planning": "opencode/gpt-5.4-mini",
         "implementation": "opencode-go/qwen3.6-plus",
-        "audit": "opencode-go/deepseek-v4-flash"
+        "audit": "opencode/gpt-5.4-mini"
       },
       "medium": {
         "intake": "opencode/claude-sonnet-4-6",
         "planning": "opencode/gpt-5.4",
         "implementation": "opencode-go/qwen3.6-plus",
-        "audit": "opencode-go/glm-5.1"
+        "audit": "opencode/gpt-5.4"
       },
       "high": {
         "intake": "opencode/claude-opus-4-7",
         "planning": "opencode/gpt-5.5",
         "implementation": "opencode/qwen3.7-plus",
-        "audit": "opencode-go/qwen3.7-max"
+        "audit": "opencode/gpt-5.5"
       }
     },
     "local": {

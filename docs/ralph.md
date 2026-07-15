@@ -59,7 +59,7 @@ The background launcher stores the current runtime context in `.worklog/ralph/cu
 | `--quiet` | off | Suppress all console output and pi streaming; only print the final JSON result. |
 | `--verbose` | off | Show detailed delegation commands, subprocess stdout/stderr, and raw audit output. |
 | `--no-stream` | off | Don't stream pi subprocess output to console (use buffered capture). Progress logging still shown. |
-| `--model` | `opencode-go/glm-5.1` | Legacy single-model override applied to all phases when per-phase mode is not enabled. |
+| `--model` | `Proxy/qwen3` | Legacy single-model override applied to all phases when per-phase mode is not enabled. |
 | `--model-source` | `local` | Selects source-specific per-phase model defaults and source-mapped config values: `remote` or `local`. No automatic fallback between sources. |
 | `--model-intake` | (none) | Override the intake phase model for this run. |
 | `--model-planning` | (none) | Override the planning phase model for this run. |
@@ -385,8 +385,8 @@ Within each model source, you can define per-tier model mappings:
   "model": {
     "remote": {
       "low": { "intake": "opencode-go/glm-5.1", "planning": "opencode-go/glm-5.1", "implementation": "opencode-go/glm-5.1", "audit": "opencode-go/glm-5.1" },
-      "medium": { "intake": "opencode/claude-opus-4.7", "planning": "opencode/gpt-5.5", "implementation": "opencode-go/qwen3.6-plus", "audit": "opencode-go/glm-5.1" },
-      "high": { "intake": "opencode/claude-opus-4.7", "planning": "opencode/gpt-5.5", "implementation": "opencode-go/qwen3.6-plus", "audit": "opencode-go/glm-5.1" }
+      "medium": { "intake": "opencode/claude-opus-4.7", "planning": "opencode/gpt-5.5", "implementation": "opencode-go/qwen3.6-plus", "audit": "opencode/gpt-5.5" },
+      "high": { "intake": "opencode/claude-opus-4.7", "planning": "opencode/gpt-5.5", "implementation": "opencode-go/qwen3.6-plus", "audit": "opencode/gpt-5.5" }
     },
     "local": {
       "low": { "intake": "Proxy/qwen3", "planning": "Proxy/qwen3", "implementation": "Proxy/qwen3", "audit": "Proxy/qwen3" },
@@ -419,7 +419,7 @@ For each phase, Ralph resolves `--model` passed to `pi` in this order:
 2. Per-tier config (`model.<source>.<tier>.<phase>`) — only when a complexity tier is active
 3. Per-phase config (`model.<phase>` or `model.<source>.<phase>`)
 4. Legacy single model (`--model` CLI or string `model` config)
-5. `DEFAULT_MODEL` (`opencode-go/glm-5.1`) when per-phase mode is not enabled
+5. `DEFAULT_MODEL` (`Proxy/qwen3`) when per-phase mode is not enabled
 6. Canonical source-specific defaults (below) when per-phase mode is enabled but no explicit per-phase value is provided
 
 Canonical defaults used by per-phase mode:
@@ -636,7 +636,7 @@ When a work item is at stage `intake_complete`, ralph automatically runs an **au
 2. **Evaluate effort and risk**: Otherwise, ralph calls the `effort-and-risk` skill (`orchestrate_estimate.py`) to compute the effort t-shirt size and risk level.
 3. **Threshold decision**:
    - If effort is **Extra Small** or **Small** **AND** risk is **Low**, ralph skips planning and proceeds directly to implementation.
-   - If effort or risk exceed these thresholds, ralph invokes `/plan <id>` to create a plan before implementation. Ralph runs the plan via the Pi agent runtime (the `pi` binary) by invoking the plan skill (e.g. `/skill:plan <id>`), so planning executes inside the agent framework with the configured model and runtime semantics. This is distinct from engine-level `opencode run "/plan <id>"` dispatch.
+   - If effort or risk exceed these thresholds, ralph invokes `/plan <id>` to create a plan before implementation. Ralph runs the plan via the Pi agent runtime (the `pi` binary) by invoking the plan skill (e.g. `/skill:plan <id>`), so planning executes inside the agent framework with the configured model and runtime semantics. This is distinct from engine-level `pi` dispatch for the plan skill.
    - If the effort-and-risk skill fails or returns ambiguous data, ralph defaults to running `/plan` (safety-first).
 4. **Post decision comment**: ralph posts a human-readable comment on the work item documenting the auto-plan decision (effort, risk, outcome). This comment is idempotent \u2014 re-running ralph will not create duplicate comments.
 

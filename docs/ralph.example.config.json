@@ -12,13 +12,13 @@
         "intake": "opencode/claude-opus-4.7",
         "planning": "opencode/gpt-5.5",
         "implementation": "opencode-go/qwen3.6-plus",
-        "audit": "opencode-go/glm-5.1"
+        "audit": "opencode/gpt-5.5"
       },
       "high": {
         "intake": "opencode/claude-opus-4.7",
         "planning": "opencode/gpt-5.5",
         "implementation": "opencode-go/qwen3.6-plus",
-        "audit": "opencode-go/glm-5.1"
+        "audit": "opencode/gpt-5.5"
       }
     },
     "local": {

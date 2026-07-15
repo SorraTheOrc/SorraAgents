@@ -197,7 +197,7 @@ def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bo
             f.write(proc.stderr or '')
         return proc.returncode, log_path
     except FileNotFoundError:
-        # opencode not installed; record error
+        # pi not installed; record error
         with open(log_path, 'w') as f:
             f.write('pi CLI not found in PATH\n')
         return 127, log_path
