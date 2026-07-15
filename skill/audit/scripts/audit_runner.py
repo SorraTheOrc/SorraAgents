@@ -716,6 +716,11 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       - All non-deleted children must be in ``in_review`` or ``done`` stage.
         Children with ``status: in_progress`` but ``stage: in_review`` are
         acceptable and do NOT block closure.
+      - Each active child's persisted audit verdict is checked via the
+        ``child_audit_ready`` field. If any active child's own audit says
+        "Ready to close: No" (child_audit_ready is False), the parent is
+        not ready to close. Children with ``status: completed`` and
+        ``stage: done`` are exempt from this check.
       - Code quality findings: critical or high severity findings block closure
         ("Ready to close: No"). Medium and low findings produce warnings
         but do NOT block closure.
@@ -731,6 +736,17 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         for c in active_children
     )
 
+    # Check each active (non-exempt) child's persisted audit verdict
+    # Exempt children: those with completed/done status+stage (already closed)
+    def _is_exempt_child(c: dict) -> bool:
+        return c.get("status") == "completed" and c.get("stage") == "done"
+
+    non_exempt_children = [c for c in active_children if not _is_exempt_child(c)]
+    any_child_audit_not_ready = any(
+        c.get("child_audit_ready") is False
+        for c in non_exempt_children
+    )
+
     # Code quality blocking: critical or high findings block closure
     cq_findings = code_quality_findings or []
     has_blocking_cq = any(
@@ -738,7 +754,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         for f in cq_findings
     )
 
-    ready_before_cq = "Yes" if (all_ac_acceptable and all_children_reviewed) else "No"
+    ready_before_cq = "Yes" if (all_ac_acceptable and all_children_reviewed and not any_child_audit_not_ready) else "No"
     if ready_before_cq == "Yes" and has_blocking_cq:
         ready = "No"
     else:
@@ -1154,11 +1170,88 @@ def _demote_met_to_partial(results: list[dict]) -> list[dict]:
     return demoted
 
 
+def _get_child_audit_verdict(runner: Runner, child_id: str) -> tuple[bool | None, str]:
+    """Check a child's persisted audit verdict via wl audit-show.
+
+    Returns a (verdict, reason) tuple:
+        (True, "ready")      — Child audit says "Ready to close: Yes"
+        (False, "not_ready") — Child audit says "Ready to close: No"
+        (None, "no_audit")   — No audit data found (audit-show returned null/empty)
+        (None, "stale")      — Audit exists but is stale (within freshness buffer)
+        (None, "error")      — wl audit-show command failed
+
+    Freshness is determined by comparing the audit's auditedAt timestamp against
+    the child's updatedAt timestamp plus AUDIT_FRESHNESS_BUFFER_SECONDS.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"])
+    except RuntimeError:
+        return None, "error"
+
+    if not isinstance(data, dict) or data.get("success") is False:
+        return None, "error"
+
+    audit = data.get("audit")
+    if not audit:
+        return None, "no_audit"
+
+    raw_output = audit.get("rawOutput")
+    if not raw_output:
+        return None, "no_audit"
+
+    audited_at = audit.get("auditedAt")
+    if not audited_at:
+        return None, "no_audit"
+
+    # Check freshness against the child's updatedAt
+    try:
+        wi_data = _run_wl(runner, ["wl", "show", child_id, "--json"])
+    except RuntimeError:
+        # Can't check freshness; treat as fresh since we have an audit
+        pass
+    else:
+        work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
+        updated_at = work_item.get("updatedAt")
+        if updated_at:
+            try:
+                audit_time_str = str(audited_at).replace("Z", "+00:00")
+                update_time_str = str(updated_at).replace("Z", "+00:00")
+                audit_time = datetime.fromisoformat(audit_time_str)
+                update_time = datetime.fromisoformat(update_time_str)
+                if audit_time.tzinfo is None:
+                    audit_time = audit_time.replace(tzinfo=timezone.utc)
+                if update_time.tzinfo is None:
+                    update_time = update_time.replace(tzinfo=timezone.utc)
+                freshness_threshold = update_time + timedelta(seconds=AUDIT_FRESHNESS_BUFFER_SECONDS)
+                if not (audit_time > freshness_threshold):
+                    return None, "stale"
+            except (ValueError, TypeError):
+                pass  # Can't parse timestamps; treat as fresh since we have an audit
+
+    # Parse the raw output for "Ready to close:"
+    for line in raw_output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Ready to close:"):
+            verdict = stripped.split(":", 1)[1].strip()
+            if verdict.lower() == "yes":
+                return True, "ready"
+            return False, "not_ready"
+
+    return None, "no_audit"
+
+
 def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict]) -> tuple[bool, str]:
     """Check whether Phase 1 automated screening has blocking issues.
 
     Returns (blocked, reason). If blocked, Phase 2 deep analysis should be
     skipped and all 'met' verdicts demoted to 'partial'.
+
+    Blocking issues include:
+    - Critical/high code quality findings
+    - Children not in in_review/done stage
+    - Active children whose persisted audit says "Ready to close: No"
     """
     # Check code quality findings
     for f in cq_findings:
@@ -1175,9 +1268,17 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
         names = ", ".join(f"{c.get('title', '?')} ({c.get('stage', '?')})" for c in blocked_children[:3])
         return True, f"Children not in in_review/done stage: {names}"
 
+    # Check each active child's persisted audit verdict
+    # A child with child_audit_ready=False means its own audit says "not ready"
+    for c in active_children:
+        car = c.get("child_audit_ready")
+        if car is False:
+            return True, (
+                f"Child '{c.get('title', '?')}' ({c.get('id', '?')}) audit says "
+                "'not ready to close' — block parent closure"
+            )
+
     return False, ""
-
-
 
 def _build_issue_json(issue: dict, ac_results: list[dict],
                       child_results: list[dict],
@@ -1190,6 +1291,11 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
         ``adjusted`` criteria represent acceptable variance and do not block closure.
       - Critical/high code quality findings block closure.
+      - Each active child's persisted audit verdict is checked via the
+        ``child_audit_ready`` field. If any non-exempt active child's own
+        audit says "Ready to close: No" (child_audit_ready is False), the
+        parent is not ready to close. Children with ``status: completed``
+        and ``stage: done`` are exempt from this check.
     """
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
@@ -1202,6 +1308,15 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         for c in active_children
     )
 
+    # Check each non-exempt child's persisted audit verdict
+    def _is_exempt(c: dict) -> bool:
+        return c.get("status") == "completed" and c.get("stage") == "done"
+    non_exempt_children = [c for c in active_children if not _is_exempt(c)]
+    any_child_audit_not_ready = any(
+        c.get("child_audit_ready") is False
+        for c in non_exempt_children
+    )
+
     # Code quality blocking
     cq_findings = code_quality_findings or []
     has_blocking_cq = any(
@@ -1209,7 +1324,7 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         for f in cq_findings
     )
 
-    ready = all_ac_acceptable and all_children_reviewed and not has_blocking_cq
+    ready = all_ac_acceptable and all_children_reviewed and not has_blocking_cq and not any_child_audit_not_ready
 
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
@@ -1452,6 +1567,14 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
     When *force* is ``True``, the freshness gate is bypassed and a full
     audit pipeline is always run, even if a recent audit already exists.
+
+    For each active child (not completed/done), the child's persisted audit
+    verdict is checked via ``wl audit-show``. If no audit exists or the audit
+    is stale, an audit is auto-triggered for that child (via the same audit
+    runner mechanism) and the resulting verdict is evaluated. A child whose
+    audit says "Ready to close: No" prevents the parent from being ready to
+    close. This check is performed before Phase 1 screening so that Phase 1
+    can block on children not individually ready.
     """
     # Resolve the effective model from config + CLI
     config = _load_config()
@@ -1710,6 +1833,70 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 "stage": child.get("stage", ""),
                 "ac_results": child_ac_results,
             })
+
+        # ------------------------------------------------------------------
+        # Check each active child's persisted audit verdict.
+        # For children without audits or with stale audits, auto-trigger
+        # a fresh audit (if persist is True) and re-evaluate.
+        # Children with completed/done status+stage are exempt (AC5).
+        # ------------------------------------------------------------------
+        _audit_runner_path = Path(__file__).resolve()
+
+        for child in child_results:
+            # Skip completed/done children (exempt per AC5)
+            if child.get("status") == "completed" and child.get("stage") == "done":
+                child["child_audit_ready"] = True  # Exempt - treat as ready
+                continue
+
+            verdict, reason = _get_child_audit_verdict(runner, child["id"])
+
+            if verdict is None and persist:
+                if _elapsed() < 110:
+                    print(
+                        f"Auto-triggering audit for child {child['id']} "
+                        f"({child['title']}) — reason: {reason}",
+                        file=sys.stderr,
+                    )
+                    try:
+                        audit_cmd = [
+                            sys.executable or "python3",
+                            str(_audit_runner_path),
+                            "issue",
+                            child["id"],
+                            "--pi-bin", pi_bin,
+                            "--model", resolved_model,
+                            "--model-source", model_source,
+                            "--force",  # Bypass freshness gate
+                        ]
+                        subprocess.run(
+                            audit_cmd,
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=CALL_PI_TIMEOUT,
+                        )
+                        # Re-check verdict after triggered audit
+                        verdict, reason = _get_child_audit_verdict(runner, child["id"])
+                    except subprocess.TimeoutExpired:
+                        print(
+                            f"Warning: Auto-triggered audit for child {child['id']} "
+                            f"timed out.", file=sys.stderr,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"Warning: Auto-triggered audit for child {child['id']} "
+                            f"failed: {exc}", file=sys.stderr,
+                        )
+                else:
+                    print(
+                        f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
+                        f"Cannot auto-trigger audit for child {child['id']} "
+                        f"({child['title']}). Manual audit required.",
+                        file=sys.stderr,
+                    )
+
+            # Set child_audit_ready: True/False if verdict is known, False otherwise
+            child["child_audit_ready"] = verdict if verdict is not None else False
 
         # Initialize child_persist_results for reporting
         child_persist_results = []

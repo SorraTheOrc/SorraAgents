@@ -26,6 +26,7 @@ from skill.audit.scripts.audit_runner import (
     _resolve_model_for_phase,
     _normalize_model_source,
     _deep_merge,
+    _get_child_audit_verdict,
     CALL_PI_TIMEOUT,
     DEFAULT_MODEL,
     DEFAULT_MODEL_SOURCE,
@@ -1423,3 +1424,250 @@ class TestFreshnessGate:
         assert rc == 0
         # Project audit should still run (no gate)
         assert pi_called["count"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Child audit verdict helper tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetChildAuditVerdict:
+    """Verify _get_child_audit_verdict helper function."""
+
+    def test_ready_yes_when_audit_says_yes(self):
+        """Returns True when child audit says "Ready to close: Yes"."""
+        def runner(cmd, **kwargs):
+            if "audit-show" in list(cmd):
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": {
+                        "workItemId": "SA-CHILD",
+                        "auditedAt": "2026-07-15T10:00:00.000Z",
+                        "rawOutput": "Ready to close: Yes\n\n## Summary\nAll good.",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        assert verdict is True
+        assert reason == "ready"
+
+    def test_ready_no_when_audit_says_no(self):
+        """Returns False when child audit says "Ready to close: No"."""
+        def runner(cmd, **kwargs):
+            if "audit-show" in list(cmd):
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": {
+                        "workItemId": "SA-CHILD",
+                        "auditedAt": "2026-07-15T10:00:00.000Z",
+                        "rawOutput": "Ready to close: No\n\n## Summary\nIssues remain.",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        assert verdict is False
+        assert reason == "not_ready"
+
+    def test_no_audit_returns_none(self):
+        """Returns (None, "no_audit") when no audit data exists."""
+        def runner(cmd, **kwargs):
+            if "audit-show" in list(cmd):
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": None,
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        assert verdict is None
+        assert reason == "no_audit"
+
+    def test_stale_audit_returns_stale(self):
+        """Returns (None, "stale") when audit is within freshness buffer but stale."""
+        def runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                # Audit just a few seconds after update (within buffer -> stale)
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": {
+                        "workItemId": "SA-CHILD",
+                        "auditedAt": "2026-07-15T10:00:30.000Z",
+                        "rawOutput": "Ready to close: Yes\n\nAll good.",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            if "show" in cmd_list and "--children" not in cmd_list:
+                wi_data = {
+                    "success": True,
+                    "workItem": {
+                        "id": "SA-CHILD",
+                        "updatedAt": "2026-07-15T10:00:00.000Z",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(wi_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        assert verdict is None
+        assert reason == "stale"
+
+    def test_fresh_audit_returns_verdict(self):
+        """Returns the verdict when audit is fresh."""
+        def runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                # Audit is well after the update (outside buffer -> fresh)
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": {
+                        "workItemId": "SA-CHILD",
+                        "auditedAt": "2026-07-15T10:02:00.000Z",
+                        "rawOutput": "Ready to close: Yes\n\nAll good.",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            if "show" in cmd_list and "--children" not in cmd_list:
+                wi_data = {
+                    "success": True,
+                    "workItem": {
+                        "id": "SA-CHILD",
+                        "updatedAt": "2026-07-15T10:00:00.000Z",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(wi_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        assert verdict is True
+        assert reason == "ready"
+
+    def test_audit_show_failure_returns_error(self):
+        """Returns (None, "error") when wl audit-show fails."""
+        def runner(cmd, **kwargs):
+            if "audit-show" in list(cmd):
+                return _fake_proc(returncode=1, stderr="command failed")
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        assert verdict is None
+        assert reason == "error"
+
+    def test_no_raw_output_returns_no_audit(self):
+        """Returns (None, "no_audit") when rawOutput is missing."""
+        def runner(cmd, **kwargs):
+            if "audit-show" in list(cmd):
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": {
+                        "workItemId": "SA-CHILD",
+                        "auditedAt": None,
+                        "rawOutput": None,
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        assert verdict is None
+        assert reason == "no_audit"
+
+
+class TestCmdIssueChildAuditAutoTrigger:
+    """Integration tests for child audit auto-trigger in cmd_issue."""
+
+    def test_child_with_no_audit_triggers_audit(self, monkeypatch, capsys):
+        """When a child has no persisted audit, an audit is auto-triggered."""
+        pi_calls = []
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            pi_calls.append(prompt)
+            return {"verdict": "met", "evidence": "x:1 — ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        triggered_children = []
+
+        def fake_subprocess_run(cmd, **kwargs):
+            # Record which child was triggered
+            if "issue" in cmd:
+                for i, arg in enumerate(cmd):
+                    if arg == "issue" and i + 1 < len(cmd):
+                        triggered_children.append(cmd[i + 1])
+                        break
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.subprocess.run",
+            fake_subprocess_run,
+        )
+
+        child_wi = _load_fixture("wi_with_numbered_ac.json")
+        child_wi["workItem"]["id"] = "SA-ACTIVE"
+        child_wi["workItem"]["title"] = "Active Child"
+        child_wi["workItem"]["status"] = "in_progress"
+        child_wi["workItem"]["stage"] = "in_review"
+
+        parent_wi = _load_fixture("wi_with_numbered_ac.json")
+        parent_wi["children"] = [
+            {
+                "id": "SA-ACTIVE",
+                "title": "Active Child",
+                "status": "in_progress",
+                "stage": "in_review",
+                "description": child_wi["workItem"]["description"],
+            },
+        ]
+
+        # Track audit-show calls per child ID so we differentiate
+        # between parent freshness gate and child audit checks.
+        child_audit_seen = {}  # child_id -> bool (has been checked once)
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi))
+            if "show" in cmd_list:
+                return _fake_proc(stdout=json.dumps(child_wi))
+            if "audit-show" in cmd_list:
+                # Extract the child ID from the command
+                target_id = cmd_list[2] if len(cmd_list) > 2 else ""
+                if target_id == "SA-ACTIVE":
+                    if child_audit_seen.get(target_id, False):
+                        # Second call (after trigger): audit exists with ready=yes
+                        audit_data = {
+                            "success": True,
+                            "workItemId": "SA-ACTIVE",
+                            "audit": {
+                                "workItemId": "SA-ACTIVE",
+                                "auditedAt": "2026-07-16T12:00:00Z",
+                                "rawOutput": "Ready to close: Yes\n\n## Summary\nAll good.",
+                            },
+                        }
+                    else:
+                        # First call for this child: no audit
+                        child_audit_seen[target_id] = True
+                        audit_data = {"success": True, "workItemId": target_id, "audit": None}
+                else:
+                    # Parent freshness gate: return no audit (proceed normally)
+                    audit_data = {"success": True, "workItemId": target_id, "audit": None}
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=True)
+        # Should have triggered an audit for the active child
+        assert "SA-ACTIVE" in triggered_children
