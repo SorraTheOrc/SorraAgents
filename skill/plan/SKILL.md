@@ -185,7 +185,7 @@ instructions above).
    - Validate readiness by `stage`:
      - `intake_complete` → ready for planning
      - `plan_complete` or later → skip, record no-op comment
-     - Other → run heuristics to auto-complete if small/well-defined; if genuinely stuck, ask the user.
+     - Other → check Step 1 auto-complete heuristics before asking the operator. If heuristics indicate planning is not needed, skip to recording a no-op comment. Only ask the operator when heuristics genuinely cannot determine.
    - Read any linked PRD for key details.
    - Derive 3-6 keywords from title/description to search for related work; present likely duplicates or relationships.
 
