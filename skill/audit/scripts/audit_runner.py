@@ -1620,7 +1620,19 @@ def cmd_issue(issue_id: str, persist: bool = True,
         }
 
     # ------------------------------------------------------------------
-    # Status lifecycle: set in_progress on entry (cleaned up to open in finally)
+    # Capture original status before setting in_progress, so we can
+    # restore it in the finally block (instead of always resetting to "open").
+    # ------------------------------------------------------------------
+    original_status = "open"  # safe default
+    try:
+        item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"])
+        if isinstance(item_data, dict):
+            original_status = item_data.get("status", "open")
+    except RuntimeError:
+        pass  # Fall back to "open" as safe default
+
+    # ------------------------------------------------------------------
+    # Status lifecycle: set in_progress on entry (restored in finally)
     # ------------------------------------------------------------------
     _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"])
 
@@ -2026,11 +2038,12 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
     finally:
         # ------------------------------------------------------------------
-        # Status lifecycle: set open on exit (success or failure)
+        # Status lifecycle: restore original status on exit (success or failure)
         # Always runs because of try/finally — guarantees cleanup.
+        # Falls back to "open" if original_status was not captured.
         # ------------------------------------------------------------------
         try:
-            _run_wl(runner, ["wl", "update", issue_id, "--status", "open", "--json"])
+            _run_wl(runner, ["wl", "update", issue_id, "--status", original_status, "--json"])
         except RuntimeError:
             pass  # Status update failure must not mask the main result
 

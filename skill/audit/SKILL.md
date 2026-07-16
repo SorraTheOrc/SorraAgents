@@ -36,8 +36,10 @@ Behavior:
 When running without `audit_runner.py`:
 
 ```bash
+# Capture original status before setting in_progress
+ORIG_STATUS=$(wl show <id> --json | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','open'))")
 wl update <id> --status in_progress --json   # before audit
-wl update <id> --status open --json           # after audit (success or failure)
+wl update <id> --status "$ORIG_STATUS" --json # after audit (success or failure)
 ```
 
 Always include `--json` for machine-readable output.
