@@ -329,9 +329,9 @@ commands:
         enum: [intake, plan, implement]
     prompt_ref: prompts/delegate.md
     dispatch_map:
-      idea: 'opencode run "/intake {id} do not ask questions"'
-      intake: 'opencode run "/plan {id}"'
-      plan: 'opencode run "work on {id} using the implement skill"'
+      idea: 'pi "/intake {id} do not ask questions"'
+      intake: 'pi "/plan {id}"'
+      plan: 'pi "work on {id} using the implement skill"'
     effects:
       set_assignee: Patch
       add_tags: [delegated]

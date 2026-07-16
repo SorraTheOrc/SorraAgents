@@ -54,7 +54,7 @@ All pre invariants pass. Command execution proceeds.
 | **State After** | `in_progress / delegated` (alias: `delegated`) |
 | **Input: action** | `intake` (determined by stage=idea) |
 | **Input: work_item_id** | WL-EXAMPLE-001 |
-| **Engine Action** | `opencode run "/intake WL-EXAMPLE-001 do not ask questions"` |
+| **Engine Action** | `pi "/intake WL-EXAMPLE-001 do not ask questions"` |
 | **Effects** | `set_assignee: Patch`, `add_tags: [delegated]` |
 | **Discord** | `"Delegating 'intake' task for 'Add user preference export API' (WL-EXAMPLE-001)"` |
 
@@ -65,7 +65,7 @@ Command: delegate (intake)
 Actor: PM -> ampa-scheduler
 Timestamp: 2026-02-19T10:00:00Z
 Outcome: success
-Agent: opencode-patch-1
+Agent: pi-agent-1
 Model: claude-opus-4
 Prompt ref: prompts/delegate.md
 ```
@@ -90,7 +90,7 @@ AMPA's next scheduler cycle finds WL-EXAMPLE-001 at stage `intake_complete`.
 | **State Before** | `open / intake_complete` (alias: `intake`) |
 | **State After** | `in_progress / delegated` (alias: `delegated`) |
 | **Input: action** | `plan` |
-| **Engine Action** | `opencode run "/plan WL-EXAMPLE-001"` |
+| **Engine Action** | `pi "/plan WL-EXAMPLE-001"` |
 | **Discord** | `"Delegating 'plan' task for 'Add user preference export API' (WL-EXAMPLE-001)"` |
 
 Patch decomposes the work into sub-tasks with acceptance criteria and updates stage to `plan_complete`.
@@ -106,7 +106,7 @@ AMPA's next scheduler cycle finds WL-EXAMPLE-001 at stage `plan_complete`.
 | **State Before** | `open / plan_complete` (alias: `plan`) |
 | **State After** | `in_progress / delegated` (alias: `delegated`) |
 | **Input: action** | `implement` |
-| **Engine Action** | `opencode run "work on WL-EXAMPLE-001 using the implement skill"` |
+| **Engine Action** | `pi "work on WL-EXAMPLE-001 using the implement skill"` |
 | **Discord** | `"Delegating 'implement' task for 'Add user preference export API' (WL-EXAMPLE-001)"` |
 
 ### Step 6: Patch Implements Autonomously
@@ -148,7 +148,7 @@ Patch works without any back-and-forth:
 | **State Before** | `in_progress / in_review` (alias: `review`) |
 | **State After** | `completed / audit_passed` (alias: `audit_passed`) |
 | **Pre Invariant** | `requires_audit_result` — PASS (audit comment present) |
-| **Engine Action** | `opencode run "/audit WL-EXAMPLE-001"` |
+| **Engine Action** | `pi "/audit WL-EXAMPLE-001"` |
 
 **Audit Output:**
 

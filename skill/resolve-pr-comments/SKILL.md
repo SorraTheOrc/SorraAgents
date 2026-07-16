@@ -2,7 +2,7 @@
 name: resolve-pr-comments
 description: Fetch GitHub PR review comments, propose fixes with a plan, and resolve threads after approval
 license: MIT
-compatibility: opencode
+compatibility: pi
 metadata:
   audience: developers
   workflow: github

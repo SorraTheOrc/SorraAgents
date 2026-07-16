@@ -15,11 +15,11 @@ User requests a new command ("Create a command to <do something>", "I need a com
 
 ## Behavior
 
-1. Review [command authoring docs](https://opencode.ai/docs/commands) and [examples](https://claude.ai/public/artifacts/e2725e41-cca5-48e5-9c15-6eab92012e75)
+1. Review [command authoring docs](https://docs.pi.ai/commands) and [examples](https://claude.ai/public/artifacts/e2725e41-cca5-48e5-9c15-6eab92012e75)
 2. Gather requirements: functionality, inputs, outputs, constraints
 3. Draft command in markdown following example format
 4. Review with user, revise until approved (do not proceed without approval)
-5. Place final command in `.opencode/commands/` directory
+5. Place final command in `./command/` directory
 6. Document in README.md
 
 ## Framework placeholders

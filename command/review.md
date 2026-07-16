@@ -91,11 +91,11 @@ The command implements the procedural workflow below. Each numbered step is part
    - `distrobox enter "$container_name" -- bash -c 'gh pr checkout "<pr-ref>"'` (without `--login`/`-l`)
 
 7. **Audit the code** (agent responsibility)
-   - `audit_output=$(distrobox enter "$container" -- bash -c 'cd /workdir/project && . /etc/ampa_bashrc && opencode run "audit <work-item-id> against the currently checked out branch"' 2>&1)`
+   - `audit_output=$(distrobox enter "$container" -- bash -c 'cd /workdir/project && . /etc/ampa_bashrc && pi "audit <work-item-id> against the currently checked out branch"' 2>&1)`
    - Do not post details in comments — only summarize outcome. Capture critical findings as structured data.
 
 8. **Review the code** (agent responsibility)
-   - `code_review_output=$(distrobox enter "$container" -- bash -c 'cd /workdir/project && . /etc/ampa_bashrc && opencode run "review code in the currently checked out branch using the code_review skill"' 2>&1)`
+   - `code_review_output=$(distrobox enter "$container" -- bash -c 'cd /workdir/project && . /etc/ampa_bashrc && pi "review code in the currently checked out branch using the code_review skill"' 2>&1)`
    - Do not post details in comments — only summarize outcome.
 
 9. **Discover and run tests** (agent responsibility)

@@ -2,7 +2,7 @@
 """Infer a suspected owner for a failing test file.
 
 Heuristics (in order of preference):
-1. Override map — `.opencode/triage/owner-map.yaml` for explicit mappings.
+1. Override map — `.worklog/triage/owner-map.yaml` for explicit mappings.
 2. CODEOWNERS — parse GitHub-style CODEOWNERS if present.
 3. Git blame — most-frequent author of the failing file.
 4. Recent commits — most-frequent author touching the file in the last N commits.
@@ -26,7 +26,7 @@ DEFAULT_RECENT_COMMITS = 50
 
 
 # ---------------------------------------------------------------------------
-# Override map (.opencode/triage/owner-map.yaml)
+# Override map (.worklog/triage/owner-map.yaml)
 # ---------------------------------------------------------------------------
 
 
@@ -37,7 +37,7 @@ def load_owner_map(repo_path: str) -> Dict[str, str]:
     We parse it without requiring PyYAML by handling the simple
     ``key: value`` format.
     """
-    map_path = os.path.join(repo_path, ".opencode", "triage", "owner-map.yaml")
+    map_path = os.path.join(repo_path, ".worklog", "triage", "owner-map.yaml")
     if not os.path.isfile(map_path):
         return {}
     result: Dict[str, str] = {}

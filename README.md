@@ -238,11 +238,11 @@ This will:
 
 The pool is replenished automatically in the background after each `start-work`, but running `warm-pool` once up front avoids the initial wait.
 
-Pool state (`pool-state.json`, `pool-cleanup.json`, `pool-replenish.log`) is stored globally at `~/.config/opencode/.worklog/ampa/` so that container claims and cleanup records are shared across all projects on the host. Per-project config (`.env`, `scheduler_store.json`, daemon PID/log) remains under `<project>/.worklog/ampa/`.
+Pool state (`pool-state.json`, `pool-cleanup.json`, `pool-replenish.log`) is stored globally at `~/.config/pi/.worklog/ampa/` so that container claims and cleanup records are shared across all projects on the host. Per-project config (`.env`, `scheduler_store.json`, daemon PID/log) remains under `<project>/.worklog/ampa/`.
 
 If the AMPA Containerfile has been modified since the image was last built, `warm-pool` will automatically tear down unclaimed pool containers and the template, rebuild the image, and re-fill the pool. Simply run `wl ampa warm-pool` again — no manual cleanup is needed.
 
-See the AMPA container pool reference for full details: <https://github.com/opencode/ampa/blob/main/docs/ampa_container_pool.md>
+See the AMPA container pool reference for full details.
 
 ### Browser test capability
 
@@ -346,8 +346,7 @@ Daemon / scheduler note
   sends a single heartbeat and exits; to run the scheduler loop you must
   explicitly enable it (for example: use `--start-scheduler` or set an
   environment flag like `AMPA_RUN_SCHEDULER=1`). Check the AMPA repository
-  README at <https://github.com/opencode/ampa> for the exact flags and
-  environment variables.
+  README for the exact flags and environment variables.
 
 ## Contributing
 
@@ -359,11 +358,9 @@ Daemon / scheduler note
 
 The AMPA Worklog plugin has been moved to its own independent repository:
 
-**<https://github.com/opencode/ampa>**
-
 The `skill/install-ampa/resources/ampa.mjs` file in this repository is a runtime loader that delegates to the installed AMPA package. To develop or modify AMPA:
 
-1. Clone the AMPA repository: `git clone https://github.com/opencode/ampa.git`
+1. Clone the AMPA repository
 2. Make changes in the AMPA repository
 3. Run tests in the AMPA repository (see its README for test commands)
 4. Re-install with `skill/install-ampa/scripts/install-worklog-plugin.sh --yes` to get the latest version

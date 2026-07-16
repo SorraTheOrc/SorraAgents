@@ -12,7 +12,7 @@ import skill.owner_inference.scripts.infer_owner as io
 
 def test_owner_map_match(tmp_path):
     """Override map returns the configured owner with confidence 1.0."""
-    triage_dir = tmp_path / ".opencode" / "triage"
+    triage_dir = tmp_path / ".worklog" / "triage"
     triage_dir.mkdir(parents=True)
     (triage_dir / "owner-map.yaml").write_text(
         "tests/test_scheduler*: scheduler-team\n"
@@ -27,7 +27,7 @@ def test_owner_map_match(tmp_path):
 
 def test_owner_map_no_match(tmp_path):
     """Override map returns None when no pattern matches."""
-    triage_dir = tmp_path / ".opencode" / "triage"
+    triage_dir = tmp_path / ".worklog" / "triage"
     triage_dir.mkdir(parents=True)
     (triage_dir / "owner-map.yaml").write_text("ampa/*: ampa-team\n")
     result = io.check_owner_map(str(tmp_path), "tests/test_foo.py")
@@ -42,7 +42,7 @@ def test_owner_map_missing_file(tmp_path):
 
 def test_owner_map_comments_and_blanks(tmp_path):
     """Comments and blank lines are ignored."""
-    triage_dir = tmp_path / ".opencode" / "triage"
+    triage_dir = tmp_path / ".worklog" / "triage"
     triage_dir.mkdir(parents=True)
     (triage_dir / "owner-map.yaml").write_text(
         "# This is a comment\n\nskill/triage/*: triage-team\n"
@@ -222,7 +222,7 @@ def test_infer_owner_prefers_override_map(tmp_path):
         capture_output=True,
     )
     # Add override map
-    triage_dir = tmp_path / ".opencode" / "triage"
+    triage_dir = tmp_path / ".worklog" / "triage"
     triage_dir.mkdir(parents=True)
     (triage_dir / "owner-map.yaml").write_text("test_file*: override-owner\n")
 

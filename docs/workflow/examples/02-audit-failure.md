@@ -27,7 +27,7 @@ The engine's triage audit cycle picks up WL-EXAMPLE-002 in `in_review` state.
 
 | Field | Value |
 |---|---|
-| **Engine Action** | `opencode run "/audit WL-EXAMPLE-002"` |
+| **Engine Action** | `pi "/audit WL-EXAMPLE-002"` |
 | **Cooldown Check** | Last audit > 6 hours ago — proceed |
 
 ### Step 2: Audit Finds Gaps — `audit_fail` Command
@@ -108,7 +108,7 @@ Next scheduler cycle picks up WL-EXAMPLE-002 at stage `plan_complete`.
 | **State After** | `in_progress / delegated` (alias: `delegated`) |
 | **Input: action** | `implement` |
 | **Pre Invariants** | All 5 pass |
-| **Engine Action** | `opencode run "work on WL-EXAMPLE-002 using the implement skill"` |
+| **Engine Action** | `pi "work on WL-EXAMPLE-002 using the implement skill"` |
 
 Patch reads the audit comment, addresses the gaps:
 

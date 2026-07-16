@@ -22,7 +22,7 @@ Inputs / Outputs
 
 ## Heuristics (in priority order)
 
-1. **Override map** — `.opencode/triage/owner-map.yaml`
+1. **Override map** — `.worklog/triage/owner-map.yaml`
 2. **CODEOWNERS** — GitHub-style file
 3. **Git blame** — most frequent author by line count
 4. **Recent commits** — most frequent committer (last 50 commits)

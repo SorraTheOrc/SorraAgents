@@ -93,7 +93,7 @@ If the seed context is sufficient to draft a clear intake brief, skip this step.
 
 1. Draft intake brief (agent responsibility)
 
-- Write a brief to `.opencode/tmp/intake-draft-<title>-<work-item-id>.md` with these sections:
+- Write a brief to `.worklog/tmp/intake-draft-<title>-<work-item-id>.md` with these sections:
   - **Problem statement:** 1–2 sentences summarizing the problem.
   - **Users:** who benefits, with example user stories.
   - **Acceptance Criteria:** 3–5 measurable bullets describing success.
@@ -122,7 +122,7 @@ After each stage: "Finished <type> review: <changes>" or "Finished <type> review
 - Adding dependencies: `wl comment add <work-item-id> --comment "Blocks:<blocked-id>" --json` / `--comment "Blocked-by:<blocking-id>" --json`
 - Adjusting priority: `wl update <work-item-id> --priority <level> --json`
 
-1. Update the work item: `wl update <work-item-id> --description-file .opencode/tmp/intake-draft-<title>-<work-item-id>.md --stage intake_complete --status open --json`
+1. Update the work item: `wl update <work-item-id> --description-file .worklog/tmp/intake-draft-<title>-<work-item-id>.md --stage intake_complete --status open --json`
 
 2. Calculate Effort and Risk (agent responsibility; must follow)
 
@@ -133,7 +133,7 @@ After each stage: "Finished <type> review: <changes>" or "Finished <type> review
 - Set status to open (DO NOT close): `wl update <work-item-id> --status open --json`
 - `wl sync` to sync changes.
 - `wl show <work-item-id>` (not --json) to display the full work item.
-- Remove temporary files: `.opencode/tmp/intake-draft-<title>-<work-item-id>.md`
+- Remove temporary files: `.worklog/tmp/intake-draft-<title>-<work-item-id>.md`
 - Output a structured summary:
 
 # Objective

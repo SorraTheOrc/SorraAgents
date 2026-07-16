@@ -13,8 +13,8 @@ Worklog Specific Ignores
 !.worklog/plugins/
 !.worklog/plugins/**/*.yaml
 
-# opencode temporary files
-.opencode/tmp/
+# Agent framework temporary files
+.worklog/tmp/
 
 # Local tmux window configuration
 scripts/tmux.windows.conf

@@ -34,6 +34,6 @@ Each example follows a consistent format:
   - Command executed and actor
   - Pre/post invariants checked
   - State before and after (`status/stage`)
-  - Engine actions (wl commands, opencode run, Discord bot notifications)
+  - Engine actions (wl commands, pi, Discord bot notifications)
   - Audit comment recorded
 - **Final State** summary

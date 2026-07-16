@@ -4,7 +4,7 @@ This guide helps existing users transition from the old bundled AMPA installatio
 
 ## What Changed
 
-AMPA (Automated Project Management Agent) has been separated from the OpenCode repository into its own independent repository at **<https://github.com/opencode/ampa>**.
+AMPA (Automated Project Management Agent) has been separated from the OpenCode repository into its own independent repository at **<the AMPA repository>**.
 
 ### Before
 
@@ -73,7 +73,7 @@ If you were developing AMPA:
 1. **Clone the new repository** (instead of editing in OpenCode):
 
    ```bash
-   git clone https://github.com/opencode/ampa.git ~/ampa-dev
+   git clone the AMPA repository.git ~/ampa-dev
    cd ~/ampa-dev
    ```
 
@@ -100,7 +100,7 @@ If you were developing AMPA:
 
 Your existing AMPA configuration is preserved during migration:
 
-- **Global config**: `~/.config/opencode/.worklog/ampa/`
+- **Global config**: `~/.config/pi/.worklog/ampa/`
 - **Per-project config**: `<project>/.worklog/ampa/`
 - **Discord bot tokens**: Stored in `.env` files (not affected by migration)
 - **Scheduler state**: `scheduler_store.json` persists
@@ -120,7 +120,7 @@ skill/install-ampa/scripts/install-worklog-plugin.sh --yes
 **Solution**: This is expected. AMPA source is no longer in the OpenCode repository. Clone the new repository if you need source access:
 
 ```bash
-git clone https://github.com/opencode/ampa.git
+git clone the AMPA repository.git
 ```
 
 ### Issue: Local modifications lost
@@ -146,7 +146,7 @@ npm --silent test
 
 All AMPA development now happens in the dedicated repository:
 
-1. Fork <https://github.com/opencode/ampa>
+1. Fork <the AMPA repository>
 2. Create a feature branch
 3. Make your changes
 4. Run AMPA tests in that repository
@@ -169,13 +169,13 @@ If you find OpenCode documentation that still references the old AMPA locations:
 
 ## Getting Help
 
-- **AMPA Issues**: <https://github.com/opencode/ampa/issues>
-- **OpenCode Issues**: <https://github.com/opencode/opencode/issues>
+- **AMPA Issues**: <the AMPA repository/issues>
+- **OpenCode Issues**: <the OpenCode repository/issues>
 - **Migration Questions**: Open an issue in either repository with "migration" in the title
 
 ## References
 
-- AMPA Repository: <https://github.com/opencode/ampa>
-- AMPA README: <https://github.com/opencode/ampa/blob/main/README.md>
+- AMPA Repository: <the AMPA repository>
+- AMPA README: <the AMPA repository/blob/main/README.md>
 - OpenCode README: [../README.md](../README.md)
 - Installation Skill: [../skill/install-ampa/SKILL.md](../skill/install-ampa/SKILL.md)

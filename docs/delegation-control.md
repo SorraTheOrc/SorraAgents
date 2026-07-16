@@ -56,15 +56,14 @@ If you want me to: (a) add a WL comment whenever AMPA skips an item for `do-not-
 
 ## Delegation watchdog / timeout
 
-AMPA enforces a configurable timeout on every delegated `opencode run` process to
+AMPA enforces a configurable timeout on every delegated `pi` process to
 prevent the scheduler from being stuck with `running=true` indefinitely.
 
 ### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `DELEGATION_TIMEOUT_SECONDS` | 3600 | Maximum seconds a delegated `opencode run` may run before being terminated. Supercedes the legacy `AMPA_DELEGATION_OPENCODE_TIMEOUT` variable. |
-| `AMPA_DELEGATION_OPENCODE_TIMEOUT` | *(see above)* | Legacy alias for `DELEGATION_TIMEOUT_SECONDS`. Still honoured for backward compatibility. |
+| `DELEGATION_TIMEOUT_SECONDS` | 3600 | Maximum seconds a delegated `pi` may run before being terminated. |
 | `AMPA_CMD_TIMEOUT_SECONDS` | 3600 | Global default timeout for all scheduled commands (used when neither delegation-specific variable is set). |
 
 ### Termination sequence

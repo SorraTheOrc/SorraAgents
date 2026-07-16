@@ -226,16 +226,16 @@ fi
 
 if [[ ${#windows[@]} -eq 0 ]]; then
   windows=("$DEFAULT_WINDOW")
-  dirs=("$HOME/.config/opencode")
-  left_cmds=("opencode -c")
+  dirs=("")
+  left_cmds=("pi -c")
   top_cmds=("wl tui")
 fi
 
 # Ensure the first window (Agents) uses the user's agent framework config dir.
 # If the first window is the default "Agents" window and no explicit dir
-# was provided in the config, make it work in $HOME/.config/opencode.
+# was provided in the config, make it work in its default directory.
 if [[ "${windows[0]:-}" == "$DEFAULT_WINDOW" ]]; then
-  dirs[0]="${dirs[0]:-$HOME/.config/opencode}"
+  dirs[0]="${dirs[0]:-}"
 fi
 
 # Start a new detached session with a single pane (use -c to set starting dir

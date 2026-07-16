@@ -54,7 +54,6 @@ Teams often lose time on ambiguous briefs, uneven task definition, and unclear d
 * Produce a delegation plan with a rationale for each proposed assignment and record it as `wl` comments and/or attached artifacts.
 * Run read-only CI checks (lint/test dry-run) and attach results as context to recommendations.
 * Provide on-demand reporting API/command that returns: current stage, recent activity, open/blocked items, percent complete, and top risks.
-* Implement a version of the workflow documented in `~/.config/opencode/Workflow.md` so APMA's behavior matches the established agent/process expectations.
 * Support a reviewed-artifact approval workflow: track delivered artifacts, surface review comments, capture approval decisions (Producer and other required roles), and attach approval metadata to delegation artifacts so downstream specialist agents can safely commit/push.
 
 ### Non-functional requirements

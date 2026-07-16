@@ -20,7 +20,7 @@ You are executing an agentic command to <primary-goal> — coordinate, plan, and
 ## Results and Outputs
 
 - Short 1–2 sentence headline summarizing the final outcome.
-- Primary artifact(s): names and paths of files created or updated (e.g. `.opencode/tmp/<slug>-<id>.md`).
+- Primary artifact(s): names and paths of files created or updated (e.g. `.worklog/tmp/<slug>-<id>.md`).
 - Idempotence requirement: describe how reruns should behave (e.g. reuse existing resources, avoid duplicates).
 
 ## Behavior
@@ -67,7 +67,7 @@ Document any required credentials or external permissions and do not assume they
 1. Execute incremental steps (agent responsibility; prefer small, reversible actions)
 
 - When possible, run actions in dry-run mode (`--dry-run`) first and present results.
-- Apply changes incrementally and produce artifacts under `.opencode/tmp/` with descriptive names.
+- Apply changes incrementally and produce artifacts under `.worklog/tmp/` with descriptive names.
 - After each automated step, summarize what changed and output commands used (copy-paste ready).
 
 Always show the exact commands the agent ran (or would run in dry-run) using fenced code blocks so the user can reproduce steps.
@@ -81,7 +81,7 @@ Always show the exact commands the agent ran (or would run in dry-run) using fen
 
 - Make final updates to persistent artifacts (work items, files, PRs) idempotently.
 - Run any sync commands required (e.g. `wl sync`) and show results.
-- Clean up temporary files created in `.opencode/tmp/`.
+- Clean up temporary files created in `.worklog/tmp/`.
 
 If publishing changes to the repository, show the `git` commands used (e.g. `git add`, `git commit`) and do not push unless explicitly requested.
 
