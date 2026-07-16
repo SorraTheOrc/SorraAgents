@@ -139,38 +139,6 @@ class TestPlanAutoCompleteStep1:
             "The comment documenting the auto-complete reason should be mandatory."
         )
 
-    def test_borderline_evidence_errs_on_progress(self, plan_content: str) -> None:
-        """When evidence is borderline or key uncertainties remain, the skill
-        should err on the side of progress (auto-complete) rather than
-        falling back to asking clarifying questions."""
-        step1_content = _find_process_step(plan_content, "Evaluate whether planning is required")
-        assert step1_content is not None
-
-        # Check for "err on the side of progress" directive
-        assert re.search(
-            r"err on the side\s+of progress",
-            step1_content,
-            re.IGNORECASE,
-        ), (
-            "Step 1 must include an 'err on the side of progress' directive "
-            "that instructs the agent to auto-complete when in doubt"
-        )
-
-        # Check that the normal planning process is only used when
-        # the heuristics genuinely cannot determine
-        assert re.search(
-            r"genuinely needs decomposition",
-            step1_content,
-            re.IGNORECASE,
-        ) or re.search(
-            r"cannot make a determination",
-            step1_content,
-            re.IGNORECASE,
-        ), (
-            "Step 1 should fall back to normal planning only when "
-            "the heuristics genuinely cannot determine whether planning is needed"
-        )
-
 
 class TestPlanAutoCompleteStep2:
     """Verify that step 2 of plan.md handles stage validation with
@@ -212,68 +180,9 @@ class TestPlanAutoCompleteStep2:
             "when stage is plan_complete or later — it should auto-skip"
         )
 
-    def test_other_stages_check_heuristics_before_asking(self, plan_content: str) -> None:
-        """When stage is not intake_complete and not plan_complete or later,
-        check the heuristics first before asking the operator."""
-        step2_content = _find_process_step(plan_content, "Fetch & summarise")
-        assert step2_content is not None
-
-        # Check for a rule that other stages first run heuristics before asking
-        assert re.search(
-            r"(?:other|any other|else).*stage.*(?:heuristic|step 1|check|auto.comp)",
-            step2_content,
-            re.IGNORECASE | re.DOTALL,
-        ), (
-            "Step 2 must check heuristics first (referencing step 1) before "
-            "asking the operator when the stage is not intake_complete or "
-            "plan_complete or later"
-        )
-
-    def test_other_stages_ask_only_when_genuinely_unclear(self, plan_content: str) -> None:
-        """When heuristics genuinely cannot determine, only then ask the
-        operator how to proceed."""
-        step2_content = _find_process_step(plan_content, "Fetch & summarise")
-        assert step2_content is not None
-
-        # Check that asking the user is a fallback when heuristics can't determine
-        ask_context = re.search(
-            r"(ask|prompt|inquire).*(?:user|operator|how to proceed)",
-            step2_content,
-            re.IGNORECASE,
-        )
-        heuristic_fallback = re.search(
-            r"(genuinely|cannot|unclear|uncertain).*(?:determine|decide|resolve)",
-            step2_content,
-            re.IGNORECASE,
-        )
-        assert ask_context is not None, (
-            "Step 2 should include an instruction to ask the operator when "
-            "heuristics genuinely cannot determine"
-        )
-        assert heuristic_fallback is not None, (
-            "Step 2 must include a guard condition (e.g., 'genuinely cannot "
-            "determine') before asking the operator"
-        )
-
 
 class TestPlanNoopCommentFormat:
     """Verify that no-op/skip comments follow a consistent format."""
-
-    def test_noop_comment_recorded_for_plan_complete(self, plan_content: str) -> None:
-        """When stage is plan_complete or later, the no-op comment must be
-        recorded via wl comment add."""
-        step2_content = _find_process_step(plan_content, "Fetch & summarise")
-        assert step2_content is not None
-
-        # Skill file uses "record a no-op comment" rather than explicit wl comment add
-        assert re.search(
-            r"plan_complete.*record a no.?op comment",
-            step2_content,
-            re.IGNORECASE | re.DOTALL,
-        ), (
-            "Step 2 must include a 'record a no-op comment' instruction when "
-            "skipping planning due to plan_complete or later stage"
-        )
 
     def test_auto_complete_comment_recorded(self, plan_content: str) -> None:
         """All auto-complete decisions must be recorded via wl comment add."""

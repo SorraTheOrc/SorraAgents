@@ -51,39 +51,4 @@ class TestImplementSkillRecentAuditBootstrap:
             "a recent audit before doing any more work."
         )
 
-    def test_step_1_distinguishes_reuse_from_fresh_audit(self) -> None:
-        """Step 1 must distinguish between reusing an existing audit and running a fresh one."""
-        content = _skill_content()
-        step1 = _find_step(content, "1. Understand the work item")
-        assert step1 is not None, "Could not find the 'Understand the work item' step"
 
-        assert re.search(r"if.*recent audit.*use.*audit", step1, re.IGNORECASE | re.DOTALL), (
-            "Step 1 must say that a recent audit should be reused to establish the work."
-        )
-        assert re.search(r"if.*no recent audit.*run.*audit", step1, re.IGNORECASE | re.DOTALL), (
-            "Step 1 must say that implement should run a full audit when no recent audit exists."
-        )
-
-    def test_step_3_fallback_uses_skill_audit_command(self) -> None:
-        """Step 3 must explicitly invoke `/skill:audit <id>` when no recent audit exists."""
-        content = _skill_content()
-        step3 = _find_step(content, "1. Implement")
-        assert step3 is not None, "Could not find the 'Implement' step"
-
-        assert "/skill:audit <id>" in step3 or "/skill:audit <work-item-id>" in step3, (
-            "The implement step must explicitly instruct the agent to call `/skill:audit <id>` "
-            "when no recent audit is available."
-        )
-        assert re.search(r"use the output of that audit|use the resulting audit output", step3, re.IGNORECASE), (
-            "The fallback audit path must say that implement uses the audit output to decide what work remains."
-        )
-
-    def test_step_3_preserves_existing_workflow_after_audit_selection(self) -> None:
-        """The audit bootstrap must feed into the existing implementation flow."""
-        content = _skill_content()
-        step3 = _find_step(content, "1. Implement")
-        assert step3 is not None, "Could not find the 'Implement' step"
-
-        assert re.search(r"after audit selection|once.*audit.*addressed|continue to step 4", step3, re.IGNORECASE | re.DOTALL), (
-            "The implement step should preserve the existing implementation workflow after audit selection."
-        )

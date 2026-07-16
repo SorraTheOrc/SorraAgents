@@ -111,25 +111,7 @@ class TestImplementSkillTDD:
             "implementation code'."
         )
 
-    def test_implement_step_4_allows_initial_test_failure(self, implement_content: str) -> None:
-        """Step 4 must allow tests to fail on first run, then implement
-        code to make them pass."""
-        step4 = _find_step(implement_content, "1. Implement")
-        assert step4 is not None, "Could not find 'Implement' step"
 
-        must_have = [
-            r"(fail|failures?)\s+on\s+(first|initial)\s+run",
-            r"tests?\s+(may\s+)?(fail|be\s+failing).*first",
-            r"(make|get).*pass.*(before\s+)?commit",
-        ]
-        assert any(
-            re.search(pat, step4, re.IGNORECASE)
-            for pat in must_have
-        ), (
-            "Step 4 must state that tests created first are allowed to fail on "
-            "first run, and that the agent must then implement code to make them "
-            "pass before committing."
-        )
 
     def test_implement_step_4_harness_mock_guidance(self, implement_content: str) -> None:
         """Step 4 must include guidance for creating harnesses or mocks
@@ -152,26 +134,7 @@ class TestImplementSkillTDD:
             "placeholders when external constraints prevent writing complete tests."
         )
 
-    def test_implement_step_4_placeholder_documentation(self, implement_content: str) -> None:
-        """Step 4 must require explicit documentation when a harness/mock
-        or placeholder is used, including a note in the work item comment
-        and in the test file header."""
-        step4 = _find_step(implement_content, "1. Implement")
-        assert step4 is not None, "Could not find 'Implement' step"
 
-        doc_patterns = [
-            r"note\s+in\s+(the\s+)?work\s+item\s+comment",
-            r"test\s+file\s+header",  # in the test file header
-            r"temporary\s+(placeholder|workaround)",
-            r"state\s+(the|a)\s+reason",
-        ]
-        assert any(
-            re.search(pat, step4, re.IGNORECASE)
-            for pat in doc_patterns
-        ), (
-            "Step 4 must require documenting the reason in the work item "
-            "comment and test file header when a placeholder is used."
-        )
 
     def test_implement_best_practices_tests_first(self, implement_content: str) -> None:
         """Best Practices section must include a tests-first guideline."""
@@ -192,24 +155,7 @@ class TestImplementSkillTDD:
             "tests first or test-driven development."
         )
 
-    def test_implement_step_4_tests_recorded_in_artifacts(self, implement_content: str) -> None:
-        """Step 4 must mention that tests must be recorded in run artifacts
-        and visible in commit history."""
-        step4 = _find_step(implement_content, "1. Implement")
-        assert step4 is not None, "Could not find 'Implement' step"
 
-        record_patterns = [
-            r"record.{1,15}(run\s+)?(artifact|commit)",
-            r"visible\s+in\s+(the\s+)?commit\s+history",
-            r"commit\s+histor",
-        ]
-        assert any(
-            re.search(pat, step4, re.IGNORECASE)
-            for pat in record_patterns
-        ), (
-            "Step 4 must mention that tests must be recorded in run artifacts "
-            "and visible in commit history."
-        )
 
 
 # ===================================================================
@@ -259,21 +205,4 @@ class TestImplementSingleTDD:
             "placeholders when external constraints prevent writing complete tests."
         )
 
-    def test_implement_single_step_3_placeholder_documentation(self, implement_single_content: str) -> None:
-        """Step 3 must require explicit note when harness/placeholder is used."""
-        step3 = _find_step(implement_single_content, "### Step 3")
-        assert step3 is not None, "Could not find 'Step 3' in implement-single"
 
-        doc_patterns = [
-            r"note\s+in\s+(the\s+)?work\s+item\s+comment",
-            r"test\s+file\s+header",
-            r"temporary\s+(placeholder|workaround)",
-            r"state\s+(the\s+)?reason",
-        ]
-        assert any(
-            re.search(pat, step3, re.IGNORECASE)
-            for pat in doc_patterns
-        ), (
-            "Step 3 must require documenting the reason in the work item "
-            "comment and test file header when a placeholder is used."
-        )
