@@ -24,6 +24,12 @@ Attach larger logs as links rather than inline when necessary.
 
 Describe the user or CI impact (e.g., "blocks all PR merges", "affects scheduler tests")
 
+## Acceptance Criteria
+
+1. The test `{test_name}` passes when run against the latest `dev`.
+2. All related documentation is updated to reflect the changes.
+3. Full project test suite passes with the new changes.
+
 ## Suggested Triage Steps
 
 1. Verify flakiness: rerun CI/test locally once.
