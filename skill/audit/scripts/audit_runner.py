@@ -79,7 +79,7 @@ _ACCEPTABLE_VERDICTS = {VERDICT_MET, VERDICT_ADJUSTED}
 # Closing-sentence constants (AC1–3)
 # ---------------------------------------------------------------------------
 _CLOSING_READY = (
-    "Work item is ready to close, would you like me to close it?"
+    "Audit passed. The item is ready for release."
 )
 _CLOSING_NOT_READY = (
     "Work item is not ready to close (see above), "

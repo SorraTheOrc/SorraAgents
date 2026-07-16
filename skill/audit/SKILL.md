@@ -236,7 +236,7 @@ Notes:
 4. **Handle failure:** If verification fails, re-print report to stdout, report error, do NOT mark as recorded.
 
 5. **Append closing sentence** (issue-level only, outside report markers):
-   - `Ready to close: Yes` → "Work item is ready to close, would you like me to close it?"
+   - `Ready to close: Yes` → "Audit passed. The item is ready for release."
    - Otherwise → "Work item is not ready to close (see above), would you like me to address the gaps in the audit?"
 
 > **Critical:** `persist_audit.py` / `wl audit-set` may return success without storing. **Always verify with `wl audit-show`**.
