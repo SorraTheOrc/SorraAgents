@@ -23,13 +23,16 @@ Verify absence before proceeding to the audit flow. Confirm that the work item i
 
 The audit runner manages the work item's `status` field during execution to prevent concurrent audit attempts.
 
-1. **`in_progress`** — set at `cmd_issue()` start.
-2. **`open`** — set after audit logic completes (via `try/finally`, guaranteed even on failure).
+1. **Capture original status** — fetched via `wl show <id> --json` at `cmd_issue()` start.
+2. **`in_progress`** — set at `cmd_issue()` start, after capturing original status.
+3. **Restore original status** — set after audit logic completes (via `try/finally`, guaranteed even on failure).
 
 Behavior:
-- Transition: `in_progress` → `open` regardless of outcome. `--do-not-persist` does NOT affect this.
+- Transition: `in_progress` → original status (captured before audit, restored in `finally`).
+- Falls back to `open` if original status cannot be determined (e.g., `wl show` fails).
+- `--do-not-persist` does NOT affect the status lifecycle.
 - `stage` is NOT modified.
-- If the `open` update fails, the error is silently caught.
+- If the status update fails, the error is silently caught.
 
 ### Manual Fallback
 
