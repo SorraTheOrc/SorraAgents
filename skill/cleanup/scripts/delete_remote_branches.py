@@ -14,7 +14,7 @@ if REPO_ROOT not in sys.path:
 from skill.cleanup.scripts import lib  # noqa: E402
 
 
-PROTECTED = {"main", "master", "develop"}
+PROTECTED = {"main", "master", "develop", "worklog/"}
 
 
 def is_merged_remote(runner: lib.CommandRunner, branch: str, default_ref: str) -> bool:
@@ -63,7 +63,10 @@ def main(argv: list[str] | None = None) -> int:
 
     actions: list[dict[str, Any]] = []
     for name, date_str in branches:
-        if name in PROTECTED:
+        if any(
+            name.startswith(p) if p.endswith("/") else name == p
+            for p in PROTECTED
+        ):
             actions.append({"branch": name, "action": "skip", "result": "protected"})
             continue
         commit_time = lib.parse_iso_datetime(date_str)

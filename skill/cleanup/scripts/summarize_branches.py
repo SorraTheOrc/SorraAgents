@@ -14,7 +14,7 @@ if REPO_ROOT not in sys.path:
 from skill.cleanup.scripts import lib  # noqa: E402
 
 
-PROTECTED = {"main", "master", "develop"}
+PROTECTED = {"main", "master", "develop", "worklog/"}
 
 
 def list_local_branches(runner: lib.CommandRunner) -> list[str]:
@@ -111,7 +111,10 @@ def main(argv: list[str] | None = None) -> int:
     data = []
     for b in branches:
         entry = {"branch": b}
-        entry["protected"] = b in PROTECTED
+        entry["protected"] = any(
+            b.startswith(p) if p.endswith("/") else b == p
+            for p in PROTECTED
+        )
         entry["has_remote"] = has_remote(runner, b)
         entry["last_commit"] = last_commit(runner, b)
         entry["merged_into_default"] = merged_into_default(runner, b, default_ref)
