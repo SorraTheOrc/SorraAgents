@@ -38,7 +38,23 @@ test('check-unmerged-branches: exports expected functions', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3. extractWorkItemId - Pure function tests
+// 3. getUnmergedBranchNames filters worklog/ branches
+// ---------------------------------------------------------------------------
+test('check-unmerged-branches: getUnmergedBranchNames filters out worklog/ branches', async () => {
+  const mod = await import(MODULE_PATH);
+  const result = mod.getUnmergedBranchNames();
+  
+  // Ensure no worklog/ branches appear in the result
+  const worklogBranches = result.filter((b) => b.startsWith('worklog/'));
+  assert.equal(
+    worklogBranches.length,
+    0,
+    `Expected no worklog/ branches in unmerged list, got: ${worklogBranches.join(', ')}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 4. extractWorkItemId - Pure function tests
 // ---------------------------------------------------------------------------
 describe('extractWorkItemId', () => {
   test('extracts ID from standard wl-<id>-<slug> pattern', async () => {
@@ -115,7 +131,24 @@ describe('extractWorkItemId', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. Module structure checks
+// 5. PROTECTED_BRANCHES should contain worklog/
+// ---------------------------------------------------------------------------
+describe('PROTECTED_BRANCHES', () => {
+  test('contains worklog/ prefix pattern in the module', async () => {
+    const { readFileSync } = await import('node:fs');
+    const content = readFileSync(MODULE_PATH, 'utf-8');
+    
+    // Check that the PROTECTED_BRANCHES definition includes worklog/
+    assert.ok(
+      content.includes("'worklog/'") ||
+      content.includes('"worklog/"'),
+      'check-unmerged-branches.js should include worklog/ in PROTECTED_BRANCHES',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Module structure checks
 // ---------------------------------------------------------------------------
 describe('check-unmerged-branches module structure', () => {
   test('uses ESM exports', async () => {
@@ -130,7 +163,7 @@ describe('check-unmerged-branches module structure', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. SKILL.md references the check-unmerged-branches gating step
+// 7. SKILL.md references the check-unmerged-branches gating step
 // ---------------------------------------------------------------------------
 test('check-unmerged-branches: SKILL.md documents the gating step', () => {
   const skillPath = join(REPO_ROOT, 'skill', 'ship', 'SKILL.md');
@@ -147,7 +180,7 @@ test('check-unmerged-branches: SKILL.md documents the gating step', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. ship.js re-exports checkUnmergedBranches
+// 8. ship.js re-exports checkUnmergedBranches
 // ---------------------------------------------------------------------------
 test('check-unmerged-branches: ship.js re-exports checkUnmergedBranches', async () => {
   const shipMod = await import(join(REPO_ROOT, 'skill', 'ship', 'scripts', 'ship.js'));
@@ -167,7 +200,7 @@ test('check-unmerged-branches: ship.js re-exports checkUnmergedBranches', async 
 });
 
 // ---------------------------------------------------------------------------
-// 7. checkUnmergedBranches returns correct structure
+// 9. checkUnmergedBranches returns correct structure
 // ---------------------------------------------------------------------------
 test('check-unmerged-branches: checkUnmergedBranches returns expected structure when no unmerged branches', async () => {
   const mod = await import(MODULE_PATH);
@@ -186,7 +219,7 @@ test('check-unmerged-branches: checkUnmergedBranches returns expected structure 
 });
 
 // ---------------------------------------------------------------------------
-// 8. getUnmergedBranchNames is a function that doesn't throw
+// 10. getUnmergedBranchNames is a function that doesn't throw
 // ---------------------------------------------------------------------------
 test('check-unmerged-branches: getUnmergedBranchNames runs without throwing', async () => {
   const mod = await import(MODULE_PATH);
