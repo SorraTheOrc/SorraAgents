@@ -84,6 +84,17 @@ if [[ "$DRY_RUN" != "true" ]]; then
   fi
 fi
 
+# ── Worklog-ref gating ─────────────────────────────────────────────────--------
+# Detect worklog refs and abort if present to prevent accidental merge of
+# worklog data into main. The worklog ref (refs/worklog/data) is an orphan ref
+# with no common ancestor with main or dev; merging it would corrupt the
+# worklog database for all users.
+if git for-each-ref refs/worklog/ 2>/dev/null | grep -q .; then
+  echo "Error: Worklog refs detected under refs/worklog/. Aborting release to prevent accidental merge of worklog data into main." >&2
+  echo "The worklog ref (refs/worklog/data) is separate from regular branches and must not be merged into main." >&2
+  exit 1
+fi
+
 # Fetch latest
 git fetch origin --prune
 

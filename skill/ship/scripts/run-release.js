@@ -13,6 +13,7 @@ import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
 import { checkAuditReadyToClose, getCandidateItems } from './check-audit-gate.js';
 import { checkCriticalItems } from './check-critical-items.js';
+import { checkWorklogRefs } from './check-worklog-refs.js';
 
 // Canonical release script path relative to repository root
 const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
@@ -304,6 +305,19 @@ export async function runRelease(cliArgs = []) {
       console.error(criticalReport.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
       return 7;
+    }
+  }
+
+  // ── Step 3.5: Check worklog refs (gating step) ─────────────────────────
+  if (!skipChecks) {
+    const worklogReport = checkWorklogRefs();
+    if (worklogReport.hasWorklogRefs) {
+      console.error(
+        '⚠️  Worklog-ref gate check failed — worklog refs are present and must not be merged into main:\n',
+      );
+      console.error(worklogReport.message);
+      console.error('\nTo bypass this check, re-run with --skip-checks.');
+      return 8;
     }
   }
 
