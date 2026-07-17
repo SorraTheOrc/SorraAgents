@@ -128,8 +128,8 @@ On abort: `wl update <work-item-id> --status open --json`
 If not already assigned: `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
 
 Check the most recent worklog action, comment, or audit entry:
-- If a recent audit exists, reuse it.
-- Otherwise, run `/skill:audit <work-item-id>` for a full audit.
+- If a recent audit exists, reuse it to establish the work.
+- If no recent audit exists, run `/skill:audit <work-item-id>` for a full audit.
 
 Fetch details: `wl show <work-item-id> --json`. Pay attention to `description`, `acceptance criteria`, and `comments`.
 
