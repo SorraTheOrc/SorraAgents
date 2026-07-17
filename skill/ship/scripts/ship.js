@@ -35,8 +35,11 @@ import { checkAuditReadyToClose } from './check-audit-gate.js';
 /** The integration branch that agents push into. */
 export const DEV_BRANCH = 'dev';
 
-/** Branches that agents must never push to directly. */
-export const PROTECTED_BRANCHES = Object.freeze(['main', 'master', 'HEAD']);
+/** Branches that agents must never push to directly.
+ *  Entries ending with `/` are treated as prefix patterns.
+ *  Exact-match entries (e.g. 'main', 'HEAD') match the full branch name.
+ */
+export const PROTECTED_BRANCHES = Object.freeze(['main', 'master', 'HEAD', 'worklog/']);
 
 // ── validatePushTarget ───────────────────────────────────────────────────────
 
@@ -56,7 +59,12 @@ export function validatePushTarget(targetBranch) {
     };
   }
 
-  if (PROTECTED_BRANCHES.includes(targetBranch)) {
+  if (PROTECTED_BRANCHES.some(
+    (blocked) =>
+      blocked.endsWith('/')
+        ? targetBranch.startsWith(blocked)
+        : targetBranch === blocked
+  )) {
     return {
       allowed: false,
       reason: `Agents must not push directly to '${targetBranch}'. Push to '${DEV_BRANCH}' instead.`,
