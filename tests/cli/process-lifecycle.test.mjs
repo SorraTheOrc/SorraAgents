@@ -5,31 +5,31 @@
  * and that killTrackedProcesses() terminates them reliably.
  *
  * @see Work Item SA-0MRP863GH000LEFO
+ * @see Work Item SA-0MRP87J73003CH7Y
  */
 
-import { test, describe, before, after } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // ── Import helpers under test ───────────────────────────────────────────────
 
-let cliHelpers: {
-  execAsync: (command: string, args?: string[]) => Promise<{ stdout: string; stderr: string }>;
-  execWithInput: (command: string, args?: string[], input?: string) => Promise<{ stdout: string; stderr: string }>;
-  killTrackedProcesses: () => number;
-  getTrackedPids: () => Set<number>;
-};
-
+let cliHelpers;
 try {
-  cliHelpers = require('./cli-helpers');
+  cliHelpers = await import(join(__dirname, 'cli-helpers.mjs'));
 } catch (err) {
   // Tests will be skipped if module can't be loaded
-  cliHelpers = null as any;
+  cliHelpers = null;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-function sleep(ms: number): Promise<void> {
+function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
@@ -47,7 +47,8 @@ describe('Process Lifecycle Tracking', () => {
       const initialPids = cliHelpers.getTrackedPids().size;
 
       // Spawn a long-running process so we can verify tracking before it exits
-      const result = cliHelpers.execAsync('sleep', ['5']);
+      const processPromise = cliHelpers.execAsync('sleep', ['5']);
+      processPromise.catch(() => {}); // Suppress rejection from kill
       await sleep(300); // Give it time to start
 
       const trackedPids = cliHelpers.getTrackedPids();
@@ -69,8 +70,9 @@ describe('Process Lifecycle Tracking', () => {
         return;
       }
 
-      // Spawn a quick process
-      await cliHelpers.execAsync('node', ['-e', 'process.exit(0)']);
+      // Spawn a quick process using spawn directly to avoid shell quoting issues
+      const child = spawn(process.execPath, ['-e', 'process.exit(0)']);
+      await new Promise(resolve => child.on('exit', resolve));
       await sleep(300); // Give it time to exit and trigger cleanup
 
       // PID should have been auto-removed on exit
@@ -81,16 +83,17 @@ describe('Process Lifecycle Tracking', () => {
   });
 
   describe('execWithInput PID tracking', () => {
-    test('tracks PID when execWithInput spawns a process', { timeout: testTimeout }, () => {
+    test('tracks PID when execWithInput spawns a process', { timeout: testTimeout }, async () => {
       if (!cliHelpers) {
         return;
       }
 
       // Use a synchronous-style check: spawn a process that reads from stdin
-      const promise = cliHelpers.execWithInput('node', ['-e', `
+      const promise = cliHelpers.execWithInput(process.execPath, ['-e', `
         process.stdin.on('data', () => {});
         setTimeout(() => process.exit(0), 5000);
       `], 'input-data\n');
+      promise.catch(() => {}); // Suppress rejection from kill
 
       // Check tracking set is populated
       const trackedPids = cliHelpers.getTrackedPids();
@@ -111,9 +114,12 @@ describe('Process Lifecycle Tracking', () => {
       }
 
       // Spawn multiple processes
-      cliHelpers.execAsync('sleep', ['10']);
-      cliHelpers.execAsync('sleep', ['10']);
-      cliHelpers.execAsync('sleep', ['10']);
+      const p1 = cliHelpers.execAsync('sleep', ['10']);
+      const p2 = cliHelpers.execAsync('sleep', ['10']);
+      const p3 = cliHelpers.execAsync('sleep', ['10']);
+      p1.catch(() => {});
+      p2.catch(() => {});
+      p3.catch(() => {});
       await sleep(500); // Let them start
 
       assert.ok(cliHelpers.getTrackedPids().size >= 3, 'Expected at least 3 tracked PIDs');
@@ -130,8 +136,9 @@ describe('Process Lifecycle Tracking', () => {
         return;
       }
 
-      // Run a quick process and let it complete
-      await cliHelpers.execAsync('node', ['-e', 'process.exit(0)']);
+      // Run a quick process using spawn directly to avoid shell quoting issues
+      const child = spawn(process.execPath, ['-e', 'process.exit(0)']);
+      await new Promise(resolve => child.on('exit', resolve));
       await sleep(500);
 
       // Killing should still succeed (no error) even if process already exited

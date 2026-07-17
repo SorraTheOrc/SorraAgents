@@ -2,9 +2,12 @@
  * CLI Helpers with Process Lifecycle Tracking
  *
  * Provides execAsync and execWithInput wrappers that track spawned child
- * process PIDs for reliable cleanup during testing.
+ * process PIDs for reliable cleanup during testing. Also installs signal
+ * handlers so orphaned mock processes are cleaned up when the test process
+ * exits normally or receives a signal.
  *
  * @see Work Item SA-0MRP863GH000LEFO
+ * @see Work Item SA-0MRP87J73003CH7Y
  */
 
 import { exec as cpExec, spawn } from 'node:child_process';
@@ -16,12 +19,12 @@ import { promisify } from 'node:util';
  * Set of tracked child process PIDs.
  * Populated by execAsync and execWithInput; consumed by killTrackedProcesses().
  */
-const pidTrackingSet = new Set<number>();
+const pidTrackingSet = new Set();
 
 /**
  * Returns a copy of the current tracked PIDs (for testing/inspection).
  */
-export function getTrackedPids(): Set<number> {
+export function getTrackedPids() {
   return new Set(pidTrackingSet);
 }
 
@@ -29,7 +32,7 @@ export function getTrackedPids(): Set<number> {
  * Register a child process for tracking.
  * Also sets up an exit handler to auto-remove the PID when the child exits.
  */
-function trackChild(child: { pid: number | undefined; on: (event: string, handler: () => void) => void }): void {
+function trackChild(child) {
   if (child.pid === undefined) {
     return;
   }
@@ -37,7 +40,7 @@ function trackChild(child: { pid: number | undefined; on: (event: string, handle
 
   // Auto-remove PID on child exit
   child.on('exit', () => {
-    pidTrackingSet.delete(child.pid!);
+    pidTrackingSet.delete(child.pid);
   });
 }
 
@@ -56,18 +59,18 @@ const _exec = promisify(cpExec);
  * @returns       - Promise resolving with { stdout, stderr }
  */
 export async function execAsync(
-  command: string,
-  args?: string[]
-): Promise<{ stdout: string; stderr: string }> {
+  command,
+  args
+) {
   // Use raw exec with callbacks so we can capture the ChildProcess object
-  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const child = cpExec(
       args ? `${command} ${args.join(' ')}` : command,
       (err, stdout, stderr) => {
         if (err) {
           // Include stdout/stderr in the error for diagnostics
-          (err as any).stdout = stdout;
-          (err as any).stderr = stderr;
+          err.stdout = stdout;
+          err.stderr = stderr;
           reject(err);
         } else {
           resolve({ stdout, stderr });
@@ -79,7 +82,7 @@ export async function execAsync(
     if (child.pid !== undefined) {
       pidTrackingSet.add(child.pid);
       child.on('exit', () => {
-        pidTrackingSet.delete(child.pid!);
+        pidTrackingSet.delete(child.pid);
       });
     }
   });
@@ -99,44 +102,44 @@ export async function execAsync(
  * @returns       - Promise resolving with { stdout, stderr }
  */
 export function execWithInput(
-  command: string,
-  args: string[] = [],
-  input?: string
-): Promise<{ stdout: string; stderr: string }> {
-  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+  command,
+  args = [],
+  input
+) {
+  return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] });
 
     // Track the child PID
     if (child.pid !== undefined) {
       pidTrackingSet.add(child.pid);
       child.on('exit', () => {
-        pidTrackingSet.delete(child.pid!);
+        pidTrackingSet.delete(child.pid);
       });
     }
 
     let stdout = '';
     let stderr = '';
 
-    child.stdout?.on('data', (data: Buffer) => {
+    child.stdout?.on('data', (data) => {
       stdout += data.toString();
     });
 
-    child.stderr?.on('data', (data: Buffer) => {
+    child.stderr?.on('data', (data) => {
       stderr += data.toString();
     });
 
-    child.on('error', (err: Error) => {
+    child.on('error', (err) => {
       reject(err);
     });
 
-    child.on('close', (code: number | null) => {
+    child.on('close', (code) => {
       if (code === 0) {
         resolve({ stdout, stderr });
       } else {
         const err = new Error(`Command exited with code ${code}`);
-        (err as any).code = code;
-        (err as any).stdout = stdout;
-        (err as any).stderr = stderr;
+        err.code = code;
+        err.stdout = stdout;
+        err.stderr = stderr;
         reject(err);
       }
     });
@@ -159,7 +162,7 @@ export function execWithInput(
  *
  * @returns The number of PIDs that were in the tracking set
  */
-export function killTrackedProcesses(): number {
+export function killTrackedProcesses() {
   const pids = Array.from(pidTrackingSet);
   pidTrackingSet.clear();
 
@@ -191,14 +194,14 @@ export function killTrackedProcesses(): number {
  *
  * Handlers are idempotent — repeated calls are safe.
  */
-function installSignalHandlers(): void {
+function installSignalHandlers() {
   // Guard against duplicate installation
-  if ((installSignalHandlers as any)._installed) {
+  if (installSignalHandlers._installed) {
     return;
   }
-  (installSignalHandlers as any)._installed = true;
+  installSignalHandlers._installed = true;
 
-  const handler = (): void => {
+  const handler = () => {
     killTrackedProcesses();
   };
 
