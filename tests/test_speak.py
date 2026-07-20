@@ -440,7 +440,7 @@ class TestStreamMode:
 
     def test_stream_does_not_create_speak_dir(self, mock_env, tmp_path):
         """--stream does not create .pi/speak/ directory."""
-        result = subprocess.run(
+        _ = subprocess.run(
             ["bash", str(SCRIPT_PATH), "--stream", "No file"],
             capture_output=True, text=True, env=mock_env,
         )
