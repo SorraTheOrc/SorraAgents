@@ -27,6 +27,7 @@ from skill.audit.scripts.audit_runner import (
     _normalize_model_source,
     _deep_merge,
     _get_child_audit_verdict,
+    Runner,
     CALL_PI_TIMEOUT,
     DEFAULT_MODEL,
     DEFAULT_MODEL_SOURCE,
