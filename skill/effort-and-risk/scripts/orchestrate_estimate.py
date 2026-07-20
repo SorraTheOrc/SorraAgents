@@ -31,7 +31,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from skill.scripts.failure_notice import FailureNotice  # noqa: E402
 
-from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
+from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
