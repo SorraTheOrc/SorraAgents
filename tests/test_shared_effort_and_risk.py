@@ -16,7 +16,7 @@ _SCRIPT_DIR = os.path.join(
 )
 sys.path.insert(0, _SCRIPT_DIR)
 
-from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
+from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS  # noqa: E402
 
 
 class TestComputeOmp(unittest.TestCase):
