@@ -113,7 +113,7 @@ JSON_PAYLOAD=$(cat <<EOF
 {
   "model": "tts-1",
   "input": $(echo "$TEXT" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read().strip()))"),
-  "voice": "alloy"
+  "voice": "ryan"
 }
 EOF
 )
