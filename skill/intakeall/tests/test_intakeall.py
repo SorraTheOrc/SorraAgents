@@ -598,7 +598,7 @@ class TestErrorHandlingWithRecovery:
         )
 
         engine = self._make_engine(runner)
-        result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
+        engine._invoke_intake(SAMPLE_ITEM_C["id"])
 
         # Verify recovery was attempted (reset stage to idea, status to open)
         reset_calls = [
