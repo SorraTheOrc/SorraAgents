@@ -311,6 +311,76 @@ class TestRunWlSearch:
         mod.run_wl_search("test-keyword")
         assert "--json" in captured_args
 
+    def test_handles_workItems_key(self, monkeypatch):
+        """run_wl_search should handle the actual wl search JSON structure with workItems key."""
+        mod = _import_find_related()
+        import json
+
+        payload = {
+            "success": True,
+            "ftsAvailable": True,
+            "count": 2,
+            "workItems": [
+                {"id": "REL-001", "title": "Item 1", "status": "open", "score": 0.5},
+                {"id": "REL-002", "title": "Item 2", "status": "closed", "score": 0.3},
+            ],
+        }
+
+        def mock_check_output(cmd, **kwargs):
+            return json.dumps(payload)
+
+        monkeypatch.setattr(mod.subprocess, "check_output", mock_check_output)
+        results = mod.run_wl_search("keyword")
+        assert isinstance(results, list)
+        assert len(results) == 2
+        assert results[0]["id"] == "REL-001"
+        assert results[1]["id"] == "REL-002"
+
+    def test_handles_bare_list_fallback(self, monkeypatch):
+        """run_wl_search should fall back if response is a bare list."""
+        mod = _import_find_related()
+        import json
+
+        payload = [
+            {"id": "REL-001", "title": "Item 1"},
+        ]
+
+        def mock_check_output(cmd, **kwargs):
+            return json.dumps(payload)
+
+        monkeypatch.setattr(mod.subprocess, "check_output", mock_check_output)
+        results = mod.run_wl_search("keyword")
+        assert isinstance(results, list)
+        assert len(results) == 1
+
+    def test_includes_semantic_flag_when_available(self, monkeypatch):
+        """run_wl_search should include --semantic when available."""
+        mod = _import_find_related()
+        import json
+        captured_args = []
+
+        def mock_check_output(cmd, **kwargs):
+            captured_args.extend(cmd)
+            return json.dumps({"success": True, "workItems": []})
+
+        monkeypatch.setattr(mod.subprocess, "check_output", mock_check_output)
+        mod.run_wl_search("test-keyword", use_semantic=True)
+        assert "--semantic" in captured_args
+
+    def test_omits_semantic_flag_when_unavailable(self, monkeypatch):
+        """run_wl_search should omit --semantic when not available/false."""
+        mod = _import_find_related()
+        import json
+        captured_args = []
+
+        def mock_check_output(cmd, **kwargs):
+            captured_args.extend(cmd)
+            return json.dumps({"success": True, "workItems": []})
+
+        monkeypatch.setattr(mod.subprocess, "check_output", mock_check_output)
+        mod.run_wl_search("test-keyword", use_semantic=False)
+        assert "--semantic" not in captured_args
+
 
 class TestRunWlUpdate:
     """Tests for run_wl_update function."""
@@ -364,8 +434,8 @@ def test_search_and_dedup_aggregates_results(monkeypatch):
 
     search_calls = []
 
-    def mock_search(keyword):
-        search_calls.append(keyword)
+    def mock_search(keyword, use_semantic=False):
+        search_calls.append((keyword, use_semantic))
         if "script" in keyword:
             return [{"id": "REL-001", "title": "Script related"}]
         elif "automation" in keyword:
@@ -380,15 +450,15 @@ def test_search_and_dedup_aggregates_results(monkeypatch):
     ids = [r["id"] for r in results]
     assert "REL-001" in ids
     assert "REL-002" in ids
-    assert "script" in search_calls
-    assert "automation" in search_calls
+    assert any(call[0] == "script" for call in search_calls)
+    assert any(call[0] == "automation" for call in search_calls)
 
 
 def test_search_and_dedup_removes_duplicates(monkeypatch):
     """Duplicate work items from different keywords should be removed."""
     mod = _import_find_related()
 
-    def mock_search(keyword):
+    def mock_search(keyword, use_semantic=False):
         # Both keywords return the same item (duplicate)
         return [{"id": "REL-001", "title": "Same item"}]
 
@@ -411,7 +481,7 @@ def test_search_and_dedup_handles_search_failures(monkeypatch):
     """Search failures for individual keywords should not break the pipeline."""
     mod = _import_find_related()
 
-    def mock_search(keyword):
+    def mock_search(keyword, use_semantic=False):
         if keyword == "broken":
             return []  # Simulating a failed/empty search
         return [{"id": "REL-001", "title": "Working item"}]
@@ -422,6 +492,164 @@ def test_search_and_dedup_handles_search_failures(monkeypatch):
     results = mod.search_and_dedup(keywords)
     assert len(results) == 1
     assert results[0]["id"] == "REL-001"
+
+
+# ---------------------------------------------------------------------------
+# Scoring, ranking, and limiting tests
+# ---------------------------------------------------------------------------
+
+
+def test_configurable_max_constants_exist():
+    """MAX_WORK_ITEM_RESULTS and MAX_REPO_FILE_RESULTS must be configurable constants."""
+    mod = _import_find_related()
+    assert hasattr(mod, "MAX_WORK_ITEM_RESULTS"), "Missing MAX_WORK_ITEM_RESULTS constant"
+    assert hasattr(mod, "MAX_REPO_FILE_RESULTS"), "Missing MAX_REPO_FILE_RESULTS constant"
+    assert mod.MAX_WORK_ITEM_RESULTS >= 1, "MAX_WORK_ITEM_RESULTS should be >= 1"
+    assert mod.MAX_REPO_FILE_RESULTS >= 1, "MAX_REPO_FILE_RESULTS should be >= 1"
+
+
+def test_search_and_dedup_limits_to_top_3_by_score(monkeypatch):
+    """search_and_dedup should return at most MAX_WORK_ITEM_RESULTS items, ranked by descending score."""
+    mod = _import_find_related()
+
+    items_with_scores = [
+        {"id": "REL-001", "title": "Top item", "score": -0.1},
+        {"id": "REL-002", "title": "Second item", "score": -0.5},
+        {"id": "REL-003", "title": "Third item", "score": -0.8},
+        {"id": "REL-004", "title": "Fourth item (lowest score)", "score": -1.5},
+        {"id": "REL-005", "title": "Fifth item", "score": -2.0},
+    ]
+
+    def mock_search(keyword, use_semantic=False):
+        return items_with_scores
+
+    monkeypatch.setattr(mod, "run_wl_search", mock_search)
+
+    keywords = ["test", "keyword"]
+    results = mod.search_and_dedup(keywords)
+    # Should be limited to MAX_WORK_ITEM_RESULTS (3)
+    assert len(results) <= mod.MAX_WORK_ITEM_RESULTS
+    # Items should be returned in descending score order
+    scores = [item.get("score", 0) for item in results]
+    assert scores == sorted(scores, reverse=True), "Items should be ranked by descending score"
+    # The top 3 by score should be included
+    result_ids = [item["id"] for item in results]
+    assert "REL-001" in result_ids
+    assert "REL-002" in result_ids
+    assert "REL-003" in result_ids
+
+
+def test_search_and_dedup_all_items_when_under_limit(monkeypatch):
+    """When fewer than MAX_WORK_ITEM_RESULTS items exist, all should be returned."""
+    mod = _import_find_related()
+
+    items = [
+        {"id": "REL-001", "title": "Only item", "score": -0.5},
+    ]
+
+    def mock_search(keyword, use_semantic=False):
+        return items
+
+    monkeypatch.setattr(mod, "run_wl_search", mock_search)
+
+    results = mod.search_and_dedup(["test"])
+    assert len(results) == 1
+    assert results[0]["id"] == "REL-001"
+
+
+def test_search_and_dedup_items_without_score_go_last(monkeypatch):
+    """Items without a score field should be ranked lower than scored items."""
+    mod = _import_find_related()
+
+    items = [
+        {"id": "REL-001", "title": "Scored low", "score": -2.0},
+        {"id": "REL-002", "title": "No score"},
+        {"id": "REL-003", "title": "Scored high", "score": -0.1},
+    ]
+
+    def mock_search(keyword, use_semantic=False):
+        return items
+
+    monkeypatch.setattr(mod, "run_wl_search", mock_search)
+
+    results = mod.search_and_dedup(["test"])
+    # Items with scores should come before those without
+    scored_ids = [item["id"] for item in results if "score" in item]
+    unscored_ids = [item["id"] for item in results if "score" not in item]
+    if scored_ids and unscored_ids:
+        scored_last_idx = max(results.index(it) for it in results if "score" in it)
+        unscored_first_idx = min(results.index(it) for it in results if "score" not in it)
+        assert scored_last_idx < unscored_first_idx, "Scored items must appear before unscored items"
+
+
+def test_rank_repo_files_by_keyword_match_count(tmp_path):
+    """Repo files should be ranked by number of distinct keywords matched (descending)."""
+    mod = _import_find_related()
+
+    # File matching 3 keywords
+    (tmp_path / "high_match.md").write_text("automation script for keyword")
+    # File matching 2 keywords
+    (tmp_path / "medium_match.md").write_text("automation keyword")
+    # File matching 1 keyword
+    (tmp_path / "low_match.md").write_text("keyword")
+
+    matches = mod.search_repo(tmp_path, ["automation", "script", "keyword"])
+    # Results should be ranked by match count descending
+    match_counts = [len(m.get("matches", [])) for m in matches]
+    assert match_counts == sorted(match_counts, reverse=True), (
+        "Repo files should be ranked by descending keyword match count"
+    )
+
+
+def test_search_repo_limits_to_top_3(tmp_path):
+    """search_repo should return at most MAX_REPO_FILE_RESULTS files."""
+    mod = _import_find_related()
+
+    for i in range(10):
+        (tmp_path / f"file_{i}.md").write_text("keyword")
+
+    matches = mod.search_repo(tmp_path, ["keyword"])
+    assert len(matches) <= mod.MAX_REPO_FILE_RESULTS, (
+        f"Should be limited to {mod.MAX_REPO_FILE_RESULTS} results, got {len(matches)}"
+    )
+
+
+def test_search_repo_returns_all_when_under_limit(tmp_path):
+    """When fewer than MAX_REPO_FILE_RESULTS files match, all should be returned."""
+    mod = _import_find_related()
+
+    (tmp_path / "only.md").write_text("keyword")
+
+    matches = mod.search_repo(tmp_path, ["keyword"])
+    assert len(matches) == 1
+
+
+def test_format_report_renders_all_items_passed():
+    """format_report should render all items passed to it (limiting is done upstream)."""
+    mod = _import_find_related()
+
+    many_items = [
+        {"id": f"REL-{i:03d}", "title": f"Item {i}", "status": "open"}
+        for i in range(5)
+    ]
+    report = mod.format_report("TEST-123", many_items, [])
+    # All 5 items should appear (format_report does not limit)
+    for i in range(5):
+        assert f"REL-{i:03d}" in report, f"Item REL-{i:03d} should appear in report"
+
+
+def test_format_report_renders_all_repo_matches_passed():
+    """format_report should render all repo matches passed to it (limiting is done upstream)."""
+    mod = _import_find_related()
+
+    many_files = [
+        {"file": f"docs/file_{i}.md", "matches": ["keyword"]}
+        for i in range(5)
+    ]
+    report = mod.format_report("TEST-123", [], many_files)
+    # All 5 files should appear (format_report does not limit)
+    for i in range(5):
+        assert f"file_{i}.md" in report, f"File file_{i}.md should appear in report"
 
 
 # ---------------------------------------------------------------------------
@@ -642,12 +870,10 @@ def test_search_repo_scans_allowed_extensions(tmp_path):
     """search_repo should only scan files with allowed extensions."""
     mod = _import_find_related()
 
-    # Should be scanned
+    # Create sample files for each allowed extension, but under the MAX limit
     (tmp_path / "doc.md").write_text("keyword")
     (tmp_path / "code.py").write_text("keyword")
     (tmp_path / "app.js").write_text("keyword")
-    (tmp_path / "module.mjs").write_text("keyword")
-    (tmp_path / "notes.txt").write_text("keyword")
 
     # Should NOT be scanned
     (tmp_path / "image.png").write_text("keyword")
@@ -656,12 +882,11 @@ def test_search_repo_scans_allowed_extensions(tmp_path):
 
     matches = mod.search_repo(tmp_path, ["keyword"])
     matched_files = [m.get("file", "") for m in matches]
-    assert len(matched_files) >= 5
+    # Should match 3 files (at or under MAX_REPO_FILE_RESULTS)
+    assert len(matched_files) == 3
     assert any(f.endswith(".md") for f in matched_files)
     assert any(f.endswith(".py") for f in matched_files)
     assert any(f.endswith(".js") for f in matched_files)
-    assert any(f.endswith(".mjs") for f in matched_files)
-    assert any(f.endswith(".txt") for f in matched_files)
     # Non-allowed extensions should not appear
     for f in matched_files:
         assert not f.endswith(".png"), f"Unexpected match: {f}"

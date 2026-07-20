@@ -56,6 +56,22 @@ REPORT_HEADING = "Related work (automated report)"
 
 
 # ---------------------------------------------------------------------------
+# Configurable limits (soft caps — may be replaced by minimum-relevance
+# thresholds when semantic/embedding-based scoring is available)
+# ---------------------------------------------------------------------------
+
+# Maximum number of related work items to show in the automated report.
+# Ranking heuristic: items are sorted by descending `score` (BM25/hybrid)
+# from `wl search --json`. Items without a score sort last.
+MAX_WORK_ITEM_RESULTS: int = 3
+
+# Maximum number of repository file matches to show in the automated report.
+# Ranking heuristic: files are sorted by descending count of distinct keywords
+# matched. Ties are broken alphabetically for deterministic ordering.
+MAX_REPO_FILE_RESULTS: int = 3
+
+
+# ---------------------------------------------------------------------------
 # CLI helpers
 # ---------------------------------------------------------------------------
 
@@ -138,18 +154,26 @@ def run_wl_show(work_item_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def run_wl_search(keyword: str) -> List[Dict[str, Any]]:
+def run_wl_search(keyword: str, use_semantic: bool = False) -> List[Dict[str, Any]]:
     """Search Worklog for items matching a keyword.
+
+    When use_semantic is True, includes the --semantic flag for hybrid
+    lexical+semantic ranking. Falls back to keyword-only search on error.
 
     Returns a list of matching work items (empty list on failure).
     """
     try:
         cmd = ["wl", "search", keyword, "--json"]
+        if use_semantic:
+            cmd.insert(2, "--semantic")
         out = subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         data = json.loads(out)
-        # wl search may return {"items": [...]} or a bare list
-        if isinstance(data, dict) and "items" in data:
-            return data["items"]
+        # wl search returns {"success": true, "workItems": [...]}
+        if isinstance(data, dict):
+            items = data.get("workItems", data.get("items"))
+            if items is not None:
+                return items
+        # Fallback: bare list
         if isinstance(data, list):
             return data
         return []
@@ -171,27 +195,73 @@ def run_wl_update(work_item_id: str, description: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Search and deduplication
+# Semantic search availability detection
 # ---------------------------------------------------------------------------
 
 
-def search_and_dedup(keywords: List[str]) -> List[Dict[str, Any]]:
-    """Search Worklog for each keyword, aggregate results, and deduplicate.
+def is_semantic_available() -> bool:
+    """Probe whether `wl search --semantic` is functional.
 
-    Returns a list of unique work item dicts (by id).
+    Runs a simple probe query. Returns True if the command succeeds
+    and returns a valid response. Falls back gracefully on any error.
+    """
+    try:
+        cmd = ["wl", "search", "--semantic", "probe", "--json"]
+        out = subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
+        data = json.loads(out)
+        # Any valid response (successful or with items) means --semantic is available
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Search and deduplication with ranking
+# ---------------------------------------------------------------------------
+
+
+def _score_key(item: Dict[str, Any]) -> float:
+    """Return the score of a work item for ranking, with tiebreaker by title.
+
+    Items without a score field sort last (score = float('-inf')).
+    Higher (less negative) scores rank first.
+    """
+    score = item.get("score")
+    if score is None:
+        return float("-inf")
+    return float(score)
+
+
+def search_and_dedup(
+    keywords: List[str],
+    use_semantic: bool = False,
+) -> List[Dict[str, Any]]:
+    """Search Worklog for each keyword, aggregate results, deduplicate, rank, and limit.
+
+    Results are ranked by descending score (the `score` field from
+    `wl search --json`, which is BM25 or hybrid BM25+semantic). Items
+    without a score sort last. The final list is capped at
+    MAX_WORK_ITEM_RESULTS.
+
+    Ranking heuristic: scored items are sorted by descending score
+    (higher = more relevant). Unscored items sort after all scored items.
     """
     seen: set = set()
     results: List[Dict[str, Any]] = []
 
     for keyword in keywords:
-        items = run_wl_search(keyword)
+        items = run_wl_search(keyword, use_semantic=use_semantic)
         for item in items:
             item_id = item.get("id")
             if item_id and item_id not in seen:
                 seen.add(item_id)
                 results.append(item)
 
-    return results
+    # Rank by descending score (unscored items sort last)
+    results.sort(key=_score_key, reverse=True)
+
+    # Limit to configured maximum
+    return results[:MAX_WORK_ITEM_RESULTS]
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +284,15 @@ def search_repo(repo_path: str, keywords: List[str]) -> List[Dict[str, Any]]:
     respecting excluded directories. Returns a list of dicts with:
       - file: relative path from repo root
       - matches: list of keywords found in the file
+
+    Results are ranked by descending number of distinct keyword matches
+    (higher = more relevant). Ties are broken alphabetically for
+    deterministic ordering. The final list is capped at
+    MAX_REPO_FILE_RESULTS.
+
+    Ranking heuristic: files matching more distinct keywords rank higher.
+    This provides a simple relevance signal without requiring embeddings
+    or full-text indexing.
 
     Returns empty list on error or no matches.
     """
@@ -249,9 +328,19 @@ def search_repo(repo_path: str, keywords: List[str]) -> List[Dict[str, Any]]:
             results.append({
                 "file": str(rel),
                 "matches": sorted(found),
+                # Number of distinct keyword matches — used for ranking
+                "_match_count": len(found),
             })
 
-    return results
+    # Rank by descending match count, then alphabetically for determinism
+    results.sort(key=lambda m: (-m["_match_count"], m["file"]))
+
+    # Strip internal ranking field before returning
+    for m in results:
+        del m["_match_count"]
+
+    # Limit to configured maximum
+    return results[:MAX_REPO_FILE_RESULTS]
 
 
 # ---------------------------------------------------------------------------
@@ -385,10 +474,15 @@ def _main() -> None:
     if args.verbose:
         print(f"[find-related] Keywords: {keywords}", file=sys.stderr)
 
-    # Search Worklog
-    related_items = search_and_dedup(keywords)
+    # Probe semantic search availability
+    use_semantic = is_semantic_available()
+    if args.verbose:
+        print(f"[find-related] Semantic search available: {use_semantic}", file=sys.stderr)
 
-    # Search repository
+    # Search Worklog (with semantic ranking when available)
+    related_items = search_and_dedup(keywords, use_semantic=use_semantic)
+
+    # Search repository (ranked and limited)
     repo_matches = search_repo(args.repo_path, keywords)
 
     # Filter out the current work item from results
