@@ -42,10 +42,10 @@ def _mock_exit(code=0):
 
 
 # Import target module
-import orchestrate_estimate as oe
+import orchestrate_estimate as oe  # noqa: E402
 
 # Also import shared for test assertions
-from _shared import DEFAULT_THRESHOLDS, TSHIRT_MAP, pick_tshirt, level_from_score
+from _shared import DEFAULT_THRESHOLDS, TSHIRT_MAP, pick_tshirt, level_from_score  # noqa: E402
 
 
 class TestLoadThresholds(unittest.TestCase):
