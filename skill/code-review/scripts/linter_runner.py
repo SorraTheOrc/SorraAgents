@@ -52,7 +52,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from detection import detect_languages, get_linters_for_language, probe_linter
+from detection import detect_languages, get_linters_for_language, probe_linter  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Severity classification
