@@ -2,15 +2,19 @@
 name: implement
 description: |
   Write tests, docs and code for a Worklog work item by following a
-  deterministic workflow. Ensure implementation meets defined acceptance
-  criteria. Trigger on user queries such as: 'Implement <work-item-id>',
-  'Complete <work-item-id>', 'Work on <work-item-id>'.
+  deterministic, script-assisted workflow. Ensure implementation meets
+  defined acceptance criteria. Trigger on user queries such as:
+  'Implement <work-item-id>', 'Complete <work-item-id>',
+  'Work on <work-item-id>'.
 ---
 
 ## Purpose
 
-Provide a deterministic, step-by-step implementation workflow for completing a
-Worklog work item through the creation of code, tests, and documentation.
+Provide a deterministic, script-assisted implementation workflow for completing
+a Worklog work item. The Python orchestration script (`scripts/implement.py`)
+manages all deterministic lifecycle steps (claim, worktree creation, refactor,
+build/test/commit cycle, cleanup, stage advancement), while this guide covers
+code/test authoring, review, and best practices.
 
 ## Inputs
 
@@ -28,7 +32,9 @@ Worklog work item through the creation of code, tests, and documentation.
 
 ## References to Bundled Resources
 
+- Script runner: `./implement` (wrapper) or `python3 scripts/implement.py`
 - Intake/interview helpers: `intake`, `plan`.
+- Refactor skill: `../refactor/SKILL.md` (invoked automatically during finish phase)
 
 Security note: Do not push or create PRs automatically unless the invoking
 agent has explicit permission to push to the repository and open pull
@@ -68,10 +74,18 @@ MUST reset status to `open`** to release the work item lock.
 
 ### Mandatory Abort Pattern
 
-All abort paths follow the same two-step pattern:
+Use the script's `abort` subcommand to cleanly abort and reset status:
 
-1. **Reset status to open:** `wl update <work-item-id> --status open --json`
-2. **Stop execution:** Return control to the operator with a clear explanation
+```bash
+python3 scripts/implement.py abort <work-item-id>
+```
+
+The abort command:
+1. Resets work-item status to `open`
+2. Cleans up worktree processes (via `wl cleanup-worktree` or fallback)
+3. Removes the worktree directory
+4. Restores the repo to the `dev` branch
+5. Adds an abort comment to the work item
 
 > **Why this matters:** Work items in `in_progress` status are filtered by `wl next`
 > and are invisible to other agents. An orphaned `in_progress` item blocks all
@@ -80,16 +94,15 @@ All abort paths follow the same two-step pattern:
 
 ### Abort Scenarios
 
-The implement skill covers **five** abort/failure scenarios, each with explicit
-status-reset instructions documented in the sections below:
+The implement script handles **five** abort/failure scenarios:
 
-| # | Scenario | Description |
-|---|----------|-------------|
-| 1 | Dirty work tree abort | User aborts when uncommitted changes exist in the working tree |
-| 2 | Definition gate failure | Work item fails definition gate (unclear scope, untestable ACs) |
-| 3 | User-initiated abort | Operator cancels the implementation mid-process |
-| 4 | Error/exception during implementation | API failure, network error, or unexpected exception during coding |
-| 5 | Unexpected termination | Agent crash, network failure, or external interruption (covered by Final cleanup step) |
+| # | Scenario | Script handling |
+|---|----------|-----------------|
+| 1 | Dirty work tree abort | Start phase detects and reports dirty tree; does not create worktree |
+| 2 | Definition gate failure | Agent detects during understanding; runs `implement.py abort <id>` |
+| 3 | User-initiated abort | Run `implement.py abort <id>` at any time |
+| 4 | Error/exception during implementation | Script catches errors and resets status to open |
+| 5 | SIGTERM/SIGINT | Signal handler runs deterministic cleanup (kill processes, remove worktree, reset status, restore repo) |
 
 ## Handling Assets
 
@@ -97,238 +110,333 @@ status-reset instructions documented in the sections below:
 - **Documentation:** Update relevant markdown files in `docs/`. Ensure changes are clear and accurate.
 - **Exception:** `CHANGELOG.md` is excluded — managed automatically by the ship skill's release pipeline.
 
-## Steps
+## Workflow
 
-Execute the following steps in order. Do not skip steps. Use the live commands where applicable and record outputs in the work-item comments as you proceed.
+Execute the following steps in order. Do not skip steps. The orchestration
+script handles deterministic lifecycle operations; the agent handles code and
+test authoring.
 
-1. Set status and safety gate
+### Step 1 — Start the implementation environment
 
-- **Before any other step**, claim the work item:
-  `wl update <work-item-id> --status in_progress --json`
-  This signals to other agents that this item is being worked on.
+Run the script's `start` subcommand to claim the work item, check for a clean
+working tree, fetch work-item details, and create an isolated worktree:
 
-1. Safety gate: handle dirty working tree
+```bash
+python3 scripts/implement.py start <work-item-id>
+```
 
-Check the git context and handle uncommitted changes before proceeding.
+Or via the wrapper:
 
-- Run `git rev-parse --is-inside-work-tree` to detect if inside a worktree.
-- Run `git status --porcelain=v1 -b` to check for uncommitted changes.
-- **Inside a worktree:**
-  - If changes are limited to `.worklog/`, carry them forward.
-  - If other changes exist, present choices: carry, commit, stash, revert, or abort.
-- **In the main checkout:**
-  - If changes are limited to `.worklog/`, carry them forward.
-  - Otherwise, report dirty files (they may be stale), proceed to create a worktree for isolation.
-  - If dirty files prevent worktree creation, follow the carry/commit/stash/revert/abort prompt.
+```bash
+./implement start <work-item-id>
+```
 
-On abort: `wl update <work-item-id> --status open --json`
+The script will:
+1. Validate the work item ID format
+2. Claim the item (`wl update --status in_progress`)
+3. Check for uncommitted changes (safety gate)
+4. Fetch and audit the work item
+5. Create a git worktree from `dev` with an auto-named branch (`wl-<id>-<slug>`)
+6. Register SIGTERM/SIGINT handlers for deterministic cleanup
+7. Write persistent state into the worktree
+8. Print the worktree path and next steps
 
-1. Understand the work item
+Output (non-JSON mode):
+```
+============================================================
+  Implement: <title> (<id>)
+============================================================
+  Worktree:  /path/to/worktree
+  Branch:    wl-<id>-<slug>
+  Parent:    dev
 
-If not already assigned: `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
+  Next steps:
+  1. cd /path/to/worktree
+  2. Write tests and implementation code
+  3. Run: python3 scripts/implement.py finish <id>
 
-Check the most recent worklog action, comment, or audit entry:
-- If a recent audit exists, reuse it to establish the work.
-- If no recent audit exists, run `/skill:audit <work-item-id>` for a full audit.
+  To abort:
+  python3 scripts/implement.py abort <id>
+```
 
-Fetch details: `wl show <work-item-id> --json`. Pay attention to `description`, `acceptance criteria`, and `comments`.
+#### Safety gate: dirty working tree
 
-Restate ACs and current status. Surface blockers, dependencies, missing requirements. Inspect linked PRDs, plans, or docs. Confirm expected tests or validation steps.
+If the start phase detects uncommitted changes outside `.worklog/`, it will
+report them and refuse to proceed. Resolve the changes (stash, commit, or
+revert) and re-run start.
 
-1.1. Definition gate (must pass before implementation)
+#### Definition gate
 
-Verify:
+Before implementing, verify:
 - Clear scope (in/out-of-scope).
 - Concrete, testable ACs.
 - Constraints and compatibility expectations.
 - Unknowns captured as explicit questions.
 
 If the gate fails:
-1. `wl update <work-item-id> --status open --json`
+1. Run `python3 scripts/implement.py abort <work-item-id>` to release the item.
 2. If not well-defined → run intake interview (see `command/intake.md`).
 3. If too large → run plan interview (`/skill:plan`) to decompose.
 4. Inform the user and ask if they want to restart implementation review.
 
-1. Create a worktree from dev and branch inside it
-
-Follow the worktree convention in [[concepts/git-worktree-best-practices-for-agent-workflows]]:
+### Step 2 — Switch to the worktree
 
 ```bash
-git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-id>-<short-slug> dev
-cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
+cd <worktree-path>
 ```
 
-See [AGENTS.md](../../AGENTS.md#implement-the-work-item) for the top-level policy.
+All implementation work happens inside this isolated worktree.
 
-1. Implement
+### Step 3 — Implement
 
-- If the work item has open/in_progress blockers or dependencies, implement them first (recursively via this procedure).
-
-4.1. Parent-advancement check (epic/parent items only)
-
-After all recursive child implementations are complete, check whether this work item has children:
-
-- Use `wl show <work-item-id> --children --json` to inspect children.
-- **If all children are in a terminal stage** (`in_review`/`completed`/`done`):
-  - Advance the parent: `wl update <work-item-id> --status completed --stage in_review --json`
-- **If any children are NOT in a terminal stage**:
-  - Set to open: `wl update <work-item-id> --status open --json`
-  - Add a comment flagging the gap for producer attention:
-    `wl comment add <work-item-id> --comment "Not all children are in a terminal stage. Needs producer review." --author "<AGENT>" --json`
-  - Return control to the operator.
-
-> **Under Ralph:** parent advancement is handled by Ralph's `_wl_update_stage()`. Skip the manual advancement above when operating under Ralph orchestration.
-
-- Check for a recent audit record; if none, run `/skill:audit <work-item-id>` to establish work needed.
-- Write tests and code to meet acceptance criteria:
-  - Make minimal, focused changes.
-  - **Write tests first** (TDD): create at least one test file before editing implementation code. Tests may fail initially; implement code to make them pass. If external constraints prevent complete tests, use harnesses/mocks and document the limitation.
-  - Follow project style and conventions.
-  - Comment on significant design decisions.
-  - If additional work is discovered, create linked work items: `wl create "<title>" --deps discovered-from:<work-item-id> --json`
-- Once all ACs are met:
-  - **Build** the project and verify no errors.
-  - **Run the full test suite**. Report results. Fix any failures.
-  - If failing tests are outside this work item's scope, invoke the triage helper:
-    `python3 ../triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`
-    - If a new or incomplete critical issue is returned, implement it, fix the test, and re-run until all pass.
-    - Under Ralph, failing tests are handled automatically.
-  - Update documentation (excluding `CHANGELOG.md`, which is managed by the ship pipeline).
-  - Summarize changes in the work item.
-  - Wait for user confirmation before proceeding.
-
-1. Error/exception handling (abort on unexpected errors)
-
-On unexpected error (API failure, network error, exception):
-1. **Reset status to open:** `wl update <work-item-id> --status open --json`
-2. **Log the error:** `wl comment add <work-item-id> --comment "Error: <description>" --author "<AGENT>" --json`
-3. **Return control** to the operator with error details.
-4. If transient, the operator may retry.
-
-### User-initiated abort
-
-If the operator cancels after Step 0:
-1. `wl update <work-item-id> --status open --json`
-2. Return control to the operator.
-3. Document: `wl comment add <work-item-id> --comment "Aborted by operator" --author "<AGENT>" --json`
-
----
-
-1. Optional refactor step
-
-After implementation completes and before final commit, an automated refactor step may detect and remediate code smells:
-- Analyzes only files modified in the current session (git diff against parent).
-- Hybrid approach: linters for mechanical issues + LLM for design/architectural smells.
-- **Session-introduced smells** are fixed immediately.
-- **Pre-existing smells** create Worklog items with REFACTOR comments.
-- Skip with ``--no-refactor`` flag.
-- Invoke directly:
+- **Write tests first** (TDD): create at least one test file before editing
+  implementation code. Tests may fail initially; implement code to make them
+  pass. If external constraints prevent complete tests, use harnesses/mocks
+  and document the limitation.
+- Make minimal, focused changes to meet the acceptance criteria.
+- Follow project style and conventions.
+- Comment on significant design decisions in the work item.
+- If additional work is discovered, create linked work items:
   ```bash
-  python3 ../refactor/scripts/refactor.py <work-item-id>
+  wl create "<title>" --deps discovered-from:<work-item-id> --json
   ```
-- See ``../refactor/SKILL.md`` for full documentation.
+- Once all ACs are met, proceed to Step 4.
 
-1. Automated self-review
+> **Parent-advancement check (epic/parent items only):**
+> After implementing, check whether this item has children:
+> ```bash
+> wl show <work-item-id> --children --json
+> ```
+> If all children are in a terminal stage (`in_review`/`completed`/`done`):
+> ```bash
+> wl update <work-item-id> --status completed --stage in_review --json
+> ```
+> If any children are NOT in a terminal stage:
+> ```bash
+> wl update <work-item-id> --status open --json
+> wl comment add <work-item-id> --comment "Not all children are in a terminal stage. Needs producer review." --author "<AGENT>" --json
+> ```
+> **Under Ralph:** parent advancement is handled automatically. Skip manual advancement.
 
-- Build and lint the code; fix any issues.
-- Run all tests again using quiet test commands; fix any failures.
-- Audit the work item: `/skill:audit <work-item-id>`. If ACs are unmet, inform the user and return to step 3.
-- Perform sequential self-review passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff.
-- For each pass, make small, goal-aligned edits. If intent changes are discovered, create an Open Question and stop.
-- Run the full test suite; fix any failures before continuing.
+#### Audit self-check
 
-1. Commit, Push to dev and mark in_review
-
-- Follow the mandatory build → test → commit order before committing.
-- Push the feature branch into `dev` using:
-  - Ship skill (preferred): `pushToDev()` from `../ship/scripts/ship.js`
-  - Direct: `git push origin HEAD:refs/heads/dev`
-- The push target `dev` is **not** a protected branch; only `main`, `master`, and `HEAD` are blocked.
-- After pushing, clean up the worktree:
-
-  ```bash
-  cd /path/to/repo/root
-  git worktree remove .worklog/worktrees/wl-<WIP-id>-<short-slug>
-  git worktree prune
-  git checkout dev
-  git pull origin dev
-  npm run build 2>/dev/null || echo "No build script, skipping rebuild"
-  ```
-
-  > **Why rebuild?** `dist/` is gitignored; a `git pull` does not update it.
-
-  See [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full worktree lifecycle.
-- Add a work-item comment with the commit hash:
-  `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>." --author "<AGENT>" --json`
-- Close your response with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
-
-  > **Parent/epic items already advanced at Step 4.1:** if this item has children and parent advancement was already performed, skip the `wl update` below.
-  > **Under Ralph:** do NOT mark `in_review` — Ralph handles it after the audit.
-  > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `wl update <work-item-id> --status completed --stage in_review --json`
-
-  > The work-item stays `in_review` until the release process promotes `dev` to `main`. See `../ship/SKILL.md` for push-to-dev workflow and `../ship/scripts/run-release.js` for release.
-
-Pre-push blocking check
------------------------
-
-- Under Ralph: failing tests automatically create child work items via the triage helper, get fixed via `implement-single`, and re-run until all pass before push.
-- Manual: invoke the triage helper and fix any failing tests before pushing.
-
-Final cleanup (belt-and-suspenders)
----------------------------------------
-
-Before exiting the implement skill at any point, check and reset status as a safety net:
+Before running the finish phase, check for a recent audit record. If a recent
+audit exists, reuse it to establish what work remains. If no recent audit
+exists, run `/skill:audit <work-item-id>` for a full audit to verify ACs and
+scope. The audit result feeds into the implementation workflow: once ACs are
+clear, proceed to the finish phase.
 
 ```bash
-wl show <work-item-id> --json
+/skill:audit <work-item-id>
 ```
 
-If `status: in_progress` and work is not complete (not at Step 7), run:
+If ACs are unmet after the audit, continue implementing (return to Step 3).
+Otherwise proceed.
+
+### Step 4 — Run the finish phase
+
+Once implementation is complete, run the `finish` subcommand to automate the
+remaining lifecycle: refactor, build, test, commit, cleanup, push, and stage
+advancement.
 
 ```bash
-wl update <work-item-id> --status open --json
+python3 scripts/implement.py finish <work-item-id>
 ```
 
-This prevents orphaned `in_progress` items from blocking other agents.
+Or:
+
+```bash
+./implement finish <work-item-id>
+```
+
+The script will:
+1. **Refactor step**: Invoke `python3 ../refactor/scripts/refactor.py <id>` to
+   detect and remediate code smells. Session-introduced smells are fixed
+   automatically; pre-existing smells create Worklog items. Skip with
+   `--no-refactor`.
+2. **Build**: Run `npm run build` (or equivalent). Fails fast if build errors.
+3. **Test**: Run the full test suite (pytest or npm test).
+4. **Test-fix loop**: If tests fail, the script reports failures and prompts
+   for fixes (interactive) or returns a structured failure report (JSON mode).
+   Up to `--max-retry N` attempts (default: 3).
+5. **Commit**: Stage all changes and commit with a descriptive message.
+6. **Process cleanup**: Call `wl cleanup-worktree <path>` to terminate tracked
+   processes. Falls back to pgrep-based scanning if unavailable.
+7. **Remove worktree**: Run `git worktree remove --force` and `git worktree prune`.
+8. **Restore repo**: Checkout `dev` branch, pull latest.
+9. **Push to dev**: Push the feature branch into `dev` on origin.
+10. **Mark in_review**: Set work item status to `completed` and stage to `in_review`.
+
+Output (non-JSON mode):
+```
+============================================================
+  ✅ Implementation complete for <id>
+============================================================
+  Commit: <hash>
+  Branch: wl-<id>-<slug>
+  Status: in_review
+```
+
+#### Test-fix loop (interactive mode)
+
+When tests fail in interactive mode, the script will:
+```
+  ⚠  Test run 1/3 failed
+  ============================================================
+  Failures:
+    • tests/test_foo.py::test_bar - AssertionError
+
+  Fix the failures and press Enter to re-run tests.
+  Type 'abort' to abort the finish phase, or 'skip' to skip tests.
+```
+
+Your options:
+- **Fix the code**, then press Enter to re-run tests.
+- Type `skip` to skip further testing and proceed to commit.
+- Type `abort` to abort the finish phase (status reset to open).
+
+#### Test-fix loop (JSON mode)
+
+In JSON mode (`--json`), test failures return a structured report and exit
+non-zero. The agent fixes the code and re-invokes `finish`:
+
+```bash
+# Run finish
+output=$(python3 scripts/implement.py finish <id> --json 2>&1)
+exit_code=$?
+# Parse output for test failures
+if echo "$output" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('steps',{}).get('tests',[{}])[-1].get('success') else 1)" 2>/dev/null; then
+  : # tests passed
+else
+  # Fix code and re-run
+  python3 scripts/implement.py finish <id> --json
+fi
+```
+
+### Step 5 — Self-review (agent responsibility)
+
+After the finish phase completes, perform a self-review:
+
+1. **Build and lint**: Verify no build or lint errors remain.
+2. **Run tests**: Confirm all tests pass.
+3. **Audit the work item**: `/skill:audit <work-item-id>`. If ACs are unmet,
+   fix and repeat.
+4. **Self-review passes**:
+   - Completeness: All ACs met?
+   - Dependencies & safety: Any regressions?
+   - Scope & regression: Only intended files changed?
+   - Tests & acceptance: Tests cover ACs?
+   - Polish & handoff: Ready for review?
+
+For each pass, make small, goal-aligned edits. If intent changes are
+discovered, create an Open Question and stop.
 
 ## Status Transition Matrix
 
 The following table documents the expected status and stage transitions at each workflow phase for the `implement` skill.
 
-| Phase | Command | Status | Stage |
-|-------|---------|--------|-------|
-| Start (Step 0 - Set status) | `wl update <id> --status in_progress --json` | in_progress | (unchanged) |
-| Claim (Step 1) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
-| Epic / parent: all children done (Step 4.1) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
-| Final (Step 6 - Mark in_review) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
-| Abort - dirty work tree | `wl update <id> --status open --json`, then abort | open | (unchanged) |
-| Abort - definition gate failure | `wl update <id> --status open --json`, run intake/plan interview, update item | open | (unchanged) |
-| Abort - user-initiated | `wl update <id> --status open --json`, return control to operator | open | (unchanged) |
-| Abort - error/exception during implementation | `wl update <id> --status open --json`, log error to comment, return | open | (unchanged) |
-| Abort - unexpected termination (Final cleanup) | Check status; if `in_progress` and work incomplete, reset | open | (unchanged) |
-| Under Ralph (Step 6 note) | Skip in_review step; Ralph handles transition | in_progress | in_progress |
+| Phase | Action | Status | Stage |
+|-------|--------|--------|-------|
+| Start (Step 1) | `implement.py start <id>` | in_progress | in_progress |
+| Finish (Step 4) | `implement.py finish <id>` | completed | in_review |
+| Abort | `implement.py abort <id>` | open | (unchanged) |
+| SIGTERM/SIGINT | Signal handler | open | (unchanged) |
 
-> **Abort/failure transitions always use `--status open` while keeping the stage unchanged.**
-> This pattern is mandatory — never leave a work item in `in_progress` status
-> unless actively implementing. See the "Status Safety & Abort Handling" section for details.
+> All abort/failure paths use `--status open` while keeping the stage unchanged.
 
-## Scripts (canonical runner & modules)
+## Scripts
 
-This skill does not ship a single orchestrator script. Implementation is carried out by following the steps above and invoking project-local build/test and linters. When a repository provides an "implement" helper script, prefer that script for deterministic behavior.
-
-Example Worklog-oriented commands using SA-0MPYMFZXO0004ZU4 (documentation example):
+### Orchestrator (canonical runner)
 
 ```bash
-# Fetch the work item
-wl show SA-0MPYMFZXO0004ZU4 --json
+python3 scripts/implement.py start <id>        # Setup phase
+python3 scripts/implement.py finish <id>        # Completion phase
+python3 scripts/implement.py abort <id>         # Abort and cleanup
+```
 
-# After implementing locally, push to dev (preferred via ship skill):
-# (JS example) node -e "require('../ship/scripts/ship.js').pushToDev('origin')"
-# or direct push
-git push origin HEAD:refs/heads/dev
+### Wrapper
 
-# Mark in_review
-wl update SA-0MPYMFZXO0004ZU4 --status completed --stage in_review --json
+```bash
+./implement start <id>
+./implement finish <id>
+./implement abort <id>
+```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Output results in JSON format |
+| `--no-refactor` | Skip the refactor step |
+| `--max-retry N` | Max test-fix loop retries (default: 3) |
+| `--commit-msg <msg>` | Override commit message |
+| `--parent-branch <branch>` | Parent branch for worktree (default: dev) |
+| `--worktree-path <path>` | Override worktree path |
+| `-v` / `--verbose` | Enable verbose logging |
+
+### Examples
+
+```bash
+# Start implementation
+python3 scripts/implement.py start SA-0MPYMFZXO0004ZU4
+
+# Start with JSON output
+python3 scripts/implement.py start SA-0MPYMFZXO0004ZU4 --json
+
+# Finish (interactive)
+python3 scripts/implement.py finish SA-0MPYMFZXO0004ZU4
+
+# Finish with custom commit message and no refactor
+python3 scripts/implement.py finish SA-0MPYMFZXO0004ZU4 \
+  --commit-msg "SA-0MPYMFZXO0004ZU4: Add input validation" \
+  --no-refactor
+
+# Finish with max 5 test-fix retries
+python3 scripts/implement.py finish SA-0MPYMFZXO0004ZU4 --max-retry 5
+
+# Abort
+python3 scripts/implement.py abort SA-0MPYMFZXO0004ZU4
+```
+
+## Lifecycle Summary
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. implement.py start <id>                                  │
+│    - Claim work item (in_progress)                          │
+│    - Safety gate (dirty check)                              │
+│    - Create worktree from dev                               │
+│    - Register signal handlers                               │
+│    - Print worktree path                                    │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Agent writes tests and code inside worktree              │
+│    - TDD: tests first                                       │
+│    - Meet acceptance criteria                               │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. implement.py finish <id>                                 │
+│    - Refactor (auto-fix smells)                             │
+│    - Build                                                  │
+│    - Test (fix-and-re-run loop, max N retries)              │
+│    - Commit                                                 │
+│    - Clean up processes (wl cleanup-worktree)               │
+│    - Remove worktree                                        │
+│    - Push to dev                                            │
+│    - Mark in_review                                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+After committing and pushing changes, close your response to the operator with:
+
+```
+<work-item-id>: <concise-summary>
+
+Work committed to dev
 ```
 
 End.

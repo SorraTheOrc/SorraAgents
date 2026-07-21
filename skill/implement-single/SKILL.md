@@ -72,6 +72,12 @@ Execute the following steps in order. Do not skip steps.
   - Other stale files → report, proceed to Step 2 for isolation.
   - If dirty files prevent branch creation → abort via `wl update ... --status open --json`.
 
+> Under Ralph, the worktree is already created by Ralph's parent loop.
+> Use the implement script for deterministic build/test/commit:
+> ```bash
+> python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py finish <work-item-id>
+> ```
+
 ### Step 1 — Understand the work item
 
 - Claim: `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
@@ -114,6 +120,19 @@ refactor step may be invoked to detect and remediate code smells:
 
 ### Step 5 — Build, test and commit
 
+Use the implement orchestration script for deterministic build, test, and commit:
+
+```bash
+python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py finish <work-item-id>
+```
+
+This will:
+1. Run the refactor step (auto-fix session-introduced smells)
+2. Build the project
+3. Run the full test suite with a fix-and-re-run loop (up to 3 retries)
+4. Commit changes with a descriptive message
+
+**Alternative (manual):** If the script is unavailable:
 - Build the project and verify no errors.
 - Run the entire test suite. Fix any failing tests.
 - Commit changes with a message referencing the work item id.
@@ -121,6 +140,10 @@ refactor step may be invoked to detect and remediate code smells:
 
 ### Step 6 — Push and mark in-review
 
+If using the implement script (`finish` subcommand), push and in_review marking
+are handled automatically.
+
+If manually:
 - Push the branch to `origin`.
 - Respond with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
 - Mark in-review: `wl update <work-item-id> --status completed --stage in_review --json`
@@ -139,11 +162,26 @@ Abort/failure transitions always use `--status open`.
 
 ## Scripts
 
-This skill does not ship a canonical CLI runner. Prefer any repository-provided implement helper script.
+### Orchestration (preferred)
+
+Use the implement skill's orchestration script for deterministic lifecycle steps:
+
+```bash
+# Finish phase: refactor, build, test, commit, push, mark in_review
+python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py finish <work-item-id>
+
+# Abort and cleanup (if needed)
+python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py abort <work-item-id>
+```
+
+### Manual fallback
 
 ```bash
 # Fetch work item
 wl show <work-item-id> --json --children
+# Build and test
+npm run build 2>/dev/null || echo "No build script"
+npm test
 # Mark in_review when complete
 wl update <work-item-id> --status completed --stage in_review --json
 ```

@@ -53,14 +53,33 @@ def implement_single_content() -> str:
 
 
 def _find_step(content: str, step_heading: str) -> str | None:
-    """Extract a numbered step section from the markdown document."""
+    """Extract a step section from the markdown document.
+
+    Supports both old numbered format (e.g., "1. Implement") and new
+    heading format (e.g., "### Step 3 — Implement").
+    """
+    # Try exact match first
     pattern = re.compile(
-        rf"(?ms)^\s*{re.escape(step_heading)}.*?(?=^\s*\d+\.\s+|\Z)",
+        rf"(?ms)^\s*{re.escape(step_heading)}.*?(?=^\s*\d+\.\s+|^\s*###\s+Step|\Z)",
     )
     match = pattern.search(content)
-    if not match:
-        return None
-    return match.group(0)
+    if match:
+        return match.group(0)
+
+    # For new format, also try matching "### Step N — <heading>"
+    # e.g., if step_heading is "1. Implement", try "### Step 3 — Implement"
+    # Extract the topic after removing numbering
+    import re as re_mod
+    topic = re_mod.sub(r"^[\d\.\s#-]+|^###\s+Step\s+\d+\s+[—\-]\s+", "", step_heading).strip()
+    if topic:
+        pattern2 = re.compile(
+            rf"(?ms)^\s*###\s+Step\s+\d+\s+[—\-]\s+{re.escape(topic)}.*?(?=^\s*###\s+Step|\Z)",
+        )
+        match2 = pattern2.search(content)
+        if match2:
+            return match2.group(0)
+
+    return None
 
 
 def _find_section(content: str, heading: str) -> str | None:

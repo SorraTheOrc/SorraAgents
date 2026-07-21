@@ -20,19 +20,26 @@ Follow the steps below when completing tasks. If you already have a current work
 2. **Ensure the work-item is clearly defined** — Fetch with `wl show <id> --children --json`. Verify it has a clear goal (user story) and testable acceptance criteria. If unclear, search worklog/repo for context, clarify with the operator, or document open questions. Advance stage: `wl update <id> --stage intake_complete`. See [skill/intakeall/SKILL.md](skill/intakeall/SKILL.md).
 3. **Plan the work** — Break into sub-tasks. Verify descriptions and ACs are clear, measurable, and testable. Create child work-items: `wl create -t "<title>" -d "<description>" --parent <id> --issue-type <type> --priority <level> --json`. Advance stage: `wl update <id> --stage plan_complete`. See [skill/plan/SKILL.md](skill/plan/SKILL.md).
 4. **Decide what to work on next** — Use `wl next --json`. If the recommended item has children, claim it and recurse until reaching a leaf item. If no descendants remain, go to End session.
-5. **Implement the work-item** — Review ACs and description. Create a worktree from `dev`:
+5. **Implement the work-item** — Use the implement orchestration script to manage the deterministic lifecycle:
 
    ```bash
-   git worktree add --track -b wl-<WIP-id>-<slug> .worklog/worktrees/wl-<WIP-id>-<slug> dev
+   # Start: claim, safety gate, create worktree
+   python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py start <WIP-id>
+
+   # Switch to the worktree
    cd .worklog/worktrees/wl-<WIP-id>-<slug>
    ```
 
-   Write tests first, then code. Follow build → test → commit order (never reverse). Push to `dev`: `git push origin HEAD:refs/heads/dev`. Clean up after:
+   Write tests first, then code. Follow build → test → commit order (never reverse). When done:
 
    ```bash
-   cd /path/to/repo/root
-   git worktree remove .worklog/worktrees/<name> && git worktree prune
-   git checkout dev && git pull origin dev
+   # Finish: refactor, build, test (fix loop), commit, cleanup, push, mark in_review
+   python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py finish <WIP-id>
+   ```
+
+   To abort at any point:
+   ```bash
+   python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py abort <WIP-id>
    ```
 
    After committing and pushing changes, close your response to the operator with: `<WIP-id>: <concise-summary>`

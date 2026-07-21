@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Wrapper to invoke the implement orchestration script.
+# This script is safe to invoke from any current working directory.
+set -euo pipefail
+
+# Resolve the real directory of this script (handles symlinks)
+BASEDIR=$(dirname "$(readlink -f "$0")")
+
+exec python3 "$BASEDIR/scripts/implement.py" "$@"
