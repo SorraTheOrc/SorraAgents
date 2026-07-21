@@ -334,3 +334,93 @@ class TestExitCodes:
             return _fake_proc(returncode=1, stderr="wl not found")
         rc = cmd_issue("SA-MISSING", runner=fake_runner)
         assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Test: --require-persist flag
+# ---------------------------------------------------------------------------
+
+class TestRequirePersistFlag:
+    """Tests for the --require-persist flag behavior."""
+
+    def test_default_require_persist_returns_nonzero_on_failure(self, monkeypatch, capsys):
+        """Default require_persist=True returns non-zero when persist fails."""
+        def fake_persist(*a, **kw):
+            return 1
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        # Default require_persist=True
+        rc = cmd_issue("SA-FAIL", runner=fake_runner)
+        assert rc == 1
+
+    def test_require_persist_true_prints_error_on_failure(self, monkeypatch, capsys):
+        """When require_persist=True and persist fails, an error message is printed."""
+        def fake_persist(*a, **kw):
+            return 1
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-FAIL", runner=fake_runner)
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "Persistence failed" in captured.err or "require-persist" in captured.err.lower()
+
+    def test_require_persist_false_returns_zero_on_failure(self, monkeypatch, capsys):
+        """When require_persist=False and persist fails, return 0 (soft failure)."""
+        def fake_persist(*a, **kw):
+            return 1
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-SOFT", runner=fake_runner, require_persist=False)
+        assert rc == 0
+
+    def test_require_persist_false_still_prints_report_on_failure(self, monkeypatch, capsys):
+        """When require_persist=False, the report is still printed even if persist fails."""
+        def fake_persist(*a, **kw):
+            return 1
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-SOFT", runner=fake_runner, require_persist=False)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "Ready to close:" in captured.out
+        assert "## Acceptance Criteria Status" in captured.out

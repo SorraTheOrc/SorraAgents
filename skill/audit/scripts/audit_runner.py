@@ -23,6 +23,8 @@ Exit codes:
 """
 from __future__ import annotations
 
+from argparse import BooleanOptionalAction
+
 import argparse
 import json
 import re
@@ -1550,6 +1552,7 @@ def _run_phase2_deep_analysis(
 
 
 def cmd_issue(issue_id: str, persist: bool = True,
+              require_persist: bool = True,
               pi_bin: str = "pi", model: str | None = None,
               model_source: str = DEFAULT_MODEL_SOURCE,
               runner: Runner | None = None, json_mode: bool = False,
@@ -2033,7 +2036,18 @@ def cmd_issue(issue_id: str, persist: bool = True,
             print(_get_closing_sentence(report))
 
         if persist:
-            return persist_audit(issue_id, report)
+            rc = persist_audit(issue_id, report)
+            if rc != 0 and require_persist:
+                print(
+                    "Persistence failed and --require-persist is active; "
+                    "exiting non-zero.",
+                    file=sys.stderr,
+                )
+                return rc
+            if rc != 0:
+                # require_persist=False: soft failure, report already printed
+                return 0
+            return rc
         return 0
 
     finally:
@@ -2203,6 +2217,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Append Pi debug output to this file (JSONL)")
     p_issue.add_argument("--force", action="store_true",
                          help="Bypass the freshness gate and force a full audit")
+    p_issue.add_argument("--require-persist",
+                         action=BooleanOptionalAction, default=True,
+                         help="Require persistence to succeed (exit non-zero on failure) (default: true)")
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
@@ -2228,7 +2245,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "issue":
+        # --do-not-persist implies --require-persist=false (can't require what you skip)
+        require_persist = args.require_persist
+        if args.do_not_persist:
+            require_persist = False
         return cmd_issue(args.issue_id, persist=not args.do_not_persist,
+                         require_persist=require_persist,
                          pi_bin=args.pi_bin, model=args.model,
                          model_source=args.model_source, json_mode=args.json,
                          debug_log=args.debug_log,

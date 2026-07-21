@@ -177,6 +177,38 @@ class TestCLIParsing:
         with pytest.raises(SystemExit):
             parser.parse_args(["project", "--force"])
 
+    # ------------------------------------------------------------------
+    # --require-persist flag tests
+    # ------------------------------------------------------------------
+
+    def test_issue_require_persist_default_true(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123"])
+        assert args.require_persist is True
+
+    def test_issue_no_require_persist_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--no-require-persist"])
+        assert args.require_persist is False
+
+    def test_issue_require_persist_explicit_true(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--require-persist"])
+        assert args.require_persist is True
+
+    def test_issue_require_persist_with_do_not_persist(self):
+        """--do-not-persist and --no-require-persist are orthogonal at CLI level."""
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--do-not-persist"])
+        assert args.do_not_persist is True
+        assert args.require_persist is True  # Not modified by do-not-persist at parser level
+
+    def test_project_no_require_persist_flag(self):
+        """--require-persist should NOT be a valid flag for the project subcommand."""
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["project", "--no-require-persist"])
+
 
 # ---------------------------------------------------------------------------
 # _run_wl tests
