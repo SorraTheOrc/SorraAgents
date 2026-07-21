@@ -207,9 +207,9 @@ Runner performs code quality checks before AC verification (invokes `../code-rev
 
 Notes:
 
-- The runner supports an optional persistence step. By default the runner will persist the generated structured audit into the work item unless invoked with `--do-not-persist`; use `--do-not-persist` for dry runs. Alternatively, the persister script (`./scripts/persist_audit.py`) may be invoked explicitly to store the report. Both mechanisms perform the same `wl update` call and are the approved ways to persist an audit.
-- The persister (and the runner when persisting) call: `wl update <issue-id> --audit-text "<report>" --json` and return a non-zero exit code on failure.
-- **Child item audit persistence:** When auditing a parent work item with children, the runner also persists an individual audit report to each child work item. Each child receives a focused report covering only its own acceptance criteria. Child persistence is controlled by the same `--do-not-persist` flag — if persistence is disabled for the parent, child persistence is also skipped. Child persist failures are logged as warnings to stderr but do not prevent the parent audit from succeeding.
+- **Persistence + readback verification is an invariant of the runner.** Unless `--do-not-persist` is given, the runner ALWAYS persists the audit and then performs a readback verification via `wl audit-show --json` to confirm the stored audit is retrievable. If either step fails, the runner exits non-zero. Use `--do-not-persist` for dry runs. The `--require-persist` flag has been removed — persist+verify is now unconditional.
+- The persister (and the runner when persisting) call: `wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json` and return a non-zero exit code on failure. After a successful return code, the runner calls `wl audit-show <issue-id> --json` and exits non-zero if the stored audit is null or has empty `rawOutput`.
+- **Child item audit persistence:** When auditing a parent work item with children, the runner also persists an individual audit report to each child work item. Each child receives a focused report covering only its own acceptance criteria. Child persistence is controlled by the same `--do-not-persist` flag — if persistence is disabled for the parent, child persistence is also skipped. Child persist failures are logged as warnings to stderr but do not prevent the parent audit from succeeding. Child readback verification is out of scope for the current release.
 
 ## Guidance for models
 
@@ -228,7 +228,11 @@ Notes:
 2. **Persist** using one of:
    - `python3 ./scripts/persist_audit.py --issue-id <id> --report "<report>"`
    - `echo "<report>" | python3 ./scripts/persist_audit.py --issue-id <id>`
-   - Runner default: `python3 ./scripts/audit_runner.py issue <id>` (persists unless `--do-not-persist`)
+   - Runner default: `python3 ./scripts/audit_runner.py issue <id>` (persists **and verifies** unless `--do-not-persist`)
+
+   > **Readback verification:** After persisting, the runner always reads back the stored audit via
+   > `wl audit-show <id> --json` and checks that the `audit` object exists and `rawOutput` is not
+   > empty. This is an invariant — not a configurable step. If readback fails, the runner exits non-zero.
 
    > **Child audits:** Runner persists individual audits to each child automatically.
 
