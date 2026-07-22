@@ -8,8 +8,8 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from skill.cleanup.scripts import summarize_branches
-from skill.cleanup.scripts import delete_remote_branches
+from skill.cleanup.scripts import summarize_branches  # noqa: E402
+from skill.cleanup.scripts import delete_remote_branches  # noqa: E402
 
 
 def test_summarize_branches_protected_contains_worklog():

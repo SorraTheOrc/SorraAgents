@@ -208,7 +208,7 @@ def is_semantic_available() -> bool:
     try:
         cmd = ["wl", "search", "--semantic", "probe", "--json"]
         out = subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
-        data = json.loads(out)
+        json.loads(out)
         # Any valid response (successful or with items) means --semantic is available
         return True
     except Exception:
