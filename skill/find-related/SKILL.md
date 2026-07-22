@@ -78,11 +78,13 @@ python3 ./scripts/find_related.py --work-item-id <id> [--json] [--verbose] [--re
 | `--repo-path` | No | auto | Repository root |
 
 ### Output (default)
+
 ```
 Work item: <id> | Related: 3 | Repo matches: 2 | Added IDs: REL-001, REL-002
 ```
 
 ### Output (JSON)
+
 ```json
 {"workItemId": "<id>", "found": true, "addedIds": [...], "reportInserted": true, "keywords": [...], "relatedItemCount": 3, "repoMatchCount": 2}
 ```

@@ -27,6 +27,7 @@ pi run /skill:implementall
 ## Output
 
 ### Markdown summary
+
 ```
 # ImplementAll Summary
 **Total**: 5 | **Implemented**: 3 | **Needs input**: 1 | **Errors**: 1 | **Remaining**: 0
@@ -37,6 +38,7 @@ pi run /skill:implementall
 ```
 
 ### JSON output (`--json`)
+
 ```json
 {
   "total": 5, "implemented": 3, "needs_input": 1, "errors": 1,

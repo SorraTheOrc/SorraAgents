@@ -28,6 +28,7 @@ The audit runner manages the work item's `status` field during execution to prev
 3. **Restore original status** — set after audit logic completes (via `try/finally`, guaranteed even on failure).
 
 Behavior:
+
 - Transition: `in_progress` → original status (captured before audit, restored in `finally`).
 - Falls back to `open` if original status cannot be determined (e.g., `wl show` fails).
 - `--do-not-persist` does NOT affect the status lifecycle.
@@ -89,21 +90,26 @@ Phase 2: Deep Code Analysis
 ```
 
 ### Phase 1 — Automated Screening
+
 Order: (1) code quality check, (2) children stage check (must be `in_review` or `done`), (3) surface-level AC assessment.
 
 Blocking: critical/high code quality findings, or any non-deleted child with stage not in `in_review`/`done`.
 
 ### Decision Gate
+
 - **Blocking found:** all "met" ACs → "partial" ("pending deep code review"), skip Phase 2, report "Ready to close: No".
 - **No blockers:** proceed to Phase 2.
 
 ### Phase 2 — Deep Code Analysis
+
 Model reads actual implementation files, verifies each AC against code behavior, checks for discrepancies, provides file:line evidence.
 
 ### Final Verdict
+
 "met" only when BOTH phases confirm it. Disagreement → "partial".
 
 ### Ready-to-close criteria
+
 1. All ACs `met` or `adjusted`.
 2. All active children in `in_review` or `done` stage (children with empty stage excluded).
 3. No critical or high code quality findings.
@@ -196,6 +202,7 @@ Synonym for "Acceptance Criteria". Use **Acceptance Criteria** as canonical head
 ### Code Quality Integration
 
 Runner performs code quality checks before AC verification (invokes `../code-review/scripts/code_quality.py`):
+
 1. Language detection → linter probing (ruff, eslint, markdownlint, shellcheck) → findings classified by severity
 2. Critical/high findings → "Ready to close: No"; medium/low are warnings
 3. Quality epics ("Quality Improvement - Refactoring") created/reused for findings
@@ -237,9 +244,11 @@ Notes:
    > **Child audits:** Runner persists individual audits to each child automatically.
 
 3. **Verify persistence** — exit code 0 does NOT guarantee storage:
+
    ```bash
    wl audit-show <id> --json
    ```
+
    Check: `success=true`, `audit` not null, `audit.rawOutput` non-empty with `Ready to close:` marker.
 
 4. **Handle failure:** If verification fails, re-print report to stdout, report error, do NOT mark as recorded.

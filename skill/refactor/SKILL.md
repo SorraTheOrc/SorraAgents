@@ -83,6 +83,7 @@ Structured report with: files analyzed, smells detected, smells fixed, work item
 ### `.refactor.json` Configuration
 
 Example config (project root):
+
 ```json
 {
   "linter": { "enabled": true, "severity_overrides": {} },

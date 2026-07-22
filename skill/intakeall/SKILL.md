@@ -29,6 +29,7 @@ pi run /intakeall
 ## Output
 
 ### Markdown summary
+
 ```
 # IntakeAll Summary
 **Total**: 5 | **Auto-completed**: 2 | **Intake completed**: 1 | **Needs input**: 1 | **Errors**: 1
@@ -37,6 +38,7 @@ pi run /intakeall
 ```
 
 ### JSON output (`--json`)
+
 ```json
 {
   "total": 5, "auto_completed": 2, "intake_completed": 1, "needs_input": 1, "errors": 1,
@@ -97,5 +99,6 @@ python3 ./scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
 - `../ralph/SKILL.md` — Auto-intake for individual items
 
 > **Implementation notes:**
+>
 > - The `_invoke_intake()` previously invoked `/intake` via `pi run /intake <id>` which blocked indefinitely in batch mode. Fixed in SA-0MQRAMZ4V0056K14 (type-safety) and SA-0MQP33ID9004OR5M (JSON invocation). Batch flow now skips interactive subprocess.
 > - Status claim was fixed in SA-0MQS18ZOI005ER2V to use status-only (`--status in_progress`), matching documented pattern.

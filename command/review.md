@@ -55,6 +55,7 @@ The command implements the procedural workflow below. Each numbered step is part
    - Multiple ids found? Post PR comment calling out the discrepancy; state chosen id.
    - No id found? Stop and ask user.
    - Examples:
+
      ```bash
      prefix=$(awk -F': ' '/^prefix:/ {print $2}' .worklog/config.yaml)
      title=$(gh pr view "$ARGUMENTS" --json title -q .title)
@@ -74,6 +75,7 @@ The command implements the procedural workflow below. Each numbered step is part
 4. **Ensure a Review child work item exists** (agent responsibility)
    - Confirm a child "Review PR #<pr-number>" exists. Create if missing (`critical`, `chore`, child of canonical work item).
    - Examples:
+
      ```bash
      review_item_id=$(wl show "$work_item_id" --json | jq -r --arg title "Review PR #${pr_number}" '.children[]? | select(.title==$title) | .id' | head -n1)
      if [ -z "$review_item_id" ]; then

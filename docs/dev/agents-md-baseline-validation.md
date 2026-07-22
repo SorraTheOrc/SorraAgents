@@ -94,8 +94,8 @@ The workflow contains **8 numbered steps** (1-8):
 
 | # | URL | Status |
 |---|-----|--------|
-| 1 | https://github.com/multica-ai/andrej-karpathy-skills | ✅ External |
-| 2 | https://x.com/karpathy/status/2015883857489522876 | ✅ External |
+| 1 | <https://github.com/multica-ai/andrej-karpathy-skills> | ✅ External |
+| 2 | <https://x.com/karpathy/status/2015883857489522876> | ✅ External |
 
 ### Wiki-style References ([[...]])
 

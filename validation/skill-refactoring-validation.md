@@ -270,6 +270,7 @@ node plugins/tests/ralph-compaction.test.js
 ### Other Test Directories (currently excluded from vitest discovery)
 
 The following directories contain test files but are not configured in vitest's `include` pattern:
+
 - `command/tests/`
 - `skill/ralph/tests/`
 - `skill/implementall/tests/`

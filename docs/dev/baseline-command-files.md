@@ -169,6 +169,7 @@ cross-references, and capture baseline test suite results.
 | Appendix | Lines 350-375 | Lines 450-480 | Near-identical |
 
 **Key differences:**
+
 - Command.md has a "Note" section (line 50) declaring itself a legacy adapter that delegates to the skill
 - Skill has a "Bundled Resources" section (line 421) not in command
 - Command uses legacy paths (`command/plan_helpers.py`); skill uses bundled paths (`plan_helpers.py`)
@@ -198,6 +199,7 @@ cross-references, and capture baseline test suite results.
 | Related skills | — | Line 176 | Skill-only |
 
 **Key differences:**
+
 - command/intake.md is the live interview process for gathering requirements and writing work items
 - skill/intakeall/SKILL.md is an orchestrator that runs intake across multiple items, with batch-processing concerns
 
@@ -223,6 +225,7 @@ cross-references, and capture baseline test suite results.
 | — | — | Error Handling | Skill-only |
 
 **Key differences:**
+
 - command/refactor.md is a high-level protocol for identifying refactoring opportunities during assessment
 - skill/refactor/SKILL.md is an automated code smell detection and remediation tool with scripts
 
@@ -241,6 +244,7 @@ cross-references, and capture baseline test suite results.
 | — | — | Scripts reference | Skill-only |
 
 **Key differences:**
+
 - command/review.md operates on GitHub PRs via Ampa pool containers
 - skill/code-review/SKILL.md guides local code review with automated linting
 
@@ -259,6 +263,7 @@ cross-references, and capture baseline test suite results.
 | — | — | Scripts | Skill-only |
 
 **Key differences:**
+
 - command/author_skill.md teaches how to create a skill (SKILL.md + bundled resources)
 - skill/author-command/SKILL.md teaches how to author a command for the agent framework
 

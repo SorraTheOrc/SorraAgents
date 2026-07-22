@@ -116,9 +116,10 @@ After each stage: "Finished <type> review: <changes>" or "Finished <type> review
 4. **Risks & assumptions** — Add missing risks, mitigations, failure modes, and assumptions in short bullets. Include a scope-creep risk: record extra opportunities as linked work items rather than expanding scope. Don't invent mitigations beyond note-level.
 5. **Polish & handoff** — Tighten language, ensure copy-paste-ready commands, produce the final 1–2 sentence headline.
 
-1. Call the `find_related` skill to collect related work and add a report to the work item description.
+6. Call the `find_related` skill to collect related work and add a report to the work item description.
 
-2. Review the new issue in project context and consider:
+7. Review the new issue in project context and consider:
+
 - Adding dependencies: `wl comment add <work-item-id> --comment "Blocks:<blocked-id>" --json` / `--comment "Blocked-by:<blocking-id>" --json`
 - Adjusting priority: `wl update <work-item-id> --priority <level> --json`
 
@@ -145,9 +146,10 @@ After each stage: "Finished <type> review: <changes>" or "Finished <type> review
   Complete list of measurable acceptance criteria. If any are not measurable, add a clarifying question to the Appendix and mark as "TBD pending clarification".
 
   Always include:
-  - At least one criterion related to testing and validation.
-  - "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries."
-  - "Full project test suite must pass with the new changes."
+
+- At least one criterion related to testing and validation.
+- "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries."
+- "Full project test suite must pass with the new changes."
 
   > **Note:** CHANGELOG.md is **excluded** from this list. It is managed automatically by the ship skill's release pipeline (`skill/ship/scripts/release/generate-changelog.js`). Implementing agents should not manually update CHANGELOG.md.
 

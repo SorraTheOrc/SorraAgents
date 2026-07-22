@@ -37,9 +37,9 @@ import subprocess
 import sys
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 # Ensure skill package root is on sys.path for shared imports
 _SKILLS_ROOT = Path(__file__).resolve().parents[3]  # .../.pi/agent/skills/
@@ -607,8 +607,8 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
                     pass
 
             result["warning"] = (
-                f"wl cleanup-worktree unavailable; used pgrep fallback. "
-                f"Result may be incomplete."
+                "wl cleanup-worktree unavailable; used pgrep fallback. "
+                "Result may be incomplete."
             )
         else:
             result["warning"] = "wl cleanup-worktree unavailable; no processes found via pgrep"
@@ -715,10 +715,6 @@ def run_refactor(work_item_id: str, cwd: str) -> dict[str, Any]:
     Returns:
         A dict with ``success`` (bool) and ``report`` (dict).
     """
-    refactor_script = (
-        Path(__file__).resolve().parents[1] / "refactor" / "scripts" / "refactor.py"
-    )
-
     # Resolve refactor script relative to skills root
     skills_root = Path(__file__).resolve().parents[2]  # .../.pi/agent/skills/
     refactor_path = skills_root / "refactor" / "scripts" / "refactor.py"
@@ -912,7 +908,6 @@ def phase_start(
         return report
 
     title = work_item.get("title", work_item_id)
-    description = work_item.get("description", "")
     slug = slug_from_title(title)
 
     # ── Step 5: Create worktree ────────────────────────────────────
@@ -1040,12 +1035,6 @@ def phase_finish(
 
     # Read state for metadata
     state = read_state(worktree_path)
-    if state:
-        parent_branch = state.parent_branch
-        title_from_state = ""
-    else:
-        parent_branch = DEFAULT_PARENT_BRANCH
-        title_from_state = ""
 
     report["worktree_path"] = worktree_path
     # Compute branch name from the worktree
@@ -1133,7 +1122,7 @@ def phase_finish(
         print("=" * 60)
         print(f"  ⚠  Test run {test_attempts}/{max_retry} failed")
         print("=" * 60)
-        print(f"  Failures:")
+        print("  Failures:")
         for f in failures[:10]:
             print(f"    • {f}")
         print()
@@ -1263,7 +1252,7 @@ def phase_finish(
         print("=" * 60)
         print(f"  Commit: {commit_hash}")
         print(f"  Branch: {branch}")
-        print(f"  Status: in_review")
+        print("  Status: in_review")
         print()
 
     return report

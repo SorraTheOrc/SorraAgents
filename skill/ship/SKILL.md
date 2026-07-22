@@ -116,6 +116,7 @@ To bypass the gating check, resolve or merge the unmerged branches first.
 ### Audit Readiness Gating
 
 Verifies all `in_review`/`completed` work items have passing audits before release:
+
 1. Query candidates: `wl list --stage in_review --json` + `wl list --status completed --json` (dedup, exclude `done`).
 2. For each, check `wl audit-show <id> --json` → `audit.readyToClose`.
 3. Items with `readyToClose: false`, `null`, or missing audit → blocking.
@@ -147,6 +148,7 @@ The audit gate uses exit code 6 to distinguish from other failure modes:
 ### Critical-Item Gating
 
 Checks whether any critical-priority items are not in a terminal state (`status=completed`, `stage=in_review` or `done`) before release:
+
 1. Query: `wl list --priority critical --json`.
 2. For each item, check `isTerminalState()`: status must be `completed` AND stage must be `in_review` or `done`.
 3. Non-terminal items → blocking, abort release with exit code 7.
@@ -172,6 +174,7 @@ modes:
 ### Gating in run-release.js
 
 Runs three gating checks before release:
+
 1. Unmerged branches check (exit code 3)
 2. Audit readiness gate (exit code 6)
 3. Critical-priority items gate (exit code 7)
@@ -213,6 +216,7 @@ node ./scripts/run-release.js
 ```
 
 Steps:
+
 1. **Unmerged branches check** — aborts with report if branches pending; `--skip-checks` bypasses.
 2. **Pre-flight checks** — verifies `gh`, `wl`, clean worktree.
 3. **Critical-priority items check** — aborts with exit 7 if non-terminal critical items exist.

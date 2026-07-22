@@ -11,17 +11,20 @@ subtask: true
 Create or improve **documentation** for a single feature. Runs **before** tests or implementation code, so docs must be high-detail — a best-effort specification that may evolve.
 
 Two doc sets:
+
 - **User docs**: `docs/` (excluding `docs/dev/`)
 - **Developer docs**: `docs/dev/`
 
 Prefer updating existing docs over creating new ones. Create new pages only when no suitable home exists.
 
 Worklog context (must do):
+
 - Mark the **Docs:** task in_progress: `wl update <docs-id> --status in_progress`
 - Fetch work item details: `wl show <parent-id> --json`
 - Treat `title`, `description`, `acceptance` (if present), and linked artifacts as authoritative seed intent.
 
 Hard requirements
+
 - Docs authored **before** tests/implementation with detailed behavior, flows, edge cases, and examples.
 - Call out assumptions and unknowns as **Open Questions**.
 - Separate audiences:
@@ -33,6 +36,7 @@ Hard requirements
 - Respect `.gitignore` and agent framework ignore rules.
 
 Temp draft requirement (must do)
+
 - Maintain an evolving draft under `docs/dev/tmp/doc_$1_$(date +%Y%m%d%H%M%S).md` containing:
   - Seed context, proposed doc changes (file list), draft content blocks, Open Questions
 - Do not delete the temp file automatically — it is useful during implementation when docs are revised.
@@ -47,6 +51,7 @@ Temp draft requirement (must do)
 - Next-step recommendations MUST always progress to the next step in the process below, with a summary of what that step involves.
 
 Seed context
+
 - Read `docs/` (including `docs/dev`), `README.md`, and other high-level files for product context.
 - Fetch and read the work item: `wl show $1 --json`
 - If the work item is a **Docs:** task, locate its parent (feature) and its PRD/design/plan as additional authoritative context.
@@ -100,12 +105,12 @@ Process (must follow)
 | `## Rollout / Migration` | Deploy steps |
 | `## Open Questions` | Unknowns |
 
-4. **User review** (must do)
+1. **User review** (must do)
    - Present proposed file list and draft content blocks to the user.
    - For each file: file path, summary of changes, draft content block (markdown).
    - Iterate until the user approves all changes.
 
-5. **Automated review stages** (must follow; no human intervention)
+2. **Automated review stages** (must follow; no human intervention)
    Run four reviews, outputting: `"Finished <Stage> review: <notes>"` or `"... no changes needed"`.
 
    i) **Completeness** — Ensure required sections exist; user docs answer what/how/errors/limits; dev docs answer how it works/extension/troubleshooting/testing.
@@ -113,14 +118,14 @@ Process (must follow)
    iii) **Actionability** — Steps runnable, examples specific, troubleshooting maps symptom → cause → fix.
    iv) **Markdown/style** — Fix headings, formatting, code fences; keep consistent with existing docs.
 
-6. **Apply docs changes** (agent responsibility)
+3. **Apply docs changes** (agent responsibility)
    - Create or update docs. Cross-link appropriately between user and dev docs.
    - Link from existing index pages (`docs/`, `docs/dev/`) when present.
 
-7. **Write back to the work item** (agent responsibility)
+4. **Write back to the work item** (agent responsibility)
    - Update the docs task description with a "Documentation" block listing updated/created files, contents, Open Questions, and a small changelog with timestamps.
 
-8. **Finishing steps** (must do)
+5. **Finishing steps** (must do)
    - `wl update $1 --stage docs_drafted --json`
    - Optionally set parent feature's stage; prefer `--stage` for machine-readable state transitions.
    - `wl sync`

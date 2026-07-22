@@ -68,9 +68,11 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
      automatically at exit code 7. No critical-priority work items should be
      in a non-terminal state (i.e., not `completed`/`in_review` or `completed`/`done`).
    - Run the gate manually to check:
+
      ```bash
      node skill/ship/scripts/run-release.js --dry-run
      ```
+
    - If the gate fails, review the blocking items and either resolve them or
      use `--skip-checks` to bypass in exceptional circumstances.
 
@@ -86,14 +88,18 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
 8. **Audit readiness gate — all `in_review` and `completed` items have passing audits**
    - The automated release script (`run-release.js`) enforces this gate at exit code 6.
    - Run the gate manually to check:
+
      ```bash
      node skill/ship/scripts/run-release.js --dry-run
      ```
+
    - If the gate fails, run `wl audit-show <blocking-item-id> --json` to inspect
      the audit status, then re-run the audit with:
+
      ```bash
      python3 skill/audit/scripts/audit_runner.py issue <blocking-item-id>
      ```
+
    - Use `--skip-checks` to bypass the gate in exceptional circumstances.
 
 9. **Verify CHANGELOG.md is up to date**

@@ -17,6 +17,7 @@ Inputs
 ------
 
 JSON payload (flat or under `failure_signature`):
+
 - `test_name` (required) — failing test name
 - `stdout_excerpt`, `stack_trace`, `commit_hash`, `ci_url` — optional context
 - `repo_path` (default `.`), `file_path` — for owner inference

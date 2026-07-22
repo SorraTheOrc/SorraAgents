@@ -26,6 +26,7 @@ pi run /planall
 ## Output
 
 ### Markdown summary
+
 ```
 # PlanAll Summary
 **Total**: 5 | **Planned**: 3 | **Needs input**: 1 | **Errors**: 1 | **Remaining**: 2
@@ -35,6 +36,7 @@ pi run /planall
 ```
 
 ### JSON output (`--json`)
+
 ```json
 {
   "total": 5, "planned": 3, "needs_input": 1, "errors": 1, "remaining": 2,

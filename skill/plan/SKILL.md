@@ -118,6 +118,7 @@ description and any existing child work items. Unlike Process step 6
 path reviews the existing content as-is.
 
 Each review stage MUST:
+
 - Run sequentially in the order listed below.
 - Operate on the existing work item content (description, child items).
 - Be conservative: only fix gaps that are clearly needed and unambiguous.
@@ -127,6 +128,7 @@ Each review stage MUST:
   "Finished <Stage Name> review: <brief notes of improvements>"
 
 Review stages (adapted for existing content):
+
 1. **Completeness review** — Ensure the work item has all required fields
    (description, acceptance criteria) and that any existing child items
    are complete. Add missing fields if clearly definable from context.
@@ -310,12 +312,14 @@ instructions above).
   above. Can also be imported as a Python module by Ralph and other tools.
 
   Usage:
+
   ```bash
   python3 ./plan_helpers.py plan-if-needed <work-item-id>
   python3 ./plan_helpers.py check-effort-risk <work-item-id>
   ```
 
   Import:
+
   ```python
   from skill.plan.plan_helpers import (
       make_autoplan_decision,
@@ -337,12 +341,14 @@ instructions above).
 Every planning session must produce an auditable Appendix of questions asked and answers received, appended to the plan content in the parent work item (description or comment).
 
 Required per entry:
+
 - Question text exactly as asked.
 - Answer provided, the answering party, and supporting evidence (work-item id, file path, PR link).
 - If the answer changed, record prior answers and mark the final accepted answer.
 - If the question led to discussion/research, include a concise summary (1-6 sentences) with links to artifacts.
 
 Behavior:
+
 - Append the complete Appendix to any temporary draft file and include it in the parent work item.
 - Idempotence: re-running must not create duplicate entries — append revision notes instead.
 - Open questions must be labelled "OPEN QUESTION" with context (directed to whom and why it matters).
@@ -350,5 +356,6 @@ Behavior:
 - Traceability: each entry should be linkable from the work item.
 
 **Example format:**
+
 - Q: "Should feature X be behind a feature flag?" Answer (product): "Yes, gradual rollout". Final: yes.
 - Q: "Can we reuse library Y?" Answer (eng): "Partially; requires adapter." Research: reviewed `libs/y` and PR #88.

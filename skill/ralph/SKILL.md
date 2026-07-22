@@ -83,6 +83,7 @@ See `docs/ralph.md` and `ralph --help` for full details.
 The auto-plan decision logic is extracted into a shared module at ``../plan/plan_helpers.py`` (canonical) with legacy delegation at ``command/plan_helpers.py``.
 
 Shared by:
+
 - **Ralph** — delegates to ``command.plan_helpers`` (maintains own I/O infrastructure for backward compat).
 - **`/skill:plan`** — invokes ``python3 ../plan/plan_helpers.py plan-if-needed <id>``.
 - **PlanAll** — shells out to ``/skill:plan <id>``.
@@ -125,6 +126,7 @@ When the operator runs `ralph status`, output the script's structured markdown r
 ```
 
 Report sections:
+
 1. **Header**: State, PID, target work-item id
 2. **Active Task**: Current child being processed (if any)
 3. **Status Counts**: Work items grouped by status with deltas
