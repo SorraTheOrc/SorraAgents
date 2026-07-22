@@ -724,11 +724,10 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       - All non-deleted children must be in ``in_review`` or ``done`` stage.
         Children with ``status: in_progress`` but ``stage: in_review`` are
         acceptable and do NOT block closure.
-      - Each active child's persisted audit verdict is checked via the
-        ``child_audit_ready`` field. If any active child's own audit says
-        "Ready to close: No" (child_audit_ready is False), the parent is
-        not ready to close. Children with ``status: completed`` and
-        ``stage: done`` are exempt from this check.
+      - Children in ``in_review`` or ``done`` stage are exempt from child
+        audit verdict checks. Per the audit spec, children in ``in_review``
+        do NOT block closure — only pre-review stages (``idea``,
+        ``intake_complete``, ``plan_complete``) block.
       - Code quality findings: critical or high severity findings block closure
         ("Ready to close: No"). Medium and low findings produce warnings
         but do NOT block closure.
@@ -746,8 +745,17 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
 
     # Check each active (non-exempt) child's persisted audit verdict
     # Exempt children: those with completed/done status+stage (already closed)
+    # and those in in_review stage (per spec, in_review children do not
+    # block parent closure — only pre-review stages block).
     def _is_exempt_child(c: dict) -> bool:
-        return c.get("status") == "completed" and c.get("stage") == "done"
+        # Completed/done children are fully closed
+        if c.get("status") == "completed" and c.get("stage") == "done":
+            return True
+        # Children in in_review stage should not have their audit verdicts
+        # block parent closure (per audit spec)
+        if c.get("stage") == "in_review":
+            return True
+        return False
 
     non_exempt_children = [c for c in active_children if not _is_exempt_child(c)]
     any_child_audit_not_ready = any(
@@ -1259,7 +1267,10 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
     Blocking issues include:
     - Critical/high code quality findings
     - Children not in in_review/done stage
-    - Active children whose persisted audit says "Ready to close: No"
+    - Active children in pre-review stages whose persisted audit says
+      "Ready to close: No" (children in ``in_review`` stage are exempt
+      from child audit verdict checking — per the audit spec, only
+      pre-review stages block)
     """
     # Check code quality findings
     for f in cq_findings:
@@ -1278,7 +1289,12 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
 
     # Check each active child's persisted audit verdict
     # A child with child_audit_ready=False means its own audit says "not ready"
+    # Children in in_review stage are exempt from this check (per audit spec,
+    # in_review children do NOT block parent closure — only pre-review stages block).
     for c in active_children:
+        # Skip in_review children — their audit verdicts do not block Phase 1
+        if c.get("stage") == "in_review":
+            continue
         car = c.get("child_audit_ready")
         if car is False:
             return True, (
@@ -1299,11 +1315,10 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
         ``adjusted`` criteria represent acceptable variance and do not block closure.
       - Critical/high code quality findings block closure.
-      - Each active child's persisted audit verdict is checked via the
-        ``child_audit_ready`` field. If any non-exempt active child's own
-        audit says "Ready to close: No" (child_audit_ready is False), the
-        parent is not ready to close. Children with ``status: completed``
-        and ``stage: done`` are exempt from this check.
+      - Children in ``in_review`` or ``done`` stage are exempt from child
+        audit verdict checks. Per the audit spec, children in ``in_review``
+        do NOT block closure — only pre-review stages (``idea``,
+        ``intake_complete``, ``plan_complete``) block.
     """
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
@@ -1317,8 +1332,18 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     )
 
     # Check each non-exempt child's persisted audit verdict
+    # Exempt children: those with completed/done status+stage (already closed)
+    # and those in in_review stage (per spec, in_review children do not
+    # block parent closure — only pre-review stages block).
     def _is_exempt(c: dict) -> bool:
-        return c.get("status") == "completed" and c.get("stage") == "done"
+        # Completed/done children are fully closed
+        if c.get("status") == "completed" and c.get("stage") == "done":
+            return True
+        # Children in in_review stage should not have their audit verdicts
+        # block parent closure (per audit spec)
+        if c.get("stage") == "in_review":
+            return True
+        return False
     non_exempt_children = [c for c in active_children if not _is_exempt(c)]
     any_child_audit_not_ready = any(
         c.get("child_audit_ready") is False

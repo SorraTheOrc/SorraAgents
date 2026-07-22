@@ -1,5 +1,8 @@
 {
   "version": "0.1.11",
   "type": "module",
+  "scripts": {
+    "build": "echo 'No build step for this Python project'"
+  },
   "dependencies": {}
 }
