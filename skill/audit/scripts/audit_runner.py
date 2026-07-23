@@ -2091,11 +2091,22 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 )
                 return 1
             audit_obj = rb_data.get("audit")
-            raw_output = audit_obj.get("rawOutput") if audit_obj else None
-            if audit_obj is None or not raw_output:
+            if audit_obj is None:
                 print(
                     f"Error: Readback verification for {issue_id}: "
-                    f"stored audit is null or rawOutput is empty",
+                    f"no audit object found",
+                    file=sys.stderr,
+                )
+                return 1
+            # Check rawOutput first, fall back to summary (some audits store
+            # content in summary instead of rawOutput).
+            raw_output = audit_obj.get("rawOutput")
+            if not raw_output:
+                raw_output = audit_obj.get("summary")
+            if not raw_output:
+                print(
+                    f"Error: Readback verification for {issue_id}: "
+                    f"stored audit is null or both rawOutput and summary are empty",
                     file=sys.stderr,
                 )
                 return 1
