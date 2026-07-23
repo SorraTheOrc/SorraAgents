@@ -81,6 +81,28 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
         # If wl didn't produce JSON, that's tolerated; just proceed.
         pass
 
+    # ── Step 2: Update the work item's auditResult field (for Pi extension UI) ──
+    # wl audit-set stores data in a separate audit store, but the work item's
+    # own auditResult field (visible via wl show) must be set via wl update --audit-text
+    # so that the Pi extension's audit column shows the green tick / verdict.
+    update_cmd = [
+        wl_bin, "update", issue_id,
+        "--audit-text", report_text,
+        "--json"
+    ]
+    update_proc = runner(update_cmd, check=False, text=True, capture_output=True)
+
+    if getattr(update_proc, "returncode", 1) != 0:
+        stderr = getattr(update_proc, "stderr", "") or ""
+        print(
+            f"wl update --audit-text failed (rc={getattr(update_proc, 'returncode', 'unknown')}): "
+            f"{stderr.strip()}",
+            file=sys.stderr
+        )
+        # Non-fatal: audit data was stored via wl audit-set; the work item
+        # field is a convenience for the UI. Return 0 from persist_audit
+        # if audit-set succeeded.
+
     return 0
 
 
