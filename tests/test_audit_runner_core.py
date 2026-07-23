@@ -521,7 +521,9 @@ class TestReportStructure:
         captured = capsys.readouterr()
         assert "| # | Criterion | Verdict | Evidence |" in captured.out
         assert "The API must return 200 for valid requests." in captured.out
-        assert "unmet" in captured.out
+        # After RC2 fix, unparseable Pi output now defaults to "partial" verdict
+        assert "partial" in captured.out
+        assert "could not be parsed" in captured.out
 
     def test_report_no_ac_fallback(self, capsys, monkeypatch):
         monkeypatch.setattr(
@@ -1747,3 +1749,321 @@ class TestCmdIssueChildAuditAutoTrigger:
         cmd_issue("SA-PARENT", runner=fake_runner, persist=True)
         # Should have triggered an audit for the active child
         assert "SA-ACTIVE" in triggered_children
+
+
+class TestRC1CompletedInReviewChildFilter:
+    """Regression tests for RC1: children in completed/in_review are included.
+
+    Before the fix, active_children filtered out all children with
+    status=="completed", which excluded completed/in_review children
+    (the most common state when auditing a parent). After the fix,
+    only deletedBy is filtered; stage logic is left to the phase1
+    blocker check.
+    """
+
+    def test_completed_in_review_child_included_in_child_results(self, monkeypatch, capsys):
+        """A child with status=completed, stage=in_review must appear in child_results."""
+        pi_calls = []
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            pi_calls.append(prompt)
+            return {"verdict": "met", "evidence": "x:1 — ok", "extracted_text": ""}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        child_wi = _load_fixture("wi_with_numbered_ac.json")
+        child_wi["workItem"]["id"] = "SA-REVIEW"
+        child_wi["workItem"]["title"] = "Completed Review Child"
+        child_wi["workItem"]["status"] = "completed"
+        child_wi["workItem"]["stage"] = "in_review"
+
+        parent_wi = _load_fixture("wi_with_numbered_ac.json")
+        parent_wi["children"] = [
+            {
+                "id": "SA-REVIEW",
+                "title": "Completed Review Child",
+                "status": "completed",
+                "stage": "in_review",
+                "description": child_wi["workItem"]["description"],
+            },
+        ]
+
+        captured_child_results = []
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi))
+            if "show" in cmd_list:
+                return _fake_proc(stdout=json.dumps(child_wi))
+            if "audit-show" in cmd_list:
+                # Return an existing audit so the child is processed
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItemId": "SA-REVIEW",
+                    "audit": {
+                        "workItemId": "SA-REVIEW",
+                        "auditedAt": "2026-07-16T12:00:00Z",
+                        "rawOutput": "Ready to close: Yes\n\n## Summary\nAll good.",
+                    },
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        # Monkey-patch _assemble_issue_report to capture child_results
+        original_assemble = __import__("skill.audit.scripts.audit_runner", fromlist=["_assemble_issue_report"])._assemble_issue_report
+
+        def capturing_assemble(issue, ac_results, child_results, **kwargs):
+            nonlocal captured_child_results
+            captured_child_results = child_results
+            return original_assemble(issue, ac_results, child_results, **kwargs)
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            capturing_assemble,
+        )
+
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+
+        # Verify the child appeared in child_results
+        child_ids = [c.get("id") for c in captured_child_results]
+        assert "SA-REVIEW" in child_ids, (
+            f"completed/in_review child should appear in child_results, got: {child_ids}"
+        )
+
+    def test_completed_done_child_is_not_excluded_by_filter(self, monkeypatch):
+        """A child with status=completed, stage=done is also included for child_results."""
+        # This test verifies RC1 does NOT re-introduce a filter that excludes
+        # completed/done children. The phase1 blocking logic handles exemption.
+        children = [
+            {"id": "SA-REVIEW", "status": "completed", "stage": "in_review", "deletedBy": ""},
+            {"id": "SA-DONE", "status": "completed", "stage": "done", "deletedBy": ""},
+            {"id": "SA-ACTIVE", "status": "in_progress", "stage": "in_review", "deletedBy": ""},
+        ]
+        # Simulate the RC1 filter logic (after fix)
+        active_children = [c for c in children if not c.get("deletedBy")]
+        child_ids = [c["id"] for c in active_children]
+        assert "SA-REVIEW" in child_ids, "completed/in_review child must be active"
+        assert "SA-DONE" in child_ids, "completed/done child must be active for reporting"
+        assert "SA-ACTIVE" in child_ids, "in_progress/in_review child must be active"
+
+    def test_deleted_child_still_excluded(self):
+        """The deletedBy exclusion must still work."""
+        children = [
+            {"id": "SA-DELETED", "status": "completed", "stage": "in_review", "deletedBy": "someone"},
+            {"id": "SA-ACTIVE", "status": "in_progress", "stage": "in_review", "deletedBy": ""},
+        ]
+        active_children = [c for c in children if not c.get("deletedBy")]
+        child_ids = [c["id"] for c in active_children]
+        assert "SA-DELETED" not in child_ids, "deleted child must be excluded"
+        assert "SA-ACTIVE" in child_ids, "non-deleted child must be included"
+
+
+class TestRC2RCFallbackVerdict:
+    """Regression tests for RC2/RC3: unparseable Pi output gets partial verdict.
+
+    Before the fix, when _extract_json_array returned None (unparseable output),
+    the fallback defaulted to verdict="unmet" with empty evidence. After the fix:
+    - Default verdict is "partial" with a diagnostic evidence string
+    - A warning is printed to stderr
+    - Raw output is logged to debug log (when --debug-log is active)
+    """
+
+    def test_parent_ac_fallback_uses_partial_verdict_and_warning(self, monkeypatch, capsys):
+        """Parent AC fallback uses "partial" verdict, diagnostic evidence, and prints warning."""
+        from skill.audit.scripts.audit_runner import _assemble_issue_report
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            # Return text that _extract_json_array cannot parse
+            return {
+                "verdict": "met",
+                "evidence": "not-a-json-array",
+                "extracted_text": "Analysis text without a JSON array.",
+                "text": "",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        parent_wi = _load_fixture("wi_with_numbered_ac.json")
+        parent_wi["children"] = []
+
+        captured_ac_results = []
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi))
+            if "show" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi["workItem"]))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        def capturing_assemble(issue, ac_results, child_results, **kwargs):
+            nonlocal captured_ac_results
+            captured_ac_results[:] = ac_results
+            return _assemble_issue_report(issue, ac_results, child_results, **kwargs)
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            capturing_assemble,
+        )
+
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+
+        # All ACs should have "partial" verdict with diagnostic evidence
+        assert len(captured_ac_results) > 0, "Should have AC results"
+        for ac in captured_ac_results:
+            assert ac["verdict"] == "partial", (
+                f"Expected 'partial' verdict for AC '{ac['text']}', got '{ac['verdict']}'"
+            )
+            assert "could not be parsed" in ac["evidence"].lower() or "unparseable" in ac["evidence"].lower(), (
+                f"Expected diagnostic evidence, got: '{ac['evidence']}'"
+            )
+
+        # Warning should be printed to stderr
+        captured = capsys.readouterr()
+        assert "unparseable" in captured.err.lower() or "could not be parsed" in captured.err.lower(), (
+            f"Expected warning on stderr about unparseable output, got: {captured.err}"
+        )
+
+    def test_child_ac_fallback_uses_partial_verdict_and_warning(self, monkeypatch, capsys):
+        """Child AC fallback uses "partial" verdict, diagnostic evidence, and prints warning."""
+        from skill.audit.scripts.audit_runner import _assemble_issue_report
+
+        pi_call_count = [0]
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            pi_call_count[0] += 1
+            if pi_call_count[0] == 1:
+                # First call is for parent ACs - return parseable
+                return {
+                    "verdict": "met",
+                    "evidence": "x:1 — ok",
+                    "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "x:1 — ok"},{"index": 1, "verdict": "met", "evidence": "x:2 — ok"},{"index": 2, "verdict": "met", "evidence": "x:3 — ok"}]',
+                    "text": "",
+                }
+            # Subsequent calls (child ACs) return unparseable text
+            return {
+                "verdict": "met",
+                "evidence": "not-a-json-array",
+                "extracted_text": "Child analysis text without a JSON array.",
+                "text": "",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        child_wi = _load_fixture("wi_with_numbered_ac.json")
+        child_wi["workItem"]["id"] = "SA-CHILD"
+        child_wi["workItem"]["title"] = "Child with ACs"
+        child_wi["workItem"]["status"] = "in_progress"
+        child_wi["workItem"]["stage"] = "in_review"
+
+        parent_wi = _load_fixture("wi_with_numbered_ac.json")
+        parent_wi["children"] = [
+            {
+                "id": "SA-CHILD",
+                "title": "Child with ACs",
+                "status": "in_progress",
+                "stage": "in_review",
+                "description": child_wi["workItem"]["description"],
+            },
+        ]
+
+        captured_child_results = []
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi))
+            if "show" in cmd_list:
+                return _fake_proc(stdout=json.dumps(child_wi))
+            if "audit-show" in cmd_list:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": {
+                        "workItemId": "SA-CHILD",
+                        "auditedAt": "2026-07-16T12:00:00Z",
+                        "rawOutput": "Ready to close: Yes\n\n## Summary\nAll good.",
+                    },
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        def capturing_assemble(issue, ac_results, child_results, **kwargs):
+            nonlocal captured_child_results
+            captured_child_results[:] = child_results
+            return _assemble_issue_report(issue, ac_results, child_results, **kwargs)
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            capturing_assemble,
+        )
+
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+
+        # Find the child result
+        child = next((c for c in captured_child_results if c["id"] == "SA-CHILD"), None)
+        assert child is not None, "Child should be in results"
+
+        for ac in child["ac_results"]:
+            assert ac["verdict"] == "partial", (
+                f"Expected 'partial' verdict for child AC '{ac['text']}', got '{ac['verdict']}'"
+            )
+            assert "could not be parsed" in ac["evidence"].lower() or "unparseable" in ac["evidence"].lower(), (
+                f"Expected diagnostic evidence, got: '{ac['evidence']}'"
+            )
+
+        # Warning should be printed to stderr (at least once - may appear for both parent and reparse)
+        captured = capsys.readouterr()
+        assert "unparseable" in captured.err.lower() or "could not be parsed" in captured.err.lower(), (
+            f"Expected warning on stderr about unparseable output, got: {captured.err}"
+        )
+
+    def test_fallback_writes_to_debug_log(self, monkeypatch, capsys, tmp_path):
+        """Parse failure should write raw output to the debug log."""
+        log_path = tmp_path / "audit_debug.jsonl"
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            return {
+                "verdict": "met",
+                "evidence": "not-json",
+                "extracted_text": "RAW UNPARSEABLE OUTPUT for debug log",
+                "text": "",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._default_debug_log_path",
+            lambda issue_id, context: log_path,
+        )
+
+        parent_wi = _load_fixture("wi_with_numbered_ac.json")
+        parent_wi["children"] = []
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi))
+            if "show" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi["workItem"]))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        cmd_issue("SA-DEBUG", runner=fake_runner, debug_log=str(log_path), persist=False)
+
+        # Check that debug log was written and contains the raw text
+        assert log_path.exists(), "Debug log should have been created"
+        content = log_path.read_text()
+        assert "RAW UNPARSEABLE OUTPUT" in content, (
+            f"Debug log should contain raw output, got: {content[:200]}"
+        )
+

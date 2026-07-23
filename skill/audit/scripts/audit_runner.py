@@ -1772,23 +1772,57 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         "evidence": item.get("evidence", ""),
                     })
             else:
-                # Fallback: treat single result as covering all ACs equally.
-                # This path is reached when the Pi response was not a parseable
-                # JSON array (e.g., a timeout diagnostic). Preserve the root-level
-                # evidence so the diagnostic is visible in the report.
-                verdict = result.get("verdict", "unmet")
-                evidence = result.get("evidence", "")
+                # Fallback: this path is reached when the Pi response was not a
+                # parseable JSON array. Print a warning, log raw output, and use
+                # 'partial' verdict with diagnostic evidence instead of silently
+                # falling back to 'unmet' with empty evidence.
+                print(
+                    "Warning: Unparseable Pi output for AC evaluation — "
+                    "falling back to 'partial' verdict",
+                    file=sys.stderr,
+                )
+                if debug_log:
+                    try:
+                        target = Path(debug_log) if debug_log else _default_debug_log_path(issue_id, "parent_ac_fallback")
+                        _write_debug_log(target, {
+                            "issue_id": issue_id,
+                            "context": "parent_ac_fallback",
+                            "reason": "parse_failure",
+                            "raw_text": raw_text,
+                            "result_verdict": result.get("verdict"),
+                            "result_evidence": result.get("evidence", "")[:500],
+                        })
+                    except Exception:
+                        pass
+                # When batched parsing fails, the root-level verdict from Pi
+                # cannot be trusted to represent each AC individually. Override
+                # verdict to 'partial' but preserve any diagnostic evidence
+                # from the root-level result (e.g., a timeout message).
+                outer_evidence = result.get("evidence", "")
+                if outer_evidence:
+                    evidence = (
+                        f"Pi model output could not be parsed — raw output logged. "
+                        f"Root-level diagnostic: {outer_evidence[:500]}"
+                    )
+                else:
+                    evidence = "Pi model output could not be parsed — raw output logged"
                 for ac in acs:
-                    ac_results.append({"text": ac, "verdict": verdict, "evidence": evidence})
+                    ac_results.append({
+                        "text": ac,
+                        "verdict": "partial",
+                        "evidence": evidence,
+                    })
         else:
             ac_results = [{"text": "No acceptance criteria defined.", "verdict": "unmet", "evidence": ""}]
 
-        # Review children (depth 1 only, skip completed/done, ignore deleted)
+        # Review children (depth 1 only, ignore deleted)
         # Pass ALL active children to the assembler; it handles the cap.
+        # Note: children with status=completed/stage=done are included for
+        # reporting but exempted from blocking checks by _has_phase1_blocking_issues.
         child_results = []
         active_children = [
             c for c in children
-            if not c.get("deletedBy") and c.get("status") != "completed"
+            if not c.get("deletedBy")
         ]
         for child in active_children:
             # Skip remaining children if we're too close to the parent
@@ -1864,13 +1898,47 @@ def cmd_issue(issue_id: str, persist: bool = True,
                             "evidence": item.get("evidence", ""),
                         })
                 else:
-                    # Fallback: preserve root-level evidence from the Pi
-                    # result (e.g., a timeout diagnostic) when batched
-                    # parsing produced an empty or unparseable result.
-                    verdict = result.get("verdict", "unmet")
-                    evidence = result.get("evidence", "")
+                    # Fallback: this path is reached when the Pi response was not a
+                    # parseable JSON array. Print a warning, log raw output, and use
+                    # 'partial' verdict with diagnostic evidence instead of silently
+                    # falling back to 'unmet' with empty evidence.
+                    print(
+                        "Warning: Unparseable Pi output for AC evaluation — "
+                        "falling back to 'partial' verdict",
+                        file=sys.stderr,
+                    )
+                    if debug_log:
+                        try:
+                            target = Path(debug_log) if debug_log else _default_debug_log_path(issue_id, f"child_{child.get('id', 'unknown')}_ac_fallback")
+                            _write_debug_log(target, {
+                                "issue_id": issue_id,
+                                "child_id": child.get("id"),
+                                "context": "child_ac_fallback",
+                                "reason": "parse_failure",
+                                "raw_text": raw_text,
+                                "result_verdict": result.get("verdict"),
+                                "result_evidence": result.get("evidence", "")[:500],
+                            })
+                        except Exception:
+                            pass
+                    # When batched parsing fails, the root-level verdict from Pi
+                    # cannot be trusted to represent each AC individually. Override
+                    # verdict to 'partial' but preserve any diagnostic evidence
+                    # from the root-level result (e.g., a timeout message).
+                    outer_evidence = result.get("evidence", "")
+                    if outer_evidence:
+                        evidence = (
+                            f"Pi model output could not be parsed — raw output logged. "
+                            f"Root-level diagnostic: {outer_evidence[:500]}"
+                        )
+                    else:
+                        evidence = "Pi model output could not be parsed — raw output logged"
                     for ac in child_acs:
-                        child_ac_results.append({"text": ac, "verdict": verdict, "evidence": evidence})
+                        child_ac_results.append({
+                            "text": ac,
+                            "verdict": "partial",
+                            "evidence": evidence,
+                        })
             child_results.append({
                 "title": child.get("title", ""),
                 "id": child.get("id", ""),

@@ -714,8 +714,13 @@ class TestChildrenReview:
 
         return fake_runner
 
-    def test_skips_completed_children(self, monkeypatch, capsys):
-        """Children with completed/done status are skipped from review."""
+    def test_includes_completed_done_children_in_report(self, monkeypatch, capsys):
+        """Children with completed/done status are now included in the review.
+
+        RC1 fixed the active_children filter to include completed children.
+        Completed/done children are exempt from blocking checks (handled by
+        _has_phase1_blocking_issues) but should still appear in the report.
+        """
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "x:1 — ok"}
@@ -745,10 +750,9 @@ class TestChildrenReview:
         runner = self._make_child_runner(children)
         cmd_issue("SA-CHILDREN", runner=runner, persist=False)
         captured = capsys.readouterr()
-        # Completed child should NOT appear in the review (skipped)
-        assert "Completed child" not in captured.out
-        # Active child should appear with Pi verdicts
-        assert "Active child" in captured.out
+        # After RC1 fix, completed children ARE included in the review report
+        assert "Completed child" in captured.out, "Completed/done child should appear in report"
+        assert "Active child" in captured.out, "Active child should appear in report"
 
     def test_ignores_deleted_children(self, monkeypatch, capsys):
         """Deleted children are completely ignored."""
