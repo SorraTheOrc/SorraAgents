@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from skill.shared.status_lifecycle import StatusLifecycle
+
 # Ensure skill package root is on sys.path for shared imports
 _SKILLS_ROOT = Path(__file__).resolve().parents[3]  # .../.pi/agent/skills/
 if str(_SKILLS_ROOT.parent / "skill") not in sys.path:
@@ -569,13 +571,16 @@ def _restore_repo_state(repo_root: str) -> None:
 
 
 def _reset_work_item_status(work_item_id: str) -> None:
-    """Reset a work item's status to open.
+    """Reset a work item's status to open using the shared StatusLifecycle helper.
 
     Args:
         work_item_id: The work item ID.
     """
-    wl_update_status(work_item_id, "open")
-    LOG.info("Work item %s status reset to open", work_item_id)
+    try:
+        StatusLifecycle.update_status(work_item_id, "open")
+        LOG.info("Work item %s status reset to open", work_item_id)
+    except RuntimeError:
+        LOG.error("Failed to reset work item %s status to open", work_item_id)
 
 
 # ---------------------------------------------------------------------------
@@ -911,9 +916,11 @@ def phase_start(
             LOG.error(msg)
         return report
 
-    # ── Step 2: Claim the work item ────────────────────────────────
+    # ── Step 2: Claim the work item via shared helper ─────────────
     LOG.info("Claiming work item %s...", work_item_id)
-    if not wl_update_status(work_item_id, "in_progress"):
+    try:
+        StatusLifecycle.update_status(work_item_id, "in_progress")
+    except RuntimeError:
         msg = f"Failed to claim work item {work_item_id}"
         report["success"] = False
         report["message"] = msg
@@ -986,8 +993,11 @@ def phase_start(
 
     abs_wt_path = str(Path(wt_path).resolve())
 
-    # Update status with stage
-    wl_update_status(work_item_id, "in_progress", "in_progress")
+    # Update status with stage via shared helper
+    try:
+        StatusLifecycle.update_status(work_item_id, "in_progress", stage="in_progress")
+    except RuntimeError:
+        LOG.warning("Failed to update stage for %s", work_item_id)
     wl_add_comment(
         work_item_id,
         f"Implementation started\n- Worktree: {abs_wt_path}\n- Branch: {branch}",
@@ -1290,12 +1300,14 @@ def phase_finish(
     report["steps"]["push"] = {"success": True, "hash": commit_hash}
     LOG.info("Push to dev succeeded")
 
-    # ── Step 9: Mark in_review ─────────────────────────────────────
+    # ── Step 9: Mark in_review via shared helper ──────────────────
     wl_add_comment(
         work_item_id,
         f"Implementation complete.\n- Commit: {commit_hash}\n- Branch: {branch}\n- Worktree: {worktree_path}",
     )
-    if not wl_update_status(work_item_id, "completed", "in_review"):
+    try:
+        StatusLifecycle.update_status(work_item_id, "completed", stage="in_review")
+    except RuntimeError:
         LOG.warning("Failed to mark work item %s as in_review", work_item_id)
 
     report["success"] = True
