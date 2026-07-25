@@ -407,7 +407,7 @@ class TestReadbackVerification:
         rc = cmd_issue("SA-NULL", runner=fake_runner)
         assert rc == 1
         captured = capsys.readouterr()
-        assert "stored audit is null" in captured.err or "null" in captured.err
+        assert "no audit object found" in captured.err
 
     def test_empty_raw_output_readback_errors(self, monkeypatch, capsys):
         """When readback returns audit with empty rawOutput, print error and return 1."""

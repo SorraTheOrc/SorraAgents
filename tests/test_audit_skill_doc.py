@@ -232,3 +232,43 @@ class TestAuditSkillWorkItemIdDetection:
         text = _skill_md_text()
         assert "wl list" in text
         assert "wl in_progress" in text
+
+
+class TestAuditSkillImperativeDirective:
+    """Assert that SKILL.md frontmatter description contains imperative
+    execution directives that prevent permission-asking behavior."""
+
+    @staticmethod
+    def _extract_description(text: str) -> str:
+        """Extract the description field from YAML frontmatter."""
+        if text.startswith("---"):
+            end = text.find("---", 3)
+            if end != -1:
+                frontmatter = text[3:end].strip()
+                for line in frontmatter.split("\n"):
+                    if line.startswith("description:"):
+                        # Handle both quoted and unquoted values
+                        val = line[12:].strip().strip('"')
+                        return val
+        return ""
+
+    def test_description_contains_immediately(self):
+        """The description must contain an immediate execute directive."""
+        text = _skill_md_text()
+        desc = self._extract_description(text)
+        # Must contain imperative language telling the model to execute immediately
+        assert "immediately" in desc.lower() or "EXECUTE" in desc
+
+    def test_description_does_not_ask_permission(self):
+        """The description must instruct the model to NOT ask permission."""
+        text = _skill_md_text()
+        desc = self._extract_description(text)
+        # Must explicitly tell the model NOT to ask permission
+        assert "Do NOT ask" in desc or "do not ask" in desc.lower()
+
+    def test_description_starts_with_imperative(self):
+        """The description must start with an imperative execution command."""
+        text = _skill_md_text()
+        desc = self._extract_description(text)
+        # The description should start with an imperative verb
+        assert desc.startswith("EXECUTE") or desc.startswith("Execute") or desc.startswith("Run")
