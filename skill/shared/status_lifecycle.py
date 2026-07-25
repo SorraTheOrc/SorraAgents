@@ -20,6 +20,14 @@ Usage::
 The helper is idempotent — safe to call when the work item is already in the
 target state. It logs all transitions and raises exceptions on ``wl`` command
 failures so callers can handle them explicitly.
+
+For testing or custom runners, an injectable ``runner`` callable can be passed::
+
+    def my_runner(cmd: list[str]) -> subprocess.CompletedProcess:
+        ...
+
+    with StatusLifecycle(id, runner=my_runner):
+        ...
 """
 
 from __future__ import annotations
@@ -27,9 +35,72 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from typing import Optional
+from typing import Callable, Optional
 
 LOG = logging.getLogger("skill.shared.status_lifecycle")
+
+# Type alias for an injectable command runner.
+# Takes a command list, returns a CompletedProcess (like subprocess.run).
+Runner = Callable[[list[str]], subprocess.CompletedProcess]
+
+
+# ======================================================================
+# Default runner
+# ======================================================================
+
+
+def _default_runner(cmd: list[str]) -> subprocess.CompletedProcess:
+    """Default command runner using ``subprocess.run``."""
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _run_wl_with_runner(runner: Runner, cmd: list[str]) -> dict:
+    """Run a ``wl`` command via an injectable runner and return parsed JSON.
+
+    Args:
+        runner: A callable that takes a command list and returns a CompletedProcess.
+        cmd: The command as a list of strings.
+
+    Returns:
+        The parsed JSON response dict.
+
+    Raises:
+        RuntimeError: If the command fails or returns invalid JSON.
+    """
+    LOG.debug("Running: %s", " ".join(cmd))
+    proc = runner(cmd)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"wl command failed ({' '.join(cmd)}): {proc.stderr.strip()}"
+        )
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON from wl: {exc}") from exc
+    if isinstance(data, dict) and data.get("success") is False:
+        raise RuntimeError(
+            f"Worklog command failed: {data.get('error', 'unknown error')}"
+        )
+    return data
+
+
+# Backwards-compatible convenience wrapper using the default runner
+def _run_wl(cmd: list[str]) -> dict:
+    """Run a ``wl`` command using the default subprocess runner.
+
+    See :func:`_run_wl_with_runner` for details.
+    """
+    return _run_wl_with_runner(_default_runner, cmd)
+
+
+# ======================================================================
+# StatusLifecycle context manager
+# ======================================================================
 
 
 class StatusLifecycle:
@@ -46,6 +117,8 @@ class StatusLifecycle:
         assignee: Optional assignee name. Set on entry; cleared on failure exit.
         target_stage: Optional stage value (e.g. ``in_review``) to set
             on successful exit.
+        runner: Optional injectable command runner for testing.
+            Must have signature ``(cmd: list[str]) -> subprocess.CompletedProcess``.
 
     Raises:
         RuntimeError: If a ``wl`` command fails. Callers can catch and handle.
@@ -69,10 +142,12 @@ class StatusLifecycle:
         *,
         assignee: Optional[str] = None,
         target_stage: Optional[str] = None,
+        runner: Optional[Runner] = None,
     ) -> None:
         self._work_item_id = work_item_id
         self._assignee = assignee
         self._target_stage = target_stage
+        self._runner = runner or _default_runner
         self._original_status: str = "open"  # safe default
         self._did_set_in_progress: bool = False
 
@@ -81,11 +156,12 @@ class StatusLifecycle:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def show(work_item_id: str) -> dict:
+    def show(work_item_id: str, runner: Optional[Runner] = None) -> dict:
         """Fetch a work item via ``wl show`` and return the parsed JSON.
 
         Args:
             work_item_id: The work item ID.
+            runner: Optional injectable runner for testing.
 
         Returns:
             The parsed JSON dict from ``wl show``.
@@ -93,7 +169,8 @@ class StatusLifecycle:
         Raises:
             RuntimeError: If the ``wl`` command fails.
         """
-        return _run_wl(["wl", "show", work_item_id, "--json"])
+        r = runner or _default_runner
+        return _run_wl_with_runner(r, ["wl", "show", work_item_id, "--json"])
 
     @staticmethod
     def update_status(
@@ -101,6 +178,7 @@ class StatusLifecycle:
         status: str,
         stage: Optional[str] = None,
         assignee: Optional[str] = None,
+        runner: Optional[Runner] = None,
     ) -> dict:
         """Update a work item's status (and optionally stage/assignee).
 
@@ -109,6 +187,7 @@ class StatusLifecycle:
             status: New status value (e.g. ``open``, ``in_progress``, ``completed``).
             stage: Optional new stage value.
             assignee: Optional new assignee value.
+            runner: Optional injectable runner for testing.
 
         Returns:
             The parsed JSON dict from ``wl update``.
@@ -121,7 +200,8 @@ class StatusLifecycle:
             cmd.extend(["--stage", stage])
         if assignee is not None:
             cmd.extend(["--assignee", assignee])
-        return _run_wl(cmd)
+        r = runner or _default_runner
+        return _run_wl_with_runner(r, cmd)
 
     # ------------------------------------------------------------------
     # Context manager protocol
@@ -131,7 +211,7 @@ class StatusLifecycle:
         """Capture original status, set ``in_progress`` (and optional assignee)."""
         # Capture original status
         try:
-            data = self.show(self._work_item_id)
+            data = self.show(self._work_item_id, runner=self._runner)
             wi = data.get("workItem", {})
             self._original_status = wi.get("status", "open")
             LOG.info(
@@ -148,7 +228,7 @@ class StatusLifecycle:
 
         # Set in_progress
         try:
-            kwargs: dict = {"status": "in_progress"}
+            kwargs: dict = {"status": "in_progress", "runner": self._runner}
             if self._assignee is not None:
                 kwargs["assignee"] = self._assignee
             self.update_status(self._work_item_id, **kwargs)
@@ -182,7 +262,7 @@ class StatusLifecycle:
 
         # Success path — transition to completed
         try:
-            kwargs: dict = {"status": "completed"}
+            kwargs: dict = {"status": "completed", "runner": self._runner}
             if self._target_stage is not None:
                 kwargs["stage"] = self._target_stage
             self.update_status(self._work_item_id, **kwargs)
@@ -210,7 +290,7 @@ class StatusLifecycle:
             return  # Nothing was changed, nothing to restore
 
         try:
-            kwargs: dict = {"status": self._original_status}
+            kwargs: dict = {"status": self._original_status, "runner": self._runner}
             # Clear assignee on failure to release the item
             if self._assignee is not None:
                 kwargs["assignee"] = ""
@@ -228,42 +308,3 @@ class StatusLifecycle:
                 self._original_status,
                 self._work_item_id,
             )
-
-
-# ======================================================================
-# Module-level helpers
-# ======================================================================
-
-
-def _run_wl(cmd: list[str]) -> dict:
-    """Run a ``wl`` command and return parsed JSON.
-
-    Args:
-        cmd: The command as a list of strings.
-
-    Returns:
-        The parsed JSON response.
-
-    Raises:
-        RuntimeError: If the command fails or returns invalid JSON.
-    """
-    LOG.debug("Running: %s", " ".join(cmd))
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"wl command failed ({' '.join(cmd)}): {proc.stderr.strip()}"
-        )
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Invalid JSON from wl: {exc}") from exc
-    if isinstance(data, dict) and data.get("success") is False:
-        raise RuntimeError(
-            f"Worklog command failed: {data.get('error', 'unknown error')}"
-        )
-    return data

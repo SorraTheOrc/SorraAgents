@@ -46,6 +46,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from skill.audit.scripts.persist_audit import persist_audit  # noqa: E402
 from skill.scripts.failure_notice import FailureNotice  # noqa: E402
+from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1653,21 +1654,21 @@ def cmd_issue(issue_id: str, persist: bool = True,
         }
 
     # ------------------------------------------------------------------
-    # Capture original status before setting in_progress, so we can
-    # restore it in the finally block (instead of always resetting to "open").
+    # Status lifecycle via shared helper: capture original, set in_progress
+    # On success: transition to completed (see audit_success flag in finally).
+    # On failure/exception: restore original status (see finally).
     # ------------------------------------------------------------------
-    original_status = "open"  # safe default
     try:
-        item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"])
+        item_data = StatusLifecycle.show(issue_id, runner=runner)
         if isinstance(item_data, dict):
-            original_status = item_data.get("status", "open")
+            original_status = item_data.get("workItem", {}).get("status", "open")
     except RuntimeError:
-        pass  # Fall back to "open" as safe default
+        original_status = "open"  # safe default
 
-    # ------------------------------------------------------------------
-    # Status lifecycle: set in_progress on entry (restored in finally)
-    # ------------------------------------------------------------------
-    _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"])
+    StatusLifecycle.update_status(issue_id, "in_progress", runner=runner)
+
+    # Track whether the audit completed successfully
+    audit_success = False
 
     try:
         try:
@@ -2178,17 +2179,23 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     file=sys.stderr,
                 )
                 return 1
+            audit_success = True
             return 0
+        audit_success = True
         return 0
 
     finally:
         # ------------------------------------------------------------------
-        # Status lifecycle: restore original status on exit (success or failure)
-        # Always runs because of try/finally — guarantees cleanup.
-        # Falls back to "open" if original_status was not captured.
+        # Status lifecycle via shared helper:
+        # - On success: transition to completed (fixes the bug where
+        #   original status was restored instead)
+        # - On failure/exception: restore original status
         # ------------------------------------------------------------------
         try:
-            _run_wl(runner, ["wl", "update", issue_id, "--status", original_status, "--json"])
+            if audit_success:
+                StatusLifecycle.update_status(issue_id, "completed", runner=runner)
+            else:
+                StatusLifecycle.update_status(issue_id, original_status, runner=runner)
         except RuntimeError:
             pass  # Status update failure must not mask the main result
 

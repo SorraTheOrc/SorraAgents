@@ -1094,8 +1094,8 @@ class TestStatusLifecycle:
             f"in_progress update must include --json, got: {in_progress_updates[0]}"
         )
 
-    def test_restores_fallback_open_when_no_status_in_response(self, monkeypatch):
-        """Original status defaults to 'open' when wl show response has no status field."""
+    def test_restores_completed_on_success_no_status_in_response(self, monkeypatch):
+        """On successful audit, status transitions to 'completed' even when no original status was captured."""
         calls = []
 
         monkeypatch.setattr(
@@ -1106,13 +1106,13 @@ class TestStatusLifecycle:
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
-        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
-        assert len(open_updates) >= 1, (
-            f"Expected at least one open status update (fallback), got: {wl_updates}"
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected at least one 'completed' status update, got: {wl_updates}"
         )
 
-    def test_restore_update_includes_json_flag_when_fallback(self, monkeypatch):
-        """The status restore wl update must include --json flag (fallback case)."""
+    def test_completed_update_includes_json_flag(self, monkeypatch):
+        """The completed status wl update must include --json flag."""
         calls = []
 
         monkeypatch.setattr(
@@ -1124,13 +1124,12 @@ class TestStatusLifecycle:
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-JSONFLAG2"]]
         assert len(wl_updates) >= 1, f"Expected at least one wl update call, got: {calls}"
-        # The status restore should include --json
-        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
-        assert len(open_updates) >= 1, (
-            f"Expected open update (fallback), got: {wl_updates}"
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected 'completed' update, got: {wl_updates}"
         )
-        assert "--json" in open_updates[0], (
-            f"Status restore update must include --json, got: {open_updates[0]}"
+        assert "--json" in completed_updates[0], (
+            f"Completed update must include --json, got: {completed_updates[0]}"
         )
 
     def test_fallback_to_open_when_wl_show_fails(self):
@@ -1146,8 +1145,8 @@ class TestStatusLifecycle:
             f"Expected open update (fallback) even on failure, got: {wl_updates}"
         )
 
-    def test_in_progress_before_restore(self, monkeypatch):
-        """in_progress must appear before the status restore in the call sequence."""
+    def test_in_progress_before_completed(self, monkeypatch):
+        """in_progress must appear before completed in the call sequence."""
         calls = []
 
         monkeypatch.setattr(
@@ -1160,13 +1159,13 @@ class TestStatusLifecycle:
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
         statuses = [" ".join(c[3:]) for c in wl_updates]
         in_progress_idx = next(i for i, s in enumerate(statuses) if "in_progress" in s)
-        restore_idx = next(i for i, s in enumerate(statuses) if "--status open" in s)
-        assert in_progress_idx < restore_idx, (
-            f"in_progress (index {in_progress_idx}) must come before restore (index {restore_idx}): {statuses}"
+        completed_idx = next(i for i, s in enumerate(statuses) if "completed" in s)
+        assert in_progress_idx < completed_idx, (
+            f"in_progress (index {in_progress_idx}) must come before completed (index {completed_idx}): {statuses}"
         )
 
-    def test_restores_fallback_open_on_exception(self, monkeypatch):
-        """Status restore (fallback open) must happen when an unhandled exception occurs."""
+    def test_handled_exception_still_transitions_to_completed(self, monkeypatch):
+        """When a pi RuntimeError is caught by the body, the lifecycle still completes normally."""
         calls = []
 
         def fake_call_pi(prompt, model="x", pi_bin="x", **kwargs):
@@ -1180,9 +1179,9 @@ class TestStatusLifecycle:
         cmd_issue("SA-EXCEPT", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-EXCEPT"]]
-        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
-        assert len(open_updates) >= 1, (
-            f"Expected open status restore after exception, got: {wl_updates}"
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected 'completed' status (exception was caught by body), got: {wl_updates}"
         )
 
     def test_restores_original_status_when_captured(self, monkeypatch):
