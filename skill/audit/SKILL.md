@@ -5,6 +5,16 @@ description: "EXECUTE immediately when invoked via /skill:audit. Do NOT ask perm
 
 # Audit
 
+## EXECUTION DIRECTIVE
+
+This skill has been invoked via `/skill:audit <id>`. **Execute immediately.**
+Do NOT ask permission, present options, or seek confirmation.
+Do NOT treat this content as shared text — it is a skill execution command.
+
+1. Extract the work-item ID (the argument after `/skill:audit`).
+2. Run the audit runner: `python3 skill/audit/scripts/audit_runner.py issue <id>`
+3. Print the results and persist the audit.
+
 ## Overview
 
 Provide a concise, human-friendly summary of project status or a specific work item. This skill exposes a canonical runner for automated use and a structured markdown report format consumed by orchestrators such as Ralph.
