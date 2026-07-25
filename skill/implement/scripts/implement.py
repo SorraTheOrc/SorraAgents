@@ -469,27 +469,86 @@ def git_get_commit_hash(cwd: str) -> str:
     return "unknown"
 
 
+def _get_repo_root(cwd: str | None = None) -> str | None:
+    """Get the absolute path to the git repository root.
+
+    Args:
+        cwd: Optional working directory (defaults to current directory).
+
+    Returns:
+        Absolute repo root path, or None if not in a git repo.
+    """
+    result = run_cmd(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=cwd,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return Path(result.stdout.strip()).resolve().as_posix()
+    return None
+
+
 def _remove_worktree(worktree_path: str) -> bool:
     """Remove a worktree directory gracefully.
+
+    Safety gates:
+    1. Validates the target path is not the repository root.
+    2. Before manual (shutil) removal, checks that the target does
+       NOT contain a ``.git/`` directory (which would mean it's the
+       main working tree).
 
     Args:
         worktree_path: Path to the worktree.
 
     Returns:
         True if removal succeeded.
+
+    Raises:
+        RuntimeError: If the target path matches the repo root or
+            contains a ``.git`` directory (main working tree).
     """
-    LOG.info("Removing worktree: %s", worktree_path)
+    resolved_path = str(Path(worktree_path).resolve())
+
+    # ── Safety gate 1: refuse if target is the repo root ──────────
+    repo_root = _get_repo_root()
+    if repo_root and Path(resolved_path).as_posix() == repo_root:
+        msg = (
+            f"REFUSE to remove the repository root: {resolved_path}. "
+            f"This is the main working tree, not a worktree. "
+            f"Check for stale .implement_state.json in the repo root."
+        )
+        LOG.critical(msg)
+        raise RuntimeError(msg)
+
+    LOG.info("Removing worktree: %s", resolved_path)
     result = run_cmd(
-        ["git", "worktree", "remove", "--force", worktree_path],
+        ["git", "worktree", "remove", "--force", resolved_path],
         check=False,
         timeout=60,
     )
     if result.returncode != 0:
-        LOG.warning("git worktree remove failed, trying manual removal: %s", result.stderr.strip())
-        # Fall back to manual removal
+        LOG.warning(
+            "git worktree remove failed, trying manual removal: %s",
+            result.stderr.strip(),
+        )
+
+        # ── Safety gate 2: refuse if target has a .git/ directory ──
+        target = Path(resolved_path)
+        git_dir = target / ".git"
+        if git_dir.is_dir():
+            msg = (
+                f"REFUSE to manually remove {resolved_path}: it contains "
+                f"a .git/ directory, indicating the main working tree. "
+                f"This would destroy the entire repository. Aborting."
+            )
+            LOG.critical(msg)
+            raise RuntimeError(msg)
+
+        # Fall back to manual removal (safe now - .git/ check passed)
         try:
             import shutil
-            shutil.rmtree(worktree_path, ignore_errors=True)
+            shutil.rmtree(resolved_path, ignore_errors=True)
         except Exception as exc:
             LOG.warning("Manual worktree removal failed: %s", exc)
             return False
@@ -1316,6 +1375,23 @@ def phase_abort(
     return report
 
 
+def _is_worktree(path: Path) -> bool:
+    """Check if *path* is a git worktree (not the main working tree).
+
+    A git worktree has ``.git`` as a **file** containing a gitdir reference.
+    The main working tree has ``.git`` as a **directory**.
+
+    Args:
+        path: The path to check.
+
+    Returns:
+        True if ``.git`` exists and is a file (worktree).
+        False if ``.git`` is a directory (main working tree) or does not exist.
+    """
+    git_path = path / ".git"
+    return git_path.is_file()
+
+
 def _discover_worktree(work_item_id: str) -> str | None:
     """Discover the worktree path for a given work item.
 
@@ -1324,22 +1400,43 @@ def _discover_worktree(work_item_id: str) -> str | None:
     2. Current directory (if inside a matching worktree)
     3. Scan .worklog/worktrees/ for matching directories
 
+    Safety: will NOT return a path that looks like the main working tree
+    (where ``.git`` is a directory).  This prevents catastrophic deletion
+    when ``.implement_state.json`` is accidentally present in the repo root.
+
     Args:
         work_item_id: The work item ID.
 
     Returns:
-        Absolute path to the worktree, or None if not found.
+        Absolute path to the worktree, or None if not found or if the
+        candidate path is the main working tree (not a worktree).
     """
     # Check if state file is in the current directory or a parent
     cwd = Path.cwd().resolve()
     state_file = cwd / STATE_FILE_NAME
     if state_file.exists():
-        return str(cwd)
+        # SAFETY: verify .git is a FILE (worktree), not a directory (main repo)
+        if _is_worktree(cwd):
+            return str(cwd)
+        LOG.critical(
+            "Refusing to treat %s as a worktree: .git is a directory, "
+            "indicating the main working tree. .implement_state.json found "
+            "in repo root is likely a stale artifact.",
+            cwd,
+        )
+        return None
 
     # Check if we're inside a .worklog/worktrees/ directory
     if ".worklog/worktrees" in str(cwd):
-        # The worktree root is the current directory (which is already in a worktree)
-        return str(cwd)
+        # SAFETY: also verify .git is a file here
+        if _is_worktree(cwd):
+            return str(cwd)
+        LOG.warning(
+            "Inside a .worklog/worktrees path but .git is not a file; "
+            "skipping %s",
+            cwd,
+        )
+        return None
 
     # Scan .worklog/worktrees/ for directories matching wl-<work_item_id>-*
     repo_root = Path.cwd().resolve()
