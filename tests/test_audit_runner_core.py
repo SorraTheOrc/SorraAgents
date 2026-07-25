@@ -22,10 +22,7 @@ from skill.audit.scripts.audit_runner import (
     _extract_acs,
     _extract_json_array,
     _run_wl,
-    _load_config,
-    _resolve_model_for_phase,
-    _normalize_model_source,
-    _deep_merge,
+
     _get_child_audit_verdict,
     Runner,
     CALL_PI_TIMEOUT,
@@ -743,130 +740,18 @@ class TestExitCodes:
 # Model resolution tests
 # ---------------------------------------------------------------------------
 
-class TestDeepMerge:
-    """Test the deep-merge helper."""
-
-    def test_deep_merge_simple(self):
-        base = {"a": 1, "b": 2}
-        override = {"b": 3, "c": 4}
-        result = _deep_merge(base, override)
-        assert result == {"a": 1, "b": 3, "c": 4}
-
-    def test_deep_merge_nested(self):
-        base = {"model": {"remote": {"audit": "m1"}, "local": {"audit": "m2"}}}
-        override = {"model": {"local": {"audit": "m3"}}}
-        result = _deep_merge(base, override)
-        assert result["model"]["remote"]["audit"] == "m1"
-        assert result["model"]["local"]["audit"] == "m3"
-
-    def test_deep_merge_empty_override(self):
-        base = {"a": 1}
-        result = _deep_merge(base, {})
-        assert result == {"a": 1}
-
-
-class TestLoadConfig:
-    """Test config loading with fallback."""
-
-    def test_load_config_returns_dict(self):
-        """_load_config must always return a dict, even when no config file exists."""
-        config = _load_config()
-        assert isinstance(config, dict)
-
-    def test_load_config_has_model_key(self):
-        """When CWD has a .ralph.json, its model config should be reflected."""
-        config = _load_config()
-        assert "model" in config
-        assert isinstance(config["model"], dict)
-
-
-class TestNormalizeModelSource:
-    """Test model source normalization."""
-
-    def test_normalize_remote(self):
-        assert _normalize_model_source("remote") == "remote"
-
-    def test_normalize_local(self):
-        assert _normalize_model_source("local") == "local"
-
-    def test_normalize_case_insensitive(self):
-        assert _normalize_model_source("REMOTE") == "remote"
-
-    def test_normalize_unknown_falls_back_to_local(self):
-        assert _normalize_model_source("unknown") == "local"
-
-    def test_normalize_none_falls_back_to_local(self):
-        assert _normalize_model_source(None) == "local"
-
-
-class TestResolveModelForPhase:
-    """Test model resolution with CLI override > config > default."""
-
-    def test_cli_model_overrides_config(self):
-        """Explicit --model flag overrides everything."""
-        config = {
-            "model": {
-                "local": {"audit": "config-local-model"},
-                "remote": {"audit": "config-remote-model"},
-            }
-        }
-        model = _resolve_model_for_phase("audit", config, "local", cli_model="cli-override")
-        assert model == "cli-override"
-
-    def test_config_model_with_local_source(self):
-        """With model_source=local, resolve the local variant from config."""
-        config = {
-            "model": {
-                "local": {"audit": "local-model"},
-                "remote": {"audit": "remote-model"},
-            }
-        }
-        model = _resolve_model_for_phase("audit", config, "local", cli_model=None)
-        assert model == "local-model"
-
-    def test_config_model_with_remote_source(self):
-        """With model_source=remote, resolve the remote variant from config."""
-        config = {
-            "model": {
-                "local": {"audit": "local-model"},
-                "remote": {"audit": "remote-model"},
-            }
-        }
-        model = _resolve_model_for_phase("audit", config, "remote", cli_model=None)
-        assert model == "remote-model"
-
-    def test_fallback_to_default_when_no_config(self):
-        """When config has no model.audit for the given source, fall back to DEFAULT_MODEL."""
-        config = {}
-        model = _resolve_model_for_phase("audit", config, "local", cli_model=None)
-        assert model == DEFAULT_MODEL
-
-    def test_fallback_to_default_when_config_missing_audit_key(self):
-        """When config has model but no audit key for the source, fall back."""
-        config = {
-            "model": {
-                "local": {"intake": "intake-model"},
-            }
-        }
-        model = _resolve_model_for_phase("audit", config, "local", cli_model=None)
-        assert model == DEFAULT_MODEL
-
-    def test_config_model_flat_string(self):
-        """When model.audit is a flat string (not source-mapped), it's used directly."""
-        config = {
-            "model": {
-                "audit": "flat-audit-model",
-            }
-        }
-        model = _resolve_model_for_phase("audit", config, "local", cli_model=None)
-        assert model == "flat-audit-model"
-
-
 class TestCmdIssueModelResolution:
-    """Integration: cmd_issue should resolve the model from config based on model_source."""
+    """Integration: cmd_issue and cmd_project resolve model = model or DEFAULT_MODEL.
 
-    def test_cmd_issue_passes_resolved_model_to_pi(self, monkeypatch):
-        """cmd_issue should resolve model from config+model_source and pass to _call_pi."""
+    After removing Ralph config dependency, model resolution is:
+      resolved_model = model or DEFAULT_MODEL
+
+    The ``model_source`` parameter is accepted for backward-compatible
+    argparse but has no effect on the resolved model.
+    """
+
+    def test_cmd_issue_default_model(self, monkeypatch):
+        """Without --model, cmd_issue passes DEFAULT_MODEL to _call_pi."""
         captured = {"model": None}
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
@@ -878,30 +763,18 @@ class TestCmdIssueModelResolution:
             fake_call_pi,
         )
 
-        # Fake the config loading to return a known model config
-        def fake_load_config():
-            return {
-                "model": {
-                    "local": {"audit": "from-config-local"},
-                    "remote": {"audit": "from-config-remote"},
-                }
-            }
-
-        monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._load_config",
-            fake_load_config,
-        )
-
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-MODEL", runner=fake_runner, model_source="local", persist=False)
-        assert captured["model"] == "from-config-local"
+        cmd_issue("SA-MODEL", runner=fake_runner, persist=False)
+        assert captured["model"] == DEFAULT_MODEL, (
+            f"Expected DEFAULT_MODEL ({DEFAULT_MODEL}), got {captured['model']}"
+        )
 
-    def test_cmd_issue_cli_model_overrides_config(self, monkeypatch):
-        """Explicit --model should override config even when model_source differs."""
+    def test_cmd_issue_explicit_model_override(self, monkeypatch):
+        """Explicit --model overrides DEFAULT_MODEL."""
         captured = {"model": None}
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
@@ -913,28 +786,16 @@ class TestCmdIssueModelResolution:
             fake_call_pi,
         )
 
-        def fake_load_config():
-            return {
-                "model": {
-                    "local": {"audit": "from-config"},
-                }
-            }
-
-        monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._load_config",
-            fake_load_config,
-        )
-
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-MODEL", runner=fake_runner, model="cli-override", model_source="local", persist=False)
+        cmd_issue("SA-MODEL", runner=fake_runner, model="cli-override", persist=False)
         assert captured["model"] == "cli-override"
 
-    def test_cmd_project_passes_resolved_model_to_pi(self, monkeypatch):
-        """cmd_project should also resolve model from config+model_source."""
+    def test_cmd_project_default_model(self, monkeypatch):
+        """Without --model, cmd_project passes DEFAULT_MODEL to _call_pi."""
         captured = {"model": None}
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
@@ -944,25 +805,34 @@ class TestCmdIssueModelResolution:
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
             fake_call_pi,
-        )
-
-        def fake_load_config():
-            return {
-                "model": {
-                    "remote": {"audit": "remote-audit-model"},
-                }
-            }
-
-        monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._load_config",
-            fake_load_config,
         )
 
         def fake_runner(cmd, **kwargs):
             return _fake_proc(stdout=json.dumps({"success": True, "workItems": []}))
 
-        cmd_project(runner=fake_runner, model_source="remote")
-        assert captured["model"] == "remote-audit-model"
+        cmd_project(runner=fake_runner)
+        assert captured["model"] == DEFAULT_MODEL, (
+            f"Expected DEFAULT_MODEL ({DEFAULT_MODEL}), got {captured['model']}"
+        )
+
+    def test_cmd_project_explicit_model_override(self, monkeypatch):
+        """Explicit --model overrides DEFAULT_MODEL in cmd_project."""
+        captured = {"model": None}
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            captured["model"] = model
+            return {"verdict": "met", "evidence": "ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(stdout=json.dumps({"success": True, "workItems": []}))
+
+        cmd_project(runner=fake_runner, model="project-model")
+        assert captured["model"] == "project-model"
 
 
 # ---------------------------------------------------------------------------

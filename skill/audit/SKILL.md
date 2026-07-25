@@ -126,14 +126,24 @@ Model reads actual implementation files, verifies each AC against code behavior,
 
 > **IMPORTANT:** Release process constraints are NOT audit concerns. Do NOT include merge-status, deployment, or release criteria.
 
+### Model resolution
+
+The audit runner resolves the model to use for Pi calls as follows:
+
+1. ``--model`` CLI flag — explicit override, highest priority
+2. ``DEFAULT_MODEL`` — hardcoded fallback (``"Local Proxy/plan"``)
+
+No config file is consulted. The ``--model-source`` flag (choices:
+``local``, ``remote``) is accepted for backward compatibility but does not
+affect model resolution.
+
 ### Model metadata line
 
 When model information is available (e.g., when the runner is invoked with
-``--model`` and ``--model-source`` flags), a metadata line is inserted after
-``Ready to close:`` and before ``## Summary`` in issue-level and child audit
-reports:
+``--model`` flag), a metadata line is inserted after ``Ready to close:`` and
+before ``## Summary`` in issue-level and child audit reports:
 
-- When model and source are provided: ``Model: <model> (provider: <source>)``
+- When model is provided: ``Model: <model> (provider: local)``
 - When no model info is available: ``Model: manual (no provider)``
 
 **Project-level reports** (``_assemble_project_report``) are NOT modified.
@@ -141,7 +151,6 @@ reports:
 Examples:
 
 - ``Model: Local Proxy/plan (provider: local)``
-- ``Model: gpt-4 (provider: remote)``
 - ``Model: manual (no provider)``
 
 ## Summary
