@@ -140,7 +140,7 @@ reports:
 
 Examples:
 
-- ``Model: Proxy/qwen3 (provider: local)``
+- ``Model: Local Proxy/plan (provider: local)``
 - ``Model: gpt-4 (provider: remote)``
 - ``Model: manual (no provider)``
 
