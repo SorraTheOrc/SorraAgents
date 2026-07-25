@@ -478,6 +478,110 @@ class TestReadbackVerification:
         assert rc == 0
         assert len(persist_called) == 0, "persist_audit should not be called when persist=False"
 
+    def test_readback_success_with_rawoutput_null_summary_fallback(self, monkeypatch, capsys):
+        """When rawOutput is null but summary has content, readback succeeds."""
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-SUMMARY-ONLY",
+                    "audit": {
+                        "workItemId": "SA-SUMMARY-ONLY",
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": None,
+                        "summary": "Ready to close: Yes\n\n## Summary\nStored in summary field.",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-SUMMARY-ONLY", runner=fake_runner)
+        assert rc == 0
+
+    def test_readback_success_with_both_rawoutput_and_summary(self, monkeypatch, capsys):
+        """When both rawOutput and summary have content, readback succeeds (preferring rawOutput)."""
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-BOTH",
+                    "audit": {
+                        "workItemId": "SA-BOTH",
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": "Ready to close: Yes\n\n## Summary\nPrimary content.",
+                        "summary": "Audit result persisted via persist_audit.py",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-BOTH", runner=fake_runner)
+        assert rc == 0
+
+    def test_readback_fails_when_both_rawoutput_and_summary_empty(self, monkeypatch, capsys):
+        """When both rawOutput and summary are empty/null, readback fails."""
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-BOTH-EMPTY",
+                    "audit": {
+                        "workItemId": "SA-BOTH-EMPTY",
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": None,
+                        "summary": "",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-BOTH-EMPTY", runner=fake_runner)
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "both rawOutput and summary are empty" in captured.err
+
 
 class TestExitCodes:
     """Verify exit codes for various scenarios."""
