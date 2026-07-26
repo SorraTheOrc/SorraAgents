@@ -1098,7 +1098,7 @@ class TestOrphanRecovery:
         """Item with status=completed, stage=idea is moved to stage=done and excluded from processing."""
         runner = FakeRunner()
         runner.set_response(
-            f"wl update {ORPHAN_ITEM_COMPLETED['id']} --stage",
+            f"wl update {ORPHAN_ITEM_COMPLETED['id']} --status completed",
             stdout=json.dumps({"success": True}),
         )
 
@@ -1108,7 +1108,7 @@ class TestOrphanRecovery:
 
         # completed+idea items are excluded from the returned list
         assert len(recovered) == 0
-        # Verify wl update was called with --stage done (not --status open)
+        # Verify wl update was called with --status completed and --stage done
         update_calls = [
             cmd for cmd in runner.calls
             if "wl" in cmd and "update" in cmd
@@ -1116,7 +1116,7 @@ class TestOrphanRecovery:
         assert len(update_calls) >= 1
         cmd_str = " ".join(update_calls[0])
         assert "--stage" in cmd_str and "done" in cmd_str
-        assert "--status" not in cmd_str
+        assert "--status" in cmd_str and "completed" in cmd_str
 
     def test_orphan_in_progress_recovered_to_open(self):
         """Item with status=in_progress, stage=idea is reset to status=open and kept for processing."""
