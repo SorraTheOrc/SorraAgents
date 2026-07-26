@@ -96,7 +96,7 @@ python3 ./scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
 
 - `command/intake.md` — Per-item intake command
 - `../planall/SKILL.md` — Sibling batch planning skill
-- `../ralph/SKILL.md` — Auto-intake for individual items
+
 
 > **Implementation notes:**
 >

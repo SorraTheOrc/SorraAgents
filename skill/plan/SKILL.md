@@ -8,7 +8,7 @@ description: Decompose a Worklog work item into features and implementation task
 Decompose a Worklog epic (or other Worklog work item) into **features** and
 **implementation tasks**. Includes a built-in effort/risk pre-check that
 automatically skips planning for small items (performing the same check used
-by Ralph's autoplan).
+by the autoplan decision logic).
 
 ## Inputs
 
@@ -57,7 +57,7 @@ See [AGENTS.md](../../AGENTS.md#workflow-for-ai-agents) for the standard claim-f
 Before starting the planning process, check whether the work item is small
 enough that planning can be skipped. This uses the shared decision logic
 from the bundled [plan_helpers.py](plan_helpers.py) (the same logic used by
-Ralph's autoplan).
+the autoplan decision logic).
 
 1. Run the effort/risk check from the skill directory:
 
@@ -309,7 +309,7 @@ instructions above).
 
 - `plan_helpers.py` — Shared autoplan decision module. Provides the CLI
   entry points `plan-if-needed` and `check-effort-risk` used in the pre-check
-  above. Can also be imported as a Python module by Ralph and other tools.
+  above. Can also be imported as a Python module by other tools.
 
   Usage:
 

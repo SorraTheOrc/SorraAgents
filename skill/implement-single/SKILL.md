@@ -4,11 +4,10 @@ description: |
   Write tests, docs and code for a single, specific Worklog work item.
   Unlike the `implement` skill, this skill operates on exactly one work-item
   without using `wl next` for recursive dependency resolution or sub-task
-  discovery. It is designed to be invoked by Ralph's per-child loop so that
+  discovery. It is designed for per-child implementation loops so that
   each child is implemented, audited, and remediated independently.
   Trigger on user queries such as: 'implement-single <work-item-id>',
-  'complete <work-item-id> (single)', or when Ralph delegates a single-child
-  implement step.
+  'complete <work-item-id> (single)'.
 ---
 
 ## Purpose
@@ -72,7 +71,7 @@ Execute the following steps in order. Do not skip steps.
   - Other stale files → report, proceed to Step 2 for isolation.
   - If dirty files prevent branch creation → abort via `wl update ... --status open --json`.
 
-> Under Ralph, the worktree is already created by Ralph's parent loop.
+> Under automated orchestration, the worktree is already created by the orchestrator's parent loop.
 > Use the implement script for deterministic build/test/commit:
 > ```bash
 > python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py finish <work-item-id>
@@ -147,7 +146,7 @@ If manually:
 - Push the branch to `origin`.
 - Respond with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
 - Mark in-review: `wl update <work-item-id> --status completed --stage in_review --json`
-- Do NOT create a PR or merge. Ralph handles PR/merge externally.
+- Do NOT create a PR or merge. PR/merge handling is external.
 
 ## Status Transition Matrix
 

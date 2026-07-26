@@ -297,8 +297,6 @@ cross-references, and capture baseline test suite results.
 
 | Source File | Target | Line | Type |
 |-------------|--------|------|------|
-| `skill/ralph/SKILL.md` | `command/plan_helpers.py` | 125 | Reference (delegation wrapper) |
-| `skill/ralph/SKILL.md` | `command/plan.md` | 138 | Reference (plan command) |
 | `skill/planall/SKILL.md` | `command/plan.md` | 140 | Reference (invokes plan for each item) |
 | `skill/implement/SKILL.md` | `command/intake.md` | 176 | Reference (intake interview) |
 | `skill/implement/SKILL.md` | `command/plan.md` | 177 | Reference (plan interview) |
@@ -311,7 +309,6 @@ command/plan.md ──────► skill/plan/SKILL.md
                     ──► skill/plan/plan_helpers.py
                     ──► command/plan_helpers.py
                         ▲
-skill/ralph/SKILL.md ──┘
 skill/planall/SKILL.md ─┘
 
 command/intake.md ────► skill/ship/scripts/... (transitive reference)

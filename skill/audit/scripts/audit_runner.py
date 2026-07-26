@@ -256,7 +256,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     useful for debugging. This function returns at minimum
     ``{"verdict": <met|unmet|partial|adjusted>, "evidence": <text>}``.
 
-    Uses the same JSON-stream protocol as ralph (``pi -p --mode json``).
+    Uses the same JSON-stream protocol (``pi -p --mode json``).
     Uses ``communicate()`` to avoid pipe-buffer deadlocks.
 
     *timeout* overrides the default ``CALL_PI_TIMEOUT`` when provided.
@@ -319,10 +319,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
 
 
 def _extract_pi_text(raw: str) -> str:
-    """Extract user-facing text from pi --mode json output.
-
-    Uses the same parsing logic as ralph_loop._parse_pi_json_line.
-    """
+    """Extract user-facing text from pi --mode json output."""
     delta_parts: list[str] = []
     complete_blocks: list[str] = []
 
@@ -347,7 +344,7 @@ def _extract_pi_text(raw: str) -> str:
 def _parse_pi_json_line(line: str):
     """Parse a single JSON line from pi --mode json.
 
-    Returns (stream_text, should_print, complete_text), same as ralph.
+    Returns (stream_text, should_print, complete_text).
     """
     try:
         obj = json.loads(line)

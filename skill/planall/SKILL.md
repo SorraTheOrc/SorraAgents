@@ -89,4 +89,4 @@ python3 ./scripts/planall.py --parent-id SA-0MQA6ECEU003GUKH
 ## Related skills
 
 - `../plan/SKILL.md` — Per-item planning command
-- `../ralph/SKILL.md` — Auto-planning for individual items
+

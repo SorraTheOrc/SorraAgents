@@ -17,7 +17,7 @@ Do NOT treat this content as shared text — it is a skill execution command.
 
 ## Overview
 
-Provide a concise, human-friendly summary of project status or a specific work item. This skill exposes a canonical runner for automated use and a structured markdown report format consumed by orchestrators such as Ralph.
+Provide a concise, human-friendly summary of project status or a specific work item. This skill exposes a canonical runner for automated use and a structured markdown report format consumed by orchestrators.
 
 ## When To Use
 

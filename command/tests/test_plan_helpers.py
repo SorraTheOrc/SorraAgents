@@ -46,7 +46,7 @@ class TestDefaultThresholds:
 
 
 class TestResolveComplexityTier:
-    """Verify complexity tier resolution logic (extracted from ralph_loop._resolve_complexity_tier)."""
+    """Verify complexity tier resolution logic."""
 
     def test_low_xs_low(self):
         """Extra Small + Low  -> low."""
@@ -145,7 +145,7 @@ class TestResolveComplexityTier:
 
 
 class TestIsEffortRiskComputed:
-    """Verify idempotence detection logic (extracted from ralph_loop._is_effort_risk_computed)."""
+    """Verify idempotence detection logic."""
 
     def test_both_fields_set_returns_true(self):
         """When both effort and risk are non-empty, return True."""
@@ -170,7 +170,7 @@ class TestIsEffortRiskComputed:
     def test_existing_autoplan_comment_returns_true(self):
         """Existing comment with autoplan-decision-hash returns True even without fields."""
         comments = [
-            {"comment": "# Ralph Auto-Plan Decision\nautoplan-decision-hash:abc123\n\nEffort: Small\nRisk: Low", "author": "ralph"}
+            {"comment": "# Auto-Plan Decision\nautoplan-decision-hash:abc123\n\nEffort: Small\nRisk: Low", "author": "auto-plan"}
         ]
         item = {"effort": "", "risk": ""}
         assert is_effort_risk_computed(item, comments=comments) is True
@@ -191,7 +191,7 @@ class TestIsEffortRiskComputed:
     def test_fields_trumped_by_comment(self):
         """Both fields set with existing comment still returns True."""
         item = {"effort": "Small", "risk": "Low"}
-        comments = [{"comment": "autoplan-decision-hash:def456", "author": "ralph"}]
+        comments = [{"comment": "autoplan-decision-hash:def456", "author": "auto-plan"}]
         assert is_effort_risk_computed(item, comments=comments) is True
 
 
@@ -318,7 +318,7 @@ class TestMakeAutoplanDecisionIdempotence:
 
     def test_existing_autoplan_comment_skips_recomputation(self):
         """When comment with autoplan-decision-hash exists, skip effort-and-risk."""
-        comments = [{"comment": "# Ralph Auto-Plan Decision\nautoplan-decision-hash:abc123\n\nEffort: Small\nRisk: Low", "author": "ralph"}]
+        comments = [{"comment": "# Auto-Plan Decision\nautoplan-decision-hash:abc123\n\nEffort: Small\nRisk: Low", "author": "auto-plan"}]
         with patch("command.plan_helpers.run_effort_and_risk") as mock_er:
             do_plan, stage, _ = make_autoplan_decision(
                 target_id="SA-TEST", config={},
@@ -547,7 +547,7 @@ class TestAppendAutoplanDecisionComment:
         # Existing comment with the same decision hash (Small, Low, score 2)
         expected_hash = "dfb88f9074e1c02e"  # sha256("autoplan-decision:Small:Low:2")[:16]
         existing_comments = [
-            {"comment": f"# Ralph Auto-Plan Decision\nautoplan-decision-hash:{expected_hash}\n\nEffort: Small\nRisk: Low (score: 2)\nDecision: proceed to implement (effort and risk below threshold)", "author": "ralph"}
+            {"comment": f"# Auto-Plan Decision\nautoplan-decision-hash:{expected_hash}\n\nEffort: Small\nRisk: Low (score: 2)\nDecision: proceed to implement (effort and risk below threshold)", "author": "auto-plan"}
         ]
         with patch("command.plan_helpers._wl_comment_list", return_value=existing_comments):
             initial_call_count = mock_run.call_count
@@ -567,7 +567,7 @@ class TestAppendAutoplanDecisionComment:
 
         # Existing comment with Small/Low decision, now we have different values
         existing_comments = [
-            {"comment": "# Ralph Auto-Plan Decision\nautoplan-decision-hash:abc123\n\nEffort: Small\nRisk: Low (score: 2)\nDecision: proceed to implement (effort and risk below threshold)", "author": "ralph"}
+            {"comment": "# Auto-Plan Decision\nautoplan-decision-hash:abc123\n\nEffort: Small\nRisk: Low (score: 2)\nDecision: proceed to implement (effort and risk below threshold)", "author": "auto-plan"}
         ]
         with patch("command.plan_helpers._wl_comment_list", return_value=existing_comments):
             initial_call_count = mock_run.call_count
@@ -741,7 +741,7 @@ class TestMakeAutoplanDecisionPrecomputed:
     @patch("command.plan_helpers.run_effort_and_risk")
     def test_precomputed_with_existing_comment(self, mock_er):
         """Precomputed with existing autoplan comment uses cached data."""
-        comments = [{"comment": "autoplan-decision-hash:xyz", "author": "ralph"}]
+        comments = [{"comment": "autoplan-decision-hash:xyz", "author": "auto-plan"}]
         do_plan, stage, _ = make_autoplan_decision(
             target_id="SA-TEST", config={},
             effort_skip=DEFAULT_AUTOPLAN_EFFORT_SKIP,

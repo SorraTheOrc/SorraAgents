@@ -774,7 +774,7 @@ class TestExitCodes:
 class TestCmdIssueModelResolution:
     """Integration: cmd_issue and cmd_project resolve model = model or DEFAULT_MODEL.
 
-    After removing Ralph config dependency, model resolution is:
+    Model resolution is:
       resolved_model = model or DEFAULT_MODEL
 
     The ``model_source`` parameter is accepted for backward-compatible

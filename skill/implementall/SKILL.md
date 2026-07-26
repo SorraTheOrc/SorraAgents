@@ -97,4 +97,4 @@ python3 ./scripts/implementall.py --parent-id SA-0MQO6YMZ3006N5MG
 
 - `../implement/SKILL.md` — Invoked per-item
 - `../planall/SKILL.md`, `../intakeall/SKILL.md` — Sibling batch skills
-- `../ralph/SKILL.md` — Auto-implementation for individual items
+

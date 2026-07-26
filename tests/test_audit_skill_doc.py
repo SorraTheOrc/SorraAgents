@@ -1,7 +1,7 @@
 """Smoke test for the audit skill documentation.
 
 Verifies that SKILL.md contains the canonical runner invocations and report header
-required by downstream consumers (ralph, persist_audit, agents).
+required by downstream consumers (persist_audit, agents).
 """
 from __future__ import annotations
 

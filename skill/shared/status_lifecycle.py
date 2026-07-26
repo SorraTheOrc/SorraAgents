@@ -2,7 +2,7 @@
 """Shared status lifecycle helper for skills.
 
 Provides a reusable context manager that manages work-item status and stage
-transitions consistently across all skills (audit, implement, plan, ralph, etc.).
+transitions consistently across all skills (audit, implement, plan, etc.).
 
 Usage::
 

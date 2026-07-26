@@ -5,7 +5,7 @@
 ``skill/plan/plan_helpers.py``. All logic, CLI entry points, and public API
 are defined there.
 
-This file exists so that existing callers (Ralph, tests, CLI invocations) continue
+This file exists so that existing callers (tests, CLI invocations) continue
 to work without changes. It loads the canonical module and re-exports everything
 into the ``command.plan_helpers`` namespace.
 
