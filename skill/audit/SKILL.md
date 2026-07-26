@@ -31,29 +31,26 @@ Verify absence before proceeding to the audit flow. Confirm that the work item i
 
 ## Status Lifecycle
 
-The audit runner manages the work item's `status` field during execution to prevent concurrent audit attempts.
+The audit runner manages the work item's `status` field during execution. After the audit completes, the runner sets the final status based on the verdict in the report (`_extract_ready_to_close()` in `audit_runner.py` handles the logic).
 
 1. **Capture original status** — fetched via `wl show <id> --json` at `cmd_issue()` start.
 2. **`in_progress`** — set at `cmd_issue()` start, after capturing original status.
-3. **Restore original status** — set after audit logic completes (via `try/finally`, guaranteed even on failure).
+3. **Verdict-based transition** — set after audit logic completes (via `try/finally`, guaranteed even on failure).
 
-Behavior:
-
-- Transition: `in_progress` → original status (captured before audit, restored in `finally`).
-- Falls back to `open` if original status cannot be determined (e.g., `wl show` fails).
+Key points:
 - `--do-not-persist` does NOT affect the status lifecycle.
 - `stage` is NOT modified.
+- Falls back to `open` if original status cannot be determined.
 - If the status update fails, the error is silently caught.
 
 ### Manual Fallback
 
-When running without `audit_runner.py`:
+When running without `audit_runner.py`, check the "Ready to close:" line in the report and set accordingly:
 
 ```bash
-# Capture original status before setting in_progress
-ORIG_STATUS=$(wl show <id> --json | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','open'))")
-wl update <id> --status in_progress --json   # before audit
-wl update <id> --status "$ORIG_STATUS" --json # after audit (success or failure)
+wl update <id> --status completed --json     # if Ready to close: Yes
+wl update <id> --status open --json          # if Ready to close: No
+wl update <id> --status "$ORIG_STATUS" --json # on error
 ```
 
 Always include `--json` for machine-readable output.
@@ -81,7 +78,7 @@ No status lifecycle transitions occur, and no persistence is performed.
 ## Safety and prompt design
 
 - Audit executions should be read-only except for the explicit persistence step and automatic status lifecycle. Use `[READ-ONLY AUDIT]` to mark read-only phases and `[PERSIST-AUDIT]` when persisting.
-- Do NOT close, create, or delete work items during an audit. Permitted state-modifying actions: (1) storing audit text via the canonical persister, (2) runner's automatic `in_progress`→`open` lifecycle. Do NOT change `stage`.
+- Do NOT close, create, or delete work items during an audit. Permitted state-modifying actions: (1) storing audit text via the canonical persister, (2) runner's automatic `in_progress`→`completed` (if ready) or `in_progress`→`open` (if not ready) lifecycle. Do NOT change `stage`.
 - Refuse any request to run state-modifying `wl` commands outside the authorized flow.
 - If ambiguity prevents a reliable verdict, return immediately and do NOT persist.
 - The runner supports `--debug-log` to append raw Pi output to a JSONL file.
@@ -216,7 +213,7 @@ Synonym for "Acceptance Criteria". Use **Acceptance Criteria** as canonical head
 - **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
-**Timeout:** `CALL_PI_TIMEOUT`=600s per Pi call. Cumulative elapsed-time guard (110s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
+**Timeout:** `CALL_PI_TIMEOUT`=900s (15min) per Pi call. Can be overridden per-invocation with the `--timeout` CLI flag (integer seconds). Cumulative elapsed-time guard (870s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
 
 ### Code Quality Integration
 

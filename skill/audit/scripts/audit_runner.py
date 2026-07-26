@@ -53,16 +53,16 @@ from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
 
-CALL_PI_TIMEOUT = 600
+CALL_PI_TIMEOUT = 900
 """Internal timeout (seconds) for each Pi model subprocess call.
 
 This is a generous safety net for individual Pi model calls during audit
 processing. Large audit prompts can take several minutes, so the timeout
 must be high enough to not interrupt normal operation.
 
-The cumulative elapsed-time guard in ``cmd_issue`` (110s threshold for
+The cumulative elapsed-time guard in ``cmd_issue`` (870s threshold for
 child audit skipping) provides the primary protection against the parent
-bash-tool execution timeout (~120s), not this per-call timeout.
+bash-tool execution timeout (~900s/15min), not this per-call timeout.
 
 If the Pi model itself takes longer than this value, something is likely
 wrong (model hang, provider issue) and the timeout diagnostic should be
@@ -128,6 +128,20 @@ def _get_closing_sentence(report: str) -> str:
                 return _CLOSING_READY
             break
     return _CLOSING_NOT_READY
+
+
+def _extract_ready_to_close(report: str) -> bool:
+    """Extract the ready-to-close verdict from an audit report.
+
+    Parses the first ``Ready to close:`` line in *report* and returns
+    ``True`` if the verdict is ``Yes``, ``False`` otherwise.
+    """
+    for line in report.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Ready to close:"):
+            verdict = stripped.split(":", 1)[1].strip()
+            return verdict.lower() == "yes"
+    return False
 
 
 def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
@@ -232,7 +246,8 @@ def _check_audit_freshness(runner: Runner, issue_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
-             pi_bin: str = "pi") -> dict:
+             pi_bin: str = "pi",
+             timeout: int | None = None) -> dict:
     """Call Pi via subprocess and parse the JSON-stream response.
 
     Returns a dict with keys ``verdict`` and ``evidence``.
@@ -243,7 +258,10 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
 
     Uses the same JSON-stream protocol as ralph (``pi -p --mode json``).
     Uses ``communicate()`` to avoid pipe-buffer deadlocks.
+
+    *timeout* overrides the default ``CALL_PI_TIMEOUT`` when provided.
     """
+    effective_timeout = timeout if timeout is not None else CALL_PI_TIMEOUT
     cmd = [pi_bin, "-p", "--mode", "json", "--model", model, prompt]
     try:
         process = subprocess.Popen(
@@ -257,14 +275,14 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         raise RuntimeError(f"pi binary not found: {pi_bin}")
 
     try:
-        stdout, stderr = process.communicate(timeout=CALL_PI_TIMEOUT)
+        stdout, stderr = process.communicate(timeout=effective_timeout)
     except subprocess.TimeoutExpired:
         process.kill()
         stdout, stderr = process.communicate()
         return {
             "verdict": "unmet",
             "evidence": (
-                f"Pi model call timed out after {CALL_PI_TIMEOUT}s. "
+                f"Pi model call timed out after {effective_timeout}s. "
                 "Manual audit required."
             ),
             "raw_stdout": stdout,
@@ -953,7 +971,8 @@ def _write_debug_log(path: Path, entry: dict) -> None:
 
 def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            model: str = DEFAULT_MODEL,
-                           pi_bin: str = "pi", debug_log: str | None = None) -> dict:
+                           pi_bin: str = "pi", debug_log: str | None = None,
+                           timeout: int | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
     If *debug_log* is provided the entry reason will be "debug_log" and the
@@ -961,8 +980,10 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     result contains diagnostic fields (``raw_stdout``/``raw_stderr``), a
     default path from ``_default_debug_log_path`` will be used and the reason
     will be "parse_failure".
+
+    *timeout* is forwarded to ``_call_pi`` to override ``CALL_PI_TIMEOUT``.
     """
-    result = _call_pi(prompt, model=model, pi_bin=pi_bin)
+    result = _call_pi(prompt, model=model, pi_bin=pi_bin, timeout=timeout)
 
     # Decide whether to write a debug line
     reason = None
@@ -1233,6 +1254,7 @@ def _run_phase2_deep_analysis(
     pi_bin: str = "pi",
     debug_log: str | None = None,
     script_failure_callback=None,
+    timeout: int | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Run Phase 2 deep code analysis.
 
@@ -1275,6 +1297,7 @@ def _run_phase2_deep_analysis(
         result = _call_pi_and_maybe_log(
             issue_id, "phase2_deep", prompt,
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+            timeout=timeout,
         )
     except RuntimeError as exc:
         # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
@@ -1360,6 +1383,7 @@ def _run_phase2_deep_analysis(
             child_result = _call_pi_and_maybe_log(
                 child.get("id", ""), f"phase2_child:{ci}", child_prompt,
                 model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+                timeout=timeout,
             )
         except RuntimeError:
             continue
@@ -1418,7 +1442,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
               model_source: str = DEFAULT_MODEL_SOURCE,
               runner: Runner | None = None, json_mode: bool = False,
               debug_log: str | None = None,
-              force: bool = False) -> int:
+              force: bool = False,
+              timeout: int | None = None) -> int:
     """Audit a single work item.
 
     The resolved model name and source are included as a metadata line
@@ -1495,8 +1520,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
     StatusLifecycle.update_status(issue_id, "in_progress", runner=runner)
 
-    # Track whether the audit completed successfully
+    # Track whether the audit completed successfully and the audit verdict
     audit_success = False
+    audit_ready_to_close = False
 
     try:
         try:
@@ -1576,7 +1602,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 f"Criteria: {ac_list_json}"
             )
             try:
-                result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
+                result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, timeout=timeout)
             except RuntimeError as exc:
                 _record_script_failure("pi (parent AC review)", exc)
                 print(f"Warning: Pi call failed for parent AC review: {exc}", file=sys.stderr)
@@ -1657,7 +1683,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # Skip remaining children if we're too close to the parent
             # timeout (~120s). This prevents a silent external kill and
             # instead produces a clear diagnostic for skipped audits.
-            if _elapsed() >= 110:
+            if _elapsed() >= 870:
                 print(
                     f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
                     f"Skipping child {child.get('id', '')} ({child.get('title', '')}). "
@@ -1675,7 +1701,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         "evidence": (
                             f"Audit runner skipped this child after "
                             f"{_elapsed():.0f}s total elapsed time to avoid "
-                            f"the parent process timeout (~120s). "
+                            f"the parent process timeout (~900s/15min). "
                             "Manual audit required."
                         ),
                     }],
@@ -1704,7 +1730,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     f"Criteria: {child_ac_list}"
                 )
                 try:
-                    result = _call_pi_and_maybe_log(issue_id, f"child:{child.get('id', '')}", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
+                    result = _call_pi_and_maybe_log(issue_id, f"child:{child.get('id', '')}", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, timeout=timeout)
                 except RuntimeError as exc:
                     _record_script_failure("pi (child AC review)", exc)
                     print(f"Warning: Pi call failed for child AC review: {exc}", file=sys.stderr)
@@ -1793,7 +1819,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
             verdict, reason = _get_child_audit_verdict(runner, child["id"])
 
             if verdict is None and persist:
-                if _elapsed() < 110:
+                if _elapsed() < 870:
                     print(
                         f"Auto-triggering audit for child {child['id']} "
                         f"({child['title']}) — reason: {reason}",
@@ -1810,12 +1836,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
                             "--model-source", model_source,
                             "--force",  # Bypass freshness gate
                         ]
+                        child_timeout = timeout if timeout is not None else CALL_PI_TIMEOUT
                         subprocess.run(
                             audit_cmd,
                             check=False,
                             capture_output=True,
                             text=True,
-                            timeout=CALL_PI_TIMEOUT,
+                            timeout=child_timeout,
                         )
                         # Re-check verdict after triggered audit
                         verdict, reason = _get_child_audit_verdict(runner, child["id"])
@@ -1903,6 +1930,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 pi_bin=pi_bin,
                 debug_log=debug_log,
                 script_failure_callback=_record_script_failure,
+                timeout=timeout,
             )
             phase2_completed = True
 
@@ -1939,6 +1967,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 stderr_context=script_failure["stderr"],
             )
             report = notice.wrap(report)
+
+        # Extract the ready-to-close verdict for status lifecycle management
+        audit_ready_to_close = _extract_ready_to_close(report)
 
         if json_mode:
             payload = _build_issue_json(
@@ -2020,10 +2051,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # - On failure/exception: restore original status
         # ------------------------------------------------------------------
         try:
-            if audit_success:
+            # Status transition based on audit verdict:
+            # - "Ready to close: Yes" → completed
+            # - "Ready to close: No" → open (item needs work)
+            # - On failure/exception → restore original status
+            if audit_ready_to_close:
                 StatusLifecycle.update_status(issue_id, "completed", runner=runner)
-            else:
+            elif not audit_success:
                 StatusLifecycle.update_status(issue_id, original_status, runner=runner)
+            else:
+                # Audit succeeded but not ready to close
+                StatusLifecycle.update_status(issue_id, "open", runner=runner)
         except RuntimeError:
             pass  # Status update failure must not mask the main result
 
@@ -2044,7 +2082,8 @@ def _build_project_json(summary: str, recommendation: str) -> dict:
 def cmd_project(pi_bin: str = "pi", model: str | None = None,
                 model_source: str = DEFAULT_MODEL_SOURCE,
                 runner: Runner | None = None, json_mode: bool = False,
-                debug_log: str | None = None) -> int:
+                debug_log: str | None = None,
+                timeout: int | None = None) -> int:
     """Audit the overall project.
 
     Model resolution:
@@ -2127,7 +2166,7 @@ def cmd_project(pi_bin: str = "pi", model: str | None = None,
         f"Return ONLY a JSON object with keys 'summary' and 'recommendation'."
     )
     try:
-        pi_result = _call_pi_and_maybe_log("project", "project", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
+        pi_result = _call_pi_and_maybe_log("project", "project", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, timeout=timeout)
         if pi_result.get("verdict") == "met" and pi_result.get("evidence"):
             # Use Pi's response if parseable
             pass  # Could enhance this in future
@@ -2181,6 +2220,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Append Pi debug output to this file (JSONL)")
     p_issue.add_argument("--force", action="store_true",
                          help="Bypass the freshness gate and force a full audit")
+    p_issue.add_argument("--timeout", type=int, default=None,
+                         help="Override CALL_PI_TIMEOUT (seconds) for this invocation")
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
@@ -2193,6 +2234,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Emit machine-readable JSON output instead of markdown")
     p_project.add_argument("--debug-log", default=None,
                            help="Append Pi debug output to this file (JSONL)")
+    p_project.add_argument("--timeout", type=int, default=None,
+                           help="Override CALL_PI_TIMEOUT (seconds) for this invocation")
 
     return p
 
@@ -2210,11 +2253,13 @@ def main(argv: list[str] | None = None) -> int:
                          pi_bin=args.pi_bin, model=args.model,
                          model_source=args.model_source, json_mode=args.json,
                          debug_log=args.debug_log,
-                         force=args.force)
+                         force=args.force,
+                         timeout=args.timeout)
     elif args.command == "project":
         return cmd_project(pi_bin=args.pi_bin, model=args.model,
                            model_source=args.model_source, json_mode=args.json,
-                           debug_log=args.debug_log)
+                           debug_log=args.debug_log,
+                           timeout=args.timeout)
 
     return 2
 

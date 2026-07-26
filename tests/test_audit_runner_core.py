@@ -174,6 +174,37 @@ class TestCLIParsing:
         with pytest.raises(SystemExit):
             parser.parse_args(["project", "--force"])
 
+    # ------------------------------------------------------------------
+    # --timeout flag tests
+    # ------------------------------------------------------------------
+
+    def test_issue_timeout_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--timeout", "600"])
+        assert args.timeout == 600
+
+    def test_issue_timeout_default_none(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123"])
+        assert args.timeout is None
+
+    def test_project_timeout_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["project", "--timeout", "1200"])
+        assert args.timeout == 1200
+
+    def test_project_timeout_default_none(self):
+        parser = build_parser()
+        args = parser.parse_args(["project"])
+        assert args.timeout is None
+
+    def test_issue_timeout_with_other_flags(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--timeout", "900", "--do-not-persist", "--json"])
+        assert args.timeout == 900
+        assert args.do_not_persist is True
+        assert args.json is True
+
 
 # ---------------------------------------------------------------------------
 # _run_wl tests
@@ -890,9 +921,18 @@ class TestPiPromptSafetyInstructions:
 class TestStatusLifecycle:
     """Verify that cmd_issue captures original status and restores it after audit."""
 
-    def _fake_runner_with_calls(self, calls: list, fail_show: bool = False):
-        """Create a fake runner that records calls and optionally fails on ``wl show``."""
+    def _fake_runner_with_calls(self, calls: list, fail_show: bool = False,
+                                 has_acs: bool = True):
+        """Create a fake runner that records calls and optionally fails on ``wl show``.
+
+        When *has_acs* is ``True``, the ``wl show --children --json`` response includes
+        a work item description with acceptance criteria so the audit can produce
+        ``Ready to close: Yes``.
+        """
+        _show_called = False
+
         def fake_runner(cmd, **kwargs):
+            nonlocal _show_called
             cmd_list = list(cmd)
             calls.append(cmd_list)
             # If fail_show is True and this is a "wl show" call, return failure
@@ -901,11 +941,27 @@ class TestStatusLifecycle:
             # The first "wl show" without --children is the original-status capture.
             # Default response has no "status" field so original_status falls back to "open".
             # Test methods that supply a specific status should use _fake_runner_with_status.
+            # For "wl show --children --json": return a work item with ACs when has_acs is True.
+            if has_acs and "show" in cmd_list and "--children" in cmd_list and not _show_called:
+                _show_called = True
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": cmd_list[2],
+                        "title": "Test Item",
+                        "description": (
+                            "## Acceptance Criteria\n"
+                            "1. The system passes the test\n"
+                        ),
+                    },
+                    "children": [],
+                }))
             # All other calls succeed with valid JSON
             return _fake_proc(stdout=json.dumps({"success": True}))
         return fake_runner
 
-    def _fake_runner_with_status(self, calls: list, status: str = "completed"):
+    def _fake_runner_with_status(self, calls: list, status: str = "completed",
+                                 has_acs: bool = True):
         """Create a fake runner that returns a work item with the given *status*.
 
         The first ``wl show <id> --json`` call (without --children) returns a work
@@ -923,6 +979,20 @@ class TestStatusLifecycle:
             if "show" in cmd_list and "--children" not in cmd_list and not _show_called:
                 _show_called = True
                 return _fake_proc(stdout=json.dumps({"success": True, "status": status}))
+            # For "wl show --children --json": return a work item with ACs when has_acs is True.
+            if has_acs and "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": cmd_list[2],
+                        "title": "Test Item",
+                        "description": (
+                            "## Acceptance Criteria\n"
+                            "1. The system passes the test\n"
+                        ),
+                    },
+                    "children": [],
+                }))
             return _fake_proc(stdout=json.dumps({"success": True}))
         return fake_runner
 
@@ -970,7 +1040,11 @@ class TestStatusLifecycle:
 
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
         )
 
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
@@ -987,7 +1061,11 @@ class TestStatusLifecycle:
 
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
         )
 
         cmd_issue("SA-JSONFLAG2", runner=self._fake_runner_with_calls(calls), persist=False)
@@ -1021,7 +1099,11 @@ class TestStatusLifecycle:
 
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
         )
 
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
@@ -1034,8 +1116,9 @@ class TestStatusLifecycle:
             f"in_progress (index {in_progress_idx}) must come before completed (index {completed_idx}): {statuses}"
         )
 
-    def test_handled_exception_still_transitions_to_completed(self, monkeypatch):
-        """When a pi RuntimeError is caught by the body, the lifecycle still completes normally."""
+    def test_handled_exception_sets_open_status(self, monkeypatch):
+        """When a pi RuntimeError is caught by the body, audit cannot verify ACs
+        so ``Ready to close: No`` → status becomes ``open``."""
         calls = []
 
         def fake_call_pi(prompt, model="x", pi_bin="x", **kwargs):
@@ -1049,9 +1132,9 @@ class TestStatusLifecycle:
         cmd_issue("SA-EXCEPT", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-EXCEPT"]]
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected 'completed' status (exception was caught by body), got: {wl_updates}"
+        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
+        assert len(open_updates) >= 1, (
+            f"Expected 'open' status (audit failed due to exception), got: {wl_updates}"
         )
 
     def test_restores_original_status_when_captured(self, monkeypatch):
@@ -1060,7 +1143,11 @@ class TestStatusLifecycle:
 
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
         )
 
         cmd_issue("SA-ORIGSTAT", runner=self._fake_runner_with_status(calls, status="completed"), persist=False)
@@ -1076,24 +1163,28 @@ class TestStatusLifecycle:
             f"Should NOT set 'open' when original status was 'completed', got: {wl_updates}"
         )
 
-    def test_restores_custom_original_status_in_json_flag(self, monkeypatch):
-        """The restore call for a custom original status must include --json flag."""
+    def test_completed_uses_json_flag_when_audit_passes(self, monkeypatch):
+        """The completed status transition must include --json flag when audit passes."""
         calls = []
 
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
         )
 
         cmd_issue("SA-ORIGSTAT2", runner=self._fake_runner_with_status(calls, status="in_progress"), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-ORIGSTAT2"]]
-        restore_updates = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]]
-        assert len(restore_updates) >= 1, (
-            f"Expected in_progress status restore, got: {wl_updates}"
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected 'completed' (audit passed), got: {wl_updates}"
         )
-        assert "--json" in restore_updates[0], (
-            f"Status restore must include --json, got: {restore_updates[0]}"
+        assert "--json" in completed_updates[0], (
+            f"Completed update must include --json, got: {completed_updates[0]}"
         )
 
 
