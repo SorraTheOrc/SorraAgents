@@ -1849,7 +1849,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     except subprocess.TimeoutExpired:
                         print(
                             f"Warning: Auto-triggered audit for child {child['id']} "
-                            f"timed out.", file=sys.stderr,
+                            f"timed out after {child_timeout}s.", file=sys.stderr,
                         )
                     except Exception as exc:
                         print(
