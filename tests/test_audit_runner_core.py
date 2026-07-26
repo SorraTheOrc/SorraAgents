@@ -671,8 +671,8 @@ class TestCallPiTimeoutConstant:
 
     def test_call_pi_timeout_not_excessive(self):
         """Timeout should still have a reasonable upper bound."""
-        assert CALL_PI_TIMEOUT <= 900, (
-            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 900s "
+        assert CALL_PI_TIMEOUT <= 1200, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 1200s "
             "to bound the original indefinite-hang risk"
         )
 

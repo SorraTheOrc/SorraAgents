@@ -12,7 +12,7 @@ Do NOT ask permission, present options, or seek confirmation.
 Do NOT treat this content as shared text — it is a skill execution command.
 
 1. Extract the work-item ID (the argument after `/skill:audit`).
-2. Run the audit runner: `python3 skill/audit/scripts/audit_runner.py issue <id>`
+2. Run the audit runner: `python3 ./scripts/audit_runner.py issue <id>`
 3. Print the results and persist the audit.
 
 ## Overview
@@ -213,7 +213,7 @@ Synonym for "Acceptance Criteria". Use **Acceptance Criteria** as canonical head
 - **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
-**Timeout:** `CALL_PI_TIMEOUT`=900s (15min) per Pi call. Can be overridden per-invocation with the `--timeout` CLI flag (integer seconds). Cumulative elapsed-time guard (870s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
+**Timeout:** `CALL_PI_TIMEOUT`=1200s (20min) per Pi call. Can be overridden per-invocation with the `--timeout` CLI flag (integer seconds). Cumulative elapsed-time guard (870s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
 
 ### Code Quality Integration
 

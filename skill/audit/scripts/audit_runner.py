@@ -53,7 +53,7 @@ from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
 
-CALL_PI_TIMEOUT = 900
+CALL_PI_TIMEOUT = 1200
 """Internal timeout (seconds) for each Pi model subprocess call.
 
 This is a generous safety net for individual Pi model calls during audit
