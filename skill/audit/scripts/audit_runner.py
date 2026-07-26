@@ -2043,17 +2043,24 @@ def cmd_issue(issue_id: str, persist: bool = True,
     finally:
         # ------------------------------------------------------------------
         # Status lifecycle via shared helper:
-        # - On success: transition to completed (fixes the bug where
-        #   original status was restored instead)
+        # - On success (ready-to-close): transition to completed/in_review
+        #   with needsProducerReview=true
+        # - On success (not ready): set open
         # - On failure/exception: restore original status
         # ------------------------------------------------------------------
         try:
             # Status transition based on audit verdict:
-            # - "Ready to close: Yes" → completed
+            # - "Ready to close: Yes" → completed, in_review, needsProducerReview=true
             # - "Ready to close: No" → open (item needs work)
             # - On failure/exception → restore original status
             if audit_ready_to_close:
-                StatusLifecycle.update_status(issue_id, "completed", runner=runner)
+                StatusLifecycle.update_status(
+                    issue_id,
+                    "completed",
+                    stage="in_review",
+                    needs_producer_review=True,
+                    runner=runner,
+                )
             elif not audit_success:
                 StatusLifecycle.update_status(issue_id, original_status, runner=runner)
             else:

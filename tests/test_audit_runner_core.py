@@ -1188,6 +1188,92 @@ class TestStatusLifecycle:
         )
 
 
+    # ------------------------------------------------------------------
+    # Tests: needs_producer_review flag (AC1, AC2)
+    # ------------------------------------------------------------------
+
+    def test_completed_update_includes_needs_producer_review_when_ready_to_close(self, monkeypatch):
+        """When audit verdict is ready-to-close, the completed update must include
+        --needs-producer-review yes and --stage in_review (AC1, AC2, AC3)."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
+        )
+
+        cmd_issue("SA-NPR1", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR1"]]
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected at least one 'completed' update, got: {wl_updates}"
+        )
+        # The completed update must include --needs-producer-review yes
+        assert "--needs-producer-review" in completed_updates[0], (
+            f"Completed update must include --needs-producer-review, got: {completed_updates[0]}"
+        )
+        npr_idx = completed_updates[0].index("--needs-producer-review")
+        assert completed_updates[0][npr_idx + 1] == "yes", (
+            f"--needs-producer-review must be 'yes', got: {completed_updates[0]}"
+        )
+        # The completed update must include --stage in_review
+        assert "--stage" in completed_updates[0], (
+            f"Completed update must include --stage, got: {completed_updates[0]}"
+        )
+        stage_idx = completed_updates[0].index("--stage")
+        assert completed_updates[0][stage_idx + 1] == "in_review", (
+            f"--stage must be 'in_review', got: {completed_updates[0]}"
+        )
+
+    def test_no_needs_producer_review_when_not_ready_to_close(self, monkeypatch):
+        """When audit verdict is NOT ready-to-close, the status update must NOT
+        include --needs-producer-review (AC1: only set when verdict is ready-to-close)."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "unmet", "evidence": "missing"}]',
+                "verdict": "unmet",
+                "evidence": "missing",
+            },
+        )
+
+        cmd_issue("SA-NPR2", runner=self._fake_runner_with_calls(calls, has_acs=False), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR2"]]
+        for update in wl_updates:
+            assert "--needs-producer-review" not in update, (
+                f"Status update should NOT include --needs-producer-review, got: {update}"
+            )
+
+    def test_no_needs_producer_review_on_exception(self, monkeypatch):
+        """When audit fails with an exception, the status update must NOT
+        include --needs-producer-review (AC1: only set when verdict is ready-to-close)."""
+        calls = []
+
+        def fake_call_pi(prompt, model="x", pi_bin="x", **kwargs):
+            raise RuntimeError("Pi crashed")
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        cmd_issue("SA-NPR3", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR3"]]
+        for update in wl_updates:
+            assert "--needs-producer-review" not in update, (
+                f"Status update on exception should NOT include --needs-producer-review, got: {update}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Freshness gate behavior tests
 # ---------------------------------------------------------------------------

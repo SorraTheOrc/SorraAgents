@@ -178,15 +178,20 @@ class StatusLifecycle:
         status: str,
         stage: Optional[str] = None,
         assignee: Optional[str] = None,
+        needs_producer_review: Optional[bool] = None,
         runner: Optional[Runner] = None,
     ) -> dict:
-        """Update a work item's status (and optionally stage/assignee).
+        """Update a work item's status (and optionally stage/assignee/needs_producer_review).
 
         Args:
             work_item_id: The work item ID.
             status: New status value (e.g. ``open``, ``in_progress``, ``completed``).
             stage: Optional new stage value.
             assignee: Optional new assignee value.
+            needs_producer_review: Optional boolean. When set, passes
+                ``--needs-producer-review yes|no`` to ``wl update``.
+                ``None`` (default) omits the flag entirely, preserving
+                backward compatibility.
             runner: Optional injectable runner for testing.
 
         Returns:
@@ -200,6 +205,9 @@ class StatusLifecycle:
             cmd.extend(["--stage", stage])
         if assignee is not None:
             cmd.extend(["--assignee", assignee])
+        if needs_producer_review is not None:
+            npr_value = "yes" if needs_producer_review else "no"
+            cmd.extend(["--needs-producer-review", npr_value])
         r = runner or _default_runner
         return _run_wl_with_runner(r, cmd)
 
