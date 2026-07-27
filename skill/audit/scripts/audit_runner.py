@@ -49,6 +49,32 @@ from skill.scripts.failure_notice import FailureNotice  # noqa: E402
 from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
 
 # ---------------------------------------------------------------------------
+# Project root detection
+# ---------------------------------------------------------------------------
+
+def _detect_project_root() -> Path:
+    """Detect the target project root from CWD.
+
+    Attempts to detect git root via ``git rev-parse --show-toplevel``.
+    Falls back to ``Path.cwd()`` if not in a git repository.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return Path(result.stdout.strip())
+    except (subprocess.SubprocessError, OSError):
+        return Path.cwd()
+
+
+TARGET_PROJECT_ROOT = _detect_project_root()
+"""Root used for debug logs and code quality scans — the project being
+   audited (CWD/git root), not the framework install directory."""
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
@@ -956,7 +982,7 @@ def _default_debug_log_path(issue_id: str, context: str) -> Path:
     Tests monkeypatch this helper so callers should use it rather than
     hard-coding a path.
     """
-    p = REPO_ROOT / ".worklog" / f"audit_debug_{issue_id}.jsonl"
+    p = TARGET_PROJECT_ROOT / ".worklog" / f"audit_debug_{issue_id}.jsonl"
     return p
 
 
@@ -1556,7 +1582,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         cq_skipped_reason: str | None = None
         try:
             from skill.code_review.scripts.code_quality import run_code_quality
-            cq_result = run_code_quality(project_root=REPO_ROOT, runner=runner, fix=True)
+            cq_result = run_code_quality(project_root=TARGET_PROJECT_ROOT, runner=runner, fix=True)
             if cq_result.get("success", False):
                 cq_findings = cq_result.get("findings", [])
                 cq_fixes_applied = cq_result.get("fixes_applied", 0)
