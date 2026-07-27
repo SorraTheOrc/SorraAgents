@@ -27,7 +27,6 @@
 |------|-------|-----------|---------|
 | `command/plan.md` | 375 | 26.3 KB | Command counterpart for plan skill |
 | `command/intake.md` | 200 | 12.3 KB | Command counterpart for intake skill |
-| `command/review.md` | 197 | 12.3 KB | Command counterpart for code-review skill |
 | `command/refactor.md` | 82 | 3.3 KB | Command counterpart for refactor skill |
 | `AGENTS.md` | 312 | 16.2 KB | Project-wide policies & workflow steps |
 
@@ -132,7 +131,7 @@ The remaining 4 skill files (implement, audit, ship, implement-single) do NOT ha
 | `skill/ship/SKILL.md` | No | — |
 | `skill/implement-single/SKILL.md` | No | — |
 
-> **Note:** The epic description identifies these command↔skill pairs: `command/plan.md` ↔ `skill/plan/SKILL.md`, `command/intake.md` ↔ `skill/intakeall/SKILL.md`, `command/refactor.md` ↔ `skill/refactor/SKILL.md`, `command/review.md` ↔ `skill/code-review/SKILL.md`, `command/author_skill.md` ↔ `skill/author-command/SKILL.md`. Of these, only `plan/SKILL.md` is among the 5 largest files.
+> **Note:** The epic description identifies these command↔skill pairs: `command/plan.md` ↔ `skill/plan/SKILL.md`, `command/intake.md` ↔ `skill/intakeall/SKILL.md`, `command/refactor.md` ↔ `skill/refactor/SKILL.md`, `command/author_skill.md` ↔ `skill/author-command/SKILL.md`. Of these, only `plan/SKILL.md` is among the 5 largest files.
 
 ---
 

@@ -21,10 +21,9 @@ cross-references, and capture baseline test suite results.
 | `command/plan.md` | 26,252 | 375 | 14 sections | 2 blocks |
 | `command/intake.md` | 18,832 | 232 | 14 sections | 2 blocks |
 | `command/author_skill.md` | 16,028 | 216 | 19 sections | 2 blocks |
-| `command/review.md` | 12,323 | 197 | 8 sections | 2 blocks |
 | `command/doc.md` | 8,774 | 230 | 28 sections | 2 blocks |
 | `command/refactor.md` | 3,285 | 82 | 8 sections | 2 blocks |
-| **Total** | **85,494** | **1,332** | **—** | **—** |
+| **Total** | **73,171** | **1,135** | **—** | **—** |
 
 ### 1.2 Detailed Section Breakdown
 
@@ -88,19 +87,6 @@ cross-references, and capture baseline test suite results.
 | 165 | Step 4: Producer Review and Iteration | H3 |
 | 171 | Step 5: Finalizing the Skill | H3 |
 | 210 | Step 6: Finalizing the skill | H3 |
-
-#### command/review.md (197 lines, 12,323 bytes)
-
-| Line | Heading | Level |
-|------|---------|-------|
-| 11 | Description | H2 |
-| 17 | Inputs | H2 |
-| 23 | Results and Outputs | H2 |
-| 31 | Behavior | H2 |
-| 35 | Hard requirements | H2 |
-| 49 | Process (must follow) | H2 |
-| 185 | Traceability & idempotence | H2 |
-| 191 | Editing rules & safety | H2 |
 
 #### command/doc.md (230 lines, 8,774 bytes)
 
@@ -231,25 +217,6 @@ cross-references, and capture baseline test suite results.
 
 **Recommendation:** These are different in structure and purpose. Low deduplication opportunity.
 
-### 2.4 Pair: command/review.md ↔ skill/code-review/SKILL.md
-
-**Overlap Assessment: LOW (~10% content overlap)**
-
-| Section | command/review.md | skill/code-review/SKILL.md | Verdict |
-|---------|------------------|---------------------------|---------|
-| Description | PR-focused automated review in Ampa container | Local code review guidance | Different scope |
-| Inputs | PR reference | — | Different |
-| Process | Ampa pool container lifecycle | Code review workflow (determine target, prepare, analyze, provide feedback) | Different |
-| — | — | Automated Linting pipeline | Skill-only |
-| — | — | Scripts reference | Skill-only |
-
-**Key differences:**
-
-- command/review.md operates on GitHub PRs via Ampa pool containers
-- skill/code-review/SKILL.md guides local code review with automated linting
-
-**Recommendation:** These serve different purposes. Low deduplication opportunity.
-
 ### 2.5 Pair: command/author_skill.md ↔ skill/author-command/SKILL.md
 
 **Overlap Assessment: LOW (~5% content overlap)**
@@ -321,7 +288,6 @@ command/author_skill.md ──► command/plan.md
 
 command/doc.md — no cross-references found
 command/refactor.md — no cross-references found
-command/review.md — no cross-references found
 
 ---
 
