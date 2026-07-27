@@ -40,6 +40,11 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
+# REPO_ROOT is the framework install directory (SorraAgents). Used ONLY
+# for module imports (sys.path.insert) so that the audit runner can import
+# persist_audit, FailureNotice, StatusLifecycle, code_quality, etc.
+# It must NOT be used for debug logs or code quality scans — those target
+# the project being audited (see TARGET_PROJECT_ROOT below).
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
