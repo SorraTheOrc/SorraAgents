@@ -11,7 +11,7 @@ import { spawnSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
-import { checkAuditReadyToClose, getCandidateItems } from './check-audit-gate.js';
+import { checkAuditReadyToClose, getCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
 
@@ -254,6 +254,8 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * 1. Check for unmerged branches (gating, exit code 3)
  * 2. Check audit readiness (gating, exit code 6)
  * 3. Check critical-priority items (gating, exit code 7)
+ * 3.5. Check worklog refs (gating, exit code 8)
+ * 3.6. Check producer-review status (gating, exit code 9)
  * 4. Find and execute the release script
  * 5. Parse PR URL from release script output
  * 6. Wait for PR merge (if not already merged with --force)
@@ -318,6 +320,20 @@ export async function runRelease(cliArgs = []) {
       console.error(worklogReport.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
       return 8;
+    }
+  }
+
+  // ── Step 3.6: Check producer-review status (gating step) ───────────────
+  if (!skipChecks) {
+    const items = getCandidateItems();
+    const producerReviewReport = checkProducerReviewStatus(items);
+    if (producerReviewReport.hasBlockingItems) {
+      console.error(
+        '⚠️  Producer-review gate check failed — some work items need producer review:\n',
+      );
+      console.error(producerReviewReport.message);
+      console.error('\nTo bypass this check, re-run with --skip-checks.');
+      return 9;
     }
   }
 
