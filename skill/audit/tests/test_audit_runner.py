@@ -347,3 +347,87 @@ class TestCallPiEnableTools:
         assert result.get("_timeout") is True
         assert result.get("verdict") == "unmet"
         assert "timed out" in result.get("evidence", "")
+
+
+# ===========================================================================
+# _call_pi_and_maybe_log enable_tools forwarding tests
+# ===========================================================================
+
+
+class TestCallPiAndMaybeLogEnableTools:
+    """Tests for _call_pi_and_maybe_log() forwarding enable_tools (AC1-AC3)."""
+
+    def _make_mock_popen(self, stdout_text: str = "{\"text\": \"test\"}"):
+        """Create a mock Popen that returns a process-like object."""
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (stdout_text, "")
+        mock_process.returncode = 0
+        return mock_process
+
+    def test_forwards_enable_tools_true_to_call_pi(self):
+        """AC1: enable_tools=True is forwarded to _call_pi().
+
+        Mocks _call_pi and asserts it was called with enable_tools=True.
+        """
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call_pi:
+            mock_call_pi.return_value = {"verdict": "met", "evidence": "ok"}
+
+            audit_runner._call_pi_and_maybe_log(
+                "TEST-1", "phase2", "test prompt",
+                model="test-model", enable_tools=True,
+            )
+
+        mock_call_pi.assert_called_once()
+        _args, kwargs = mock_call_pi.call_args
+        assert kwargs.get("enable_tools") is True
+
+    def test_forwards_enable_tools_false_to_call_pi(self):
+        """AC2: enable_tools=False is forwarded to _call_pi()."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call_pi:
+            mock_call_pi.return_value = {"verdict": "met", "evidence": "ok"}
+
+            audit_runner._call_pi_and_maybe_log(
+                "TEST-1", "phase2", "test prompt",
+                model="test-model", enable_tools=False,
+            )
+
+        mock_call_pi.assert_called_once()
+        _args, kwargs = mock_call_pi.call_args
+        assert kwargs.get("enable_tools") is False
+
+    def test_default_enable_tools_is_false(self):
+        """AC3: Default enable_tools is False (backward compatible).
+
+        Existing callers that don't pass enable_tools should get the default.
+        """
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call_pi:
+            mock_call_pi.return_value = {"verdict": "met", "evidence": "ok"}
+
+            # Call with same signature as existing callers
+            audit_runner._call_pi_and_maybe_log(
+                "TEST-1", "phase2", "test prompt",
+                model="test-model",
+            )
+
+        mock_call_pi.assert_called_once()
+        _args, kwargs = mock_call_pi.call_args
+        assert kwargs.get("enable_tools") is False
+
+    def test_existing_callers_unchanged(self):
+        """AC3 (guard): Existing callers work without modification."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call_pi:
+            mock_call_pi.return_value = {"verdict": "met", "evidence": "ok"}
+
+            # Call with same signature as current callers use
+            audit_runner._call_pi_and_maybe_log(
+                "TEST-1", "phase2", "test prompt",
+                model="test-model", pi_bin="pi",
+            )
+
+        mock_call_pi.assert_called_once()
+        _args, kwargs = mock_call_pi.call_args
+        # ensure enable_tools is False by default
+        assert kwargs.get("enable_tools") is False
+        # Original parameters are still forwarded
+        assert kwargs.get("model") == "test-model"
+        assert kwargs.get("pi_bin") == "pi"

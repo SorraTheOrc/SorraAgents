@@ -1134,8 +1134,20 @@ def _write_debug_log(path: Path, entry: dict) -> None:
 
 def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            model: str = DEFAULT_MODEL,
-                           pi_bin: str = "pi", debug_log: str | None = None) -> dict:
+                           pi_bin: str = "pi",
+                           debug_log: str | None = None,
+                           enable_tools: bool = False) -> dict:
     """Call _call_pi and optionally write debug information to a log.
+
+    Args:
+        issue_id: Work item ID for debug log naming.
+        context: Context string for debug log naming.
+        prompt: The prompt text to send to Pi.
+        model: The model name to use.
+        pi_bin: Path to the pi binary.
+        debug_log: Optional path for debug log output.
+        enable_tools: If True, forwards to _call_pi() to enable file-reading
+                       tools in the Pi agent session.
 
     If *debug_log* is provided the entry reason will be "debug_log" and the
     provided path will be used. If *debug_log* is not provided but the pi
@@ -1143,7 +1155,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     default path from ``_default_debug_log_path`` will be used and the reason
     will be "parse_failure".
     """
-    result = _call_pi(prompt, model=model, pi_bin=pi_bin)
+    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools)
 
     # Decide whether to write a debug line
     reason = None
