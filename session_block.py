@@ -33,7 +33,7 @@ def _tool_output_dir() -> str:
     path = os.getenv("AMPA_TOOL_OUTPUT_DIR")
     if path:
         return path
-    default = os.path.join(tempfile.gettempdir(), "opencode_tool_output")
+    default = os.path.join(tempfile.gettempdir(), "pi_tool_output")
     return default
 
 

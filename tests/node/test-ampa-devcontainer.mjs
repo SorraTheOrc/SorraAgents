@@ -415,7 +415,7 @@ describe('poolStatePath', () => {
     const xdgDir = useIsolatedGlobalDir();
     try {
       const p = plugin.poolStatePath('/tmp/test-project');
-      assert.equal(p, path.join(xdgDir, 'opencode', '.worklog', 'ampa', 'pool-state.json'));
+      assert.equal(p, path.join(xdgDir, 'pi', '.worklog', 'ampa', 'pool-state.json'));
       assert.ok(p.endsWith('pool-state.json'));
       // Should NOT contain the projectRoot
       assert.ok(!p.includes('/tmp/test-project'));
@@ -588,7 +588,7 @@ describe('poolCleanupPath', () => {
     const xdgDir = useIsolatedGlobalDir();
     try {
       const p = plugin.poolCleanupPath('/tmp/test-project');
-      assert.equal(p, path.join(xdgDir, 'opencode', '.worklog', 'ampa', 'pool-cleanup.json'));
+      assert.equal(p, path.join(xdgDir, 'pi', '.worklog', 'ampa', 'pool-cleanup.json'));
       assert.ok(p.endsWith('pool-cleanup.json'));
       // Should NOT contain the projectRoot
       assert.ok(!p.includes('/tmp/test-project'));
@@ -790,7 +790,7 @@ describe('globalAmpaDir', () => {
     try {
       process.env.XDG_CONFIG_HOME = '/custom/xdg';
       const dir = plugin.globalAmpaDir();
-      assert.equal(dir, path.join('/custom/xdg', 'opencode', '.worklog', 'ampa'));
+      assert.equal(dir, path.join('/custom/xdg', 'pi', '.worklog', 'ampa'));
     } finally {
       if (savedXdg === undefined) {
         delete process.env.XDG_CONFIG_HOME;
@@ -807,7 +807,7 @@ describe('globalAmpaDir', () => {
       delete process.env.XDG_CONFIG_HOME;
       process.env.HOME = '/home/testuser';
       const dir = plugin.globalAmpaDir();
-      assert.equal(dir, path.join('/home/testuser', '.config', 'opencode', '.worklog', 'ampa'));
+      assert.equal(dir, path.join('/home/testuser', '.config', 'pi', '.worklog', 'ampa'));
     } finally {
       if (savedXdg === undefined) {
         delete process.env.XDG_CONFIG_HOME;
@@ -830,7 +830,7 @@ describe('globalAmpaDir', () => {
       delete process.env.HOME;
       const dir = plugin.globalAmpaDir();
       // os.homedir() returns a platform-specific home directory
-      const expected = path.join(os.homedir(), '.config', 'opencode', '.worklog', 'ampa');
+      const expected = path.join(os.homedir(), '.config', 'pi', '.worklog', 'ampa');
       assert.equal(dir, expected);
     } finally {
       if (savedXdg === undefined) {
@@ -859,7 +859,7 @@ describe('pool state directory creation', () => {
   test('savePoolState creates nested global directory on first write', () => {
     const xdgDir = useIsolatedGlobalDir();
     try {
-      const globalDir = path.join(xdgDir, 'opencode', '.worklog', 'ampa');
+      const globalDir = path.join(xdgDir, 'pi', '.worklog', 'ampa');
       // Directory should not exist before first write
       assert.ok(!fs.existsSync(globalDir), 'global ampa dir should not exist yet');
 
@@ -880,7 +880,7 @@ describe('pool state directory creation', () => {
   test('saveCleanupList creates nested global directory on first write', () => {
     const xdgDir = useIsolatedGlobalDir();
     try {
-      const globalDir = path.join(xdgDir, 'opencode', '.worklog', 'ampa');
+      const globalDir = path.join(xdgDir, 'pi', '.worklog', 'ampa');
       assert.ok(!fs.existsSync(globalDir), 'global ampa dir should not exist yet');
 
       plugin.saveCleanupList('/tmp/unused', ['ampa-pool-0']);

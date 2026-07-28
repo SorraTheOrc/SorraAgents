@@ -31,7 +31,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from skill.scripts.failure_notice import FailureNotice  # noqa: E402
 
-from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
+from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ def _fetch_issue_stage(issue_id: str) -> str:
         stage = show_json.get("workItem", {}).get("stage", "")
         if stage not in ("plan_complete", "intake_complete"):
             print(
-                f"The issue does not have a sufficiently detailed plan, to proceed it must be in the stage of `intake_complete` or `plan_complete`. Run the intake command with `/intake {issue_id}` or the plan command with `/plan {issue_id}`."
+                f"The issue does not have a sufficiently detailed plan, to proceed it must be in the stage of `intake_complete` or `plan_complete`. Run the intake skill with `/skill:intake {issue_id}` or the plan command with `/skill:plan {issue_id}`."
             )
             sys.exit(4)
         return stage

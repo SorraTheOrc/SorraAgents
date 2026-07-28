@@ -108,7 +108,7 @@ Next scheduler cycle picks up WL-EXAMPLE-006 at stage `plan_complete`.
 
 ```bash
 wl update WL-EXAMPLE-006 --status in_progress --stage delegated
-opencode run "work on WL-EXAMPLE-006 using the implement skill"
+pi "work on WL-EXAMPLE-006 using the implement skill"
 ```
 
 Patch reads the prior audit comment and attempts fixes:

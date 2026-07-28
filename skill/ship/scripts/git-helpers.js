@@ -35,8 +35,11 @@
 /** Maximum safe length for a git branch name. */
 const MAX_BRANCH_LENGTH = 250;
 
-/** Protected branches that agents must never push to. */
-export const BLOCKED_BRANCHS = Object.freeze(['main', 'master', 'HEAD']);
+/** Protected branches that agents must never push to.
+ *  Entries ending with `/` are treated as prefix patterns.
+ *  Exact-match entries (e.g. 'main', 'HEAD') match the full branch name.
+ */
+export const BLOCKED_BRANCHS = Object.freeze(['main', 'master', 'HEAD', 'worklog/']);
 
 /** Regex pattern for valid agent branch names: wl-<id>-<slug>
  *  Work-item IDs may contain hyphens (e.g. SA-0MPDZDPZB00121IE), so the id
@@ -115,5 +118,10 @@ export function validateBranchName(name) {
  * @returns {boolean} True if the branch is blocked for agent pushes.
  */
 export function isBranchBlocked(branch) {
-  return BLOCKED_BRANCHS.includes(branch);
+  return BLOCKED_BRANCHS.some(
+    (blocked) =>
+      blocked.endsWith('/')
+        ? branch.startsWith(blocked)
+        : branch === blocked
+  );
 }

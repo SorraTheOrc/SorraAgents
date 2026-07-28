@@ -2,14 +2,13 @@
 """Shared autoplan decision logic — canonical copy bundled with the plan skill.
 
 Centralizes the effort/risk threshold decision logic that was previously
-duplicated across RalphLoop (skill/ralph/scripts/ralph_loop.py) and the
-/plan command prompt.
+duplicated and needed deduplication.
 
 This is the canonical source of truth for the autoplan decision module.
 The legacy wrapper at ``command/plan_helpers.py`` delegates here for
 backward compatibility.
 
-Both Ralph and PlanAll invoke this module to decide whether a work item
+Both PlanAll and this module are invoked to decide whether a work item
 should be planned or can skip directly to implementation.
 
 The module provides:
@@ -184,13 +183,13 @@ def _execute_subprocess(
     """Execute a subprocess, supporting custom runners for test injection.
 
     When ``runner`` is provided, the payload is appended as a trailing
-    command-line argument (the convention used by Ralph's FakeRunner).
+    command-line argument (the convention used by FakeRunner).
     When ``runner`` is None, the payload is supplied via stdin (the
     convention used by the CLI and production subprocess calls).
 
     Returns an object with ``returncode``, ``stdout``, and ``stderr``
     attributes (compatible with both ``subprocess.CompletedProcess``
-    and Ralph's ``Result`` dataclass).
+    and the ``Result`` dataclass).
     """
     if runner is not None:
         if input_data is not None:
@@ -228,7 +227,7 @@ def _wl_comment_list(
 def _wl_comment_add(
     work_item_id: str,
     comment: str,
-    author: str = "ralph",
+    author: str = "auto-plan",
     runner: Callable[..., Any] | None = None,
 ) -> dict:
     """Call ``wl comment add <id> --author <a> --comment <c> --json``."""
@@ -359,7 +358,7 @@ def run_effort_and_risk(
     result.
 
     When ``runner`` is provided, the payload is appended as a trailing CLI
-    argument (the convention used by Ralph's FakeRunner in tests). When
+    argument (the convention used by FakeRunner in tests). When
     ``runner`` is None, the payload is supplied via stdin (production use).
 
     Returns None on failure (non-zero exit, invalid JSON, or error key in
@@ -427,7 +426,7 @@ def append_autoplan_decision_comment(
     risk_level: str,
     risk_score: int | float,
     do_plan: bool,
-    author: str = "ralph",
+    author: str = "auto-plan",
     runner: Callable[..., Any] | None = None,
 ) -> None:
     """Post (or skip posting) an auto-plan decision comment, idempotently.
@@ -459,7 +458,7 @@ def append_autoplan_decision_comment(
         else "proceed to implement (effort and risk below threshold)"
     )
     comment_parts = [
-        "# Ralph Auto-Plan Decision",
+        "# Auto-Plan Decision",
         marker,
         "",
         f"Effort: {tshirt}",
@@ -495,11 +494,11 @@ def make_autoplan_decision(
 
     When ``precomputed_item`` and ``precomputed_comments`` are provided, the
     function uses those instead of fetching the work item from the worklog.
-    This allows callers (like Ralph) to supply already-fetched data and avoid
+    This allows callers to supply already-fetched data and avoid
     redundant wl calls.
 
     When ``runner`` is provided, uses it for all subprocess calls (enables
-    test injection via Ralph's FakeRunner). When ``runner`` is None, uses
+    test injection via FakeRunner). When ``runner`` is None, uses
     direct subprocess calls (production/CLI use).
     """
     effort_skip = effort_skip or DEFAULT_AUTOPLAN_EFFORT_SKIP

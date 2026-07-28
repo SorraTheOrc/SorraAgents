@@ -63,28 +63,46 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
    - Ensure `dev` has no unresolved conflicts with `main`.
    - Run `git diff main...dev --name-only` to inspect divergent files.
 
-5. **Review outstanding worklog items**
-   - Run `wl list --status open --priority high --json` to check for any
-     critical or high-priority items that may block the release.
-
-6. **No open blockers**
-   - All blocking work-items related to the release are closed.
-   - No unresolved merge conflicts exist on `dev`.
-
-7. **Audit readiness gate — all `in_review` and `completed` items have passing audits**
-   - The automated release script (`run-release.js`) enforces this gate at exit code 6.
+5. **Critical-priority items gate — all critical items are in terminal state**
+   - The automated release script (`run-release.js`) now enforces this check
+     automatically at exit code 7. No critical-priority work items should be
+     in a non-terminal state (i.e., not `completed`/`in_review` or `completed`/`done`).
    - Run the gate manually to check:
+
      ```bash
      node skill/ship/scripts/run-release.js --dry-run
      ```
+
+   - If the gate fails, review the blocking items and either resolve them or
+     use `--skip-checks` to bypass in exceptional circumstances.
+
+6. **Review outstanding worklog items**
+   - Run `wl list --status open --priority high --json` to check for any
+     high-priority items that may block the release (critical items are
+     already checked automatically by the gate above).
+
+7. **No open blockers**
+   - All blocking work-items related to the release are closed.
+   - No unresolved merge conflicts exist on `dev`.
+
+8. **Audit readiness gate — all `in_review` and `completed` items have passing audits**
+   - The automated release script (`run-release.js`) enforces this gate at exit code 6.
+   - Run the gate manually to check:
+
+     ```bash
+     node skill/ship/scripts/run-release.js --dry-run
+     ```
+
    - If the gate fails, run `wl audit-show <blocking-item-id> --json` to inspect
      the audit status, then re-run the audit with:
+
      ```bash
      python3 skill/audit/scripts/audit_runner.py issue <blocking-item-id>
      ```
+
    - Use `--skip-checks` to bypass the gate in exceptional circumstances.
 
-8. **Verify CHANGELOG.md is up to date**
+9. **Verify CHANGELOG.md is up to date**
    - The release script now generates `CHANGELOG.md` automatically from
      worklog items (completed / in_review) during the release flow.
    - Verify that the generated `CHANGELOG.md` section reflects the correct
@@ -181,19 +199,25 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
 
 1. Verify `main` is green — confirm the `ci` workflow passes on the merge
    commit.
-2. Version numbering, tagging, and tag pushing are **now automated** as part
+2. **Work items are automatically closed** — After a successful release via
+   `run-release.js`, all work items that passed the audit readiness gate
+   (items in `in_review` stage or `completed` status, excluding `stage: done`)
+   are closed with the reason `"Shipped in v<version>"`. This is a
+   non-blocking step — individual close failures are logged as warnings but
+   do not affect the release outcome.
+3. Version numbering, tagging, and tag pushing are **now automated** as part
    of the merge script (`merge-dev-to-main.sh`). Before merging, the script:
    - Increments the version in `package.json` (default: patch bump).
    - Commits the version change.
    - Creates an annotated git tag `v<new-version>` on the merge commit.
    - Pushes the tag to `origin`.
-3. Customize the bump type with the `--bump` flag:
+4. Customize the bump type with the `--bump` flag:
 
    ```bash
    bash scripts/release/merge-dev-to-main.sh --bump minor
    ```
 
-4. Update any downstream consumers or deployment targets.
+5. Update any downstream consumers or deployment targets.
 
 > **Note:** If you need to see the current version, run:
 >

@@ -23,6 +23,9 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable, Sequence, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
+
 # Add repo root to sys.path for shared utility access
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
@@ -145,30 +148,14 @@ class PlanAllEngine:
             "recovery": None,
         }
 
-        # Claim the item
-        claim_cmd = [
-            "wl", "update", item_id,
-            "--status", "in_progress",
-            "--json",
-        ]
-        logger.debug("planall.claim cmd=%s", " ".join(claim_cmd))
+        # Claim the item via shared StatusLifecycle helper
         try:
-            claim_result = self.runner(claim_cmd)
-        except Exception as exc:
+            StatusLifecycle.update_status(item_id, "in_progress", runner=self.runner)
+            logger.debug("planall.claim item=%s", item_id)
+        except RuntimeError as exc:
             logger.warning("planall.claim.exception item=%s exc=%s", item_id, exc)
             result["outcome"] = "error"
-            result["error_detail"] = f"Claim exception: {exc}"
-            return result
-
-        if claim_result.returncode != 0:
-            logger.warning(
-                "planall.claim.failed item=%s rc=%s stderr=%s",
-                item_id,
-                claim_result.returncode,
-                (claim_result.stderr or "").strip(),
-            )
-            result["outcome"] = "error"
-            result["error_detail"] = f"Claim failed (rc={claim_result.returncode})"
+            result["error_detail"] = f"Claim failed: {exc}"
             return result
 
         # Invoke /plan via pi (non-interactive JSON-stream mode)
@@ -233,29 +220,13 @@ class PlanAllEngine:
             "success": False,
         }
 
-        # Reset status to open and stage back to intake_complete
-        cmd = [
-            "wl", "update", item_id,
-            "--status", "open",
-            "--stage", "intake_complete",
-            "--json",
-        ]
-        logger.debug("planall.recovery cmd=%s", " ".join(cmd))
+        # Reset status to open and stage back to intake_complete via shared helper
         try:
-            recovery_result = self.runner(cmd)
-        except Exception as exc:
+            StatusLifecycle.update_status(item_id, "open", stage="intake_complete", runner=self.runner)
+            logger.debug("planall.recovery item=%s", item_id)
+        except RuntimeError as exc:
             logger.warning("planall.recovery.exception item=%s exc=%s", item_id, exc)
             recovery["action"] = f"recovery_failed: {exc}"
-            return recovery
-
-        if recovery_result.returncode != 0:
-            logger.warning(
-                "planall.recovery.failed item=%s rc=%s stderr=%s",
-                item_id,
-                recovery_result.returncode,
-                (recovery_result.stderr or "").strip(),
-            )
-            recovery["action"] = f"recovery_failed (rc={recovery_result.returncode})"
             return recovery
 
         recovery["success"] = True

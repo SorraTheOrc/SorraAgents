@@ -28,8 +28,11 @@ import { execSync } from 'node:child_process';
 /** The integration branch that agents push into. */
 const DEV_BRANCH = 'dev';
 
-/** Branches that are protected and should never be merged into dev. */
-const PROTECTED_BRANCHES = Object.freeze(['main', 'master', 'HEAD']);
+/** Branches that are protected and should never be merged into dev.
+ *  Entries ending with `/` are treated as prefix patterns.
+ *  Exact-match entries (e.g. 'main', 'HEAD') match the full branch name.
+ */
+const PROTECTED_BRANCHES = Object.freeze(['main', 'master', 'HEAD', 'worklog/']);
 
 /**
  * Regex to extract work item ID from canonical agent branch names.
@@ -214,11 +217,16 @@ export function checkUnmergedBranches() {
   // Get the current branch so we can exclude it (it's the one we're about to push)
   const currentBranch = getCurrentBranch();
 
-  // Filter out dev, protected branches (main, master, HEAD), and the current branch
+  // Filter out dev, protected branches (main, master, HEAD, worklog/*), and the current branch
   const filteredBranches = branchNames.filter(
     (b) =>
       b !== DEV_BRANCH &&
-      !PROTECTED_BRANCHES.includes(b) &&
+      !PROTECTED_BRANCHES.some(
+        (blocked) =>
+          blocked.endsWith('/')
+            ? b.startsWith(blocked)
+            : b === blocked
+      ) &&
       b !== currentBranch,
   );
 

@@ -136,6 +136,17 @@ function main() {
     humanError(msg, EXIT.GENERAL_ERROR);
   }
 
+  // Check that neither the head nor base branch is a worklog/ branch
+  // Worklog refs must never be merged into main or dev via PR.
+  if (
+    (prInfo.headRefName && prInfo.headRefName.startsWith('worklog/')) ||
+    (prInfo.baseRefName && prInfo.baseRefName.startsWith('worklog/'))
+  ) {
+    const msg = `Cannot merge PR #${prNumber}: worklog/ branch detected (${prInfo.baseRefName.startsWith('worklog/') ? 'base: ' + prInfo.baseRefName : 'head: ' + prInfo.headRefName}). Worklog refs are orphan refs with no common ancestor and must not be merged.`;
+    if (asJson) jsonOutput({ success: false, error: msg }, EXIT.SAFETY_VIOLATION);
+    humanError(msg, EXIT.SAFETY_VIOLATION);
+  }
+
   // Check target branch is not protected against direct bypass
   if (isBranchBlocked(prInfo.baseRefName)) {
     // Merging into main via PR is allowed — this is the canonical flow.

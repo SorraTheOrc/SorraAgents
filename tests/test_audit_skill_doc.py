@@ -1,7 +1,7 @@
 """Smoke test for the audit skill documentation.
 
 Verifies that SKILL.md contains the canonical runner invocations and report header
-required by downstream consumers (ralph, persist_audit, agents).
+required by downstream consumers (persist_audit, agents).
 """
 from __future__ import annotations
 
@@ -232,3 +232,117 @@ class TestAuditSkillWorkItemIdDetection:
         text = _skill_md_text()
         assert "wl list" in text
         assert "wl in_progress" in text
+
+
+class TestAuditSkillImperativeDirective:
+    """Assert that SKILL.md frontmatter description contains imperative
+    execution directives that prevent permission-asking behavior."""
+
+    @staticmethod
+    def _extract_description(text: str) -> str:
+        """Extract the description field from YAML frontmatter."""
+        if text.startswith("---"):
+            end = text.find("---", 3)
+            if end != -1:
+                frontmatter = text[3:end].strip()
+                for line in frontmatter.split("\n"):
+                    if line.startswith("description:"):
+                        # Handle both quoted and unquoted values
+                        val = line[12:].strip().strip('"')
+                        return val
+        return ""
+
+    def test_description_contains_immediately(self):
+        """The description must contain an immediate execute directive."""
+        text = _skill_md_text()
+        desc = self._extract_description(text)
+        # Must contain imperative language telling the model to execute immediately
+        assert "immediately" in desc.lower() or "EXECUTE" in desc
+
+    def test_description_does_not_ask_permission(self):
+        """The description must instruct the model to NOT ask permission."""
+        text = _skill_md_text()
+        desc = self._extract_description(text)
+        # Must explicitly tell the model NOT to ask permission
+        assert "Do NOT ask" in desc or "do not ask" in desc.lower()
+
+    def test_description_starts_with_imperative(self):
+        """The description must start with an imperative execution command."""
+        text = _skill_md_text()
+        desc = self._extract_description(text)
+        # The description should start with an imperative verb
+        assert desc.startswith("EXECUTE") or desc.startswith("Execute") or desc.startswith("Run")
+
+
+class TestAuditSkillBodyExecutionDirective:
+    """Assert that SKILL.md body starts with an EXECUTION DIRECTIVE section
+    immediately after the # Audit heading, before any other content.
+    This ensures the model sees the directive first when the skill is loaded."""
+
+    def test_body_has_execution_directive_section(self):
+        """The body must contain an EXECUTION DIRECTIVE section."""
+        text = _skill_md_text()
+        # Check for the execution directive heading
+        assert "EXECUTION DIRECTIVE" in text, (
+            "SKILL.md body must have an EXECUTION DIRECTIVE section"
+        )
+
+    def test_execution_directive_is_before_overview(self):
+        """The EXECUTION DIRECTIVE must appear before ## Overview."""
+        text = _skill_md_text()
+        directive_pos = text.find("EXECUTION DIRECTIVE")
+        overview_pos = text.find("## Overview")
+        assert directive_pos != -1, "EXECUTION DIRECTIVE section not found"
+        assert overview_pos != -1, "## Overview not found"
+        assert directive_pos < overview_pos, (
+            "EXECUTION DIRECTIVE must appear before ## Overview in the body"
+        )
+
+    def test_execution_directive_contains_execute_immediately(self):
+        """The EXECUTION DIRECTIVE must tell the model to execute immediately."""
+        text = _skill_md_text()
+        directive_start = text.find("EXECUTION DIRECTIVE")
+        # Find the end of the directive section (next ## heading or end of text)
+        overview_start = text.find("## Overview")
+        if overview_start > directive_start:
+            directive_section = text[directive_start:overview_start]
+        else:
+            directive_section = text[directive_start:]
+        assert "Execute immediately" in directive_section or "EXECUTE immediately" in text, (
+            "Directive must instruct immediate execution"
+        )
+
+    def test_execution_directive_contains_do_not_ask(self):
+        """The EXECUTION DIRECTIVE must tell the model to NOT ask permission."""
+        text = _skill_md_text()
+        directive_start = text.find("EXECUTION DIRECTIVE")
+        overview_start = text.find("## Overview")
+        if overview_start > directive_start:
+            directive_section = text[directive_start:overview_start]
+        else:
+            directive_section = text[directive_start:]
+        assert "Do NOT ask" in directive_section, (
+            "Directive must say 'Do NOT ask' to prevent permission-seeking"
+        )
+
+    def test_execution_directive_mentions_skill_invocation(self):
+        """The directive must reference /skill:audit to connect it to the invocation mechanism."""
+        text = _skill_md_text()
+        assert "/skill:audit" in text, (
+            "Directive must reference /skill:audit to anchor the invocation context"
+        )
+
+    def test_body_directive_is_prominent_first_content(self):
+        """The EXECUTION DIRECTIVE must appear early, ideally as the first
+        substantive content after the # Audit heading."""
+        text = _skill_md_text()
+        # Find the text between # Audit and first ## section heading
+        audit_heading = text.find("# Audit")
+        # The first ## heading after # Audit should be EXECUTION DIRECTIVE
+        first_heading_after_audit_start = text.find("##", audit_heading)
+        if first_heading_after_audit_start != -1:
+            next_newline = text.find("\n", first_heading_after_audit_start)
+            first_heading_line = text[first_heading_after_audit_start:next_newline].strip() if next_newline != -1 else ""
+            assert "EXECUTION DIRECTIVE" in first_heading_line, (
+                f"First section after # Audit must be EXECUTION DIRECTIVE, got: {first_heading_line}"
+            )

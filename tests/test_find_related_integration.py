@@ -55,8 +55,11 @@ if cmd == 'show':
     sys.exit(0)
 
 elif cmd == 'search':
-    keyword = args[1] if len(args) > 1 else ''
+    # Skip --semantic flag if present to find the actual keyword
+    filtered_args = [a for a in args[1:] if not a.startswith('--')]
+    keyword = filtered_args[0] if filtered_args else ''
     results = state.get('search_results', {{}}).get(keyword, [])
+    # Ensure --json format matches real wl search output (bare list is also OK)
     print(json.dumps(results))
     sys.exit(0)
 

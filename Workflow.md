@@ -76,7 +76,7 @@ Expand the initial idea into a more detailed feature intake work-item. This step
 - **Acceptance Criteria:** work-item contains a clear understanding of the feature's purpose and requirements.
 - **Status Tag:** `intake_complete`
 - **Useful Commands:**
-  - `/intake <Work-Item ID>`
+  - `/skill:intake <Work-Item ID>`
 - **Next Step:** proceed to the `Plan` step.
 
 Summary: a clear, testable project definition that guides epics and prioritization.
@@ -92,7 +92,7 @@ For smaller features, the plan may be a simple implementation outline. For large
 
 Agent Commands:
 
-1. Decompose epics into features and tasks: `/plan <Epic ID>`
+1. Decompose epics into features and tasks: `/skill:plan <Epic ID>`
 
 Summary: features make epics executable and testable in small increments.
 

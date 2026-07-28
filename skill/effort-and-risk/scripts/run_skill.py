@@ -12,7 +12,7 @@ The script will:
   - assemble a JSON payload using provided O/M/P (and optional per-item estimates) and overheads (defaults applied if omitted)
  - call orchestrate_estimate.py with the assembled payload and print the final JSON output
 
-This enforces the canonical scripts are used (orchestrate_estimate.py + json_to_human.py) so comments and updates are consistent.
+Status lifecycle is managed by StatusLifecycle context manager.
 """
 
 import argparse
@@ -20,6 +20,8 @@ import json
 import subprocess
 import sys
 import os
+
+from skill.shared.status_lifecycle import StatusLifecycle
 
 
 def wl_show(issue_id):
@@ -50,95 +52,97 @@ def main():
     args = parser.parse_args()
 
     issue_id = args.issue
-    show = wl_show(issue_id)
 
-    def flatten_children(children):
-        out = []
-        for c in children or []:
-            out.append(c)
-            out.extend(flatten_children(c.get("children", [])))
-        return out
+    with StatusLifecycle(issue_id):
+        show = wl_show(issue_id)
 
-    # Collect children (recursive) if present
-    children_nodes = flatten_children(show.get("children", []))
-    children_info = []
-    for c in children_nodes:
-        cid = c.get("id")
-        title = c.get("title", "")
-        children_info.append({"id": cid, "title": title, "probability": 2, "impact": 1})
+        def flatten_children(children):
+            out = []
+            for c in children or []:
+                out.append(c)
+                out.extend(flatten_children(c.get("children", [])))
+            return out
 
-    # Build WBS items from child work items (with proportionate O/M/P distribution)
-    items = []
-    if children_nodes:
-        # Distribute O/M/P proportionally across children when we have O/M/P totals
-        total_omp = args.o + args.m + args.p
-        if total_omp > 0:
-            for c in children_nodes:
-                cid = c.get("id", "")
-                title = c.get("title", "")
-                # Equal split as default when no per-item estimates provided
-                weight = 1.0 / len(children_nodes)
-                items.append({
-                    "id": cid,
-                    "title": title,
-                    "o": round(args.o * weight, 2),
-                    "m": round(args.m * weight, 2),
-                    "p": round(args.p * weight, 2),
-                })
+        # Collect children (recursive) if present
+        children_nodes = flatten_children(show.get("children", []))
+        children_info = []
+        for c in children_nodes:
+            cid = c.get("id")
+            title = c.get("title", "")
+            children_info.append({"id": cid, "title": title, "probability": 2, "impact": 1})
 
-    payload = {
-        "o": args.o,
-        "m": args.m,
-        "p": args.p,
-        "overheads": {
-            "coordination": args.coord,
-            "review": args.review,
-            "testing": args.testing,
-            "risk_buffer": args.risk_buffer,
-        },
-        "parent": {"probability": args.parent_prob, "impact": args.parent_imp},
-        "children": children_info,
-        "items": items,
-        "certainty": args.certainty,
-        "assumptions": json.loads(args.assumptions),
-        "unknowns": json.loads(args.unknowns),
-        "issue_id": issue_id,
-    }
+        # Build WBS items from child work items (with proportionate O/M/P distribution)
+        items = []
+        if children_nodes:
+            # Distribute O/M/P proportionally across children when we have O/M/P totals
+            total_omp = args.o + args.m + args.p
+            if total_omp > 0:
+                for c in children_nodes:
+                    cid = c.get("id", "")
+                    title = c.get("title", "")
+                    # Equal split as default when no per-item estimates provided
+                    weight = 1.0 / len(children_nodes)
+                    items.append({
+                        "id": cid,
+                        "title": title,
+                        "o": round(args.o * weight, 2),
+                        "m": round(args.m * weight, 2),
+                        "p": round(args.p * weight, 2),
+                    })
 
-    if not sys.stdin.isatty():
-        try:
-            stdin_payload = json.load(sys.stdin)
-            if isinstance(stdin_payload, dict):
-                # Allow stdin override to replace items if provided
-                if "items" in stdin_payload:
-                    payload["items"] = stdin_payload["items"]
-                payload.update(stdin_payload)
-        except Exception:
-            pass
+        payload = {
+            "o": args.o,
+            "m": args.m,
+            "p": args.p,
+            "overheads": {
+                "coordination": args.coord,
+                "review": args.review,
+                "testing": args.testing,
+                "risk_buffer": args.risk_buffer,
+            },
+            "parent": {"probability": args.parent_prob, "impact": args.parent_imp},
+            "children": children_info,
+            "items": items,
+            "certainty": args.certainty,
+            "assumptions": json.loads(args.assumptions),
+            "unknowns": json.loads(args.unknowns),
+            "issue_id": issue_id,
+        }
 
-    # Call orchestrate_estimate.py located in the same scripts directory
-    script_dir = os.path.dirname(__file__)
-    orchestrator = os.path.join(script_dir, "orchestrate_estimate.py")
-    proc = subprocess.run(
-        ["python3", orchestrator],
-        input=json.dumps(payload),
-        text=True,
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        print(
-            json.dumps(
-                {
-                    "error": "orchestrator failed",
-                    "stdout": proc.stdout,
-                    "stderr": proc.stderr,
-                }
-            )
+        if not sys.stdin.isatty():
+            try:
+                stdin_payload = json.load(sys.stdin)
+                if isinstance(stdin_payload, dict):
+                    # Allow stdin override to replace items if provided
+                    if "items" in stdin_payload:
+                        payload["items"] = stdin_payload["items"]
+                    payload.update(stdin_payload)
+            except Exception:
+                pass
+
+        # Call orchestrate_estimate.py located in the same scripts directory
+        script_dir = os.path.dirname(__file__)
+        orchestrator = os.path.join(script_dir, "orchestrate_estimate.py")
+        proc = subprocess.run(
+            ["python3", orchestrator],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
         )
-        sys.exit(3)
+        if proc.returncode != 0:
+            print(
+                json.dumps(
+                    {
+                        "error": "orchestrator failed",
+                        "stdout": proc.stdout,
+                        "stderr": proc.stderr,
+                    }
+                )
+            )
+            sys.exit(3)
 
-    # Print orchestrator output
-    print(proc.stdout)
+        # Print orchestrator output
+        print(proc.stdout)
 
 
 if __name__ == "__main__":

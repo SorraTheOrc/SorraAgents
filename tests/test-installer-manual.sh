@@ -58,8 +58,7 @@ setup_test_env() {
   # Copy installer script - look in multiple locations
   if [ -f "skill/install-ampa/scripts/install-worklog-plugin.sh" ]; then
     cp skill/install-ampa/scripts/install-worklog-plugin.sh ./install-test.sh
-  elif [ -f "/home/rgardler/.config/opencode/skill/install-ampa/scripts/install-worklog-plugin.sh" ]; then
-    cp /home/rgardler/.config/opencode/skill/install-ampa/scripts/install-worklog-plugin.sh ./install-test.sh
+  # Note: additional fallback paths for installer script are not configured
   else
     echo "Error: Cannot find installer script"
     exit 1

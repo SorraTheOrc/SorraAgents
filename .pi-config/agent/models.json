@@ -10,6 +10,7 @@
       "models": [
         { "id": "plan" },
         { "id": "code" },
+        { "id": "author" },
         { "id": "qwen3" },
         { "id": "gpt120" }
       ]

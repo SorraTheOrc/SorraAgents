@@ -89,7 +89,7 @@ def test_critical_skills_directory_exists():
     """The skill/ directory exists with expected skills."""
     skill_dir = _REPO_ROOT / "skill"
     assert skill_dir.is_dir(), f"Missing {skill_dir}"
-    expected = ["audit", "implement", "implement-single", "ralph", "triage"]
+    expected = ["audit", "implement", "implement-single", "triage"]
     for s in expected:
         assert (skill_dir / s).is_dir(), f"Missing skill: {s}"
 

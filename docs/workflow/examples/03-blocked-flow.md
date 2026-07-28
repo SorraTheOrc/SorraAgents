@@ -44,7 +44,7 @@ wl comment add WL-EXAMPLE-003 --comment "Blocked: Payment service webhook endpoi
 
 ```
 Command: block_delegated
-Actor: Patch -> opencode-patch-1
+Actor: Patch -> pi-agent-1
 Timestamp: 2026-02-19T14:30:00Z
 Outcome: success
 Reason: Payment service webhook endpoint not deployed
@@ -82,7 +82,7 @@ wl comment add WL-EXAMPLE-003 --comment "Unblocked: Payment service webhook endp
 
 ### Step 6: AMPA Re-delegates
 
-On the next scheduler cycle, AMPA sees WL-EXAMPLE-003 is in `delegated` state but the opencode run process is no longer active. The engine needs to re-delegate.
+On the next scheduler cycle, AMPA sees WL-EXAMPLE-003 is in `delegated` state but the pi process is no longer active. The engine needs to re-delegate.
 
 | Field | Value |
 |---|---|
@@ -90,7 +90,7 @@ On the next scheduler cycle, AMPA sees WL-EXAMPLE-003 is in `delegated` state bu
 | **Actor** | PM |
 | **State Before** | `in_progress / delegated` |
 | **Input: action** | `implement` (resume) |
-| **Engine Action** | `opencode run "work on WL-EXAMPLE-003 using the implement skill"` |
+| **Engine Action** | `pi "work on WL-EXAMPLE-003 using the implement skill"` |
 
 Patch picks up where it left off, reading the work item comments for context about the blocker and its resolution.
 

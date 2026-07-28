@@ -1,5 +1,5 @@
 - Restatement: Implement a Risk & Effort Estimator skill that ingests an issue and produces a structured PERT effort estimate and risk matrix for engineering planning.
-- WBS: 1) Requirements & prompt spec; 2) CLI trigger + opencode/wl integration; 3) Core estimator logic (WBS, PERT, risk aggregation); 4) Helper scripts (calc_*); 5) Tests (unit, integration, JSON shape); 6) Documentation & examples; 7) CI/QA checks and pre-commit hooks; 8) Release packaging and CLI entrypoint; 9) Monitoring/telemetry and maintenance handoff.
+- WBS: 1) Requirements & prompt spec; 2) CLI trigger + pi/wl integration; 3) Core estimator logic (WBS, PERT, risk aggregation); 4) Helper scripts (calc_*); 5) Tests (unit, integration, JSON shape); 6) Documentation & examples; 7) CI/QA checks and pre-commit hooks; 8) Release packaging and CLI entrypoint; 9) Monitoring/telemetry and maintenance handoff.
 - PERT (hours): O=120, M=240, P=480 → Expected E = (120 + 4*240 + 480)/6 = 1560/6 = 260.0h.
 - Additive overheads: coordination 24h, review 16h, testing/integration 32h, risk buffer 24h → overhead total 96h.
 - Final range and recommendation: min = O + overhead = 120+96 = 216h; max = P + overhead = 480+96 = 576h; recommended planning value ≈ 360h (rounded conservative from 356h).
@@ -39,12 +39,12 @@
   },
   "confidence_percent": 60,
   "assumptions": [
-    "Access to the opencode/wl CLI and necessary permissions is available",
+    "Access to the pi/wl CLI and necessary permissions is available",
     "Team members with CLI/CI access and a reviewer for security are available",
     "No external regulatory changes during implementation"
   ],
   "unknowns": [
-    "Exact integration surface and authentication model for wl/opencode CLI",
+    "Exact integration surface and authentication model for wl/pi CLI",
     "Production performance requirements and telemetry expectations",
     "Any additional security/compliance requirements beyond standard reviews"
   ]
