@@ -85,8 +85,8 @@ def validate_file(path):
     # Wildcard bash permission detection
     perm = data.get("permission") or {}
     bash_perm = perm.get("bash") if isinstance(perm, dict) else None
-    if isinstance(bash_perm, dict):
-        if any(k == "*" for k in bash_perm.keys()):
+    if isinstance(bash_perm, dict):  # noqa: SIM102
+        if any(k == "*" for k in bash_perm):
             # Check for documented justification in raw front-matter
             if re.search(r"wildcard\-bash\-justification:", fm_text):
                 pass  # documented exception
@@ -105,7 +105,7 @@ def validate_file(path):
             idx = body.find("Boundaries:")
             if idx != -1:
                 boundaries_text = body[idx:]
-    if write_allowed and boundaries_text:
+    if write_allowed and boundaries_text:  # noqa: SIM102
         if re.search(r"never (write|modify|commit|push)", boundaries_text, re.I):
             # Check for documented justification in raw front-matter
             if re.search(r"tools\-write\-contradiction\-justification:", fm_text):

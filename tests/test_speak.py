@@ -127,7 +127,7 @@ class TestScriptExists:
     def test_script_is_bash(self):
         """AC1: Script has a valid bash shebang."""
         first_line = SCRIPT_PATH.read_text().splitlines()[0]
-        assert first_line.startswith("#!/bin/bash") or first_line.startswith(
+        assert first_line.startswith("#!/bin/bash") or first_line.startswith(  # noqa: PIE810
             "#!/usr/bin/env bash"
         ), f"Script should have a bash shebang, got: {first_line}"
 
@@ -142,7 +142,7 @@ class TestMissingArgument:
 
     def test_no_args_exits_nonzero(self, mock_env):
         """AC5: Running without arguments exits non-zero."""
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH)],
             capture_output=True, text=True, env=mock_env,
         )
@@ -153,7 +153,7 @@ class TestMissingArgument:
 
     def test_no_args_shows_usage(self, mock_env):
         """AC5: Running without arguments prints usage instructions."""
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH)],
             capture_output=True, text=True, env=mock_env,
         )
@@ -165,7 +165,7 @@ class TestMissingArgument:
 
     def test_help_flag_exits_zero(self, mock_env):
         """--help shows usage and exits 0."""
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "--help"],
             capture_output=True, text=True, env=mock_env,
         )
@@ -189,7 +189,7 @@ class TestApiEndpoint:
         """Helper: run speak and return curl invocation log."""
         log_file = tmp_path / "mock.log"
         log_file.write_text("")
-        subprocess.run(
+        subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "Hello world"],
             capture_output=True, text=True, env=mock_env,
         )
@@ -235,7 +235,7 @@ class TestRollingBuffer:
 
     def test_creates_speak_directory(self, mock_env, tmp_path):
         """AC2: Script creates .pi/speak/ directory if it doesn't exist."""
-        subprocess.run(
+        subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "Hello world"],
             capture_output=True, text=True, env=mock_env,
         )
@@ -246,7 +246,7 @@ class TestRollingBuffer:
 
     def test_generates_speech_wav(self, mock_env, tmp_path):
         """AC2: Script generates speech.wav file in .pi/speak/."""
-        subprocess.run(
+        subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "Hello world"],
             capture_output=True, text=True, env=mock_env,
         )
@@ -265,7 +265,7 @@ class TestRollingBuffer:
             (speak_dir / fname).write_text("old-data")
 
         for _ in range(3):
-            subprocess.run(
+            subprocess.run(  # noqa: PLW1510
                 ["bash", str(SCRIPT_PATH), "Hello world"],
                 capture_output=True, text=True, env=mock_env,
             )
@@ -284,7 +284,7 @@ class TestRollingBuffer:
         speak_dir.mkdir(parents=True, exist_ok=True)
 
         for i in range(6):
-            subprocess.run(
+            subprocess.run(  # noqa: PLW1510
                 ["bash", str(SCRIPT_PATH), f"Message {i}"],
                 capture_output=True, text=True, env=mock_env,
             )
@@ -318,7 +318,7 @@ class TestPlaybackFallback:
         log_file = tmp_path / "mock.log"
         log_file.write_text("")
 
-        subprocess.run(
+        subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "Hello world"],
             capture_output=True, text=True, env=mock_env,
         )
@@ -341,7 +341,7 @@ class TestPlaybackFallback:
         mock_log.write_text("")
         env = _env_with_bindir(bindir, speak_dir, mock_log)
 
-        subprocess.run(
+        subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "Hello world"],
             capture_output=True, text=True, env=env,
         )
@@ -364,7 +364,7 @@ class TestPlaybackFallback:
         mock_log.write_text("")
         env = _env_with_bindir(bindir, speak_dir, mock_log)
 
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "Hello world"],
             capture_output=True, text=True, env=env,
         )
@@ -396,7 +396,7 @@ class TestPlaybackFallback:
         mock_log.write_text("")
         env = _env_with_bindir(bindir, speak_dir, mock_log)
 
-        subprocess.run(
+        subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "Hello termux"],
             capture_output=True, text=True, env=env,
         )
@@ -425,7 +425,7 @@ class TestStreamMode:
         log_file = tmp_path / "mock.log"
         log_file.write_text("")
 
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "--stream", "Hello stream"],
             capture_output=True, text=True, env=mock_env,
         )
@@ -440,7 +440,7 @@ class TestStreamMode:
 
     def test_stream_does_not_create_speak_dir(self, mock_env, tmp_path):
         """--stream does not create .pi/speak/ directory."""
-        _ = subprocess.run(
+        _ = subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "--stream", "No file"],
             capture_output=True, text=True, env=mock_env,
         )
@@ -451,7 +451,7 @@ class TestStreamMode:
 
     def test_stream_no_args_shows_error(self, mock_env):
         """--stream without text argument prints error."""
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "--stream"],
             capture_output=True, text=True, env=mock_env,
         )
@@ -467,7 +467,7 @@ class TestStreamMode:
         """--stream still calls the correct TTS API endpoint."""
         log_file = tmp_path / "mock.log"
         log_file.write_text("")
-        subprocess.run(
+        subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "--stream", "Check API"],
             capture_output=True, text=True, env=mock_env,
         )
@@ -510,7 +510,7 @@ class TestHappyPath:
         log_file = tmp_path / "mock.log"
         log_file.write_text("")
 
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: PLW1510
             ["bash", str(SCRIPT_PATH), "Test message for TTS"],
             capture_output=True, text=True, env=mock_env,
         )

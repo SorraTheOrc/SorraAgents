@@ -1093,7 +1093,7 @@ class TestChildAuditVerdict:
                 "ac_results": [],
             },
         ]
-        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        blocked, _reason = _has_phase1_blocking_issues(cq_findings, child_results)
         # Children in in_review stage are exempt from child audit verdict check
         assert blocked is False
 
@@ -1110,7 +1110,7 @@ class TestChildAuditVerdict:
                 "ac_results": [],
             },
         ]
-        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        blocked, _reason = _has_phase1_blocking_issues(cq_findings, child_results)
         assert blocked is False
 
     def test_phase1_still_blocks_for_stage_when_no_audit_field(self):
@@ -1125,7 +1125,7 @@ class TestChildAuditVerdict:
                 "ac_results": [],
             },
         ]
-        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        blocked, _reason = _has_phase1_blocking_issues(cq_findings, child_results)
         assert blocked is True
 
     def test_pre_review_child_audit_still_blocks_phase1(self):
@@ -1141,7 +1141,7 @@ class TestChildAuditVerdict:
                 "ac_results": [],
             },
         ]
-        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        blocked, _reason = _has_phase1_blocking_issues(cq_findings, child_results)
         # Pre-review stage child should still block (stage check catches this first)
         assert blocked is True
 
@@ -1158,7 +1158,7 @@ class TestChildAuditVerdict:
                 "ac_results": [],
             },
         ]
-        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        blocked, _reason = _has_phase1_blocking_issues(cq_findings, child_results)
         # Pre-review stage blocks regardless of child_audit_ready
         assert blocked is True
 

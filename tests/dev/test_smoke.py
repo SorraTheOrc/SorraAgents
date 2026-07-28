@@ -80,7 +80,7 @@ def test_smoke_readme_documents_ci():
 @pytest.mark.critical
 def test_critical_wl_cli_available():
     """Worklog CLI is available on PATH."""
-    result = subprocess.run(["wl", "--version"], capture_output=True, text=True)
+    result = subprocess.run(["wl", "--version"], capture_output=True, text=True)  # noqa: PLW1510
     assert result.returncode == 0, f"wl CLI not available: {result.stderr}"
 
 

@@ -87,7 +87,7 @@ class TestRunRuffAutoFix:
         from skill.code_review.scripts.linter_runner import run_ruff
 
         runner = self._make_runner([])
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["python"]):
+        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["python"]):  # noqa: SIM117
             with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": True}):
                 result = run_ruff(str(REPO_ROOT), runner=runner, fix=True)
 
@@ -164,7 +164,7 @@ class TestRunEslintAutoFix:
         from skill.code_review.scripts.linter_runner import run_eslint
 
         runner = self._make_runner()
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["typescript"]):
+        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["typescript"]):  # noqa: SIM117
             with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "eslint", "available": True}):
                 result = run_eslint(str(REPO_ROOT), runner=runner, fix=True)
 
@@ -177,7 +177,7 @@ class TestRunEslintAutoFix:
         from skill.code_review.scripts.linter_runner import run_eslint
 
         runner = self._make_runner()
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["typescript"]):
+        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["typescript"]):  # noqa: SIM117
             with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "eslint", "available": True}):
                 result = run_eslint(str(REPO_ROOT), runner=runner, fix=True)
 
@@ -220,7 +220,7 @@ class TestRunMarkdownlintAutoFix:
         from skill.code_review.scripts.linter_runner import run_markdownlint
 
         runner = self._make_runner()
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["markdown"]):
+        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["markdown"]):  # noqa: SIM117
             with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "markdownlint", "available": True}):
                 result = run_markdownlint(str(REPO_ROOT), runner=runner, fix=True)
 
@@ -267,7 +267,7 @@ class TestRunDotnetFormatAutoFix:
         from skill.code_review.scripts.linter_runner import run_dotnet_format
 
         runner = self._make_runner()
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["csharp"]):
+        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["csharp"]):  # noqa: SIM117
             with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "dotnet-format", "available": True}):
                 result = run_dotnet_format(str(REPO_ROOT), runner=runner, fix=True)
 
@@ -301,7 +301,7 @@ class TestRunLintersForProjectAutoFix:
         def mock_runner(cmd):
             return _mock_result(returncode=0, stdout="")
 
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["python"]):
+        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["python"]):  # noqa: SIM117
             with patch("skill.code_review.scripts.linter_runner.get_linters_for_language", return_value=["ruff"]):
                 with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": True}):
                     # Patch run_ruff to return fix=True result
@@ -318,7 +318,7 @@ class TestRunLintersForProjectAutoFix:
         def mock_runner(cmd):
             return _mock_result(returncode=0, stdout="")
 
-        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["python"]):
+        with patch("skill.code_review.scripts.linter_runner.detect_languages", return_value=["python"]):  # noqa: SIM117
             with patch("skill.code_review.scripts.linter_runner.get_linters_for_language", return_value=["ruff"]):
                 with patch("skill.code_review.scripts.linter_runner.probe_linter", return_value={"name": "ruff", "available": True}):
                     with patch("skill.code_review.scripts.linter_runner.run_ruff", return_value={"findings": [], "fixes_applied": False}):

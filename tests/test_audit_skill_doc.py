@@ -271,7 +271,7 @@ class TestAuditSkillImperativeDirective:
         text = _skill_md_text()
         desc = self._extract_description(text)
         # The description should start with an imperative verb
-        assert desc.startswith("EXECUTE") or desc.startswith("Execute") or desc.startswith("Run")
+        assert desc.startswith(("EXECUTE", "Execute", "Run"))
 
 
 class TestAuditSkillBodyExecutionDirective:

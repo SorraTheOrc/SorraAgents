@@ -7,16 +7,16 @@ from typing import Dict, Iterable, List, MutableMapping
 def _parse_created_at(value: str) -> datetime:
     """Parse createdAt value to datetime. Fall back to epoch on error."""
     if not value:
-        return datetime.fromtimestamp(0)
+        return datetime.fromtimestamp(0)  # noqa: DTZ006
     try:
         # support ISO 8601-ish strings
         return datetime.fromisoformat(value)
     except Exception:
         try:
             # try common fallback: seconds since epoch
-            return datetime.fromtimestamp(float(value))
+            return datetime.fromtimestamp(float(value))  # noqa: DTZ006
         except Exception:
-            return datetime.fromtimestamp(0)
+            return datetime.fromtimestamp(0)  # noqa: DTZ006
 
 
 def choose_blocker(items: Iterable[dict]) -> str | None:

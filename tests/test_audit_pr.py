@@ -52,7 +52,7 @@ def test_run_build_test_dry_run(tmp_path):
     rc, log = audit_pr.run_build_test(str(tmp_path), 'echo hi', dry_run=True)
     assert rc == 0
     assert os.path.exists(log)
-    content = open(log).read()
+    content = open(log).read()  # noqa: SIM115
     assert 'DRY-RUN' in content
 
 
@@ -60,14 +60,14 @@ def test_run_build_test_real(tmp_path):
     # run a simple command that prints to stdout
     rc, log = audit_pr.run_build_test(str(tmp_path), 'echo hello', dry_run=False)
     assert rc == 0
-    content = open(log).read()
+    content = open(log).read()  # noqa: SIM115
     assert 'hello' in content
 
 
 def test_run_audit_dry_run(tmp_path):
     rc, log = audit_pr.run_audit_in_worktree(str(tmp_path), 'SA-TEST', dry_run=True)
     assert rc == 0
-    content = open(log).read()
+    content = open(log).read()  # noqa: SIM115
     assert 'DRY-RUN' in content
 
 
@@ -76,7 +76,7 @@ def test_record_audit_result_dry_run(tmp_path):
     assert ok
     fpath = os.path.join('.pi', 'tmp', 'audit-result-SA-TEST.json')
     assert os.path.exists(fpath)
-    data = json.load(open(fpath))
+    data = json.load(open(fpath))  # noqa: SIM115
     assert data['ready_to_close'] is True
     assert data['summary'] == 'summary'
 
@@ -137,7 +137,7 @@ def test_append_audit_comment_dry_run():
     assert ok is True
     fpath = os.path.join('.pi', 'tmp', 'audit-comment-SA-901.md')
     assert os.path.exists(fpath)
-    assert '# AMPA Audit Result' in open(fpath).read()
+    assert '# AMPA Audit Result' in open(fpath).read()  # noqa: SIM115
 
 
 def test_append_audit_comment_non_dry_run_invokes_wl(monkeypatch):

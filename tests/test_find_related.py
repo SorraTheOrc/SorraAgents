@@ -21,7 +21,7 @@ def test_script_is_executable():
 
 def test_help_flag():
     """Script --help should display usage and exit 0."""
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: PLW1510
         [sys.executable, str(SCRIPT_PATH), "--help"],
         capture_output=True,
         text=True,
@@ -32,7 +32,7 @@ def test_help_flag():
 
 def test_verbose_flag():
     """Script should accept --verbose flag."""
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: PLW1510
         [
             sys.executable,
             str(SCRIPT_PATH),
@@ -49,7 +49,7 @@ def test_verbose_flag():
 
 def test_json_flag():
     """Script should accept --json flag and produce JSON output when all required args are passed."""
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: PLW1510
         [
             sys.executable,
             str(SCRIPT_PATH),
@@ -73,7 +73,7 @@ def test_json_flag():
 
 def test_work_item_id_required_help():
     """Running script without required args should show error."""
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: PLW1510
         [sys.executable, str(SCRIPT_PATH)],
         capture_output=True,
         text=True,
@@ -86,7 +86,7 @@ def test_work_item_id_required_help():
 
 def test_repo_path_flag():
     """Script should accept --repo-path argument."""
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: PLW1510
         [
             sys.executable,
             str(SCRIPT_PATH),

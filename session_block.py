@@ -62,7 +62,7 @@ def emit_internal_event(event_type: str, payload: Dict[str, Any]) -> str:
     _ensure_dir(out_dir)
     events_path = os.path.join(out_dir, "events.jsonl")
     record = {
-        "ts": datetime.utcnow().isoformat() + "Z",
+        "ts": datetime.utcnow().isoformat() + "Z",  # noqa: DTZ003
         "event": event_type,
         "payload": payload,
     }
@@ -87,7 +87,7 @@ def set_session_state(session_id: str, state: str) -> str:
     payload = {
         "session": session_id,
         "state": state,
-        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "updated_at": datetime.utcnow().isoformat() + "Z",  # noqa: DTZ003
     }
     try:
         with open(state_path, "w", encoding="utf-8") as fh:
@@ -168,7 +168,7 @@ def detect_and_surface_blocking_prompt(
 
     Returns the metadata dictionary written.
     """
-    ts = datetime.utcnow().isoformat() + "Z"
+    ts = datetime.utcnow().isoformat() + "Z"  # noqa: DTZ003
     summary = _excerpt_text(prompt_text, limit=500)
 
     out_dir = _tool_output_dir()

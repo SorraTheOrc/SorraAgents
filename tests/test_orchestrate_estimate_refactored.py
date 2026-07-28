@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Tests for the refactored helper functions extracted from main() in
 orchestrate_estimate.py.
@@ -565,7 +564,7 @@ class TestMainRefactoredBehavior(unittest.TestCase):
         """main() exits with code 2 when issue_id is missing."""
         input_data = {"o": 1.0, "m": 2.0, "p": 3.0}
 
-        with patch("json.load", return_value=input_data):
+        with patch("json.load", return_value=input_data):  # noqa: SIM117
             with self.assertRaises(ExitCaptured) as ctx:
                 oe.main()
         self.assertEqual(ctx.exception.code, 2)

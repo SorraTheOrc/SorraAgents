@@ -15,7 +15,7 @@ def test_agent_front_matter_valid():
 def test_agent_front_matter_warnings_are_visible():
     # Warnings should not fail the test suite, but we assert they are a list per-file
     results = val.validate_all_agents(base="agent")
-    for p, r in results.items():
+    for r in results.values():
         assert isinstance(r.get('warnings', []), list)
 
 
@@ -103,5 +103,5 @@ def test_all_agents_pass_validation():
 def test_missing_required_field_temperature():
     """A front-matter missing 'temperature' should produce an error."""
     data = {"description": "Test", "mode": "primary", "model": "github-copilot/gpt-5.2"}
-    errors, warnings = val.validate_front_matter(data, "")
+    errors, _warnings = val.validate_front_matter(data, "")
     assert any("temperature" in e for e in errors)

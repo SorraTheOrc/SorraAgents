@@ -720,7 +720,7 @@ class TestNonExistentFileHandling:
 
         result = create_smell_work_item(smell)
         assert result is None, (
-            "Expected None when file does not exist, got %r" % result
+            "Expected None when file does not exist, got {!r}".format(result)
         )
 
     def test_skip_creation_when_file_does_not_exist_batch(
@@ -739,7 +739,7 @@ class TestNonExistentFileHandling:
 
         results = create_smell_work_items([smell1, smell2])
         assert results == [], (
-            "Expected empty list when all files are nonexistent, got %r" % results
+            "Expected empty list when all files are nonexistent, got {!r}".format(results)
         )
 
     def test_warning_logged_when_file_does_not_exist(
@@ -770,7 +770,7 @@ class TestNonExistentFileHandling:
             assert result is None
             log_output = log_capture.getvalue()
             assert "does not exist" in log_output.lower() or "nonexistent" in log_output.lower() or "skipping" in log_output.lower(), (
-                "Expected warning log about non-existent file, got: %s" % log_output
+                "Expected warning log about non-existent file, got: {}".format(log_output)
             )
         finally:
             logger.removeHandler(handler)
@@ -845,7 +845,7 @@ class TestWorklogDuplicatePrevention:
 
         result = create_smell_work_item(smell)
         assert result is None, (
-            "Expected None when worklog has existing item, got %r" % result
+            "Expected None when worklog has existing item, got {!r}".format(result)
         )
 
     def test_allows_creation_when_worklog_has_no_match(

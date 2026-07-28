@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Tests for the effort-and-risk human narrative renderer (json_to_human.py).
 
@@ -27,7 +26,7 @@ class TestJsonToHumanNarrative(unittest.TestCase):
 
     def _run_json_to_human(self, input_data: dict) -> str:
         """Run json_to_human.py with the given input and return stdout."""
-        proc = subprocess.run(
+        proc = subprocess.run(  # noqa: PLW1510
             [sys.executable, JSON_TO_HUMAN],
             input=json.dumps(input_data),
             text=True,
