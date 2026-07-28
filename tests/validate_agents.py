@@ -121,7 +121,7 @@ def validate_all_agents(base: str = "agent") -> Dict[str, Dict]:
         txt = p.read_text(encoding="utf-8")
         try:
             data, body, fm_raw = extract_front_matter(txt)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             out[str(p)] = {"errors": [f"front-matter parse error: {e}"], "warnings": []}
             continue
         errors, warnings = validate_front_matter(data, body, fm_raw)

@@ -23,7 +23,7 @@ from typing import Dict, Any, Optional
 
 try:
     from ampa import notifications as notifications_module
-except Exception:  # pragma: no cover - optional dependency
+except Exception:  # pragma: no cover - optional dependency  # noqa: BLE001
     notifications_module = None
 
 LOG = logging.getLogger("session_block")

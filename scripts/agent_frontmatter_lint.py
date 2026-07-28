@@ -60,7 +60,7 @@ def validate_file(path):
         return {"file": path, "errors": ["missing front-matter"], "warnings": []}
     try:
         data = yaml.safe_load(fm_text) or {}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return {"file": path, "errors": [f"yaml parse error: {e}"], "warnings": []}
     errors = []
     warnings = []

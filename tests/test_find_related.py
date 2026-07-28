@@ -260,7 +260,7 @@ class TestRunWlShow:
         mod = _import_find_related()
 
         def mock_check_output(cmd, **kwargs):
-            raise Exception("wl command failed")
+            raise Exception("wl command failed")  # noqa: TRY002
 
         monkeypatch.setattr(mod.subprocess, "check_output", mock_check_output)
         result = mod.run_wl_show("TEST-999")
@@ -301,7 +301,7 @@ class TestRunWlSearch:
         mod = _import_find_related()
 
         def mock_check_output(cmd, **kwargs):
-            raise Exception("search failed")
+            raise Exception("search failed")  # noqa: TRY002
 
         monkeypatch.setattr(mod.subprocess, "check_output", mock_check_output)
         results = mod.run_wl_search("keyword")
@@ -408,7 +408,7 @@ class TestRunWlUpdate:
         mod = _import_find_related()
 
         def mock_check_output(cmd, **kwargs):
-            raise Exception("update failed")
+            raise Exception("update failed")  # noqa: TRY002
 
         monkeypatch.setattr(mod.subprocess, "check_output", mock_check_output)
         result = mod.run_wl_update("TEST-123", "New description")

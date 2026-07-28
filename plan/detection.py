@@ -11,11 +11,11 @@ def _parse_created_at(value: str) -> datetime:
     try:
         # support ISO 8601-ish strings
         return datetime.fromisoformat(value)
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             # try common fallback: seconds since epoch
             return datetime.fromtimestamp(float(value))  # noqa: DTZ006
-        except Exception:
+        except Exception:  # noqa: BLE001
             return datetime.fromtimestamp(0)  # noqa: DTZ006
 
 
