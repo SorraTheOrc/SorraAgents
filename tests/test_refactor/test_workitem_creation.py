@@ -133,7 +133,7 @@ def _make_fake_subprocess_run(
         *args: Any,
         **kwargs: Any,
     ) -> subprocess.CompletedProcess:
-        key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+        key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)  # noqa: FLY002
         if key not in responses:
             raise FileNotFoundError(f"Unexpected command: {key}")
         return responses[key]
@@ -833,7 +833,7 @@ class TestWorklogDuplicatePrevention:
         responses[expected_list_cmd] = cp_list
 
         def _fake_run(cmd, *args, **kwargs):
-            key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)  # noqa: FLY002
             if key in responses:
                 return responses[key]
             # Default: return empty for any other command
@@ -893,7 +893,7 @@ class TestWorklogDuplicatePrevention:
         }
 
         def _fake_run(cmd, *args, **kwargs):
-            key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)  # noqa: FLY002
             if key in responses:
                 return responses[key]
             raise FileNotFoundError(f"Unexpected command: {key}")
