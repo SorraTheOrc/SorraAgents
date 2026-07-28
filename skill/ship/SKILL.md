@@ -43,10 +43,10 @@ Triggers: "release", "merge dev to main", "ship it", "promote dev", "release the
 
 ## Scripts and Modules
 
-- `./scripts/ship.js` — Push-to-dev module (`pushToDev`, `pushToBranch`, `validatePushTarget`, `checkUnmergedBranches`, `checkAuditReadyToClose`)
+- `./scripts/ship.js` — Push-to-dev module (`pushToDev`, `pushToBranch`, `validatePushTarget`, `checkUnmergedBranches`, `checkAuditReadyToClose`, `checkProducerReviewStatus`)
 - `./scripts/git-helpers.js` — Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`)
 - `./scripts/check-unmerged-branches.js` — Unmerged branch detection
-- `./scripts/check-audit-gate.js` — Audit readiness gating
+- `./scripts/check-audit-gate.js` — Audit readiness and producer-review gating
 - `./scripts/run-release.js` — Release wrapper (includes gating, post-release dev sync)
 - `./scripts/release/merge-dev-to-main.sh` — Canonical release merge script
 
@@ -144,6 +144,8 @@ The audit gate uses exit code 6 to distinguish from other failure modes:
 | 5 | Dev sync failed |
 | **6** | **Audit gate failure (items not ready to close)** |
 | **7** | **Critical-items gate failure (critical items not in terminal state)** |
+| **8** | **Worklog-ref gate failure (worklog refs present)** |
+| **9** | **Producer-review gate failure (items need producer review)** |
 
 ### Critical-Item Gating
 
@@ -171,13 +173,49 @@ modes:
 |------|---------|
 | **7** | **Critical-items gate failure (critical items not in terminal state)** |
 
+### Producer-Review Gating
+
+Checks whether any candidate work items (in_review/completed, not done) have
+`needsProducerReview = true`, `null`, or `undefined` before release. Items
+flagged for producer review block the release until a producer clears the flag.
+
+1. Calls `getCandidateItems()` to fetch all candidate items.
+2. For each item, checks `needsProducerReview`:
+   - `false` → passing (item can be shipped).
+   - `true`, `null`, or `undefined` → blocking (needs producer review).
+3. Blocking items abort release with exit code 9.
+4. Gate respects `--skip-checks` flag.
+
+Items with unknown/missing `needsProducerReview` are treated as needing review
+(conservative default) to avoid shipping unreviewed work.
+
+#### Using checkProducerReviewStatus Programmatically
+
+```javascript
+import { getCandidateItems, checkProducerReviewStatus } from './scripts/check-audit-gate.js';
+
+const items = getCandidateItems();
+const report = checkProducerReviewStatus(items);
+// report: { hasBlockingItems, message, blockingItems: [{workItemId, title, needsProducerReview, reason, remediation}] }
+```
+
+#### Exit Code
+
+The producer-review gate uses exit code 9:
+
+| Code | Meaning |
+|------|---------|
+| **9** | **Producer-review gate failure (items need producer review)** |
+
 ### Gating in run-release.js
 
-Runs three gating checks before release:
+Runs five gating checks before release:
 
 1. Unmerged branches check (exit code 3)
 2. Audit readiness gate (exit code 6)
 3. Critical-priority items gate (exit code 7)
+4. Worklog refs gate (exit code 8)
+5. Producer-review gate (exit code 9)
 
 Any failure aborts the release. Bypass all checks: `node ./scripts/run-release.js --skip-checks`
 
@@ -227,7 +265,7 @@ Steps:
 8. **Audit logging** — records merge hash, CI run IDs, PR URL in worklog.
 9. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push.
    > Release ops run from **main checkout**, not worktrees.
-10. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, logs warnings on individual failures.
+10. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Logs warnings on individual close failures.
 
 ### Fallback: Human Release Manager
 
