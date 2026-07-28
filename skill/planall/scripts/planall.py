@@ -9,7 +9,7 @@ Usage:
     python3 skill/planall/scripts/planall.py [--json] [--parent-id <id>]
 
 Related work item: SA-0MQA6ECEU003GUKH
-"""
+"""  # noqa: EXE001
 
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ class PlanAllEngine:
 
         try:
             result = self.runner(cmd)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("planall.discover.error cmd=%s exc=%s", " ".join(cmd), exc)
             return []
 
@@ -163,7 +163,7 @@ class PlanAllEngine:
         logger.debug("planall.plan.invoke cmd=%s", " ".join(plan_cmd))
         try:
             plan_result = self.runner(plan_cmd, timeout=self.item_timeout)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("planall.plan.exception item=%s exc=%s", item_id, exc)
             result["outcome"] = "error"
             result["error_detail"] = f"Plan exception: {exc}"
@@ -372,7 +372,7 @@ class PlanAllEngine:
             logger.debug("planall.comment cmd=%s", " ".join(comment_cmd))
             try:
                 self.runner(comment_cmd)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "planall.comment.failed parent=%s exc=%s",
                     parent_id,
@@ -507,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     try:
         return _main(argv)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         notice = FailureNotice(
             script_name="planall.py",
             reason=f"Unhandled exception: {exc}",

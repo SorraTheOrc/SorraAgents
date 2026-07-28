@@ -125,7 +125,7 @@ def extract_keywords(title: str, description: str) -> List[str]:
     # Split into tokens
     tokens = combined.split()
     # Filter: remove stop words, keep only words with 3+ characters, deduplicate
-    keywords = sorted(set(
+    keywords = sorted(set(  # noqa: C401
         t for t in tokens
         if t not in STOP_WORDS and len(t) >= 3
     ))
@@ -151,7 +151,7 @@ def run_wl_show(work_item_id: str) -> Optional[Dict[str, Any]]:
         if isinstance(data, dict) and "workItem" in data:
             return data["workItem"]
         return data
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -178,7 +178,7 @@ def run_wl_search(keyword: str, use_semantic: bool = False) -> List[Dict[str, An
         if isinstance(data, list):
             return data
         return []
-    except Exception:
+    except Exception:  # noqa: BLE001
         return []
 
 
@@ -191,7 +191,7 @@ def run_wl_update(work_item_id: str, description: str) -> bool:
         cmd = ["wl", "update", work_item_id, "--description", description, "--json"]
         subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -212,7 +212,7 @@ def is_semantic_available() -> bool:
         json.loads(out)
         # Any valid response (successful or with items) means --semantic is available
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -321,7 +321,7 @@ def search_repo(repo_path: str, keywords: List[str]) -> List[Dict[str, Any]]:
         # Read and search file content
         try:
             content = file_path.read_text(encoding="utf-8", errors="ignore").lower()
-        except Exception:
+        except Exception:  # noqa: BLE001, S112
             continue
 
         found = [kw for kw in keywords if kw.lower() in content]
@@ -427,7 +427,7 @@ def update_description(original_desc: str, report_section: str) -> str:
 def main() -> None:
     try:
         _main()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         notice = FailureNotice(
             script_name="find_related.py",
             reason=f"Unhandled exception: {exc}",

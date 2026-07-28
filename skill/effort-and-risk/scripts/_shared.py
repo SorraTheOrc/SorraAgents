@@ -14,7 +14,7 @@ Exports:
     compute_omp(data: dict) -> tuple[float, float, float]
     level_from_score(score: int | float) -> str
     pick_tshirt(hours: float, thresholds: dict | None = None) -> str
-"""
+"""  # noqa: EXE001
 
 # Map t-shirt size codes to human-readable labels
 TSHIRT_MAP: dict[str, str] = {

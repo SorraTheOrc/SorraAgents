@@ -74,14 +74,14 @@ def gh_get_pr(owner: str, repo: str, number: int) -> Optional[PRInfo]:
             title = data.get('name', '')
             body = data.get('body', '')
             head = data.get('head', '')
-        except Exception:
+        except Exception:  # noqa: BLE001
             raw = subprocess.check_output(['gh', 'api', f"repos/{owner}/{repo}/pulls/{number}"], text=True)
             data = json.loads(raw)
             title = data.get('title', '')
             body = data.get('body', '')
             head = data.get('head', {}).get('ref', '')
         return PRInfo(owner=owner, repo=repo, number=number, title=title, body=body, head_ref=head)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -125,7 +125,7 @@ def create_ephemeral_checkout(owner: str, repo: str, pr_number: int, head_ref: O
         # Checkout the fetched ref
         subprocess.check_call(['git', 'checkout', f'pr-{pr_number}'], cwd=dest)
         return dest
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         # cleanup
         if os.path.exists(dest):
             shutil.rmtree(dest)
@@ -150,7 +150,7 @@ def run_build_test(path: str, build_cmd: str, timeout: int = 600, dry_run: bool 
     # Run the command
     try:
         # Use shell=True for convenience with compound commands like "npm test"
-        proc = subprocess.run(build_cmd, shell=True, cwd=path, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(build_cmd, shell=True, cwd=path, capture_output=True, text=True, timeout=timeout)  # noqa: PLW1510
         with open(log_path, 'w') as f:
             f.write('STDOUT:\n')
             f.write(proc.stdout or '')
@@ -161,7 +161,7 @@ def run_build_test(path: str, build_cmd: str, timeout: int = 600, dry_run: bool 
         with open(log_path, 'w') as f:
             f.write(f'Timeout after {timeout}s\n')
         return 124, log_path
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         with open(log_path, 'w') as f:
             f.write(f'Error running build: {e}\n')
         return 2, log_path
@@ -187,7 +187,7 @@ def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bo
 
     cmd = ['pi', '-p', '--mode', 'json', f"/audit {wl_id}"]
     try:
-        proc = subprocess.run(cmd, cwd=path, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, cwd=path, capture_output=True, text=True, timeout=timeout)  # noqa: PLW1510
         # Parse JSON-stream output to extract plain text before writing to log
         extracted = extract_pi_text(proc.stdout or '')
         with open(log_path, 'w') as f:
@@ -205,7 +205,7 @@ def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bo
         with open(log_path, 'w') as f:
             f.write(f'Timeout after {timeout}s\n')
         return 124, log_path
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         with open(log_path, 'w') as f:
             f.write(f'Error running audit: {e}\n')
         return 2, log_path
@@ -237,7 +237,7 @@ def record_audit_result(wl_id: str, ready_to_close: bool, summary: str, raw_outp
             '--author', 'ampa-audit'
         ])
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -253,7 +253,7 @@ def append_audit_comment(wl_id: str, audit_text: str, dry_run: bool = True) -> b
     try:
         subprocess.check_call(['wl', 'comment', 'add', wl_id, '--comment', comment, '--author', 'ampa-audit'])
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -276,7 +276,7 @@ def create_wl_from_pr(pr: PRInfo, dry_run: bool = True) -> Optional[str]:
         ], text=True)
         data = json.loads(out)
         return data.get('workItem', {}).get('id')
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -328,7 +328,7 @@ def gh_get_pr_checks(owner: str, repo: str, number: int) -> Dict[str, Any]:
             'merge_state': data.get('mergeStateStatus', ''),
             'raw': data,
         }
-    except Exception:
+    except Exception:  # noqa: BLE001
         return {'checks_ok': None, 'merge_state': '', 'raw': {}}
 
 
@@ -339,7 +339,7 @@ def merge_pr(owner: str, repo: str, number: int, dry_run: bool = True) -> bool:
     try:
         subprocess.check_call(['gh', 'pr', 'merge', str(number), '--repo', f'{owner}/{repo}', '--merge'])
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

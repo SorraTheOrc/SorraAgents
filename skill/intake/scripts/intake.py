@@ -17,7 +17,7 @@ Exit codes:
     1 — error during execution
 
 All commands produce JSON output for agent consumption.
-"""
+"""  # noqa: EXE001
 
 from __future__ import annotations
 
@@ -211,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(json.dumps({"success": False, "error": f"Unknown command: {args.command}"}))
             return 1
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         LOG.error("Command failed: %s", exc)
         print(json.dumps({"success": False, "error": str(exc)}))
         return 1

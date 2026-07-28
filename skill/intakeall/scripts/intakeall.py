@@ -11,7 +11,7 @@ Usage:
         [--parent-id <id>] [--verbose]
 
 Related work item: SA-0MQK9SWN6008DWVQ
-"""
+"""  # noqa: EXE001
 
 from __future__ import annotations
 
@@ -147,7 +147,7 @@ class IntakeAllEngine:
 
         try:
             result = self.runner(cmd)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("intakeall.discover.error cmd=%s exc=%s", " ".join(cmd), exc)
             return []
 
@@ -219,14 +219,14 @@ class IntakeAllEngine:
             comment_cmd = [
                 "wl", "comment", "add", item_id,
                 "--comment",
-                "Intake auto-completed: work item has sufficient detail "
+                "Intake auto-completed: work item has sufficient detail "  # noqa: ISC004
                 "(acceptance criteria + implementation guidance) for direct implementation.",
                 "--author", "intakeall",
                 "--json",
             ]
             try:
                 self.runner(comment_cmd)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("intakeall.comment.error item=%s exc=%s", item_id, exc)
 
         return "completed"
@@ -268,7 +268,7 @@ class IntakeAllEngine:
         logger.debug("intakeall.intake.invoke cmd=%s", " ".join(intake_cmd))
         try:
             intake_result = self.runner(intake_cmd, timeout=self.item_timeout)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("intakeall.intake.exception item=%s exc=%s", item_id, exc)
             result["outcome"] = "error"
             result["error_detail"] = f"Intake exception: {exc}"
@@ -727,7 +727,7 @@ class IntakeAllEngine:
             logger.debug("intakeall.comment cmd=%s", " ".join(comment_cmd))
             try:
                 self.runner(comment_cmd)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "intakeall.comment.failed parent=%s exc=%s",
                     parent_id,
@@ -891,7 +891,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     try:
         return _main(argv)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         notice = FailureNotice(
             script_name="intakeall.py",
             reason=f"Unhandled exception: {exc}",

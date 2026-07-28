@@ -17,7 +17,7 @@ Input: JSON via stdin with keys:
   unknowns (list)
 
 Output: final JSON block written to stdout
-"""
+"""  # noqa: EXE001
 
 import sys
 import json
@@ -51,7 +51,7 @@ def _load_thresholds() -> dict:
         with open("references/t-shirt_sizes.json", "r") as f:
             tshirt_cfg = json.load(f)
             return tshirt_cfg.get("thresholds", {})
-    except Exception:
+    except Exception:  # noqa: BLE001
         return DEFAULT_THRESHOLDS
 
 
@@ -73,7 +73,7 @@ def _fetch_issue_stage(issue_id: str) -> str:
     try:
         import subprocess
 
-        show_proc = subprocess.run(
+        show_proc = subprocess.run(  # noqa: PLW1510
             ["wl", "show", issue_id, "--json"], capture_output=True, text=True
         )
         if show_proc.returncode != 0:
@@ -91,7 +91,7 @@ def _fetch_issue_stage(issue_id: str) -> str:
             )
             sys.exit(4)
         return stage
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(json.dumps({"error": str(e)}))
         sys.exit(5)
 
@@ -129,7 +129,7 @@ def _compute_risk(data: dict, certainty: float) -> dict:
     certainty_factor = 1.0 + max(0, (100 - certainty) / 100.0) * 0.1
     agg_prob = min(5, max(probs) * certainty_factor)
     agg_imp = min(5, max(imps) * certainty_factor)
-    score = int(round(agg_prob * agg_imp))
+    score = int(round(agg_prob * agg_imp))  # noqa: RUF046
     level = level_from_score(score)
 
     drivers = []
@@ -183,14 +183,14 @@ def _update_work_item(issue_id: str, wl_effort: str, wl_risk: str) -> dict:
             str(wl_risk),
             "--json",
         ]
-        update_proc = subprocess.run(update_cmd, capture_output=True, text=True)
+        update_proc = subprocess.run(update_cmd, capture_output=True, text=True)  # noqa: PLW1510
         return {
             "success": update_proc.returncode == 0,
             "returncode": update_proc.returncode,
             "stdout": update_proc.stdout,
             "stderr": update_proc.stderr,
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return {"success": False, "error": str(e)}
 
 
@@ -228,7 +228,7 @@ def _render_human_text(data: dict, final: dict) -> str:
         script_dir = os.path.dirname(__file__)
         json_to_human_path = os.path.join(script_dir, "json_to_human.py")
         sj = json.dumps(sanitized)
-        p = subprocess.run(
+        p = subprocess.run(  # noqa: PLW1510
             ["python3", json_to_human_path], input=sj, text=True, capture_output=True
         )
         human_text = p.stdout or ""
@@ -237,7 +237,7 @@ def _render_human_text(data: dict, final: dict) -> str:
         final["human_render_stderr"] = p.stderr
 
         return human_text
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         final["human_text"] = ""
         final["human_render_rc"] = -1
         final["human_render_stderr"] = str(e)
@@ -269,14 +269,14 @@ def _post_comment(issue_id: str, combined_text: str) -> dict:
             combined_text,
             "--json",
         ]
-        comment_proc = subprocess.run(comment_cmd, capture_output=True, text=True)
+        comment_proc = subprocess.run(comment_cmd, capture_output=True, text=True)  # noqa: PLW1510
         return {
             "returncode": comment_proc.returncode,
             "stdout": comment_proc.stdout,
             "stderr": comment_proc.stderr,
             "success": comment_proc.returncode == 0,
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return {"success": False, "error": str(e)}
 
 
@@ -388,7 +388,7 @@ def _run() -> None:
     """Entry point with failure notice wrapping."""
     try:
         main()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         notice = FailureNotice(
             script_name="orchestrate_estimate.py",
             reason=f"Unhandled exception: {exc}",

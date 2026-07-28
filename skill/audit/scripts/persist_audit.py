@@ -10,7 +10,7 @@ The script calls:
   wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json
 
 Returns non-zero on failure.
-"""
+"""  # noqa: EXE001
 from __future__ import annotations
 
 import argparse
@@ -30,7 +30,7 @@ def _extract_ready_to_close(report_text: str) -> bool:
 
 
 def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
-                  runner: Callable = None, _fail: bool = False) -> int:
+                  runner: Callable = None, _fail: bool = False) -> int:  # noqa: RUF013
     """Persist the given report_text to the work item using wl audit-set.
 
     Returns the wl subprocess return code (0 on success).

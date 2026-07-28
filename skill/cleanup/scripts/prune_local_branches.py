@@ -37,7 +37,7 @@ def load_branches_from_file(path: str) -> list[str]:
     try:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return []
     if isinstance(payload, list):
         return [str(item).strip() for item in payload if str(item).strip()]

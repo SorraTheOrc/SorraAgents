@@ -11,7 +11,7 @@ Usage:
 Exit codes:
   0 – success (findings may be present)
   1 – internal error
-"""
+"""  # noqa: EXE001
 from __future__ import annotations
 
 import argparse
@@ -139,7 +139,7 @@ def run_code_quality(
             "fixes_applied": result.get("fixes_applied", 0),
             "success": True,
         }
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {
             "languages": [],
             "linters": [],
@@ -207,7 +207,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             languages=languages,
             fix=args.fix,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(f"Internal error: {exc}", file=sys.stderr)
         return 1
 

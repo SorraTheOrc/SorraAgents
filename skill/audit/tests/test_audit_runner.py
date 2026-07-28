@@ -5,7 +5,7 @@ Tests cover:
   - _detect_project_root() git-root detection and fallback
   - _default_debug_log_path() using TARGET_PROJECT_ROOT
   - Code quality invocation passing TARGET_PROJECT_ROOT as project_root
-"""
+"""  # noqa: EXE001
 from __future__ import annotations
 
 import json

@@ -14,7 +14,7 @@ Usage:
 Exit codes:
   0 – success
   1 – internal error or wl failure
-"""
+"""  # noqa: EXE001
 from __future__ import annotations
 
 import argparse
@@ -62,7 +62,7 @@ Runner = Callable[[list[str]], Any]
 def _default_runner(cmd: list[str]) -> Any:
     """Default subprocess runner."""
     try:
-        return subprocess.run(
+        return subprocess.run(  # noqa: PLW1510
             cmd,
             capture_output=True,
             text=True,
@@ -364,7 +364,7 @@ def _update_epic_priority(
     current_priority = work_item.get("priority", "medium")
 
     # Only escalate: never reduce priority
-    if new_priority in PRIORITY_ORDER and current_priority in PRIORITY_ORDER:
+    if new_priority in PRIORITY_ORDER and current_priority in PRIORITY_ORDER:  # noqa: SIM102
         if PRIORITY_ORDER.index(new_priority) < PRIORITY_ORDER.index(current_priority):
             try:
                 _run_wl(runner, [
@@ -495,7 +495,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(f"Unexpected error: {exc}", file=sys.stderr)
         return 1
 

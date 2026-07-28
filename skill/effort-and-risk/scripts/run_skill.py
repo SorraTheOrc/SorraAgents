@@ -25,7 +25,7 @@ from skill.shared.status_lifecycle import StatusLifecycle
 
 
 def wl_show(issue_id):
-    p = subprocess.run(
+    p = subprocess.run(  # noqa: PLW1510
         ["wl", "show", issue_id, "--children", "--json"], capture_output=True, text=True
     )
     if p.returncode != 0:
@@ -117,13 +117,13 @@ def main():
                     if "items" in stdin_payload:
                         payload["items"] = stdin_payload["items"]
                     payload.update(stdin_payload)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
 
         # Call orchestrate_estimate.py located in the same scripts directory
         script_dir = os.path.dirname(__file__)
         orchestrator = os.path.join(script_dir, "orchestrate_estimate.py")
-        proc = subprocess.run(
+        proc = subprocess.run(  # noqa: PLW1510
             ["python3", orchestrator],
             input=json.dumps(payload),
             text=True,

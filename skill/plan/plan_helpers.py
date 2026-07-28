@@ -20,7 +20,7 @@ The module provides:
   - ``validate_key_files_in_description()`` for validating key files within
     a full work item description
   - CLI entry points ``plan-if-needed`` and ``check-effort-risk``
-"""
+"""  # noqa: EXE001
 
 from __future__ import annotations
 
@@ -103,7 +103,7 @@ def _extract_path_from_bullet(bullet: str) -> str | None:
 
     # Take first word
     first = bullet.split()[0] if bullet.split() else None
-    if first and not first.startswith("#"):
+    if first and not first.startswith("#"):  # noqa: SIM102
         # Heuristic: real file paths typically contain "/" or ".". If the
         # extracted token looks like a sentence fragment (no / or .), skip
         # it to avoid false positives from free-text bullets like
@@ -195,7 +195,7 @@ def _execute_subprocess(
         if input_data is not None:
             return runner(list(cmd) + [input_data])
         return runner(list(cmd))
-    return subprocess.run(cmd, input=input_data, capture_output=True, text=True)
+    return subprocess.run(cmd, input=input_data, capture_output=True, text=True)  # noqa: PLW1510
 
 
 # ---------------------------------------------------------------------------

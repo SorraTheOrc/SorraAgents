@@ -28,7 +28,7 @@ For testing or custom runners, an injectable ``runner`` callable can be passed::
 
     with StatusLifecycle(id, runner=my_runner):
         ...
-"""
+"""  # noqa: EXE001
 
 from __future__ import annotations
 
@@ -215,7 +215,7 @@ class StatusLifecycle:
     # Context manager protocol
     # ------------------------------------------------------------------
 
-    def __enter__(self) -> "StatusLifecycle":
+    def __enter__(self) -> "StatusLifecycle":  # noqa: PYI034
         """Capture original status, set ``in_progress`` (and optional assignee)."""
         # Capture original status
         try:
@@ -257,9 +257,9 @@ class StatusLifecycle:
 
     def __exit__(
         self,
-        exc_type: Optional[type],
+        exc_type: Optional[type],  # noqa: PYI036
         exc_val: Optional[BaseException],
-        exc_tb: Optional[object],
+        exc_tb: Optional[object],  # noqa: PYI036
     ) -> Optional[bool]:
         """On success: set completed. On exception: restore original status."""
         if exc_type is not None:

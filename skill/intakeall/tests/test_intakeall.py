@@ -2122,7 +2122,7 @@ class TestIntakeSkipWhenNeedsInput:
 
         assert len(results) == 2
         # C should be marked as needs_input (not error, not intake_completed)
-        c_result = [r for r in results if r["id"] == SAMPLE_ITEM_C["id"]][0]
+        c_result = [r for r in results if r["id"] == SAMPLE_ITEM_C["id"]][0]  # noqa: RUF015
         assert c_result["outcome"] == "needs_input", \
             f"Expected needs_input, got {c_result['outcome']}"
         # A should still auto-complete

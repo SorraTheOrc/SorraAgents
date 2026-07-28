@@ -28,7 +28,7 @@ def test_intake_md_does_not_use_type_flag():
     # don't use the bare --type flag. The --issue-type flag is correct.
     for line_number, line in enumerate(content.splitlines(), start=1):
         stripped = line.strip()
-        if stripped.startswith("`wl") and "--type " in stripped:
+        if stripped.startswith("`wl") and "--type " in stripped:  # noqa: SIM102
             # Allow --issue-type but flag bare --type usage
             if "--issue-type" not in stripped:
                 raise AssertionError(

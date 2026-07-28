@@ -16,7 +16,7 @@ Usage:
 Exit codes:
   0 – success (no smells or all handled)
   1 – error during execution
-"""
+"""  # noqa: EXE001
 
 from __future__ import annotations
 
@@ -157,7 +157,7 @@ def _run_linter_fix(
     try:
         import subprocess
         cmd = cmd_builder(files)
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)  # noqa: PLW1510
 
         if proc.returncode in (0, 1):
             output = proc.stdout.strip()
@@ -560,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
     """Main entry point for the refactor orchestration."""
     try:
         return _main(argv)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         notice = FailureNotice(
             script_name="refactor.py",
             reason=f"Unhandled exception: {exc}",

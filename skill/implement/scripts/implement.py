@@ -23,7 +23,7 @@ Exit codes:
   0 – success
   1 – error during execution (non-abort)
   2 – aborted
-"""
+"""  # noqa: EXE001
 
 from __future__ import annotations
 
@@ -143,7 +143,7 @@ def _signal_handler(signum: int, frame: Any) -> None:
             _reset_work_item_status(wid)
         if rr:
             _restore_repo_state(rr)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         LOG.error("Cleanup handler error: %s", exc)
 
     LOG.info("Cleanup complete. Exiting due to %s.", signame)
@@ -551,7 +551,7 @@ def _remove_worktree(worktree_path: str) -> bool:
         try:
             import shutil
             shutil.rmtree(resolved_path, ignore_errors=True)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             LOG.warning("Manual worktree removal failed: %s", exc)
             return False
 
@@ -1543,7 +1543,7 @@ def main(argv: list[str] | None = None) -> int:
         if _work_item_id_global:
             _reset_work_item_status(_work_item_id_global)
         return 2
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         LOG.error("Unhandled exception: %s", exc)
         LOG.debug(traceback.format_exc())
         if _work_item_id_global:

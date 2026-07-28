@@ -73,7 +73,7 @@ def _is_npm_test_command(parts: list[str]) -> bool:
 
     if npm_args[0] == "test":
         return True
-    if npm_args[0] in {"run", "run-script"} and len(npm_args) >= 2 and npm_args[1].startswith("test"):
+    if npm_args[0] in {"run", "run-script"} and len(npm_args) >= 2 and npm_args[1].startswith("test"):  # noqa: SIM103
         return True
     return False
 

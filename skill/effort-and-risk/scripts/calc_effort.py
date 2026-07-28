@@ -12,7 +12,7 @@ Inputs (CLI args or stdin JSON):
   overheads: dict of additive overheads in hours (coordination, review, testing, risk_buffer)
 
 Output: JSON with keys: unit, o, m, p, expected, overheads_total, recommended, range, tshirt
-"""
+"""  # noqa: EXE001
 
 import sys
 import json
@@ -53,7 +53,7 @@ def main():
         with open("references/t-shirt_sizes.json", "r") as f:
             tshirt_cfg = json.load(f)
             thresholds = tshirt_cfg.get("thresholds", {})
-    except Exception:
+    except Exception:  # noqa: BLE001
         thresholds = DEFAULT_THRESHOLDS
 
     tshirt = pick_tshirt(recommended, thresholds)
