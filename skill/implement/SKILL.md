@@ -148,7 +148,7 @@ Verify:
 If the gate fails:
 
 1. `wl update <work-item-id> --status open --json`
-2. If not well-defined → run intake interview (see `command/intake.md`).
+2. If not well-defined → run intake interview (see `skill/intake/SKILL.md`).
 3. If too large → run plan interview (`/skill:plan`) to decompose.
 4. Inform the user and ask if they want to restart implementation review.
 

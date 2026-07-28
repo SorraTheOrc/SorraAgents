@@ -263,8 +263,8 @@ class IntakeAllEngine:
             result["error_detail"] = f"Claim failed: {exc}"
             return result
 
-        # Invoke /intake via pi (canonical pattern: pi -p --mode json <prompt>)
-        intake_cmd = ["pi", "-p", "--mode", "json", f"/intake {item_id}"]
+        # Invoke /skill:intake via pi (canonical pattern: pi -p --mode json <prompt>)
+        intake_cmd = ["pi", "-p", "--mode", "json", f"/skill:intake {item_id}"]
         logger.debug("intakeall.intake.invoke cmd=%s", " ".join(intake_cmd))
         try:
             intake_result = self.runner(intake_cmd, timeout=self.item_timeout)

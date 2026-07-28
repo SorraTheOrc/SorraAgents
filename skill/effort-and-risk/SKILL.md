@@ -19,7 +19,7 @@ Produce a machine-readable engineering estimate (effort + risk) and human-readab
 
 ## Gating
 
-Issue MUST be in `intake_complete` or `plan_complete` stage. If not, refuse with: "The issue does not have a sufficiently detailed plan... Run the intake command with `/intake <issue-id>` or the plan command with `/skill:plan <issue-id>`." No other output on refusal.
+Issue MUST be in `intake_complete` or `plan_complete` stage. If not, refuse with: "The issue does not have a sufficiently detailed plan... Run the intake skill with `/skill:intake <issue-id>` or the plan command with `/skill:plan <issue-id>`." No other output on refusal.
 
 ## Orchestrator
 

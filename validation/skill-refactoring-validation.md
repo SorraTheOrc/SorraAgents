@@ -26,7 +26,7 @@
 | File | Lines | Bytes (KB) | Purpose |
 |------|-------|-----------|---------|
 | `command/plan.md` | 375 | 26.3 KB | Command counterpart for plan skill |
-| `command/intake.md` | 200 | 12.3 KB | Command counterpart for intake skill |
+| ~~`command/intake.md`~~ | ~~200~~ | ~~12.3 KB~~ | Command counterpart for intake skill — migrated to `skill/intake/SKILL.md` (SA-0MS3CIU0F00066CD) |
 | `command/refactor.md` | 82 | 3.3 KB | Command counterpart for refactor skill |
 | `AGENTS.md` | 312 | 16.2 KB | Project-wide policies & workflow steps |
 
@@ -131,7 +131,7 @@ The remaining 4 skill files (implement, audit, ship, implement-single) do NOT ha
 | `skill/ship/SKILL.md` | No | — |
 | `skill/implement-single/SKILL.md` | No | — |
 
-> **Note:** The epic description identifies these command↔skill pairs: `command/plan.md` ↔ `skill/plan/SKILL.md`, `command/intake.md` ↔ `skill/intakeall/SKILL.md`, `command/refactor.md` ↔ `skill/refactor/SKILL.md`, `command/author_skill.md` ↔ `skill/author-command/SKILL.md`. Of these, only `plan/SKILL.md` is among the 5 largest files.
+> **Note:** The epic description identifies these command↔skill pairs: `command/plan.md` ↔ `skill/plan/SKILL.md`, ~~`command/intake.md`~~ ↔ `skill/intake/SKILL.md` (migrated in SA-0MS3CIU0F00066CD, replaced `skill/intakeall/SKILL.md` mapping), `command/refactor.md` ↔ `skill/refactor/SKILL.md`, `command/author_skill.md` ↔ `skill/author-command/SKILL.md`. Of these, only `plan/SKILL.md` is among the 5 largest files.
 
 ---
 
@@ -143,7 +143,7 @@ The remaining 4 skill files (implement, audit, ship, implement-single) do NOT ha
 |---|---|---|
 | `[AGENTS.md](../../AGENTS.md#implement-the-work-item)` | Outbound | Step 3 (worktree section) |
 | `[[concepts/git-worktree-best-practices-for-agent-workflows]]` | Wiki link | Best Practices + Step 7 |
-| `command/intake.md` | Command reference | Definition gate (step 1.1) |
+| ~~`command/intake.md`~~ → `skill/intake/SKILL.md` | Skill reference | Definition gate (step 1.1) — updated in SA-0MS3CIU0F00066CD |
 | `command/plan.md` | Command reference | Definition gate (step 1.1) |
 | `../refactor/SKILL.md` | Skill reference | Optional refactor step |
 | `../ship/scripts/ship.js` | Script reference | Step 7 push instructions |

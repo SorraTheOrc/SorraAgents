@@ -19,7 +19,7 @@ cross-references, and capture baseline test suite results.
 | File | Size (bytes) | Lines | Sections (H1/H2/H3+) | YAML Frontmatter |
 |------|-------------|-------|---------------------|-----------------|
 | `command/plan.md` | 26,252 | 375 | 14 sections | 2 blocks |
-| `command/intake.md` | 18,832 | 232 | 14 sections | 2 blocks |
+| ~~`command/intake.md`~~ | ~~18,832~~ | ~~232~~ | ~~14 sections~~ | ~~2 blocks~~ (migrated to `skill/intake/SKILL.md` — SA-0MS3CIU0F00066CD) |
 | `command/author_skill.md` | 16,028 | 216 | 19 sections | 2 blocks |
 | `command/review.md` | 12,323 | 197 | 8 sections | 2 blocks |
 | `command/refactor.md` | 3,285 | 82 | 8 sections | 2 blocks |
@@ -46,23 +46,13 @@ cross-references, and capture baseline test suite results.
 | 343 | Examples | H2 |
 | 350 | Appendix: Clarifying questions & answers | H2 |
 
-#### command/intake.md (232 lines, 18,832 bytes)
+#### ~~command/intake.md~~ (migrated to `skill/intake/SKILL.md`)
+
+The file `command/intake.md` has been migrated to `skill/intake/SKILL.md` as part of SA-0MS3CIU0F00066CD. The new skill file follows the established directory pattern:
 
 | Line | Heading | Level |
 |------|---------|-------|
-| 11 | Description | H2 |
-| 16 | Inputs | H2 |
-| 22 | Results and Outputs | H2 |
-| 28 | Behavior | H2 |
-| 32 | Hard requirements | H2 |
-| 47 | Status lifecycle (first action) | H2 |
-| 55 | Process (must follow) | H2 |
-| 169 | Objective | H1 |
-| 173 | Acceptance Criteria | H1 |
-| 187 | Effort and Risk | H1 |
-| 193 | Traceability & idempotence | H2 |
-| 197 | Editing rules & safety | H2 |
-| 204 | Appendix: Clarifying questions & answers | H2 |
+| ... | (see `skill/intake/SKILL.md`) | ... |
 
 #### command/author_skill.md (216 lines, 16,028 bytes)
 
@@ -146,34 +136,25 @@ cross-references, and capture baseline test suite results.
 
 **Recommendation:** Make command/plan.md reference skill/plan/SKILL.md as canonical source and strip duplicated content.
 
-### 2.2 Pair: command/intake.md ↔ skill/intakeall/SKILL.md
+### 2.2 ~~command/intake.md~~ ↔ ~~skill/intakeall/SKILL.md~~ (historical)
+
+`command/intake.md` has been migrated to `skill/intake/SKILL.md` as part of SA-0MS3CIU0F00066CD. The overlap analysis below is preserved for historical reference.
 
 **Overlap Assessment: LOW (~20% content overlap)**
 
-| Section | command/intake.md | skill/intakeall/SKILL.md | Verdict |
-|---------|-------------------|-------------------------|---------|
-| Description | Lines 11-15 | — | Command-only |
-| Inputs | Lines 16-21 | — | Command-only |
-| Results and Outputs | Lines 22-27 | — (skill has "Output" at line 34, different content) | Different |
-| Behavior | Lines 28-31 | Lines 10-20 | Different focus |
-| Hard requirements | Lines 32-46 | — | Command-only |
-| Status lifecycle | Lines 47-54 | — | Command-only |
-| Process (must follow) | Lines 55-168 | — (skill has auto-complete criteria, needs-input detection, etc.) | Different |
-| Acceptance Criteria | Lines 173-186 | — | Template/workflow example content |
-| — | — | Auto-complete criteria | Skill-only |
-| — | — | Needs-input detection | Skill-only |
-| — | — | Orphan recovery | Skill-only |
-| — | — | Signal handling | Skill-only |
-| — | — | CLI flags | Skill-only |
-| Scripts | — | Lines 171-175 | Skill-only |
-| Related skills | — | Line 176 | Skill-only |
+| Section | ~~command/intake.md~~ | skill/intakeall/SKILL.md | Verdict |
+|---------|---------------------|-------------------------|---------|
+| Description | — | — | N/A (command removed) |
+| Inputs | — | — | N/A (command removed) |
+| Results and Outputs | — | (skill has "Output" section) | N/A |
+| Behavior | — | Lines 10-20 | N/A |
 
 **Key differences:**
 
-- command/intake.md is the live interview process for gathering requirements and writing work items
+- ~~command/intake.md~~ (now `skill/intake/SKILL.md`) is the live interview process for gathering requirements and writing work items
 - skill/intakeall/SKILL.md is an orchestrator that runs intake across multiple items, with batch-processing concerns
 
-**Recommendation:** These files are genuinely different (one is the interview protocol, the other is a batch orchestrator). Low deduplication opportunity.
+**Recommendation:** These files were genuinely different. Low deduplication opportunity.
 
 ### 2.3 Pair: command/refactor.md ↔ skill/refactor/SKILL.md
 
@@ -229,7 +210,7 @@ cross-references, and capture baseline test suite results.
 | `command/plan.md` | `skill/plan/SKILL.md` | 14 | Reference (declares skill as canonical) |
 | `command/plan.md` | `skill/plan/plan_helpers.py` | 74 | Reference (pre-check helper) |
 | `command/plan.md` | `command/plan_helpers.py` | 86 | Reference (legacy delegation wrapper) |
-| `command/intake.md` | `skill/ship/scripts/...` | 181 | Reference (CHANGELOG.md management) |
+| ~~`command/intake.md`~~ | `skill/ship/scripts/...` | 181 | Reference (CHANGELOG.md management) — migrated to `skill/intake/SKILL.md` |
 | `command/author_skill.md` | `command/plan.md` | 135 | Reference (follow plan process) |
 
 ### 3.2 From Skill Files to Command Files
@@ -237,9 +218,9 @@ cross-references, and capture baseline test suite results.
 | Source File | Target | Line | Type |
 |-------------|--------|------|------|
 | `skill/planall/SKILL.md` | `command/plan.md` | 140 | Reference (invokes plan for each item) |
-| `skill/implement/SKILL.md` | `command/intake.md` | 176 | Reference (intake interview) |
+| `skill/implement/SKILL.md` | ~~`command/intake.md`~~ → `skill/intake/SKILL.md` | 176 | Reference (intake interview) — updated in SA-0MS3CIU0F00066CD |
 | `skill/implement/SKILL.md` | `command/plan.md` | 177 | Reference (plan interview) |
-| `skill/intakeall/SKILL.md` | `command/intake.md` | 178 | Reference (invokes intake for each item) |
+| `skill/intakeall/SKILL.md` | ~~`command/intake.md`~~ → `skill/intake/SKILL.md` | 178 | Reference (invokes intake for each item) — updated in SA-0MS3CIU0F00066CD |
 
 ### 3.3 Cross-Reference Map Summary
 
@@ -250,9 +231,9 @@ command/plan.md ──────► skill/plan/SKILL.md
                         ▲
 skill/planall/SKILL.md ─┘
 
-command/intake.md ────► skill/ship/scripts/... (transitive reference)
-skill/intakeall/SKILL.md ──► command/intake.md
-skill/implement/SKILL.md ──► command/intake.md
+~~command/intake.md~~ ────► skill/ship/scripts/... (transitive reference) — removed in SA-0MS3CIU0F00066CD
+skill/intakeall/SKILL.md ──► ~~command/intake.md~~ → skill/intake/SKILL.md (updated)
+skill/implement/SKILL.md ──► ~~command/intake.md~~ → skill/intake/SKILL.md (updated)
                         ──► command/plan.md
 
 command/author_skill.md ──► command/plan.md

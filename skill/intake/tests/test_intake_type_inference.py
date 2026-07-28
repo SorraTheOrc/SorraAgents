@@ -1,7 +1,7 @@
-"""Tests for type inference and flag correction in command/intake.md.
+"""Tests for type inference and flag correction in skill/intake/SKILL.md.
 
 Verifies that:
-- The --type flag is no longer used (only --issue-type)
+- The --issue-type flag is used (not --type)
 - The work item creation step includes type inference logic
 - Existing items have their issueType reviewed/corrected on re-intake
 """
@@ -9,15 +9,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-INTAKE_MD = REPO_ROOT / "command" / "intake.md"
+REPO_ROOT = Path(__file__).resolve().parents[3]  # <repo>/skill/intake/tests/
+INTAKE_MD = REPO_ROOT / "skill" / "intake" / "SKILL.md"
 
 
 def test_intake_md_uses_issue_type_flag():
     """The incorrect --type flag must be replaced with --issue-type."""
     content = INTAKE_MD.read_text()
     assert "--issue-type" in content, (
-        "command/intake.md must use --issue-type flag instead of --type"
+        "skill/intake/SKILL.md must use --issue-type flag instead of --type"
     )
 
 
@@ -49,7 +49,7 @@ def test_intake_md_has_type_inference_instructions():
     ]
     found = any(marker.lower() in content.lower() for marker in section_markers)
     assert found, (
-        "command/intake.md must include instructions for inferring the issue type "
+        "skill/intake/SKILL.md must include instructions for inferring the issue type "
         "from the seed intent or user-provided context"
     )
 
@@ -61,7 +61,7 @@ def test_intake_md_instructs_type_inference_mapping():
     type_mentions = sum(1 for t in ["bug", "feature", "chore", "task", "epic"]
                         if t in content.lower())
     assert type_mentions >= 3, (
-        "command/intake.md must reference at least 3 of the supported "
+        "skill/intake/SKILL.md must reference at least 3 of the supported "
         "issue types (bug, feature, chore, task, epic) in the inference logic"
     )
 
@@ -79,6 +79,6 @@ def test_intake_md_corrects_existing_item_type():
     # Check in the context of the Work Item prep section or similar
     found = any(marker.lower() in content.lower() for marker in correction_markers)
     assert found, (
-        "command/intake.md must include instructions for reviewing and correcting "
+        "skill/intake/SKILL.md must include instructions for reviewing and correcting "
         "the issueType of an existing work item during re-intake"
     )
