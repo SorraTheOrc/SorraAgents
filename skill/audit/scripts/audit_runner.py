@@ -401,8 +401,17 @@ def _resolve_model_for_phase(phase: str, config: dict,
 # ---------------------------------------------------------------------------
 
 def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
-             pi_bin: str = "pi") -> dict:
+             pi_bin: str = "pi",
+             enable_tools: bool = False) -> dict:
     """Call Pi via subprocess and parse the JSON-stream response.
+
+    Args:
+        prompt: The prompt text to send to Pi.
+        model: The model name to use.
+        pi_bin: Path to the pi binary.
+        enable_tools: If True, adds ``--tools read,bash,grep,find,ls
+                       --exclude-tools ask_question`` to enable file-reading
+                       capabilities in the Pi agent session.
 
     Returns a dict with keys ``verdict`` and ``evidence``.
     On success, implementations may also include additional diagnostic keys
@@ -414,6 +423,11 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     Uses ``communicate()`` to avoid pipe-buffer deadlocks.
     """
     cmd = [pi_bin, "-p", "--mode", "json", "--model", model, prompt]
+    if enable_tools:
+        cmd.extend([
+            "--tools", "read,bash,grep,find,ls",
+            "--exclude-tools", "ask_question",
+        ])
     try:
         process = subprocess.Popen(
             cmd,

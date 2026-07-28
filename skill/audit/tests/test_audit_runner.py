@@ -254,3 +254,96 @@ class TestCodeQualityUsesTargetProjectRoot:
         assert kwargs["project_root"] is audit_runner.TARGET_PROJECT_ROOT
         # The argument identity check ensures the code uses the module-level
         # constant rather than a copy or other value.
+
+
+# ===========================================================================
+# _call_pi enable_tools parameter tests
+# ===========================================================================
+
+
+class TestCallPiEnableTools:
+    """Tests for _call_pi() enable_tools parameter (AC1-AC5)."""
+
+    def _make_mock_popen(self, stdout_text: str = "{\"text\": \"test\"}"):
+        """Create a mock Popen that returns a process-like object."""
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (stdout_text, "")
+        mock_process.returncode = 0
+        return mock_process
+
+    def test_command_includes_tools_when_enable_tools_true(self):
+        """AC1: _call_pi() adds --tools flags when enable_tools=True.
+
+        Mocks ``subprocess.Popen`` and asserts the constructed command
+        includes ``--tools read,bash,grep,find,ls --exclude-tools ask_question``.
+        """
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            audit_runner._call_pi("test prompt", model="test-model", enable_tools=True)
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]  # The command list
+        assert "--tools" in args
+        tools_idx = args.index("--tools")
+        assert args[tools_idx + 1] == "read,bash,grep,find,ls"
+        assert "--exclude-tools" in args
+        exclude_idx = args.index("--exclude-tools")
+        assert args[exclude_idx + 1] == "ask_question"
+
+    def test_command_unchanged_when_enable_tools_false(self):
+        """AC2: _call_pi() does NOT add --tools when enable_tools=False (default)."""
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            audit_runner._call_pi("test prompt", model="test-model")
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--tools" not in args
+        assert "--exclude-tools" not in args
+        # Standard flags are present
+        assert args[0] == "pi"
+        assert args[1] == "-p"
+        assert args[2] == "--mode"
+        assert args[3] == "json"
+
+    def test_default_enable_tools_is_false(self):
+        """AC3: Default value of enable_tools is False (backward compatible)."""
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            audit_runner._call_pi("test prompt", model="test-model")
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert "--tools" not in args
+
+    def test_existing_callers_unchanged(self):
+        """AC4: Existing callers work without modification (default enable_tools=False).
+
+        Verifies the default command structure matches current behavior.
+        """
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+            # Call with the same signature as existing callers use
+            audit_runner._call_pi("test prompt", model="test-model", pi_bin="pi")
+
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert args == ["pi", "-p", "--mode", "json", "--model", "test-model", "test prompt"]
+
+    def test_timeout_handling_unchanged(self):
+        """AC5: Timeout handling remains unchanged when enable_tools=True."""
+        mock_process = mock.MagicMock()
+        # First communicate() raises TimeoutExpired, second returns normally
+        timeout_error = subprocess.TimeoutExpired(cmd="pi", timeout=10, output="", stderr="")
+        mock_process.communicate.side_effect = [timeout_error, ("", "")]
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process):
+            result = audit_runner._call_pi("test prompt", model="test-model", enable_tools=True)
+
+        assert result.get("_timeout") is True
+        assert result.get("verdict") == "unmet"
+        assert "timed out" in result.get("evidence", "")
