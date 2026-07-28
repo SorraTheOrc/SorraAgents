@@ -70,4 +70,4 @@ The following skills use `FailureNotice` to surface script execution failures:
 - `skill/effort-and-risk/scripts/orchestrate_estimate.py`
 - `skill/triage/scripts/check_or_create.py`
 - `skill/refactor/scripts/refactor.py`
-- `skill/ralph/scripts/ralph_loop.py`
+

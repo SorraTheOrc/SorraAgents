@@ -3,7 +3,6 @@
 Written before the implementation exists (TDD).
 """
 
-import pytest
 
 from skill.plan.plan_helpers import validate_key_files_format, validate_key_files_in_description
 

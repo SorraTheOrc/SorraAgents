@@ -150,6 +150,26 @@ describe('isBranchBlocked', () => {
   test('BLOCKED_BRANCHS contains main', () => {
     assert.ok(BLOCKED_BRANCHS.includes('main'));
   });
+
+  test('blocks push to worklog/data (prefix match)', () => {
+    assert.equal(isBranchBlocked('worklog/data'), true);
+  });
+
+  test('blocks push to worklog/remotes/origin/worklog/data (prefix match)', () => {
+    assert.equal(isBranchBlocked('worklog/remotes/origin/worklog/data'), true);
+  });
+
+  test('blocks any branch starting with worklog/ (prefix match)', () => {
+    assert.equal(isBranchBlocked('worklog/something-else'), true);
+  });
+
+  test('allows push to normal agent branches (not worklog/)', () => {
+    assert.equal(isBranchBlocked('wl-SA-001-feature'), false);
+  });
+
+  test('BLOCKED_BRANCHS contains worklog/ prefix pattern', () => {
+    assert.ok(BLOCKED_BRANCHS.includes('worklog/'));
+  });
 });
 
 // ── BRANCH_NAME_PATTERN export ──────────────────────────────────────────────

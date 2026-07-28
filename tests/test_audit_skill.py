@@ -21,7 +21,8 @@ def test_persist_audit_calls_wl_update_with_report():
 
     rc = persist_audit("SA-TEST", "Ready to close: Yes\nDetails", runner=fake_runner)
     assert rc == 0
-    assert len(calls) == 1
+    # persist_audit now does two wl calls: audit-set + update --audit-text
+    assert len(calls) == 2
     cmd = calls[0]
     # ensure wl audit-set was invoked
     assert cmd[:3] == ["wl", "audit-set", "SA-TEST"]
@@ -31,6 +32,11 @@ def test_persist_audit_calls_wl_update_with_report():
     raw_idx = cmd.index("--raw-output")
     assert cmd[raw_idx + 1] == "Ready to close: Yes\nDetails"
     assert cmd[-1] == "--json"
+    # ensure wl update --audit-text was invoked
+    cmd2 = calls[1]
+    assert cmd2[:3] == ["wl", "update", "SA-TEST"]
+    assert "--audit-text" in cmd2
+    assert cmd2[-1] == "--json"
 
 
 def test_persist_audit_returns_nonzero_on_wl_failure():

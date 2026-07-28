@@ -13,10 +13,10 @@ setup() {
   export TEST_DIR
   
   # Redirect XDG_CONFIG_HOME so the installer's global default
-  # (${XDG_CONFIG_HOME}/opencode/.worklog/plugins) resolves inside TEST_DIR.
+  # (${XDG_CONFIG_HOME}/pi/.worklog/plugins) resolves inside TEST_DIR.
   export XDG_CONFIG_HOME="$TEST_DIR/xdg"
   # The expected global target directory when XDG_CONFIG_HOME is set
-  GLOBAL_TARGET="$XDG_CONFIG_HOME/opencode/.worklog/plugins"
+  GLOBAL_TARGET="$XDG_CONFIG_HOME/pi/.worklog/plugins"
   export GLOBAL_TARGET
   
   # Create necessary test subdirectories
@@ -28,7 +28,7 @@ setup() {
   cd "$TEST_DIR"
   
   # Copy the installer script to test directory (use current user's repo path)
-  cp /home/rgardler/.config/opencode/skill/install-ampa/scripts/install-worklog-plugin.sh ./install-test.sh
+  cp /home/rgardler/.config/pi/skill/install-ampa/scripts/install-worklog-plugin.sh ./install-test.sh
   
   # Make it executable
   chmod +x ./install-test.sh

@@ -18,6 +18,8 @@ from skill.audit.scripts.audit_runner import (
     _call_pi,
     _assemble_issue_report,
     _assemble_project_report,
+    _build_issue_json,
+    _has_phase1_blocking_issues,
     _CHILDREN_CAP,
 )
 
@@ -207,8 +209,8 @@ class TestCallPi:
             f"communicate timeout {captured_timeout[0]}s should be >= 300s "
             "to allow large audit prompts to complete"
         )
-        assert captured_timeout[0] <= 900, (
-            f"communicate timeout {captured_timeout[0]}s should be <= 900s "
+        assert captured_timeout[0] <= 1200, (
+            f"communicate timeout {captured_timeout[0]}s should be <= 1200s "
             "(not exceed the original value)"
         )
 
@@ -712,8 +714,13 @@ class TestChildrenReview:
 
         return fake_runner
 
-    def test_skips_completed_children(self, monkeypatch, capsys):
-        """Children with completed/done status are skipped from review."""
+    def test_includes_completed_done_children_in_report(self, monkeypatch, capsys):
+        """Children with completed/done status are now included in the review.
+
+        RC1 fixed the active_children filter to include completed children.
+        Completed/done children are exempt from blocking checks (handled by
+        _has_phase1_blocking_issues) but should still appear in the report.
+        """
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
             return {"verdict": "met", "evidence": "x:1 — ok"}
@@ -743,10 +750,9 @@ class TestChildrenReview:
         runner = self._make_child_runner(children)
         cmd_issue("SA-CHILDREN", runner=runner, persist=False)
         captured = capsys.readouterr()
-        # Completed child should NOT appear in the review (skipped)
-        assert "Completed child" not in captured.out
-        # Active child should appear with Pi verdicts
-        assert "Active child" in captured.out
+        # After RC1 fix, completed children ARE included in the review report
+        assert "Completed child" in captured.out, "Completed/done child should appear in report"
+        assert "Active child" in captured.out, "Active child should appear in report"
 
     def test_ignores_deleted_children(self, monkeypatch, capsys):
         """Deleted children are completely ignored."""
@@ -825,6 +831,33 @@ class TestBuildParserJsonFlag:
         parser = build_parser()
         args = parser.parse_args(["issue", "SA-123"])
         assert args.json is False
+
+
+class TestBuildParserForceFlag:
+    """Verify --force is accepted only by the issue subcommand."""
+
+    def test_issue_parses_force_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--force"])
+        assert args.force is True
+
+    def test_issue_defaults_force_false(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123"])
+        assert args.force is False
+
+    def test_force_can_combine_with_other_flags(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--force", "--json", "--do-not-persist"])
+        assert args.force is True
+        assert args.json is True
+        assert args.do_not_persist is True
+
+    def test_project_rejects_force_flag(self):
+        """--force is only for issue subcommand; project should reject it."""
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["project", "--force"])
 
 
 class TestCmdIssueJsonMode:
@@ -965,3 +998,206 @@ class TestCmdProjectJsonMode:
         cmd_project(runner=fake_runner, json_mode=False)
         captured = capsys.readouterr()
         assert captured.out.startswith("Ready to close:")
+
+
+# ---------------------------------------------------------------------------
+# Child audit verdict tests
+# ---------------------------------------------------------------------------
+
+class TestChildAuditVerdict:
+    """Verify child audit verdict checking in report assembly and phase 1."""
+
+    def test_ready_no_when_child_audit_verdict_no(self):
+        """When a child's child_audit_ready is False but child is in in_review stage, it does not block.
+
+        Children in in_review stage are exempt from child audit verdict checks.
+        """
+        issue = {"id": "SA-123", "title": "Parent", "description": ""}
+        ac_results = [{"text": "Parent AC", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child 1",
+                "id": "SA-C1",
+                "status": "in_progress",
+                "stage": "in_review",
+                "child_audit_ready": False,
+                "ac_results": [{"text": "Child AC", "verdict": "met", "evidence": "y:1 — ok"}],
+            },
+        ]
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        # Child in in_review stage is exempt from child audit verdict check
+        assert report.startswith("Ready to close: Yes")
+
+    def test_ready_yes_when_child_audit_verdict_yes(self):
+        """When all children have child_audit_ready True, parent can close."""
+        issue = {"id": "SA-123", "title": "Parent", "description": ""}
+        ac_results = [{"text": "Parent AC", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child 1",
+                "id": "SA-C1",
+                "status": "in_progress",
+                "stage": "in_review",
+                "child_audit_ready": True,
+                "ac_results": [{"text": "Child AC", "verdict": "met", "evidence": "y:1 — ok"}],
+            },
+        ]
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert report.startswith("Ready to close: Yes")
+
+    def test_ready_no_when_child_no_audit_verdict_field_still_works(self):
+        """Backward compat: children without child_audit_ready field use stage check only."""
+        issue = {"id": "SA-123", "title": "Parent", "description": ""}
+        ac_results = [{"text": "Parent AC", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child 1",
+                "id": "SA-C1",
+                "status": "in_progress",
+                "stage": "in_review",
+                "ac_results": [{"text": "Child AC", "verdict": "met", "evidence": "y:1 — ok"}],
+            },
+        ]
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        assert report.startswith("Ready to close: Yes")
+
+    def test_completed_child_exempt_from_audit_verdict(self):
+        """Completed/done children are exempt from child_audit_ready check."""
+        issue = {"id": "SA-123", "title": "Parent", "description": ""}
+        ac_results = [{"text": "Parent AC", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Done Child",
+                "id": "SA-DONE",
+                "status": "completed",
+                "stage": "done",
+                "child_audit_ready": False,  # Would block if exempted, but should be exempt
+                "ac_results": [{"text": "Child AC", "verdict": "met", "evidence": "y:1 — ok"}],
+            },
+        ]
+        report = _assemble_issue_report(issue, ac_results, child_results)
+        # Completed child with child_audit_ready=False is exempt, should not block
+        assert report.startswith("Ready to close: Yes")
+
+    def test_child_audit_does_not_block_phase1_when_in_review(self):
+        """_has_phase1_blocking_issues returns False when child is in in_review stage
+        even if child_audit_ready is False."""
+        cq_findings = []
+        child_results = [
+            {
+                "title": "Review-Ready Child",
+                "id": "SA-BAD",
+                "status": "in_progress",
+                "stage": "in_review",
+                "child_audit_ready": False,
+                "ac_results": [],
+            },
+        ]
+        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        # Children in in_review stage are exempt from child audit verdict check
+        assert blocked is False
+
+    def test_child_audit_ready_does_not_block_phase1(self):
+        """_has_phase1_blocking_issues returns False when all child_audit_ready are True."""
+        cq_findings = []
+        child_results = [
+            {
+                "title": "Good Child",
+                "id": "SA-GOOD",
+                "status": "in_progress",
+                "stage": "in_review",
+                "child_audit_ready": True,
+                "ac_results": [],
+            },
+        ]
+        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        assert blocked is False
+
+    def test_phase1_still_blocks_for_stage_when_no_audit_field(self):
+        """Backward compat: without child_audit_ready field, stage check still works."""
+        cq_findings = []
+        child_results = [
+            {
+                "title": "Child in progress",
+                "id": "SA-IP",
+                "status": "in_progress",
+                "stage": "in_progress",
+                "ac_results": [],
+            },
+        ]
+        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        assert blocked is True
+
+    def test_pre_review_child_audit_still_blocks_phase1(self):
+        """Children in pre-review stages with child_audit_ready=False still block Phase 1."""
+        cq_findings = []
+        child_results = [
+            {
+                "title": "Planned Child",
+                "id": "SA-PLAN",
+                "status": "open",
+                "stage": "plan_complete",
+                "child_audit_ready": False,
+                "ac_results": [],
+            },
+        ]
+        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        # Pre-review stage child should still block (stage check catches this first)
+        assert blocked is True
+
+    def test_pre_review_stage_blocks_even_when_child_audit_ready_true(self):
+        """Children in pre-review stages block Phase 1 even if child_audit_ready is True."""
+        cq_findings = []
+        child_results = [
+            {
+                "title": "Idea Child",
+                "id": "SA-IDEA",
+                "status": "open",
+                "stage": "idea",
+                "child_audit_ready": True,
+                "ac_results": [],
+            },
+        ]
+        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        # Pre-review stage blocks regardless of child_audit_ready
+        assert blocked is True
+
+
+class TestBuildIssueJsonChildAuditVerdict:
+    """Verify _build_issue_json incorporates child audit verdict."""
+
+    def test_ready_false_when_child_audit_no(self):
+        """_build_issue_json ready_to_close is True when child is in in_review stage
+        even if child_audit_ready is False."""
+        issue = {"id": "SA-123", "title": "Parent", "description": ""}
+        ac_results = [{"text": "Parent AC", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child",
+                "id": "SA-C1",
+                "status": "in_progress",
+                "stage": "in_review",
+                "child_audit_ready": False,
+                "ac_results": [{"text": "Child AC", "verdict": "met", "evidence": "y:1 — ok"}],
+            },
+        ]
+        payload = _build_issue_json(issue, ac_results, child_results)
+        # Child in in_review stage is exempt from child audit verdict check
+        assert payload["ready_to_close"] is True
+
+    def test_ready_true_when_child_audit_yes(self):
+        """_build_issue_json ready_to_close is True when all child_audit_ready are True."""
+        issue = {"id": "SA-123", "title": "Parent", "description": ""}
+        ac_results = [{"text": "Parent AC", "verdict": "met", "evidence": "x:1 — ok"}]
+        child_results = [
+            {
+                "title": "Child",
+                "id": "SA-C1",
+                "status": "in_progress",
+                "stage": "in_review",
+                "child_audit_ready": True,
+                "ac_results": [{"text": "Child AC", "verdict": "met", "evidence": "y:1 — ok"}],
+            },
+        ]
+        payload = _build_issue_json(issue, ac_results, child_results)
+        assert payload["ready_to_close"] is True

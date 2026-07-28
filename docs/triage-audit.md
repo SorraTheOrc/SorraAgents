@@ -4,10 +4,6 @@ This document explains the AMPA scheduler's audit post-processing (historically 
 
 References:
 
-- <https://github.com/opencode/ampa/blob/main/src/ampa/audit_poller.py> (candidate detection, cooldown filtering, selection)
-- <https://github.com/opencode/ampa/blob/main/src/ampa/audit/handlers.py> (descriptor-driven audit handlers: `audit_result`, `audit_fail`, `close_with_audit`)
-- <https://github.com/opencode/ampa/blob/main/src/ampa/audit/result.py> (audit result parser and dataclasses: `AuditResult`, `CriterionResult`, `ParseError`)
-- <https://github.com/opencode/ampa/blob/main/src/ampa/scheduler.py> (routing)
 - `tests/test_audit_poller.py` (poller unit tests)
 - `tests/test_audit_handlers.py` and `tests/test_scheduler_audit_routing.py` (integration and behavior tests)
 - `skill/audit/SKILL.md` (the `/audit` command itself)
@@ -17,8 +13,8 @@ References:
 The audit flow is organised around three responsibilities:
 
 - `audit_poller.py` — Detection and selection. Queries for `in_review` items, applies store-based cooldown filtering, selects the oldest eligible candidate, persists the `last_audit_at` timestamp, and hands off the selected candidate to a handoff handler.
-- AMPA audit handlers — Descriptor-driven handlers implementing the audit command lifecycle. Handlers run the audit (via `opencode run "/audit <id>"`), parse output using the audit result module, write structured `# AMPA Audit Result` comments, evaluate invariants, and apply descriptor effects (state transitions, tags, notifications). See <https://github.com/opencode/ampa/tree/main/src/ampa/audit>
-- AMPA audit result module — Parsing and typed models. Extracts the structured report between marker delimiters and returns a typed `AuditResult` or `ParseError` for handlers to consume. See <https://github.com/opencode/ampa/blob/main/src/ampa/audit/result.py>
+- AMPA audit handlers — Descriptor-driven handlers implementing the audit command lifecycle. Handlers run the audit (via `pi "/audit <id>"`), parse output using the audit result module, write structured `# AMPA Audit Result` comments, evaluate invariants, and apply descriptor effects (state transitions, tags, notifications).
+- AMPA audit result module — Parsing and typed models. Extracts the structured report between marker delimiters and returns a typed `AuditResult` or `ParseError` for handlers to consume.
 
 The scheduler's `start_command()` routes `wl-audit` commands through `poll_and_handoff()` and passes a handler adapter that delegates to the descriptor-driven handlers in the AMPA audit module.
 
@@ -37,7 +33,7 @@ The scheduler's `start_command()` routes `wl-audit` commands through `poll_and_h
    - The audit agent is expected to produce a **structured report** bounded by delimiter markers (see below).
 
 3. Parse the structured report
-   - Parsing is implemented in the AMPA audit result module. The parser extracts content between `--- AUDIT REPORT START ---` and `--- AUDIT REPORT END ---`, parses the `## Summary`, the Acceptance Criteria table (rows → `CriterionResult`), `## Recommendation`, and detects closure recommendation. See <https://github.com/opencode/ampa/blob/main/src/ampa/audit/result.py>
+   - Parsing is implemented in the AMPA audit result module. The parser extracts content between `--- AUDIT REPORT START ---` and `--- AUDIT REPORT END ---`, parses the `## Summary`, the Acceptance Criteria table (rows → `CriterionResult`), `## Recommendation`, and detects closure recommendation.
    - The parser returns a typed `AuditResult` with fields such as `summary`, `criteria`, `recommendation`, `audit_recommends_closure`, `raw_output`, and `report_text`. If the output is empty or malformed the parser returns a `ParseError`.
    - Handlers use the parsed `AuditResult` to produce the Worklog comment and to evaluate invariants that gate descriptor effects.
 
@@ -90,7 +86,7 @@ The audit agent should produce a structured report bounded by delimiter markers.
 --- AUDIT REPORT END ---
 ```
 
-The AMPA audit result parser (<https://github.com/opencode/ampa/blob/main/src/ampa/audit/result.py>) extracts the content between the markers and produces a typed `AuditResult` for handlers to consume.
+The AMPA audit result parser extracts the content between the markers and produces a typed `AuditResult` for handlers to consume.
 
 ## Output locations and formats
 

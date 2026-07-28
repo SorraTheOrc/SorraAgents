@@ -114,9 +114,12 @@ class TestPersistAuditFailFlag:
 
         rc = persist_audit("SA-TEST", report_text, wl_bin="wl", runner=fake_runner, _fail=False)
         assert rc == 0
-        assert len(persist_calls) == 1
+        # persist_audit now does two wl calls: audit-set + update --audit-text
+        assert len(persist_calls) == 2
         assert "audit-set" in persist_calls[0]
         assert "SA-TEST" in persist_calls[0]
+        assert "update" in persist_calls[1]
+        assert "--audit-text" in persist_calls[1]
 
     def test_persist_audit_normal_failure_returns_1(self, monkeypatch):
         """When wl update fails normally, return 1."""
@@ -179,6 +182,17 @@ class TestAuditRunnerReportOnPersistFailure:
         )
 
         def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItemId": "SA-SUCCESS",
+                    "audit": {
+                        "workItemId": "SA-SUCCESS",
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": "Ready to close: Yes\n\n## Summary\nOK.",
+                    },
+                }))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
 
         rc = cmd_issue("SA-SUCCESS", runner=fake_runner, persist=True)
@@ -205,6 +219,16 @@ class TestAuditRunnerReportOnPersistFailure:
         )
 
         def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                # Handle audit-show for both parent and child readback
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "audit": {
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": "Ready to close: Yes\n\n## Summary\nOK.",
+                    },
+                }))
             return _fake_proc(stdout=json.dumps(WI_WITH_CHILDREN))
 
         rc = cmd_issue("SA-PARENT", runner=fake_runner, persist=True)
@@ -286,6 +310,279 @@ class TestAuditRunnerReportOnPersistFailure:
 # Test: Exit codes are correct
 # ---------------------------------------------------------------------------
 
+class TestReadbackVerification:
+    """Tests for persist readback verification in cmd_issue.
+
+    After persist_audit() returns successfully, the runner must verify that
+    the stored audit is actually retrievable via ``wl audit-show --json``.
+    """
+
+    def test_successful_persist_and_readback_returns_0(self, monkeypatch, capsys):
+        """When persist succeeds and readback returns valid audit data, return 0."""
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+        persist_called = []
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            persist_called.append(issue_id)
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                # Return valid audit data for readback
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-READBACK-OK",
+                    "audit": {
+                        "workItemId": "SA-READBACK-OK",
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": "Ready to close: Yes\n\n## Summary\nAll good.",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-READBACK-OK", runner=fake_runner)
+        assert rc == 0
+        assert "SA-READBACK-OK" in persist_called
+
+    def test_failed_persist_returns_rc(self, monkeypatch, capsys):
+        """When persist_audit returns non-zero, the runner prints an error and returns that rc."""
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            return 7  # Simulate non-zero exit code
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-FAIL-PERSIST", runner=fake_runner)
+        assert rc == 7
+        captured = capsys.readouterr()
+        assert "Failed to persist" in captured.err
+        assert "SA-FAIL-PERSIST" in captured.err
+
+    def test_null_audit_readback_errors(self, monkeypatch, capsys):
+        """When readback returns null audit, print error and return 1."""
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-NULL",
+                    "audit": None,
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-NULL", runner=fake_runner)
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "no audit object found" in captured.err
+
+    def test_empty_raw_output_readback_errors(self, monkeypatch, capsys):
+        """When readback returns audit with empty rawOutput, print error and return 1."""
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-EMPTY",
+                    "audit": {
+                        "workItemId": "SA-EMPTY",
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": "",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-EMPTY", runner=fake_runner)
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "rawOutput is empty" in captured.err or "empty" in captured.err
+
+    def test_do_not_persist_skips_readback_too(self, monkeypatch, capsys):
+        """When persist=False, both persist_audit and post-persist readback are skipped.
+
+        Note: wl audit-show may still be called by the freshness gate at the start
+        of cmd_issue. The key assertion is that persist_audit is NOT called and
+        that an audit-show returning null does NOT trigger an error (which would
+        happen if the readback verification ran).
+        """
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+        persist_called = []
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            persist_called.append(issue_id)
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                # Return null audit - this would trigger an error if readback ran
+                return _fake_proc(stdout=json.dumps({"success": True, "audit": None}))
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-SKIP-ALL", runner=fake_runner, persist=False)
+        assert rc == 0
+        assert len(persist_called) == 0, "persist_audit should not be called when persist=False"
+
+    def test_readback_success_with_rawoutput_null_summary_fallback(self, monkeypatch, capsys):
+        """When rawOutput is null but summary has content, readback succeeds."""
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-SUMMARY-ONLY",
+                    "audit": {
+                        "workItemId": "SA-SUMMARY-ONLY",
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": None,
+                        "summary": "Ready to close: Yes\n\n## Summary\nStored in summary field.",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-SUMMARY-ONLY", runner=fake_runner)
+        assert rc == 0
+
+    def test_readback_success_with_both_rawoutput_and_summary(self, monkeypatch, capsys):
+        """When both rawOutput and summary have content, readback succeeds (preferring rawOutput)."""
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-BOTH",
+                    "audit": {
+                        "workItemId": "SA-BOTH",
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": "Ready to close: Yes\n\n## Summary\nPrimary content.",
+                        "summary": "Audit result persisted via persist_audit.py",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-BOTH", runner=fake_runner)
+        assert rc == 0
+
+    def test_readback_fails_when_both_rawoutput_and_summary_empty(self, monkeypatch, capsys):
+        """When both rawOutput and summary are empty/null, readback fails."""
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: _fake_pi_result(),
+        )
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            return 0
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.persist_audit",
+            fake_persist,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-BOTH-EMPTY",
+                    "audit": {
+                        "workItemId": "SA-BOTH-EMPTY",
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": None,
+                        "summary": "",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
+
+        rc = cmd_issue("SA-BOTH-EMPTY", runner=fake_runner)
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "both rawOutput and summary are empty" in captured.err
+
+
 class TestExitCodes:
     """Verify exit codes for various scenarios."""
 
@@ -302,6 +599,15 @@ class TestExitCodes:
         )
 
         def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "audit": {
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": "Ready to close: Yes\n\n## Summary\nOK.",
+                    },
+                }))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
 
         rc = cmd_issue("SA-OK", runner=fake_runner)
@@ -334,3 +640,5 @@ class TestExitCodes:
             return _fake_proc(returncode=1, stderr="wl not found")
         rc = cmd_issue("SA-MISSING", runner=fake_runner)
         assert rc == 1
+
+

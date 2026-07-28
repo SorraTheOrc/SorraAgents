@@ -1,7 +1,8 @@
 {
   "version": "0.1.11",
   "type": "module",
-  "dependencies": {
-    "@opencode-ai/plugin": "1.4.7"
-  }
+  "scripts": {
+    "build": "echo 'No build step for this Python project'"
+  },
+  "dependencies": {}
 }

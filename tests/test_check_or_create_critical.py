@@ -497,56 +497,6 @@ def test_child_mode_with_existing_matched_issue_adds_dependency(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Extract failing test names
-# ---------------------------------------------------------------------------
-
-
-def test_extract_failing_test_names_parses_pytest_output():
-    """_extract_failing_test_names correctly extracts test names from pytest output."""
-    import skill.ralph.scripts.ralph_loop as rl
-
-    output = """tests/test_module.py::test_one PASSED
-tests/test_module.py::test_two FAILED
-tests/test_module.py::test_three PASSED
-tests/test_another.py::test_failure ERROR"""
-    names = rl._extract_failing_test_names(output)
-    assert "test_two" in names
-    assert "test_failure" in names
-    assert "test_one" not in names
-    assert "test_three" not in names
-
-
-def test_extract_failing_test_names_empty_output():
-    """Empty output returns empty list."""
-    import skill.ralph.scripts.ralph_loop as rl
-
-    names = rl._extract_failing_test_names("")
-    assert names == []
-
-
-def test_extract_failing_test_names_no_failures():
-    """Output with no failures returns empty list."""
-    import skill.ralph.scripts.ralph_loop as rl
-
-    output = """tests/test_module.py::test_one PASSED
-tests/test_module.py::test_two PASSED"""
-    names = rl._extract_failing_test_names(output)
-    assert names == []
-
-
-def test_extract_failing_test_names_deduplicates():
-    """Duplicate test names are deduplicated while preserving order."""
-    import skill.ralph.scripts.ralph_loop as rl
-
-    output = """FAILED tests/test_module.py::test_dup
-FAILED tests/test_module.py::test_dup
-tests/test_module.py::test_unique FAILED"""
-    names = rl._extract_failing_test_names(output)
-    assert names.count("test_dup") == 1
-    assert "test_unique" in names
-
-
-# ---------------------------------------------------------------------------
 # CLI main() integration
 # ---------------------------------------------------------------------------
 

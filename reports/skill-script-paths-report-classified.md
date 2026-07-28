@@ -108,26 +108,6 @@
 
 - skill/owner_inference/scripts/infer_owner.py:1 — # Compatibility shim: delegate to the implementation in skill/owner-inference/scripts/infer_owner.py
 
-## ralph
-
-- path: skill/ralph
-- status: NEEDS_REVIEW
-
-### Needs attention
-
-- skill/ralph/SKILL.md:82 — # python3 /path/to/skills/ralph/scripts/ralph_loop.py <work-item-id> --json — classification: should_use_skill_relative
-
-### Safe matches (informational)
-
-- skill/ralph/ralph:8 — exec python3 "$BASEDIR/scripts/ralph_control.py" "$@"
-- skill/ralph/ralph:10 — exec python3 "$BASEDIR/scripts/ralph_control.py" launch "$@"
-- skill/ralph/SKILL.md:74 — # python3 skill/ralph/scripts/ralph_loop.py <work-item-id> --json
-- skill/ralph/SKILL.md:77 — # python3 skill/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
-- skill/ralph/tests/test_structured_response.py:39 — {"command": "edit", "args": ["skill/ralph/scripts/ralph_loop.py"]},
-- skill/ralph/tests/test_structured_response.py:47 — assert parsed.text == "edit skill/ralph/scripts/ralph_loop.py"
-- skill/ralph/tests/test_structured_response.py:48 — assert parsed.summary == "edit skill/ralph/scripts/ralph_loop.py"
-- skill/ralph/tests/test_structured_response.py:49 — assert parsed.actions[0].render() == "edit skill/ralph/scripts/ralph_loop.py"
-
 ## resolve-pr-comments
 
 - path: skill/resolve-pr-comments

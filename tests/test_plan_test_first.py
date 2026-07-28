@@ -1,6 +1,6 @@
-"""Tests that plan.md enforces test-first ordering for child work items.
+"""Tests that skill/plan/SKILL.md enforces test-first ordering for child work items.
 
-These tests verify that the /plan command specification (command/plan.md)
+These tests verify that the /plan skill specification (skill/plan/SKILL.md)
 includes mandatory rules ensuring test-related work items are always created
 before implementation work items.
 
@@ -18,7 +18,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_PLAN_MD = _REPO_ROOT / "command" / "plan.md"
+_PLAN_MD = _REPO_ROOT / "skill" / "plan" / "SKILL.md"
 
 
 # ---------------------------------------------------------------------------
@@ -28,8 +28,8 @@ _PLAN_MD = _REPO_ROOT / "command" / "plan.md"
 
 @pytest.fixture(scope="module")
 def plan_content() -> str:
-    """Load plan.md content once per module."""
-    assert _PLAN_MD.exists(), f"plan.md not found at {_PLAN_MD}"
+    """Load skill/plan/SKILL.md content once per module."""
+    assert _PLAN_MD.exists(), f"skill/plan/SKILL.md not found at {_PLAN_MD}"
     return _PLAN_MD.read_text(encoding="utf-8")
 
 
@@ -72,14 +72,14 @@ def _count_heading_occurrences(content: str, heading: str) -> int:
 
 
 class TestPlanHardRequirementsForTestFirst:
-    """Verify that the Hard requirements section of plan.md includes
+    """Verify that the Hard requirements section of skill/plan/SKILL.md includes
     a rule mandating that test tasks must be created before implementation
     tasks."""
 
     def test_hard_requirements_section_exists(self, plan_content: str) -> None:
-        """The 'Hard requirements' section must exist in plan.md."""
+        """The 'Hard requirements' section must exist in skill/plan/SKILL.md."""
         assert re.search(r"^##\s*Hard requirements", plan_content, re.MULTILINE), (
-            "plan.md must contain a '## Hard requirements' section"
+            "skill/plan/SKILL.md must contain a '## Hard requirements' section"
         )
 
     def test_test_first_rule_in_hard_requirements(self, plan_content: str) -> None:
@@ -88,14 +88,15 @@ class TestPlanHardRequirementsForTestFirst:
         work items."""
         hard_req_section = _find_section(plan_content, "Hard requirements")
         assert hard_req_section is not None, (
-            "Could not find 'Hard requirements' section in plan.md"
+            "Could not find 'Hard requirements' section in skill/plan/SKILL.md"
         )
         # Check for language about tests being first/created before implementation
         test_first_patterns = [
-            r"test.{0,20}(first|before|ahead of|prior to).{0,30}implement",
-            r"test.{0,20}work.{0,5}item.{0,20}(first|before|prior)",
-            r"verification.{0,20}(first|before|prior).{0,30}implement",
-            r"(first|before|prior).{0,20}test.{0,20}(implement|feature|task)",
+            r"Test.first ordering",
+            r"test.{0,50}(first|before|ahead of|prior to).{0,50}implement",
+            r"test.{0,30}work.{0,10}item.{0,40}(first|before|prior)",
+            r"verification.{0,40}(first|before|prior).{0,40}implement",
+            r"(first|before|prior).{0,30}test.{0,30}(implement|feature|task)",
         ]
         matched = any(
             re.search(pat, hard_req_section, re.IGNORECASE)
@@ -110,15 +111,15 @@ class TestPlanHardRequirementsForTestFirst:
 
 
 class TestPlanUpdateWorkItemsStepForTestFirst:
-    """Verify that step 5 (Update work items) in the plan process explicitly
+    """Verify that step 7 (Update work items) in the plan skill process explicitly
     instructs the agent to create test work items before implementation work
     items."""
 
     def test_update_work_items_section_exists(self, plan_content: str) -> None:
-        """The 'Update work items' step must exist in plan.md."""
+        """The 'Update work items' step must exist in skill/plan/SKILL.md."""
         # The section heading might be numbered (e.g., "5. Update work items")
         assert re.search(r"(?:\d+\.\s*)?Update work items", plan_content, re.IGNORECASE), (
-            "plan.md must contain an 'Update work items' step"
+            "skill/plan/SKILL.md must contain an 'Update work items' step"
         )
 
     def test_test_first_instruction_in_update_step(self, plan_content: str) -> None:
@@ -132,7 +133,7 @@ class TestPlanUpdateWorkItemsStepForTestFirst:
             re.DOTALL | re.IGNORECASE,
         )
         assert update_section_match is not None, (
-            "Could not find 'Update work items' section in plan.md"
+            "Could not find 'Update work items' section in skill/plan/SKILL.md"
         )
         update_section = update_section_match.group(0)
 
@@ -163,7 +164,7 @@ class TestPlanUpdateWorkItemsStepForTestFirst:
             re.DOTALL | re.IGNORECASE,
         )
         assert update_section_match is not None, (
-            "Could not find 'Update work items' section in plan.md"
+            "Could not find 'Update work items' section in skill/plan/SKILL.md"
         )
         update_section = update_section_match.group(0)
 
@@ -177,16 +178,17 @@ class TestPlanUpdateWorkItemsStepForTestFirst:
 
 class TestPlanSequencingReviewForTestFirst:
     """Verify that the automated review stage for sequencing and dependencies
-    includes a check that test tasks appear before implementation tasks."""
+    in skill/plan/SKILL.md includes a check that test tasks appear before
+    implementation tasks."""
 
     def test_sequencing_review_exists(self, plan_content: str) -> None:
-        """There must be a 'Sequencing & dependencies review' stage in plan.md."""
+        """There must be a 'Sequencing & dependencies review' stage in skill/plan/SKILL.md."""
         assert re.search(
             r"Sequencing.{0,5}(?:&|and).{0,5}dependencies.{0,10}review",
             plan_content,
             re.IGNORECASE,
         ), (
-            "plan.md must contain a 'Sequencing & dependencies review' stage"
+            "skill/plan/SKILL.md must contain a 'Sequencing & dependencies review' stage"
         )
 
     def test_sequencing_review_checks_test_first(self, plan_content: str) -> None:
@@ -199,7 +201,7 @@ class TestPlanSequencingReviewForTestFirst:
             re.DOTALL | re.IGNORECASE,
         )
         assert seq_match is not None, (
-            "Could not find 'Sequencing & dependencies review' section in plan.md"
+            "Could not find 'Sequencing & dependencies review' section in skill/plan/SKILL.md"
         )
         seq_section = seq_match.group(0)
 
@@ -219,17 +221,17 @@ class TestPlanSequencingReviewForTestFirst:
 
 
 class TestPlanProposeFeaturePlanForTestFirst:
-    """Verify that the 'Propose feature plan' step requires test features to
-    be listed first in the plan."""
+    """Verify that the 'Propose feature plan' step in skill/plan/SKILL.md
+    requires test features to be listed first in the plan."""
 
     def test_propose_feature_plan_section_exists(self, plan_content: str) -> None:
-        """The 'Propose feature plan' step must exist in plan.md."""
+        """The 'Propose feature plan' step must exist in skill/plan/SKILL.md."""
         assert re.search(
             r"Propose feature plan|feature plan.*propose",
             plan_content,
             re.IGNORECASE,
         ), (
-            "plan.md must contain a 'Propose feature plan' step"
+            "skill/plan/SKILL.md must contain a 'Propose feature plan' step"
         )
 
     def test_propose_step_requires_test_first(self, plan_content: str) -> None:
@@ -242,7 +244,7 @@ class TestPlanProposeFeaturePlanForTestFirst:
             re.DOTALL | re.IGNORECASE,
         )
         assert propose_match is not None, (
-            "Could not find 'Propose feature plan' section in plan.md"
+            "Could not find 'Propose feature plan' section in skill/plan/SKILL.md"
         )
         propose_section = propose_match.group(0)
 
@@ -264,7 +266,7 @@ class TestPlanProposeFeaturePlanForTestFirst:
 
 class TestPlanChildWorkItemStage:
     """Verify that the wl create command in the Update work items step
-    uses `--stage intake_complete` for child work items."""
+    in skill/plan/SKILL.md uses `--stage intake_complete` for child work items."""
 
     def test_child_create_command_has_intake_complete_stage(self, plan_content: str) -> None:
         """The wl create example command must use --stage intake_complete."""
@@ -274,7 +276,7 @@ class TestPlanChildWorkItemStage:
             plan_content,
         )
         assert create_match is not None, (
-            "Could not find wl create command with --stage flag in plan.md"
+            "Could not find wl create command with --stage flag in skill/plan/SKILL.md"
         )
         stage_value = create_match.group(1)
         assert stage_value == "intake_complete", (
@@ -294,8 +296,8 @@ class TestPlanChildWorkItemStage:
 
 
 class TestPlanNegativeRegression:
-    """Negative tests: ensure the plan.md content cannot be incorrectly
-    modified to remove test-first ordering without tests catching it."""
+    """Negative tests: ensure the skill/plan/SKILL.md content cannot be
+    incorrectly modified to remove test-first ordering without tests catching it."""
 
     def test_removal_of_test_first_in_hard_req_fails(self, plan_content: str) -> None:
         """If the test-first rule in Hard requirements is removed, the
@@ -307,8 +309,9 @@ class TestPlanNegativeRegression:
         assert hard_req_section is not None
         # Verify our test pattern reliably detects the rule
         test_first_patterns = [
-            r"test.{0,20}(first|before|ahead of|prior to).{0,30}implement",
-            r"test.{0,20}work.{0,5}item.{0,20}(first|before|prior)",
+            r"Test.first ordering",
+            r"test.{0,50}(first|before|ahead of|prior to).{0,50}implement",
+            r"test.{0,30}work.{0,10}item.{0,40}(first|before|prior)",
         ]
         assert any(
             re.search(pat, hard_req_section, re.IGNORECASE)

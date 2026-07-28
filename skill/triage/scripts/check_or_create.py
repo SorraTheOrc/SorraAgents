@@ -81,6 +81,8 @@ def create_issue(title: str, body: str, parent_id: Optional[str] = None) -> Opti
         "test-failure",
         "--issue-type",
         "bug",
+        "--stage",
+        "intake_complete",
     ]
     if parent_id:
         args.extend(["--parent", parent_id])
@@ -206,6 +208,12 @@ def render_template(
 ## Impact
 
 Failing test detected by agent during automated run. May block PR creation for the agent's current work item.
+
+## Acceptance Criteria
+
+1. The test `{test_name}` passes when run against the latest `dev`.
+2. All related documentation is updated to reflect the changes.
+3. Full project test suite passes with the new changes.
 
 ## Suggested Triage Steps
 
@@ -400,6 +408,10 @@ def check_or_create(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if match:
         issue_id = _get_id(match)
+        # Advance stage to intake_complete if still in idea or unset
+        current_stage = _get_field(match, "stage")
+        if not current_stage or current_stage == "idea":
+            run_wl(["update", issue_id, "--stage", "intake_complete", "--json"])
         # Enhance existing issue with new evidence
         comment_lines = ["Additional evidence from triage helper:"]
         if stdout_excerpt:

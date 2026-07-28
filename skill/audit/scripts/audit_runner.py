@@ -16,9 +16,17 @@ Verdicts:
   adjusted  – acceptance criterion adapted with acceptable variance
               (does not block ready-to-close, recorded in variance decisions)
 
+Persist + verify invariant:
+  Unless ``--do-not-persist`` is given, the runner ALWAYS persists the
+  audit report via ``persist_audit()`` and then performs a readback
+  verification via ``wl audit-show --json`` to confirm the stored audit
+  is retrievable.  If either step fails the runner exits non-zero.
+  This is not configurable — it is an invariant of the runner.
+
 Exit codes:
   0 – success (report printed to stdout)
-  1 – Worklog / CLI / Pi failure
+  1 – Worklog / CLI / Pi failure, persistence failure, or readback
+      verification failure
   2 – argument error
 """
 from __future__ import annotations
@@ -60,6 +68,14 @@ wrong (model hang, provider issue) and the timeout diagnostic should be
 produced rather than blocking indefinitely.
 """
 
+AUDIT_FRESHNESS_BUFFER_SECONDS = 60
+"""Freshness buffer (seconds) for the recent-audit gate.
+
+When the audit's ``auditedAt`` timestamp is more recent than the work item's
+``updatedAt`` timestamp plus this buffer, the audit is considered fresh and
+the runner skips the full audit pipeline.
+"""
+
 # Verdict constants
 VERDICT_MET = "met"
 VERDICT_UNMET = "unmet"
@@ -71,7 +87,7 @@ _ACCEPTABLE_VERDICTS = {VERDICT_MET, VERDICT_ADJUSTED}
 # Closing-sentence constants (AC1–3)
 # ---------------------------------------------------------------------------
 _CLOSING_READY = (
-    "Work item is ready to close, would you like me to close it?"
+    "Audit passed. The item is ready for release."
 )
 _CLOSING_NOT_READY = (
     "Work item is not ready to close (see above), "
@@ -80,7 +96,7 @@ _CLOSING_NOT_READY = (
 
 # Model / config constants (following Ralph's pattern)
 ASSET_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "ralph" / "assets" / ".ralph.json"
-DEFAULT_MODEL = "opencode-go/glm-5.1"
+DEFAULT_MODEL = "Local Proxy/plan"
 DEFAULT_MODEL_SOURCE = "local"
 MODEL_SOURCES = frozenset({"remote", "local"})
 RALPH_CONFIG_FILES = [
@@ -140,6 +156,80 @@ def _run_wl(runner: Runner, cmd: Sequence[str]) -> dict:
             f"Worklog command failed: {data.get('error', 'unknown error')}"
         )
     return data
+
+
+# ---------------------------------------------------------------------------
+# Freshness gate
+# ---------------------------------------------------------------------------
+
+
+def _check_audit_freshness(runner: Runner, issue_id: str) -> str | None:
+    """Check if there's a fresh audit for the work item.
+
+    Fetches the latest audit via ``wl audit-show <id> --json`` and compares
+    the audit's ``auditedAt`` timestamp against the work item's ``updatedAt``
+    timestamp plus ``AUDIT_FRESHNESS_BUFFER_SECONDS``.
+
+    Returns the ``rawOutput`` of the existing audit if still fresh, ``None``
+    otherwise (no prior audit, stale audit, or command failure).
+
+    The gate gracefully falls through on any failure (no audit data, command
+    error, parse error) so that the normal audit pipeline always runs when
+    freshness cannot be determined.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"])
+    except RuntimeError:
+        return None  # No audit data or command failure
+
+    if not isinstance(data, dict) or data.get("success") is False:
+        return None
+
+    audit = data.get("audit")
+    if not audit:
+        return None  # No prior audit
+
+    audited_at = audit.get("auditedAt")
+    raw_output = audit.get("rawOutput")
+    if not audited_at or not raw_output:
+        return None
+
+    # Get the work item's updatedAt
+    try:
+        wi_data = _run_wl(runner, ["wl", "show", issue_id, "--json"])
+    except RuntimeError:
+        return None
+
+    work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
+    updated_at = work_item.get("updatedAt")
+    if not updated_at:
+        return None
+
+    # Compare ISO-8601 timestamps
+    try:
+        # Normalize Z suffix for Python 3.10 compatibility
+        audit_time_str = str(audited_at).replace("Z", "+00:00")
+        update_time_str = str(updated_at).replace("Z", "+00:00")
+
+        audit_time = datetime.fromisoformat(audit_time_str)
+        update_time = datetime.fromisoformat(update_time_str)
+
+        # Ensure both are timezone-aware for comparison
+        if audit_time.tzinfo is None:
+            audit_time = audit_time.replace(tzinfo=timezone.utc)
+        if update_time.tzinfo is None:
+            update_time = update_time.replace(tzinfo=timezone.utc)
+
+        freshness_threshold = update_time + timedelta(seconds=AUDIT_FRESHNESS_BUFFER_SECONDS)
+
+        if audit_time > freshness_threshold:
+            return raw_output
+    except (ValueError, TypeError):
+        return None
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +724,10 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       - All non-deleted children must be in ``in_review`` or ``done`` stage.
         Children with ``status: in_progress`` but ``stage: in_review`` are
         acceptable and do NOT block closure.
+      - Children in ``in_review`` or ``done`` stage are exempt from child
+        audit verdict checks. Per the audit spec, children in ``in_review``
+        do NOT block closure — only pre-review stages (``idea``,
+        ``intake_complete``, ``plan_complete``) block.
       - Code quality findings: critical or high severity findings block closure
         ("Ready to close: No"). Medium and low findings produce warnings
         but do NOT block closure.
@@ -649,6 +743,26 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         for c in active_children
     )
 
+    # Check each active (non-exempt) child's persisted audit verdict
+    # Exempt children: those with completed/done status+stage (already closed)
+    # and those in in_review stage (per spec, in_review children do not
+    # block parent closure — only pre-review stages block).
+    def _is_exempt_child(c: dict) -> bool:
+        # Completed/done children are fully closed
+        if c.get("status") == "completed" and c.get("stage") == "done":
+            return True
+        # Children in in_review stage should not have their audit verdicts
+        # block parent closure (per audit spec)
+        if c.get("stage") == "in_review":
+            return True
+        return False
+
+    non_exempt_children = [c for c in active_children if not _is_exempt_child(c)]
+    any_child_audit_not_ready = any(
+        c.get("child_audit_ready") is False
+        for c in non_exempt_children
+    )
+
     # Code quality blocking: critical or high findings block closure
     cq_findings = code_quality_findings or []
     has_blocking_cq = any(
@@ -656,7 +770,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         for f in cq_findings
     )
 
-    ready_before_cq = "Yes" if (all_ac_acceptable and all_children_reviewed) else "No"
+    ready_before_cq = "Yes" if (all_ac_acceptable and all_children_reviewed and not any_child_audit_not_ready) else "No"
     if ready_before_cq == "Yes" and has_blocking_cq:
         ready = "No"
     else:
@@ -1072,11 +1186,91 @@ def _demote_met_to_partial(results: list[dict]) -> list[dict]:
     return demoted
 
 
+def _get_child_audit_verdict(runner: Runner, child_id: str) -> tuple[bool | None, str]:
+    """Check a child's persisted audit verdict via wl audit-show.
+
+    Returns a (verdict, reason) tuple:
+        (True, "ready")      — Child audit says "Ready to close: Yes"
+        (False, "not_ready") — Child audit says "Ready to close: No"
+        (None, "no_audit")   — No audit data found (audit-show returned null/empty)
+        (None, "stale")      — Audit exists but is stale (within freshness buffer)
+        (None, "error")      — wl audit-show command failed
+
+    Freshness is determined by comparing the audit's auditedAt timestamp against
+    the child's updatedAt timestamp plus AUDIT_FRESHNESS_BUFFER_SECONDS.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"])
+    except RuntimeError:
+        return None, "error"
+
+    if not isinstance(data, dict) or data.get("success") is False:
+        return None, "error"
+
+    audit = data.get("audit")
+    if not audit:
+        return None, "no_audit"
+
+    raw_output = audit.get("rawOutput")
+    if not raw_output:
+        return None, "no_audit"
+
+    audited_at = audit.get("auditedAt")
+    if not audited_at:
+        return None, "no_audit"
+
+    # Check freshness against the child's updatedAt
+    try:
+        wi_data = _run_wl(runner, ["wl", "show", child_id, "--json"])
+    except RuntimeError:
+        # Can't check freshness; treat as fresh since we have an audit
+        pass
+    else:
+        work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
+        updated_at = work_item.get("updatedAt")
+        if updated_at:
+            try:
+                audit_time_str = str(audited_at).replace("Z", "+00:00")
+                update_time_str = str(updated_at).replace("Z", "+00:00")
+                audit_time = datetime.fromisoformat(audit_time_str)
+                update_time = datetime.fromisoformat(update_time_str)
+                if audit_time.tzinfo is None:
+                    audit_time = audit_time.replace(tzinfo=timezone.utc)
+                if update_time.tzinfo is None:
+                    update_time = update_time.replace(tzinfo=timezone.utc)
+                freshness_threshold = update_time + timedelta(seconds=AUDIT_FRESHNESS_BUFFER_SECONDS)
+                if not (audit_time > freshness_threshold):
+                    return None, "stale"
+            except (ValueError, TypeError):
+                pass  # Can't parse timestamps; treat as fresh since we have an audit
+
+    # Parse the raw output for "Ready to close:"
+    for line in raw_output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Ready to close:"):
+            verdict = stripped.split(":", 1)[1].strip()
+            if verdict.lower() == "yes":
+                return True, "ready"
+            return False, "not_ready"
+
+    return None, "no_audit"
+
+
 def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict]) -> tuple[bool, str]:
     """Check whether Phase 1 automated screening has blocking issues.
 
     Returns (blocked, reason). If blocked, Phase 2 deep analysis should be
     skipped and all 'met' verdicts demoted to 'partial'.
+
+    Blocking issues include:
+    - Critical/high code quality findings
+    - Children not in in_review/done stage
+    - Active children in pre-review stages whose persisted audit says
+      "Ready to close: No" (children in ``in_review`` stage are exempt
+      from child audit verdict checking — per the audit spec, only
+      pre-review stages block)
     """
     # Check code quality findings
     for f in cq_findings:
@@ -1093,9 +1287,22 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
         names = ", ".join(f"{c.get('title', '?')} ({c.get('stage', '?')})" for c in blocked_children[:3])
         return True, f"Children not in in_review/done stage: {names}"
 
+    # Check each active child's persisted audit verdict
+    # A child with child_audit_ready=False means its own audit says "not ready"
+    # Children in in_review stage are exempt from this check (per audit spec,
+    # in_review children do NOT block parent closure — only pre-review stages block).
+    for c in active_children:
+        # Skip in_review children — their audit verdicts do not block Phase 1
+        if c.get("stage") == "in_review":
+            continue
+        car = c.get("child_audit_ready")
+        if car is False:
+            return True, (
+                f"Child '{c.get('title', '?')}' ({c.get('id', '?')}) audit says "
+                "'not ready to close' — block parent closure"
+            )
+
     return False, ""
-
-
 
 def _build_issue_json(issue: dict, ac_results: list[dict],
                       child_results: list[dict],
@@ -1108,6 +1315,10 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
         ``adjusted`` criteria represent acceptable variance and do not block closure.
       - Critical/high code quality findings block closure.
+      - Children in ``in_review`` or ``done`` stage are exempt from child
+        audit verdict checks. Per the audit spec, children in ``in_review``
+        do NOT block closure — only pre-review stages (``idea``,
+        ``intake_complete``, ``plan_complete``) block.
     """
     all_ac_acceptable = all(
         r["verdict"] in _ACCEPTABLE_VERDICTS
@@ -1120,6 +1331,25 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         for c in active_children
     )
 
+    # Check each non-exempt child's persisted audit verdict
+    # Exempt children: those with completed/done status+stage (already closed)
+    # and those in in_review stage (per spec, in_review children do not
+    # block parent closure — only pre-review stages block).
+    def _is_exempt(c: dict) -> bool:
+        # Completed/done children are fully closed
+        if c.get("status") == "completed" and c.get("stage") == "done":
+            return True
+        # Children in in_review stage should not have their audit verdicts
+        # block parent closure (per audit spec)
+        if c.get("stage") == "in_review":
+            return True
+        return False
+    non_exempt_children = [c for c in active_children if not _is_exempt(c)]
+    any_child_audit_not_ready = any(
+        c.get("child_audit_ready") is False
+        for c in non_exempt_children
+    )
+
     # Code quality blocking
     cq_findings = code_quality_findings or []
     has_blocking_cq = any(
@@ -1127,7 +1357,7 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         for f in cq_findings
     )
 
-    ready = all_ac_acceptable and all_children_reviewed and not has_blocking_cq
+    ready = all_ac_acceptable and all_children_reviewed and not has_blocking_cq and not any_child_audit_not_ready
 
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
@@ -1356,7 +1586,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
               pi_bin: str = "pi", model: str | None = None,
               model_source: str = DEFAULT_MODEL_SOURCE,
               runner: Runner | None = None, json_mode: bool = False,
-              debug_log: str | None = None) -> int:
+              debug_log: str | None = None,
+              force: bool = False) -> int:
     """Audit a single work item.
 
     The resolved model name and source are included as a metadata line
@@ -1366,6 +1597,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
       1. --model CLI flag (explicit override)
       2. Config-driven: model.audit from .ralph.json resolved via model_source
       3. Hardcoded fallback: DEFAULT_MODEL
+
+    When *force* is ``True``, the freshness gate is bypassed and a full
+    audit pipeline is always run, even if a recent audit already exists.
+
+    For each active child (not completed/done), the child's persisted audit
+    verdict is checked via ``wl audit-show``. If no audit exists or the audit
+    is stale, an audit is auto-triggered for that child (via the same audit
+    runner mechanism) and the resulting verdict is evaluated. A child whose
+    audit says "Ready to close: No" prevents the parent from being ready to
+    close. This check is performed before Phase 1 screening so that Phase 1
+    can block on children not individually ready.
     """
     # Resolve the effective model from config + CLI
     config = _load_config()
@@ -1375,6 +1617,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
     if runner is None:
         runner = _default_runner
+
+    # ------------------------------------------------------------------
+    # Freshness gate: skip if a recent audit already exists
+    # (before status lifecycle to avoid unnecessary in_progress transitions)
+    # ------------------------------------------------------------------
+    if not force:
+        fresh_report = _check_audit_freshness(runner, issue_id)
+        if fresh_report is not None:
+            print("Skipping: audit still fresh")
+            print(fresh_report)
+            return 0
 
     # Track script execution failures for prominent surfacing
     script_failure: dict | None = None
@@ -1400,7 +1653,19 @@ def cmd_issue(issue_id: str, persist: bool = True,
         }
 
     # ------------------------------------------------------------------
-    # Status lifecycle: set in_progress on entry (cleaned up to open in finally)
+    # Capture original status before setting in_progress, so we can
+    # restore it in the finally block (instead of always resetting to "open").
+    # ------------------------------------------------------------------
+    original_status = "open"  # safe default
+    try:
+        item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"])
+        if isinstance(item_data, dict):
+            original_status = item_data.get("status", "open")
+    except RuntimeError:
+        pass  # Fall back to "open" as safe default
+
+    # ------------------------------------------------------------------
+    # Status lifecycle: set in_progress on entry (restored in finally)
     # ------------------------------------------------------------------
     _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"])
 
@@ -1507,23 +1772,57 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         "evidence": item.get("evidence", ""),
                     })
             else:
-                # Fallback: treat single result as covering all ACs equally.
-                # This path is reached when the Pi response was not a parseable
-                # JSON array (e.g., a timeout diagnostic). Preserve the root-level
-                # evidence so the diagnostic is visible in the report.
-                verdict = result.get("verdict", "unmet")
-                evidence = result.get("evidence", "")
+                # Fallback: this path is reached when the Pi response was not a
+                # parseable JSON array. Print a warning, log raw output, and use
+                # 'partial' verdict with diagnostic evidence instead of silently
+                # falling back to 'unmet' with empty evidence.
+                print(
+                    "Warning: Unparseable Pi output for AC evaluation — "
+                    "falling back to 'partial' verdict",
+                    file=sys.stderr,
+                )
+                if debug_log:
+                    try:
+                        target = Path(debug_log) if debug_log else _default_debug_log_path(issue_id, "parent_ac_fallback")
+                        _write_debug_log(target, {
+                            "issue_id": issue_id,
+                            "context": "parent_ac_fallback",
+                            "reason": "parse_failure",
+                            "raw_text": raw_text,
+                            "result_verdict": result.get("verdict"),
+                            "result_evidence": result.get("evidence", "")[:500],
+                        })
+                    except Exception:
+                        pass
+                # When batched parsing fails, the root-level verdict from Pi
+                # cannot be trusted to represent each AC individually. Override
+                # verdict to 'partial' but preserve any diagnostic evidence
+                # from the root-level result (e.g., a timeout message).
+                outer_evidence = result.get("evidence", "")
+                if outer_evidence:
+                    evidence = (
+                        f"Pi model output could not be parsed — raw output logged. "
+                        f"Root-level diagnostic: {outer_evidence[:500]}"
+                    )
+                else:
+                    evidence = "Pi model output could not be parsed — raw output logged"
                 for ac in acs:
-                    ac_results.append({"text": ac, "verdict": verdict, "evidence": evidence})
+                    ac_results.append({
+                        "text": ac,
+                        "verdict": "partial",
+                        "evidence": evidence,
+                    })
         else:
             ac_results = [{"text": "No acceptance criteria defined.", "verdict": "unmet", "evidence": ""}]
 
-        # Review children (depth 1 only, skip completed/done, ignore deleted)
+        # Review children (depth 1 only, ignore deleted)
         # Pass ALL active children to the assembler; it handles the cap.
+        # Note: children with status=completed/stage=done are included for
+        # reporting but exempted from blocking checks by _has_phase1_blocking_issues.
         child_results = []
         active_children = [
             c for c in children
-            if not c.get("deletedBy") and c.get("status") != "completed"
+            if not c.get("deletedBy")
         ]
         for child in active_children:
             # Skip remaining children if we're too close to the parent
@@ -1599,13 +1898,47 @@ def cmd_issue(issue_id: str, persist: bool = True,
                             "evidence": item.get("evidence", ""),
                         })
                 else:
-                    # Fallback: preserve root-level evidence from the Pi
-                    # result (e.g., a timeout diagnostic) when batched
-                    # parsing produced an empty or unparseable result.
-                    verdict = result.get("verdict", "unmet")
-                    evidence = result.get("evidence", "")
+                    # Fallback: this path is reached when the Pi response was not a
+                    # parseable JSON array. Print a warning, log raw output, and use
+                    # 'partial' verdict with diagnostic evidence instead of silently
+                    # falling back to 'unmet' with empty evidence.
+                    print(
+                        "Warning: Unparseable Pi output for AC evaluation — "
+                        "falling back to 'partial' verdict",
+                        file=sys.stderr,
+                    )
+                    if debug_log:
+                        try:
+                            target = Path(debug_log) if debug_log else _default_debug_log_path(issue_id, f"child_{child.get('id', 'unknown')}_ac_fallback")
+                            _write_debug_log(target, {
+                                "issue_id": issue_id,
+                                "child_id": child.get("id"),
+                                "context": "child_ac_fallback",
+                                "reason": "parse_failure",
+                                "raw_text": raw_text,
+                                "result_verdict": result.get("verdict"),
+                                "result_evidence": result.get("evidence", "")[:500],
+                            })
+                        except Exception:
+                            pass
+                    # When batched parsing fails, the root-level verdict from Pi
+                    # cannot be trusted to represent each AC individually. Override
+                    # verdict to 'partial' but preserve any diagnostic evidence
+                    # from the root-level result (e.g., a timeout message).
+                    outer_evidence = result.get("evidence", "")
+                    if outer_evidence:
+                        evidence = (
+                            f"Pi model output could not be parsed — raw output logged. "
+                            f"Root-level diagnostic: {outer_evidence[:500]}"
+                        )
+                    else:
+                        evidence = "Pi model output could not be parsed — raw output logged"
                     for ac in child_acs:
-                        child_ac_results.append({"text": ac, "verdict": verdict, "evidence": evidence})
+                        child_ac_results.append({
+                            "text": ac,
+                            "verdict": "partial",
+                            "evidence": evidence,
+                        })
             child_results.append({
                 "title": child.get("title", ""),
                 "id": child.get("id", ""),
@@ -1613,6 +1946,70 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 "stage": child.get("stage", ""),
                 "ac_results": child_ac_results,
             })
+
+        # ------------------------------------------------------------------
+        # Check each active child's persisted audit verdict.
+        # For children without audits or with stale audits, auto-trigger
+        # a fresh audit (if persist is True) and re-evaluate.
+        # Children with completed/done status+stage are exempt (AC5).
+        # ------------------------------------------------------------------
+        _audit_runner_path = Path(__file__).resolve()
+
+        for child in child_results:
+            # Skip completed/done children (exempt per AC5)
+            if child.get("status") == "completed" and child.get("stage") == "done":
+                child["child_audit_ready"] = True  # Exempt - treat as ready
+                continue
+
+            verdict, reason = _get_child_audit_verdict(runner, child["id"])
+
+            if verdict is None and persist:
+                if _elapsed() < 110:
+                    print(
+                        f"Auto-triggering audit for child {child['id']} "
+                        f"({child['title']}) — reason: {reason}",
+                        file=sys.stderr,
+                    )
+                    try:
+                        audit_cmd = [
+                            sys.executable or "python3",
+                            str(_audit_runner_path),
+                            "issue",
+                            child["id"],
+                            "--pi-bin", pi_bin,
+                            "--model", resolved_model,
+                            "--model-source", model_source,
+                            "--force",  # Bypass freshness gate
+                        ]
+                        subprocess.run(
+                            audit_cmd,
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=CALL_PI_TIMEOUT,
+                        )
+                        # Re-check verdict after triggered audit
+                        verdict, reason = _get_child_audit_verdict(runner, child["id"])
+                    except subprocess.TimeoutExpired:
+                        print(
+                            f"Warning: Auto-triggered audit for child {child['id']} "
+                            f"timed out.", file=sys.stderr,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"Warning: Auto-triggered audit for child {child['id']} "
+                            f"failed: {exc}", file=sys.stderr,
+                        )
+                else:
+                    print(
+                        f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
+                        f"Cannot auto-trigger audit for child {child['id']} "
+                        f"({child['title']}). Manual audit required.",
+                        file=sys.stderr,
+                    )
+
+            # Set child_audit_ready: True/False if verdict is known, False otherwise
+            child["child_audit_ready"] = verdict if verdict is not None else False
 
         # Initialize child_persist_results for reporting
         child_persist_results = []
@@ -1737,16 +2134,61 @@ def cmd_issue(issue_id: str, persist: bool = True,
             print(_get_closing_sentence(report))
 
         if persist:
-            return persist_audit(issue_id, report)
+            persist_rc = persist_audit(issue_id, report)
+            if persist_rc != 0:
+                print(
+                    f"Error: Failed to persist audit for {issue_id} "
+                    f"(exit code {persist_rc})",
+                    file=sys.stderr,
+                )
+                return persist_rc
+            # Readback verification: confirm the stored audit is retrievable
+            try:
+                rb_data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"])
+            except RuntimeError as exc:
+                print(
+                    f"Error: Readback verification failed for {issue_id}: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            if not isinstance(rb_data, dict):
+                print(
+                    f"Error: Readback verification for {issue_id}: "
+                    f"invalid response from wl audit-show",
+                    file=sys.stderr,
+                )
+                return 1
+            audit_obj = rb_data.get("audit")
+            if audit_obj is None:
+                print(
+                    f"Error: Readback verification for {issue_id}: "
+                    f"no audit object found",
+                    file=sys.stderr,
+                )
+                return 1
+            # Check rawOutput first, fall back to summary (some audits store
+            # content in summary instead of rawOutput).
+            raw_output = audit_obj.get("rawOutput")
+            if not raw_output:
+                raw_output = audit_obj.get("summary")
+            if not raw_output:
+                print(
+                    f"Error: Readback verification for {issue_id}: "
+                    f"stored audit is null or both rawOutput and summary are empty",
+                    file=sys.stderr,
+                )
+                return 1
+            return 0
         return 0
 
     finally:
         # ------------------------------------------------------------------
-        # Status lifecycle: set open on exit (success or failure)
+        # Status lifecycle: restore original status on exit (success or failure)
         # Always runs because of try/finally — guarantees cleanup.
+        # Falls back to "open" if original_status was not captured.
         # ------------------------------------------------------------------
         try:
-            _run_wl(runner, ["wl", "update", issue_id, "--status", "open", "--json"])
+            _run_wl(runner, ["wl", "update", issue_id, "--status", original_status, "--json"])
         except RuntimeError:
             pass  # Status update failure must not mask the main result
 
@@ -1904,6 +2346,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Emit machine-readable JSON output instead of markdown")
     p_issue.add_argument("--debug-log", default=None,
                          help="Append Pi debug output to this file (JSONL)")
+    p_issue.add_argument("--force", action="store_true",
+                         help="Bypass the freshness gate and force a full audit")
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
@@ -1932,7 +2376,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_issue(args.issue_id, persist=not args.do_not_persist,
                          pi_bin=args.pi_bin, model=args.model,
                          model_source=args.model_source, json_mode=args.json,
-                         debug_log=args.debug_log)
+                         debug_log=args.debug_log,
+                         force=args.force)
     elif args.command == "project":
         return cmd_project(pi_bin=args.pi_bin, model=args.model,
                            model_source=args.model_source, json_mode=args.json,

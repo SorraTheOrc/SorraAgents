@@ -20,39 +20,15 @@ A lightweight collection of workflow guides, command patterns, and skill templat
   - [skill/planall/](skill/planall/): PlanAll — automated batch planning for intake_complete work items.
   - [skill/intakeall/](skill/intakeall/): IntakeAll — automated batch intake for idea-stage work items.
   - [skill/implementall/](skill/implementall/): ImplementAll — automated batch implementation for plan_complete work items.
-- plugins/: local agent framework plugins used by this repository (includes `ralph` compaction plugin).
+- plugins/: local agent framework plugins used by this repository.
 - docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)).
 - Workflow.md: high-level workflow for using this repository.
 - package.json: basic metadata used by tooling.
 
-## Ralph compaction plugin
-
-This repository includes a local plugin at `plugins/ralph.js` that
-implements `experimental.session.compacting` to preserve original session intent
-during compaction.
-
-- If the original prompt matches override patterns (for example `implement <id>`),
-  `ralph` can provide a derived compaction prompt (for example `audit <id> ...`).
-- If no override applies, it appends the original prompt to compaction context.
-
-Behavior, configuration options, and test references are documented in
-`docs/ralph-compaction-plugin.md`.
-
-## Ralph orchestration loop
-
-The repository also includes the Ralph implement→audit loop for Worklog items.
-Use `/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id>` to launch a background run and `/home/rgardler/.pi/agent/skills/ralph/ralph status` to inspect the current process.
-When the target has children, Ralph runs a per-child implement→audit loop using `implement-single` for each child and finishes with a parent-level integration audit.
-Ralph runs non-interactively by default, includes a stream watchdog so a delegated `pi` process that keeps stdout open too long fails with a clear error instead of hanging forever, and can stop early with a structured `producer_input_required` result when the model cannot safely continue without producer input.
-
-When the target work item has children, Ralph iterates over each child independently: implementing, auditing, and remediating each child before moving to the next, followed by a final parent-level integration audit. For single work items (no children), Ralph uses the classic implement→audit→remediate loop.
-
-See `docs/ralph.md` for the full command reference and operational guidance.
-
 ## PlanAll — Automated Batch Planning
 
 The PlanAll skill (`skill/planall/`) provides automated batch planning for work items
-in `intake_complete` status. It discovers all eligible items, invokes `/plan` for
+in `intake_complete` status. It discovers all eligible items, invokes `/skill:plan` for
 each sequentially, detects items that require producer input, and produces a
 summary report.
 
@@ -143,12 +119,6 @@ python3 skill/implementall/scripts/implementall.py --parent-id SA-0MQO6YMZ3006N5
 
 See [skill/implementall/SKILL.md](skill/implementall/SKILL.md) for full documentation.
 
-A useful debugging pattern is to focus Ralph on a single direct child work item:
-
-```sh
-python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
-```
-
 ## CI Workflows
 
 This repository uses GitHub Actions to validate changes. The following workflows are available:
@@ -238,11 +208,11 @@ This will:
 
 The pool is replenished automatically in the background after each `start-work`, but running `warm-pool` once up front avoids the initial wait.
 
-Pool state (`pool-state.json`, `pool-cleanup.json`, `pool-replenish.log`) is stored globally at `~/.config/opencode/.worklog/ampa/` so that container claims and cleanup records are shared across all projects on the host. Per-project config (`.env`, `scheduler_store.json`, daemon PID/log) remains under `<project>/.worklog/ampa/`.
+Pool state (`pool-state.json`, `pool-cleanup.json`, `pool-replenish.log`) is stored globally at `~/.config/pi/.worklog/ampa/` so that container claims and cleanup records are shared across all projects on the host. Per-project config (`.env`, `scheduler_store.json`, daemon PID/log) remains under `<project>/.worklog/ampa/`.
 
 If the AMPA Containerfile has been modified since the image was last built, `warm-pool` will automatically tear down unclaimed pool containers and the template, rebuild the image, and re-fill the pool. Simply run `wl ampa warm-pool` again — no manual cleanup is needed.
 
-See the AMPA container pool reference for full details: <https://github.com/opencode/ampa/blob/main/docs/ampa_container_pool.md>
+See the AMPA container pool reference for full details.
 
 ### Browser test capability
 
@@ -346,8 +316,7 @@ Daemon / scheduler note
   sends a single heartbeat and exits; to run the scheduler loop you must
   explicitly enable it (for example: use `--start-scheduler` or set an
   environment flag like `AMPA_RUN_SCHEDULER=1`). Check the AMPA repository
-  README at <https://github.com/opencode/ampa> for the exact flags and
-  environment variables.
+  README for the exact flags and environment variables.
 
 ## Contributing
 
@@ -359,11 +328,9 @@ Daemon / scheduler note
 
 The AMPA Worklog plugin has been moved to its own independent repository:
 
-**<https://github.com/opencode/ampa>**
-
 The `skill/install-ampa/resources/ampa.mjs` file in this repository is a runtime loader that delegates to the installed AMPA package. To develop or modify AMPA:
 
-1. Clone the AMPA repository: `git clone https://github.com/opencode/ampa.git`
+1. Clone the AMPA repository
 2. Make changes in the AMPA repository
 3. Run tests in the AMPA repository (see its README for test commands)
 4. Re-install with `skill/install-ampa/scripts/install-worklog-plugin.sh --yes` to get the latest version

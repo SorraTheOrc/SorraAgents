@@ -354,13 +354,13 @@ test('resolveAmpaPackage finds global package when local absent', async () => {
 
     await withTempDir('tmp-ampa-pkg-global-proj', async (tmp) => {
       // No local package — create global package
-      const globalPy = path.join(xdgDir, 'opencode', '.worklog', 'plugins', 'ampa_py', 'ampa');
+      const globalPy = path.join(xdgDir, 'pi', '.worklog', 'plugins', 'ampa_py', 'ampa');
       fs.mkdirSync(globalPy, { recursive: true });
       fs.writeFileSync(path.join(globalPy, '__init__.py'), '');
 
       const result = plugin.resolveAmpaPackage(tmp);
       assert.ok(result, 'should find global package');
-      assert.equal(result.pyPath, path.join(xdgDir, 'opencode', '.worklog', 'plugins', 'ampa_py'));
+      assert.equal(result.pyPath, path.join(xdgDir, 'pi', '.worklog', 'plugins', 'ampa_py'));
     });
   } finally {
     if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
@@ -381,7 +381,7 @@ test('resolveAmpaPackage prefers local over global', async () => {
       fs.mkdirSync(localPy, { recursive: true });
       fs.writeFileSync(path.join(localPy, '__init__.py'), '');
 
-      const globalPy = path.join(xdgDir, 'opencode', '.worklog', 'plugins', 'ampa_py', 'ampa');
+      const globalPy = path.join(xdgDir, 'pi', '.worklog', 'plugins', 'ampa_py', 'ampa');
       fs.mkdirSync(globalPy, { recursive: true });
       fs.writeFileSync(path.join(globalPy, '__init__.py'), '');
 
@@ -426,7 +426,7 @@ test('globalPluginsDir respects XDG_CONFIG_HOME', () => {
   const saved = process.env.XDG_CONFIG_HOME;
   try {
     process.env.XDG_CONFIG_HOME = '/tmp/test-xdg';
-    assert.equal(plugin.globalPluginsDir(), path.join('/tmp/test-xdg', 'opencode', '.worklog', 'plugins'));
+    assert.equal(plugin.globalPluginsDir(), path.join('/tmp/test-xdg', 'pi', '.worklog', 'plugins'));
   } finally {
     if (saved === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = saved;
@@ -502,7 +502,7 @@ test('resolveDaemonStore defaults to per-project path when global package has no
       fs.writeFileSync(path.join(base, 't1.pid'), String(proc.pid));
 
       // Create global ampa_py package with scheduler.py but no store file
-      const globalPy = path.join(xdgDir, 'opencode', '.worklog', 'plugins', 'ampa_py', 'ampa');
+      const globalPy = path.join(xdgDir, 'pi', '.worklog', 'plugins', 'ampa_py', 'ampa');
       fs.mkdirSync(globalPy, { recursive: true });
       fs.writeFileSync(path.join(globalPy, 'scheduler.py'), '# placeholder');
 
@@ -551,7 +551,7 @@ test('resolveDaemonStore uses global package store for backward compat when file
       fs.writeFileSync(path.join(base, 't1.pid'), String(proc.pid));
 
       // Create global ampa_py package with scheduler.py AND scheduler_store.json
-      const globalPy = path.join(xdgDir, 'opencode', '.worklog', 'plugins', 'ampa_py', 'ampa');
+      const globalPy = path.join(xdgDir, 'pi', '.worklog', 'plugins', 'ampa_py', 'ampa');
       fs.mkdirSync(globalPy, { recursive: true });
       fs.writeFileSync(path.join(globalPy, 'scheduler.py'), '# placeholder');
       fs.writeFileSync(path.join(globalPy, 'scheduler_store.json'), '{}');
@@ -604,7 +604,7 @@ test('resolveDaemonStore prefers per-project store over package-dir store', asyn
       const projectStore = path.join(tmp, '.worklog', 'ampa', 'scheduler_store.json');
       fs.writeFileSync(projectStore, '{"source":"project"}');
 
-      const globalPy = path.join(xdgDir, 'opencode', '.worklog', 'plugins', 'ampa_py', 'ampa');
+      const globalPy = path.join(xdgDir, 'pi', '.worklog', 'plugins', 'ampa_py', 'ampa');
       fs.mkdirSync(globalPy, { recursive: true });
       fs.writeFileSync(path.join(globalPy, 'scheduler.py'), '# placeholder');
       fs.writeFileSync(path.join(globalPy, 'scheduler_store.json'), '{"source":"global"}');

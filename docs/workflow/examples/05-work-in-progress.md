@@ -53,7 +53,7 @@ The engine does not proceed to candidate selection. No commands are executed.
       "title": "Implement user dashboard",
       "status": "in-progress",
       "stage": "delegated",
-      "assignee": "opencode-patch-1"
+      "assignee": "pi-agent-1"
     }
   ]
 }

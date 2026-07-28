@@ -339,17 +339,17 @@ class TestWorklogCLIIntegration:
     ):
         """Calls ``wl create`` with correct arguments and returns the ID."""
         from skill.refactor.workitem_creation import (
-            build_smell_title,
             build_smell_description,
-            severity_to_priority,
+            build_smell_title,
             create_smell_work_item,
+            severity_to_priority,
         )
 
         title = build_smell_title(referent_critical)
         description = build_smell_description(referent_critical)
         priority = severity_to_priority(referent_critical["severity"])
 
-        expected_list_cmd = " ".join(["wl", "list", "--tags", "Refactor", "--json"])
+        expected_list_cmd = "wl list --tags Refactor --json"
         expected_create_cmd = _build_wl_create_cmd(title, description, priority)
 
         responses = {
@@ -368,17 +368,17 @@ class TestWorklogCLIIntegration:
     ):
         """Work item is created with the priority mapped from severity."""
         from skill.refactor.workitem_creation import (
-            build_smell_title,
             build_smell_description,
-            severity_to_priority,
+            build_smell_title,
             create_smell_work_item,
+            severity_to_priority,
         )
 
         title = build_smell_title(referent_medium)
         description = build_smell_description(referent_medium)
         priority = severity_to_priority(referent_medium["severity"])
 
-        expected_list_cmd = " ".join(["wl", "list", "--tags", "Refactor", "--json"])
+        expected_list_cmd = "wl list --tags Refactor --json"
         expected_create_cmd = _build_wl_create_cmd(title, description, priority)
 
         responses = {
@@ -398,17 +398,17 @@ class TestWorklogCLIIntegration:
     ):
         """Work item is created with 'Refactor' tag."""
         from skill.refactor.workitem_creation import (
-            build_smell_title,
             build_smell_description,
-            severity_to_priority,
+            build_smell_title,
             create_smell_work_item,
+            severity_to_priority,
         )
 
         title = build_smell_title(referent_high)
         description = build_smell_description(referent_high)
         priority = severity_to_priority(referent_high["severity"])
 
-        expected_list_cmd = " ".join(["wl", "list", "--tags", "Refactor", "--json"])
+        expected_list_cmd = "wl list --tags Refactor --json"
         expected_create_cmd = _build_wl_create_cmd(title, description, priority)
 
         responses = {
@@ -427,10 +427,10 @@ class TestWorklogCLIIntegration:
     ):
         """When ``wl create`` fails, returns None rather than crashing."""
         from skill.refactor.workitem_creation import (
-            build_smell_title,
             build_smell_description,
-            severity_to_priority,
+            build_smell_title,
             create_smell_work_item,
+            severity_to_priority,
         )
 
         title = build_smell_title(sample_smell_low)
@@ -452,10 +452,10 @@ class TestWorklogCLIIntegration:
     ):
         """When ``wl create`` returns unparseable output, returns None."""
         from skill.refactor.workitem_creation import (
-            build_smell_title,
             build_smell_description,
-            severity_to_priority,
+            build_smell_title,
             create_smell_work_item,
+            severity_to_priority,
         )
 
         title = build_smell_title(sample_smell_critical)
@@ -476,10 +476,10 @@ class TestWorklogCLIIntegration:
     ):
         """When ``wl`` is not installed, returns None rather than crashing."""
         from skill.refactor.workitem_creation import (
-            build_smell_title,
             build_smell_description,
-            severity_to_priority,
+            build_smell_title,
             create_smell_work_item,
+            severity_to_priority,
         )
 
         title = build_smell_title(sample_smell_medium)
@@ -515,10 +515,10 @@ class TestWorklogCLIIntegration:
     ):
         """Creating work items for multiple smells returns all IDs."""
         from skill.refactor.workitem_creation import (
-            build_smell_title,
             build_smell_description,
-            severity_to_priority,
+            build_smell_title,
             create_smell_work_item,
+            severity_to_priority,
         )
 
         # Create files on disk
@@ -660,10 +660,10 @@ class TestDuplicatePrevention:
         file_path.write_text("import os\n")
 
         from skill.refactor.workitem_creation import (
-            build_smell_title,
             build_smell_description,
-            severity_to_priority,
+            build_smell_title,
             create_smell_work_item,
+            severity_to_priority,
         )
 
         smell = dict(sample_smell_high)
@@ -833,10 +833,7 @@ class TestWorklogDuplicatePrevention:
         })
 
         # Build expected wl list command
-        expected_list_cmd = " ".join([
-            "wl", "list", "--tags", "Refactor",
-            "--json",
-        ])
+        expected_list_cmd = "wl list --tags Refactor --json"
 
         responses = {}
         # Set up mock response for wl list
@@ -883,24 +880,18 @@ class TestWorklogDuplicatePrevention:
             "workItems": [],
         })
 
-        expected_list_cmd = " ".join(["wl", "list", "--tags", "Refactor", "--json"])
+        expected_list_cmd = "wl list --tags Refactor --json"
 
         # Build expected wl create command
         from skill.refactor.workitem_creation import (
-            build_smell_title,
             build_smell_description,
+            build_smell_title,
             severity_to_priority,
         )
         title = build_smell_title(smell)
         description = build_smell_description(smell)
         priority = severity_to_priority(smell["severity"])
-        expected_create_cmd = " ".join([
-            "wl", "create", "--title", title,
-            "--description", description,
-            "--priority", priority,
-            "--tags", "Refactor",
-            "--json",
-        ])
+        expected_create_cmd = f"wl create --title {title} --description {description} --priority {priority} --tags Refactor --json"
 
         responses = {
             expected_list_cmd: subprocess.CompletedProcess(
@@ -941,10 +932,10 @@ class TestBatchWorkItemCreation:
     ):
         """Batch creation returns work item IDs for each smell."""
         from skill.refactor.workitem_creation import (
-            build_smell_title,
             build_smell_description,
-            severity_to_priority,
+            build_smell_title,
             create_smell_work_items,
+            severity_to_priority,
         )
 
         # Create files on disk for two smells
@@ -1034,10 +1025,10 @@ class TestBatchWorkItemCreation:
         clean_file.write_text("import sys\n")
 
         from skill.refactor.workitem_creation import (
-            build_smell_title,
             build_smell_description,
-            severity_to_priority,
+            build_smell_title,
             create_smell_work_items,
+            severity_to_priority,
         )
 
         smell_with_dup = dict(sample_smell_critical)
@@ -1138,7 +1129,9 @@ class TestDocHygiene:
     SKILL_MD = Path(__file__).resolve().parent.parent.parent / "skill" / "refactor" / "SKILL.md"
 
     def test_skill_md_has_status_management_instructions(self):
-        """SKILL.md must include instructions for setting in_progress and open status."""
+        """SKILL.md must reference StatusLifecycle for status management (not manual wl commands)."""
         content = self.SKILL_MD.read_text()
+        assert "StatusLifecycle" in content, "SKILL.md must reference StatusLifecycle for status management"
         assert "in_progress" in content, "SKILL.md must reference setting status to in_progress"
-        assert "open --json" in content, "SKILL.md must reference setting status to open at end"
+        assert "open --json" not in content, "SKILL.md must NOT contain ad-hoc wl update --status commands"
+        assert "wl update <id> --status" not in content, "SKILL.md must NOT contain ad-hoc wl update --status commands"

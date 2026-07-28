@@ -23,6 +23,9 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
 from typing import Any, Callable, Optional, Sequence
 
 # Add repo root to sys.path for shared utility access
@@ -197,45 +200,19 @@ class IntakeAllEngine:
             return "skipped"
 
         if not self.dry_run:
-            # Claim the item first
-            claim_cmd = ["wl", "update", item_id, "--status", "in_progress", "--json"]
-            logger.debug("intakeall.claim cmd=%s", " ".join(claim_cmd))
+            # Claim the item and mark intake_complete via shared helper
             try:
-                claim_result = self.runner(claim_cmd)
-            except Exception as exc:
+                StatusLifecycle.update_status(item_id, "in_progress", runner=self.runner)
+                logger.debug("intakeall.auto_claim item=%s", item_id)
+            except RuntimeError as exc:
                 logger.warning("intakeall.claim.error item=%s exc=%s", item_id, exc)
                 return "error"
 
-            if claim_result.returncode != 0:
-                logger.warning(
-                    "intakeall.claim.failed item=%s rc=%s stderr=%s",
-                    item_id,
-                    claim_result.returncode,
-                    (claim_result.stderr or "").strip(),
-                )
-                return "error"
-
-            # Mark as intake_complete
-            complete_cmd = [
-                "wl", "update", item_id,
-                "--stage", "intake_complete",
-                "--status", "open",
-                "--json",
-            ]
-            logger.debug("intakeall.auto_complete cmd=%s", " ".join(complete_cmd))
             try:
-                result = self.runner(complete_cmd)
-            except Exception as exc:
-                logger.warning("intakeall.auto_complete.error item=%s exc=%s",
-                               item_id, exc)
-                return "error"
-
-            if result.returncode != 0:
-                stderr = (result.stderr or "").strip()
-                logger.warning(
-                    "intakeall.auto_complete.failed item=%s rc=%s stderr=%s",
-                    item_id, result.returncode, stderr,
-                )
+                StatusLifecycle.update_status(item_id, "open", stage="intake_complete", runner=self.runner)
+                logger.debug("intakeall.auto_complete item=%s", item_id)
+            except RuntimeError as exc:
+                logger.warning("intakeall.auto_complete.error item=%s exc=%s", item_id, exc)
                 return "error"
 
             # Add a comment explaining the auto-complete
@@ -276,33 +253,18 @@ class IntakeAllEngine:
             "recovery": None,
         }
 
-        # Claim the item
-        claim_cmd = [
-            "wl", "update", item_id,
-            "--status", "in_progress",
-            "--json",
-        ]
-        logger.debug("intakeall.claim cmd=%s", " ".join(claim_cmd))
+        # Claim the item via shared StatusLifecycle helper
         try:
-            claim_result = self.runner(claim_cmd)
-        except Exception as exc:
+            StatusLifecycle.update_status(item_id, "in_progress", runner=self.runner)
+            logger.debug("intakeall.claim item=%s", item_id)
+        except RuntimeError as exc:
             logger.warning("intakeall.claim.exception item=%s exc=%s", item_id, exc)
             result["outcome"] = "error"
-            result["error_detail"] = f"Claim exception: {exc}"
+            result["error_detail"] = f"Claim failed: {exc}"
             return result
 
-        if claim_result.returncode != 0:
-            stderr = (claim_result.stderr or "").strip()
-            logger.warning(
-                "intakeall.claim.failed item=%s rc=%s stderr=%s",
-                item_id, claim_result.returncode, stderr,
-            )
-            result["outcome"] = "error"
-            result["error_detail"] = f"Claim failed (rc={claim_result.returncode}): {stderr}"
-            return result
-
-        # Invoke /intake via pi (canonical pattern: pi -p --mode json <prompt>)
-        intake_cmd = ["pi", "-p", "--mode", "json", f"/intake {item_id}"]
+        # Invoke /skill:intake via pi (canonical pattern: pi -p --mode json <prompt>)
+        intake_cmd = ["pi", "-p", "--mode", "json", f"/skill:intake {item_id}"]
         logger.debug("intakeall.intake.invoke cmd=%s", " ".join(intake_cmd))
         try:
             intake_result = self.runner(intake_cmd, timeout=self.item_timeout)
@@ -344,24 +306,12 @@ class IntakeAllEngine:
             result["error_detail"] = "Intake output contains unanswered questions"
             return result
 
-        # Mark the item as intake_complete
+        # Mark the item as intake_complete via shared helper
         if not self.dry_run:
-            complete_cmd = [
-                "wl", "update", item_id,
-                "--stage", "intake_complete",
-                "--status", "open",
-                "--json",
-            ]
-            logger.debug("intakeall.intake_complete cmd=%s", " ".join(complete_cmd))
             try:
-                complete_result = self.runner(complete_cmd)
-                if complete_result.returncode != 0:
-                    stderr = (complete_result.stderr or "").strip()
-                    logger.warning(
-                        "intakeall.intake_complete.failed item=%s rc=%s stderr=%s",
-                        item_id, complete_result.returncode, stderr,
-                    )
-            except Exception as exc:
+                StatusLifecycle.update_status(item_id, "open", stage="intake_complete", runner=self.runner)
+                logger.debug("intakeall.intake_complete item=%s", item_id)
+            except RuntimeError as exc:
                 logger.warning(
                     "intakeall.intake_complete.error item=%s exc=%s",
                     item_id, exc,
@@ -400,62 +350,40 @@ class IntakeAllEngine:
 
         if current_status == "completed":
             # completed+idea → stage=done (status stays completed)
-            cmd = [
-                "wl", "update", item_id,
-                "--stage", "done",
-                "--json",
-            ]
-            recovery["action"] = "move_to_done_stage"
-            logger.debug(
-                "intakeall.recovery.completed item=%s cmd=%s",
-                item_id, " ".join(cmd),
-            )
+            try:
+                StatusLifecycle.update_status(item_id, "completed", stage="done", runner=self.runner)
+                recovery["action"] = "move_to_done_stage"
+                logger.debug("intakeall.recovery.completed item=%s", item_id)
+            except RuntimeError as exc:
+                logger.warning(
+                    "intakeall.recovery.exception item=%s exc=%s", item_id, exc,
+                )
+                recovery["action"] = f"move_to_done_stage_failed: {exc}"
+                return recovery
         elif current_status == "in_progress":
             # in_progress+idea → status=open (stage stays idea)
-            cmd = [
-                "wl", "update", item_id,
-                "--status", "open",
-                "--json",
-            ]
-            recovery["action"] = "reset_status_to_open"
-            logger.debug(
-                "intakeall.recovery.in_progress item=%s cmd=%s",
-                item_id, " ".join(cmd),
-            )
+            try:
+                StatusLifecycle.update_status(item_id, "open", runner=self.runner)
+                recovery["action"] = "reset_status_to_open"
+                logger.debug("intakeall.recovery.in_progress item=%s", item_id)
+            except RuntimeError as exc:
+                logger.warning(
+                    "intakeall.recovery.exception item=%s exc=%s", item_id, exc,
+                )
+                recovery["action"] = f"reset_status_to_open_failed: {exc}"
+                return recovery
         else:
             # Fallback: reset both status and stage (e.g. signal handler)
-            cmd = [
-                "wl", "update", item_id,
-                "--stage", "idea",
-                "--status", "open",
-                "--json",
-            ]
-            recovery["action"] = "reset_status_to_open"
-            logger.debug(
-                "intakeall.recovery.fallback item=%s cmd=%s",
-                item_id, " ".join(cmd),
-            )
-
-        try:
-            reset_result = self.runner(cmd)
-        except Exception as exc:
-            logger.warning(
-                "intakeall.recovery.exception item=%s exc=%s", item_id, exc,
-            )
-            recovery["action"] = f"{recovery['action']}_failed: {exc}"
-            return recovery
-
-        if reset_result.returncode != 0:
-            logger.warning(
-                "intakeall.recovery.failed item=%s rc=%s stderr=%s",
-                item_id,
-                reset_result.returncode,
-                (reset_result.stderr or "").strip(),
-            )
-            recovery["action"] = (
-                f"{recovery['action']}_failed (rc={reset_result.returncode})"
-            )
-            return recovery
+            try:
+                StatusLifecycle.update_status(item_id, "open", stage="idea", runner=self.runner)
+                recovery["action"] = "reset_status_to_open"
+                logger.debug("intakeall.recovery.fallback item=%s", item_id)
+            except RuntimeError as exc:
+                logger.warning(
+                    "intakeall.recovery.exception item=%s exc=%s", item_id, exc,
+                )
+                recovery["action"] = f"reset_status_to_open_failed: {exc}"
+                return recovery
 
         recovery["success"] = True
         return recovery
