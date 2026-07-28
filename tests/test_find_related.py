@@ -116,6 +116,15 @@ def _import_find_related():
     return mod
 
 
+def test_script_uses_status_lifecycle():
+    """The script must import and use StatusLifecycle as a context manager."""
+    content = SCRIPT_PATH.read_text()
+    assert "from skill.shared.status_lifecycle import StatusLifecycle" in content, \
+        "Script must import StatusLifecycle from the shared module"
+    assert "with StatusLifecycle" in content, \
+        "Script must use StatusLifecycle as a context manager"
+
+
 def test_keywords_from_title():
     """Keywords should be extracted from a work-item title."""
     mod = _import_find_related()
@@ -894,12 +903,11 @@ def test_search_repo_scans_allowed_extensions(tmp_path):
         assert not f.endswith(".o"), f"Unexpected match: {f}"
 
 
-def test_skill_md_has_status_management_instructions():
-    """SKILL.md must include instructions for setting in_progress and open status."""
+def test_skill_md_documents_status_lifecycle():
+    """SKILL.md must document that StatusLifecycle handles status management automatically."""
     skill_md = REPO_ROOT / "skill" / "find-related" / "SKILL.md"
     content = skill_md.read_text()
 
-    # Must contain the status lifecycle steps
-    assert "in_progress" in content, "SKILL.md must reference setting status to in_progress"
-    assert "open --json" in content, "SKILL.md must reference setting status to open at end"
+    # Must reference StatusLifecycle as the status management mechanism
+    assert "StatusLifecycle" in content, "SKILL.md must reference StatusLifecycle for status management"
     assert "status" in content.lower(), "SKILL.md must mention status"

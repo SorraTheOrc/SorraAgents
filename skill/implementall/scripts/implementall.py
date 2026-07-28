@@ -23,6 +23,9 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
 from typing import Any, Callable, Optional, Sequence
 
 # Add repo root to sys.path for shared utility access
@@ -153,30 +156,14 @@ class ImplementAllEngine:
             "recovery": None,
         }
 
-        # Claim the item
-        claim_cmd = [
-            "wl", "update", item_id,
-            "--status", "in_progress",
-            "--stage", "in_progress",
-            "--json",
-        ]
-        logger.debug("implementall.claim cmd=%s", " ".join(claim_cmd))
+        # Claim the item via shared StatusLifecycle helper
         try:
-            claim_result = self.runner(claim_cmd)
-        except Exception as exc:
+            StatusLifecycle.update_status(item_id, "in_progress", stage="in_progress", runner=self.runner)
+            logger.debug("implementall.claim item=%s", item_id)
+        except RuntimeError as exc:
             logger.warning("implementall.claim.exception item=%s exc=%s", item_id, exc)
             result["outcome"] = "error"
-            result["error_detail"] = f"Claim exception: {exc}"
-            return result
-
-        if claim_result.returncode != 0:
-            stderr = (claim_result.stderr or "").strip()
-            logger.warning(
-                "implementall.claim.failed item=%s rc=%s stderr=%s",
-                item_id, claim_result.returncode, stderr,
-            )
-            result["outcome"] = "error"
-            result["error_detail"] = f"Claim failed (rc={claim_result.returncode}): {stderr}"
+            result["error_detail"] = f"Claim failed: {exc}"
             return result
 
         # Invoke /skill:implement via pi
@@ -242,28 +229,12 @@ class ImplementAllEngine:
             recovery["success"] = True
             return recovery
 
-        reset_cmd = [
-            "wl", "update", item_id,
-            "--status", "open",
-            "--stage", "plan_complete",
-            "--json",
-        ]
-        logger.debug("implementall.recovery cmd=%s", " ".join(reset_cmd))
         try:
-            reset_result = self.runner(reset_cmd)
-        except Exception as exc:
+            StatusLifecycle.update_status(item_id, "open", stage="plan_complete", runner=self.runner)
+            logger.debug("implementall.recovery item=%s", item_id)
+        except RuntimeError as exc:
             logger.warning("implementall.recovery.exception item=%s exc=%s", item_id, exc)
             recovery["action"] = f"reset_status_failed: {exc}"
-            return recovery
-
-        if reset_result.returncode != 0:
-            logger.warning(
-                "implementall.recovery.failed item=%s rc=%s stderr=%s",
-                item_id,
-                reset_result.returncode,
-                (reset_result.stderr or "").strip(),
-            )
-            recovery["action"] = f"reset_status_failed (rc={reset_result.returncode})"
             return recovery
 
         recovery["success"] = True

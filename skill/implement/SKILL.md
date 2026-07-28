@@ -148,7 +148,7 @@ Verify:
 If the gate fails:
 
 1. `wl update <work-item-id> --status open --json`
-2. If not well-defined → run intake interview (see `command/intake.md`).
+2. If not well-defined → run intake interview (see `skill/intake/SKILL.md`).
 3. If too large → run plan interview (`/skill:plan`) to decompose.
 4. Inform the user and ask if they want to restart implementation review.
 
@@ -180,8 +180,6 @@ After all recursive child implementations are complete, check whether this work 
     `wl comment add <work-item-id> --comment "Not all children are in a terminal stage. Needs producer review." --author "<AGENT>" --json`
   - Return control to the operator.
 
-> **Under Ralph:** parent advancement is handled by Ralph's `_wl_update_stage()`. Skip the manual advancement above when operating under Ralph orchestration.
-
 - Check for a recent audit record; if none, run `/skill:audit <work-item-id>` to establish work needed.
 - Write tests and code to meet acceptance criteria:
   - Make minimal, focused changes.
@@ -195,7 +193,6 @@ After all recursive child implementations are complete, check whether this work 
   - If failing tests are outside this work item's scope, invoke the triage helper:
     `python3 ../triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`
     - If a new or incomplete critical issue is returned, implement it, fix the test, and re-run until all pass.
-    - Under Ralph, failing tests are handled automatically.
   - Update documentation (excluding `CHANGELOG.md`, which is managed by the ship pipeline).
   - Summarize changes in the work item.
   - Wait for user confirmation before proceeding.
@@ -271,7 +268,6 @@ After implementation completes and before final commit, an automated refactor st
 - Close your response with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
 
   > **Parent/epic items already advanced at Step 4.1:** if this item has children and parent advancement was already performed, skip the `wl update` below.
-  > **Under Ralph:** do NOT mark `in_review` — Ralph handles it after the audit.
   > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `wl update <work-item-id> --status completed --stage in_review --json`
 
   > The work-item stays `in_review` until the release process promotes `dev` to `main`. See `../ship/SKILL.md` for push-to-dev workflow and `../ship/scripts/run-release.js` for release.
@@ -279,8 +275,7 @@ After implementation completes and before final commit, an automated refactor st
 Pre-push blocking check
 -----------------------
 
-- Under Ralph: failing tests automatically create child work items via the triage helper, get fixed via `implement-single`, and re-run until all pass before push.
-- Manual: invoke the triage helper and fix any failing tests before pushing.
+Invoke the triage helper and fix any failing tests before pushing.
 
 Final cleanup (belt-and-suspenders)
 ---------------------------------------
@@ -314,7 +309,6 @@ The following table documents the expected status and stage transitions at each 
 | Abort - user-initiated | `wl update <id> --status open --json`, return control to operator | open | (unchanged) |
 | Abort - error/exception during implementation | `wl update <id> --status open --json`, log error to comment, return | open | (unchanged) |
 | Abort - unexpected termination (Final cleanup) | Check status; if `in_progress` and work incomplete, reset | open | (unchanged) |
-| Under Ralph (Step 6 note) | Skip in_review step; Ralph handles transition | in_progress | in_progress |
 
 > **Abort/failure transitions always use `--status open` while keeping the stage unchanged.**
 > This pattern is mandatory — never leave a work item in `in_progress` status

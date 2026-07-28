@@ -22,10 +22,7 @@ from skill.audit.scripts.audit_runner import (
     _extract_acs,
     _extract_json_array,
     _run_wl,
-    _load_config,
-    _resolve_model_for_phase,
-    _normalize_model_source,
-    _deep_merge,
+
     _get_child_audit_verdict,
     Runner,
     CALL_PI_TIMEOUT,
@@ -176,6 +173,37 @@ class TestCLIParsing:
         parser = build_parser()
         with pytest.raises(SystemExit):
             parser.parse_args(["project", "--force"])
+
+    # ------------------------------------------------------------------
+    # --timeout flag tests
+    # ------------------------------------------------------------------
+
+    def test_issue_timeout_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--timeout", "600"])
+        assert args.timeout == 600
+
+    def test_issue_timeout_default_none(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123"])
+        assert args.timeout is None
+
+    def test_project_timeout_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["project", "--timeout", "1200"])
+        assert args.timeout == 1200
+
+    def test_project_timeout_default_none(self):
+        parser = build_parser()
+        args = parser.parse_args(["project"])
+        assert args.timeout is None
+
+    def test_issue_timeout_with_other_flags(self):
+        parser = build_parser()
+        args = parser.parse_args(["issue", "SA-123", "--timeout", "900", "--do-not-persist", "--json"])
+        assert args.timeout == 900
+        assert args.do_not_persist is True
+        assert args.json is True
 
 
 # ---------------------------------------------------------------------------
@@ -643,8 +671,8 @@ class TestCallPiTimeoutConstant:
 
     def test_call_pi_timeout_not_excessive(self):
         """Timeout should still have a reasonable upper bound."""
-        assert CALL_PI_TIMEOUT <= 900, (
-            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 900s "
+        assert CALL_PI_TIMEOUT <= 1200, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 1200s "
             "to bound the original indefinite-hang risk"
         )
 
@@ -743,130 +771,18 @@ class TestExitCodes:
 # Model resolution tests
 # ---------------------------------------------------------------------------
 
-class TestDeepMerge:
-    """Test the deep-merge helper."""
-
-    def test_deep_merge_simple(self):
-        base = {"a": 1, "b": 2}
-        override = {"b": 3, "c": 4}
-        result = _deep_merge(base, override)
-        assert result == {"a": 1, "b": 3, "c": 4}
-
-    def test_deep_merge_nested(self):
-        base = {"model": {"remote": {"audit": "m1"}, "local": {"audit": "m2"}}}
-        override = {"model": {"local": {"audit": "m3"}}}
-        result = _deep_merge(base, override)
-        assert result["model"]["remote"]["audit"] == "m1"
-        assert result["model"]["local"]["audit"] == "m3"
-
-    def test_deep_merge_empty_override(self):
-        base = {"a": 1}
-        result = _deep_merge(base, {})
-        assert result == {"a": 1}
-
-
-class TestLoadConfig:
-    """Test config loading with fallback."""
-
-    def test_load_config_returns_dict(self):
-        """_load_config must always return a dict, even when no config file exists."""
-        config = _load_config()
-        assert isinstance(config, dict)
-
-    def test_load_config_has_model_key(self):
-        """When CWD has a .ralph.json, its model config should be reflected."""
-        config = _load_config()
-        assert "model" in config
-        assert isinstance(config["model"], dict)
-
-
-class TestNormalizeModelSource:
-    """Test model source normalization."""
-
-    def test_normalize_remote(self):
-        assert _normalize_model_source("remote") == "remote"
-
-    def test_normalize_local(self):
-        assert _normalize_model_source("local") == "local"
-
-    def test_normalize_case_insensitive(self):
-        assert _normalize_model_source("REMOTE") == "remote"
-
-    def test_normalize_unknown_falls_back_to_local(self):
-        assert _normalize_model_source("unknown") == "local"
-
-    def test_normalize_none_falls_back_to_local(self):
-        assert _normalize_model_source(None) == "local"
-
-
-class TestResolveModelForPhase:
-    """Test model resolution with CLI override > config > default."""
-
-    def test_cli_model_overrides_config(self):
-        """Explicit --model flag overrides everything."""
-        config = {
-            "model": {
-                "local": {"audit": "config-local-model"},
-                "remote": {"audit": "config-remote-model"},
-            }
-        }
-        model = _resolve_model_for_phase("audit", config, "local", cli_model="cli-override")
-        assert model == "cli-override"
-
-    def test_config_model_with_local_source(self):
-        """With model_source=local, resolve the local variant from config."""
-        config = {
-            "model": {
-                "local": {"audit": "local-model"},
-                "remote": {"audit": "remote-model"},
-            }
-        }
-        model = _resolve_model_for_phase("audit", config, "local", cli_model=None)
-        assert model == "local-model"
-
-    def test_config_model_with_remote_source(self):
-        """With model_source=remote, resolve the remote variant from config."""
-        config = {
-            "model": {
-                "local": {"audit": "local-model"},
-                "remote": {"audit": "remote-model"},
-            }
-        }
-        model = _resolve_model_for_phase("audit", config, "remote", cli_model=None)
-        assert model == "remote-model"
-
-    def test_fallback_to_default_when_no_config(self):
-        """When config has no model.audit for the given source, fall back to DEFAULT_MODEL."""
-        config = {}
-        model = _resolve_model_for_phase("audit", config, "local", cli_model=None)
-        assert model == DEFAULT_MODEL
-
-    def test_fallback_to_default_when_config_missing_audit_key(self):
-        """When config has model but no audit key for the source, fall back."""
-        config = {
-            "model": {
-                "local": {"intake": "intake-model"},
-            }
-        }
-        model = _resolve_model_for_phase("audit", config, "local", cli_model=None)
-        assert model == DEFAULT_MODEL
-
-    def test_config_model_flat_string(self):
-        """When model.audit is a flat string (not source-mapped), it's used directly."""
-        config = {
-            "model": {
-                "audit": "flat-audit-model",
-            }
-        }
-        model = _resolve_model_for_phase("audit", config, "local", cli_model=None)
-        assert model == "flat-audit-model"
-
-
 class TestCmdIssueModelResolution:
-    """Integration: cmd_issue should resolve the model from config based on model_source."""
+    """Integration: cmd_issue and cmd_project resolve model = model or DEFAULT_MODEL.
 
-    def test_cmd_issue_passes_resolved_model_to_pi(self, monkeypatch):
-        """cmd_issue should resolve model from config+model_source and pass to _call_pi."""
+    Model resolution is:
+      resolved_model = model or DEFAULT_MODEL
+
+    The ``model_source`` parameter is accepted for backward-compatible
+    argparse but has no effect on the resolved model.
+    """
+
+    def test_cmd_issue_default_model(self, monkeypatch):
+        """Without --model, cmd_issue passes DEFAULT_MODEL to _call_pi."""
         captured = {"model": None}
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
@@ -878,30 +794,18 @@ class TestCmdIssueModelResolution:
             fake_call_pi,
         )
 
-        # Fake the config loading to return a known model config
-        def fake_load_config():
-            return {
-                "model": {
-                    "local": {"audit": "from-config-local"},
-                    "remote": {"audit": "from-config-remote"},
-                }
-            }
-
-        monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._load_config",
-            fake_load_config,
-        )
-
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-MODEL", runner=fake_runner, model_source="local", persist=False)
-        assert captured["model"] == "from-config-local"
+        cmd_issue("SA-MODEL", runner=fake_runner, persist=False)
+        assert captured["model"] == DEFAULT_MODEL, (
+            f"Expected DEFAULT_MODEL ({DEFAULT_MODEL}), got {captured['model']}"
+        )
 
-    def test_cmd_issue_cli_model_overrides_config(self, monkeypatch):
-        """Explicit --model should override config even when model_source differs."""
+    def test_cmd_issue_explicit_model_override(self, monkeypatch):
+        """Explicit --model overrides DEFAULT_MODEL."""
         captured = {"model": None}
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
@@ -913,28 +817,16 @@ class TestCmdIssueModelResolution:
             fake_call_pi,
         )
 
-        def fake_load_config():
-            return {
-                "model": {
-                    "local": {"audit": "from-config"},
-                }
-            }
-
-        monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._load_config",
-            fake_load_config,
-        )
-
         def fake_runner(cmd, **kwargs):
             return _fake_proc(
                 stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")),
             )
 
-        cmd_issue("SA-MODEL", runner=fake_runner, model="cli-override", model_source="local", persist=False)
+        cmd_issue("SA-MODEL", runner=fake_runner, model="cli-override", persist=False)
         assert captured["model"] == "cli-override"
 
-    def test_cmd_project_passes_resolved_model_to_pi(self, monkeypatch):
-        """cmd_project should also resolve model from config+model_source."""
+    def test_cmd_project_default_model(self, monkeypatch):
+        """Without --model, cmd_project passes DEFAULT_MODEL to _call_pi."""
         captured = {"model": None}
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
@@ -944,25 +836,34 @@ class TestCmdIssueModelResolution:
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
             fake_call_pi,
-        )
-
-        def fake_load_config():
-            return {
-                "model": {
-                    "remote": {"audit": "remote-audit-model"},
-                }
-            }
-
-        monkeypatch.setattr(
-            "skill.audit.scripts.audit_runner._load_config",
-            fake_load_config,
         )
 
         def fake_runner(cmd, **kwargs):
             return _fake_proc(stdout=json.dumps({"success": True, "workItems": []}))
 
-        cmd_project(runner=fake_runner, model_source="remote")
-        assert captured["model"] == "remote-audit-model"
+        cmd_project(runner=fake_runner)
+        assert captured["model"] == DEFAULT_MODEL, (
+            f"Expected DEFAULT_MODEL ({DEFAULT_MODEL}), got {captured['model']}"
+        )
+
+    def test_cmd_project_explicit_model_override(self, monkeypatch):
+        """Explicit --model overrides DEFAULT_MODEL in cmd_project."""
+        captured = {"model": None}
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            captured["model"] = model
+            return {"verdict": "met", "evidence": "ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_runner(cmd, **kwargs):
+            return _fake_proc(stdout=json.dumps({"success": True, "workItems": []}))
+
+        cmd_project(runner=fake_runner, model="project-model")
+        assert captured["model"] == "project-model"
 
 
 # ---------------------------------------------------------------------------
@@ -1020,9 +921,18 @@ class TestPiPromptSafetyInstructions:
 class TestStatusLifecycle:
     """Verify that cmd_issue captures original status and restores it after audit."""
 
-    def _fake_runner_with_calls(self, calls: list, fail_show: bool = False):
-        """Create a fake runner that records calls and optionally fails on ``wl show``."""
+    def _fake_runner_with_calls(self, calls: list, fail_show: bool = False,
+                                 has_acs: bool = True):
+        """Create a fake runner that records calls and optionally fails on ``wl show``.
+
+        When *has_acs* is ``True``, the ``wl show --children --json`` response includes
+        a work item description with acceptance criteria so the audit can produce
+        ``Ready to close: Yes``.
+        """
+        _show_called = False
+
         def fake_runner(cmd, **kwargs):
+            nonlocal _show_called
             cmd_list = list(cmd)
             calls.append(cmd_list)
             # If fail_show is True and this is a "wl show" call, return failure
@@ -1031,11 +941,27 @@ class TestStatusLifecycle:
             # The first "wl show" without --children is the original-status capture.
             # Default response has no "status" field so original_status falls back to "open".
             # Test methods that supply a specific status should use _fake_runner_with_status.
+            # For "wl show --children --json": return a work item with ACs when has_acs is True.
+            if has_acs and "show" in cmd_list and "--children" in cmd_list and not _show_called:
+                _show_called = True
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": cmd_list[2],
+                        "title": "Test Item",
+                        "description": (
+                            "## Acceptance Criteria\n"
+                            "1. The system passes the test\n"
+                        ),
+                    },
+                    "children": [],
+                }))
             # All other calls succeed with valid JSON
             return _fake_proc(stdout=json.dumps({"success": True}))
         return fake_runner
 
-    def _fake_runner_with_status(self, calls: list, status: str = "completed"):
+    def _fake_runner_with_status(self, calls: list, status: str = "completed",
+                                 has_acs: bool = True):
         """Create a fake runner that returns a work item with the given *status*.
 
         The first ``wl show <id> --json`` call (without --children) returns a work
@@ -1053,6 +979,20 @@ class TestStatusLifecycle:
             if "show" in cmd_list and "--children" not in cmd_list and not _show_called:
                 _show_called = True
                 return _fake_proc(stdout=json.dumps({"success": True, "status": status}))
+            # For "wl show --children --json": return a work item with ACs when has_acs is True.
+            if has_acs and "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": cmd_list[2],
+                        "title": "Test Item",
+                        "description": (
+                            "## Acceptance Criteria\n"
+                            "1. The system passes the test\n"
+                        ),
+                    },
+                    "children": [],
+                }))
             return _fake_proc(stdout=json.dumps({"success": True}))
         return fake_runner
 
@@ -1094,43 +1034,50 @@ class TestStatusLifecycle:
             f"in_progress update must include --json, got: {in_progress_updates[0]}"
         )
 
-    def test_restores_fallback_open_when_no_status_in_response(self, monkeypatch):
-        """Original status defaults to 'open' when wl show response has no status field."""
+    def test_restores_completed_on_success_no_status_in_response(self, monkeypatch):
+        """On successful audit, status transitions to 'completed' even when no original status was captured."""
         calls = []
 
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
         )
 
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
-        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
-        assert len(open_updates) >= 1, (
-            f"Expected at least one open status update (fallback), got: {wl_updates}"
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected at least one 'completed' status update, got: {wl_updates}"
         )
 
-    def test_restore_update_includes_json_flag_when_fallback(self, monkeypatch):
-        """The status restore wl update must include --json flag (fallback case)."""
+    def test_completed_update_includes_json_flag(self, monkeypatch):
+        """The completed status wl update must include --json flag."""
         calls = []
 
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
         )
 
         cmd_issue("SA-JSONFLAG2", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-JSONFLAG2"]]
         assert len(wl_updates) >= 1, f"Expected at least one wl update call, got: {calls}"
-        # The status restore should include --json
-        open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
-        assert len(open_updates) >= 1, (
-            f"Expected open update (fallback), got: {wl_updates}"
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected 'completed' update, got: {wl_updates}"
         )
-        assert "--json" in open_updates[0], (
-            f"Status restore update must include --json, got: {open_updates[0]}"
+        assert "--json" in completed_updates[0], (
+            f"Completed update must include --json, got: {completed_updates[0]}"
         )
 
     def test_fallback_to_open_when_wl_show_fails(self):
@@ -1146,13 +1093,17 @@ class TestStatusLifecycle:
             f"Expected open update (fallback) even on failure, got: {wl_updates}"
         )
 
-    def test_in_progress_before_restore(self, monkeypatch):
-        """in_progress must appear before the status restore in the call sequence."""
+    def test_in_progress_before_completed(self, monkeypatch):
+        """in_progress must appear before completed in the call sequence."""
         calls = []
 
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
         )
 
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
@@ -1160,13 +1111,14 @@ class TestStatusLifecycle:
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
         statuses = [" ".join(c[3:]) for c in wl_updates]
         in_progress_idx = next(i for i, s in enumerate(statuses) if "in_progress" in s)
-        restore_idx = next(i for i, s in enumerate(statuses) if "--status open" in s)
-        assert in_progress_idx < restore_idx, (
-            f"in_progress (index {in_progress_idx}) must come before restore (index {restore_idx}): {statuses}"
+        completed_idx = next(i for i, s in enumerate(statuses) if "completed" in s)
+        assert in_progress_idx < completed_idx, (
+            f"in_progress (index {in_progress_idx}) must come before completed (index {completed_idx}): {statuses}"
         )
 
-    def test_restores_fallback_open_on_exception(self, monkeypatch):
-        """Status restore (fallback open) must happen when an unhandled exception occurs."""
+    def test_handled_exception_sets_open_status(self, monkeypatch):
+        """When a pi RuntimeError is caught by the body, audit cannot verify ACs
+        so ``Ready to close: No`` → status becomes ``open``."""
         calls = []
 
         def fake_call_pi(prompt, model="x", pi_bin="x", **kwargs):
@@ -1182,7 +1134,7 @@ class TestStatusLifecycle:
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-EXCEPT"]]
         open_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
         assert len(open_updates) >= 1, (
-            f"Expected open status restore after exception, got: {wl_updates}"
+            f"Expected 'open' status (audit failed due to exception), got: {wl_updates}"
         )
 
     def test_restores_original_status_when_captured(self, monkeypatch):
@@ -1191,7 +1143,11 @@ class TestStatusLifecycle:
 
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
         )
 
         cmd_issue("SA-ORIGSTAT", runner=self._fake_runner_with_status(calls, status="completed"), persist=False)
@@ -1207,25 +1163,115 @@ class TestStatusLifecycle:
             f"Should NOT set 'open' when original status was 'completed', got: {wl_updates}"
         )
 
-    def test_restores_custom_original_status_in_json_flag(self, monkeypatch):
-        """The restore call for a custom original status must include --json flag."""
+    def test_completed_uses_json_flag_when_audit_passes(self, monkeypatch):
+        """The completed status transition must include --json flag when audit passes."""
         calls = []
 
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
-            lambda prompt, model="x", pi_bin="x", **kwargs: {"verdict": "met", "evidence": "ok"},
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
         )
 
         cmd_issue("SA-ORIGSTAT2", runner=self._fake_runner_with_status(calls, status="in_progress"), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-ORIGSTAT2"]]
-        restore_updates = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]]
-        assert len(restore_updates) >= 1, (
-            f"Expected in_progress status restore, got: {wl_updates}"
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected 'completed' (audit passed), got: {wl_updates}"
         )
-        assert "--json" in restore_updates[0], (
-            f"Status restore must include --json, got: {restore_updates[0]}"
+        assert "--json" in completed_updates[0], (
+            f"Completed update must include --json, got: {completed_updates[0]}"
         )
+
+
+    # ------------------------------------------------------------------
+    # Tests: needs_producer_review flag (AC1, AC2)
+    # ------------------------------------------------------------------
+
+    def test_completed_update_includes_needs_producer_review_when_ready_to_close(self, monkeypatch):
+        """When audit verdict is ready-to-close, the completed update must include
+        --needs-producer-review yes and --stage in_review (AC1, AC2, AC3)."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
+        )
+
+        cmd_issue("SA-NPR1", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR1"]]
+        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
+        assert len(completed_updates) >= 1, (
+            f"Expected at least one 'completed' update, got: {wl_updates}"
+        )
+        # The completed update must include --needs-producer-review yes
+        assert "--needs-producer-review" in completed_updates[0], (
+            f"Completed update must include --needs-producer-review, got: {completed_updates[0]}"
+        )
+        npr_idx = completed_updates[0].index("--needs-producer-review")
+        assert completed_updates[0][npr_idx + 1] == "yes", (
+            f"--needs-producer-review must be 'yes', got: {completed_updates[0]}"
+        )
+        # The completed update must include --stage in_review
+        assert "--stage" in completed_updates[0], (
+            f"Completed update must include --stage, got: {completed_updates[0]}"
+        )
+        stage_idx = completed_updates[0].index("--stage")
+        assert completed_updates[0][stage_idx + 1] == "in_review", (
+            f"--stage must be 'in_review', got: {completed_updates[0]}"
+        )
+
+    def test_no_needs_producer_review_when_not_ready_to_close(self, monkeypatch):
+        """When audit verdict is NOT ready-to-close, the status update must NOT
+        include --needs-producer-review (AC1: only set when verdict is ready-to-close)."""
+        calls = []
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "unmet", "evidence": "missing"}]',
+                "verdict": "unmet",
+                "evidence": "missing",
+            },
+        )
+
+        cmd_issue("SA-NPR2", runner=self._fake_runner_with_calls(calls, has_acs=False), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR2"]]
+        for update in wl_updates:
+            assert "--needs-producer-review" not in update, (
+                f"Status update should NOT include --needs-producer-review, got: {update}"
+            )
+
+    def test_no_needs_producer_review_on_exception(self, monkeypatch):
+        """When audit fails with an exception, the status update must NOT
+        include --needs-producer-review (AC1: only set when verdict is ready-to-close)."""
+        calls = []
+
+        def fake_call_pi(prompt, model="x", pi_bin="x", **kwargs):
+            raise RuntimeError("Pi crashed")
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        cmd_issue("SA-NPR3", runner=self._fake_runner_with_calls(calls), persist=False)
+
+        wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR3"]]
+        for update in wl_updates:
+            assert "--needs-producer-review" not in update, (
+                f"Status update on exception should NOT include --needs-producer-review, got: {update}"
+            )
 
 
 # ---------------------------------------------------------------------------

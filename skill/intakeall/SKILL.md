@@ -1,6 +1,6 @@
 ---
 name: intakeall
-description: "Automated batch intake for idea-stage work items. Discovers all items in idea stage and runs /intake for each sequentially, auto-completing well-defined items, detecting producer-input needs, and producing a summary report."
+description: "Automated batch intake for idea-stage work items. Discovers all items in idea stage and runs /skill:intake for each sequentially, auto-completing well-defined items, detecting producer-input needs, and producing a summary report."
 ---
 
 # IntakeAll
@@ -94,11 +94,12 @@ python3 ./scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
 
 ## Related skills
 
-- `command/intake.md` — Per-item intake command
+- `skill/intake/SKILL.md` — Per-item intake skill
 - `../planall/SKILL.md` — Sibling batch planning skill
-- `../ralph/SKILL.md` — Auto-intake for individual items
+
 
 > **Implementation notes:**
 >
 > - The `_invoke_intake()` previously invoked `/intake` via `pi run /intake <id>` which blocked indefinitely in batch mode. Fixed in SA-0MQRAMZ4V0056K14 (type-safety) and SA-0MQP33ID9004OR5M (JSON invocation). Batch flow now skips interactive subprocess.
+> - After migration (SA-0MS3CIU0F00066CD), `_invoke_intake()` now uses `/skill:intake` instead of `/intake`. The batch flow still skips the interactive subprocess.
 > - Status claim was fixed in SA-0MQS18ZOI005ER2V to use status-only (`--status in_progress`), matching documented pattern.

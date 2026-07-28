@@ -172,7 +172,7 @@ The `delegate` command in `workflow.yaml` defines a `dispatch_map` that maps fro
 
 | From State Alias | Shell Command Template | Actor |
 |---|---|---|
-| `idea` | `pi "/intake {id} do not ask questions"` | PM |
+| `idea` | `pi "/skill:intake {id} do not ask questions"` | PM |
 | `intake` | `pi "/plan {id}"` | PM |
 | `plan` | `pi "work on {id} using the implement skill"` | Patch |
 
@@ -770,7 +770,7 @@ This section addresses the gap identified in the SA-0MLT1ENFV0CTQ1IO audit: no i
 
 | Workflow Command | Actor | Engine Code Path | Delegation Module | Description |
 |---|---|---|---|---|
-| `intake` | PM | `process_delegation()` Step 4, dispatch_map["idea"] | `run_idle_delegation()` | Spawn `/intake {id}` |
+| `intake` | PM | `process_delegation()` Step 4, dispatch_map["idea"] | `run_idle_delegation()` | Spawn `/skill:intake {id}` |
 | `author_prd` | PM | Not engine-driven | N/A | Manual or PM-assisted PRD authoring |
 | `plan` | PM | `process_delegation()` Step 4, dispatch_map["intake"] | `run_idle_delegation()` | Spawn `/plan {id}` |
 | `start_build` | Patch | Not engine-driven | N/A | Manual developer pickup |

@@ -129,7 +129,7 @@ def _contains_questions(text: str) -> bool:
 
 Several options:
 
-**Option A — Skip `/intake` for items needing input**: Instead of invoking `pi -p --mode json /intake <id>` as a subprocess, the intakeall script could directly use the pi agent framework SDK or API to process intake without interactive input. This would avoid the blocking subprocess entirely.
+**Option A — Skip `/skill:intake` for items needing input**: Instead of invoking `pi -p --mode json /skill:intake <id>` as a subprocess, the intakeall script could directly use the pi agent framework SDK or API to process intake without interactive input. This would avoid the blocking subprocess entirely.
 
 **Option B — Feed defaults via stdin**: Pipe default answers ("no additional input needed") into the `pi` subprocess to allow it to proceed without blocking:
 
@@ -149,7 +149,7 @@ intake_result = self.runner(
 
 1. Apply **Fix 1** (type safety in `_extract_pi_text` and `_contains_questions`) immediately — it's a clear bug.
 2. Apply **Fix 2 Option C** (broaden `has_sufficient_detail` to cover "## Recommendation" headings) or **Option D** (skip the /intake subprocess, mark as needs_input) to unblock batch intake.
-3. Consider removing the `_invoke_intake` subprocess approach entirely, or document that the `/intake` subprocess route is a known limitation requiring user interaction.
+3. Consider removing the `_invoke_intake` subprocess approach entirely, or document that the `/skill:intake` subprocess route is a known limitation requiring user interaction.
 
 ---
 
@@ -162,7 +162,7 @@ Instead of fixing the script, we processed the 8 `idea`-stage items directly:
 3. Updated each item via `wl update <id> --description-file <file> --stage intake_complete --status open --json`
 4. Added a comment documenting the intake completion
 
-This approach works for items that have clear, well-structured descriptions but lack formal AC headers. Items with insufficient detail would still need the interactive `/intake` process.
+This approach works for items that have clear, well-structured descriptions but lack formal AC headers. Items with insufficient detail would still need the interactive `/skill:intake` process.
 
 ---
 

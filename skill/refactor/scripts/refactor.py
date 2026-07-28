@@ -25,28 +25,31 @@ import json
 import logging
 import sys
 import traceback
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 # Add repo root to sys.path for shared utility access
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.scripts.failure_notice import FailureNotice  # noqa: E402
-
+from skill.scripts.failure_notice import FailureNotice
+from skill.shared.status_lifecycle import StatusLifecycle
 
 # Ensure repo root is on sys.path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.code_review.scripts.linter_runner import probe_linter  # noqa: E402
-from skill.refactor.session_boundary import get_changed_files, get_untracked_files  # noqa: E402
-from skill.refactor.smell_detection import detect_smells, load_rules  # noqa: E402
-from skill.refactor.workitem_creation import create_smell_work_items  # noqa: E402
-from skill.refactor.comment_injection import inject_refactor_comment  # noqa: E402
-
+from skill.code_review.scripts.linter_runner import probe_linter
+from skill.refactor.comment_injection import inject_refactor_comment
+from skill.refactor.session_boundary import (
+    get_changed_files,
+    get_untracked_files,
+)
+from skill.refactor.smell_detection import detect_smells, load_rules
+from skill.refactor.workitem_creation import create_smell_work_items
 
 LOG = logging.getLogger("refactor.scripts.refactor")
 
@@ -569,6 +572,61 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def _build_pipeline_runner(args: argparse.Namespace) -> Callable[[], dict[str, Any]]:
+    """Build and return a callable that runs the refactor pipeline.
+
+    When a ``work_item_id`` is provided (and ``--dry-run`` is not set),
+    wraps the pipeline execution in a ``StatusLifecycle`` context manager
+    so work item status is managed automatically (``in_progress`` on entry,
+    restored on failure).
+
+    Args:
+        args: The parsed CLI arguments.
+
+    Returns:
+        A callable that runs the pipeline and returns the report dict.
+    """
+    config = _load_config(args.config)
+
+    def _run() -> dict[str, Any]:
+        return refactor_pipeline(
+            parent_branch=args.parent_branch,
+            config=config,
+            no_linter=args.no_linter,
+            no_llm=args.no_llm,
+            dry_run=args.dry_run,
+        )
+
+    if args.work_item_id and not args.dry_run:
+        def _wrapped() -> dict[str, Any]:
+            with StatusLifecycle(args.work_item_id):
+                return _run()
+        return _wrapped
+
+    return _run
+
+
+def _load_config(config_path: str | None) -> dict[str, Any] | None:
+    """Load a JSON config file if specified.
+
+    Args:
+        config_path: Optional path to a .refactor.json config file.
+
+    Returns:
+        The parsed config dict, or None if no path given or load fails.
+    """
+    if not config_path:
+        return None
+    path = Path(config_path)
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        LOG.warning("Failed to load config %s: %s", config_path, exc)
+        return None
+
+
 def _main(argv: list[str] | None = None) -> int:
     """Main entry point for the refactor orchestration."""
     args = parse_args(argv)
@@ -578,25 +636,11 @@ def _main(argv: list[str] | None = None) -> int:
         format="%(levelname)s: %(message)s",
     )
 
-    # Load config if specified
-    config = None
-    if args.config:
-        config_path = Path(args.config)
-        if config_path.is_file():
-            try:
-                config = json.loads(config_path.read_text())
-            except (json.JSONDecodeError, OSError) as exc:
-                LOG.warning("Failed to load config %s: %s", args.config, exc)
+    # Build and run the pipeline (with StatusLifecycle if work_item_id given)
+    pipeline_runner = _build_pipeline_runner(args)
+    report = pipeline_runner()
 
-    # Run the pipeline
-    report = refactor_pipeline(
-        parent_branch=args.parent_branch,
-        config=config,
-        no_linter=args.no_linter,
-        no_llm=args.no_llm,
-        dry_run=args.dry_run,
-    )
-
+    # Output section (unchanged):
     if args.json:
         print(json.dumps(report, indent=2, default=str))
     else:

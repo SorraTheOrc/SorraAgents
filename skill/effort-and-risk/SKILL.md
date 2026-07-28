@@ -12,14 +12,15 @@ Produce a machine-readable engineering estimate (effort + risk) and human-readab
 
 ## Status lifecycle
 
-1. **Claim**: `wl update <issue-id> --status in_progress --json` (before any other step)
-2. **Release**: `wl update <issue-id> --status open --json` (end of execution, success or failure)
+Status is managed automatically by the `StatusLifecycle` context manager from `skill.shared.status_lifecycle`.
 
-> Stage is NOT modified. Only `--status` is used.
+On entry, the work item is set to `in_progress`. On successful completion, it transitions to `completed`. On error or failure, the original status is restored.
+
+Stage is NOT modified by `run_skill.py`.
 
 ## Gating
 
-Issue MUST be in `intake_complete` or `plan_complete` stage. If not, refuse with: "The issue does not have a sufficiently detailed plan... Run the intake command with `/intake <issue-id>` or the plan command with `/skill:plan <issue-id>`." No other output on refusal.
+Issue MUST be in `intake_complete` or `plan_complete` stage. If not, refuse with: "The issue does not have a sufficiently detailed plan... Run the intake skill with `/skill:intake <issue-id>` or the plan command with `/skill:plan <issue-id>`." No other output on refusal.
 
 ## Orchestrator
 

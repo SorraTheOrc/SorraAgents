@@ -76,7 +76,7 @@ Expand the initial idea into a more detailed feature intake work-item. This step
 - **Acceptance Criteria:** work-item contains a clear understanding of the feature's purpose and requirements.
 - **Status Tag:** `intake_complete`
 - **Useful Commands:**
-  - `/intake <Work-Item ID>`
+  - `/skill:intake <Work-Item ID>`
 - **Next Step:** proceed to the `Plan` step.
 
 Summary: a clear, testable project definition that guides epics and prioritization.

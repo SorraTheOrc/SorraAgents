@@ -1,10 +1,10 @@
 ---
-description: Create an intake brief (Workflow step 1)
-tags:
-  - workflow
-  - intake
+name: intake
+description: Create an intake brief (Workflow step 1). Interview-driven requirements gathering, drafting, and work-item preparation.
 agent: build
 ---
+
+# Intake Skill
 
 You are authoring a new Worklog work item for a feature or bug fix, following an interview-driven approach to gather requirements, constraints, Acceptance Criteria (synonym: Success Criteria), and related work — ensuring sufficient detail for a developer to complete the work.
 
@@ -17,11 +17,11 @@ You are authoring a new Worklog work item for a feature or bug fix, following an
 
 - A 1–2 sentence headline summary of the intake brief
 - Final brief text and the new or updated work item
-- Idempotence: rerunning `/intake` reuses existing work items when they represent the same item
+- Idempotence: rerunning `/skill:intake` reuses existing work items when they represent the same item
 
 ## Behavior
 
-The command implements the procedural workflow below. Each numbered step is part of the canonical execution path; substeps describe concrete checks or commands to run.
+The skill implements the procedural workflow below. Each numbered step is part of the canonical execution path; substeps describe concrete checks or commands to run.
 
 ## Hard requirements
 
@@ -35,15 +35,49 @@ The command implements the procedural workflow below. Each numbered step is part
 - The goal is sufficient detail to create a clear work item — not an exhaustive spec.
 - Do not include procedural next steps (e.g., "Proceed to planning") in the intake brief or work item description. Workflow progression is handled by stage transitions, not by work item content.
 
-## Status lifecycle (first action)
+## Status Lifecycle
 
-- **Before any other step**, claim the work item:
-  `wl update <work-item-id> --status in_progress --json`
-  This must be done before any evaluation, context gathering, or preflight checks. The status signals that this item is being processed and prevents concurrent claims.
+All work-item status transitions are managed by the shared `StatusLifecycle` context manager (from `skill/shared/status_lifecycle.py`). Do **not** use ad-hoc `wl update --status` commands.
+
+The intake lifecycle script at `skill/intake/scripts/intake.py` provides the canonical CLI interface for lifecycle operations:
+
+- **Claim the item** — run before any other step:
+  ```bash
+  python3 skill/intake/scripts/intake.py start <work-item-id> --assignee "<AGENT>"
+  ```
+  This sets `status=in_progress`, claims the item, and prevents concurrent claims.
+
+- **Auto-complete** — skip full intake for sufficiently defined items:
+  ```bash
+  python3 skill/intake/scripts/intake.py auto-complete <work-item-id>
+  ```
+
+- **Finish intake** — complete the process and advance stage:
+  ```bash
+  python3 skill/intake/scripts/intake.py finish <work-item-id> [--description-file <path>]
+  ```
+
+- **Abort** — release the item on failure or interruption:
+  ```bash
+  python3 skill/intake/scripts/intake.py abort <work-item-id>
+  ```
+
+> **Design rationale:** The `StatusLifecycle` context manager from `skill/shared/status_lifecycle.py` is the single source of truth for all
+> status lifecycle management. The `intake.py` script provides a CLI
+> wrapper so that SKILL.md instructions can invoke lifecycle operations
+> without embedding ad-hoc `wl update --status` commands.
 
 ## Process (must follow)
 
-1. Evaluate whether intake is required (agent responsibility)
+### 0. Claim the work item
+
+- **Before any other step**, claim the work item:
+  ```bash
+  python3 skill/intake/scripts/intake.py start <work-item-id> --assignee Map
+  ```
+  This must be done before any evaluation, context gathering, or preflight checks. The status signals that this item is being processed and prevents concurrent claims.
+
+### 1. Evaluate whether intake is required (agent responsibility)
 
 - Before performing full intake, run a lightweight evaluation to determine whether the work item already contains sufficient information to skip the interview/draft process.
 - Suggested heuristics (conservative, idempotent):
@@ -52,11 +86,16 @@ The command implements the procedural workflow below. Each numbered step is part
   - If the item is small (`task` or `bug`, not `epic`) with explicit ACs and a minimal implementation sketch, prefer to mark intake complete.
   - If parent/child relationships already express the required context, consider skipping.
 - If intake is not needed:
-  - `wl update <work-item-id> --stage intake_complete --status open --json`
-  - Optionally add a comment: `wl comment add <work-item-id> "Intake auto-complete: work item appears sufficiently defined (ACs present / small task)." --actor Map --json`
+  ```bash
+  python3 skill/intake/scripts/intake.py auto-complete <work-item-id>
+  ```
+  Optionally add a comment:
+  ```bash
+  wl comment add <work-item-id> "Intake auto-complete: work item appears sufficiently defined (ACs present / small task)." --actor Map --json
+  ```
 - If uncertain, fall back to the normal intake process (do not auto-complete on borderline evidence).
 
-1. Gather context (agent responsibility)
+### 2. Gather context (agent responsibility)
 
 - Derive 2–6 keywords from `<seed-context>` and user input.
 - Search work items (`wl search <keywords> --json`) and the repository for additional context (ignore `node_modules`, `.git`, and most `.`-prefixed folders).
@@ -69,19 +108,25 @@ The command implements the procedural workflow below. Each numbered step is part
   - "Potentially related work items" (titles + IDs)
 - Read and summarize each related artifact for later reference.
 
-1. Work Item prep (agent responsibility)
+### 3. Work Item prep (agent responsibility)
 
 - If `<work-item-id>` was provided:
-  - `wl update $1 --stage idea --assignee Map --json` (status was already set to `in_progress` — see Status lifecycle above)
-  - Review the item's `issueType`. If it doesn't match the nature of the work, update: `wl update <work-item-id> --issue-type <correct-type> --json`
+  - Review the item's `issueType`. If it doesn't match the nature of the work, update:
+    ```bash
+    wl update <work-item-id> --issue-type <correct-type> --json
+    ```
     - `bug` — problem/fix | `feature` — new capability | `chore` — maintenance | `task` — general work | `epic` — large scope with subtasks
 - If no id was provided:
   - Extract a working title from `<seed-intent>` (one line).
   - Infer the issue type from context (bug/feature/chore/epic/task).
-  - Create: `wl create --stage idea --status in_progress --title "<title>" --description "<seed-context>" --issue-type <type> --assignee Map --json`
+  - Create:
+    ```bash
+    wl create --stage idea --status in_progress --title "<title>" --description "<seed-context>" --issue-type <type> --assignee Map --json
+    ```
+    (Creating a new item is a creation operation, not a status lifecycle transition — the initial status is set at creation time.)
   - Remember the returned id.
 
-1. Interview
+### 4. Interview
 
 If the seed context is sufficient to draft a clear intake brief, skip this step. Otherwise, proceed with the interview.
 
@@ -91,7 +136,7 @@ If the seed context is sufficient to draft a clear intake brief, skip this step.
 - If anything is ambiguous, ask for clarification rather than guessing.
 - Do not proceed until sufficient information is gathered.
 
-1. Draft intake brief (agent responsibility)
+### 5. Draft intake brief (agent responsibility)
 
 - Write a brief to `.worklog/tmp/intake-draft-<title>-<work-item-id>.md` with these sections:
   - **Problem statement:** 1–2 sentences summarizing the problem.
@@ -104,7 +149,7 @@ If the seed context is sufficient to draft a clear intake brief, skip this step.
   - **Related work:** related docs or work items with descriptions and links/ids.
 - Present the draft to the user and invite feedback. Incorporate edits when supplied, but don't block waiting for approval — proceed automatically to review stages.
 
-1. Five mini-review stages (agent responsibility; must follow)
+### 6. Five mini-review stages (agent responsibility; must follow)
 
 Run five conservative review iterations on the draft brief. If a proposed change could alter intent, ask a clarifying question first.
 
@@ -116,27 +161,50 @@ After each stage: "Finished <type> review: <changes>" or "Finished <type> review
 4. **Risks & assumptions** — Add missing risks, mitigations, failure modes, and assumptions in short bullets. Include a scope-creep risk: record extra opportunities as linked work items rather than expanding scope. Don't invent mitigations beyond note-level.
 5. **Polish & handoff** — Tighten language, ensure copy-paste-ready commands, produce the final 1–2 sentence headline.
 
-6. Call the `find_related` skill to collect related work and add a report to the work item description.
+### 7. Call the find_related skill
 
-7. Review the new issue in project context and consider:
+Collect related work via `/skill:find-related <work-item-id>` and add a report to the work item description.
 
-- Adding dependencies: `wl comment add <work-item-id> --comment "Blocks:<blocked-id>" --json` / `--comment "Blocked-by:<blocking-id>" --json`
-- Adjusting priority: `wl update <work-item-id> --priority <level> --json`
+### 8. Review the new issue in project context
 
-1. Update the work item: `wl update <work-item-id> --description-file .worklog/tmp/intake-draft-<title>-<work-item-id>.md --stage intake_complete --status open --json`
+Consider:
 
-2. Calculate Effort and Risk (agent responsibility; must follow)
+- Adding dependencies:
+  ```bash
+  wl comment add <work-item-id> --comment "Blocks:<blocked-id>" --json
+  wl comment add <work-item-id> --comment "Blocked-by:<blocking-id>" --json
+  ```
+- Adjusting priority:
+  ```bash
+  wl update <work-item-id> --priority <level> --json
+  ```
 
-- Call the `effort_and_risk` skill on the new or updated work item to produce an estimate.
+### 9. Update the work item
 
-1. Finishing (must do as the final step only)
+Write the final draft to the work item description and advance the stage:
 
-- Set status to open (DO NOT close): `wl update <work-item-id> --status open --json`
+```bash
+python3 skill/intake/scripts/intake.py finish <work-item-id> --description-file .worklog/tmp/intake-draft-<title>-<work-item-id>.md
+```
+
+This transitions `status=open`, `stage=intake_complete`.
+
+### 10. Calculate Effort and Risk (agent responsibility; must follow)
+
+- Call the effort_and_risk skill on the new or updated work item to produce an estimate:
+  ```bash
+  python3 skill/effort-and-risk/scripts/orchestrate_estimate.py <work-item-id>
+  ```
+  (Refer to `skill/effort-and-risk/SKILL.md` for details.)
+
+### 11. Finishing (must do as the final step only)
+
 - `wl sync` to sync changes.
 - `wl show <work-item-id>` (not --json) to display the full work item.
 - Remove temporary files: `.worklog/tmp/intake-draft-<title>-<work-item-id>.md`
 - Output a structured summary:
 
+```markdown
 # Objective
 
   Headline summary of the issue
@@ -158,12 +226,23 @@ After each stage: "Finished <type> review: <changes>" or "Finished <type> review
 # Effort and Risk
 
   T-shirt sizing and one-line description of the biggest risks
+```
 
 - Finish with "This completes the Intake process for <work-item-id> <work-item-title>"
 
+### 12. Error/abort handling
+
+If the intake process fails or is interrupted before completion:
+
+```bash
+python3 skill/intake/scripts/intake.py abort <work-item-id>
+```
+
+This resets `status=open`, releasing the item for other agents.
+
 ## Traceability & idempotence
 
-- All work item updates or creations must be idempotent: rerunning `/intake` must not create duplicate links or clarifying-question entries.
+- All work item updates or creations must be idempotent: rerunning `/skill:intake` must not create duplicate links or clarifying-question entries.
 
 ## Editing rules & safety
 
@@ -190,7 +269,7 @@ After each stage: "Finished <type> review: <changes>" or "Finished <type> review
 - **Behavior and placement:**
   - Append the complete Appendix to the draft file before final approval.
   - Include it in the `wl update --description-file` content.
-  - **Idempotent:** rerunning `/intake` must not duplicate earlier entries — update existing records instead.
+  - **Idempotent:** rerunning `/skill:intake` must not duplicate earlier entries — update existing records instead.
   - Open questions: mark as "OPEN QUESTION" with context.
   - Respect `.gitignore` and agent framework ignore rules.
 

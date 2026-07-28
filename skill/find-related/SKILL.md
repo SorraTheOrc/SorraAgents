@@ -51,10 +51,14 @@ Discover related work for a work item via Worklog search, file inspection, and o
 
 ## Status management
 
-1. Start: `wl update <id> --status in_progress --json`
-2. End: `wl update <id> --status open --json` (success or failure)
+Status transitions are handled **automatically** by the `StatusLifecycle` context
+manager from `skill/shared/status_lifecycle.py`:
 
-> Stage is NOT modified.
+- **On entry:** Status is set to `in_progress` (original value captured)
+- **On success:** Status is set to `completed`
+- **On exception:** Original status is restored
+
+> Stage is NOT modified. See `StatusLifecycle` for details.
 
 > **Note:** The script probes semantic search availability and auto-detects the correct `wl search` response format. No manual configuration needed.
 

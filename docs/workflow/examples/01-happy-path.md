@@ -54,7 +54,7 @@ All pre invariants pass. Command execution proceeds.
 | **State After** | `in_progress / delegated` (alias: `delegated`) |
 | **Input: action** | `intake` (determined by stage=idea) |
 | **Input: work_item_id** | WL-EXAMPLE-001 |
-| **Engine Action** | `pi "/intake WL-EXAMPLE-001 do not ask questions"` |
+| **Engine Action** | `pi "/skill:intake WL-EXAMPLE-001 do not ask questions"` |
 | **Effects** | `set_assignee: Patch`, `add_tags: [delegated]` |
 | **Discord** | `"Delegating 'intake' task for 'Add user preference export API' (WL-EXAMPLE-001)"` |
 

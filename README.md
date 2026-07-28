@@ -20,34 +20,10 @@ A lightweight collection of workflow guides, command patterns, and skill templat
   - [skill/planall/](skill/planall/): PlanAll — automated batch planning for intake_complete work items.
   - [skill/intakeall/](skill/intakeall/): IntakeAll — automated batch intake for idea-stage work items.
   - [skill/implementall/](skill/implementall/): ImplementAll — automated batch implementation for plan_complete work items.
-- plugins/: local agent framework plugins used by this repository (includes `ralph` compaction plugin).
+- plugins/: local agent framework plugins used by this repository.
 - docs/dev/: development and release process documentation ([release-process.md](docs/dev/release-process.md), [release-tests.md](docs/dev/release-tests.md)).
 - Workflow.md: high-level workflow for using this repository.
 - package.json: basic metadata used by tooling.
-
-## Ralph compaction plugin
-
-This repository includes a local plugin at `plugins/ralph.js` that
-implements `experimental.session.compacting` to preserve original session intent
-during compaction.
-
-- If the original prompt matches override patterns (for example `implement <id>`),
-  `ralph` can provide a derived compaction prompt (for example `audit <id> ...`).
-- If no override applies, it appends the original prompt to compaction context.
-
-Behavior, configuration options, and test references are documented in
-`docs/ralph-compaction-plugin.md`.
-
-## Ralph orchestration loop
-
-The repository also includes the Ralph implement→audit loop for Worklog items.
-Use `/home/rgardler/.pi/agent/skills/ralph/ralph <work-item-id>` to launch a background run and `/home/rgardler/.pi/agent/skills/ralph/ralph status` to inspect the current process.
-When the target has children, Ralph runs a per-child implement→audit loop using `implement-single` for each child and finishes with a parent-level integration audit.
-Ralph runs non-interactively by default, includes a stream watchdog so a delegated `pi` process that keeps stdout open too long fails with a clear error instead of hanging forever, and can stop early with a structured `producer_input_required` result when the model cannot safely continue without producer input.
-
-When the target work item has children, Ralph iterates over each child independently: implementing, auditing, and remediating each child before moving to the next, followed by a final parent-level integration audit. For single work items (no children), Ralph uses the classic implement→audit→remediate loop.
-
-See `docs/ralph.md` for the full command reference and operational guidance.
 
 ## PlanAll — Automated Batch Planning
 
@@ -142,12 +118,6 @@ python3 skill/implementall/scripts/implementall.py --parent-id SA-0MQO6YMZ3006N5
 ```
 
 See [skill/implementall/SKILL.md](skill/implementall/SKILL.md) for full documentation.
-
-A useful debugging pattern is to focus Ralph on a single direct child work item:
-
-```sh
-python3 /home/rgardler/.pi/agent/skills/ralph/scripts/ralph_loop.py <parent-id> --child <child-id> --json
-```
 
 ## CI Workflows
 

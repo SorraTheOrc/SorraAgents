@@ -2,8 +2,8 @@
 
 These tests verify:
 - Discovery of idea-stage items via wl list
-- Auto-complete for well-defined items (skip /intake, advance to intake_complete)
-- Sequential /intake invocation for each item
+- Auto-complete for well-defined items (skip /skill:intake, advance to intake_complete)
+- Sequential /skill:intake invocation for each item
 - Producer-input detection via unanswered questions
 - Enhanced error handling: capture, recovery attempts, action recording, recovery outcome
 - Error resilience (errors for one item don't stop processing)
@@ -298,7 +298,7 @@ class TestDiscovery:
 # ===========================================================================
 
 class TestAutoComplete:
-    """Verify auto-complete skips /intake for well-defined items."""
+    """Verify auto-complete skips /skill:intake for well-defined items."""
 
     def test_well_defined_item_auto_completed(self):
         """Item with sufficient detail is auto-completed to intake_complete."""
@@ -330,12 +330,12 @@ class TestAutoComplete:
         assert results[0]["outcome"] == "auto_completed"
         assert results[0]["id"] == "SA-INTAKE-001"
 
-        # Verify no /intake was called for this item
+        # Verify no /skill:intake was called for this item
         intake_calls = [
             cmd for cmd in runner.calls
-            if "pi" in cmd and "-p" in cmd and "/intake" in " ".join(cmd)
+            if "pi" in cmd and "-p" in cmd and "/skill:intake" in " ".join(cmd)
         ]
-        assert len(intake_calls) == 0, "Auto-completed items should skip /intake"
+        assert len(intake_calls) == 0, "Auto-completed items should skip /skill:intake"
 
     def test_well_defined_item_advances_to_intake_complete(self):
         """Auto-completed item is advanced to intake_complete stage."""
@@ -374,27 +374,27 @@ class TestAutoComplete:
 
 
 # ===========================================================================
-# Test: Sequential /intake invocation (direct method call)
+# Test: Sequential /skill:intake invocation (direct method call)
 # ===========================================================================
 
 class TestIntakeInvocation:
-    """Verify that /intake is invoked when _invoke_intake is called directly."""
+    """Verify that /skill:intake is invoked when _invoke_intake is called directly."""
 
     def _make_engine(self, runner):
         """Create an engine with the given runner for direct _invoke_intake tests."""
         return IntakeAllEngine(runner=runner, dry_run=False)
 
     def test_intake_invoked_for_items_requiring_intake(self):
-        """/intake is invoked when _invoke_intake is called directly."""
+        """/skill:intake is invoked when _invoke_intake is called directly."""
         runner = FakeRunner()
         # Mock claim for the vague epic
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
         )
-        # Mock /intake for the vague epic
+        # Mock /skill:intake for the vague epic
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /skill:intake {SAMPLE_ITEM_C['id']}",
             stdout=json.dumps({"success": True}),
         )
         # Mock stage update for C after successful intake
@@ -407,23 +407,23 @@ class TestIntakeInvocation:
         result = engine._invoke_intake(SAMPLE_ITEM_C["id"])
 
         assert result["outcome"] == "intake_completed"
-        # Check /intake was called
+        # Check /skill:intake was called
         intake_calls = [
             cmd for cmd in runner.calls
-            if "pi" in cmd and "-p" in cmd and "/intake" in " ".join(cmd)
+            if "pi" in cmd and "-p" in cmd and "/skill:intake" in " ".join(cmd)
         ]
         assert len(intake_calls) == 1
         assert SAMPLE_ITEM_C["id"] in " ".join(intake_calls[0])
 
     def test_intake_items_claimed_before_intake(self):
-        """Each item is claimed with wl update before /intake is invoked."""
+        """Each item is claimed with wl update before /skill:intake is invoked."""
         runner = FakeRunner()
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /skill:intake {SAMPLE_ITEM_C['id']}",
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
@@ -440,7 +440,7 @@ class TestIntakeInvocation:
             cmd_str = " ".join(cmd)
             if "wl update" in cmd_str and "--status" in cmd_str:
                 claim_calls.append(cmd)
-            if "pi -p --mode json /intake" in cmd_str:
+            if "pi -p --mode json /skill:intake" in cmd_str:
                 intake_calls.append(cmd)
 
         assert len(claim_calls) >= 1
@@ -470,7 +470,7 @@ class TestProducerInputDetection:
         )
         # Simulate intake output that indicates unanswered questions (JSON stream format)
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /skill:intake {SAMPLE_ITEM_C['id']}",
             stdout=json.dumps({
                 "type": "message_update",
                 "assistantMessageEvent": {
@@ -493,7 +493,7 @@ class TestProducerInputDetection:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /skill:intake {SAMPLE_ITEM_C['id']}",
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
@@ -513,7 +513,7 @@ class TestProducerInputDetection:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /skill:intake {SAMPLE_ITEM_C['id']}",
             stdout=json.dumps({
                 "type": "message_update",
                 "assistantMessageEvent": {
@@ -529,7 +529,7 @@ class TestProducerInputDetection:
         assert result["outcome"] == "needs_input"
 
     def test_exception_during_intake_detected(self):
-        """Exception during /intake is caught and flagged as error."""
+        """Exception during /skill:intake is caught and flagged as error."""
         runner = FakeRunner()
         runner.set_response(
             f"wl update {SAMPLE_ITEM_C['id']} --status",
@@ -537,7 +537,7 @@ class TestProducerInputDetection:
         )
         # Intake fails
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /skill:intake {SAMPLE_ITEM_C['id']}",
             returncode=1,
             stderr="Connection refused",
         )
@@ -565,7 +565,7 @@ class TestErrorHandlingWithRecovery:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /skill:intake {SAMPLE_ITEM_C['id']}",
             returncode=1,
             stdout="Some output before error",
             stderr="Intake failed: timeout exceeded",
@@ -587,7 +587,7 @@ class TestErrorHandlingWithRecovery:
         )
         # Intake fails
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /skill:intake {SAMPLE_ITEM_C['id']}",
             returncode=1,
             stderr="timeout",
         )
@@ -616,7 +616,7 @@ class TestErrorHandlingWithRecovery:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /skill:intake {SAMPLE_ITEM_C['id']}",
             returncode=1,
             stderr="timeout",
         )
@@ -1098,7 +1098,7 @@ class TestOrphanRecovery:
         """Item with status=completed, stage=idea is moved to stage=done and excluded from processing."""
         runner = FakeRunner()
         runner.set_response(
-            f"wl update {ORPHAN_ITEM_COMPLETED['id']} --stage",
+            f"wl update {ORPHAN_ITEM_COMPLETED['id']} --status completed",
             stdout=json.dumps({"success": True}),
         )
 
@@ -1108,7 +1108,7 @@ class TestOrphanRecovery:
 
         # completed+idea items are excluded from the returned list
         assert len(recovered) == 0
-        # Verify wl update was called with --stage done (not --status open)
+        # Verify wl update was called with --status completed and --stage done
         update_calls = [
             cmd for cmd in runner.calls
             if "wl" in cmd and "update" in cmd
@@ -1116,7 +1116,7 @@ class TestOrphanRecovery:
         assert len(update_calls) >= 1
         cmd_str = " ".join(update_calls[0])
         assert "--stage" in cmd_str and "done" in cmd_str
-        assert "--status" not in cmd_str
+        assert "--status" in cmd_str and "completed" in cmd_str
 
     def test_orphan_in_progress_recovered_to_open(self):
         """Item with status=in_progress, stage=idea is reset to status=open and kept for processing."""
@@ -1579,7 +1579,7 @@ class TestMaxFlag:
             "wl list --stage idea",
             stdout=SAMPLE_WL_LIST_RESPONSE,
         )
-        # A, B, D auto-complete; C is skipped (needs_input, no /intake)
+        # A, B, D auto-complete; C is skipped (needs_input, no /skill:intake)
         for item in [SAMPLE_ITEM_A, SAMPLE_ITEM_B, SAMPLE_ITEM_D]:
             runner.set_response(
                 f"wl update {item['id']} --status",
@@ -1693,7 +1693,7 @@ class TestItemTimeout:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /skill:intake {SAMPLE_ITEM_C['id']}",
             returncode=-15,
             stderr="timed out",
         )
@@ -1723,7 +1723,7 @@ class TestItemTimeout:
             stdout=json.dumps({"success": True}),
         )
         runner.set_response(
-            f"pi -p --mode json /intake {SAMPLE_ITEM_C['id']}",
+            f"pi -p --mode json /skill:intake {SAMPLE_ITEM_C['id']}",
             returncode=-15,
             stderr="timed out after 10 seconds",
         )
@@ -1749,8 +1749,8 @@ class TestItemTimeout:
                 "workItems": [SAMPLE_ITEM_C, SAMPLE_ITEM_A, SAMPLE_ITEM_B],
             }),
         )
-        # Item C needs_input (skipped, no /intake), A and B auto-complete
-        # C is not auto-completable but we skip /intake
+        # Item C needs_input (skipped, no /skill:intake), A and B auto-complete
+        # C is not auto-completable but we skip /skill:intake
         # A and B auto-complete
         for item in [SAMPLE_ITEM_A, SAMPLE_ITEM_B]:
             runner.set_response(
@@ -2086,11 +2086,11 @@ class TestHasSufficientDetailBroadened:
 
 
 # ===========================================================================
-# Test: Items needing /intake are gracefully skipped and marked needs_input
+# Test: Items needing /skill:intake are gracefully skipped and marked needs_input
 # ===========================================================================
 
 class TestIntakeSkipWhenNeedsInput:
-    """Verify items needing /intake are skipped and marked needs_input without blocking batch."""
+    """Verify items needing /skill:intake are skipped and marked needs_input without blocking batch."""
 
     def test_item_needing_intake_skipped_and_marked_needs_input(self):
         """Items that fail has_sufficient_detail are marked needs_input and batch continues."""
@@ -2129,12 +2129,12 @@ class TestIntakeSkipWhenNeedsInput:
         auto_results = [r for r in results if r["outcome"] == "auto_completed"]
         assert len(auto_results) == 1
 
-        # Verify NO /intake subprocess was called
+        # Verify NO /skill:intake subprocess was called
         intake_calls = [
             cmd for cmd in runner.calls
-            if "pi" in " ".join(cmd) and "/intake" in " ".join(cmd)
+            if "pi" in " ".join(cmd) and "/skill:intake" in " ".join(cmd)
         ]
-        assert len(intake_calls) == 0, "No /intake subprocess should be invoked"
+        assert len(intake_calls) == 0, "No /skill:intake subprocess should be invoked"
         # Verify no wl commands were issued for C (it should be untouched)
         c_calls = [
             cmd for cmd in runner.calls
@@ -2179,9 +2179,9 @@ class TestIntakeSkipWhenNeedsInput:
         assert results[2]["outcome"] == "needs_input", \
             f"Expected needs_input, got {results[2]['outcome']}"
 
-        # Verify no /intake calls
+        # Verify no /skill:intake calls
         intake_calls = [
             cmd for cmd in runner.calls
-            if "pi" in " ".join(cmd) and "/intake" in " ".join(cmd)
+            if "pi" in " ".join(cmd) and "/skill:intake" in " ".join(cmd)
         ]
         assert len(intake_calls) == 0

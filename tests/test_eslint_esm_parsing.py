@@ -103,8 +103,6 @@ class TestEslintParsing:
     """All previously-affected files must parse without ESLint errors."""
 
     AFFECTED_FILES = [
-        "plugins/ralph.js",
-        "plugins/tests/ralph-compaction.test.js",
         "skill/ship/scripts/check-audit-gate.js",
         "skill/ship/scripts/check-unmerged-branches.js",
         "skill/ship/scripts/git-helpers.js",

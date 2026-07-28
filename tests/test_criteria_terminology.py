@@ -12,7 +12,7 @@ import yaml
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_INTAKE_MD = _REPO_ROOT / "command" / "intake.md"
+_INTAKE_MD = _REPO_ROOT / "skill" / "intake" / "SKILL.md"
 _PLAN_MD = _REPO_ROOT / "skill" / "plan" / "SKILL.md"
 _AUDIT_SKILL = _REPO_ROOT / "skill" / "audit" / "SKILL.md"
 _WORKFLOW_JSON = _REPO_ROOT / "docs" / "workflow" / "workflow.json"

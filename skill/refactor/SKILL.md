@@ -43,15 +43,27 @@ refactor/
 
 ## Status Management
 
-When invoked with a work-item-id, this skill manages the work item status during execution to signal that the item is being processed.
+The refactor script manages work item status automatically via the shared
+`StatusLifecycle` context manager when invoked with a work-item-id.
 
-1. **Set** the status to `in_progress` at the start of execution (before any other action):
-   `wl update <id> --status in_progress --json`
-2. **Set** the status to `open` at the end of execution (whether success or failure):
-   `wl update <id> --status open --json`
+- **On entry:** Status is set to `in_progress`
+- **On success:** Status is set to `completed`
+- **On error:** Status is restored to its original value
 
-> Stage is NOT modified by this skill. Only `--status` is used. The new convention is:
-> `in_progress` at start → `open` at end (no longer restoring the original status).
+No manual `wl update --status` commands are needed — the script handles
+lifecycle transparently. Stage is NOT modified by this skill.
+
+> In `--dry-run` mode, status management is skipped entirely, since no
+> changes are being made and no work item context is expected.
+
+## Invocation
+
+```bash
+python -m skill.refactor.scripts.refactor [<work-item-id>] [--no-llm] [--no-linter] [--dry-run] [--json] [--parent-branch <branch>] [--config <path>]
+```
+
+- If a `<work-item-id>` is provided and `--dry-run` is not set, the script will manage the work item's status using `StatusLifecycle`.
+- If no `<work-item-id>` is provided or `--dry-run` is set, the script runs without any work item status interaction.
 
 ## Usage
 
