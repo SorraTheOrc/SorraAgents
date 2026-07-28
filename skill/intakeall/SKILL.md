@@ -94,7 +94,7 @@ python3 ./scripts/intakeall.py --parent-id SA-0MQK9SWN6008DWVQ
 
 ## Related skills
 
-- `skill/intake/SKILL.md` — Per-item intake skill
+- `../intake/SKILL.md` — Per-item intake skill
 - `../planall/SKILL.md` — Sibling batch planning skill
 
 

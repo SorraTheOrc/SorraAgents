@@ -37,32 +37,32 @@ The skill implements the procedural workflow below. Each numbered step is part o
 
 ## Status Lifecycle
 
-All work-item status transitions are managed by the shared `StatusLifecycle` context manager (from `skill/shared/status_lifecycle.py`). Do **not** use ad-hoc `wl update --status` commands.
+All work-item status transitions are managed by the shared `StatusLifecycle` context manager (from `../shared/status_lifecycle.py`). Do **not** use ad-hoc `wl update --status` commands.
 
-The intake lifecycle script at `skill/intake/scripts/intake.py` provides the canonical CLI interface for lifecycle operations:
+The intake lifecycle script at `./scripts/intake.py` provides the canonical CLI interface for lifecycle operations:
 
 - **Claim the item** — run before any other step:
   ```bash
-  python3 skill/intake/scripts/intake.py start <work-item-id> --assignee "<AGENT>"
+  python3 ./scripts/intake.py start <work-item-id> --assignee "<AGENT>"
   ```
   This sets `status=in_progress`, claims the item, and prevents concurrent claims.
 
 - **Auto-complete** — skip full intake for sufficiently defined items:
   ```bash
-  python3 skill/intake/scripts/intake.py auto-complete <work-item-id>
+  python3 ./scripts/intake.py auto-complete <work-item-id>
   ```
 
 - **Finish intake** — complete the process and advance stage:
   ```bash
-  python3 skill/intake/scripts/intake.py finish <work-item-id> [--description-file <path>]
+  python3 ./scripts/intake.py finish <work-item-id> [--description-file <path>]
   ```
 
 - **Abort** — release the item on failure or interruption:
   ```bash
-  python3 skill/intake/scripts/intake.py abort <work-item-id>
+  python3 ./scripts/intake.py abort <work-item-id>
   ```
 
-> **Design rationale:** The `StatusLifecycle` context manager from `skill/shared/status_lifecycle.py` is the single source of truth for all
+> **Design rationale:** The `StatusLifecycle` context manager from `../shared/status_lifecycle.py` is the single source of truth for all
 > status lifecycle management. The `intake.py` script provides a CLI
 > wrapper so that SKILL.md instructions can invoke lifecycle operations
 > without embedding ad-hoc `wl update --status` commands.
@@ -73,7 +73,7 @@ The intake lifecycle script at `skill/intake/scripts/intake.py` provides the can
 
 - **Before any other step**, claim the work item:
   ```bash
-  python3 skill/intake/scripts/intake.py start <work-item-id> --assignee Map
+  python3 ./scripts/intake.py start <work-item-id> --assignee Map
   ```
   This must be done before any evaluation, context gathering, or preflight checks. The status signals that this item is being processed and prevents concurrent claims.
 
@@ -87,7 +87,7 @@ The intake lifecycle script at `skill/intake/scripts/intake.py` provides the can
   - If parent/child relationships already express the required context, consider skipping.
 - If intake is not needed:
   ```bash
-  python3 skill/intake/scripts/intake.py auto-complete <work-item-id>
+  python3 ./scripts/intake.py auto-complete <work-item-id>
   ```
   Optionally add a comment:
   ```bash
@@ -184,7 +184,7 @@ Consider:
 Write the final draft to the work item description and advance the stage:
 
 ```bash
-python3 skill/intake/scripts/intake.py finish <work-item-id> --description-file .worklog/tmp/intake-draft-<title>-<work-item-id>.md
+python3 ./scripts/intake.py finish <work-item-id> --description-file .worklog/tmp/intake-draft-<title>-<work-item-id>.md
 ```
 
 This transitions `status=open`, `stage=intake_complete`.
@@ -193,9 +193,9 @@ This transitions `status=open`, `stage=intake_complete`.
 
 - Call the effort_and_risk skill on the new or updated work item to produce an estimate:
   ```bash
-  python3 skill/effort-and-risk/scripts/orchestrate_estimate.py <work-item-id>
+  python3 ../effort-and-risk/scripts/orchestrate_estimate.py <work-item-id>
   ```
-  (Refer to `skill/effort-and-risk/SKILL.md` for details.)
+  (Refer to `../effort-and-risk/SKILL.md` for details.)
 
 ### 11. Finishing (must do as the final step only)
 
@@ -219,7 +219,7 @@ This transitions `status=open`, `stage=intake_complete`.
 - "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries."
 - "Full project test suite must pass with the new changes."
 
-  > **Note:** CHANGELOG.md is **excluded** from this list. It is managed automatically by the ship skill's release pipeline (`skill/ship/scripts/release/generate-changelog.js`). Implementing agents should not manually update CHANGELOG.md.
+  > **Note:** CHANGELOG.md is **excluded** from this list. It is managed automatically by the ship skill's release pipeline (`../ship/scripts/release/generate-changelog.js`). Implementing agents should not manually update CHANGELOG.md.
 
   Do not include CI/CD pipeline tests.
 
@@ -235,7 +235,7 @@ This transitions `status=open`, `stage=intake_complete`.
 If the intake process fails or is interrupted before completion:
 
 ```bash
-python3 skill/intake/scripts/intake.py abort <work-item-id>
+python3 ./scripts/intake.py abort <work-item-id>
 ```
 
 This resets `status=open`, releasing the item for other agents.
