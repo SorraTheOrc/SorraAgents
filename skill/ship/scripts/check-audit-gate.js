@@ -1,23 +1,29 @@
 /**
- * check-audit-gate.js — Audit readiness gating step for the ship skill.
+ * check-audit-gate.js — Audit readiness and producer-review gating for the ship skill.
  *
- * Checks all `in_review` work items for their audit readiness. For each
- * item, the gate calls `wl audit-show <id> --json` and checks
- * `audit.readyToClose`. Items with no audit or with `readyToClose: false`
- * are flagged as blocking.
+ * This module provides gating functions for the release process:
+ *   1. Audit readiness — checks all `in_review` work items have `audit.readyToClose`.
+ *   2. Producer review — checks that no candidate items have `needsProducerReview = true`.
  *
- * This is intended as a gating step in the release process: before a
- * dev → main merge, agents should call `checkAuditReadyToClose()` to
- * determine whether all candidate work items have passed their audits.
+ * Both gates are complementary and must pass before a release proceeds.
  *
  * Usage:
  *
- *   import { checkAuditReadyToClose } from './check-audit-gate.js';
+ *   import { checkAuditReadyToClose, checkProducerReviewStatus } from './check-audit-gate.js';
  *
- *   const report = await checkAuditReadyToClose();
- *   if (report.hasBlockingItems) {
- *     console.log(report.message);
+ *   // Audit gate
+ *   const auditReport = await checkAuditReadyToClose();
+ *   if (auditReport.hasBlockingItems) {
+ *     console.log(auditReport.message);
  *     // Release is blocked with exit code 6
+ *   }
+ *
+ *   // Producer-review gate
+ *   const items = getCandidateItems();
+ *   const reviewReport = checkProducerReviewStatus(items);
+ *   if (reviewReport.hasBlockingItems) {
+ *     console.log(reviewReport.message);
+ *     // Release is blocked with exit code 9
  *   }
  */
 
@@ -32,11 +38,26 @@ import { execSync } from 'node:child_process';
  * by ID. Items in `status: completed` with `stage: done` are already released
  * and are excluded from the candidate set.
  *
- * @returns {Array<{ id: string, title: string }>}
+ * Extracts `needsProducerReview` from each item's `wl list` output,
+ * defaulting to `null` when the field is missing. This field is used
+ * by `checkProducerReviewStatus()` for the producer-review gating step.
+ *
+ * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null }>}
  */
 export function getCandidateItems() {
   const seen = new Set();
   const items = [];
+
+  // Helper: extract fields from a work item, defaulting needsProducerReview to null
+  function extractItem(item) {
+    return {
+      id: item.id,
+      title: item.title || item.id,
+      needsProducerReview: item.needsProducerReview !== undefined
+        ? item.needsProducerReview
+        : null,
+    };
+  }
 
   // Query 1: items in in_review stage (main case — about to be released)
   try {
@@ -49,7 +70,7 @@ export function getCandidateItems() {
       for (const item of data.workItems) {
         if (!seen.has(item.id)) {
           seen.add(item.id);
-          items.push({ id: item.id, title: item.title || item.id });
+          items.push(extractItem(item));
         }
       }
     }
@@ -72,7 +93,7 @@ export function getCandidateItems() {
       for (const item of data.workItems) {
         if (!seen.has(item.id) && item.stage !== 'done') {
           seen.add(item.id);
-          items.push({ id: item.id, title: item.title || item.id });
+          items.push(extractItem(item));
         }
       }
     }
@@ -143,6 +164,122 @@ export function buildRemediationCommand(workItemId) {
     `  wl audit-show ${workItemId} --json`,
     `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId}`,
   ].join('\n');
+}
+
+// ── buildProducerReviewRemediationCommand ────────────────────────────────────
+
+/**
+ * Build an actionable remediation command string for a work item that is
+ * blocked by the producer-review gate.
+ *
+ * Suggests running the audit to clear the flag or manually setting
+ * `needsProducerReview = false` via `wl update`.
+ *
+ * @param {string} workItemId - The ID of the blocking work item.
+ * @returns {string} A shell command to resolve the producer-review flag.
+ */
+export function buildProducerReviewRemediationCommand(workItemId) {
+  return [
+    `  # Clear the producer-review flag for ${workItemId}:`,
+    `  wl update ${workItemId} --needsProducerReview false --json`,
+    `  # Or re-run audit to auto-resolve:`,
+    `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId}`,
+  ].join('\n');
+}
+
+// ── checkProducerReviewStatus ────────────────────────────────────────────────
+
+/**
+ * Check a list of candidate work items for producer-review blocking.
+ *
+ * Items with `needsProducerReview = true`, `null`, or `undefined` are
+ * considered blocking — they require producer approval before they can
+ * be shipped. Items with `needsProducerReview = false` are passing.
+ *
+ * This is intended as a gating step in the release process, complementing
+ * the audit readiness gate. It blocks the release with exit code 9 if any
+ * candidate items need producer review.
+ *
+ * @param {Array<{ id: string, title: string, needsProducerReview: boolean|null }>} items -
+ *   Candidate work items to check (typically from `getCandidateItems()`).
+ * @returns {{
+ *   hasBlockingItems: boolean,
+ *   blockingItems: Array<{
+ *     workItemId: string,
+ *     title: string,
+ *     needsProducerReview: boolean|null,
+ *     reason: string,
+ *     remediation: string
+ *   }>,
+ *   message: string
+ * }}
+ */
+export function checkProducerReviewStatus(items) {
+  if (!items || items.length === 0) {
+    return {
+      hasBlockingItems: false,
+      blockingItems: [],
+      message: 'No candidate work items. Producer-review gate passed.',
+    };
+  }
+
+  const blockingItems = [];
+
+  for (const item of items) {
+    // Items with needsProducerReview = true, null, or undefined are blocking
+    const needsReview = item.needsProducerReview === true ||
+      item.needsProducerReview === null ||
+      item.needsProducerReview === undefined;
+
+    if (needsReview) {
+      const reason = item.needsProducerReview === true
+        ? 'Flagged for producer review'
+        : 'Producer-review status unknown (needsProducerReview not set)';
+
+      blockingItems.push({
+        workItemId: item.id,
+        title: item.title,
+        needsProducerReview: item.needsProducerReview !== undefined
+          ? item.needsProducerReview
+          : null,
+        reason,
+        remediation: buildProducerReviewRemediationCommand(item.id),
+      });
+    }
+  }
+
+  // Build report
+  if (blockingItems.length === 0) {
+    return {
+      hasBlockingItems: false,
+      blockingItems: [],
+      message: `All ${items.length} work item(s) have passed producer review. Producer-review gate passed.`,
+    };
+  }
+
+  const lines = [
+    `⚠️  Producer-review gate check failed — ${blockingItems.length} of ${items.length} work item(s) need producer review:`,
+    '',
+  ];
+
+  blockingItems.forEach((entry, i) => {
+    lines.push(`${i + 1}. ${entry.title} (${entry.workItemId})`);
+    lines.push(`   Reason: ${entry.reason}`);
+    lines.push(`   Remediation:`);
+    lines.push(entry.remediation);
+    lines.push('');
+  });
+
+  lines.push(
+    'These items are blocking the release until a producer reviews and approves them.',
+    'To bypass this check, re-run with --skip-checks.',
+  );
+
+  return {
+    hasBlockingItems: true,
+    blockingItems,
+    message: lines.join('\n'),
+  };
 }
 
 // ── checkAuditReadyToClose ───────────────────────────────────────────────────

@@ -202,6 +202,172 @@ describe('check-audit-gate module structure', () => {
     assert.ok(mod.checkAuditReadyToClose);
     assert.ok(mod.getAuditStatus);
     assert.ok(mod.getCandidateItems);
-    assert.ok(mod.getCandidateItems);
+    assert.ok(mod.checkProducerReviewStatus);
   });
+});
+
+// ---------------------------------------------------------------------------
+// 12. getCandidateItems returns needsProducerReview field per AC6
+// ---------------------------------------------------------------------------
+describe('getCandidateItems - needsProducerReview field', () => {
+  test('returns needsProducerReview field for each item', async () => {
+    const mod = await import(MODULE_PATH);
+    const items = mod.getCandidateItems();
+    for (const item of items) {
+      assert.ok('id' in item, 'item should have id');
+      assert.ok('title' in item, 'item should have title');
+      assert.ok('needsProducerReview' in item, 'item should have needsProducerReview');
+    }
+  });
+
+  test('needsProducerReview is boolean or null', async () => {
+    const mod = await import(MODULE_PATH);
+    const items = mod.getCandidateItems();
+    for (const item of items) {
+      if (item.needsProducerReview !== null) {
+        assert.equal(typeof item.needsProducerReview, 'boolean',
+          `needsProducerReview should be boolean or null, got ${typeof item.needsProducerReview} for ${item.id}`);
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 13. checkProducerReviewStatus function
+// ---------------------------------------------------------------------------
+describe('checkProducerReviewStatus', () => {
+  test('is exported as a function', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(typeof mod.checkProducerReviewStatus, 'function');
+  });
+
+  test('returns expected structure for empty items', async () => {
+    const mod = await import(MODULE_PATH);
+    const result = mod.checkProducerReviewStatus([]);
+    assert.ok(typeof result === 'object');
+    assert.ok('hasBlockingItems' in result);
+    assert.ok('blockingItems' in result);
+    assert.ok('message' in result);
+    assert.ok(Array.isArray(result.blockingItems));
+    assert.equal(typeof result.message, 'string');
+    assert.equal(result.hasBlockingItems, false);
+  });
+
+  test('flags items with needsProducerReview = true as blocking', async () => {
+    const mod = await import(MODULE_PATH);
+    const items = [
+      { id: 'SA-001', title: 'Needs Review', needsProducerReview: true },
+      { id: 'SA-002', title: 'Ready', needsProducerReview: false },
+    ];
+    const result = mod.checkProducerReviewStatus(items);
+    assert.equal(result.hasBlockingItems, true);
+    assert.equal(result.blockingItems.length, 1);
+    assert.equal(result.blockingItems[0].workItemId, 'SA-001');
+    assert.ok(result.blockingItems[0].remediation.includes('wl update'));
+  });
+
+  test('flags items with needsProducerReview = null as blocking', async () => {
+    const mod = await import(MODULE_PATH);
+    const items = [
+      { id: 'SA-003', title: 'Unknown', needsProducerReview: null },
+    ];
+    const result = mod.checkProducerReviewStatus(items);
+    assert.equal(result.hasBlockingItems, true);
+    assert.equal(result.blockingItems.length, 1);
+    assert.equal(result.blockingItems[0].workItemId, 'SA-003');
+  });
+
+  test('flags items with needsProducerReview = undefined as blocking', async () => {
+    const mod = await import(MODULE_PATH);
+    const items = [
+      { id: 'SA-004', title: 'Missing Field' },
+    ];
+    const result = mod.checkProducerReviewStatus(items);
+    assert.equal(result.hasBlockingItems, true);
+    assert.equal(result.blockingItems.length, 1);
+    assert.equal(result.blockingItems[0].workItemId, 'SA-004');
+  });
+
+  test('passes when all items have needsProducerReview = false', async () => {
+    const mod = await import(MODULE_PATH);
+    const items = [
+      { id: 'SA-005', title: 'Ready 1', needsProducerReview: false },
+      { id: 'SA-006', title: 'Ready 2', needsProducerReview: false },
+    ];
+    const result = mod.checkProducerReviewStatus(items);
+    assert.equal(result.hasBlockingItems, false);
+    assert.equal(result.blockingItems.length, 0);
+  });
+
+  test('blockingItems entries have expected fields', async () => {
+    const mod = await import(MODULE_PATH);
+    const items = [
+      { id: 'SA-007', title: 'Blocked', needsProducerReview: true },
+    ];
+    const result = mod.checkProducerReviewStatus(items);
+    const entry = result.blockingItems[0];
+    assert.ok('workItemId' in entry);
+    assert.ok('title' in entry);
+    assert.ok('needsProducerReview' in entry);
+    assert.ok('reason' in entry);
+    assert.ok('remediation' in entry);
+    assert.equal(entry.workItemId, 'SA-007');
+    assert.equal(entry.needsProducerReview, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 14. buildProducerReviewRemediationCommand helper
+// ---------------------------------------------------------------------------
+describe('buildProducerReviewRemediationCommand', () => {
+  test('is exported as a function', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(typeof mod.buildProducerReviewRemediationCommand, 'function');
+  });
+
+  test('returns a string containing wl update command', async () => {
+    const mod = await import(MODULE_PATH);
+    const cmd = mod.buildProducerReviewRemediationCommand('SA-001');
+    assert.equal(typeof cmd, 'string');
+    assert.ok(cmd.includes('wl update SA-001'), 'Should contain wl update command');
+    assert.ok(cmd.includes('needsProducerReview'), 'Should mention needsProducerReview');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 15. ship.js re-exports checkProducerReviewStatus
+// ---------------------------------------------------------------------------
+test('check-audit-gate: ship.js re-exports checkProducerReviewStatus', async () => {
+  const shipMod = await import(join(REPO_ROOT, 'skill', 'ship', 'scripts', 'ship.js'));
+
+  assert.ok(
+    typeof shipMod.checkProducerReviewStatus === 'function',
+    'ship.js should re-export checkProducerReviewStatus from check-audit-gate.js',
+  );
+
+  // Verify the function is the same by checking identity
+  const checkModule = await import(join(REPO_ROOT, 'skill', 'ship', 'scripts', 'check-audit-gate.js'));
+  assert.equal(
+    shipMod.checkProducerReviewStatus,
+    checkModule.checkProducerReviewStatus,
+    'ship.js should export the same checkProducerReviewStatus function',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 16. JSDoc consistency: checkProducerReviewStatus has JSDoc
+// ---------------------------------------------------------------------------
+test('check-audit-gate: checkProducerReviewStatus has JSDoc comment', async () => {
+  const content = readFileSync(MODULE_PATH, 'utf-8');
+  // Find the index of 'export function checkProducerReviewStatus' and search
+  // backwards for the preceding JSDoc comment (greedy match for the most
+  // recent /** ... */ block before that line).
+  const fnIndex = content.indexOf('export function checkProducerReviewStatus');
+  assert.ok(fnIndex >= 0, 'should find checkProducerReviewStatus export');
+  const beforeFn = content.slice(0, fnIndex);
+  const jsdocMatch = beforeFn.match(/\/\*\*[\s\S]*?\*\//g);
+  assert.ok(jsdocMatch && jsdocMatch.length > 0, 'checkProducerReviewStatus should have a JSDoc comment');
+  const jsdoc = jsdocMatch[jsdocMatch.length - 1];
+  assert.ok(jsdoc.includes('@returns'), 'JSDoc should document return type');
+  assert.ok(jsdoc.includes('@param'), 'JSDoc should document parameters');
 });
