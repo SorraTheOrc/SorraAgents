@@ -21,10 +21,11 @@ def test_script_is_executable():
 
 def test_help_flag():
     """Script --help should display usage and exit 0."""
-    result = subprocess.run(  # noqa: PLW1510
+    result = subprocess.run(
         [sys.executable, str(SCRIPT_PATH), "--help"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode == 0, f"--help failed: {result.stderr}"
     assert "usage:" in result.stdout.lower() or "usage:" in result.stderr.lower()
@@ -32,7 +33,7 @@ def test_help_flag():
 
 def test_verbose_flag():
     """Script should accept --verbose flag."""
-    result = subprocess.run(  # noqa: PLW1510
+    result = subprocess.run(
         [
             sys.executable,
             str(SCRIPT_PATH),
@@ -42,6 +43,7 @@ def test_verbose_flag():
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     # Should not crash with --verbose
     assert result.returncode in (0, 1), f"Unexpected error: {result.stderr}"
@@ -49,7 +51,7 @@ def test_verbose_flag():
 
 def test_json_flag():
     """Script should accept --json flag and produce JSON output when all required args are passed."""
-    result = subprocess.run(  # noqa: PLW1510
+    result = subprocess.run(
         [
             sys.executable,
             str(SCRIPT_PATH),
@@ -59,6 +61,7 @@ def test_json_flag():
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     # The script will fail since TEST-123 doesn't exist, but it should still
     # produce valid JSON if --json is passed
@@ -73,10 +76,11 @@ def test_json_flag():
 
 def test_work_item_id_required_help():
     """Running script without required args should show error."""
-    result = subprocess.run(  # noqa: PLW1510
+    result = subprocess.run(
         [sys.executable, str(SCRIPT_PATH)],
         capture_output=True,
         text=True,
+        check=False,
     )
     # Should exit non-zero and indicate --work-item-id is required
     assert result.returncode != 0, "Should fail without --work-item-id"
@@ -86,7 +90,7 @@ def test_work_item_id_required_help():
 
 def test_repo_path_flag():
     """Script should accept --repo-path argument."""
-    result = subprocess.run(  # noqa: PLW1510
+    result = subprocess.run(
         [
             sys.executable,
             str(SCRIPT_PATH),
@@ -97,6 +101,7 @@ def test_repo_path_flag():
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
     # Should not crash with --repo-path
     assert result.returncode in (0, 1), f"Unexpected error: {result.stderr}"
@@ -260,7 +265,7 @@ class TestRunWlShow:
         mod = _import_find_related()
 
         def mock_check_output(cmd, **kwargs):
-            raise Exception("wl command failed")  # noqa: TRY002
+            raise RuntimeError("wl command failed")
 
         monkeypatch.setattr(mod.subprocess, "check_output", mock_check_output)
         result = mod.run_wl_show("TEST-999")
@@ -301,7 +306,7 @@ class TestRunWlSearch:
         mod = _import_find_related()
 
         def mock_check_output(cmd, **kwargs):
-            raise Exception("search failed")  # noqa: TRY002
+            raise RuntimeError("search failed")
 
         monkeypatch.setattr(mod.subprocess, "check_output", mock_check_output)
         results = mod.run_wl_search("keyword")
@@ -408,7 +413,7 @@ class TestRunWlUpdate:
         mod = _import_find_related()
 
         def mock_check_output(cmd, **kwargs):
-            raise Exception("update failed")  # noqa: TRY002
+            raise RuntimeError("update failed")
 
         monkeypatch.setattr(mod.subprocess, "check_output", mock_check_output)
         result = mod.run_wl_update("TEST-123", "New description")

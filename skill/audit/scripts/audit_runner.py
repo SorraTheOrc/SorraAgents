@@ -28,7 +28,7 @@ Exit codes:
   1 – Worklog / CLI / Pi failure, persistence failure, or readback
       verification failure
   2 – argument error
-"""  # noqa: EXE001
+"""
 from __future__ import annotations
 
 import argparse
@@ -37,15 +37,15 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Callable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts.persist_audit import persist_audit  # noqa: E402
-from skill.scripts.failure_notice import FailureNotice  # noqa: E402
+from skill.audit.scripts.persist_audit import persist_audit
+from skill.scripts.failure_notice import FailureNotice
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -177,7 +177,7 @@ def _check_audit_freshness(runner: Runner, issue_id: str) -> str | None:
     error, parse error) so that the normal audit pipeline always runs when
     freshness cannot be determined.
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
 
     try:
         data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"])
@@ -753,9 +753,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             return True
         # Children in in_review stage should not have their audit verdicts
         # block parent closure (per audit spec)
-        if c.get("stage") == "in_review":  # noqa: SIM103
-            return True
-        return False
+        return c.get("stage") == "in_review"
 
     non_exempt_children = [c for c in active_children if not _is_exempt_child(c)]
     any_child_audit_not_ready = any(
@@ -1010,8 +1008,8 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict],
     lines.extend([
         "## Summary",
         "",
-        f"Child work item audit for {child['title']} ({child['id']}). "  # noqa: ISC004
-        f"Status: {child['status']}/{child['stage']}.",
+        (f"Child work item audit for {child['title']} ({child['id']}). "
+        f"Status: {child['status']}/{child['stage']}."),
         "",
         "## Acceptance Criteria Status",
         "",
@@ -1156,8 +1154,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         }
         try:
             _write_debug_log(target, entry)
-        except Exception:  # noqa: BLE001, S110
-            # Debug logging must not break audit execution
+        except Exception:  # noqa: S110, BLE001 -- debug logging must not break audit execution
             pass
 
     return result
@@ -1199,7 +1196,7 @@ def _get_child_audit_verdict(runner: Runner, child_id: str) -> tuple[bool | None
     Freshness is determined by comparing the audit's auditedAt timestamp against
     the child's updatedAt timestamp plus AUDIT_FRESHNESS_BUFFER_SECONDS.
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
 
     try:
         data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"])
@@ -1341,9 +1338,7 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
             return True
         # Children in in_review stage should not have their audit verdicts
         # block parent closure (per audit spec)
-        if c.get("stage") == "in_review":  # noqa: SIM103
-            return True
-        return False
+        return c.get("stage") == "in_review"
     non_exempt_children = [c for c in active_children if not _is_exempt(c)]
     any_child_audit_not_ready = any(
         c.get("child_audit_ready") is False
@@ -1713,7 +1708,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         except ImportError:
             # code_quality module not available — skip gracefully
             cq_skipped_reason = "code_quality module not available"
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 -- code_quality module not available, skip gracefully
             cq_skipped_reason = str(exc)
 
         acs = _extract_acs(description)
@@ -1792,7 +1787,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                             "result_verdict": result.get("verdict"),
                             "result_evidence": result.get("evidence", "")[:500],
                         })
-                    except Exception:  # noqa: BLE001, S110
+                    except Exception:  # noqa: S110, BLE001 -- optional enhancement, ignore on failure
                         pass
                 # When batched parsing fails, the root-level verdict from Pi
                 # cannot be trusted to represent each AC individually. Override
@@ -1919,7 +1914,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                                 "result_verdict": result.get("verdict"),
                                 "result_evidence": result.get("evidence", "")[:500],
                             })
-                        except Exception:  # noqa: BLE001, S110
+                        except Exception:  # noqa: S110, BLE001 -- optional enhancement, ignore on failure
                             pass
                     # When batched parsing fails, the root-level verdict from Pi
                     # cannot be trusted to represent each AC individually. Override
@@ -1995,7 +1990,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                             f"Warning: Auto-triggered audit for child {child['id']} "
                             f"timed out.", file=sys.stderr,
                         )
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001 -- audit failure warning
                         print(
                             f"Warning: Auto-triggered audit for child {child['id']} "
                             f"failed: {exc}", file=sys.stderr,
@@ -2017,7 +2012,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # Persist child audits to individual child work items (if persist is True)
         if persist:
             for child in child_results:
-                child_success, child_report = _persist_child_audit(  # noqa: RUF059
+                child_success, _child_report = _persist_child_audit(
                     child_id=child["id"],
                     child_title=child["title"],
                     child_status=child["status"],
@@ -2083,12 +2078,12 @@ def cmd_issue(issue_id: str, persist: bool = True,
         if cq_findings:
             try:
                 from skill.code_review.scripts.create_quality_epics import (
-                    create_epics_for_findings
+                    create_epics_for_findings,
                 )
                 _epic_result = create_epics_for_findings(cq_findings, runner=runner)
             except ImportError:
                 _epic_result = {"epic_id": None, "error": "create_quality_epics module not available"}
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 -- epic creation failure
                 _epic_result = {"epic_id": None, "error": str(exc)}
 
         # Assemble and output report

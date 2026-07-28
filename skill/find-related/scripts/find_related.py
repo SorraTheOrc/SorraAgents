@@ -18,16 +18,15 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # Add repo root to sys.path for shared utility access
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.scripts.failure_notice import FailureNotice  # noqa: E402
-from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
-
+from skill.scripts.failure_notice import FailureNotice
+from skill.shared.status_lifecycle import StatusLifecycle
 
 # ---------------------------------------------------------------------------
 # Stop words
@@ -40,9 +39,8 @@ STOP_WORDS: set = {
     "to", "from", "in", "on", "at", "by", "with", "without", "into",
     "per", "between", "out", "against", "within", "upon", "after",
     "before", "above", "below", "across", "behind", "all", "any", "each",
-    "few", "more", "most", "other", "some", "such", "no", "nor", "not",
-    "only", "own", "same", "too", "very", "can", "will", "just",
-    "it", "its", "has", "have", "do", "does", "did", "done",
+    "few", "more", "most", "other", "some", "no", "nor", "not",
+    "only", "own", "same", "too", "very", "can", "will", "it", "its", "has", "have", "do", "does", "did", "done",
     "be", "been", "being", "am", "are", "was", "were",
 }
 
@@ -77,7 +75,7 @@ MAX_REPO_FILE_RESULTS: int = 3
 # ---------------------------------------------------------------------------
 
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Discover related work for a Worklog work item.",
@@ -111,7 +109,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def extract_keywords(title: str, description: str) -> List[str]:
+def extract_keywords(title: str, description: str) -> list[str]:
     """Derive conservative keywords from a work-item title and description.
 
     Returns a sorted list of unique, lowercased keywords.
@@ -125,10 +123,10 @@ def extract_keywords(title: str, description: str) -> List[str]:
     # Split into tokens
     tokens = combined.split()
     # Filter: remove stop words, keep only words with 3+ characters, deduplicate
-    keywords = sorted(set(  # noqa: C401
+    keywords = sorted({
         t for t in tokens
         if t not in STOP_WORDS and len(t) >= 3
-    ))
+    })
     return keywords
 
 
@@ -137,7 +135,7 @@ def extract_keywords(title: str, description: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def run_wl_show(work_item_id: str) -> Optional[Dict[str, Any]]:
+def run_wl_show(work_item_id: str) -> dict[str, Any] | None:
     """Fetch a work item via `wl show <id> --json` and return parsed JSON.
 
     Unwraps the nested 'workItem' object from the wl response.
@@ -151,11 +149,11 @@ def run_wl_show(work_item_id: str) -> Optional[Dict[str, Any]]:
         if isinstance(data, dict) and "workItem" in data:
             return data["workItem"]
         return data
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 -- wl show failure handled gracefully
         return None
 
 
-def run_wl_search(keyword: str, use_semantic: bool = False) -> List[Dict[str, Any]]:
+def run_wl_search(keyword: str, use_semantic: bool = False) -> list[dict[str, Any]]:
     """Search Worklog for items matching a keyword.
 
     When use_semantic is True, includes the --semantic flag for hybrid
@@ -178,7 +176,7 @@ def run_wl_search(keyword: str, use_semantic: bool = False) -> List[Dict[str, An
         if isinstance(data, list):
             return data
         return []
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 -- search failure handled gracefully
         return []
 
 
@@ -191,7 +189,7 @@ def run_wl_update(work_item_id: str, description: str) -> bool:
         cmd = ["wl", "update", work_item_id, "--description", description, "--json"]
         subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         return True
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 -- update failure handled gracefully
         return False
 
 
@@ -212,7 +210,7 @@ def is_semantic_available() -> bool:
         json.loads(out)
         # Any valid response (successful or with items) means --semantic is available
         return True
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 -- semantic probe failure handled gracefully
         return False
 
 
@@ -221,7 +219,7 @@ def is_semantic_available() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _score_key(item: Dict[str, Any]) -> float:
+def _score_key(item: dict[str, Any]) -> float:
     """Return the score of a work item for ranking, with tiebreaker by title.
 
     Items without a score field sort last (score = float('-inf')).
@@ -234,9 +232,9 @@ def _score_key(item: Dict[str, Any]) -> float:
 
 
 def search_and_dedup(
-    keywords: List[str],
+    keywords: list[str],
     use_semantic: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Search Worklog for each keyword, aggregate results, deduplicate, rank, and limit.
 
     Results are ranked by descending score (the `score` field from
@@ -248,7 +246,7 @@ def search_and_dedup(
     (higher = more relevant). Unscored items sort after all scored items.
     """
     seen: set = set()
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
 
     for keyword in keywords:
         items = run_wl_search(keyword, use_semantic=use_semantic)
@@ -278,7 +276,7 @@ EXCLUDED_DIRS: set = {".git", "node_modules", "__pycache__", ".pytest_cache",
                       "dist", "build", ".next"}
 
 
-def search_repo(repo_path: str, keywords: List[str]) -> List[Dict[str, Any]]:
+def search_repo(repo_path: str, keywords: list[str]) -> list[dict[str, Any]]:
     """Search repository files for matching keywords.
 
     Scans files with allowed extensions (see ALLOWED_EXTENSIONS) while
@@ -301,7 +299,7 @@ def search_repo(repo_path: str, keywords: List[str]) -> List[Dict[str, Any]]:
     if not root.is_dir():
         return []
 
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
 
     for file_path in root.rglob("*"):
         # Skip directories
@@ -321,7 +319,7 @@ def search_repo(repo_path: str, keywords: List[str]) -> List[Dict[str, Any]]:
         # Read and search file content
         try:
             content = file_path.read_text(encoding="utf-8", errors="ignore").lower()
-        except Exception:  # noqa: BLE001, S112
+        except Exception:  # noqa: S112, BLE001 -- skip unreadable files
             continue
 
         found = [kw for kw in keywords if kw.lower() in content]
@@ -351,14 +349,14 @@ def search_repo(repo_path: str, keywords: List[str]) -> List[Dict[str, Any]]:
 
 def format_report(
     work_item_id: str,
-    related_items: List[Dict[str, Any]],
-    repo_matches: List[Dict[str, Any]],
+    related_items: list[dict[str, Any]],
+    repo_matches: list[dict[str, Any]],
 ) -> str:
     """Generate a Markdown report with related work items and repo matches.
 
     Returns a string containing the full report section including heading.
     """
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append(f"\n## {REPORT_HEADING}")
 
     if not related_items and not repo_matches:
@@ -427,7 +425,7 @@ def update_description(original_desc: str, report_section: str) -> str:
 def main() -> None:
     try:
         _main()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 -- top-level error handler
         notice = FailureNotice(
             script_name="find_related.py",
             reason=f"Unhandled exception: {exc}",
@@ -512,7 +510,7 @@ def _main() -> None:
 
         added_ids = [item.get("id") for item in related_items if item.get("id")]
 
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "workItemId": args.work_item_id,
             "found": len(related_items) > 0 or len(repo_matches) > 0,
             "addedIds": added_ids,

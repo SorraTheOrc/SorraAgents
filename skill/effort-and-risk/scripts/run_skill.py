@@ -17,16 +17,16 @@ Status lifecycle is managed by StatusLifecycle context manager.
 
 import argparse
 import json
+import os
 import subprocess
 import sys
-import os
 
 from skill.shared.status_lifecycle import StatusLifecycle
 
 
 def wl_show(issue_id):
-    p = subprocess.run(  # noqa: PLW1510
-        ["wl", "show", issue_id, "--children", "--json"], capture_output=True, text=True
+    p = subprocess.run(
+        ["wl", "show", issue_id, "--children", "--json"], capture_output=True, text=True, check=False
     )
     if p.returncode != 0:
         print(json.dumps({"error": "wl show failed", "stderr": p.stderr}))
@@ -117,17 +117,18 @@ def main():
                     if "items" in stdin_payload:
                         payload["items"] = stdin_payload["items"]
                     payload.update(stdin_payload)
-            except Exception:  # noqa: BLE001, S110
+            except Exception:  # noqa: S110, BLE001 -- stdin parsing enhancement, ignore on failure
                 pass
 
         # Call orchestrate_estimate.py located in the same scripts directory
         script_dir = os.path.dirname(__file__)
         orchestrator = os.path.join(script_dir, "orchestrate_estimate.py")
-        proc = subprocess.run(  # noqa: PLW1510
+        proc = subprocess.run(
             ["python3", orchestrator],
             input=json.dumps(payload),
             text=True,
             capture_output=True,
+            check=False,
         )
         if proc.returncode != 0:
             print(

@@ -133,7 +133,7 @@ def _make_fake_subprocess_run(
         *args: Any,
         **kwargs: Any,
     ) -> subprocess.CompletedProcess:
-        key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)  # noqa: FLY002
+        key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
         if key not in responses:
             raise FileNotFoundError(f"Unexpected command: {key}")
         return responses[key]
@@ -720,7 +720,7 @@ class TestNonExistentFileHandling:
 
         result = create_smell_work_item(smell)
         assert result is None, (
-            "Expected None when file does not exist, got {!r}".format(result)
+            f"Expected None when file does not exist, got {result!r}"
         )
 
     def test_skip_creation_when_file_does_not_exist_batch(
@@ -739,7 +739,7 @@ class TestNonExistentFileHandling:
 
         results = create_smell_work_items([smell1, smell2])
         assert results == [], (
-            "Expected empty list when all files are nonexistent, got {!r}".format(results)
+            f"Expected empty list when all files are nonexistent, got {results!r}"
         )
 
     def test_warning_logged_when_file_does_not_exist(
@@ -770,7 +770,7 @@ class TestNonExistentFileHandling:
             assert result is None
             log_output = log_capture.getvalue()
             assert "does not exist" in log_output.lower() or "nonexistent" in log_output.lower() or "skipping" in log_output.lower(), (
-                "Expected warning log about non-existent file, got: {}".format(log_output)
+                f"Expected warning log about non-existent file, got: {log_output}"
             )
         finally:
             logger.removeHandler(handler)
@@ -833,7 +833,7 @@ class TestWorklogDuplicatePrevention:
         responses[expected_list_cmd] = cp_list
 
         def _fake_run(cmd, *args, **kwargs):
-            key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)  # noqa: FLY002
+            key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
             if key in responses:
                 return responses[key]
             # Default: return empty for any other command
@@ -845,7 +845,7 @@ class TestWorklogDuplicatePrevention:
 
         result = create_smell_work_item(smell)
         assert result is None, (
-            "Expected None when worklog has existing item, got {!r}".format(result)
+            f"Expected None when worklog has existing item, got {result!r}"
         )
 
     def test_allows_creation_when_worklog_has_no_match(
@@ -893,7 +893,7 @@ class TestWorklogDuplicatePrevention:
         }
 
         def _fake_run(cmd, *args, **kwargs):
-            key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)  # noqa: FLY002
+            key = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
             if key in responses:
                 return responses[key]
             raise FileNotFoundError(f"Unexpected command: {key}")

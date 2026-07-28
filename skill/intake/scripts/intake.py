@@ -17,7 +17,7 @@ Exit codes:
     1 — error during execution
 
 All commands produce JSON output for agent consumption.
-"""  # noqa: EXE001
+"""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]  # e.g. <repo>/skill/intake/scr
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
+from skill.shared.status_lifecycle import StatusLifecycle
 
 LOG = logging.getLogger("intake.scripts.intake")
 
@@ -211,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(json.dumps({"success": False, "error": f"Unknown command: {args.command}"}))
             return 1
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 -- command failure logged
         LOG.error("Command failed: %s", exc)
         print(json.dumps({"success": False, "error": str(exc)}))
         return 1

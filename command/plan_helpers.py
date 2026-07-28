@@ -17,7 +17,7 @@ to run the canonical module's code in this module's namespace. This ensures:
 4. The ``if __name__ == "__main__"`` guard works for both import and CLI modes
 
 See ``skill/plan/plan_helpers.py`` for the canonical source.
-"""  # noqa: EXE001
+"""
 
 from pathlib import Path
 
@@ -32,4 +32,4 @@ _globals = globals()
 _globals["__file__"] = _canonical_path
 
 with open(_canonical_path, encoding="utf-8") as _f:
-    exec(compile(_f.read(), _canonical_path, "exec"), _globals)  # noqa: S102
+    exec(compile(_f.read(), _canonical_path, "exec"), _globals)  # noqa: S102 -- intentional delegation wrapper, loading known local file
