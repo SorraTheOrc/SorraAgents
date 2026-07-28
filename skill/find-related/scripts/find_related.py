@@ -26,6 +26,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from skill.scripts.failure_notice import FailureNotice  # noqa: E402
+from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -442,90 +443,96 @@ def main() -> None:
 def _main() -> None:
     args = parse_args()
 
-    if args.verbose:
-        print(f"[find-related] Work item: {args.work_item_id}", file=sys.stderr)
-        print(f"[find-related] Repo path: {args.repo_path}", file=sys.stderr)
+    # StatusLifecycle manages work-item status transitions:
+    #   - On entry: sets status to in_progress (captures original)
+    #   - On success: sets status to completed
+    #   - On exception: restores original status
+    with StatusLifecycle(args.work_item_id):
 
-    # Fetch the work item
-    work_item = run_wl_show(args.work_item_id)
-    if work_item is None:
-        msg = f"Failed to fetch work item {args.work_item_id}"
-        notice = FailureNotice(
-            script_name="find_related.py",
-            reason=f"Could not fetch work item {args.work_item_id}",
-            stderr_context=msg,
-        )
+        if args.verbose:
+            print(f"[find-related] Work item: {args.work_item_id}", file=sys.stderr)
+            print(f"[find-related] Repo path: {args.repo_path}", file=sys.stderr)
+
+        # Fetch the work item
+        work_item = run_wl_show(args.work_item_id)
+        if work_item is None:
+            msg = f"Failed to fetch work item {args.work_item_id}"
+            notice = FailureNotice(
+                script_name="find_related.py",
+                reason=f"Could not fetch work item {args.work_item_id}",
+                stderr_context=msg,
+            )
+            if args.json_output:
+                payload = {"error": msg, "script_failure": {"script_name": "find_related.py", "reason": msg}}
+                print(json.dumps(payload))
+            else:
+                print(notice.wrap(f"Error: {msg}"))
+            sys.exit(1)
+
+        title = work_item.get("title", "")
+        description = work_item.get("description", "")
+
+        if args.verbose:
+            print(f"[find-related] Title: {title}", file=sys.stderr)
+
+        # Derive keywords
+        keywords = extract_keywords(title, description)
+
+        if args.verbose:
+            print(f"[find-related] Keywords: {keywords}", file=sys.stderr)
+
+        # Probe semantic search availability
+        use_semantic = is_semantic_available()
+        if args.verbose:
+            print(f"[find-related] Semantic search available: {use_semantic}", file=sys.stderr)
+
+        # Search Worklog (with semantic ranking when available)
+        related_items = search_and_dedup(keywords, use_semantic=use_semantic)
+
+        # Search repository (ranked and limited)
+        repo_matches = search_repo(args.repo_path, keywords)
+
+        # Filter out the current work item from results
+        related_items = [
+            item for item in related_items
+            if item.get("id") != args.work_item_id
+        ]
+
+        # Generate report
+        report_section = format_report(args.work_item_id, related_items, repo_matches)
+
+        # Update description
+        original_desc = work_item.get("description", "")
+        updated_desc = update_description(original_desc, report_section)
+        update_success = run_wl_update(args.work_item_id, updated_desc)
+
+        if args.verbose and not update_success:
+            print("[find-related] Warning: Failed to update work item description",
+                  file=sys.stderr)
+
+        added_ids = [item.get("id") for item in related_items if item.get("id")]
+
+        result: Dict[str, Any] = {
+            "workItemId": args.work_item_id,
+            "found": len(related_items) > 0 or len(repo_matches) > 0,
+            "addedIds": added_ids,
+            "reportInserted": update_success,
+            "keywords": keywords,
+            "relatedItemCount": len(related_items),
+            "repoMatchCount": len(repo_matches),
+        }
+
         if args.json_output:
-            payload = {"error": msg, "script_failure": {"script_name": "find_related.py", "reason": msg}}
-            print(json.dumps(payload))
+            print(json.dumps(result))
         else:
-            print(notice.wrap(f"Error: {msg}"))
-        sys.exit(1)
+            print(f"Work item: {args.work_item_id}")
+            print(f"Related items found: {len(related_items)}")
+            print(f"Repository matches: {len(repo_matches)}")
+            if added_ids:
+                print(f"Added IDs: {', '.join(added_ids)}")
+            print(f"Report inserted: {update_success}")
 
-    title = work_item.get("title", "")
-    description = work_item.get("description", "")
-
-    if args.verbose:
-        print(f"[find-related] Title: {title}", file=sys.stderr)
-
-    # Derive keywords
-    keywords = extract_keywords(title, description)
-
-    if args.verbose:
-        print(f"[find-related] Keywords: {keywords}", file=sys.stderr)
-
-    # Probe semantic search availability
-    use_semantic = is_semantic_available()
-    if args.verbose:
-        print(f"[find-related] Semantic search available: {use_semantic}", file=sys.stderr)
-
-    # Search Worklog (with semantic ranking when available)
-    related_items = search_and_dedup(keywords, use_semantic=use_semantic)
-
-    # Search repository (ranked and limited)
-    repo_matches = search_repo(args.repo_path, keywords)
-
-    # Filter out the current work item from results
-    related_items = [
-        item for item in related_items
-        if item.get("id") != args.work_item_id
-    ]
-
-    # Generate report
-    report_section = format_report(args.work_item_id, related_items, repo_matches)
-
-    # Update description
-    original_desc = work_item.get("description", "")
-    updated_desc = update_description(original_desc, report_section)
-    update_success = run_wl_update(args.work_item_id, updated_desc)
-
-    if args.verbose and not update_success:
-        print("[find-related] Warning: Failed to update work item description",
-              file=sys.stderr)
-
-    added_ids = [item.get("id") for item in related_items if item.get("id")]
-
-    result: Dict[str, Any] = {
-        "workItemId": args.work_item_id,
-        "found": len(related_items) > 0 or len(repo_matches) > 0,
-        "addedIds": added_ids,
-        "reportInserted": update_success,
-        "keywords": keywords,
-        "relatedItemCount": len(related_items),
-        "repoMatchCount": len(repo_matches),
-    }
-
-    if args.json_output:
-        print(json.dumps(result))
-    else:
-        print(f"Work item: {args.work_item_id}")
-        print(f"Related items found: {len(related_items)}")
-        print(f"Repository matches: {len(repo_matches)}")
-        if added_ids:
-            print(f"Added IDs: {', '.join(added_ids)}")
-        print(f"Report inserted: {update_success}")
-
-    sys.exit(0)
+        sys.exit(0)
 
 
 if __name__ == "__main__":
