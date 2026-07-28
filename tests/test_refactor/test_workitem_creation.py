@@ -157,20 +157,10 @@ def _cp(
 
 def _build_wl_create_cmd(title: str, description: str, priority: str) -> str:
     """Build the expected ``wl create`` command string for matching."""
-    parts = [
-        "wl",
-        "create",
-        "--title",
-        title,
-        "--description",
-        description,
-        "--priority",
-        priority,
-        "--tags",
-        "Refactor",
-        "--json",
-    ]
-    return " ".join(parts)
+    return (
+        f"wl create --title {title} --description {description}"
+        f" --priority {priority} --tags Refactor --json"
+    )
 
 
 # ---------------------------------------------------------------------------
