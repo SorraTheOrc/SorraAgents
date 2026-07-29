@@ -41,6 +41,24 @@ in work item comments or PR bodies. If such data must be referenced, reference
 it by work-item id or document path instead of pasting values. Mask or redact
 any sensitive values before writing them to logs or comments.
 
+## StatusLifecycle Integration
+
+Status transitions are managed by the shared `StatusLifecycle` context manager
+from `skill/shared/status_lifecycle.py`. The implement skill's orchestration
+script (`implement.py`) uses `StatusLifecycle` for automatic status management:
+
+- **`phase_start()`** uses `StatusLifecycle.update_status()` to claim the
+  work item (`status → in_progress`)
+- **`phase_finish()`** wraps build/test/commit/push in
+  `with StatusLifecycle(..., target_stage="in_review"):` which:
+  - On success: sets `status=completed`, `stage=in_review`
+  - On error: restores original status (no orphaned `in_progress` items)
+- **`phase_abort()`** uses `StatusLifecycle.update_status()` to reset to `open`
+
+For agents following this SKILL.md manually (without the orchestration script),
+use the `StatusLifecycle.update_status()` static method or the context manager
+pattern described in `skill/shared/status_lifecycle.py`.
+
 ## Best Practices
 
 - Follow the steps in order and do not skip steps.
@@ -56,6 +74,7 @@ any sensitive values before writing them to logs or comments.
 - If blockers or dependencies exist, implement those first.
 - Follow AGENTS.md policies for branch naming, commit discipline, worktree workflow, and push-to-dev integration. See [AGENTS.md](../../AGENTS.md#implement-the-work-item).
 - After implementation is `in_review`, use the cleanup skill to tidy up local feature branches (do not clean up `dev` or `main`).
+- Use `StatusLifecycle` for all status transitions — never use ad-hoc `wl update --status` commands.
 
 ## Status Safety & Abort Handling
 
@@ -70,7 +89,8 @@ MUST reset status to `open`** to release the work item lock.
 
 All abort paths follow the same two-step pattern:
 
-1. **Reset status to open:** `wl update <work-item-id> --status open --json`
+1. **Reset status to open:** `StatusLifecycle.update_status(<work-item-id>, "open")`
+   or `_reset_work_item_status(<work-item-id>)` from the orchestration script.
 2. **Stop execution:** Return control to the operator with a clear explanation
 
 > **Why this matters:** Work items in `in_progress` status are filtered by `wl next`
@@ -103,8 +123,9 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 1. Set status and safety gate
 
-- **Before any other step**, claim the work item:
-  `wl update <work-item-id> --status in_progress --json`
+- **Before any other step**, claim the work item using the orchestration script
+  or `StatusLifecycle`:
+  `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
   This signals to other agents that this item is being worked on.
 
 1. Safety gate: handle dirty working tree
@@ -121,11 +142,12 @@ Check the git context and handle uncommitted changes before proceeding.
   - Otherwise, report dirty files (they may be stale), proceed to create a worktree for isolation.
   - If dirty files prevent worktree creation, follow the carry/commit/stash/revert/abort prompt.
 
-On abort: `wl update <work-item-id> --status open --json`
+On abort: `StatusLifecycle.update_status(<work-item-id>, "open")`
 
 1. Understand the work item
 
-If not already assigned: `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
+If not already assigned (or when using the orchestration script, this is handled
+by `phase_start()`): `StatusLifecycle.update_status(<work-item-id>, "in_progress", stage="in_progress", assignee="<AGENT>")`
 
 Check the most recent worklog action, comment, or audit entry:
 
@@ -147,7 +169,7 @@ Verify:
 
 If the gate fails:
 
-1. `wl update <work-item-id> --status open --json`
+1. `StatusLifecycle.update_status(<work-item-id>, "open")`
 2. If not well-defined → run intake interview (see `../intake/SKILL.md`).
 3. If too large → run plan interview (`/skill:plan`) to decompose.
 4. Inform the user and ask if they want to restart implementation review.
@@ -173,9 +195,9 @@ After all recursive child implementations are complete, check whether this work 
 
 - Use `wl show <work-item-id> --children --json` to inspect children.
 - **If all children are in a terminal stage** (`in_review`/`completed`/`done`):
-  - Advance the parent: `wl update <work-item-id> --status completed --stage in_review --json`
+  - Advance the parent: `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`
 - **If any children are NOT in a terminal stage**:
-  - Set to open: `wl update <work-item-id> --status open --json`
+  - Set to open: `StatusLifecycle.update_status(<work-item-id>, "open")`
   - Add a comment flagging the gap for producer attention:
     `wl comment add <work-item-id> --comment "Not all children are in a terminal stage. Needs producer review." --author "<AGENT>" --json`
   - Return control to the operator.
@@ -201,7 +223,7 @@ After all recursive child implementations are complete, check whether this work 
 
 On unexpected error (API failure, network error, exception):
 
-1. **Reset status to open:** `wl update <work-item-id> --status open --json`
+1. **Reset status to open:** `StatusLifecycle.update_status(<work-item-id>, "open")`
 2. **Log the error:** `wl comment add <work-item-id> --comment "Error: <description>" --author "<AGENT>" --json`
 3. **Return control** to the operator with error details.
 4. If transient, the operator may retry.
@@ -210,7 +232,7 @@ On unexpected error (API failure, network error, exception):
 
 If the operator cancels after Step 0:
 
-1. `wl update <work-item-id> --status open --json`
+1. `StatusLifecycle.update_status(<work-item-id>, "open")`
 2. Return control to the operator.
 3. Document: `wl comment add <work-item-id> --comment "Aborted by operator" --author "<AGENT>" --json`
 
@@ -267,8 +289,8 @@ After implementation completes and before final commit, an automated refactor st
   `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>." --author "<AGENT>" --json`
 - Close your response with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
 
-  > **Parent/epic items already advanced at Step 4.1:** if this item has children and parent advancement was already performed, skip the `wl update` below.
-  > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `wl update <work-item-id> --status completed --stage in_review --json`
+  > **Parent/epic items already advanced at Step 4.1:** if this item has children and parent advancement was already performed, skip the status update.
+  > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`
 
   > The work-item stays `in_review` until the release process promotes `dev` to `main`. See `../ship/SKILL.md` for push-to-dev workflow and `../ship/scripts/run-release.js` for release.
 
@@ -286,33 +308,36 @@ Before exiting the implement skill at any point, check and reset status as a saf
 wl show <work-item-id> --json
 ```
 
-If `status: in_progress` and work is not complete (not at Step 7), run:
+If `status: in_progress` and work is not complete (not at Step 7), reset via `StatusLifecycle`:
 
-```bash
-wl update <work-item-id> --status open --json
+```python
+StatusLifecycle.update_status(work_item_id, "open")
 ```
 
 This prevents orphaned `in_progress` items from blocking other agents.
 
 ## Status Transition Matrix
 
-The following table documents the expected status and stage transitions at each workflow phase for the `implement` skill.
+The following table documents the expected status and stage transitions at each
+workflow phase. All transitions are managed via `StatusLifecycle` — ad-hoc
+`wl update --status` commands (without `StatusLifecycle`) should never be used.
 
-| Phase | Command | Status | Stage |
-|-------|---------|--------|-------|
-| Start (Step 0 - Set status) | `wl update <id> --status in_progress --json` | in_progress | (unchanged) |
-| Claim (Step 1) | `wl update <id> --status in_progress --stage in_progress --assignee "<AGENT>" --json` | in_progress | in_progress |
-| Epic / parent: all children done (Step 4.1) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
-| Final (Step 6 - Mark in_review) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
-| Abort - dirty work tree | `wl update <id> --status open --json`, then abort | open | (unchanged) |
-| Abort - definition gate failure | `wl update <id> --status open --json`, run intake/plan interview, update item | open | (unchanged) |
-| Abort - user-initiated | `wl update <id> --status open --json`, return control to operator | open | (unchanged) |
-| Abort - error/exception during implementation | `wl update <id> --status open --json`, log error to comment, return | open | (unchanged) |
+| Phase | Mechanism | Status | Stage |
+|-------|-----------|--------|-------|
+| Start (Step 0 - Set status) | `StatusLifecycle.update_status(id, "in_progress")` or `phase_start()` | in_progress | (unchanged) |
+| Claim (Step 1) | `StatusLifecycle.update_status(id, "in_progress", stage="in_progress", assignee="<AGENT>")` | in_progress | in_progress |
+| Epic / parent: all children done (Step 4.1) | `StatusLifecycle.update_status(id, "completed", stage="in_review")` | completed | in_review |
+| Final (Step 6 - Mark in_review) | `with StatusLifecycle(id, target_stage="in_review"):` or `phase_start()`+`phase_finish()` | completed | in_review |
+| Abort - dirty work tree | `StatusLifecycle.update_status(id, "open")` via `phase_abort()` | open | (unchanged) |
+| Abort - definition gate failure | `StatusLifecycle.update_status(id, "open")` | open | (unchanged) |
+| Abort - user-initiated | `StatusLifecycle.update_status(id, "open")` via `phase_abort()` | open | (unchanged) |
+| Abort - error/exception during implementation | `StatusLifecycle` context manager restores original status | open | (unchanged) |
 | Abort - unexpected termination (Final cleanup) | Check status; if `in_progress` and work incomplete, reset | open | (unchanged) |
 
-> **Abort/failure transitions always use `--status open` while keeping the stage unchanged.**
-> This pattern is mandatory — never leave a work item in `in_progress` status
-> unless actively implementing. See the "Status Safety & Abort Handling" section for details.
+> **All abort/failure transitions reset to `open`.** The `StatusLifecycle`
+> context manager handles this automatically on exception. For manual fallback,
+> use `StatusLifecycle.update_status(id, "open")`. Never leave a work item
+> in `in_progress` status unless actively implementing.
 
 ## Scripts (canonical runner & modules)
 
@@ -329,8 +354,8 @@ wl show SA-0MPYMFZXO0004ZU4 --json
 # or direct push
 git push origin HEAD:refs/heads/dev
 
-# Mark in_review
-wl update SA-0MPYMFZXO0004ZU4 --status completed --stage in_review --json
+# Mark in_review via StatusLifecycle
+python3 -c "from skill.shared.status_lifecycle import StatusLifecycle; StatusLifecycle.update_status('SA-0MPYMFZXO0004ZU4', 'completed', stage='in_review')"
 ```
 
 End.

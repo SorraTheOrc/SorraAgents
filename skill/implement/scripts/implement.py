@@ -1146,6 +1146,7 @@ def phase_finish(
             work_item_id,
             f"Build failed during finish phase.\n```\n{build_result['stderr'][:500]}\n```",
         )
+        _reset_work_item_status(work_item_id)
         if json_output:
             print(format_json_output(report))
         return report
@@ -1234,6 +1235,7 @@ def phase_finish(
         report["success"] = False
         report["message"] = msg
         wl_add_comment(work_item_id, msg)
+        _reset_work_item_status(work_item_id)
         if json_output:
             print(format_json_output(report))
         else:
@@ -1242,73 +1244,75 @@ def phase_finish(
 
     LOG.info("All tests passed")
 
-    # ── Step 4: Commit ─────────────────────────────────────────────
-    commit_msg = commit_msg_override or f"{work_item_id}: Implementation complete"
-    LOG.info("Committing changes...")
-    if not git_commit(worktree_path, commit_msg):
-        msg = "git commit failed"
+    try:
+        with StatusLifecycle(work_item_id, target_stage="in_review"):
+            # ── Step 4: Commit ─────────────────────────────────────────────
+            commit_msg = commit_msg_override or f"{work_item_id}: Implementation complete"
+            LOG.info("Committing changes...")
+            if not git_commit(worktree_path, commit_msg):
+                raise RuntimeError("git commit failed")
+
+            commit_hash = git_get_commit_hash(worktree_path)
+            report["steps"]["commit"] = {
+                "hash": commit_hash,
+                "message": commit_msg,
+            }
+            LOG.info("Committed at %s", commit_hash)
+
+            # ── Step 5: Clean up worktree processes ────────────────────────
+            LOG.info("Cleaning up worktree processes...")
+            cleanup_result = cleanup_worktree_processes(worktree_path)
+            report["steps"]["cleanup"] = cleanup_result
+            if cleanup_result.get("warning"):
+                LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
+
+            # ── Step 6: Remove worktree ────────────────────────────────────
+            LOG.info("Removing worktree...")
+            remove_state(worktree_path)
+            if not _remove_worktree(worktree_path):
+                msg = f"Failed to remove worktree at {worktree_path}"
+                LOG.warning(msg)
+                report["steps"]["worktree_removed"] = False
+
+            # ── Step 7: Restore repo state ─────────────────────────────────
+            repo_root = state.repo_root if state else str(Path.cwd().resolve())
+            _restore_repo_state(repo_root)
+
+            # ── Step 8: Push to dev ────────────────────────────────────────
+            LOG.info("Pushing to dev...")
+            if not git_push_to_dev(repo_root, branch):
+                raise RuntimeError("git push to dev failed.")
+
+            report["steps"]["push"] = {"success": True, "hash": commit_hash}
+            LOG.info("Push to dev succeeded")
+
+            # StatusLifecycle.__exit__ sets status=completed, stage=in_review
+
+    except RuntimeError as e:
+        msg = str(e)
         report["success"] = False
         report["message"] = msg
+        # Status was restored to original by StatusLifecycle; override to open
+        _reset_work_item_status(work_item_id)
+        if "git push to dev failed" in msg:
+            wl_add_comment(
+                work_item_id,
+                f"Push to dev failed. Commit {commit_hash} is local. "
+                f"Push manually: git push origin {branch}:refs/heads/dev",
+            )
+        elif "git commit failed" in msg:
+            wl_add_comment(work_item_id, f"Commit failed during finish phase.")
         if json_output:
             print(format_json_output(report))
         else:
             LOG.error(msg)
         return report
 
-    commit_hash = git_get_commit_hash(worktree_path)
-    report["steps"]["commit"] = {
-        "hash": commit_hash,
-        "message": commit_msg,
-    }
-    LOG.info("Committed at %s", commit_hash)
-
-    # ── Step 5: Clean up worktree processes ────────────────────────
-    LOG.info("Cleaning up worktree processes...")
-    cleanup_result = cleanup_worktree_processes(worktree_path)
-    report["steps"]["cleanup"] = cleanup_result
-    if cleanup_result.get("warning"):
-        LOG.warning("Process cleanup warning: %s", cleanup_result["warning"])
-
-    # ── Step 6: Remove worktree ────────────────────────────────────
-    LOG.info("Removing worktree...")
-    remove_state(worktree_path)
-    if not _remove_worktree(worktree_path):
-        msg = f"Failed to remove worktree at {worktree_path}"
-        LOG.warning(msg)
-        report["steps"]["worktree_removed"] = False
-
-    # ── Step 7: Restore repo state ─────────────────────────────────
-    repo_root = state.repo_root if state else str(Path.cwd().resolve())
-    _restore_repo_state(repo_root)
-
-    # ── Step 8: Push to dev ────────────────────────────────────────
-    LOG.info("Pushing to dev...")
-    if not git_push_to_dev(repo_root, branch):
-        msg = "git push to dev failed."
-        LOG.error(msg)
-        report["success"] = False
-        report["message"] = msg
-        wl_add_comment(
-            work_item_id,
-            f"Push to dev failed. Commit {commit_hash} is local. "
-            f"Push manually: git push origin {branch}:refs/heads/dev",
-        )
-        if json_output:
-            print(format_json_output(report))
-        return report
-
-    report["steps"]["push"] = {"success": True, "hash": commit_hash}
-    LOG.info("Push to dev succeeded")
-
-    # ── Step 9: Mark in_review via shared helper ──────────────────
+    #── Step 9: Add completion comment ─────────────────────────────
     wl_add_comment(
         work_item_id,
         f"Implementation complete.\n- Commit: {commit_hash}\n- Branch: {branch}\n- Worktree: {worktree_path}",
     )
-    try:
-        StatusLifecycle.update_status(work_item_id, "completed", stage="in_review")
-    except RuntimeError:
-        LOG.warning("Failed to mark work item %s as in_review", work_item_id)
 
     report["success"] = True
     report["hash"] = commit_hash

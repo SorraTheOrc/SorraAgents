@@ -93,8 +93,10 @@ the autoplan decision logic).
      checked and what (if anything) was found or changed. Then mark the
      work item as `plan_complete` and record a summary comment:
 
+     ```python
+     StatusLifecycle.update_status(work_item_id, "open", stage="plan_complete")
+     ```
      ```bash
-     wl update <work-item-id> --stage plan_complete --status open --json
      wl comment add <work-item-id> --author "plan" --comment "Auto-plan completed with review: effort and risk below threshold. Review summary: [summarise what each stage checked and any changes made]" --json
      ```
 
@@ -176,7 +178,7 @@ instructions above).
    - If a concise plan block exists → treat as sufficient.
 
    If planning is not needed:
-   - `wl update <work-item-id> --stage plan_complete --status open --json`
+   - `StatusLifecycle.update_status(<work-item-id>, "open", stage="plan_complete")`
    - Add comment: `wl comment add <work-item-id> "Plan auto-complete: sufficiently sized/defined for direct implementation." --actor Map --json`
 
    When borderline, err toward auto-complete. Only fall back to clarifying questions when decomposition is clearly needed.
@@ -274,7 +276,7 @@ instructions above).
    - Add dependency edges: `wl dep add <DependentId> <PrereqId>`
    - Ensure idempotence: if a child with the same canonical name exists, reuse it.
    - Add completion comment: `wl comments add $1 "Planning Complete. <Summary>" --actor <agent> --json`
-   - Update stage: `wl update $1 --stage plan_complete --status open --json`
+   - Update stage: `StatusLifecycle.update_status(<work-item-id>, "open", stage="plan_complete")`
 
 8. Calculate Effort and Risk (agent responsibility; must follow)
 
@@ -300,7 +302,7 @@ instructions above).
 ## 8. Finishing (must do as the final step only)
 
 - Set stage to `plan_complete` and status to `open`:
-  `wl update <work-item-id> --stage plan_complete --status open --json`
+  `StatusLifecycle.update_status(<work-item-id>, "open", stage="plan_complete")`
 - Run `wl sync` to sync changes.
 - Run `wl show <work-item-id>` (not --json) to display the work item.
 - End with: "This completes the Plan process for <work-item-id>".

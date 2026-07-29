@@ -110,7 +110,8 @@ class TestPlanAutoCompleteStep1:
 
         # Check that auto-complete behavior is present: update stage + comment
         assert re.search(
-            r"wl update.*--stage plan_complete",
+            r"(?:wl update.*--stage plan_complete|"
+            r"StatusLifecycle\.update_status.*?stage=\"plan_complete\")",
             step1_content,
         ), (
             "Step 1 must include updating stage to plan_complete when planning is not needed"
