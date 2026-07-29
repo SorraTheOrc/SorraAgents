@@ -199,6 +199,13 @@ Synonym for "Acceptance Criteria". Use **Acceptance Criteria** as canonical head
 
 **Timeout:** `CALL_PI_TIMEOUT`=600s per Pi call. Cumulative elapsed-time guard (110s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
 
+**Tools-enabled invocation (Phase 2 only):** Phase 2 deep analysis calls Pi with
+`enable_tools=True`, which appends
+`--tools read,bash,grep,find,ls --exclude-tools ask_question` to the pi command.
+This gives the model file-reading capabilities to verify ACs against
+implementation code. Non-Phase-2 calls (Phase 1 screening, project-level audit)
+remain in bare LLM pipe mode (`enable_tools=False`).
+
 ### Code Quality Integration
 
 Runner performs code quality checks before AC verification (invokes `../code-review/scripts/code_quality.py`):
@@ -294,3 +301,18 @@ The following output was produced manually.
 - **Silent persistence failure:** `persist_audit.py` / `wl audit-set` returns success without storing. **Always verify with `wl audit-show --json`**.
 - Skipping persistence: always verify before reporting as recorded.
 - If `wl` is unavailable or returns invalid JSON, report the error, do not claim success.
+
+### Agent-mode response parsing
+
+- Phase 2 deep analysis now runs Pi in agent mode (with `--tools`). The agent-mode
+  JSON-stream output may contain additional event types (`agent_start`, `turn_start`,
+  `message_start`, `tool_execution_start`, `tool_execution_end`, `agent_end`) not
+  present in bare LLM pipe mode. The `_extract_pi_text()` and `_parse_pi_json_line()`
+  functions handle these transparently by extracting text content from
+  `message_update` events (same as bare LLM mode).
+- If response parsing fails, check debug logs (use `--debug-log`) to see the raw
+  agent output. The runner automatically falls back to Phase 1 results on Phase 2
+  failure.
+- The `_extract_json_array()` function strips prose text before/after JSON arrays,
+  so it works correctly regardless of whether the model wraps its output in
+  explanatory text (common in agent mode).
