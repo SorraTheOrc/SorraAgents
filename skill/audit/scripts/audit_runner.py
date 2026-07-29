@@ -52,12 +52,14 @@ from skill.scripts.failure_notice import FailureNotice
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
 
-CALL_PI_TIMEOUT = 600
+CALL_PI_TIMEOUT = 1800
 """Internal timeout (seconds) for each Pi model subprocess call.
 
 This is a generous safety net for individual Pi model calls during audit
-processing. Large audit prompts can take several minutes, so the timeout
-must be high enough to not interrupt normal operation.
+processing. Phase 2 deep analysis now runs Pi in agent mode (with file-reading
+tools), which is inherently slower than bare LLM calls. 1800s (30 min)
+accommodates typical agent-mode analyses where the model reads and searches
+multiple implementation files.
 
 The cumulative elapsed-time guard in ``cmd_issue`` (110s threshold for
 child audit skipping) provides the primary protection against the parent
@@ -1423,14 +1425,16 @@ def _run_phase2_deep_analysis(
     pi_bin: str = "pi",
     debug_log: str | None = None,
     script_failure_callback=None,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
     Calls Pi with a detailed prompt asking the model to read the actual
     implementation files and verify each acceptance criterion against
     what the code actually does.
 
-    Returns (updated_ac_results, updated_child_results).
+    Returns (updated_ac_results, updated_child_results, phase2_completed).
+    The ``phase2_completed`` flag is ``False`` when the Pi call times out,
+    allowing the caller to set appropriate diagnostic evidence.
     """
     # Build a detailed prompt for deep analysis
     ac_list_json = json.dumps([
@@ -1472,7 +1476,39 @@ def _run_phase2_deep_analysis(
         print(f"Warning: Phase 2 deep analysis failed: {exc}", file=sys.stderr)
         if script_failure_callback:
             script_failure_callback("pi (Phase 2 deep analysis)", exc)
-        return ac_results, child_results
+        return ac_results, child_results, False
+
+    # Check for timeout before attempting to parse results
+    if result.get("_timeout"):
+        evidence = result.get("evidence", "Deep analysis timed out.")
+        print(f"Warning: Phase 2 deep analysis timed out: {evidence}", file=sys.stderr)
+        if script_failure_callback:
+            script_failure_callback(
+                "pi (Phase 2 deep analysis)",
+                RuntimeError(f"Phase 2 deep analysis timed out after {CALL_PI_TIMEOUT}s"),
+            )
+        # Mark all ACs as partial with timeout evidence
+        timeout_acs = []
+        for ac in ac_results:
+            timeout_acs.append({
+                "text": ac.get("text", ""),
+                "verdict": VERDICT_PARTIAL,
+                "evidence": "Deep analysis timed out \u2014 manual review required.",
+            })
+        # Also mark all child ACs as partial
+        timeout_children = []
+        for child in child_results:
+            child_acs = child.get("ac_results", [])
+            updated_child_acs = []
+            for ac in child_acs:
+                updated_child_acs.append({
+                    "text": ac.get("text", ""),
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": "Deep analysis timed out \u2014 manual review required.",
+                })
+            timeout_children.append(dict(child))
+            timeout_children[-1]["ac_results"] = updated_child_acs
+        return timeout_acs, timeout_children, False
 
     # Parse the batched result
     raw_text = (
@@ -1524,6 +1560,7 @@ def _run_phase2_deep_analysis(
 
     # Also run deep analysis on active children
     updated_children = list(child_results)
+    child_timeout_occurred = False
     for ci, child in enumerate(updated_children):
         if child.get("status") == "completed" and child.get("stage") == "done":
             continue  # Skip already-closed children
@@ -1554,6 +1591,24 @@ def _run_phase2_deep_analysis(
                 enable_tools=True,
             )
         except RuntimeError:
+            continue
+
+        # Handle child timeout: mark all child ACs as partial
+        if child_result.get("_timeout"):
+            print(
+                f"Warning: Child deep analysis timed out for {child.get('id', '')}",
+                file=sys.stderr,
+            )
+            child_timeout_occurred = True
+            timeout_acs = []
+            for ac in child_acs:
+                timeout_acs.append({
+                    "text": ac.get("text", ""),
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": "Deep analysis timed out \u2014 manual review required.",
+                })
+            updated_children[ci] = dict(child)
+            updated_children[ci]["ac_results"] = timeout_acs
             continue
 
         child_raw = (
@@ -1602,7 +1657,7 @@ def _run_phase2_deep_analysis(
             updated_children[ci] = dict(child)
             updated_children[ci]["ac_results"] = updated_child_acs
 
-    return updated_ac, updated_children
+    return updated_ac, updated_children, not child_timeout_occurred
 
 
 def cmd_issue(issue_id: str, persist: bool = True,
@@ -2091,14 +2146,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
         else:
             # Phase 1 passed → run Phase 2 deep code analysis
             print("Phase 1 passed: running Phase 2 deep code analysis...", file=sys.stderr)
-            ac_results, child_results = _run_phase2_deep_analysis(
+            ac_results, child_results, phase2_completed = _run_phase2_deep_analysis(
                 work_item, ac_results, child_results,
                 resolved_model=resolved_model,
                 pi_bin=pi_bin,
                 debug_log=debug_log,
                 script_failure_callback=_record_script_failure,
             )
-            phase2_completed = True
 
         # ------------------------------------------------------------------
         # Create quality epics for findings (before report assembly)

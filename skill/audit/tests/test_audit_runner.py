@@ -560,3 +560,149 @@ class TestRunPhase2DeepAnalysisEnableTools:
                 audit_runner._call_pi_and_maybe_log("PRJ", "project", "test")
                 _args, kwargs = mock_cp.call_args
                 assert kwargs.get("enable_tools") is False
+
+
+# ===========================================================================
+# Phase 2 graceful timeout handling tests
+# ===========================================================================
+
+
+class TestPhase2TimeoutHandling:
+    """Tests for Phase 2 graceful timeout handling (AC1-AC3)."""
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text",
+                  verdict: str = "met") -> dict:
+        return {"index": index, "text": text, "verdict": verdict, "evidence": ""}
+
+    def test_timeout_marks_acs_as_partial(self):
+        """AC1: When Phase 2 times out, all ACs are marked 'partial' with timeout evidence."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "AC1"), self._make_ac(1, "AC2")]
+
+        timeout_result = {
+            "verdict": "unmet",
+            "evidence": "Pi model call timed out after 600s. Manual audit required.",
+            "_timeout": True,
+            "extracted_text": "",
+        }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value=timeout_result,
+        ):
+            result = audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model",
+            )
+
+        # The function now returns 3-tuple (acs, children, phase2_completed)
+        updated_acs, _, phase2_completed = result
+
+        assert phase2_completed is False
+        for ac in updated_acs:
+            assert ac["verdict"] == "partial"
+            assert "timed out" in ac["evidence"].lower()
+
+    def test_timeout_preserves_metadata(self):
+        """AC2: On timeout, AC text is preserved and verdict is 'partial'."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Criterion 1"), self._make_ac(1, "Criterion 2", "unmet")]
+
+        timeout_result = {
+            "verdict": "unmet",
+            "evidence": "Pi model call timed out after 600s.",
+            "_timeout": True,
+            "extracted_text": "",
+        }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value=timeout_result,
+        ):
+            updated_acs, _, phase2_completed = audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model",
+            )
+
+        assert phase2_completed is False
+        for i, ac in enumerate(updated_acs):
+            assert ac["text"] == acs[i]["text"]  # Original text preserved
+            assert ac["verdict"] == "partial"
+
+    def test_successful_return_still_works(self):
+        """AC3: Successful Phase 2 still works correctly (backward compat).
+
+        When no timeout occurs, the function should return phase2_completed=True
+        and update ACs based on deep analysis results.
+        """
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "AC1")]
+
+        success_result = {
+            "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "file.py:10 works"}]',
+            "evidence": "",
+        }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value=success_result,
+        ):
+            updated_acs, _, phase2_completed = audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model",
+            )
+
+        assert phase2_completed is True
+        assert updated_acs[0]["verdict"] == "met"
+        assert updated_acs[0]["evidence"] == "file.py:10 works"
+
+    def test_child_timeout_handled_gracefully(self):
+        """AC4: Child deep analysis timeout marks child ACs as partial."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        child = {
+            "id": "CHILD-1",
+            "title": "Child Issue",
+            "stage": "in_progress",
+            "status": "open",
+            "ac_results": [
+                {"index": 0, "text": "Child AC 1", "verdict": "met", "evidence": ""},
+            ],
+        }
+
+        # First call (parent) succeeds, second call (child) times out
+        parent_result = {
+            "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "file.py:10 works"}]',
+        }
+
+        child_timeout = {
+            "_timeout": True,
+            "verdict": "unmet",
+            "evidence": "timed out",
+            "extracted_text": "",
+        }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            side_effect=[parent_result, child_timeout],
+        ):
+            updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model",
+                )
+            )
+
+        # Parent AC should still be updated (from the successful call)
+        assert updated_acs[0]["verdict"] == "met"
+        # Child AC should be marked partial due to timeout
+        assert updated_children[0]["ac_results"][0]["verdict"] == "partial"
+        assert "timed out" in updated_children[0]["ac_results"][0]["evidence"].lower()
+        # Overall phase2_completed should be False
+        assert phase2_completed is False
+
+    def test_call_pi_timeout_constant_increased(self):
+        """AC5: CALL_PI_TIMEOUT is increased to accommodate agent-mode Phase 2."""
+        assert audit_runner.CALL_PI_TIMEOUT >= 1800, (
+            f"CALL_PI_TIMEOUT ({audit_runner.CALL_PI_TIMEOUT}) should be at least 1800s "
+            "for agent-mode Phase 2 deep analysis"
+        )
