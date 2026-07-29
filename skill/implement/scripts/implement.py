@@ -140,7 +140,10 @@ def _signal_handler(signum: int, frame: Any) -> None:
             cleanup_worktree_processes(wt)
             _remove_worktree(wt)
         if wid:
-            _reset_work_item_status(wid)
+            try:
+                StatusLifecycle.update_status(wid, "open")
+            except RuntimeError:
+                LOG.error("Failed to reset work item %s status to open", wid)
         if rr:
             _restore_repo_state(rr)
     except Exception as exc:  # noqa: BLE001
@@ -281,27 +284,6 @@ def wl_show(work_item_id: str) -> dict[str, Any]:
     except (json.JSONDecodeError, ValueError) as exc:
         LOG.error("Invalid JSON from wl show: %s", exc)
         return {}
-
-
-def wl_update_status(work_item_id: str, status: str, stage: str | None = None) -> bool:
-    """Update a work item's status (and optionally stage).
-
-    Args:
-        work_item_id: The work item ID.
-        status: New status value (e.g. ``open``, ``in_progress``, ``completed``).
-        stage: Optional new stage value (e.g. ``in_review``).
-
-    Returns:
-        True if the update succeeded.
-    """
-    cmd = ["wl", "update", work_item_id, "--status", status, "--json"]
-    if stage:
-        cmd.extend(["--stage", stage])
-    result = run_cmd(cmd, check=False)
-    if result.returncode != 0:
-        LOG.error("Failed to update work item %s: %s", work_item_id, result.stderr.strip())
-        return False
-    return True
 
 
 def wl_add_comment(work_item_id: str, comment: str) -> bool:
@@ -568,19 +550,6 @@ def _restore_repo_state(repo_root: str) -> None:
     """
     run_cmd(["git", "checkout", DEFAULT_PARENT_BRANCH], cwd=repo_root, check=False)
     run_cmd(["git", "pull", "origin", DEFAULT_PARENT_BRANCH], cwd=repo_root, check=False)
-
-
-def _reset_work_item_status(work_item_id: str) -> None:
-    """Reset a work item's status to open using the shared StatusLifecycle helper.
-
-    Args:
-        work_item_id: The work item ID.
-    """
-    try:
-        StatusLifecycle.update_status(work_item_id, "open")
-        LOG.info("Work item %s status reset to open", work_item_id)
-    except RuntimeError:
-        LOG.error("Failed to reset work item %s status to open", work_item_id)
 
 
 # ---------------------------------------------------------------------------
@@ -954,7 +923,10 @@ def phase_start(
         report["message"] = msg
         report["dirty_worktree"] = True
         wl_add_comment(work_item_id, f"Start phase aborted: dirty working tree detected.\n```\n{status_output}\n```")
-        _reset_work_item_status(work_item_id)
+        try:
+            StatusLifecycle.update_status(work_item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
             print(format_json_output(report))
         return report
@@ -966,7 +938,10 @@ def phase_start(
         msg = f"Work item {work_item_id} not found or failed to fetch"
         report["success"] = False
         report["message"] = msg
-        _reset_work_item_status(work_item_id)
+        try:
+            StatusLifecycle.update_status(work_item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
             print(format_json_output(report))
         else:
@@ -986,7 +961,10 @@ def phase_start(
         LOG.error(msg)
         report["success"] = False
         report["message"] = msg
-        _reset_work_item_status(work_item_id)
+        try:
+            StatusLifecycle.update_status(work_item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
             print(format_json_output(report))
         return report
@@ -1146,7 +1124,10 @@ def phase_finish(
             work_item_id,
             f"Build failed during finish phase.\n```\n{build_result['stderr'][:500]}\n```",
         )
-        _reset_work_item_status(work_item_id)
+        try:
+            StatusLifecycle.update_status(work_item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
             print(format_json_output(report))
         return report
@@ -1208,7 +1189,10 @@ def phase_finish(
             report["success"] = False
             report["message"] = msg
             wl_add_comment(work_item_id, msg)
-            _reset_work_item_status(work_item_id)
+            try:
+                StatusLifecycle.update_status(work_item_id, "open")
+            except RuntimeError:
+                LOG.error("Failed to reset work item %s status to open", work_item_id)
             if json_output:
                 print(format_json_output(report))
             else:
@@ -1235,7 +1219,10 @@ def phase_finish(
         report["success"] = False
         report["message"] = msg
         wl_add_comment(work_item_id, msg)
-        _reset_work_item_status(work_item_id)
+        try:
+            StatusLifecycle.update_status(work_item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
             print(format_json_output(report))
         else:
@@ -1293,7 +1280,10 @@ def phase_finish(
         report["success"] = False
         report["message"] = msg
         # Status was restored to original by StatusLifecycle; override to open
-        _reset_work_item_status(work_item_id)
+        try:
+            StatusLifecycle.update_status(work_item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
         if "git push to dev failed" in msg:
             wl_add_comment(
                 work_item_id,
@@ -1301,7 +1291,7 @@ def phase_finish(
                 f"Push manually: git push origin {branch}:refs/heads/dev",
             )
         elif "git commit failed" in msg:
-            wl_add_comment(work_item_id, f"Commit failed during finish phase.")
+            wl_add_comment(work_item_id, "Commit failed during finish phase.")
         if json_output:
             print(format_json_output(report))
         else:
@@ -1363,7 +1353,10 @@ def phase_abort(
 
     # ── Step 1: Reset status ───────────────────────────────────────
     LOG.info("Resetting work item %s status to open...", work_item_id)
-    _reset_work_item_status(work_item_id)
+    try:
+        StatusLifecycle.update_status(work_item_id, "open")
+    except RuntimeError:
+        LOG.error("Failed to reset work item %s status to open", work_item_id)
 
     # ── Step 2: Find and cleanup worktree ──────────────────────────
     worktree_path = _discover_worktree(work_item_id)
@@ -1545,13 +1538,19 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         LOG.warning("Interrupted by user")
         if _work_item_id_global:
-            _reset_work_item_status(_work_item_id_global)
+            try:
+                StatusLifecycle.update_status(_work_item_id_global, "open")
+            except RuntimeError:
+                LOG.error("Failed to reset work item %s status to open", _work_item_id_global)
         return 2
     except Exception as exc:  # noqa: BLE001
         LOG.error("Unhandled exception: %s", exc)
         LOG.debug(traceback.format_exc())
         if _work_item_id_global:
-            _reset_work_item_status(_work_item_id_global)
+            try:
+                StatusLifecycle.update_status(_work_item_id_global, "open")
+            except RuntimeError:
+                LOG.error("Failed to reset work item %s status to open", _work_item_id_global)
         return 1
 
 

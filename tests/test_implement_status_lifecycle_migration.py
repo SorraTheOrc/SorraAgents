@@ -12,7 +12,6 @@ Related work item: SA-0MS69FE4Q008N8SZ
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
@@ -80,13 +79,6 @@ class TestImplementScriptStatusLifecycle:
     def test_phase_start_uses_update_status(self):
         """phase_start uses StatusLifecycle.update_status() for transitions."""
         # phase_start should still use the static method (not context manager)
-        uses_static = any([
-            "StatusLifecycle.update_status(" in line
-            for line in self.SOURCE.split("\n")
-            if "def phase_start" in self.SOURCE[:self.SOURCE.find(line) + len(line)]
-            and "StatusLifecycle.update_status(" in line
-        ])
-        # Instead, check that phase_start function uses StatusLifecycle
         assert "StatusLifecycle.update_status" in self.SOURCE, (
             "implement.py should use StatusLifecycle.update_status for status transitions"
         )

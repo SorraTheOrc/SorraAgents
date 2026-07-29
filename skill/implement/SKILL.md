@@ -90,7 +90,6 @@ MUST reset status to `open`** to release the work item lock.
 All abort paths follow the same two-step pattern:
 
 1. **Reset status to open:** `StatusLifecycle.update_status(<work-item-id>, "open")`
-   or `_reset_work_item_status(<work-item-id>)` from the orchestration script.
 2. **Stop execution:** Return control to the operator with a clear explanation
 
 > **Why this matters:** Work items in `in_progress` status are filtered by `wl next`
