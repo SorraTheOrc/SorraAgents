@@ -91,7 +91,6 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     # runner's status lifecycle MUST NOT modify the stage field under any
     # circumstances (see SA-0MS6B5ESG0056GZJ).
     current_stage = ""
-    current_status = ""
     try:
         fetch_cmd = [wl_bin, "show", issue_id, "--json"]
         fetch_proc = runner(fetch_cmd, check=False, text=True, capture_output=True)
@@ -99,8 +98,7 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
             fetch_data = json.loads(fetch_proc.stdout)
             wi = fetch_data.get("workItem", {}) if isinstance(fetch_data, dict) else {}
             current_stage = wi.get("stage", "") or ""
-            current_status = wi.get("status", "") or ""
-    except Exception:
+    except (json.JSONDecodeError, KeyError, TypeError):
         pass  # Best-effort; audit text persistence must not fail on fetch errors
 
     update_cmd = [

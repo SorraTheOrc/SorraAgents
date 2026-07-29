@@ -67,7 +67,7 @@ class TestImplementScriptStatusLifecycle:
         for i, line in enumerate(lines, 1):
             stripped = line.strip()
             # Skip comments and docstrings
-            if stripped.startswith("#") or stripped.startswith('"""') or stripped.startswith("'''"):
+            if stripped.startswith(("#", '"""', "'''")):
                 continue
             # Allow only wl show, wl comment add, wl list, wl cleanup-worktree
             if "subprocess.run" in stripped and "wl" in stripped and "wl update" in stripped:
@@ -122,9 +122,8 @@ class TestImplementSkillDocReferencesStatusLifecycle:
                 in_reference = False
             
             # Only check non-reference sections
-            if not in_reference and "wl update" in line and "--status" in line:
-                # Allow references that explain what StatusLifecycle replaces
-                if "StatusLifecycle" not in line:
+            # Allow references that explain what StatusLifecycle replaces
+            if not in_reference and "wl update" in line and "--status" in line and "StatusLifecycle" not in line:
                     pytest.fail(
                         f"Line {i+1}: ad-hoc 'wl update --status' command found "
                         f"in SKILL.md without StatusLifecycle reference: {line.strip()}"
