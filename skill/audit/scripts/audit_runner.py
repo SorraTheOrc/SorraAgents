@@ -1465,6 +1465,7 @@ def _run_phase2_deep_analysis(
         result = _call_pi_and_maybe_log(
             issue_id, "phase2_deep", prompt,
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+            enable_tools=True,
         )
     except RuntimeError as exc:
         # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
@@ -1550,6 +1551,7 @@ def _run_phase2_deep_analysis(
             child_result = _call_pi_and_maybe_log(
                 child.get("id", ""), f"phase2_child:{ci}", child_prompt,
                 model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+                enable_tools=True,
             )
         except RuntimeError:
             continue

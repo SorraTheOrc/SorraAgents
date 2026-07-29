@@ -431,3 +431,132 @@ class TestCallPiAndMaybeLogEnableTools:
         # Original parameters are still forwarded
         assert kwargs.get("model") == "test-model"
         assert kwargs.get("pi_bin") == "pi"
+
+
+# ===========================================================================
+# _run_phase2_deep_analysis enable_tools usage tests
+# ===========================================================================
+
+
+class TestRunPhase2DeepAnalysisEnableTools:
+    """Tests for _run_phase2_deep_analysis() using enable_tools=True (AC1-AC5)."""
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text",
+                  verdict: str = "met") -> dict:
+        return {"index": index, "text": text, "verdict": verdict, "evidence": ""}
+
+    def _make_child(self, child_id: str = "CHILD-1",
+                    stage: str = "in_progress",
+                    status: str = "open",
+                    ac_count: int = 1) -> dict:
+        return {
+            "id": child_id,
+            "title": "Child Issue",
+            "stage": stage,
+            "status": status,
+            "ac_results": [
+                {"index": i, "text": f"Child AC {i}", "verdict": "met", "evidence": ""}
+                for i in range(ac_count)
+            ],
+        }
+
+    def test_parent_deep_analysis_uses_enable_tools_true(self):
+        """AC1: Parent deep analysis calls _call_pi_and_maybe_log with enable_tools=True."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0), self._make_ac(1)]
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log"
+        ) as mock_call:
+            mock_call.return_value = {"extracted_text": "[]"}
+
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model",
+            )
+
+        # Find the parent call (first argument is issue_id)
+        parent_calls = [
+            call for call in mock_call.call_args_list
+            if call[0][0] == "TEST-1" and call[0][1] == "phase2_deep"
+        ]
+        assert len(parent_calls) >= 1
+        _args, kwargs = parent_calls[0]
+        assert kwargs.get("enable_tools") is True
+
+    def test_child_deep_analysis_uses_enable_tools_true(self):
+        """AC2: Child deep analysis calls _call_pi_and_maybe_log with enable_tools=True."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = self._make_child("CHILD-1", ac_count=2)
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log"
+        ) as mock_call:
+            mock_call.return_value = {"extracted_text": "[]"}
+
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model",
+            )
+
+        # Find the child call (first argument is child id)
+        child_calls = [
+            call for call in mock_call.call_args_list
+            if call[0][0] == "CHILD-1"
+        ]
+        assert len(child_calls) >= 1
+        _args, kwargs = child_calls[0]
+        assert kwargs.get("enable_tools") is True
+
+    def test_phase2_prompt_unchanged(self):
+        """AC3: Phase 2 prompt remains appropriate for tools-enabled mode.
+
+        The prompt already asks the model to read files, which is now feasible.
+        Verify it still contains the file-reading instructions.
+        """
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log"
+        ) as mock_call:
+            mock_call.return_value = {"extracted_text": "[]"}
+
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model",
+            )
+
+        mock_call.assert_called_once()
+        prompt = mock_call.call_args[0][2]  # third positional arg is prompt
+        assert "Read the actual implementation files" in prompt
+        assert "file:line reference" in prompt
+
+    def test_non_phase2_calls_unchanged(self):
+        """AC5: Non-Phase-2 calls (Phase 1, project-level) remain unchanged.
+
+        Verify that _call_pi() and _call_pi_and_maybe_log() default to
+        enable_tools=False for non-Phase-2 callers. This is verified by
+        the existing TestCallPiEnableTools and TestCallPiAndMaybeLogEnableTools
+        tests which confirm the default is False.
+        """
+        # This is a documentation/coverage test - the actual behavior
+        # is verified by the other test classes.
+        # Confirm the default is False in both functions.
+        with mock.patch.object(audit_runner.subprocess, "Popen") as mock_popen:
+            mock_process = mock.MagicMock()
+            mock_process.communicate.return_value = ("{}", "")
+            mock_popen.return_value = mock_process
+
+            # Phase 1-like call (no enable_tools argument)
+            audit_runner._call_pi("test", model="test-model")
+            args = mock_popen.call_args[0][0]
+            assert "--tools" not in args
+
+            # Phase 1-like call via _call_pi_and_maybe_log
+            with mock.patch.object(audit_runner, "_call_pi") as mock_cp:
+                mock_cp.return_value = {"verdict": "met", "evidence": ""}
+                audit_runner._call_pi_and_maybe_log("PRJ", "project", "test")
+                _args, kwargs = mock_cp.call_args
+                assert kwargs.get("enable_tools") is False
