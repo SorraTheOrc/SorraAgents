@@ -762,10 +762,13 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     )
 
     # Check each active (non-exempt) child's persisted audit verdict
-    # Exempt children: those with completed/done status+stage (already closed)
+    # Exempt children: status=deleted (wl delete), completed/done (already closed),
     # and those in in_review stage (per spec, in_review children do not
     # block parent closure — only pre-review stages block).
     def _is_exempt_child(c: dict) -> bool:
+        # Deleted children are fully closed
+        if c.get("status") == "deleted":
+            return True
         # Completed/done children are fully closed
         if c.get("status") == "completed" and c.get("stage") == "done":
             return True
@@ -1305,8 +1308,11 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
         if f.get("severity") in ("critical", "high"):
             return True, f"Critical/high code quality finding: {f.get('file', '?')}:{f.get('line', 0)} — {f.get('message', '')}"
 
-    # Check children stages
-    active_children = [c for c in child_results if c.get("stage") not in ("", None)]
+    # Check children stages — skip deleted children
+    active_children = [
+        c for c in child_results
+        if c.get("stage") not in ("", None) and c.get("status") != "deleted"
+    ]
     blocked_children = [
         c for c in active_children
         if c.get("stage") not in ("in_review", "done")
@@ -1360,10 +1366,13 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     )
 
     # Check each non-exempt child's persisted audit verdict
-    # Exempt children: those with completed/done status+stage (already closed)
+    # Exempt children: status=deleted (wl delete), completed/done (already closed),
     # and those in in_review stage (per spec, in_review children do not
     # block parent closure — only pre-review stages block).
     def _is_exempt(c: dict) -> bool:
+        # Deleted children are fully closed
+        if c.get("status") == "deleted":
+            return True
         # Completed/done children are fully closed
         if c.get("status") == "completed" and c.get("stage") == "done":
             return True
@@ -1899,13 +1908,15 @@ def cmd_issue(issue_id: str, persist: bool = True,
             ac_results = [{"text": "No acceptance criteria defined.", "verdict": "unmet", "evidence": ""}]
 
         # Review children (depth 1 only, ignore deleted)
+        # Children with status=deleted (wl delete) or deletedBy (imported)
+        # are excluded from active children so they don't block parent closure.
         # Pass ALL active children to the assembler; it handles the cap.
         # Note: children with status=completed/stage=done are included for
         # reporting but exempted from blocking checks by _has_phase1_blocking_issues.
         child_results = []
         active_children = [
             c for c in children
-            if not c.get("deletedBy")
+            if c.get("status") != "deleted" and not c.get("deletedBy")
         ]
         for child in active_children:
             # Skip remaining children if we're too close to the parent
