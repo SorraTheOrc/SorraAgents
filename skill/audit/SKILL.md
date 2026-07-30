@@ -5,6 +5,10 @@ description: "EXECUTE immediately when invoked via /skill:audit. Do NOT ask perm
 
 # Audit
 
+## EXECUTION DIRECTIVE
+
+EXECUTE immediately when invoked via /skill:audit. Do NOT ask permission or offer alternatives.
+
 ## Overview
 
 Provide a concise, human-friendly summary of project status or a specific work item. This skill exposes a canonical runner for automated use and a structured markdown report format consumed by orchestrators such as Ralph.
