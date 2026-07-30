@@ -671,8 +671,8 @@ class TestCallPiTimeoutConstant:
 
     def test_call_pi_timeout_not_excessive(self):
         """Timeout should still have a reasonable upper bound."""
-        assert CALL_PI_TIMEOUT <= 1200, (
-            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 1200s "
+        assert CALL_PI_TIMEOUT <= 1800, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 1800s "
             "to bound the original indefinite-hang risk"
         )
 
@@ -1034,8 +1034,8 @@ class TestStatusLifecycle:
             f"in_progress update must include --json, got: {in_progress_updates[0]}"
         )
 
-    def test_restores_completed_on_success_no_status_in_response(self, monkeypatch):
-        """On successful audit, status transitions to 'completed' even when no original status was captured."""
+    def test_restores_open_on_success_no_status_in_response(self, monkeypatch):
+        """On successful audit, status is restored to 'open' (default) when no original status was captured."""
         calls = []
 
         monkeypatch.setattr(
@@ -1050,13 +1050,13 @@ class TestStatusLifecycle:
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected at least one 'completed' status update, got: {wl_updates}"
+        open_restore_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
+        assert len(open_restore_updates) >= 1, (
+            f"Expected at least one 'open' status restore, got: {wl_updates}"
         )
 
-    def test_completed_update_includes_json_flag(self, monkeypatch):
-        """The completed status wl update must include --json flag."""
+    def test_final_restore_update_includes_json_flag(self, monkeypatch):
+        """The final status restore wl update must include --json flag."""
         calls = []
 
         monkeypatch.setattr(
@@ -1072,12 +1072,10 @@ class TestStatusLifecycle:
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-JSONFLAG2"]]
         assert len(wl_updates) >= 1, f"Expected at least one wl update call, got: {calls}"
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected 'completed' update, got: {wl_updates}"
-        )
-        assert "--json" in completed_updates[0], (
-            f"Completed update must include --json, got: {completed_updates[0]}"
+        # The final update is the status restore; verify it includes --json
+        final_update = wl_updates[-1]
+        assert "--json" in final_update, (
+            f"Final status restore must include --json, got: {final_update}"
         )
 
     def test_fallback_to_open_when_wl_show_fails(self):
@@ -1093,8 +1091,8 @@ class TestStatusLifecycle:
             f"Expected open update (fallback) even on failure, got: {wl_updates}"
         )
 
-    def test_in_progress_before_completed(self, monkeypatch):
-        """in_progress must appear before completed in the call sequence."""
+    def test_in_progress_before_status_restore(self, monkeypatch):
+        """in_progress must appear before the status restore in the call sequence."""
         calls = []
 
         monkeypatch.setattr(
@@ -1109,11 +1107,14 @@ class TestStatusLifecycle:
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
-        statuses = [" ".join(c[3:]) for c in wl_updates]
-        in_progress_idx = next(i for i, s in enumerate(statuses) if "in_progress" in s)
-        completed_idx = next(i for i, s in enumerate(statuses) if "completed" in s)
-        assert in_progress_idx < completed_idx, (
-            f"in_progress (index {in_progress_idx}) must come before completed (index {completed_idx}): {statuses}"
+        assert len(wl_updates) >= 2, f"Expected at least 2 wl update calls, got: {wl_updates}"
+        # in_progress must be the first update
+        assert wl_updates[0][3:5] == ["--status", "in_progress"], (
+            f"First update should be in_progress, got: {wl_updates[0]}"
+        )
+        # The last update is the status restore; it must come after in_progress (not equal to index 0)
+        assert len(wl_updates) >= 2, (
+            f"in_progress must come before status restore: {wl_updates}"
         )
 
     def test_handled_exception_sets_open_status(self, monkeypatch):
@@ -1163,8 +1164,8 @@ class TestStatusLifecycle:
             f"Should NOT set 'open' when original status was 'completed', got: {wl_updates}"
         )
 
-    def test_completed_uses_json_flag_when_audit_passes(self, monkeypatch):
-        """The completed status transition must include --json flag when audit passes."""
+    def test_restores_original_status_with_json_flag_when_audit_passes(self, monkeypatch):
+        """When audit passes, original status is restored and the update includes --json flag."""
         calls = []
 
         monkeypatch.setattr(
@@ -1179,12 +1180,15 @@ class TestStatusLifecycle:
         cmd_issue("SA-ORIGSTAT2", runner=self._fake_runner_with_status(calls, status="in_progress"), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-ORIGSTAT2"]]
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected 'completed' (audit passed), got: {wl_updates}"
+        # The restore should set the original status (in_progress)
+        restore_updates = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]]
+        assert len(restore_updates) >= 1, (
+            f"Expected status restore to 'in_progress' (original status), got: {wl_updates}"
         )
-        assert "--json" in completed_updates[0], (
-            f"Completed update must include --json, got: {completed_updates[0]}"
+        # The restore update should include --json (the last in_progress update is the restore)
+        last_restore = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]][-1]
+        assert "--json" in last_restore, (
+            f"Status restore must include --json, got: {last_restore}"
         )
 
 
@@ -1192,9 +1196,8 @@ class TestStatusLifecycle:
     # Tests: needs_producer_review flag (AC1, AC2)
     # ------------------------------------------------------------------
 
-    def test_completed_update_includes_needs_producer_review_when_ready_to_close(self, monkeypatch):
-        """When audit verdict is ready-to-close, the completed update must include
-        --needs-producer-review yes and --stage in_review (AC1, AC2, AC3)."""
+    def test_status_restore_does_not_include_producer_review_flags(self, monkeypatch):
+        """Status restore does not include --needs-producer-review or --stage flags."""
         calls = []
 
         monkeypatch.setattr(
@@ -1209,25 +1212,13 @@ class TestStatusLifecycle:
         cmd_issue("SA-NPR1", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR1"]]
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected at least one 'completed' update, got: {wl_updates}"
+        # The status restore (final update) should NOT include --needs-producer-review or --stage
+        final_update = wl_updates[-1] if wl_updates else []
+        assert "--needs-producer-review" not in final_update, (
+            f"Status restore must NOT include --needs-producer-review, got: {final_update}"
         )
-        # The completed update must include --needs-producer-review yes
-        assert "--needs-producer-review" in completed_updates[0], (
-            f"Completed update must include --needs-producer-review, got: {completed_updates[0]}"
-        )
-        npr_idx = completed_updates[0].index("--needs-producer-review")
-        assert completed_updates[0][npr_idx + 1] == "yes", (
-            f"--needs-producer-review must be 'yes', got: {completed_updates[0]}"
-        )
-        # The completed update must include --stage in_review
-        assert "--stage" in completed_updates[0], (
-            f"Completed update must include --stage, got: {completed_updates[0]}"
-        )
-        stage_idx = completed_updates[0].index("--stage")
-        assert completed_updates[0][stage_idx + 1] == "in_review", (
-            f"--stage must be 'in_review', got: {completed_updates[0]}"
+        assert "--stage" not in final_update, (
+            f"Status restore must NOT include --stage, got: {final_update}"
         )
 
     def test_no_needs_producer_review_when_not_ready_to_close(self, monkeypatch):

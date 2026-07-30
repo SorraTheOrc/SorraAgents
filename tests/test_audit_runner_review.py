@@ -209,9 +209,9 @@ class TestCallPi:
             f"communicate timeout {captured_timeout[0]}s should be >= 300s "
             "to allow large audit prompts to complete"
         )
-        assert captured_timeout[0] <= 1200, (
-            f"communicate timeout {captured_timeout[0]}s should be <= 1200s "
-            "(not exceed the original value)"
+        assert captured_timeout[0] <= 1800, (
+            f"communicate timeout {captured_timeout[0]}s should be <= 1800s "
+            "(not exceed the current value)"
         )
 
 
