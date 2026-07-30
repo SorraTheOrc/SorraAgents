@@ -194,10 +194,10 @@ Synonym for "Acceptance Criteria". Use **Acceptance Criteria** as canonical head
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force]`
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
-**Timeout:** `CALL_PI_TIMEOUT`=600s per Pi call. Cumulative elapsed-time guard (110s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
+**Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS`. Cumulative elapsed-time guard (110s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
 
 **Tools-enabled invocation (Phase 2 only):** Phase 2 deep analysis calls Pi with
 `enable_tools=True`, which appends
