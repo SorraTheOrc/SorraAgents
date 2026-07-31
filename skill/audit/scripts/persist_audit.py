@@ -17,8 +17,8 @@ import argparse
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 
 def _extract_ready_to_close(report_text: str) -> bool:

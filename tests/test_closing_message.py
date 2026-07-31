@@ -9,7 +9,6 @@ Related work item: SA-0MQ037ZH000403K0
 
 from pathlib import Path
 
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _PI_SKILLS_DIR = Path("/home/rgardler/.pi/agent/skills")
 

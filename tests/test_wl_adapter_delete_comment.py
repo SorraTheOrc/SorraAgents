@@ -1,5 +1,11 @@
 import json
-from plan.wl_adapter import WLAdapter, _normalize_comment_ref, _extract_comments_from_response, _match_comment_id
+
+from plan.wl_adapter import (
+    WLAdapter,
+    _extract_comments_from_response,
+    _match_comment_id,
+    _normalize_comment_ref,
+)
 
 
 class DummyWL(WLAdapter):

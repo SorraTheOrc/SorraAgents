@@ -15,8 +15,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import pytest
-
 # ---------------------------------------------------------------------------
 # Ensure repo root is on sys.path so the audit_runner module is importable.
 # This mirrors the pattern used by tests/conftest.py.
@@ -706,3 +704,92 @@ class TestPhase2TimeoutHandling:
             f"CALL_PI_TIMEOUT ({audit_runner.CALL_PI_TIMEOUT}) should be at least 1800s "
             "for agent-mode Phase 2 deep analysis"
         )
+
+
+# ===========================================================================
+# Effective timeout resolution (SA-0MS95HJ0J004IDIW AC2)
+# ===========================================================================
+
+
+class TestEffectiveTimeoutResolution:
+    """Tests for effective timeout resolution (--timeout flag vs env var)."""
+
+    def test_cli_flag_wins_over_env_var(self):
+        """The --timeout CLI flag takes precedence over AUDIT_PI_TIMEOUT."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PI_TIMEOUT_ENV: "3600"},
+            clear=False,
+        ):
+            assert audit_runner._resolve_effective_timeout(900) == 900
+
+    def test_env_var_used_when_no_cli_flag(self):
+        """AUDIT_PI_TIMEOUT is used when --timeout is not passed."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PI_TIMEOUT_ENV: "3600"},
+            clear=False,
+        ):
+            assert audit_runner._resolve_effective_timeout(None) == 3600
+
+    def test_none_when_no_flag_and_no_env(self):
+        """Returns None (CALL_PI_TIMEOUT default) when neither is set."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {},
+            clear=True,
+        ):
+            assert audit_runner._resolve_effective_timeout(None) is None
+
+    def test_invalid_env_value_falls_back_to_none(self):
+        """An invalid AUDIT_PI_TIMEOUT value falls back to the default."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PI_TIMEOUT_ENV: "not-a-number"},
+            clear=False,
+        ):
+            assert audit_runner._resolve_effective_timeout(None) is None
+
+    def test_env_var_constant_defined(self):
+        """The AUDIT_PI_TIMEOUT env var constant is defined."""
+        assert audit_runner.AUDIT_PI_TIMEOUT_ENV == "AUDIT_PI_TIMEOUT"
+
+    def test_main_resolves_env_var_timeout(self):
+        """main() resolves the effective timeout from env var and passes it through."""
+        with (
+            mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
+            mock.patch.object(audit_runner, "cmd_project") as mock_project,
+            mock.patch.dict(
+                audit_runner.os.environ,
+                {audit_runner.AUDIT_PI_TIMEOUT_ENV: "3600"},
+                clear=False,
+            ),
+        ):
+            rc = audit_runner.main(["issue", "SA-123", "--do-not-persist"])
+            assert rc == mock_cmd.return_value
+            _args, kwargs = mock_cmd.call_args
+            assert kwargs["timeout"] == 3600
+
+            rc = audit_runner.main(["project"])
+            assert rc == mock_project.return_value
+            _args, kwargs = mock_project.call_args
+            assert kwargs["timeout"] == 3600
+
+    def test_main_uses_cli_flag_over_env_var(self):
+        """main() prefers the CLI --timeout flag over the env var."""
+        with (
+            mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
+            mock.patch.object(audit_runner, "cmd_project") as mock_project,
+            mock.patch.dict(
+                audit_runner.os.environ,
+                {audit_runner.AUDIT_PI_TIMEOUT_ENV: "3600"},
+                clear=False,
+            ),
+        ):
+            audit_runner.main(["issue", "SA-123", "--do-not-persist", "--timeout", "7200"])
+            _args, kwargs = mock_cmd.call_args
+            assert kwargs["timeout"] == 7200
+
+            audit_runner.main(["project", "--timeout", "7200"])
+            _args, kwargs = mock_project.call_args
+            assert kwargs["timeout"] == 7200

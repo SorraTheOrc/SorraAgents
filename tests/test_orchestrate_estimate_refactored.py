@@ -12,7 +12,7 @@ import json
 import os
 import sys
 import unittest
-from unittest.mock import patch, mock_open, MagicMock
+from unittest.mock import MagicMock, mock_open, patch
 
 # Add the target script directory to sys.path
 _SCRIPT_DIR = os.path.join(
@@ -41,10 +41,10 @@ def _mock_exit(code=0):
 
 
 # Import target module
-import orchestrate_estimate as oe  # noqa: E402
+import orchestrate_estimate as oe
 
 # Also import shared for test assertions
-from _shared import DEFAULT_THRESHOLDS  # noqa: E402
+from _shared import DEFAULT_THRESHOLDS
 
 
 class TestLoadThresholds(unittest.TestCase):

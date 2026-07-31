@@ -30,11 +30,12 @@ from typing import Any
 
 from skill.code_review.scripts.linter_runner import (
     classify_finding as _classify_linter_finding,
-    run_ruff,
-    run_eslint,
-    probe_linter,
 )
-
+from skill.code_review.scripts.linter_runner import (
+    probe_linter,
+    run_eslint,
+    run_ruff,
+)
 
 LOG = logging.getLogger("refactor.smell_detection")
 

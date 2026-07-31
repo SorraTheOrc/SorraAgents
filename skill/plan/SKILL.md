@@ -44,6 +44,22 @@ by the autoplan decision logic).
 
 See [AGENTS.md](../../AGENTS.md#workflow-for-ai-agents) for the standard claim-first pattern.
 
+Claim the item with `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
+before starting, and always leave the item in a **valid terminal status**
+(`open`, `blocked`, or `completed`) when the skill ends — including on error:
+
+- **On completion:** `StatusLifecycle.update_status(<work-item-id>, "open", stage="plan_complete")`
+- **When pausing for producer input:** reset to
+  `StatusLifecycle.update_status(<work-item-id>, "open", needs_producer_review=True)`
+  (optionally preserving the current stage) so the item is released back to
+  `open` and flagged for producer triage instead of being left `in_progress`.
+- **On error/abort:** `StatusLifecycle.update_status(<work-item-id>, "open")`
+  and log a comment describing the failure.
+
+Never leave an item in `in_progress` status when control returns to the
+operator — an orphaned `in_progress` item is invisible to `wl next` and
+blocks all downstream work until a human intervenes.
+
 ## Seed context
 
 - Read `docs/` (excluding `docs/dev`), `README.md`, and other high-level files for context.

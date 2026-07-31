@@ -8,7 +8,8 @@ const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = join(dirname(__filename), '..', '..');
 const PATH = join(REPO_ROOT, 'skill', 'owner-inference', 'SKILL.md');
 
-test('owner-inference SKILL.md uses skill-relative script paths', () => {
+test('owner-inference SKILL.md references its scripts via relative paths', () => {
   const content = readFileSync(PATH, 'utf-8');
-  assert.ok(content.includes('skill/owner-inference/scripts/infer_owner.py') || content.includes('skill/owner-inference/scripts/'), 'SKILL.md should reference skill/owner-inference/scripts/*');
+  // pi skill convention: in-skill references use ./scripts/ (not skill/<name>/scripts/)
+  assert.ok(content.includes('./scripts/infer_owner.py'), 'SKILL.md should reference ./scripts/infer_owner.py');
 });

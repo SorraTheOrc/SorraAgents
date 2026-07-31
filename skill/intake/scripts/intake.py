@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import subprocess
 import sys
 from pathlib import Path
 
@@ -33,7 +32,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]  # e.g. <repo>/skill/intake/scr
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.shared.status_lifecycle import StatusLifecycle
+from skill.shared.status_lifecycle import StatusLifecycle, run_wl
 
 LOG = logging.getLogger("intake.scripts.intake")
 
@@ -79,7 +78,16 @@ def cmd_finish(item_id: str, description_file: str | None = None) -> dict:
         A dict with action and item_id keys.
     """
     if description_file:
-        _run_wl_update_description(item_id, description_file)
+        try:
+            _run_wl_update_description(item_id, description_file)
+        except RuntimeError:
+            # The item was claimed (in_progress) by `start`; reset to open so
+            # it is never left stuck in in_progress on failure.
+            try:
+                StatusLifecycle.update_status(item_id, "open")
+            except RuntimeError:
+                LOG.error("Failed to reset work item %s status to open", item_id)
+            raise
 
     StatusLifecycle.update_status(item_id, "open", stage="intake_complete")
     LOG.info("Intake finished for %s", item_id)
@@ -98,7 +106,15 @@ def cmd_auto_complete(item_id: str) -> dict:
         A dict with action and item_id keys.
     """
     StatusLifecycle.update_status(item_id, "in_progress")
-    StatusLifecycle.update_status(item_id, "open", stage="intake_complete")
+    try:
+        StatusLifecycle.update_status(item_id, "open", stage="intake_complete")
+    except RuntimeError:
+        # Reset back to open so the item is never left stuck in in_progress.
+        try:
+            StatusLifecycle.update_status(item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", item_id)
+        raise
     LOG.info("Intake auto-completed for %s", item_id)
     return {"success": True, "action": "auto_completed", "item_id": item_id}
 
@@ -130,7 +146,9 @@ def _run_wl_update_description(item_id: str, description_file: str) -> None:
         description_file: Path to the description file.
 
     Raises:
-        RuntimeError: If the wl command fails.
+        RuntimeError: If the wl command fails (includes the underlying wl
+            error detail). The command is routed through the shared
+            ``run_wl`` helper so it works regardless of the caller's cwd.
     """
     cmd = [
         "wl", "update", item_id,
@@ -138,11 +156,7 @@ def _run_wl_update_description(item_id: str, description_file: str) -> None:
         "--json",
     ]
     LOG.debug("Running: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"wl update --description-file failed: {proc.stderr.strip()}"
-        )
+    run_wl(cmd)
     LOG.info("Description file applied for %s: %s", item_id, description_file)
 
 

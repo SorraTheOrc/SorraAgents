@@ -21,22 +21,21 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.scripts.failure_notice import FailureNotice  # noqa: E402
-from skill.test_runner import canonicalize_quiet_pytest_command  # noqa: E402
-
+from skill.scripts.failure_notice import FailureNotice
+from skill.test_runner import canonicalize_quiet_pytest_command
 
 # ---------------------------------------------------------------------------
 # WL CLI helpers
 # ---------------------------------------------------------------------------
 
 
-def run_wl(args: List[str]) -> Optional[str]:
+def run_wl(args: list[str]) -> str | None:
     """Run a wl CLI command and return stdout, or None on failure."""
     cmd = ["wl"] + args
     try:
@@ -47,7 +46,7 @@ def run_wl(args: List[str]) -> Optional[str]:
         return None
 
 
-def list_critical_issues() -> List[Dict[str, Any]]:
+def list_critical_issues() -> list[dict[str, Any]]:
     """List all critical issues tagged test-failure."""
     out = run_wl(["list", "--priority", "critical", "--tags", "test-failure", "--json"])
     if not out:
@@ -64,7 +63,7 @@ def list_critical_issues() -> List[Dict[str, Any]]:
         return []
 
 
-def create_issue(title: str, body: str, parent_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def create_issue(title: str, body: str, parent_id: str | None = None) -> dict[str, Any] | None:
     """Create a critical test-failure work item via wl create.
     
     If parent_id is provided, the created issue will be a child of the parent.
@@ -126,7 +125,7 @@ def add_dependency(parent_id: str, child_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def emit_event(event_name: str, data: Dict[str, Any]) -> None:
+def emit_event(event_name: str, data: dict[str, Any]) -> None:
     """Emit a telemetry event to stderr as a JSON line."""
     payload = {"event": event_name, **data}
     print(json.dumps(payload), file=sys.stderr)
@@ -137,7 +136,7 @@ def emit_event(event_name: str, data: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def infer_owner(repo_path: str, file_path: Optional[str]) -> Dict[str, Any]:
+def infer_owner(repo_path: str, file_path: str | None) -> dict[str, Any]:
     """Try to infer the owner using the owner-inference skill."""
     if not file_path:
         return {
@@ -166,9 +165,9 @@ def render_template(
     test_name: str,
     stdout_excerpt: str,
     stack_trace: str,
-    commit_hash: Optional[str],
-    ci_url: Optional[str],
-    owner_info: Dict[str, Any],
+    commit_hash: str | None,
+    ci_url: str | None,
+    owner_info: dict[str, Any],
 ) -> str:
     """Render the test-failure template with provided evidence."""
     commit_line = commit_hash or "(not available)"
@@ -237,28 +236,28 @@ Failing test detected by agent during automated run. May block PR creation for t
 # ---------------------------------------------------------------------------
 
 
-def _get_status(item: Dict[str, Any]) -> str:
+def _get_status(item: dict[str, Any]) -> str:
     """Extract status from a work item dict (handles nested workItem)."""
     status = item.get("status") or (item.get("workItem") or {}).get("status", "")
     return status.lower().replace("-", "_")
 
 
-def _get_id(item: Dict[str, Any]) -> Optional[str]:
+def _get_id(item: dict[str, Any]) -> str | None:
     """Extract the work item id."""
     return item.get("id") or (item.get("workItem") or {}).get("id")
 
 
-def _get_field(item: Dict[str, Any], field: str) -> str:
+def _get_field(item: dict[str, Any], field: str) -> str:
     """Extract a string field from item or nested workItem."""
     return item.get(field, "") or (item.get("workItem") or {}).get(field, "") or ""
 
 
-def _is_incomplete(item: Dict[str, Any]) -> bool:
+def _is_incomplete(item: dict[str, Any]) -> bool:
     """True if the work item is open or in_progress."""
     return _get_status(item) in ("open", "in_progress")
 
 
-def _updated_at(item: Dict[str, Any]) -> str:
+def _updated_at(item: dict[str, Any]) -> str:
     """Return updatedAt for sorting (most recent first)."""
     return _get_field(item, "updatedAt") or _get_field(item, "createdAt") or ""
 
@@ -275,7 +274,7 @@ def _tokenize(text: str) -> set:
     return tokens
 
 
-def _extract_top_frame(stack_trace: str) -> Optional[str]:
+def _extract_top_frame(stack_trace: str) -> str | None:
     """Extract the top frame filename from a stack trace (Python-style)."""
     # Match  File "path/to/file.py", line N  or similar
     match = re.search(r'File "([^"]+)"', stack_trace)
@@ -289,7 +288,7 @@ def _extract_top_frame(stack_trace: str) -> Optional[str]:
     return None
 
 
-def match_heuristic_1(candidates: List[Dict], test_name: str) -> Optional[Dict]:
+def match_heuristic_1(candidates: list[dict], test_name: str) -> dict | None:
     """Heuristic 1: Exact test name match in title or body."""
     matches = []
     for c in candidates:
@@ -307,8 +306,8 @@ def match_heuristic_1(candidates: List[Dict], test_name: str) -> Optional[Dict]:
 
 
 def match_heuristic_2(
-    candidates: List[Dict], test_name: str, stack_trace: str
-) -> Optional[Dict]:
+    candidates: list[dict], test_name: str, stack_trace: str
+) -> dict | None:
     """Heuristic 2: Title token overlap + matching stacktrace top-frame."""
     if not stack_trace:
         return None
@@ -339,8 +338,8 @@ def match_heuristic_2(
 
 
 def match_heuristic_3(
-    candidates: List[Dict], commit_hash: Optional[str], ci_url: Optional[str]
-) -> Optional[Dict]:
+    candidates: list[dict], commit_hash: str | None, ci_url: str | None
+) -> dict | None:
     """Heuristic 3: CI job URL or failing commit hash match."""
     if not commit_hash and not ci_url:
         return None
@@ -352,9 +351,7 @@ def match_heuristic_3(
         body = _get_field(c, "description")
         title = _get_field(c, "title")
         text = title + " " + body
-        if commit_hash and commit_hash in text:
-            matches.append(c)
-        elif ci_url and ci_url in text:
+        if commit_hash and commit_hash in text or ci_url and ci_url in text:
             matches.append(c)
 
     if not matches:
@@ -368,7 +365,7 @@ def match_heuristic_3(
 # ---------------------------------------------------------------------------
 
 
-def check_or_create(payload: Dict[str, Any]) -> Dict[str, Any]:
+def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
     """Core logic: search for or create a critical test-failure issue.
 
     Returns a structured dict with issueId, created, matchedId, reason.

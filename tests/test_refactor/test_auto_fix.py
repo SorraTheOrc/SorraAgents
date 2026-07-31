@@ -289,9 +289,9 @@ class TestAutoFixIntegration:
 
     def test_refactor_pipeline_includes_auto_fix_step(self):
         """refactor_pipeline should include auto-fix step before detection."""
-        from skill.refactor.scripts.refactor import refactor_pipeline
-
         import inspect
+
+        from skill.refactor.scripts.refactor import refactor_pipeline
         sig = inspect.signature(refactor_pipeline)
         params = list(sig.parameters.keys())
 

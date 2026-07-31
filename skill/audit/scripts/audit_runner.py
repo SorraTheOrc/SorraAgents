@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -68,6 +69,19 @@ bash-tool execution timeout (~120s), not this per-call timeout.
 If the Pi model itself takes longer than this value, something is likely
 wrong (model hang, provider issue) and the timeout diagnostic should be
 produced rather than blocking indefinitely.
+
+The effective per-call timeout can be raised via the ``--timeout`` CLI flag
+or the ``AUDIT_PI_TIMEOUT`` environment variable (see
+``_resolve_effective_timeout``).
+"""
+
+AUDIT_PI_TIMEOUT_ENV = "AUDIT_PI_TIMEOUT"
+"""Environment variable name for overriding the per-call Pi timeout.
+
+When set (and ``--timeout`` is not passed), this value (seconds) is used as
+the effective per-call Pi model timeout instead of ``CALL_PI_TIMEOUT``.
+This lets release operators raise the audit runner's tolerance for slow
+Pi model calls (e.g. ``AUDIT_PI_TIMEOUT=3600``) without changing defaults.
 """
 
 _PI_MAX_RETRIES = 2
@@ -328,6 +342,32 @@ def _load_config() -> dict:
                 pass
 
     return config
+
+
+def _resolve_effective_timeout(cli_timeout: int | None) -> int | None:
+    """Resolve the effective per-call Pi timeout in seconds.
+
+    Precedence:
+      1. ``--timeout`` CLI flag (explicit override)
+      2. ``AUDIT_PI_TIMEOUT`` environment variable (seconds)
+      3. ``None`` — falls back to ``CALL_PI_TIMEOUT`` inside ``_call_pi``
+
+    An invalid ``AUDIT_PI_TIMEOUT`` value (non-integer) is ignored with a
+    warning so a misconfigured environment cannot break the audit run.
+    """
+    if cli_timeout is not None:
+        return cli_timeout
+    env_value = os.environ.get(AUDIT_PI_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_PI_TIMEOUT_ENV} value {env_value!r}; "
+                "using default timeout",
+                file=sys.stderr,
+            )
+    return None
 
 
 def _normalize_model_source(source: str | None) -> str:
@@ -2663,13 +2703,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "issue":
         return cmd_issue(args.issue_id, persist=not args.do_not_persist,
-                         timeout=args.timeout,
+                         timeout=_resolve_effective_timeout(args.timeout),
                          pi_bin=args.pi_bin, model=args.model,
                          model_source=args.model_source, json_mode=args.json,
                          debug_log=args.debug_log,
                          force=args.force)
     elif args.command == "project":
-        return cmd_project(timeout=args.timeout,
+        return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
                            pi_bin=args.pi_bin, model=args.model,
                            model_source=args.model_source, json_mode=args.json,
                            debug_log=args.debug_log)

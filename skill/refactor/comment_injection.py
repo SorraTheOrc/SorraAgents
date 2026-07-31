@@ -33,7 +33,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-
 LOG = logging.getLogger("refactor.comment_injection")
 
 # ---------------------------------------------------------------------------

@@ -22,19 +22,18 @@ import signal
 from pathlib import Path
 from types import SimpleNamespace
 
-
 # Ensure the repo root is on sys.path so skill packages are importable
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-import sys  # noqa: E402
+import sys
+
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.intakeall.scripts.intakeall import (  # noqa: E402
+from skill.intakeall.scripts.intakeall import (
     IntakeAllEngine,
     generate_summary,
     has_sufficient_detail,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fake helpers
@@ -42,7 +41,6 @@ from skill.intakeall.scripts.intakeall import (  # noqa: E402
 
 class FakeProc(SimpleNamespace):
     """Fake subprocess.CompletedProcess used by FakeRunner."""
-    pass
 
 
 class FakeRunner:
@@ -2135,12 +2133,17 @@ class TestIntakeSkipWhenNeedsInput:
             if "pi" in " ".join(cmd) and "/skill:intake" in " ".join(cmd)
         ]
         assert len(intake_calls) == 0, "No /skill:intake subprocess should be invoked"
-        # Verify no wl commands were issued for C (it should be untouched)
+        # Verify C was flagged for producer review (never left in-progress)
         c_calls = [
             cmd for cmd in runner.calls
             if SAMPLE_ITEM_C["id"] in " ".join(cmd)
         ]
-        assert len(c_calls) == 0, f"No wl commands should be issued for {SAMPLE_ITEM_C['id']}"
+        assert len(c_calls) == 1, \
+            f"Expected exactly one wl command for {SAMPLE_ITEM_C['id']}, got {c_calls}"
+        assert "--needs-producer-review" in " ".join(c_calls[0]), \
+            "Item needing input should be flagged for producer review"
+        assert "--status" in " ".join(c_calls[0]) and "open" in " ".join(c_calls[0]), \
+            "Item needing input should remain status=open"
 
     def test_batch_continues_after_needs_input(self):
         """After marking an item as needs_input, processing continues to remaining items."""

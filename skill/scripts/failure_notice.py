@@ -30,9 +30,6 @@ And is placed as the first and last lines of the output.
 
 from __future__ import annotations
 
-from typing import Optional
-
-
 DEFAULT_NOTICE_LINE = (
     "The following output was produced manually."
 )
@@ -52,7 +49,7 @@ class FailureNotice:
         self,
         script_name: str,
         reason: str,
-        stderr_context: Optional[str] = None,
+        stderr_context: str | None = None,
     ) -> None:
         self.script_name = script_name
         self.reason = reason
@@ -89,7 +86,7 @@ class FailureNotice:
         lines = self.format_lines()
         return "\n".join(lines)
 
-    def wrap(self, report: Optional[str]) -> str:
+    def wrap(self, report: str | None) -> str:
         """Wrap *report* with the failure notice as first and last lines.
 
         If *report* is ``None`` or empty, just the notice block plus a

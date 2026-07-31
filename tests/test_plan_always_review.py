@@ -19,11 +19,10 @@ following behaviors:
 Related work item: SA-0MQZWR37U0057KWF
 """
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Constants

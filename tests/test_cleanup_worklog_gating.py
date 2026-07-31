@@ -1,15 +1,17 @@
 """Tests for worklog/ prefix protection in cleanup scripts."""
 
-import sys
 import os
+import sys
 
 # Add repo root to path so we can import the cleanup scripts
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from skill.cleanup.scripts import summarize_branches  # noqa: E402
-from skill.cleanup.scripts import delete_remote_branches  # noqa: E402
+from skill.cleanup.scripts import (
+    delete_remote_branches,
+    summarize_branches,
+)
 
 
 def test_summarize_branches_protected_contains_worklog():

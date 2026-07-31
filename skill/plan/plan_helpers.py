@@ -29,8 +29,9 @@ import hashlib
 import json
 import logging
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger("plan_helpers")
 
@@ -424,7 +425,7 @@ def append_autoplan_decision_comment(
     work_item_id: str,
     tshirt: str,
     risk_level: str,
-    risk_score: int | float,
+    risk_score: float,
     do_plan: bool,
     author: str = "auto-plan",
     runner: Callable[..., Any] | None = None,

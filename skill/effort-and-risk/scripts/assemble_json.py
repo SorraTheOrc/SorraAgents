@@ -14,8 +14,8 @@ Accepts stdin JSON with keys:
 Prints the combined JSON object required by the skill output.
 """  # noqa: EXE001
 
-import sys
 import json
+import sys
 
 
 def main():

@@ -56,6 +56,30 @@ describe('merge-dev-to-main.sh: worklog-ref gating', () => {
       'Worklog gating check should appear before the merge operation',
     );
   });
+
+  test('uses --format=%(refname) so mirror refs can be filtered', () => {
+    assert.ok(
+      content.includes('--format="%(refname)"'),
+      'Script should use --format=%(refname) so remote-tracking mirrors can be excluded',
+    );
+  });
+
+  test('ignores remote-tracking mirror refs (refs/worklog/remotes/**)', () => {
+    assert.ok(
+      content.includes("grep -v '^refs/worklog/remotes/'") ||
+        content.includes('refs/worklog/remotes/'),
+      'Script should exclude refs/worklog/remotes/ mirror refs from the gate',
+    );
+  });
+
+  test('still blocks when a local orphan ref (refs/worklog/data) exists', () => {
+    // The filter must only exclude refs/worklog/remotes/**, not local refs.
+    const filterLine = content.split('\n').find((line) => line.includes('remotes/'));
+    assert.ok(
+      filterLine && !filterLine.includes('refs/worklog/data'),
+      'Filter should exclude only refs/worklog/remotes/**, never refs/worklog/data',
+    );
+  });
 });
 
 // ── run-release.js worklog-ref gating ────────────────────────────────────────

@@ -118,10 +118,15 @@ _cleanup_done = False
 
 
 def _signal_handler(signum: int, frame: Any) -> None:
-    """Global signal handler for SIGTERM/SIGINT during the start phase.
+    """Global signal handler for SIGTERM/SIGINT during any phase.
 
-    Runs deterministic cleanup: terminates child processes, removes the
-    worktree, resets the work-item status, and exits.
+    Runs deterministic cleanup: resets the work-item status (never leaves it
+    in-progress), terminates child processes, removes the worktree, and exits.
+
+    Uses ``os._exit`` (not ``sys.exit``) so the status reset is authoritative:
+    a ``sys.exit``-raised ``SystemExit`` would unwind through any active
+    ``StatusLifecycle`` context manager, which would restore the original
+    (in-progress) status and undo the reset.
     """
     global _cleanup_done
     if _cleanup_done:
@@ -136,21 +141,25 @@ def _signal_handler(signum: int, frame: Any) -> None:
         wid = _work_item_id_global
         rr = _repo_root_global
 
+        # Reset the work item status FIRST: this is the critical invariant.
+        # A failure in later cleanup steps must not prevent the item from
+        # being released back to a valid terminal state.
+        if wid:
+            try:
+                _safety_reset_if_in_progress(wid)
+            except RuntimeError:
+                LOG.error("Failed to reset work item %s status to open", wid)
+
         if wt and Path(wt).exists():
             cleanup_worktree_processes(wt)
             _remove_worktree(wt)
-        if wid:
-            try:
-                StatusLifecycle.update_status(wid, "open")
-            except RuntimeError:
-                LOG.error("Failed to reset work item %s status to open", wid)
         if rr:
             _restore_repo_state(rr)
     except Exception as exc:  # noqa: BLE001
         LOG.error("Cleanup handler error: %s", exc)
 
     LOG.info("Cleanup complete. Exiting due to %s.", signame)
-    sys.exit(2)
+    os._exit(2)
 
 
 def _register_signal_handlers() -> None:
@@ -304,6 +313,30 @@ def wl_add_comment(work_item_id: str, comment: str) -> bool:
         LOG.warning("Failed to add comment to %s: %s", work_item_id, result.stderr.strip())
         return False
     return True
+
+
+def _safety_reset_if_in_progress(work_item_id: str) -> None:
+    """Reset a work item to ``open`` ONLY if it is currently in-progress.
+
+    Guards against clobbering items that already reached a valid terminal
+    state (``open``/``blocked``/``completed``) when a late, unrelated error
+    or signal occurs (e.g. after a successful finish phase).
+
+    Args:
+        work_item_id: The work item ID.
+    """
+    try:
+        data = StatusLifecycle.show(work_item_id)
+    except RuntimeError:
+        LOG.warning("Could not fetch %s; skipping safety reset", work_item_id)
+        return
+    wi = data.get("workItem", {})
+    current = wi.get("status", "")
+    if current in ("in-progress", "in_progress"):
+        StatusLifecycle.update_status(work_item_id, "open")
+        LOG.info("Safety reset: %s status in-progress -> open", work_item_id)
+    else:
+        LOG.info("Safety reset skipped: %s status is %r", work_item_id, current)
 
 
 # ---------------------------------------------------------------------------
@@ -1538,25 +1571,27 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         LOG.warning("Interrupted by user")
         if _work_item_id_global:
-            try:
-                StatusLifecycle.update_status(_work_item_id_global, "open")
-            except RuntimeError:
-                LOG.error("Failed to reset work item %s status to open", _work_item_id_global)
+            _safety_reset_if_in_progress(_work_item_id_global)
         return 2
     except Exception as exc:  # noqa: BLE001
         LOG.error("Unhandled exception: %s", exc)
         LOG.debug(traceback.format_exc())
         if _work_item_id_global:
-            try:
-                StatusLifecycle.update_status(_work_item_id_global, "open")
-            except RuntimeError:
-                LOG.error("Failed to reset work item %s status to open", _work_item_id_global)
+            _safety_reset_if_in_progress(_work_item_id_global)
         return 1
 
 
 def _main(argv: list[str] | None = None) -> int:
     """Internal main with proper exception handling."""
     args = parse_args(argv)
+
+    # Track the work item for ALL phases (start/finish/abort) so that the
+    # top-level exception and signal handlers can always release the item
+    # back to a valid terminal state — never leave it stuck in-progress.
+    # phase_start() later overwrites these globals with the real worktree
+    # path and repo root once they are known.
+    _store_signal_globals("", args.work_item_id, "")
+    _register_signal_handlers()
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

@@ -12,11 +12,9 @@ Produce a machine-readable engineering estimate (effort + risk) and human-readab
 
 ## Status lifecycle
 
-Status is managed automatically by the `StatusLifecycle` context manager from `skill.shared.status_lifecycle`.
+`run_skill.py` does **not** modify the work item's `status` or `stage`.
 
-On entry, the work item is set to `in_progress`. On successful completion, it transitions to `completed`. On error or failure, the original status is restored.
-
-Stage is NOT modified by `run_skill.py`.
+The pre-run status is captured and restored deterministically via the shared `StatusLifecycle` helpers (`StatusLifecycle.show` / `StatusLifecycle.update_status`). The `StatusLifecycle` **context manager** is deliberately not used here: its success exit sets `status=completed`, which would violate the documented lifecycle — items at `intake_complete`/`plan_complete` stay `open` until the post-release close.
 
 ## Gating
 
