@@ -10,7 +10,7 @@ tested changes from the `dev` integration branch to `main`.
 The **Release Manager** is the person or role authorised to perform the
 `dev` → `main` merge. The Release Manager:
 
-- Reviews CI results and confirms all required checks are green.
+- Runs the local test suite and confirms all required checks pass.
 - Executes the merge script or performs the merge manually.
 - Records the merge in the worklog with approval metadata.
 
@@ -35,31 +35,20 @@ they clean up the worktree and return to the main checkout.
 ## Overview
 
 - Agents work in worktrees with feature branches and push completed work to `dev` as the integration step. See the [[concepts/git-worktree-best-practices-for-agent-workflows]] wiki page for the canonical worktree workflow.
-- CI validates `dev` on every change.
-- A human reviewer inspects CI results and triggers the merge from `dev` → `main`.
+- Tests run locally on every change (no CI pipeline; see [Release Tests](./release-tests.md)).
+- A human reviewer inspects local test results and triggers the merge from `dev` → `main`.
 - `main` must always be releasable.
 
 ## Pre-merge Checklist
 
 Before merging `dev` into `main`, the Release Manager **must** verify:
 
-1. **CI — `dev-full-suite` is green**
-   - The `dev-full-suite` GitHub Actions workflow must have completed
-     successfully on the current `dev` HEAD.
-   - Check the [Actions tab](https://github.com/SorraAgents/actions) for the
-     latest `dev-full-suite` run.
-   - Confirm the `full-suite` job shows a green checkmark.
+1. **Test suite results**
+   - Smoke tests have passed locally.
+   - Critical tests have passed locally.
+   - The full test suite has passed locally (see [Release Tests](./release-tests.md) for commands).
 
-2. **CI — `dev-smoke` is green**
-   - The `dev-smoke` workflow (smoke + critical tests) must also
-     be green on `dev`.
-
-3. **Test suite results**
-   - Smoke tests have passed.
-   - Critical tests have passed.
-   - The full test suite has passed (run locally or via CI if not already run on `dev`).
-
-4. **No open merge conflicts**
+2. **No open merge conflicts**
    - Ensure `dev` has no unresolved conflicts with `main`.
    - Run `git diff main...dev --name-only` to inspect divergent files.
 
@@ -135,9 +124,9 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
    - Verify that the generated `CHANGELOG.md` section reflects the correct
      release version and contains all expected entries.
 
-## CI Jobs
+## Local Test Jobs
 
-The CI pipeline for `dev` is expected to run:
+The test suite is expected to run locally before any merge:
 
 - **Smoke tests**: Quick sanity checks that core functionality works.
 - **Critical tests**: Tests for high-priority features and known failure points.
@@ -157,23 +146,20 @@ bash scripts/release/merge-dev-to-main.sh
 
 The script will:
 
-1. Verify the `dev-full-suite` CI job is green (via GitHub Actions API). This
-   is a **hard gate** — the script will abort if CI is not green. Use
-   `--force` to bypass (only in exceptional circumstances).
-2. Fetch the latest `dev` and `main` from origin.
-3. **Automatically increment** the version in `package.json` (default: patch
+1. Fetch the latest `dev` and `main` from origin.
+2. **Automatically increment** the version in `package.json` (default: patch
    bump; use `--bump minor` or `--bump major` to override) and commit it.
-4. **Generate `CHANGELOG.md`** by querying worklog for completed / in_review
+3. **Generate `CHANGELOG.md`** by querying worklog for completed / in_review
    work items, categorising by issue_type, and prepending a new release
    section. The updated file is committed.
-5. Merge `dev` into the release branch (`dev` → `main`).
-6. Create an **annotated git tag** `v<new-version>` on the merge commit.
-7. Push the merge branch and the tag to `origin`.
-8. Create a **GitHub Pull Request** from the temp branch to `main`.
-9. Wait for required status checks to pass on the PR.
-10. Merge the PR using `gh pr merge --merge --delete-branch`.
-11. Record an audit comment in the worklog with the merge commit hash,
-    CI run IDs, PR number, and approver identity.
+4. Merge `dev` into the release branch (`dev` → `main`).
+5. Create an **annotated git tag** `v<new-version>` on the merge commit.
+6. Push the merge branch and the tag to `origin`.
+7. Create a **GitHub Pull Request** from the temp branch to `main`.
+8. Wait for required status checks to pass on the PR (if any are configured).
+9. Merge the PR using `gh pr merge --merge --delete-branch`.
+10. Record an audit comment in the worklog with the merge commit hash,
+    PR number, and approver identity.
 
 Example with custom bump:
 
@@ -224,8 +210,8 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
 
 ## Post-merge Steps
 
-1. Verify `main` is green — confirm the `ci` workflow passes on the merge
-   commit.
+1. Verify `main` is healthy — run the local test suite against the merge
+   commit before deploying.
 2. **Work items are automatically closed** — After a successful release via
    `run-release.js`, all work items that passed the audit readiness gate
    (items in `in_review` stage or `completed` status, excluding `stage: done`)
@@ -292,15 +278,12 @@ If a release introduces a critical issue:
 
 ## Troubleshooting
 
-### `dev-full-suite` is red
+### Local test suite fails
 
-- The merge script enforces a **hard gate** and will abort if CI is not green.
-- Identify the failing tests from the CI artifacts.
+- Identify the failing tests from the local test run.
 - Create a work item for the failure using the triage skill.
 - Notify the operator / Producer.
-- If you must proceed despite red CI (exceptional circumstances), use the
-  `--force` flag. This bypasses the gate and records the override in the
-  audit log with a warning.
+- Do not release until the full test suite passes locally.
 
 ### Merge conflicts between `dev` and `main`
 
@@ -320,7 +303,6 @@ If a release introduces a critical issue:
 Every merge must be recorded in the worklog with:
 
 - The merge commit hash.
-- The CI run IDs for `dev-full-suite` and `dev-smoke`.
 - The identity of the Release Manager who approved the merge.
 - A brief summary of what was released.
 
@@ -329,6 +311,6 @@ the Release Manager is responsible for adding the audit comment.
 
 ### Override Auditing
 
-When the `--force` flag is used to bypass the CI gate, the script emits a
-warning in the audit log indicating that the gate was bypassed. This provides
-a clear audit trail for any merges that did not have green CI.
+When the `--force` flag is used to bypass a gate, the script emits a warning
+in the audit log indicating that the gate was bypassed. This provides a clear
+audit trail for any merges that did not satisfy all gates.

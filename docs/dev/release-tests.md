@@ -3,67 +3,53 @@
 ## Overview
 
 Before any merge from `dev` → `main` is performed, the **full test suite**
-must pass. This ensures `main` always contains releasable, verified code.
+must pass locally. This ensures `main` always contains releasable, verified
+code.
 
-## The `dev-full-suite` CI Job
+This project operates fully locally — there is no CI pipeline and no GitHub
+Actions workflows. All validation happens on the developer's machine.
 
-A dedicated GitHub Actions workflow — `.github/workflows/dev-full-suite.yml` —
-runs the project's complete test suite. This job is the gating step for
-pre-merge validation.
+## Local test commands
 
-### How the job is triggered
-
-| Trigger | Description |
-|---|---|
-| **workflow_dispatch** | Manually via the GitHub Actions UI or `gh workflow run`. Use this for ad-hoc pre-merge checks. |
-| **Release-candidate tag** | Pushing a tag matching `rc-*` (e.g. `rc-1.0.0`) triggers the job automatically. |
-| **Pull request → main** | Any PR targeting `main` will run the full suite as a status check. |
-
-### How to run it manually
-
-**Via the GitHub Actions UI:**
-
-1. Navigate to **Actions** in the repository.
-2. Select the **dev-full-suite** workflow.
-3. Click **Run workflow**.
-4. Optionally provide a reason (e.g. "pre-merge gate for v1.2").
-5. Click **Run workflow**.
-
-**Via the GitHub CLI:**
+Run the full test suite:
 
 ```bash
-gh workflow run dev-full-suite.yml --ref <branch-or-tag>
+python3 -m pytest -q
 ```
 
-### How the merge is gated on success
+Run only the smoke tests (fast, high-confidence checks):
 
-1. The release manager creates a release candidate (e.g. pushes an `rc-*` tag
-   or opens a PR from `dev` targeting `main`).
-2. The `dev-full-suite` workflow runs automatically (or is triggered manually).
-3. The release manager reviews the workflow run:
+```bash
+python3 -m pytest -m smoke -q
+```
+
+Run only the critical tests (essential validation that must always pass):
+
+```bash
+python3 -m pytest -m critical -q
+```
+
+For verbose output on a single group:
+
+```bash
+python3 -m pytest tests/dev/test_smoke.py -v -k smoke
+python3 -m pytest tests/dev/test_smoke.py -v -k critical
+```
+
+## How the merge is gated on success
+
+1. The developer/Release Manager runs the full test suite locally.
+2. All tests must pass:
    - **Green** → proceed with the merge to `main`.
    - **Red** → investigate failures, fix them, and re-run the full suite.
-4. The merge to `main` should **only** be performed when `dev-full-suite`
+3. The merge to `main` should **only** be performed when the full suite
    reports success.
 
-### Branch protection (recommended)
+## Re-running after a fix
 
-To enforce this gate automatically, configure branch protection on `main`:
+If the suite fails:
 
-1. Go to **Settings → Branches** in the repository.
-2. Add or edit the rule for `main`.
-3. Under **Require status checks to pass before merging**, search for and
-   select `Full test suite` (the job name from `dev-full-suite.yml`).
-4. Save the rule.
-
-With this enabled, GitHub will block any merge to `main` until the
-`dev-full-suite` job completes successfully.
-
-### Re-running a failed job
-
-If the full suite fails:
-
-1. Review the failure logs in the workflow run.
+1. Review the failure output.
 2. Fix the underlying issues on the `dev` branch.
-3. Push the fix and re-run the full suite (via any trigger method above).
+3. Re-run the full suite locally.
 4. Do **not** merge until the full suite passes.

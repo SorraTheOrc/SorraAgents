@@ -21,7 +21,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_WORKFLOWS_DIR = _REPO_ROOT / ".github" / "workflows"
+_GITHUB_DIR = _REPO_ROOT / ".github"
 
 # ---------------------------------------------------------------------------
 # Smoke tests
@@ -29,47 +29,21 @@ _WORKFLOWS_DIR = _REPO_ROOT / ".github" / "workflows"
 
 
 @pytest.mark.smoke
-def test_smoke_workflows_exist():
-    """Both dev CI workflow files are present."""
-    smoke = _WORKFLOWS_DIR / "dev-smoke.yml"
-    full = _WORKFLOWS_DIR / "dev-full-suite.yml"
-    assert smoke.is_file(), f"Missing {smoke}"
-    assert full.is_file(), f"Missing {full}"
+def test_smoke_no_ci_workflows():
+    """No GitHub CI workflow files remain (project operates fully locally)."""
+    assert not (_GITHUB_DIR / "workflows").exists(), \
+        "CI workflows directory should have been removed"
+    assert not (_GITHUB_DIR / "ampa-dev-baseline-size").exists(), \
+        "CI baseline size file should have been removed"
 
 
 @pytest.mark.smoke
-def test_smoke_dev_smoke_has_correct_trigger():
-    """dev-smoke.yml triggers on push to dev."""
-    import yaml
-
-    with open(_WORKFLOWS_DIR / "dev-smoke.yml") as f:
-        wf = yaml.safe_load(f)
-    triggers = wf.get("on", {}) or wf.get(True, {})
-    # GitHub Actions uses None key for bare 'on:' but yaml.safe_load
-    # may use True as the key for 'on'
-    push = triggers.get("push", {})
-    branches = push.get("branches", []) if isinstance(push, dict) else []
-    assert "dev" in branches, f"dev branch not in push triggers: {branches}"
-
-
-@pytest.mark.smoke
-def test_smoke_dev_full_suite_has_dispatch():
-    """dev-full-suite.yml supports workflow_dispatch."""
-    import yaml
-
-    with open(_WORKFLOWS_DIR / "dev-full-suite.yml") as f:
-        wf = yaml.safe_load(f)
-    triggers = wf.get("on", {}) or wf.get(True, {})
-    assert "workflow_dispatch" in triggers, "Missing workflow_dispatch trigger"
-
-
-@pytest.mark.smoke
-def test_smoke_readme_documents_ci():
-    """README.md documents the CI workflows."""
+def test_smoke_readme_does_not_document_ci():
+    """README.md does not reference the removed CI workflows."""
     readme = _REPO_ROOT / "README.md"
     content = readme.read_text()
-    assert "dev-smoke" in content, "README missing dev-smoke reference"
-    assert "dev-full-suite" in content, "README missing dev-full-suite reference"
+    for ref in ("dev-smoke", "dev-full-suite", "workflows/ci.yml"):
+        assert ref not in content, f"README still references removed CI workflow: {ref}"
 
 
 # ---------------------------------------------------------------------------
@@ -95,23 +69,9 @@ def test_critical_skills_directory_exists():
 
 
 @pytest.mark.critical
-def test_critical_workflow_files_are_valid_yaml():
-    """All GitHub workflow files parse as valid YAML."""
-    import yaml
-
-    for wf_file in sorted(_WORKFLOWS_DIR.glob("*.yml")):
-        with open(wf_file) as f:
-            data = yaml.safe_load(f)
-        assert data is not None, f"{wf_file.name} is empty or invalid YAML"
-        assert "name" in data, f"{wf_file.name} missing 'name' key"
-        assert "jobs" in data, f"{wf_file.name} missing 'jobs' key"
-
-
-@pytest.mark.critical
 def test_critical_release_process_documented():
-    """The release process is documented and references the dev-full-suite gate."""
+    """The release process is documented and does not reference removed CI gates."""
     readme = _REPO_ROOT / "README.md"
     content = readme.read_text().lower()
     assert "release process" in content, "README missing release process section"
-    assert "dev-full-suite" in content, "Release process does not reference dev-full-suite"
-    assert "gate" in content or "block" in content, "Release process does not describe gating behaviour"
+    assert "dev-full-suite" not in content, "Release process still references dev-full-suite"

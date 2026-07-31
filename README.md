@@ -119,31 +119,6 @@ python3 skill/implementall/scripts/implementall.py --parent-id SA-0MQO6YMZ3006N5
 
 See [skill/implementall/SKILL.md](skill/implementall/SKILL.md) for full documentation.
 
-## CI Workflows
-
-This repository uses GitHub Actions to validate changes. The following workflows are available:
-
-| Workflow | File | Trigger | Description |
-|---|---|---|---|
-| CI | `.github/workflows/ci.yml` | push, pull_request | Full unit test suite on every push and PR. Required status check for `main`. |
-| Cleanup dry-run | `.github/workflows/cleanup.yml` | pull_request, workflow_dispatch | Validates cleanup scripts in dry-run mode. |
-| Dev smoke | `.github/workflows/dev-smoke.yml` | push to `dev` | Runs smoke and critical tests on the `dev` branch. Results appear in commit checks. |
-| Dev full suite | `.github/workflows/dev-full-suite.yml` | workflow_dispatch, push to `release-candidate/**` | Runs the full test suite. Artifacts (JUnit XML, HTML report, logs) are uploaded for reviewer use. |
-
-### Re-running jobs
-
-- **Dev smoke**: Pushes to `dev` trigger automatically. Results are visible in the Actions tab and on commit check pages.
-- **Dev full suite**: Go to **Actions → dev-full-suite → Run workflow** and select the branch. Optionally provide a reason. This is intended for release managers to run before merging `dev` → `main`.
-
-### Release process
-
-The `dev-full-suite` workflow result is used as a gate in the release process:
-
-1. Changes are integrated into `dev` via feature branch pushes.
-2. The release manager triggers `dev-full-suite` manually on the release candidate.
-3. If the full suite passes, the release manager reviews uploaded artifacts and proceeds with the `dev` → `main` merge.
-4. If the full suite fails, the release is blocked until failures are resolved.
-
 ## Prerequisites
 
 The dev container commands (`wl ampa start-work`, `finish-work`, `list-containers`) require the following tools on the host:
@@ -256,15 +231,6 @@ WL_AMPA_POOL_SIZE=4 skill/install-ampa/scripts/install-worklog-plugin.sh --yes
 wl ampa warm-pool --non-interactive --size 3
 ```
 
-## CI Workflows
-
-Two CI workflows validate changes on the `dev` branch:
-
-- **`dev-smoke`** — runs smoke and critical tests on every push to `dev`, providing fast pass/fail feedback in the commit checks UI.
-- **`dev-full-suite`** — runs the full test suite, triggered manually via `workflow_dispatch` or on release-candidate tags. This workflow acts as a gating check before merging to `main`.
-
-See [release-tests.md](docs/dev/release-tests.md) for test commands and CI configuration details.
-
 ## Release Process
 
 Promoting changes from `dev` to `main` requires a human-reviewed merge.
@@ -273,26 +239,23 @@ the checklist and role definition.
 
 ### For Release Managers
 
+The canonical release script lives under the ship skill at
+`skill/ship/scripts/release/merge-dev-to-main.sh` and is invoked via
+`node skill/ship/scripts/run-release.js` (see [skill/ship/SKILL.md](skill/ship/SKILL.md)).
+
 ```sh
 # Run a dry-run to preview the merge
-bash scripts/release/merge-dev-to-main.sh --dry-run
+node skill/ship/scripts/run-release.js --dry-run
 
-# Execute the merge (after confirming CI is green)
-bash scripts/release/merge-dev-to-main.sh [--work-item-id <id>]
-
-# Override CI gate in exceptional circumstances (--force logs a warning)
-bash scripts/release/merge-dev-to-main.sh --force [--work-item-id <id>]
+# Execute the merge
+node skill/ship/scripts/run-release.js
 ```
 
-The script enforces **two hard gates** before executing the release:
-
-1. **`dev-full-suite` CI gate** — aborts if CI is not green (use `--force` to
-   bypass in exceptional circumstances).
-2. **Audit readiness gate** — checks all `in_review` / `completed` work items
-   for passing audits (exit code 6; use `--skip-checks` to bypass).
-
-After both gates pass, the script merges `dev` into `main`, pushes the result,
-and records an audit comment in the worklog.
+Before merging, the release process runs local gates (worklog refs, audit
+readiness, critical items, producer review). Tests are run locally before
+release; there is no CI pipeline. After the gates pass, the script merges
+`dev` into `main`, pushes the result, and records an audit comment in the
+worklog.
 
 ## Getting started
 
@@ -339,7 +302,6 @@ See the [Migration Guide](docs/AMPA_MIGRATION.md) for information about transiti
 
 ## Next steps / Suggestions
 
-- Add a CI workflow to validate new skills and docs.
 - Add example usage for each skill in `skill/` to make onboarding easier.
 
 ## License
