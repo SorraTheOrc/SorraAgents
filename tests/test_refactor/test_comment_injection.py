@@ -1091,7 +1091,7 @@ class TestCommentStyleDetection:
         comment_mod = _import_comment_injection()
 
         style = comment_mod.get_comment_style("src/example.py")
-        assert isinstance(style, str) or isinstance(style, dict)
+        assert isinstance(style, (str, dict))
         if isinstance(style, str):
             assert "#" in style or "//" in style or "<!--" in style
 
@@ -1100,35 +1100,35 @@ class TestCommentStyleDetection:
         comment_mod = _import_comment_injection()
 
         style = comment_mod.get_comment_style("src/app.js")
-        assert isinstance(style, str) or isinstance(style, dict)
+        assert isinstance(style, (str, dict))
 
     def test_get_comment_style_markdown(self, temp_dir: Path):
         """get_comment_style returns appropriate style for .md files."""
         comment_mod = _import_comment_injection()
 
         style = comment_mod.get_comment_style("docs/README.md")
-        assert isinstance(style, str) or isinstance(style, dict)
+        assert isinstance(style, (str, dict))
 
     def test_get_comment_style_yaml(self, temp_dir: Path):
         """get_comment_style returns appropriate style for .yml/.yaml files."""
         comment_mod = _import_comment_injection()
 
         style = comment_mod.get_comment_style("config/settings.yml")
-        assert isinstance(style, str) or isinstance(style, dict)
+        assert isinstance(style, (str, dict))
 
     def test_get_comment_style_html(self, temp_dir: Path):
         """get_comment_style returns appropriate style for .html files."""
         comment_mod = _import_comment_injection()
 
         style = comment_mod.get_comment_style("public/index.html")
-        assert isinstance(style, str) or isinstance(style, dict)
+        assert isinstance(style, (str, dict))
 
     def test_get_comment_style_no_extension(self, temp_dir: Path):
         """get_comment_style handles files without extensions."""
         comment_mod = _import_comment_injection()
 
         style = comment_mod.get_comment_style("Dockerfile")
-        assert isinstance(style, str) or isinstance(style, dict)
+        assert isinstance(style, (str, dict))
 
 
 # ---------------------------------------------------------------------------

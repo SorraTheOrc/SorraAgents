@@ -12,7 +12,7 @@ Accepts stdin JSON with keys:
 - unknowns (list)
 
 Prints the combined JSON object required by the skill output.
-"""
+"""  # noqa: EXE001
 
 import sys
 import json

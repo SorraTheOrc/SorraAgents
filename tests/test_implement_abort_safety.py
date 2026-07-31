@@ -105,7 +105,7 @@ def run_function_test(
     runner_path = tmp_path / "_test_runner.py"
     runner_path.write_text(runner_source)
 
-    proc = subprocess.run(
+    proc = subprocess.run(  # noqa: PLW1510
         [sys.executable, str(runner_path)],
         cwd=str(tmp_path),
         capture_output=True,

@@ -12,15 +12,18 @@ from types import SimpleNamespace
 import pytest
 
 from skill.audit.scripts.audit_runner import (
-    build_parser,
-    cmd_issue,
-    cmd_project,
-    _call_pi,
+    _CHILDREN_CAP,
+    _PI_MAX_RETRIES,
     _assemble_issue_report,
     _assemble_project_report,
     _build_issue_json,
+    _call_pi,
+    _extract_pi_text,
+    _extract_provider_error,
     _has_phase1_blocking_issues,
-    _CHILDREN_CAP,
+    build_parser,
+    cmd_issue,
+    cmd_project,
 )
 
 # ---------------------------------------------------------------------------
@@ -37,6 +40,36 @@ def _load_fixture(name: str) -> dict:
 
 def _fake_proc(returncode: int = 0, stdout: str = "", stderr: str = ""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def _make_provider_error_response(message: str = "Provider finish_reason: error") -> str:
+    """Build a pi --mode json response that ended in a provider error.
+
+    Mimics the observed Local Proxy failure mode: the final assistant message
+    carries ``stopReason == "error"`` / ``errorMessage`` and only thinking +
+    toolCall content (no final text output).
+    """
+    lines = [
+        json.dumps({"type": "session", "id": "test-session"}),
+        json.dumps({
+            "type": "message_start",
+            "message": {"role": "user", "content": [{"type": "text", "text": "the prompt echo"}]},
+        }),
+        json.dumps({
+            "type": "agent_end",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "the prompt echo"}]},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "..."}],
+                    "stopReason": "error",
+                    "rawStopReason": "error",
+                    "errorMessage": message,
+                },
+            ],
+        }),
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def _make_pi_response(verdict: str, evidence: str) -> str:
@@ -209,10 +242,114 @@ class TestCallPi:
             f"communicate timeout {captured_timeout[0]}s should be >= 300s "
             "to allow large audit prompts to complete"
         )
-        assert captured_timeout[0] <= 1200, (
-            f"communicate timeout {captured_timeout[0]}s should be <= 1200s "
-            "(not exceed the original value)"
+        assert captured_timeout[0] <= 1800, (
+            f"communicate timeout {captured_timeout[0]}s should be <= 1800s "
+            "(not exceed the current value)"
         )
+
+    # ------------------------------------------------------------------
+    # Provider error detection & retry (SA-0MS8UI3H3007GPWX)
+    # ------------------------------------------------------------------
+
+    def test_extract_provider_error_detects_error(self):
+        """A stream ending with stopReason=error yields the errorMessage."""
+        raw = _make_provider_error_response("Provider finish_reason: error")
+        assert _extract_provider_error(raw) == "Provider finish_reason: error"
+
+    def test_extract_provider_error_none_when_no_error(self):
+        """A normal stream yields no provider error."""
+        raw = _make_pi_response("met", "auth.py:10 — ok")
+        assert _extract_provider_error(raw) is None
+
+    def test_call_pi_retries_on_provider_error_then_succeeds(self, monkeypatch):
+        """A transient provider error should be retried; the retry result is used."""
+        attempts = []
+
+        def fake_popen(cmd, **kwargs):
+            attempts.append(cmd)
+            if len(attempts) == 1:
+                response = _make_provider_error_response()
+            else:
+                response = _make_pi_response("met", "auth.py:10 — retry succeeded")
+            return SimpleNamespace(
+                communicate=lambda timeout=None: (response, ""),
+                stdout=SimpleNamespace(read=lambda: response),
+                stderr="",
+                wait=lambda timeout=None: None,
+            )
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        # Avoid real sleeping during tests
+        monkeypatch.setattr("skill.audit.scripts.audit_runner.time.sleep", lambda s: None)
+
+        result = _call_pi("criterion", model="test/model")
+        assert result["verdict"] == "met"
+        assert "retry succeeded" in result["evidence"]
+        assert len(attempts) == 2, f"Expected 2 attempts, got {len(attempts)}"
+
+    def test_call_pi_exhausts_retries_then_reports_provider_error(self, monkeypatch):
+        """Persistent provider errors yield a structured _provider_error result."""
+        attempts = []
+
+        def fake_popen(cmd, **kwargs):
+            attempts.append(cmd)
+            response = _make_provider_error_response("Provider finish_reason: error")
+            return SimpleNamespace(
+                communicate=lambda timeout=None: (response, ""),
+                stdout=SimpleNamespace(read=lambda: response),
+                stderr="",
+                wait=lambda timeout=None: None,
+            )
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr("skill.audit.scripts.audit_runner.time.sleep", lambda s: None)
+
+        result = _call_pi("criterion", model="test/model")
+        assert result["_provider_error"] is True
+        assert "provider error" in result["evidence"].lower()
+        assert "finish_reason" in result["evidence"].lower()
+        assert result["verdict"] == "unmet"
+        # Initial attempt + _PI_MAX_RETRIES retries
+        assert len(attempts) == 1 + _PI_MAX_RETRIES, (
+            f"Expected {1 + _PI_MAX_RETRIES} attempts, got {len(attempts)}"
+        )
+
+    def test_call_pi_no_retry_when_no_provider_error(self, monkeypatch):
+        """Non-provider failures are not retried (single attempt)."""
+        attempts = []
+
+        def fake_popen(cmd, **kwargs):
+            attempts.append(cmd)
+            return SimpleNamespace(
+                communicate=lambda timeout=None: ("not valid json at all\n", ""),
+                stdout=SimpleNamespace(read=lambda: "not valid json at all\n"),
+                stderr="",
+                wait=lambda timeout=None: None,
+            )
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+        result = _call_pi("some criterion", model="test/model")
+        assert result["verdict"] == "unmet"
+        assert len(attempts) == 1, f"Expected 1 attempt, got {len(attempts)}"
+
+    def test_extract_pi_text_ignores_user_prompt_echo(self):
+        """A user message_start (prompt echo) must not be treated as model output."""
+        raw = "\n".join([
+            json.dumps({"type": "session", "id": "s"}),
+            json.dumps({
+                "type": "message_start",
+                "message": {"role": "user", "content": [{"type": "text", "text": "THE PROMPT ECHO"}]},
+            }),
+            json.dumps({
+                "type": "agent_end",
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "THE PROMPT ECHO"}]},
+                    {"role": "assistant", "content": [{"type": "thinking", "thinking": "..."}]},
+                ],
+            }),
+        ]) + "\n"
+        assert _extract_pi_text(raw) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1093,7 +1230,7 @@ class TestChildAuditVerdict:
                 "ac_results": [],
             },
         ]
-        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        blocked, _reason = _has_phase1_blocking_issues(cq_findings, child_results)
         # Children in in_review stage are exempt from child audit verdict check
         assert blocked is False
 
@@ -1110,7 +1247,7 @@ class TestChildAuditVerdict:
                 "ac_results": [],
             },
         ]
-        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        blocked, _reason = _has_phase1_blocking_issues(cq_findings, child_results)
         assert blocked is False
 
     def test_phase1_still_blocks_for_stage_when_no_audit_field(self):
@@ -1125,7 +1262,7 @@ class TestChildAuditVerdict:
                 "ac_results": [],
             },
         ]
-        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        blocked, _reason = _has_phase1_blocking_issues(cq_findings, child_results)
         assert blocked is True
 
     def test_pre_review_child_audit_still_blocks_phase1(self):
@@ -1141,7 +1278,7 @@ class TestChildAuditVerdict:
                 "ac_results": [],
             },
         ]
-        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        blocked, _reason = _has_phase1_blocking_issues(cq_findings, child_results)
         # Pre-review stage child should still block (stage check catches this first)
         assert blocked is True
 
@@ -1158,7 +1295,7 @@ class TestChildAuditVerdict:
                 "ac_results": [],
             },
         ]
-        blocked, reason = _has_phase1_blocking_issues(cq_findings, child_results)
+        blocked, _reason = _has_phase1_blocking_issues(cq_findings, child_results)
         # Pre-review stage blocks regardless of child_audit_ready
         assert blocked is True
 

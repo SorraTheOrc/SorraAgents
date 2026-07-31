@@ -102,7 +102,7 @@ class TestLinterRunnerNoNoEslintrc:
 class TestEslintParsing:
     """All previously-affected files must parse without ESLint errors."""
 
-    AFFECTED_FILES = [
+    AFFECTED_FILES = [  # noqa: RUF012
         "skill/ship/scripts/check-audit-gate.js",
         "skill/ship/scripts/check-unmerged-branches.js",
         "skill/ship/scripts/git-helpers.js",
@@ -123,7 +123,7 @@ class TestEslintParsing:
         if not file_path.exists():
             pytest.skip(f"File does not exist: {file_path}")
 
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: PLW1510
             ["eslint", str(file_path), "-f", "json", "--quiet"],
             capture_output=True, text=True, timeout=30,
         )

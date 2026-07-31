@@ -147,3 +147,60 @@ test('close-work-items: Post-merge section mentions auto-close', () => {
     'release-process.md should mention that work items are automatically closed',
   );
 });
+
+// ---------------------------------------------------------------------------
+// F3: Filter closeWorkItemsAfterRelease by needsProducerReview
+// ---------------------------------------------------------------------------
+test('close-work-items: closeWorkItemsAfterRelease filters by needsProducerReview=false', () => {
+  const content = readFileSync(RUN_RELEASE_PATH, 'utf-8');
+  // Verify the function checks needsProducerReview before closing
+  assert.ok(
+    content.includes('needsProducerReview'),
+    'closeWorkItemsAfterRelease should reference needsProducerReview for filtering',
+  );
+});
+
+test('close-work-items: closeWorkItemsAfterRelease logs skipped items', () => {
+  const content = readFileSync(RUN_RELEASE_PATH, 'utf-8');
+  // Find the closeWorkItemsAfterRelease function body
+  const fnStart = content.indexOf('export function closeWorkItemsAfterRelease');
+  assert.ok(fnStart >= 0, 'Should find closeWorkItemsAfterRelease function');
+  // Should mention skipping items
+  const fnBody = content.slice(fnStart);
+  assert.ok(
+    fnBody.includes('skip') || fnBody.includes('Skip'),
+    'closeWorkItemsAfterRelease should log skipped items',
+  );
+});
+
+test('close-work-items: return value includes skippedCount', () => {
+  const content = readFileSync(RUN_RELEASE_PATH, 'utf-8');
+  const fnStart = content.indexOf('export function closeWorkItemsAfterRelease');
+  assert.ok(fnStart >= 0, 'Should find closeWorkItemsAfterRelease function');
+  const fnBody = content.slice(fnStart);
+  assert.ok(
+    fnBody.includes('skippedCount'),
+    'closeWorkItemsAfterRelease return value should include skippedCount',
+  );
+});
+
+test('close-work-items: return value includes skippedItems', () => {
+  const content = readFileSync(RUN_RELEASE_PATH, 'utf-8');
+  const fnStart = content.indexOf('export function closeWorkItemsAfterRelease');
+  assert.ok(fnStart >= 0, 'Should find closeWorkItemsAfterRelease function');
+  const fnBody = content.slice(fnStart);
+  assert.ok(
+    fnBody.includes('skippedItems'),
+    'closeWorkItemsAfterRelease return value should include skippedItems',
+  );
+});
+
+test('close-work-items: release-process.md mentions producer-review filtering', () => {
+  const content = readFileSync(RELEASE_PROCESS_PATH, 'utf-8');
+  assert.ok(
+    content.includes('needsProducerReview') ||
+    content.includes('producer review') ||
+    content.includes('Producer review'),
+    'release-process.md should mention producer-review filtering in close step',
+  );
+});

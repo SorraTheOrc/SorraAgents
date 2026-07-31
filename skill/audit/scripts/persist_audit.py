@@ -10,7 +10,7 @@ The script calls:
   wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json
 
 Returns non-zero on failure.
-"""
+"""  # noqa: EXE001
 from __future__ import annotations
 
 import argparse
@@ -30,7 +30,7 @@ def _extract_ready_to_close(report_text: str) -> bool:
 
 
 def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
-                  runner: Callable = None, _fail: bool = False) -> int:
+                  runner: Callable = None, _fail: bool = False) -> int:  # noqa: RUF013
     """Persist the given report_text to the work item using wl audit-set.
 
     Returns the wl subprocess return code (0 on success).
@@ -85,11 +85,30 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     # wl audit-set stores data in a separate audit store, but the work item's
     # own auditResult field (visible via wl show) must be set via wl update --audit-text
     # so that the Pi extension's audit column shows the green tick / verdict.
+    #
+    # SAFETY: Fetch the current work item stage and pass it explicitly so that
+    # the `wl update` call never accidentally advances the stage. The audit
+    # runner's status lifecycle MUST NOT modify the stage field under any
+    # circumstances (see SA-0MS6B5ESG0056GZJ).
+    current_stage = ""
+    try:
+        fetch_cmd = [wl_bin, "show", issue_id, "--json"]
+        fetch_proc = runner(fetch_cmd, check=False, text=True, capture_output=True)
+        if fetch_proc.returncode == 0:
+            fetch_data = json.loads(fetch_proc.stdout)
+            wi = fetch_data.get("workItem", {}) if isinstance(fetch_data, dict) else {}
+            current_stage = wi.get("stage", "") or ""
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass  # Best-effort; audit text persistence must not fail on fetch errors
+
     update_cmd = [
         wl_bin, "update", issue_id,
         "--audit-text", report_text,
-        "--json"
     ]
+    # Explicitly preserve current stage to prevent accidental advancement
+    if current_stage:
+        update_cmd.extend(["--stage", current_stage])
+    update_cmd.append("--json")
     update_proc = runner(update_cmd, check=False, text=True, capture_output=True)
 
     if getattr(update_proc, "returncode", 1) != 0:

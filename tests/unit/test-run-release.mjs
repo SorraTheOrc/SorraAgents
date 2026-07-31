@@ -254,3 +254,68 @@ describe('run-release: SKILL.md consistency', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// F2: Producer-review gating step — AC1, AC2, AC3, AC5
+// ---------------------------------------------------------------------------
+describe('run-release: producer-review gating step', () => {
+  test('run-release.js imports checkProducerReviewStatus from check-audit-gate.js', () => {
+    const content = readFileSync(RUN_RELEASE_SRC, 'utf-8');
+    assert.ok(
+      content.includes('checkProducerReviewStatus'),
+      'run-release.js should import checkProducerReviewStatus from check-audit-gate.js',
+    );
+  });
+
+  test('run-release.js has a comment for the producer-review gating step', () => {
+    const content = readFileSync(RUN_RELEASE_SRC, 'utf-8');
+    assert.ok(
+      content.includes('producer-review') || content.includes('Producer review') ||
+        content.includes('Producer Review'),
+      'run-release.js should have a step comment for producer-review gating',
+    );
+  });
+
+  test('run-release.js uses exit code 9 for producer-review gate failure', () => {
+    const content = readFileSync(RUN_RELEASE_SRC, 'utf-8');
+    assert.ok(
+      content.includes('return 9') ||
+      content.includes('exit code 9'),
+      'run-release.js should use exit code 9 for producer-review gate failures',
+    );
+  });
+
+  test('runRelease JSDoc lists producer-review gating step', () => {
+    const content = readFileSync(RUN_RELEASE_SRC, 'utf-8');
+    // Find the runRelease function's JSDoc comment
+    const runReleaseDocMatch = content.match(/\/\*\*[\s\S]*?runRelease[\s\S]*?\*\//);
+    assert.ok(runReleaseDocMatch, 'Should find runRelease JSDoc');
+    const runReleaseDoc = runReleaseDocMatch[0];
+    assert.ok(
+      runReleaseDoc.includes('producer') || runReleaseDoc.includes('Producer'),
+      'runRelease JSDoc should document the producer-review gating step',
+    );
+  });
+
+  test('new gating step includes getCandidateItems call', () => {
+    const content = readFileSync(RUN_RELEASE_SRC, 'utf-8');
+    // Verify there is a checkProducerReviewStatus(getCandidateItems()) or getCandidateItems() reference nearby
+    assert.ok(
+      content.includes('checkProducerReviewStatus') &&
+      content.includes('getCandidateItems'),
+      'Producer-review gate should call checkProducerReviewStatus with getCandidateItems',
+    );
+  });
+
+  test('--skip-checks bypasses the producer-review gate', () => {
+    const content = readFileSync(RUN_RELEASE_SRC, 'utf-8');
+    // Find the gating step code (not the import) that contains getCandidateItems
+    const stepStart = content.indexOf('Step 3.6: Check producer-review');
+    assert.ok(stepStart >= 0, 'Should find Step 3.6 comment in run-release.js');
+    // Search backwards from the step to find the preceding skipChecks guard
+    const beforeStep = content.slice(0, stepStart);
+    // The last occurrence of '!skipChecks' before the step should be the guard
+    const lastGuard = beforeStep.lastIndexOf('!skipChecks');
+    assert.ok(lastGuard >= 0, 'Producer-review gate should be guarded by !skipChecks');
+  });
+});

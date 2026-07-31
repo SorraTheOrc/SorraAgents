@@ -350,13 +350,14 @@ class TestNoSkipWithoutReview:
         # Verify there's a review mention before plan_complete
         review_before = re.search(
             r"(?:review|reviewing|completeness|sequencing|scope|acceptance|polish).*?"
-            r"wl update.*?--stage plan_complete",
+            r"(?:wl update.*?--stage plan_complete|"
+            r"StatusLifecycle\.update_status.*?stage=\"plan_complete\")",
             skip_section,
             re.DOTALL | re.IGNORECASE,
         )
         assert review_before is not None, (
             "In the 'decision == skip' subsection, there must be a review "
-            "instruction before the 'wl update --stage plan_complete' command"
+            "instruction before the plan_complete transition"
         )
 
     def test_skip_path_outputs_summary_comment(self, skill_content: str) -> None:

@@ -11,7 +11,7 @@ import { spawnSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { checkUnmergedBranches } from './check-unmerged-branches.js';
-import { checkAuditReadyToClose, getCandidateItems } from './check-audit-gate.js';
+import { checkAuditReadyToClose, getCandidateItems, checkProducerReviewStatus } from './check-audit-gate.js';
 import { checkCriticalItems } from './check-critical-items.js';
 import { checkWorklogRefs } from './check-worklog-refs.js';
 
@@ -41,18 +41,24 @@ export function parsePRUrl(output) {
 // ── closeWorkItemsAfterRelease ──────────────────────────────────────────────
 
 /**
- * Close all candidate work items after a successful release.
+ * Close candidate work items after a successful release, filtering by
+ * `needsProducerReview`.
  *
  * Uses `getCandidateItems()` from check-audit-gate.js to find items in
- * `in_review` stage or `completed` status (excluding `stage: done`). For
- * each candidate item, runs `wl close <id> --reason "Shipped in v<version>"`.
+ * `in_review` stage or `completed` status (excluding `stage: done`).
+ * Only items with `needsProducerReview === false` are closed. Items with
+ * `needsProducerReview = true`, `null`, or `undefined` are skipped and
+ * logged with "Skipped (needs producer review)".
+ *
+ * The existing audit gate (Step 2) already validates `audit.readyToClose`,
+ * so this step does not re-check `readyToClose`.
  *
  * This is a non-blocking step: individual close failures are logged as
  * warnings and do not affect the return value. Empty candidate sets
  * are handled gracefully.
  *
  * @param {string|null} version - The released semver version (e.g., "0.2.0").
- * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number }}
+ * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}> }}
  */
 export function closeWorkItemsAfterRelease(version) {
   if (!version) {
@@ -61,6 +67,8 @@ export function closeWorkItemsAfterRelease(version) {
       message: 'No version provided; skipping close work items step.',
       closedCount: 0,
       errorCount: 0,
+      skippedCount: 0,
+      skippedItems: [],
     };
   }
 
@@ -76,16 +84,55 @@ export function closeWorkItemsAfterRelease(version) {
       message,
       closedCount: 0,
       errorCount: 0,
+      skippedCount: 0,
+      skippedItems: [],
     };
   }
 
-  console.log(`Found ${items.length} work item(s) to close.`);
+  console.log(`Found ${items.length} work item(s).`);
+
+  // Filter: only close items where needsProducerReview === false
+  const toClose = items.filter(
+    (item) => item.needsProducerReview === false,
+  );
+  const skippedItems = items
+    .filter(
+      (item) => item.needsProducerReview !== false,
+    )
+    .map((item) => ({
+      id: item.id,
+      title: item.title,
+      reason: 'Skipped (needs producer review)',
+    }));
+
+  if (skippedItems.length > 0) {
+    console.log(`\nSkipping ${skippedItems.length} work item(s) that need producer review:`);
+    for (const skipped of skippedItems) {
+      console.log(`  ○ ${skipped.title} (${skipped.id}) — ${skipped.reason}`);
+    }
+    console.log('');
+  }
+
+  if (toClose.length === 0) {
+    const message = `No work items to close (${skippedItems.length} skipped, needs producer review).`;
+    console.log(message);
+    return {
+      success: true,
+      message,
+      closedCount: 0,
+      errorCount: 0,
+      skippedCount: skippedItems.length,
+      skippedItems,
+    };
+  }
+
+  console.log(`Closing ${toClose.length} work item(s)...`);
 
   let closedCount = 0;
   let errorCount = 0;
   const errors = [];
 
-  for (const item of items) {
+  for (const item of toClose) {
     try {
       const reason = `Shipped in v${version}`;
       execSync(`wl close ${item.id} --reason "${reason}" --json`, {
@@ -109,6 +156,10 @@ export function closeWorkItemsAfterRelease(version) {
     summary = `Closed ${closedCount} work item(s); ${errorCount} error(s) (non-fatal).`;
   }
 
+  if (skippedItems.length > 0) {
+    summary += ` ${skippedItems.length} item(s) skipped (needs producer review).`;
+  }
+
   console.log(`\n${summary}`);
 
   return {
@@ -118,6 +169,8 @@ export function closeWorkItemsAfterRelease(version) {
       : summary,
     closedCount,
     errorCount,
+    skippedCount: skippedItems.length,
+    skippedItems,
   };
 }
 
@@ -254,6 +307,8 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * 1. Check for unmerged branches (gating, exit code 3)
  * 2. Check audit readiness (gating, exit code 6)
  * 3. Check critical-priority items (gating, exit code 7)
+ * 3.5. Check worklog refs (gating, exit code 8)
+ * 3.6. Check producer-review status (gating, exit code 9)
  * 4. Find and execute the release script
  * 5. Parse PR URL from release script output
  * 6. Wait for PR merge (if not already merged with --force)
@@ -318,6 +373,20 @@ export async function runRelease(cliArgs = []) {
       console.error(worklogReport.message);
       console.error('\nTo bypass this check, re-run with --skip-checks.');
       return 8;
+    }
+  }
+
+  // ── Step 3.6: Check producer-review status (gating step) ───────────────
+  if (!skipChecks) {
+    const items = getCandidateItems();
+    const producerReviewReport = checkProducerReviewStatus(items);
+    if (producerReviewReport.hasBlockingItems) {
+      console.error(
+        '⚠️  Producer-review gate check failed — some work items need producer review:\n',
+      );
+      console.error(producerReviewReport.message);
+      console.error('\nTo bypass this check, re-run with --skip-checks.');
+      return 9;
     }
   }
 

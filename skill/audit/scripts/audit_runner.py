@@ -37,27 +37,29 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Callable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts.persist_audit import persist_audit  # noqa: E402
-from skill.scripts.failure_notice import FailureNotice  # noqa: E402
+from skill.audit.scripts.persist_audit import persist_audit
+from skill.scripts.failure_notice import FailureNotice
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 _CHILDREN_CAP = 10
 
-CALL_PI_TIMEOUT = 600
+CALL_PI_TIMEOUT = 1800
 """Internal timeout (seconds) for each Pi model subprocess call.
 
 This is a generous safety net for individual Pi model calls during audit
-processing. Large audit prompts can take several minutes, so the timeout
-must be high enough to not interrupt normal operation.
+processing. Phase 2 deep analysis now runs Pi in agent mode (with file-reading
+tools), which is inherently slower than bare LLM calls. 1800s (30 min)
+accommodates typical agent-mode analyses where the model reads and searches
+multiple implementation files.
 
 The cumulative elapsed-time guard in ``cmd_issue`` (110s threshold for
 child audit skipping) provides the primary protection against the parent
@@ -66,6 +68,22 @@ bash-tool execution timeout (~120s), not this per-call timeout.
 If the Pi model itself takes longer than this value, something is likely
 wrong (model hang, provider issue) and the timeout diagnostic should be
 produced rather than blocking indefinitely.
+"""
+
+_PI_MAX_RETRIES = 2
+"""Number of retries for transient provider errors in ``_call_pi``.
+
+Providers sometimes terminate a model call with ``finish_reason: error``
+(e.g., local proxy glitches) before the model emits its final output. The
+audit runner treats these as transient and retries up to this many extra
+times before surfacing a provider-error diagnostic. Non-provider failures
+(e.g., unparseable output, timeouts) are NOT retried.
+"""
+
+_PI_RETRY_BACKOFF_SECONDS = 2.0
+"""Base backoff (seconds) between provider-error retries in ``_call_pi``.
+
+Backoff grows linearly: 1x, 2x, ... base per retry attempt.
 """
 
 AUDIT_FRESHNESS_BUFFER_SECONDS = 60
@@ -158,6 +176,34 @@ def _run_wl(runner: Runner, cmd: Sequence[str]) -> dict:
     return data
 
 
+def _detect_project_root() -> Path:
+    """Detect the project root directory.
+
+    Tries ``git rev-parse --show-toplevel`` first. If that fails
+    (not a git repo, git not available, etc.), falls back to
+    ``Path.cwd()``.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return Path(proc.stdout.strip())
+    except (subprocess.CalledProcessError, OSError):
+        return Path.cwd()
+
+
+TARGET_PROJECT_ROOT: Path = _detect_project_root()
+"""Project root targeted by the audit runner.
+
+Defaults to the git root (or ``Path.cwd()`` as fallback) at import time.
+This may differ from ``REPO_ROOT`` when the audit runner's framework
+repository is not the working directory.
+"""
+
+
 # ---------------------------------------------------------------------------
 # Freshness gate
 # ---------------------------------------------------------------------------
@@ -177,7 +223,7 @@ def _check_audit_freshness(runner: Runner, issue_id: str) -> str | None:
     error, parse error) so that the normal audit pipeline always runs when
     freshness cannot be determined.
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
 
     try:
         data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"])
@@ -401,8 +447,18 @@ def _resolve_model_for_phase(phase: str, config: dict,
 # ---------------------------------------------------------------------------
 
 def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
-             pi_bin: str = "pi") -> dict:
+             pi_bin: str = "pi",
+             enable_tools: bool = False,
+             timeout: int | None = None) -> dict:
     """Call Pi via subprocess and parse the JSON-stream response.
+
+    Args:
+        prompt: The prompt text to send to Pi.
+        model: The model name to use.
+        pi_bin: Path to the pi binary.
+        enable_tools: If True, adds ``--tools read,bash,grep,find,ls
+                       --exclude-tools ask_question`` to enable file-reading
+                       capabilities in the Pi agent session.
 
     Returns a dict with keys ``verdict`` and ``evidence``.
     On success, implementations may also include additional diagnostic keys
@@ -414,32 +470,63 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     Uses ``communicate()`` to avoid pipe-buffer deadlocks.
     """
     cmd = [pi_bin, "-p", "--mode", "json", "--model", model, prompt]
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(f"pi binary not found: {pi_bin}")
+    if enable_tools:
+        cmd.extend([
+            "--tools", "read,bash,grep,find,ls",
+            "--exclude-tools", "ask_question",
+        ])
 
-    try:
-        stdout, stderr = process.communicate(timeout=CALL_PI_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        stdout, stderr = process.communicate()
+    effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
+    attempt = 0
+    provider_error: str | None = None
+    stdout = ""
+    stderr = ""
+    while True:
+        attempt += 1
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(f"pi binary not found: {pi_bin}")
+
+        try:
+            stdout, stderr = process.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            return {
+                "verdict": "unmet",
+                "evidence": (
+                    f"Pi model call timed out after {effective_timeout}s. "
+                    "Manual audit required."
+                ),
+                "raw_stdout": stdout,
+                "raw_stderr": stderr,
+                "extracted_text": "",
+                "_timeout": True,
+            }
+
+        # Detect provider errors (e.g. "finish_reason: error" where the model
+        # never emits its final structured output) and retry them with backoff.
+        provider_error = _extract_provider_error(stdout or "")
+        if provider_error is None or attempt > _PI_MAX_RETRIES:
+            break
+        time.sleep(_PI_RETRY_BACKOFF_SECONDS * attempt)
+
+    if provider_error:
         return {
             "verdict": "unmet",
-            "evidence": (
-                f"Pi model call timed out after {CALL_PI_TIMEOUT}s. "
-                "Manual audit required."
-            ),
+            "evidence": f"Pi provider error: {provider_error}",
             "raw_stdout": stdout,
             "raw_stderr": stderr,
             "extracted_text": "",
-            "_timeout": True,
+            "_provider_error": True,
+            "_provider_error_message": provider_error,
         }
 
     raw = stdout or ""
@@ -531,6 +618,12 @@ def _parse_pi_json_line(line: str):
 
     if event_type in ("message_start", "message_end", "turn_end"):
         message = obj.get("message")
+        # Only extract text from assistant messages. The user prompt echo
+        # (message_start with role=user) must never be treated as model
+        # output — it caused false parse failures when the model errored out
+        # mid-stream and the prompt was the last complete text block.
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return "", False, None
         text = _extract_text_from_assistant_message(message)
         if text:
             return "", False, text
@@ -584,6 +677,45 @@ def _extract_last_assistant_message_text(messages) -> str | None:
             if text:
                 return text
     return None
+
+
+def _extract_provider_error(raw: str) -> str | None:
+    """Return the provider error message if the Pi stream ended in a provider error.
+
+    Scans the JSON stream for ``agent_end`` events and inspects the last
+    assistant message for ``stopReason == "error"`` or an ``errorMessage``
+    field (as seen with Local Proxy ``finish_reason: error`` failures where
+    the model never emits its final structured output).
+
+    Returns the error message, or ``None`` if no provider error is present.
+    """
+    if not raw:
+        return None
+    provider_error: str | None = None
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "agent_end":
+            continue
+        messages = obj.get("messages")
+        if not isinstance(messages, list):
+            continue
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            stop_reason = msg.get("stopReason")
+            error_message = msg.get("errorMessage")
+            if stop_reason == "error" or error_message:
+                provider_error = error_message or f"provider stop reason: {stop_reason}"
+            break
+    return provider_error
 
 
 # ---------------------------------------------------------------------------
@@ -744,18 +876,19 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     )
 
     # Check each active (non-exempt) child's persisted audit verdict
-    # Exempt children: those with completed/done status+stage (already closed)
+    # Exempt children: status=deleted (wl delete), completed/done (already closed),
     # and those in in_review stage (per spec, in_review children do not
     # block parent closure — only pre-review stages block).
     def _is_exempt_child(c: dict) -> bool:
+        # Deleted children are fully closed
+        if c.get("status") == "deleted":
+            return True
         # Completed/done children are fully closed
         if c.get("status") == "completed" and c.get("stage") == "done":
             return True
         # Children in in_review stage should not have their audit verdicts
         # block parent closure (per audit spec)
-        if c.get("stage") == "in_review":
-            return True
-        return False
+        return c.get("stage") == "in_review"
 
     non_exempt_children = [c for c in active_children if not _is_exempt_child(c)]
     any_child_audit_not_ready = any(
@@ -1010,8 +1143,8 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict],
     lines.extend([
         "## Summary",
         "",
-        f"Child work item audit for {child['title']} ({child['id']}). "
-        f"Status: {child['status']}/{child['stage']}.",
+        (f"Child work item audit for {child['title']} ({child['id']}). "
+        f"Status: {child['status']}/{child['stage']}."),
         "",
         "## Acceptance Criteria Status",
         "",
@@ -1110,7 +1243,7 @@ def _default_debug_log_path(issue_id: str, context: str) -> Path:
     Tests monkeypatch this helper so callers should use it rather than
     hard-coding a path.
     """
-    p = REPO_ROOT / ".worklog" / f"audit_debug_{issue_id}.jsonl"
+    p = TARGET_PROJECT_ROOT / ".worklog" / f"audit_debug_{issue_id}.jsonl"
     return p
 
 
@@ -1122,8 +1255,21 @@ def _write_debug_log(path: Path, entry: dict) -> None:
 
 def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            model: str = DEFAULT_MODEL,
-                           pi_bin: str = "pi", debug_log: str | None = None) -> dict:
+                           pi_bin: str = "pi",
+                           debug_log: str | None = None,
+                           enable_tools: bool = False,
+                           timeout: int | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
+
+    Args:
+        issue_id: Work item ID for debug log naming.
+        context: Context string for debug log naming.
+        prompt: The prompt text to send to Pi.
+        model: The model name to use.
+        pi_bin: Path to the pi binary.
+        debug_log: Optional path for debug log output.
+        enable_tools: If True, forwards to _call_pi() to enable file-reading
+                       tools in the Pi agent session.
 
     If *debug_log* is provided the entry reason will be "debug_log" and the
     provided path will be used. If *debug_log* is not provided but the pi
@@ -1131,7 +1277,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     default path from ``_default_debug_log_path`` will be used and the reason
     will be "parse_failure".
     """
-    result = _call_pi(prompt, model=model, pi_bin=pi_bin)
+    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout)
 
     # Decide whether to write a debug line
     reason = None
@@ -1140,7 +1286,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         reason = "debug_log"
         target = Path(debug_log)
     elif isinstance(result, dict) and (result.get("raw_stdout") or result.get("raw_stderr")):
-        reason = "parse_failure"
+        reason = "provider_error" if result.get("_provider_error") else "parse_failure"
         target = _default_debug_log_path(issue_id, context)
 
     if reason and target:
@@ -1152,12 +1298,12 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             "raw_stderr": result.get("raw_stderr"),
             "extracted_text": result.get("extracted_text"),
             "evidence": result.get("evidence"),
+            "provider_error": result.get("_provider_error_message"),
             "prompt": prompt[:1000],
         }
         try:
             _write_debug_log(target, entry)
-        except Exception:
-            # Debug logging must not break audit execution
+        except Exception:  # noqa: S110, BLE001 -- debug logging must not break audit execution
             pass
 
     return result
@@ -1199,7 +1345,7 @@ def _get_child_audit_verdict(runner: Runner, child_id: str) -> tuple[bool | None
     Freshness is determined by comparing the audit's auditedAt timestamp against
     the child's updatedAt timestamp plus AUDIT_FRESHNESS_BUFFER_SECONDS.
     """
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
 
     try:
         data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"])
@@ -1277,8 +1423,11 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
         if f.get("severity") in ("critical", "high"):
             return True, f"Critical/high code quality finding: {f.get('file', '?')}:{f.get('line', 0)} — {f.get('message', '')}"
 
-    # Check children stages
-    active_children = [c for c in child_results if c.get("stage") not in ("", None)]
+    # Check children stages — skip deleted children
+    active_children = [
+        c for c in child_results
+        if c.get("stage") not in ("", None) and c.get("status") != "deleted"
+    ]
     blocked_children = [
         c for c in active_children
         if c.get("stage") not in ("in_review", "done")
@@ -1332,18 +1481,19 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     )
 
     # Check each non-exempt child's persisted audit verdict
-    # Exempt children: those with completed/done status+stage (already closed)
+    # Exempt children: status=deleted (wl delete), completed/done (already closed),
     # and those in in_review stage (per spec, in_review children do not
     # block parent closure — only pre-review stages block).
     def _is_exempt(c: dict) -> bool:
+        # Deleted children are fully closed
+        if c.get("status") == "deleted":
+            return True
         # Completed/done children are fully closed
         if c.get("status") == "completed" and c.get("stage") == "done":
             return True
         # Children in in_review stage should not have their audit verdicts
         # block parent closure (per audit spec)
-        if c.get("stage") == "in_review":
-            return True
-        return False
+        return c.get("stage") == "in_review"
     non_exempt_children = [c for c in active_children if not _is_exempt(c)]
     any_child_audit_not_ready = any(
         c.get("child_audit_ready") is False
@@ -1402,14 +1552,17 @@ def _run_phase2_deep_analysis(
     pi_bin: str = "pi",
     debug_log: str | None = None,
     script_failure_callback=None,
-) -> tuple[list[dict], list[dict]]:
+    timeout: int | None = None,
+) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
     Calls Pi with a detailed prompt asking the model to read the actual
     implementation files and verify each acceptance criterion against
     what the code actually does.
 
-    Returns (updated_ac_results, updated_child_results).
+    Returns (updated_ac_results, updated_child_results, phase2_completed).
+    The ``phase2_completed`` flag is ``False`` when the Pi call times out,
+    allowing the caller to set appropriate diagnostic evidence.
     """
     # Build a detailed prompt for deep analysis
     ac_list_json = json.dumps([
@@ -1444,13 +1597,81 @@ def _run_phase2_deep_analysis(
         result = _call_pi_and_maybe_log(
             issue_id, "phase2_deep", prompt,
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+            enable_tools=True, timeout=timeout,
         )
     except RuntimeError as exc:
         # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
         print(f"Warning: Phase 2 deep analysis failed: {exc}", file=sys.stderr)
         if script_failure_callback:
             script_failure_callback("pi (Phase 2 deep analysis)", exc)
-        return ac_results, child_results
+        return ac_results, child_results, False
+
+    # Check for timeout before attempting to parse results
+    if result.get("_timeout"):
+        evidence = result.get("evidence", "Deep analysis timed out.")
+        print(f"Warning: Phase 2 deep analysis timed out: {evidence}", file=sys.stderr)
+        if script_failure_callback:
+            script_failure_callback(
+                "pi (Phase 2 deep analysis)",
+                RuntimeError(f"Phase 2 deep analysis timed out after {CALL_PI_TIMEOUT}s"),
+            )
+        # Mark all ACs as partial with timeout evidence
+        timeout_acs = []
+        for ac in ac_results:
+            timeout_acs.append({
+                "text": ac.get("text", ""),
+                "verdict": VERDICT_PARTIAL,
+                "evidence": "Deep analysis timed out \u2014 manual review required.",
+            })
+        # Also mark all child ACs as partial
+        timeout_children = []
+        for child in child_results:
+            child_acs = child.get("ac_results", [])
+            updated_child_acs = []
+            for ac in child_acs:
+                updated_child_acs.append({
+                    "text": ac.get("text", ""),
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": "Deep analysis timed out \u2014 manual review required.",
+                })
+            timeout_children.append(dict(child))
+            timeout_children[-1]["ac_results"] = updated_child_acs
+        return timeout_acs, timeout_children, False
+
+    # Check for provider errors (e.g. finish_reason: error) before parsing.
+    # The model never emitted its structured output, so treat all ACs as
+    # partial with a provider-error diagnostic (distinct from a parse failure).
+    if result.get("_provider_error"):
+        provider_error = result.get("_provider_error_message", "unknown")
+        print(
+            f"Warning: Phase 2 deep analysis provider error: {provider_error}",
+            file=sys.stderr,
+        )
+        if script_failure_callback:
+            script_failure_callback(
+                "pi (Phase 2 deep analysis)",
+                RuntimeError(f"Pi provider error: {provider_error}"),
+            )
+        error_acs = []
+        for ac in ac_results:
+            error_acs.append({
+                "text": ac.get("text", ""),
+                "verdict": VERDICT_PARTIAL,
+                "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+            })
+        error_children = []
+        for child in child_results:
+            child_acs = child.get("ac_results", [])
+            updated_child_acs = []
+            for ac in child_acs:
+                updated_child_acs.append({
+                    "text": ac.get("text", ""),
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+                })
+            error_children.append(dict(child))
+            error_children[-1]["ac_results"] = updated_child_acs
+        return error_acs, error_children, False
 
     # Parse the batched result
     raw_text = (
@@ -1502,6 +1723,7 @@ def _run_phase2_deep_analysis(
 
     # Also run deep analysis on active children
     updated_children = list(child_results)
+    child_timeout_occurred = False
     for ci, child in enumerate(updated_children):
         if child.get("status") == "completed" and child.get("stage") == "done":
             continue  # Skip already-closed children
@@ -1529,8 +1751,27 @@ def _run_phase2_deep_analysis(
             child_result = _call_pi_and_maybe_log(
                 child.get("id", ""), f"phase2_child:{ci}", child_prompt,
                 model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+                enable_tools=True, timeout=timeout,
             )
         except RuntimeError:
+            continue
+
+        # Handle child timeout: mark all child ACs as partial
+        if child_result.get("_timeout"):
+            print(
+                f"Warning: Child deep analysis timed out for {child.get('id', '')}",
+                file=sys.stderr,
+            )
+            child_timeout_occurred = True
+            timeout_acs = []
+            for ac in child_acs:
+                timeout_acs.append({
+                    "text": ac.get("text", ""),
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": "Deep analysis timed out \u2014 manual review required.",
+                })
+            updated_children[ci] = dict(child)
+            updated_children[ci]["ac_results"] = timeout_acs
             continue
 
         child_raw = (
@@ -1579,10 +1820,11 @@ def _run_phase2_deep_analysis(
             updated_children[ci] = dict(child)
             updated_children[ci]["ac_results"] = updated_child_acs
 
-    return updated_ac, updated_children
+    return updated_ac, updated_children, not child_timeout_occurred
 
 
 def cmd_issue(issue_id: str, persist: bool = True,
+              timeout: int | None = None,
               pi_bin: str = "pi", model: str | None = None,
               model_source: str = DEFAULT_MODEL_SOURCE,
               runner: Runner | None = None, json_mode: bool = False,
@@ -1704,7 +1946,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         cq_skipped_reason: str | None = None
         try:
             from skill.code_review.scripts.code_quality import run_code_quality
-            cq_result = run_code_quality(project_root=REPO_ROOT, runner=runner, fix=True)
+            cq_result = run_code_quality(project_root=TARGET_PROJECT_ROOT, runner=runner, fix=True)
             if cq_result.get("success", False):
                 cq_findings = cq_result.get("findings", [])
                 cq_fixes_applied = cq_result.get("fixes_applied", 0)
@@ -1713,7 +1955,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         except ImportError:
             # code_quality module not available — skip gracefully
             cq_skipped_reason = "code_quality module not available"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- code_quality module not available, skip gracefully
             cq_skipped_reason = str(exc)
 
         acs = _extract_acs(description)
@@ -1747,7 +1989,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 f"Criteria: {ac_list_json}"
             )
             try:
-                result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
+                result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, timeout=timeout)
             except RuntimeError as exc:
                 _record_script_failure("pi (parent AC review)", exc)
                 print(f"Warning: Pi call failed for parent AC review: {exc}", file=sys.stderr)
@@ -1762,7 +2004,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     batch = json.loads(raw_text)
                 except json.JSONDecodeError:
                     batch = []
-            if isinstance(batch, list) and batch:
+            if isinstance(batch, list) and batch and any(
+                isinstance(item, dict) and "index" in item for item in batch
+            ):
                 reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
                 for i, ac in enumerate(acs):
                     item = reviewed.get(i, {})
@@ -1776,36 +2020,54 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 # parseable JSON array. Print a warning, log raw output, and use
                 # 'partial' verdict with diagnostic evidence instead of silently
                 # falling back to 'unmet' with empty evidence.
-                print(
-                    "Warning: Unparseable Pi output for AC evaluation — "
-                    "falling back to 'partial' verdict",
-                    file=sys.stderr,
-                )
+                if result.get("_provider_error"):
+                    print(
+                        "Warning: Pi provider error during AC evaluation — "
+                        "falling back to 'partial' verdict",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "Warning: Unparseable Pi output for AC evaluation — "
+                        "falling back to 'partial' verdict",
+                        file=sys.stderr,
+                    )
                 if debug_log:
                     try:
                         target = Path(debug_log) if debug_log else _default_debug_log_path(issue_id, "parent_ac_fallback")
                         _write_debug_log(target, {
                             "issue_id": issue_id,
                             "context": "parent_ac_fallback",
-                            "reason": "parse_failure",
+                            "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
                             "raw_text": raw_text,
                             "result_verdict": result.get("verdict"),
                             "result_evidence": result.get("evidence", "")[:500],
+                            "provider_error": result.get("_provider_error_message"),
                         })
-                    except Exception:
+                    except Exception:  # noqa: S110, BLE001 -- optional enhancement, ignore on failure
                         pass
                 # When batched parsing fails, the root-level verdict from Pi
                 # cannot be trusted to represent each AC individually. Override
                 # verdict to 'partial' but preserve any diagnostic evidence
                 # from the root-level result (e.g., a timeout message).
-                outer_evidence = result.get("evidence", "")
-                if outer_evidence:
+                if result.get("_provider_error"):
+                    # Provider errors are NOT model parse failures: surface the
+                    # actual provider diagnostic so operators can distinguish a
+                    # transient model outage from a genuine unparseable response.
+                    provider_error = result.get("_provider_error_message", "unknown")
                     evidence = (
-                        f"Pi model output could not be parsed — raw output logged. "
-                        f"Root-level diagnostic: {outer_evidence[:500]}"
+                        f"Pi provider error: {provider_error} — "
+                        "criterion could not be evaluated."
                     )
                 else:
-                    evidence = "Pi model output could not be parsed — raw output logged"
+                    outer_evidence = result.get("evidence", "")
+                    if outer_evidence:
+                        evidence = (
+                            f"Pi model output could not be parsed — raw output logged. "
+                            f"Root-level diagnostic: {outer_evidence[:500]}"
+                        )
+                    else:
+                        evidence = "Pi model output could not be parsed — raw output logged"
                 for ac in acs:
                     ac_results.append({
                         "text": ac,
@@ -1813,16 +2075,18 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         "evidence": evidence,
                     })
         else:
-            ac_results = [{"text": "No acceptance criteria defined.", "verdict": "unmet", "evidence": ""}]
+            ac_results = [{"text": "No acceptance criteria defined.", "verdict": "met", "evidence": ""}]
 
         # Review children (depth 1 only, ignore deleted)
+        # Children with status=deleted (wl delete) or deletedBy (imported)
+        # are excluded from active children so they don't block parent closure.
         # Pass ALL active children to the assembler; it handles the cap.
         # Note: children with status=completed/stage=done are included for
         # reporting but exempted from blocking checks by _has_phase1_blocking_issues.
         child_results = []
         active_children = [
             c for c in children
-            if not c.get("deletedBy")
+            if c.get("status") != "deleted" and not c.get("deletedBy")
         ]
         for child in active_children:
             # Skip remaining children if we're too close to the parent
@@ -1875,7 +2139,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     f"Criteria: {child_ac_list}"
                 )
                 try:
-                    result = _call_pi_and_maybe_log(issue_id, f"child:{child.get('id', '')}", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
+                    result = _call_pi_and_maybe_log(issue_id, f"child:{child.get('id', '')}", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, timeout=timeout)
                 except RuntimeError as exc:
                     _record_script_failure("pi (child AC review)", exc)
                     print(f"Warning: Pi call failed for child AC review: {exc}", file=sys.stderr)
@@ -1888,7 +2152,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         batch = json.loads(raw_text)
                     except json.JSONDecodeError:
                         batch = []
-                if isinstance(batch, list) and batch:
+                if isinstance(batch, list) and batch and any(
+                    isinstance(item, dict) and "index" in item for item in batch
+                ):
                     reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
                     for i, ac in enumerate(child_acs):
                         item = reviewed.get(i, {})
@@ -1902,11 +2168,18 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     # parseable JSON array. Print a warning, log raw output, and use
                     # 'partial' verdict with diagnostic evidence instead of silently
                     # falling back to 'unmet' with empty evidence.
-                    print(
-                        "Warning: Unparseable Pi output for AC evaluation — "
-                        "falling back to 'partial' verdict",
-                        file=sys.stderr,
-                    )
+                    if result.get("_provider_error"):
+                        print(
+                            "Warning: Pi provider error during child AC evaluation — "
+                            "falling back to 'partial' verdict",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            "Warning: Unparseable Pi output for AC evaluation — "
+                            "falling back to 'partial' verdict",
+                            file=sys.stderr,
+                        )
                     if debug_log:
                         try:
                             target = Path(debug_log) if debug_log else _default_debug_log_path(issue_id, f"child_{child.get('id', 'unknown')}_ac_fallback")
@@ -1914,25 +2187,33 @@ def cmd_issue(issue_id: str, persist: bool = True,
                                 "issue_id": issue_id,
                                 "child_id": child.get("id"),
                                 "context": "child_ac_fallback",
-                                "reason": "parse_failure",
+                                "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
                                 "raw_text": raw_text,
                                 "result_verdict": result.get("verdict"),
                                 "result_evidence": result.get("evidence", "")[:500],
+                                "provider_error": result.get("_provider_error_message"),
                             })
-                        except Exception:
+                        except Exception:  # noqa: S110, BLE001 -- optional enhancement, ignore on failure
                             pass
                     # When batched parsing fails, the root-level verdict from Pi
                     # cannot be trusted to represent each AC individually. Override
                     # verdict to 'partial' but preserve any diagnostic evidence
                     # from the root-level result (e.g., a timeout message).
-                    outer_evidence = result.get("evidence", "")
-                    if outer_evidence:
+                    if result.get("_provider_error"):
+                        provider_error = result.get("_provider_error_message", "unknown")
                         evidence = (
-                            f"Pi model output could not be parsed — raw output logged. "
-                            f"Root-level diagnostic: {outer_evidence[:500]}"
+                            f"Pi provider error: {provider_error} — "
+                            "criterion could not be evaluated."
                         )
                     else:
-                        evidence = "Pi model output could not be parsed — raw output logged"
+                        outer_evidence = result.get("evidence", "")
+                        if outer_evidence:
+                            evidence = (
+                                f"Pi model output could not be parsed — raw output logged. "
+                                f"Root-level diagnostic: {outer_evidence[:500]}"
+                            )
+                        else:
+                            evidence = "Pi model output could not be parsed — raw output logged"
                     for ac in child_acs:
                         child_ac_results.append({
                             "text": ac,
@@ -1981,12 +2262,15 @@ def cmd_issue(issue_id: str, persist: bool = True,
                             "--model-source", model_source,
                             "--force",  # Bypass freshness gate
                         ]
+                        if timeout is not None:
+                            audit_cmd.extend(["--timeout", str(timeout)])
+                        effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
                         subprocess.run(
                             audit_cmd,
                             check=False,
                             capture_output=True,
                             text=True,
-                            timeout=CALL_PI_TIMEOUT,
+                            timeout=effective_timeout,
                         )
                         # Re-check verdict after triggered audit
                         verdict, reason = _get_child_audit_verdict(runner, child["id"])
@@ -1995,7 +2279,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                             f"Warning: Auto-triggered audit for child {child['id']} "
                             f"timed out.", file=sys.stderr,
                         )
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 -- audit failure warning
                         print(
                             f"Warning: Auto-triggered audit for child {child['id']} "
                             f"failed: {exc}", file=sys.stderr,
@@ -2017,7 +2301,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # Persist child audits to individual child work items (if persist is True)
         if persist:
             for child in child_results:
-                child_success, child_report = _persist_child_audit(
+                child_success, _child_report = _persist_child_audit(
                     child_id=child["id"],
                     child_title=child["title"],
                     child_status=child["status"],
@@ -2068,14 +2352,14 @@ def cmd_issue(issue_id: str, persist: bool = True,
         else:
             # Phase 1 passed → run Phase 2 deep code analysis
             print("Phase 1 passed: running Phase 2 deep code analysis...", file=sys.stderr)
-            ac_results, child_results = _run_phase2_deep_analysis(
+            ac_results, child_results, phase2_completed = _run_phase2_deep_analysis(
                 work_item, ac_results, child_results,
                 resolved_model=resolved_model,
                 pi_bin=pi_bin,
                 debug_log=debug_log,
                 script_failure_callback=_record_script_failure,
+                timeout=timeout,
             )
-            phase2_completed = True
 
         # ------------------------------------------------------------------
         # Create quality epics for findings (before report assembly)
@@ -2083,12 +2367,12 @@ def cmd_issue(issue_id: str, persist: bool = True,
         if cq_findings:
             try:
                 from skill.code_review.scripts.create_quality_epics import (
-                    create_epics_for_findings
+                    create_epics_for_findings,
                 )
                 _epic_result = create_epics_for_findings(cq_findings, runner=runner)
             except ImportError:
                 _epic_result = {"epic_id": None, "error": "create_quality_epics module not available"}
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- epic creation failure
                 _epic_result = {"epic_id": None, "error": str(exc)}
 
         # Assemble and output report
@@ -2206,7 +2490,8 @@ def _build_project_json(summary: str, recommendation: str) -> dict:
     }
 
 
-def cmd_project(pi_bin: str = "pi", model: str | None = None,
+def cmd_project(timeout: int | None = None,
+                pi_bin: str = "pi", model: str | None = None,
                 model_source: str = DEFAULT_MODEL_SOURCE,
                 runner: Runner | None = None, json_mode: bool = False,
                 debug_log: str | None = None) -> int:
@@ -2294,7 +2579,7 @@ def cmd_project(pi_bin: str = "pi", model: str | None = None,
         f"Return ONLY a JSON object with keys 'summary' and 'recommendation'."
     )
     try:
-        pi_result = _call_pi_and_maybe_log("project", "project", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log)
+        pi_result = _call_pi_and_maybe_log("project", "project", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, timeout=timeout)
         if pi_result.get("verdict") == "met" and pi_result.get("evidence"):
             # Use Pi's response if parseable
             pass  # Could enhance this in future
@@ -2334,6 +2619,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_issue = sub.add_parser("issue", help="Audit a single work item")
     p_issue.add_argument("issue_id", help="Work item id to audit")
+    p_issue.add_argument("--timeout", type=int, default=None,
+                         help="Override the per-call Pi model timeout in seconds")
     p_issue.add_argument("--do-not-persist", action="store_true",
                          help="Do not persist the audit report via wl update")
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
@@ -2350,6 +2637,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Bypass the freshness gate and force a full audit")
 
     p_project = sub.add_parser("project", help="Audit the overall project")
+    p_project.add_argument("--timeout", type=int, default=None,
+                           help="Override the per-call Pi model timeout in seconds")
     p_project.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
     p_project.add_argument("--model", default=None,
                            help="Pi model to use for review (default: resolved from .ralph.json)")
@@ -2374,12 +2663,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "issue":
         return cmd_issue(args.issue_id, persist=not args.do_not_persist,
+                         timeout=args.timeout,
                          pi_bin=args.pi_bin, model=args.model,
                          model_source=args.model_source, json_mode=args.json,
                          debug_log=args.debug_log,
                          force=args.force)
     elif args.command == "project":
-        return cmd_project(pi_bin=args.pi_bin, model=args.model,
+        return cmd_project(timeout=args.timeout,
+                           pi_bin=args.pi_bin, model=args.model,
                            model_source=args.model_source, json_mode=args.json,
                            debug_log=args.debug_log)
 

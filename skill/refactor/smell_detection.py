@@ -120,7 +120,7 @@ def load_rules(config_path: str | None = None) -> dict[str, Any]:
     rules: dict[str, Any] = {}
     try:
         rules = dict(DEFAULT_RULES)
-    except Exception:
+    except Exception:  # noqa: BLE001
         rules = {}
 
     if config_path is not None:
@@ -321,7 +321,7 @@ def detect_linter_smells(
     # ruff and eslint may report findings for files outside the
     # current session's scope; we only keep findings that match
     # files the caller explicitly asked about.
-    session_file_set = set(os.path.abspath(f) for f in files)
+    session_file_set = set(os.path.abspath(f) for f in files)  # noqa: C401
 
     # Run actual linters on the project
     project_root = _find_common_root(existing_files)
@@ -390,7 +390,7 @@ def detect_llm_smells(
                     "code": str(item.get("code", "")),
                 }
                 findings.append(finding)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         LOG.warning("LLM smell detection failed: %s", exc)
 
     return _deduplicate_findings(findings)
@@ -433,7 +433,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             result[key] = base_val
     # Add keys from override that are not in base
-    for key in override:
+    for key in override:  # noqa: PLC0206
         if key not in result:
             result[key] = override[key]
     return result

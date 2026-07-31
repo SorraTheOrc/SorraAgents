@@ -77,9 +77,9 @@ def validate_front_matter(data: Dict, body: str, fm_raw: str = "") -> Tuple[List
     # permissions check (semantic)
     perm = data.get("permission") or {}
     bash_perm = perm.get("bash") if isinstance(perm, dict) else None
-    if isinstance(bash_perm, dict):
+    if isinstance(bash_perm, dict):  # noqa: SIM102
         # look for wildcard key '*' or quoted '*' which YAML parses to '*'
-        if any(k == "*" for k in bash_perm.keys()):
+        if any(k == "*" for k in bash_perm):
             if re.search(r"wildcard\-bash\-justification:", fm_raw):
                 pass  # documented exception
             else:
@@ -99,7 +99,7 @@ def validate_front_matter(data: Dict, body: str, fm_raw: str = "") -> Tuple[List
         if idx != -1:
             boundaries_text = body[idx:]
 
-    if write_allowed and boundaries_text:
+    if write_allowed and boundaries_text:  # noqa: SIM102
         if re.search(r"never (write|modify|commit|push)", boundaries_text, re.I):
             if re.search(r"tools\-write\-contradiction\-justification:", fm_raw):
                 pass  # documented exception
@@ -121,7 +121,7 @@ def validate_all_agents(base: str = "agent") -> Dict[str, Dict]:
         txt = p.read_text(encoding="utf-8")
         try:
             data, body, fm_raw = extract_front_matter(txt)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             out[str(p)] = {"errors": [f"front-matter parse error: {e}"], "warnings": []}
             continue
         errors, warnings = validate_front_matter(data, body, fm_raw)

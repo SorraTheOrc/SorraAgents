@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and integration tests for StatusLifecycle context manager."""
+"""Unit and integration tests for StatusLifecycle context manager."""  # noqa: EXE001
 
 from __future__ import annotations
 
@@ -103,7 +103,7 @@ class TestStatusLifecycleUnit:
             _make_wl_update_proc(),  # restore
         ]
 
-        with pytest.raises(ValueError, match="test error"):
+        with pytest.raises(ValueError, match="test error"):  # noqa: SIM117
             with StatusLifecycle("TEST-123"):
                 raise ValueError("test error")
 
@@ -173,7 +173,7 @@ class TestStatusLifecycleUnit:
             _make_wl_update_proc(),  # restore
         ]
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError):  # noqa: SIM117
             with StatusLifecycle("TEST-123", assignee="bot"):
                 raise RuntimeError("boom")
 
@@ -189,7 +189,7 @@ class TestStatusLifecycleUnit:
             _make_wl_failure_proc(returncode=1, stderr="update failed"),  # update fails
         ]
 
-        with pytest.raises(RuntimeError, match="update failed"):
+        with pytest.raises(RuntimeError, match="update failed"):  # noqa: SIM117
             with StatusLifecycle("TEST-123"):
                 pass
 
@@ -200,7 +200,7 @@ class TestStatusLifecycleUnit:
             _make_wl_failure_proc(returncode=1, stderr="permission denied"),
         ]
 
-        with pytest.raises(RuntimeError, match="permission denied"):
+        with pytest.raises(RuntimeError, match="permission denied"):  # noqa: SIM117
             with StatusLifecycle("TEST-123"):
                 pass
 
@@ -212,7 +212,7 @@ class TestStatusLifecycleUnit:
             _make_wl_failure_proc(returncode=1, stderr="timeout"),
         ]
 
-        with pytest.raises(RuntimeError, match="timeout"):
+        with pytest.raises(RuntimeError, match="timeout"):  # noqa: SIM117
             with StatusLifecycle("TEST-123"):
                 pass
 
@@ -227,7 +227,7 @@ class TestStatusLifecycleUnit:
             _make_wl_failure_proc(returncode=1, stderr="restore failed"),
         ]
 
-        with pytest.raises(ValueError, match="inner error"):
+        with pytest.raises(ValueError, match="inner error"):  # noqa: SIM117
             with StatusLifecycle("TEST-123"):
                 raise ValueError("inner error")
 
@@ -286,7 +286,7 @@ class TestStatusLifecycleIntegration:
         item_id = work_item["id"]
         yield item_id
         # Cleanup: close the item
-        subprocess.run(
+        subprocess.run(  # noqa: PLW1510
             ["wl", "update", item_id, "--status", "completed", "--json"],
             capture_output=True,
         )
@@ -332,7 +332,7 @@ class TestStatusLifecycleIntegration:
         initial = json.loads(show.stdout)
         original_status = initial["workItem"]["status"]
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError):  # noqa: SIM117
             with StatusLifecycle(item_id):
                 raise ValueError("intentional failure")
 
@@ -373,7 +373,7 @@ class TestStatusLifecycleIntegration:
 
     def test_work_item_not_found(self):
         """Verify RuntimeError for non-existent work item."""
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError):  # noqa: SIM117
             with StatusLifecycle("NONEXISTENT-999"):
                 pass
 

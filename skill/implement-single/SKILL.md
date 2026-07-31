@@ -38,9 +38,17 @@ is invoked.
 - **No interactive questions.** The implementing agent must never ask the
   producer questions or pause for interactive input. If it cannot continue
   safely without explicit producer input, it must first run
-  `wl update <work-item-id> --status open --json`, then return a structured
+  `StatusLifecycle.update_status(work_item_id, "open")`, then return a structured
   `no_safe_path` response with the missing decision.
 - **No merge.** Do not merge changes into main. Only commit to a feature branch.
+
+## StatusLifecycle Integration
+
+Status transitions are managed via the shared `StatusLifecycle` module from
+`skill/shared/status_lifecycle.py`. Use `StatusLifecycle.update_status()` for
+status transitions and `with StatusLifecycle(...)` for automatic lifecycle management.
+
+Manual `wl update --status` commands (without `StatusLifecycle`) should NOT be used.
 
 ## Best Practices
 
@@ -60,16 +68,16 @@ Execute the following steps in order. Do not skip steps.
 ### Step 0 — Set status and safety gate
 
 - **Before any other step**, claim the work item:
-  `wl update <work-item-id> --status in_progress --json`
+  `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
 - Detect git context: `git rev-parse --is-inside-work-tree`
 - Run `git status --porcelain=v1 -b`.
 - **Inside a worktree:**
   - `.worklog/` changes only → carry forward.
-  - Other changes → abort via `wl update <work-item-id> --status open --json` and return `no_safe_path`.
+  - Other changes → abort via `StatusLifecycle.update_status(<work-item-id>, "open")` and return `no_safe_path`.
 - **In the main checkout:**
   - `.worklog/` changes only → carry forward.
   - Other stale files → report, proceed to Step 2 for isolation.
-  - If dirty files prevent branch creation → abort via `wl update ... --status open --json`.
+  - If dirty files prevent branch creation → abort via `StatusLifecycle.update_status(<work-item-id>, "open")`.
 
 > Under automated orchestration, the worktree is already created by the orchestrator's parent loop.
 > Use the implement script for deterministic build/test/commit:
@@ -79,7 +87,7 @@ Execute the following steps in order. Do not skip steps.
 
 ### Step 1 — Understand the work item
 
-- Claim: `wl update <work-item-id> --status in_progress --stage in_progress --assignee "<AGENT>" --json`
+- Claim: `StatusLifecycle.update_status(<work-item-id>, "in_progress", stage="in_progress", assignee="<AGENT>")`
 - Fetch details: `wl show <work-item-id> --json --children`
 - Restate ACs, current status, constraints.
 - Surface blockers, dependencies, missing requirements.
@@ -145,19 +153,19 @@ are handled automatically.
 If manually:
 - Push the branch to `origin`.
 - Respond with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
-- Mark in-review: `wl update <work-item-id> --status completed --stage in_review --json`
+- Mark in-review: `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`
 - Do NOT create a PR or merge. PR/merge handling is external.
 
 ## Status Transition Matrix
 
-| Phase | Command | Status | Stage |
-|-------|---------|--------|-------|
-| Start (Step 0) | `wl update <id> --status in_progress --json` | in_progress | (unchanged) |
-| Claim (Step 1) | `wl update <id> --status in_progress --stage in_progress ...` | in_progress | in_progress |
-| Complete (Step 6) | `wl update <id> --status completed --stage in_review --json` | completed | in_review |
-| Abort (dirty/no_safe_path) | `wl update <id> --status open --json` | open | (unchanged) |
+| Phase | Mechanism | Status | Stage |
+|-------|-----------|--------|-------|
+| Start (Step 0) | `StatusLifecycle.update_status(id, "in_progress")` | in_progress | (unchanged) |
+| Claim (Step 1) | `StatusLifecycle.update_status(id, "in_progress", stage="in_progress", assignee="<AGENT>")` | in_progress | in_progress |
+| Complete (Step 6) | `StatusLifecycle.update_status(id, "completed", stage="in_review")` | completed | in_review |
+| Abort (dirty/no_safe_path) | `StatusLifecycle.update_status(id, "open")` | open | (unchanged) |
 
-Abort/failure transitions always use `--status open`.
+All transitions use `StatusLifecycle` — never ad-hoc `wl update --status` commands.
 
 ## Scripts
 
@@ -182,7 +190,7 @@ wl show <work-item-id> --json --children
 npm run build 2>/dev/null || echo "No build script"
 npm test
 # Mark in_review when complete
-wl update <work-item-id> --status completed --stage in_review --json
+python3 -c "from skill.shared.status_lifecycle import StatusLifecycle; StatusLifecycle.update_status('<work-item-id>', 'completed', stage='in_review')"
 ```
 
 End.

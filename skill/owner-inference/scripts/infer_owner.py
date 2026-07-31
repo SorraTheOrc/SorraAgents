@@ -12,7 +12,7 @@ Usage:
     python3 infer_owner.py '{"repo_path": ".", "file_path": "tests/test_foo.py"}'
 
 Returns JSON: { "assignee": "...", "confidence": 0.0-1.0, "reason": "..." }
-"""
+"""  # noqa: EXE001
 
 import json
 import os
@@ -53,7 +53,7 @@ def load_owner_map(repo_path: str) -> Dict[str, str]:
                 result[key.strip().strip('"').strip("'")] = (
                     value.strip().strip('"').strip("'")
                 )
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return result
 
@@ -102,7 +102,7 @@ def parse_codeowners(repo_path: str) -> list:
                     pattern = parts[0]
                     owners = [p.lstrip("@") for p in parts[1:]]
                     rules.append((pattern, owners))
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return rules
 
@@ -152,7 +152,7 @@ def check_git_blame(repo_path: str, file_path: str) -> Optional[Tuple[str, float
             encoding="utf-8",
             stderr=subprocess.DEVNULL,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
     author_counts: Dict[str, int] = {}
@@ -192,7 +192,7 @@ def check_recent_commits(
             encoding="utf-8",
             stderr=subprocess.DEVNULL,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
     authors: Dict[str, int] = {}
@@ -236,7 +236,7 @@ def infer_owner(
     for name, fn in heuristics:
         try:
             result = fn()
-        except Exception:
+        except Exception:  # noqa: BLE001, S112
             continue
         if result is not None:
             assignee, confidence, reason = result
@@ -262,7 +262,7 @@ def main():
         sys.exit(2)
     try:
         payload = json.loads(sys.argv[1])
-    except Exception:
+    except Exception:  # noqa: BLE001
         print(json.dumps({"error": "invalid JSON"}))
         sys.exit(2)
 

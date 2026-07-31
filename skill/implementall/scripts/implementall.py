@@ -11,7 +11,7 @@ Usage:
         [--parent-id <id>] [--max N] [--verbose]
 
 Related work item: SA-0MQO6YMZ3006N5MG
-"""
+"""  # noqa: EXE001
 
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ class ImplementAllEngine:
 
         try:
             result = self.runner(cmd)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("implementall.discover.error cmd=%s exc=%s", " ".join(cmd), exc)
             return []
 
@@ -171,7 +171,7 @@ class ImplementAllEngine:
         logger.debug("implementall.implement.invoke cmd=%s", " ".join(impl_cmd))
         try:
             impl_result = self.runner(impl_cmd, timeout=self.item_timeout)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("implementall.implement.exception item=%s exc=%s", item_id, exc)
             result["outcome"] = "error"
             result["error_detail"] = f"Implement exception: {exc}"
@@ -395,7 +395,7 @@ class ImplementAllEngine:
             logger.debug("implementall.comment cmd=%s", " ".join(comment_cmd))
             try:
                 self.runner(comment_cmd)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "implementall.comment.failed parent=%s exc=%s",
                     parent_id,
@@ -555,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     try:
         return _main(argv)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         notice = FailureNotice(
             script_name="implementall.py",
             reason=f"Unhandled exception: {exc}",

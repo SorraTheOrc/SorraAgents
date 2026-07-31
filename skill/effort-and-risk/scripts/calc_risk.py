@@ -10,7 +10,7 @@ Inputs (stdin JSON):
   certainty: 0-100
 
 Output: risk object with aggregated probability, impact, score, level, top_drivers, mitigations
-"""
+"""  # noqa: EXE001
 
 import sys
 import json
@@ -34,7 +34,7 @@ def main():
     agg_prob = min(5, max(probs) * certainty_factor)
     agg_imp = min(5, max(imps) * certainty_factor)
 
-    score = int(round(agg_prob * agg_imp))
+    score = int(round(agg_prob * agg_imp))  # noqa: RUF046
     level = level_from_score(score)
 
     # Top drivers: pick top 3 child issues by probability*impact
