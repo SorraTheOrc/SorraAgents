@@ -12,18 +12,18 @@ from types import SimpleNamespace
 import pytest
 
 from skill.audit.scripts.audit_runner import (
-    build_parser,
-    cmd_issue,
-    cmd_project,
-    _call_pi,
-    _extract_pi_text,
-    _extract_provider_error,
+    _CHILDREN_CAP,
+    _PI_MAX_RETRIES,
     _assemble_issue_report,
     _assemble_project_report,
     _build_issue_json,
+    _call_pi,
+    _extract_pi_text,
+    _extract_provider_error,
     _has_phase1_blocking_issues,
-    _CHILDREN_CAP,
-    _PI_MAX_RETRIES,
+    build_parser,
+    cmd_issue,
+    cmd_project,
 )
 
 # ---------------------------------------------------------------------------

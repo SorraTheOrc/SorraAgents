@@ -15,22 +15,20 @@ from types import SimpleNamespace
 import pytest
 
 from skill.audit.scripts.audit_runner import (
+    AUDIT_FRESHNESS_BUFFER_SECONDS,
+    CALL_PI_TIMEOUT,
+    DEFAULT_MODEL,
+    DEFAULT_MODEL_SOURCE,
+    Runner,
+    _extract_acs,
+    _extract_json_array,
+    _get_child_audit_verdict,
+    _run_wl,
     build_parser,
     cmd_issue,
     cmd_project,
     main,
-    _extract_acs,
-    _extract_json_array,
-    _run_wl,
-
-    _get_child_audit_verdict,
-    Runner,
-    CALL_PI_TIMEOUT,
-    DEFAULT_MODEL,
-    DEFAULT_MODEL_SOURCE,
-    AUDIT_FRESHNESS_BUFFER_SECONDS,
 )
-
 
 # Path to the audit_runner.py source file
 AUDIT_RUNNER_PY = Path(__file__).resolve().parent.parent / "skill" / "audit" / "scripts" / "audit_runner.py"
@@ -1271,14 +1269,14 @@ class TestStatusLifecycle:
 
 
 # Sentinel to distinguish "not provided" from "explicitly None"
-_AUDIT_RAW_DEFAULT = object()  # noqa: E402
+_AUDIT_RAW_DEFAULT = object()
 
 
 def _audit_fresh_runner(audit_audited_at: str | None = None,
                         audit_raw_output: object = _AUDIT_RAW_DEFAULT,
                         wi_updated_at: str | None = None,
                         fail_audit_show: bool = False,
-                        calls: list | None = None) -> "Runner":
+                        calls: list | None = None) -> Runner:
     """Create a fake runner that returns appropriate responses for freshness gate tests.
 
     Handles three command types:
