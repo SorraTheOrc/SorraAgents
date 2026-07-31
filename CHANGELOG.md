@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.12 (2026-07-31)
+### Bug Fixes
+- audit runner: detect provider errors, retry transient failures, fix role-aware text extraction (SA-0MS8UI3H3007GPWX)
+- [test-failure] test_detection_module.py (collection error: from plan import detection) — failing test (SA-0MS8WCP3E006NPA3)
+### Other
+- Fix pre-existing test failures: audit_runner_core (StatusLifecycle migration) (SA-0MS7FO76A0051W0L)
+- Remove accidentally-tracked .implement_state.json from dev (SA-0MS8XDUFK004AZ5V)
+- Fix pre-existing test failures: test_audit_skill_doc.py (EXECUTION DIRECTIVE) (SA-0MS7FO6TO001ZBF0)
+
 ## v0.1.11 (2026-07-28)
 ### Features
 - Add worktree process cleanup call to implement workflow (SA-0MRTSO5W8005ZGA7)
