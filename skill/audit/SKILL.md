@@ -201,7 +201,7 @@ Synonym for "Acceptance Criteria". Use **Acceptance Criteria** as canonical head
 - **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
-**Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS`. Cumulative elapsed-time guard (110s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
+**Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard (110s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
 
 **Provider-error retry:** Pi calls that end in a provider error (`stopReason: "error"` / `errorMessage` on the last assistant message of `agent_end`, e.g. Local Proxy `finish_reason: error`) are retried automatically up to `_PI_MAX_RETRIES` (2) times with linear backoff (`_PI_RETRY_BACKOFF_SECONDS`). Timeouts and unparseable-but-otherwise-healthy responses are NOT retried. If a provider error persists after retries, ACs fall back to `partial` with evidence like "Pi provider error: <errorMessage> — criterion could not be evaluated." rather than the misleading "Pi model output could not be parsed" message, so operators can distinguish a transient model outage from a genuine parse failure.
 

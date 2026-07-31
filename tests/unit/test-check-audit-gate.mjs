@@ -88,6 +88,159 @@ describe('getAuditStatus - blocking condition detection', () => {
       auditData,
     );
     assert.equal(result.isBlocking, false);
+    assert.equal(result.transient, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getAuditStatus / isTimeoutOrTransientAudit — timeout vs genuine failure
+// (SA-0MS95HJ0J004IDIW AC1: a timeout/transient audit must NOT hard-block)
+// ---------------------------------------------------------------------------
+describe('getAuditStatus - timeout vs genuine not-ready distinction', () => {
+  test('treats readyToClose:false with timeout marker as transient non-blocking', async () => {
+    const mod = await import(MODULE_PATH);
+    const auditData = {
+      success: true,
+      workItemId: 'SA-101',
+      audit: {
+        readyToClose: false,
+        summary: 'Some summary',
+        rawOutput: 'Ready to close: No\n\n## Summary\n\nDeep analysis timed out — manual review required.',
+      },
+    };
+    const result = mod.getAuditStatus(
+      { id: 'SA-101', title: 'Timed Out Item' },
+      auditData,
+    );
+    assert.equal(result.isBlocking, false, 'timeout audit should not hard-block');
+    assert.equal(result.transient, true, 'timeout audit should be flagged transient');
+    assert.match(result.reason, /timeout|transient/i);
+  });
+
+  test('treats readyToClose:false with provider-error marker as transient non-blocking', async () => {
+    const mod = await import(MODULE_PATH);
+    const auditData = {
+      success: true,
+      workItemId: 'SA-102',
+      audit: {
+        readyToClose: false,
+        summary: 'Some summary',
+        rawOutput: 'Ready to close: No\n\nPi provider error: upstream unavailable — criterion could not be evaluated.',
+      },
+    };
+    const result = mod.getAuditStatus(
+      { id: 'SA-102', title: 'Provider Error Item' },
+      auditData,
+    );
+    assert.equal(result.isBlocking, false, 'provider-error audit should not hard-block');
+    assert.equal(result.transient, true);
+  });
+
+  test('treats readyToClose:false with FailureNotice wrapper as transient non-blocking', async () => {
+    const mod = await import(MODULE_PATH);
+    const auditData = {
+      success: true,
+      workItemId: 'SA-103',
+      audit: {
+        readyToClose: false,
+        summary: 'Some summary',
+        rawOutput: '======================================================================\n⚠ Script Execution Failure: pi (Phase 2 deep analysis) — Timeout after 1800s\nThe following output was produced manually.\n======================================================================',
+      },
+    };
+    const result = mod.getAuditStatus(
+      { id: 'SA-103', title: 'Failure Notice Item' },
+      auditData,
+    );
+    assert.equal(result.isBlocking, false);
+    assert.equal(result.transient, true);
+  });
+
+  test('treats readyToClose:false with clean output as genuine blocking failure', async () => {
+    const mod = await import(MODULE_PATH);
+    const auditData = {
+      success: true,
+      workItemId: 'SA-104',
+      audit: {
+        readyToClose: false,
+        summary: 'Some summary',
+        rawOutput: 'Ready to close: No\n\n## Summary\n\n2 of 3 acceptance criteria for work item SA-104 are not met.',
+      },
+    };
+    const result = mod.getAuditStatus(
+      { id: 'SA-104', title: 'Genuinely Not Ready' },
+      auditData,
+    );
+    assert.equal(result.isBlocking, true, 'genuine not-ready audit should hard-block');
+    assert.equal(result.transient, false);
+    assert.equal(result.reason, 'Audit verdict: not ready to close');
+  });
+
+  test('treats readyToClose:false with summary-only timeout marker as transient', async () => {
+    const mod = await import(MODULE_PATH);
+    const auditData = {
+      success: true,
+      workItemId: 'SA-105',
+      audit: {
+        readyToClose: false,
+        summary: 'Ready to close: No — Phase 2 deep analysis timed out. Manual audit required.',
+        rawOutput: null,
+      },
+    };
+    const result = mod.getAuditStatus(
+      { id: 'SA-105', title: 'Summary Timeout' },
+      auditData,
+    );
+    assert.equal(result.isBlocking, false);
+    assert.equal(result.transient, true);
+  });
+});
+
+describe('isTimeoutOrTransientAudit', () => {
+  test('is exported as a function', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(typeof mod.isTimeoutOrTransientAudit, 'function');
+  });
+
+  test('detects timeout markers in rawOutput', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({ rawOutput: 'Deep analysis timed out — manual review required.' }),
+      true,
+    );
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({ rawOutput: 'Pi model call timed out after 1800s. Manual audit required.' }),
+      true,
+    );
+  });
+
+  test('detects provider-error markers', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({ rawOutput: 'Pi provider error: upstream down' }),
+      true,
+    );
+  });
+
+  test('detects markers in summary when rawOutput is absent', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({ rawOutput: null, summary: 'Phase 2 deep analysis timed out. Manual review required.' }),
+      true,
+    );
+  });
+
+  test('returns false for genuine not-ready audits without transient markers', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({ rawOutput: 'Ready to close: No\n\n2 of 3 acceptance criteria not met.' }),
+      false,
+    );
+  });
+
+  test('returns false for null/undefined audit', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(mod.isTimeoutOrTransientAudit(null), false);
+    assert.equal(mod.isTimeoutOrTransientAudit(undefined), false);
   });
 });
 
@@ -103,8 +256,10 @@ test('check-audit-gate: checkAuditReadyToClose returns expected structure', asyn
   assert.ok(typeof report === 'object');
   assert.ok('hasBlockingItems' in report);
   assert.ok('blockingItems' in report);
+  assert.ok('transientItems' in report);
   assert.ok('message' in report);
   assert.ok(Array.isArray(report.blockingItems));
+  assert.ok(Array.isArray(report.transientItems));
   assert.equal(typeof report.message, 'string');
 });
 
