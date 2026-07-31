@@ -90,7 +90,7 @@ def compute_omp(data: dict) -> tuple[float, float, float]:
     )
 
 
-def level_from_score(score: int | float) -> str:
+def level_from_score(score: float) -> str:
     """Return a risk level label for the given numeric score.
 
     Maps a risk score (typically 1-25) to a human-readable level:

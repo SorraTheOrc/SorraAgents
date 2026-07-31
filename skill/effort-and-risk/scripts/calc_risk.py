@@ -12,8 +12,8 @@ Inputs (stdin JSON):
 Output: risk object with aggregated probability, impact, score, level, top_drivers, mitigations
 """  # noqa: EXE001
 
-import sys
 import json
+import sys
 
 from _shared import level_from_score
 

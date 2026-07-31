@@ -14,11 +14,10 @@ correctly implements the following behaviors:
 Related work item: SA-0MQFWHQW7008JSNZ
 """
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Constants

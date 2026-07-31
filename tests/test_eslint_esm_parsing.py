@@ -147,9 +147,7 @@ class TestEslintParsing:
             if isinstance(file_result, dict):
                 msgs = file_result.get("messages", [])
                 for msg in msgs:
-                    if msg.get("fatal"):
-                        errors.append(f"  Line {msg.get('line')}: {msg.get('message')}")
-                    elif msg.get("severity", 0) >= 2:
+                    if msg.get("fatal") or msg.get("severity", 0) >= 2:
                         errors.append(f"  Line {msg.get('line')}: {msg.get('message')}")
 
         assert len(errors) == 0, (

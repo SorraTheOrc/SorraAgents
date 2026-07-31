@@ -21,8 +21,9 @@ import argparse
 import json
 import subprocess
 import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any
 
 # Ensure the package is importable when run as __main__
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -135,8 +136,7 @@ def _highest_priority(findings: list[dict[str, Any]]) -> str:
         pri = _severity_to_priority(sev)
         if pri in PRIORITY_ORDER:
             idx = PRIORITY_ORDER.index(pri)
-            if idx < highest_idx:
-                highest_idx = idx
+            highest_idx = min(highest_idx, idx)
     # If no finding had a valid priority, default to medium
     if highest_idx >= len(PRIORITY_ORDER):
         return "medium"

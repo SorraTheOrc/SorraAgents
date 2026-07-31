@@ -44,15 +44,20 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Union
+from typing import Any
 
 # Ensure the script directory is on sys.path for internal imports
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from detection import detect_languages, get_linters_for_language, probe_linter  # noqa: E402
+from detection import (
+    detect_languages,
+    get_linters_for_language,
+    probe_linter,
+)
 
 # ---------------------------------------------------------------------------
 # Severity classification
@@ -391,7 +396,7 @@ def _commit_changes(
         return False
 
 
-def _normalize_paths(root: Union[str, os.PathLike[str], None] = None) -> Path:
+def _normalize_paths(root: str | os.PathLike[str] | None = None) -> Path:
     """Normalise the project root to an absolute Path."""
     if root is None:
         return Path.cwd().resolve()
@@ -550,7 +555,7 @@ def _run_eslint_fix_mode(
 
 
 def run_ruff(
-    project_root: Union[str, os.PathLike[str], None] = None,
+    project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
     fix: bool = False,
 ) -> dict[str, Any]:
@@ -596,7 +601,7 @@ def run_ruff(
 
 
 def run_eslint(
-    project_root: Union[str, os.PathLike[str], None] = None,
+    project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
     fix: bool = False,
 ) -> dict[str, Any]:
@@ -643,7 +648,7 @@ def run_eslint(
 
 
 def run_markdownlint(
-    project_root: Union[str, os.PathLike[str], None] = None,
+    project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
     fix: bool = False,
 ) -> dict[str, Any]:
@@ -728,7 +733,7 @@ def run_markdownlint(
 
 
 def run_shellcheck(
-    project_root: Union[str, os.PathLike[str], None] = None,
+    project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
 ) -> list[dict[str, Any]]:
     """Run shellcheck on the given project root and return structured findings.
@@ -805,7 +810,7 @@ def run_shellcheck(
 
 
 def run_dotnet_format(
-    project_root: Union[str, os.PathLike[str], None] = None,
+    project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
     fix: bool = False,
 ) -> dict[str, Any]:
@@ -888,7 +893,7 @@ def run_dotnet_format(
 
 
 def run_linters_for_project(
-    project_root: Union[str, os.PathLike[str], None] = None,
+    project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
     fix: bool = False,
 ) -> dict[str, Any]:

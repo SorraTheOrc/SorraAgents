@@ -8,19 +8,18 @@ import shutil
 import subprocess
 import sys
 import traceback
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any
 
 # Add repo root to sys.path for shared utility access
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.scripts.failure_notice import FailureNotice  # noqa: E402
-
-
+from skill.scripts.failure_notice import FailureNotice
 
 LOG = logging.getLogger("skill.cleanup")
 

@@ -80,7 +80,7 @@ const blocked = isBranchBlocked('main');
 The `release` action runs five gating checks before merging `dev` to `main`:
 
 1. **Unmerged branches check** — aborts with report if feature branches pending; exit code 3; `--skip-checks` bypasses.
-2. **Audit readiness gate** — verifies all `in_review`/`completed` items pass audits; exit code 6; `--skip-checks` bypasses.
+2. **Audit readiness gate** — verifies all `in_review`/`completed` items pass audits; exit code 6; `--skip-checks` bypasses. Timed-out or transient audits (provider error, script execution failure) are reported as warnings and do **not** block the release — only genuine "not ready to close" verdicts block.
 3. **Critical-items gate** — aborts if non-terminal critical items exist; exit code 7; `--skip-checks` bypasses.
 4. **Worklog refs gate** — aborts if worklog refs are still present in merged code; exit code 8.
 5. **Producer-review gate** — aborts if items need producer review; exit code 9; `--skip-checks` bypasses.

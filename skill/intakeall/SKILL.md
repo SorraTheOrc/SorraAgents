@@ -9,11 +9,11 @@ Use this skill when asked to run batch intake on all `idea` stage work items. It
 
 ## Behavior
 
-1. **Orphan recovery**: Query `wl list --stage idea --json` to find items in `idea` stage. Orphans (`status=completed` + `stage=idea` or `status=in_progress` + `stage=idea`) are reset to `status=open` via `_recover_orphans()` before processing.
+1. **Orphan recovery**: Query `wl list --stage idea --needs-producer-review no --json` to find items in `idea` stage not awaiting producer input. Orphans (`status=completed` + `stage=idea` or `status=in_progress` + `stage=idea`) are reset to `status=open` via `_recover_orphans()` before processing.
 2. **Signal registration**: SIGINT/SIGTERM handlers recover the active item (reset to `status=open, stage=idea`) on abort.
 3. For each item:
    - If sufficient detail (ACs + implementation guidance), auto-complete to `intake_complete` without invoking `/intake`
-   - Otherwise, **skip the interactive `/intake` subprocess** (blocks indefinitely waiting for stdin) and mark as `needs_input`
+   - Otherwise, **skip the interactive `/intake` subprocess** (blocks indefinitely waiting for stdin) and mark as `needs_input`, flagging `needsProducerReview=yes` so the batch does not re-process it
 4. On error, attempt recovery (reset to `stage=idea, status=open`) and record outcome
 5. Continue processing remaining items despite errors/input-needs
 6. Produce summary report
@@ -55,15 +55,28 @@ Item is auto-completed to `stage=intake_complete, status=open` if: NOT an epic, 
 
 ## Needs-input detection
 
-Items failing `has_sufficient_detail()` are marked `needs_input` without invoking `/intake` (the interactive subprocess blocks in batch mode). Direct `_invoke_intake()` detects needs by non-zero exit, question patterns, or exceptions.
+Items failing `has_sufficient_detail()` are marked `needs_input` without invoking `/intake` (the interactive subprocess blocks in batch mode). The item is **never claimed**, so it stays `status=open`; it is flagged `needsProducerReview=yes` so the batch excludes it from re-processing. Direct `_invoke_intake()` detects needs by non-zero exit, question patterns, or exceptions and recovers the item to `open` + `idea` + `needsProducerReview=yes`.
 
 ## Error handling
 
 - `wl list` failure: empty list returned gracefully
 - Auto-complete claim failure: logged as warning, marked `error`
-- Insufficient detail items: marked `needs_input` (no recovery needed)
+- Auto-complete transition failure: item is reset to `status=open` (never left `in_progress`), marked `error`
+- Insufficient detail items: marked `needs_input` and flagged `needsProducerReview=yes`
 - Direct `/intake` failure: recovered to `stage=idea, status=open`
 - All errors/recoveries captured in summary report
+
+## Status safety invariant
+
+No matter how an item's processing ends (auto-completed, intake-completed,
+needs input, error, or interruption), the item is **never left in
+`in_progress`** when the batch completes. Every terminal path ends in a
+valid status:
+
+- **auto_completed / intake_completed** → `open` + `intake_complete`
+- **needs_input** → `open` + `idea` + `needsProducerReview=yes`
+- **error** → `open` + `idea` (recovered)
+- **signal abort** → `open` + `idea` (recovered)
 
 ## Idempotence
 

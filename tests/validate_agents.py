@@ -3,10 +3,10 @@
 Provides a small set of helpers to extract YAML front-matter from agent/*.md
 and perform schema + semantic checks.
 """
-from pathlib import Path
-import yaml
 import re
-from typing import List, Dict, Tuple
+from pathlib import Path
+
+import yaml
 
 REQUIRED_FIELDS = ["description", "mode", "model", "temperature"]
 ALLOWED_MODELS = [
@@ -21,12 +21,12 @@ MODEL_CANONICAL_PATTERNS = {
 }
 
 
-def find_agent_files(base: str = "agent") -> List[Path]:
+def find_agent_files(base: str = "agent") -> list[Path]:
     p = Path(base)
     return sorted([x for x in p.glob("*.md") if x.is_file()])
 
 
-def extract_front_matter(text: str) -> Tuple[Dict, str, str]:
+def extract_front_matter(text: str) -> tuple[dict, str, str]:
     """Return (front_matter_dict, body_text, raw_fm_text). Raises ValueError on parse error."""
     if not text.startswith("---"):
         raise ValueError("missing front-matter delimiters")
@@ -39,7 +39,7 @@ def extract_front_matter(text: str) -> Tuple[Dict, str, str]:
     return data, body, fm_text
 
 
-def validate_front_matter(data: Dict, body: str, fm_raw: str = "") -> Tuple[List[str], List[str]]:
+def validate_front_matter(data: dict, body: str, fm_raw: str = "") -> tuple[list[str], list[str]]:
     """Validate a single agent front-matter dict.
 
     Returns (errors, warnings).
@@ -51,8 +51,8 @@ def validate_front_matter(data: Dict, body: str, fm_raw: str = "") -> Tuple[List
     - `wildcard-bash-justification:` suppresses wildcard bash permission warnings
     - `tools-write-contradiction-justification:` suppresses tool/boundary contradiction warnings
     """
-    errors: List[str] = []
-    warnings: List[str] = []
+    errors: list[str] = []
+    warnings: list[str] = []
 
     for f in REQUIRED_FIELDS:
         if f not in data:
@@ -90,7 +90,7 @@ def validate_front_matter(data: Dict, body: str, fm_raw: str = "") -> Tuple[List
     write_allowed = bool(tools.get("write")) if isinstance(tools, dict) else False
     # search body for lines under 'Boundaries:' that include 'never' + verb
     boundaries_text = ""
-    m = re.search(r"\nBoundaries:\n(.*?)(\n\S|$)", body, re.S)
+    m = re.search(r"\nBoundaries:\n(.*?)(\n\S|$)", body, re.DOTALL)
     if m:
         boundaries_text = m.group(1)
     else:
@@ -100,7 +100,7 @@ def validate_front_matter(data: Dict, body: str, fm_raw: str = "") -> Tuple[List
             boundaries_text = body[idx:]
 
     if write_allowed and boundaries_text:  # noqa: SIM102
-        if re.search(r"never (write|modify|commit|push)", boundaries_text, re.I):
+        if re.search(r"never (write|modify|commit|push)", boundaries_text, re.IGNORECASE):
             if re.search(r"tools\-write\-contradiction\-justification:", fm_raw):
                 pass  # documented exception
             else:
@@ -109,7 +109,7 @@ def validate_front_matter(data: Dict, body: str, fm_raw: str = "") -> Tuple[List
     return errors, warnings
 
 
-def validate_all_agents(base: str = "agent") -> Dict[str, Dict]:
+def validate_all_agents(base: str = "agent") -> dict[str, dict]:
     """Run validation across all agent files and return a map of path -> {errors, warnings}.
 
     This is intentionally lightweight and conservative to avoid false positives.

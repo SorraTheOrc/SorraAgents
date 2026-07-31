@@ -8,7 +8,8 @@ const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = join(dirname(__filename), '..', '..');
 const PATH = join(REPO_ROOT, 'skill', 'triage', 'SKILL.md');
 
-test('triage SKILL.md uses skill-relative script paths', () => {
+test('triage SKILL.md references its scripts via relative paths', () => {
   const content = readFileSync(PATH, 'utf-8');
-  assert.ok(content.includes('skill/triage/scripts/check_or_create.py') || content.includes('skill/triage/scripts/'), 'SKILL.md should reference skill/triage/scripts/*');
+  // pi skill convention: in-skill references use ./scripts/ (not skill/<name>/scripts/)
+  assert.ok(content.includes('./scripts/check_or_create.py'), 'SKILL.md should reference ./scripts/check_or_create.py');
 });

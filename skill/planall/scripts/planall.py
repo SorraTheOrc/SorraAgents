@@ -20,20 +20,20 @@ import signal
 import subprocess
 import sys
 import traceback
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Callable, Sequence, Optional
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
+from skill.shared.status_lifecycle import StatusLifecycle
 
 # Add repo root to sys.path for shared utility access
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.scripts.failure_notice import FailureNotice  # noqa: E402
-from skill.scripts.pi_utils import extract_pi_text  # noqa: E402
-
+from skill.scripts.failure_notice import FailureNotice
+from skill.scripts.pi_utils import extract_pi_text
 
 logger = logging.getLogger("planall")
 
@@ -77,7 +77,7 @@ class PlanAllEngine:
         self.item_timeout = item_timeout
         self.verbose = verbose
         # Track the item currently being processed for signal-handler recovery
-        self._current_item_id: Optional[str] = None
+        self._current_item_id: str | None = None
         self._total_discovered: int = 0
         # Saved original signal handlers for restore
         self._original_sigint: Any = None
@@ -93,7 +93,13 @@ class PlanAllEngine:
         Returns:
             A list of work item dicts, or an empty list on error.
         """
-        cmd = ["wl", "list", "--stage", "intake_complete", "--json"]
+        # Exclude items flagged as needing producer review (e.g. items that
+        # previously hit a needs_input outcome) so they are not re-processed
+        # in an infinite loop. Such items stay status=open for visibility.
+        cmd = [
+            "wl", "list", "--stage", "intake_complete",
+            "--needs-producer-review", "no", "--json",
+        ]
         logger.debug("planall.discover cmd=%s", " ".join(cmd))
 
         try:
@@ -188,6 +194,12 @@ class PlanAllEngine:
             if self._contains_questions(plan_stdout):
                 result["outcome"] = "needs_input"
                 result["error_detail"] = f"Plan needs input (rc={plan_result.returncode}): {stderr}"
+                # A needs_input item was claimed (in_progress); release it back
+                # to open + intake_complete and flag producer review so the
+                # batch does not re-process it on the next run.
+                result["recovery"] = self._attempt_recovery(
+                    item_id, flag_producer_review=True,
+                )
                 return result
             # Otherwise it's an error - attempt recovery
             result["outcome"] = "error"
@@ -199,30 +211,51 @@ class PlanAllEngine:
         if self._contains_questions(plan_stdout):
             result["outcome"] = "needs_input"
             result["error_detail"] = "Plan output contains unanswered questions"
+            result["recovery"] = self._attempt_recovery(
+                item_id, flag_producer_review=True,
+            )
             return result
 
         result["outcome"] = "planned"
         return result
 
-    def _attempt_recovery(self, item_id: str) -> dict:
+    def _attempt_recovery(self, item_id: str, flag_producer_review: bool = False) -> dict:
         """Attempt to recover from a failed plan by resetting the item status.
+
+        Always resets the item to a valid terminal status (``open``) so the
+        item is never left stuck in ``in_progress`` after a failure or a
+        needs_input outcome.
 
         Args:
             item_id: The work item ID to recover.
+            flag_producer_review: If True, also set ``needsProducerReview=yes``
+                so producers can triage the item and the batch excludes it
+                from re-processing.
 
         Returns:
             A dict with keys:
                 - action: description of recovery action taken
                 - success: whether recovery succeeded
         """
+        action = "reset_status_to_open_with_stage_intake_complete"
+        if flag_producer_review:
+            action += "_flagged_producer_review"
         recovery: dict[str, Any] = {
-            "action": "reset_status_to_open_with_stage_intake_complete",
+            "action": action,
             "success": False,
         }
 
-        # Reset status to open and stage back to intake_complete via shared helper
+        # Reset status to open and stage back to intake_complete via shared
+        # helper. Producer-review flag is set only when explicitly requested
+        # (None omits the flag entirely).
         try:
-            StatusLifecycle.update_status(item_id, "open", stage="intake_complete", runner=self.runner)
+            StatusLifecycle.update_status(
+                item_id,
+                "open",
+                stage="intake_complete",
+                needs_producer_review=flag_producer_review or None,
+                runner=self.runner,
+            )
             logger.debug("planall.recovery item=%s", item_id)
         except RuntimeError as exc:
             logger.warning("planall.recovery.exception item=%s exc=%s", item_id, exc)

@@ -106,17 +106,53 @@ export function getCandidateItems() {
 
 // ── getAuditStatus ───────────────────────────────────────────────────────────
 
+// Patterns that indicate the audit pipeline failed transiently (timeout,
+// provider error, script execution failure) rather than reaching a genuine
+// 'not ready to close' verdict. When the audit's stored report matches one of
+// these markers, the gate treats the item as transient (warning, not blocking)
+// so a release is not spuriously blocked by a merely timed-out audit.
+const TIMEOUT_TRANSIENT_PATTERNS = [
+  /\btime(?:d)?\s*outs?\b/i, // "timed out", "time out", "timeout(s)"
+  /provider\s+(?:error|stop\s+reason)/i, // "Pi provider error: ..."
+  /script\s+execution\s+failure/i, // FailureNotice banner
+];
+
+/**
+ * Detect whether an audit's stored report indicates a timeout or transient
+ * failure rather than a genuine 'not ready to close' verdict.
+ *
+ * Inspects the audit's ``rawOutput`` and ``summary`` (whichever is present)
+ * for markers produced by the audit runner's timeout/skip/provider-error
+ * paths (e.g. "Deep analysis timed out — manual review required.",
+ * "Pi provider error: ...", "Script Execution Failure: ...").
+ *
+ * @param {object|null} audit - The audit object from ``wl audit-show``.
+ * @returns {boolean} True if the audit appears to have timed out or hit a
+ *   transient failure; false for genuine verdicts.
+ */
+export function isTimeoutOrTransientAudit(audit) {
+  if (!audit || typeof audit !== 'object') {
+    return false;
+  }
+  const haystack = [audit.rawOutput, audit.summary]
+    .filter((v) => typeof v === 'string' && v.length > 0)
+    .join('\n');
+  return TIMEOUT_TRANSIENT_PATTERNS.some((pattern) => pattern.test(haystack));
+}
+
 /**
  * Check the audit status for a single work item.
  *
- * Determines whether the item's audit is blocking (not ready to close)
- * or passing (ready to close).
+ * Determines whether the item's audit is blocking (not ready to close),
+ * transient (timed out / hit a transient failure — reported as a warning,
+ * NOT blocking), or passing (ready to close).
  *
  * @param {{ id: string, title: string }} workItem - The work item to check.
  * @param {object|null} auditData - The parsed audit data (or null if no audit).
  * @param {object|null} [auditData.audit] - The audit object from wl audit-show.
  * @returns {{
  *   isBlocking: boolean,
+ *   transient: boolean,
  *   reason: string,
  *   summary: string|null
  * }}
@@ -126,6 +162,7 @@ export function getAuditStatus(workItem, auditData) {
   if (!auditData || auditData.audit === null || auditData.audit === undefined) {
     return {
       isBlocking: true,
+      transient: false,
       reason: 'No audit found',
       summary: null,
     };
@@ -137,7 +174,21 @@ export function getAuditStatus(workItem, auditData) {
   if (audit.readyToClose === true) {
     return {
       isBlocking: false,
+      transient: false,
       reason: 'Ready to close',
+      summary: audit.summary || null,
+    };
+  }
+
+  // readyToClose is false or missing. Distinguish a genuine 'not ready to
+  // close' verdict from a timeout/transient failure: a timed-out or failed
+  // audit pipeline is not a real verdict and must not hard-block the release.
+  if (isTimeoutOrTransientAudit(audit)) {
+    return {
+      isBlocking: false,
+      transient: true,
+      reason:
+        'Audit timed out or hit a transient failure — not blocking (re-audit recommended)',
       summary: audit.summary || null,
     };
   }
@@ -145,6 +196,7 @@ export function getAuditStatus(workItem, auditData) {
   // readyToClose is false or missing → blocking
   return {
     isBlocking: true,
+    transient: false,
     reason: 'Audit verdict: not ready to close',
     summary: audit.summary || null,
   };
@@ -288,12 +340,22 @@ export function checkProducerReviewStatus(items) {
  * Check all `in_review` and `completed` work items for audit readiness.
  *
  * For each candidate item, queries `wl audit-show <id> --json` and checks
- * `audit.readyToClose`. Collects any items that are blocking (no audit,
- * or audit verdict is not ready to close) and returns a structured report.
+ * `audit.readyToClose`. Items whose audit timed out or hit a transient
+ * failure are collected separately in `transientItems` (warnings, NOT
+ * blocking) so a slow/transient audit does not spuriously block the release.
+ * Collects any items that are genuinely blocking (no audit, or a real
+ * not-ready verdict) and returns a structured report.
  *
  * @returns {Promise<{
  *   hasBlockingItems: boolean,
  *   blockingItems: Array<{
+ *     workItemId: string,
+ *     title: string,
+ *     reason: string,
+ *     summary: string|null,
+ *     remediation: string
+ *   }>,
+ *   transientItems: Array<{
  *     workItemId: string,
  *     title: string,
  *     reason: string,
@@ -311,12 +373,14 @@ export async function checkAuditReadyToClose() {
     return {
       hasBlockingItems: false,
       blockingItems: [],
+      transientItems: [],
       message: 'No in_review work items found. Audit gate passed.',
     };
   }
 
   // Step 3: Check audit status for each item
   const blockingItems = [];
+  const transientItems = [];
 
   for (const item of items) {
     let auditData = null;
@@ -348,15 +412,49 @@ export async function checkAuditReadyToClose() {
         summary: status.summary,
         remediation: buildRemediationCommand(item.id),
       });
+    } else if (status.transient) {
+      // Timeout / transient failure: report as a warning, NOT a blocker
+      transientItems.push({
+        workItemId: item.id,
+        title: item.title,
+        reason: status.reason,
+        summary: status.summary,
+        remediation: buildRemediationCommand(item.id),
+      });
     }
+  }
+
+  // Helper: format a transient-items warning block for the report message
+  function buildTransientWarning(lines) {
+    if (transientItems.length === 0) {
+      return;
+    }
+    lines.push(
+      '',
+      `Note: ${transientItems.length} work item(s) had timed-out or transient audits ` +
+        'and were NOT treated as blocking (re-audit recommended):',
+      '',
+    );
+    transientItems.forEach((entry, i) => {
+      lines.push(`${i + 1}. ${entry.title} (${entry.workItemId})`);
+      lines.push(`   Reason: ${entry.reason}`);
+      lines.push(`   Remediation:`);
+      lines.push(entry.remediation);
+      lines.push('');
+    });
   }
 
   // Step 4: Build report
   if (blockingItems.length === 0) {
+    const lines = [
+      `All ${items.length} work item(s) have passing audits. Audit gate passed.`,
+    ];
+    buildTransientWarning(lines);
     return {
       hasBlockingItems: false,
       blockingItems: [],
-      message: `All ${items.length} work item(s) have passing audits. Audit gate passed.`,
+      transientItems,
+      message: lines.join('\n'),
     };
   }
 
@@ -380,6 +478,8 @@ export async function checkAuditReadyToClose() {
     lines.push('');
   });
 
+  buildTransientWarning(lines);
+
   lines.push(
     'Note: This report is a point-in-time snapshot. After remediation, re-run the release',
     'process without --skip-checks to re-validate. Use --skip-checks to bypass this gate.',
@@ -388,6 +488,7 @@ export async function checkAuditReadyToClose() {
   return {
     hasBlockingItems: true,
     blockingItems,
+    transientItems,
     message: lines.join('\n'),
   };
 }

@@ -5,7 +5,9 @@ description: "Unified git management skill that orchestrates the full feature-br
 
 # Git Management Skill
 
-Deterministic, safe feature-branch lifecycle for agents and operators.
+## Purpose
+
+Unified git management skill that orchestrates the full feature-branch lifecycle — create, commit, push, PR, merge, cleanup — for both AI agents and human operators. Deterministic, safe feature-branch lifecycle for agents and operators.
 
 ## Operations
 
@@ -41,7 +43,7 @@ Deterministic, safe feature-branch lifecycle for agents and operators.
 ## Safety Constraints
 
 - **No force-push**: Any `--force` request is rejected (exit 2)
-- **Protected branches**: Pushes to `main`, `master`, `HEAD` rejected. Validated via `isBranchBlocked()` from `../ship/scripts/git-helpers.js`
+- **Protected branches**: Pushes to `main`, `master`, `HEAD` are blocked. Validated via `isBranchBlocked()` from `../ship/scripts/git-helpers.js`
 - **Branch naming**: `wl-<work-item-id>-<short-desc>` generated via `makeBranchName()`
 - **Worktree naming**: Same pattern, under `.worklog/worktrees/`. See [[concepts/git-worktree-best-practices-for-agent-workflows]] and [AGENTS.md](../../AGENTS.md)
 - **CI gate**: `merge-pr` verifies CI checks before merge; skips/fails if pending/failing

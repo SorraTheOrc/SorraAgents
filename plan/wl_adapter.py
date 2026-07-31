@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import json
 from subprocess import CalledProcessError, check_output
-from typing import Any, Dict, List, Optional
-
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Helper functions for comment operations
@@ -101,7 +100,7 @@ class WLAdapter:
     empty list rather than raising, so callers can decide how strict to be.
     """
 
-    def _run(self, args: List[str]) -> Optional[str]:
+    def _run(self, args: list[str]) -> str | None:
         cmd = ["wl"] + args
         try:
             out = check_output(cmd, encoding="utf-8")
@@ -112,7 +111,7 @@ class WLAdapter:
             # permissive: return None on failure
             return None
 
-    def list_children(self, parent: str) -> List[Dict[str, Any]]:
+    def list_children(self, parent: str) -> list[dict[str, Any]]:
         out = self._run(["list", "--parent", parent, "--json"])
         if not out:
             return []
@@ -131,7 +130,7 @@ class WLAdapter:
         out = self._run(["dep", "rm", blocked, blocker, "--json"])
         return out is not None
 
-    def dep_list(self, id: str) -> List[Dict[str, Any]]:
+    def dep_list(self, id: str) -> list[dict[str, Any]]:
         out = self._run(["dep", "list", id, "--json"])
         if not out:
             return []
@@ -146,7 +145,7 @@ class WLAdapter:
         out = self._run(["comment", "add", id, "--comment", text])
         return out is not None
 
-    def show(self, id: str) -> Optional[Dict[str, Any]]:
+    def show(self, id: str) -> dict[str, Any] | None:
         out = self._run(["show", id, "--json"])
         if not out:
             return None

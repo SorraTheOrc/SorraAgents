@@ -1,8 +1,6 @@
 import json
 
-from scripts.cleanup import prune_local_branches
-from scripts.cleanup import cleanup_stale_remote_branches
-from scripts.cleanup import lib
+from scripts.cleanup import cleanup_stale_remote_branches, lib, prune_local_branches
 
 
 class DummyRunner:

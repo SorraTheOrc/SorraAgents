@@ -443,9 +443,10 @@ def _main() -> None:
 
     # StatusLifecycle manages work-item status transitions:
     #   - On entry: sets status to in_progress (captures original)
-    #   - On success: sets status to completed
+    #   - On exit: restores original status (restore_on_exit) — this skill
+    #     is read-only and must NOT advance the item to `completed`
     #   - On exception: restores original status
-    with StatusLifecycle(args.work_item_id):
+    with StatusLifecycle(args.work_item_id, restore_on_exit=True):
 
         if args.verbose:
             print(f"[find-related] Work item: {args.work_item_id}", file=sys.stderr)

@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
-from typing import Union
 
 # ---------------------------------------------------------------------------
 # Language-to-extension mapping
@@ -45,7 +44,7 @@ LANGUAGE_LINTERS: dict[str, list[str]] = {
 
 
 def detect_languages(
-    project_root: Union[str, os.PathLike[str], None] = None,
+    project_root: str | os.PathLike[str] | None = None,
 ) -> list[str]:
     """Detect programming languages present in *project_root*.
 
@@ -124,7 +123,7 @@ def get_linters_for_language(language: str) -> list[str]:
 
 
 def get_linters_for_project(
-    project_root: Union[str, os.PathLike[str], None] = None,
+    project_root: str | os.PathLike[str] | None = None,
 ) -> list[dict[str, object]]:
     """Convenience: detect languages and probe linters in one call.
 
@@ -148,7 +147,7 @@ def get_linters_for_project(
 
 
 def get_full_report(
-    project_root: Union[str, os.PathLike[str], None] = None,
+    project_root: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
     """Return a complete structured report combining detection and probing.
 

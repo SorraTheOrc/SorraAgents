@@ -47,11 +47,14 @@ The refactor script manages work item status automatically via the shared
 `StatusLifecycle` context manager when invoked with a work-item-id.
 
 - **On entry:** Status is set to `in_progress`
-- **On success:** Status is set to `completed`
+- **On success:** Original status is restored (`restore_on_exit=True` — this
+  read-only skill never advances the item to `completed`, which wl only
+  allows for `in_review`/`done` stages)
 - **On error:** Status is restored to its original value
 
 No manual `wl update --status` commands are needed — the script handles
-lifecycle transparently. Stage is NOT modified by this skill.
+lifecycle transparently. Stage is NOT modified by this skill. The item is
+never left in `in_progress` when the script exits.
 
 > In `--dry-run` mode, status management is skipped entirely, since no
 > changes are being made and no work item context is expected.

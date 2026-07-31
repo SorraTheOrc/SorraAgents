@@ -5,7 +5,6 @@ import sys
 
 import skill.triage.scripts.check_or_create as cc
 
-
 # ---------------------------------------------------------------------------
 # Heuristic 1: exact test name match
 # ---------------------------------------------------------------------------

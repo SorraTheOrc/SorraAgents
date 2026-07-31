@@ -18,8 +18,9 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence, Union
+from typing import Any
 
 # Ensure the package is importable when run as __main__
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -27,15 +28,14 @@ _PACKAGE_ROOT = _SCRIPT_DIR.parent.parent.parent  # repo root
 if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
-from skill.code_review.scripts.detection import (  # noqa: E402
+from skill.code_review.scripts.detection import (
     detect_languages,
     get_linters_for_language,
     probe_linter,
 )
-from skill.code_review.scripts.linter_runner import (  # noqa: E402
+from skill.code_review.scripts.linter_runner import (
     run_linters_for_project,
 )
-
 
 # ---------------------------------------------------------------------------
 # Language filter
@@ -77,7 +77,7 @@ def _validate_languages(languages: list[str]) -> list[str]:
 
 
 def run_code_quality(
-    project_root: Union[str, os.PathLike[str], None] = None,
+    project_root: str | os.PathLike[str] | None = None,
     languages: list[str] | None = None,
     runner: Any = None,
     fix: bool = False,

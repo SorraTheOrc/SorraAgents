@@ -55,10 +55,13 @@ Status transitions are handled **automatically** by the `StatusLifecycle` contex
 manager from `../shared/status_lifecycle.py`:
 
 - **On entry:** Status is set to `in_progress` (original value captured)
-- **On success:** Status is set to `completed`
+- **On success:** Original status is restored (`restore_on_exit=True` — this
+  read-only skill never advances the item to `completed`, which wl only
+  allows for `in_review`/`done` stages)
 - **On exception:** Original status is restored
 
-> Stage is NOT modified. See `StatusLifecycle` for details.
+> Stage is NOT modified. The item is never left in `in_progress` when the
+> script exits — every path restores the pre-run status.
 
 > **Note:** The script probes semantic search availability and auto-detects the correct `wl search` response format. No manual configuration needed.
 

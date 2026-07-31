@@ -19,7 +19,7 @@ import os
 import tempfile
 import time
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Any
 
 try:
     from ampa import notifications as notifications_module
@@ -44,7 +44,7 @@ def _ensure_dir(path: str) -> None:
         LOG.exception("Failed to create tool-output dir=%s", path)
 
 
-def _excerpt_text(text: Optional[str], limit: int = 500) -> str:
+def _excerpt_text(text: str | None, limit: int = 500) -> str:
     if not text:
         return ""
     one = " ".join(str(text).split())
@@ -53,7 +53,7 @@ def _excerpt_text(text: Optional[str], limit: int = 500) -> str:
     return one[:limit].rstrip() + "..."
 
 
-def emit_internal_event(event_type: str, payload: Dict[str, Any]) -> str:
+def emit_internal_event(event_type: str, payload: dict[str, Any]) -> str:
     """Emit a simple internal event by appending a JSON line to events.log.
 
     Returns the path to the events log file.
@@ -114,7 +114,7 @@ def _responder_endpoint_url() -> str:
     return os.getenv("AMPA_RESPONDER_URL", "http://localhost:8081/respond")
 
 
-def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[bool]:
+def _send_waiting_for_input_notification(metadata: dict[str, Any]) -> bool | None:
     if notifications_module is None:
         LOG.warning("ampa.notifications is unavailable; cannot send notification")
         return None
@@ -152,12 +152,12 @@ def _send_waiting_for_input_notification(metadata: Dict[str, Any]) -> Optional[b
 
 def detect_and_surface_blocking_prompt(
     session_id: str,
-    work_item_id: Optional[str],
+    work_item_id: str | None,
     prompt_text: str,
     *,
-    choices: Optional[Any] = None,
-    context: Optional[Any] = None,
-) -> Dict[str, Any]:
+    choices: Any | None = None,
+    context: Any | None = None,
+) -> dict[str, Any]:
     """Record that a prompt is blocking and surface minimal metadata.
 
     Behaviour:
@@ -177,7 +177,7 @@ def detect_and_surface_blocking_prompt(
     # filename uses timestamp to avoid races
     stamp = str(int(time.time() * 1000))
     filename = f"pending_prompt_{session_id}_{stamp}.json"
-    metadata: Dict[str, Any] = {
+    metadata: dict[str, Any] = {
         "session": session_id,
         "session_id": session_id,
         "work_item": work_item_id,

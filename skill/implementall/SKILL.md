@@ -9,7 +9,7 @@ Use this skill when asked to run batch implementation on all `plan_complete` wor
 
 ## Behavior
 
-1. Query `wl list --stage plan_complete --status open --json` for eligible items
+1. Query `wl list --stage plan_complete --status open --needs-producer-review no --json` for eligible items (items flagged `needsProducerReview` are awaiting producer input and are excluded to avoid re-processing loops)
 2. Claim each item (`wl update <id> --status in_progress --stage in_progress`) and run `/skill:implement <id>`
 3. Detect producer-input need (non-zero exit, question patterns, exceptions)
 4. On error, recover (reset status to `open`) and record outcome
@@ -51,15 +51,26 @@ pi run /skill:implementall
 
 ## Producer-input detection
 
-Detected by: non-zero exit from `/skill:implement`, question-like patterns in output (`? (yes/no)`, "What should"), or exceptions. Flagged items are skipped (not retried).
+Detected by: non-zero exit from `/skill:implement`, question-like patterns in output (`? (yes/no)`, "What should"), or exceptions. Flagged items are skipped (not retried) and **recovered to a valid terminal state**: `status=open`, `stage=plan_complete`, `needsProducerReview=yes`. The producer-review flag keeps the item visible (`open`) while preventing the batch from re-processing it on the next run. Producers clear the flag via `wl reviewed <id> no` after triaging.
 
 ## Error handling
 
 - `wl list` failure: returns empty list gracefully
 - Claim failure: logs warning, marks as `error`
 - Implement failure: resets status to `open` and stage to `plan_complete`; continues
-- Question-pattern output: marks as `needs_input` without recovery (preserves context)
+- Question-pattern output: marks as `needs_input` and recovers to `open` + `plan_complete` + `needsProducerReview=yes` (never left `in_progress`)
 - Error outcomes trigger a **Script Execution Failure Notice** wrapping via `./scripts/failure_notice.py`
+
+## Status safety invariant
+
+No matter how an item's processing ends (implemented, needs input, error, or
+interruption), the item is **never left in `in_progress`** when the batch
+completes. Every terminal path resets to a valid status:
+
+- **implemented** → managed by the `/skill:implement` skill itself (`completed`/`in_review`)
+- **needs_input** → `open` + `plan_complete` + `needsProducerReview=yes`
+- **error** → `open` + `plan_complete`
+- **signal abort** → `open` + `plan_complete`
 
 ## Signal handling
 

@@ -15,7 +15,6 @@ Related work item: SA-0MS0DK6BD001RNDG
 """
 
 import json
-import os
 import subprocess
 import sys
 import textwrap
@@ -61,8 +60,8 @@ def _generate_runner_script(
     lines.append(f"sys.path.insert(0, {str(_REPO_ROOT)!r})")
     lines.append("")
     lines.append("import importlib.util")
-    lines.append(f"spec = importlib.util.spec_from_file_location(")
-    lines.append(f'    "implement_under_test",')
+    lines.append("spec = importlib.util.spec_from_file_location(")
+    lines.append('    "implement_under_test",')
     lines.append(f"    {str(_IMPLEMENT_PY)!r},")
     lines.append(")")
     lines.append("mod = importlib.util.module_from_spec(spec)")

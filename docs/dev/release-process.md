@@ -87,6 +87,10 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
 
 8. **Audit readiness gate — all `in_review` and `completed` items have passing audits**
    - The automated release script (`run-release.js`) enforces this gate at exit code 6.
+   - The gate distinguishes a genuine "not ready to close" verdict from an audit
+     that merely timed out or hit a transient failure (provider error, script
+     execution failure). Timed-out/transient audits are reported as warnings in
+     the gate output and do **not** block the release.
    - Run the gate manually to check:
 
      ```bash
@@ -98,6 +102,17 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
 
      ```bash
      python3 skill/audit/scripts/audit_runner.py issue <blocking-item-id>
+     ```
+
+   - If the audit timed out because it outran the per-call 1800s Pi timeout, raise
+     the effective timeout for the re-run:
+
+     ```bash
+     # Via CLI flag (per-call timeout in seconds):
+     python3 skill/audit/scripts/audit_runner.py issue <blocking-item-id> --timeout 3600
+
+     # Or via env var (applies whenever --timeout is not passed):
+     AUDIT_PI_TIMEOUT=3600 python3 skill/audit/scripts/audit_runner.py issue <blocking-item-id>
      ```
 
    - Use `--skip-checks` to bypass the gate in exceptional circumstances.

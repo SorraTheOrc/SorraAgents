@@ -17,8 +17,8 @@ Input fields:
   wbs_children: optional list of { id, title } — child work items
 """  # noqa: EXE001
 
-import sys
 import json
+import sys
 
 
 def _tshirt_display(tshirt: str) -> str:

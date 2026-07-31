@@ -14,10 +14,10 @@ Inputs (CLI args or stdin JSON):
 Output: JSON with keys: unit, o, m, p, expected, overheads_total, recommended, range, tshirt
 """  # noqa: EXE001
 
-import sys
 import json
+import sys
 
-from _shared import compute_omp, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
+from _shared import DEFAULT_THRESHOLDS, TSHIRT_MAP, compute_omp, pick_tshirt
 
 
 def main():

@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 try:
-    from jsonschema import Draft202012Validator  # noqa: F401
+    from jsonschema import Draft202012Validator
 except ImportError:
     print(
         "ERROR: jsonschema package required. Install with: pip install jsonschema",

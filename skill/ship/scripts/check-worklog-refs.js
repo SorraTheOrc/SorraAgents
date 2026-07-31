@@ -28,8 +28,11 @@ import { execSync } from 'node:child_process';
  * Check for the presence of worklog refs under refs/worklog/.
  *
  * Uses `git for-each-ref refs/worklog/` to detect any refs in the worklog
- * namespace. If such refs exist, the operation should be blocked to prevent
- * accidental merge of worklog data into main/dev.
+ * namespace. Remote-tracking mirror refs (refs/worklog/remotes/**) are
+ * excluded — they are harmless bookkeeping maintained by `wl sync` and
+ * are never merged by `git merge`/`git pull`.
+ *
+ * Only local worklog refs (e.g., refs/worklog/data) are flagged as dangerous.
  *
  * @returns {{
  *   hasWorklogRefs: boolean,
@@ -44,10 +47,15 @@ export function checkWorklogRefs() {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    const refs = output
+    const allRefs = output
       .split('\n')
       .map((line) => line.trim())
       .filter((line) => line.length > 0);
+
+    // Filter out remote-tracking mirror refs (refs/worklog/remotes/**).
+    // These are harmless bookkeeping mirrors maintained by `wl sync` and
+    // are never merged by `git merge`/`git pull` of a branch.
+    const refs = allRefs.filter((ref) => !ref.startsWith('refs/worklog/remotes/'));
 
     if (refs.length === 0) {
       return {

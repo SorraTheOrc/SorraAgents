@@ -1,14 +1,13 @@
 """Tests for skill/scripts/pi_utils.py — shared Pi JSON-stream parsing."""
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.scripts.pi_utils import extract_pi_text, parse_pi_json_line  # noqa: E402
-
+from skill.scripts.pi_utils import extract_pi_text, parse_pi_json_line
 
 # ---------------------------------------------------------------------------
 # Tests: parse_pi_json_line

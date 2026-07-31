@@ -19,8 +19,8 @@ Input: JSON via stdin with keys:
 Output: final JSON block written to stdout
 """  # noqa: EXE001
 
-import sys
 import json
+import sys
 import traceback
 from pathlib import Path
 
@@ -29,10 +29,16 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.scripts.failure_notice import FailureNotice  # noqa: E402
+from _shared import (
+    DEFAULT_THRESHOLDS,
+    TSHIRT_MAP,
+    compute_omp,
+    level_from_score,
+    pick_tshirt,
+)
 
-from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS  # noqa: E402
-
+from skill.scripts.failure_notice import FailureNotice
+from skill.shared.status_lifecycle import worklog_dir_flag
 
 # ---------------------------------------------------------------------------
 # Extracted helper functions
@@ -73,8 +79,10 @@ def _fetch_issue_stage(issue_id: str) -> str:
     try:
         import subprocess
 
+        show_cmd = ["wl", "show", issue_id, "--json"]
+        show_cmd[1:1] = worklog_dir_flag()
         show_proc = subprocess.run(  # noqa: PLW1510
-            ["wl", "show", issue_id, "--json"], capture_output=True, text=True
+            show_cmd, capture_output=True, text=True
         )
         if show_proc.returncode != 0:
             print(json.dumps({
@@ -183,6 +191,7 @@ def _update_work_item(issue_id: str, wl_effort: str, wl_risk: str) -> dict:
             str(wl_risk),
             "--json",
         ]
+        update_cmd[1:1] = worklog_dir_flag()
         update_proc = subprocess.run(update_cmd, capture_output=True, text=True)  # noqa: PLW1510
         return {
             "success": update_proc.returncode == 0,
@@ -208,8 +217,8 @@ def _render_human_text(data: dict, final: dict) -> str:
         The rendered human text string (may be empty on failure).
     """
     try:
-        import subprocess
         import os
+        import subprocess
 
         # Build a sanitized object for rendering to avoid contaminating the
         # human text. Include WBS data (items and children) for narrative generation.
@@ -269,6 +278,7 @@ def _post_comment(issue_id: str, combined_text: str) -> dict:
             combined_text,
             "--json",
         ]
+        comment_cmd[1:1] = worklog_dir_flag()
         comment_proc = subprocess.run(comment_cmd, capture_output=True, text=True)  # noqa: PLW1510
         return {
             "returncode": comment_proc.returncode,

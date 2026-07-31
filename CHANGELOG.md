@@ -1,5 +1,7 @@
 # Changelog
 
+## v0.1.13 (2026-07-31)
+
 ## v0.1.12 (2026-07-31)
 ### Bug Fixes
 - audit runner: detect provider errors, retry transient failures, fix role-aware text extraction (SA-0MS8UI3H3007GPWX)

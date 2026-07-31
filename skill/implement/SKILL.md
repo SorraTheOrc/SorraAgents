@@ -44,7 +44,7 @@ any sensitive values before writing them to logs or comments.
 ## StatusLifecycle Integration
 
 Status transitions are managed by the shared `StatusLifecycle` context manager
-from `skill/shared/status_lifecycle.py`. The implement skill's orchestration
+from `../shared/status_lifecycle.py`. The implement skill's orchestration
 script (`implement.py`) uses `StatusLifecycle` for automatic status management:
 
 - **`phase_start()`** uses `StatusLifecycle.update_status()` to claim the
@@ -57,7 +57,7 @@ script (`implement.py`) uses `StatusLifecycle` for automatic status management:
 
 For agents following this SKILL.md manually (without the orchestration script),
 use the `StatusLifecycle.update_status()` static method or the context manager
-pattern described in `skill/shared/status_lifecycle.py`.
+pattern described in `../shared/status_lifecycle.py`.
 
 ## Best Practices
 
@@ -109,6 +109,18 @@ status-reset instructions documented in the sections below:
 | 3 | User-initiated abort | Operator cancels the implementation mid-process |
 | 4 | Error/exception during implementation | API failure, network error, or unexpected exception during coding |
 | 5 | Unexpected termination | Agent crash, network failure, or external interruption (covered by Final cleanup step) |
+
+> **Status reset is conditional, not blind.** The orchestration script's
+top-level error/signal handlers and the signal handler use
+`_safety_reset_if_in_progress()` — they reset an item to `open` **only if**
+it is currently `in-progress`. This prevents clobbering items that already
+reached a valid terminal state (`open`/`blocked`/`completed`).
+
+> **Signal handling covers all phases.** Since the work-item id is tracked
+for `start`, `finish`, and `abort` alike, a SIGINT/SIGTERM during any phase
+releases the item back to `open`. The handler uses `os._exit` so the reset
+cannot be undone by a `StatusLifecycle` context-manager rollback during
+exception unwinding.
 
 ## Handling Assets
 

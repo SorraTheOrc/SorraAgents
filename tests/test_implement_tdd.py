@@ -11,11 +11,10 @@ These tests verify that:
 Related work item: SA-0MQC4A11A008BSRI
 """
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Constants

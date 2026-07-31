@@ -36,7 +36,6 @@ import shutil
 import subprocess
 from typing import Any
 
-
 LOG = logging.getLogger("refactor.workitem_creation")
 
 # ---------------------------------------------------------------------------
