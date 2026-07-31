@@ -16,8 +16,6 @@ Usage:
 from __future__ import annotations
 
 import json
-from typing import Optional
-
 
 __all__ = ["extract_pi_text", "parse_pi_json_line"]
 
@@ -118,7 +116,7 @@ def extract_pi_text(raw: str) -> str:
     return "".join(delta_parts)
 
 
-def _extract_text_from_content(content) -> Optional[str]:
+def _extract_text_from_content(content) -> str | None:
     """Extract text from a content field which may be a string or list."""
     if isinstance(content, str) and content:
         return content
@@ -133,14 +131,14 @@ def _extract_text_from_content(content) -> Optional[str]:
     return None
 
 
-def _extract_text_from_assistant_message(message) -> Optional[str]:
+def _extract_text_from_assistant_message(message) -> str | None:
     """Extract text from an assistant message dict."""
     if not isinstance(message, dict):
         return None
     return _extract_text_from_content(message.get("content"))
 
 
-def _extract_last_assistant_message_text(messages) -> Optional[str]:
+def _extract_last_assistant_message_text(messages) -> str | None:
     """Extract text from the last assistant message in a list of messages."""
     if not isinstance(messages, list):
         return None

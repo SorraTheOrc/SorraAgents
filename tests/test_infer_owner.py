@@ -4,7 +4,6 @@ import subprocess
 
 import skill.owner_inference.scripts.infer_owner as io
 
-
 # ---------------------------------------------------------------------------
 # Owner map tests
 # ---------------------------------------------------------------------------

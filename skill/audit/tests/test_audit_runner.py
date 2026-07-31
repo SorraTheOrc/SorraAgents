@@ -15,8 +15,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import pytest
-
 # ---------------------------------------------------------------------------
 # Ensure repo root is on sys.path so the audit_runner module is importable.
 # This mirrors the pattern used by tests/conftest.py.

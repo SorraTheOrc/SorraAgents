@@ -6,13 +6,11 @@ import re
 import sys
 from typing import Any
 
-
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from skill.cleanup.scripts import lib  # noqa: E402
-
+from skill.cleanup.scripts import lib
 
 PROTECTED = {"main", "master", "develop", "worklog/"}
 
@@ -97,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
                 "--json",
                 "number,title,headRefName,url,author",
             ]
-        )  # noqa: E501
+        )
         if pr_report.returncode == 0:
             open_prs = lib.parse_json_payload(pr_report.stdout) or []
     else:

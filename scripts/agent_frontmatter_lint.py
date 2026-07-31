@@ -13,10 +13,11 @@ Checks:
 Exits with code 0 if no errors found, 1 if warnings only, 2 if errors found.
 """
 import argparse
-import sys
-import yaml
 import re
+import sys
 from pathlib import Path
+
+import yaml
 
 REQUIRED_FIELDS = ["description", "mode", "model", "temperature"]
 # Allowed canonical models list. Keep this small and extendable.
@@ -98,7 +99,7 @@ def validate_file(path):
     write_allowed = bool(tools.get("write")) if isinstance(tools, dict) else False
     boundaries_text = ""
     if body:
-        m = re.search(r"\nBoundaries:\n(.*?)(\n\S|$)", body, re.S)
+        m = re.search(r"\nBoundaries:\n(.*?)(\n\S|$)", body, re.DOTALL)
         if m:
             boundaries_text = m.group(1)
         else:
@@ -106,7 +107,7 @@ def validate_file(path):
             if idx != -1:
                 boundaries_text = body[idx:]
     if write_allowed and boundaries_text:  # noqa: SIM102
-        if re.search(r"never (write|modify|commit|push)", boundaries_text, re.I):
+        if re.search(r"never (write|modify|commit|push)", boundaries_text, re.IGNORECASE):
             # Check for documented justification in raw front-matter
             if re.search(r"tools\-write\-contradiction\-justification:", fm_text):
                 pass  # documented exception

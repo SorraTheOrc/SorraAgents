@@ -3,8 +3,8 @@ import json
 import sys
 from types import SimpleNamespace
 
-
-from skill.audit.scripts.persist_audit import persist_audit, main as persist_main
+from skill.audit.scripts.persist_audit import main as persist_main
+from skill.audit.scripts.persist_audit import persist_audit
 
 
 class FakeProc(SimpleNamespace):

@@ -16,19 +16,24 @@ Input via stdin JSON:
 Output: final JSON block printed to stdout
 """  # noqa: EXE001
 
-import sys
 import json
 import math
+import sys
 
-from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS
+from _shared import (
+    DEFAULT_THRESHOLDS,
+    TSHIRT_MAP,
+    compute_omp,
+    level_from_score,
+    pick_tshirt,
+)
 
 
 def approx_pi_from_score(score):
     # Approximate probability and impact from a 1-25 score by sqrt
     v = max(1, min(25, int(round(score))))  # noqa: RUF046
     p = int(math.ceil(math.sqrt(v)))  # noqa: RUF046
-    if p > 5:
-        p = 5
+    p = min(p, 5)
     return p, p
 
 

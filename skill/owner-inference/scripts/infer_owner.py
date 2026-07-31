@@ -18,7 +18,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 DEFAULT_FALLBACK = "Build"
 DEFAULT_CONFIDENCE_THRESHOLD = 0.3
@@ -30,7 +30,7 @@ DEFAULT_RECENT_COMMITS = 50
 # ---------------------------------------------------------------------------
 
 
-def load_owner_map(repo_path: str) -> Dict[str, str]:
+def load_owner_map(repo_path: str) -> dict[str, str]:
     """Load the override map if it exists.
 
     The file is a simple YAML with path-glob -> owner mappings.
@@ -40,7 +40,7 @@ def load_owner_map(repo_path: str) -> Dict[str, str]:
     map_path = os.path.join(repo_path, ".worklog", "triage", "owner-map.yaml")
     if not os.path.isfile(map_path):
         return {}
-    result: Dict[str, str] = {}
+    result: dict[str, str] = {}
     try:
         with open(map_path) as f:
             for line in f:
@@ -58,7 +58,7 @@ def load_owner_map(repo_path: str) -> Dict[str, str]:
     return result
 
 
-def check_owner_map(repo_path: str, file_path: str) -> Optional[Tuple[str, float, str]]:
+def check_owner_map(repo_path: str, file_path: str) -> tuple[str, float, str] | None:
     """Return (assignee, confidence, reason) if file_path matches an override."""
     owner_map = load_owner_map(repo_path)
     if not owner_map:
@@ -109,7 +109,7 @@ def parse_codeowners(repo_path: str) -> list:
 
 def check_codeowners(
     repo_path: str, file_path: str
-) -> Optional[Tuple[str, float, str]]:
+) -> tuple[str, float, str] | None:
     """Match file_path against CODEOWNERS rules (last match wins)."""
     rules = parse_codeowners(repo_path)
     if not rules:
@@ -140,7 +140,7 @@ def check_codeowners(
 # ---------------------------------------------------------------------------
 
 
-def check_git_blame(repo_path: str, file_path: str) -> Optional[Tuple[str, float, str]]:
+def check_git_blame(repo_path: str, file_path: str) -> tuple[str, float, str] | None:
     """Use git blame to find the most frequent author of the file."""
     full_path = os.path.join(repo_path, file_path)
     if not os.path.isfile(full_path):
@@ -155,7 +155,7 @@ def check_git_blame(repo_path: str, file_path: str) -> Optional[Tuple[str, float
     except Exception:  # noqa: BLE001
         return None
 
-    author_counts: Dict[str, int] = {}
+    author_counts: dict[str, int] = {}
     for line in out.splitlines():
         if line.startswith("author "):
             author = line[len("author ") :]
@@ -183,7 +183,7 @@ def check_git_blame(repo_path: str, file_path: str) -> Optional[Tuple[str, float
 
 def check_recent_commits(
     repo_path: str, file_path: str, n: int = DEFAULT_RECENT_COMMITS
-) -> Optional[Tuple[str, float, str]]:
+) -> tuple[str, float, str] | None:
     """Find the most frequent committer touching file_path in the last n commits."""
     try:
         out = subprocess.check_output(
@@ -195,7 +195,7 @@ def check_recent_commits(
     except Exception:  # noqa: BLE001
         return None
 
-    authors: Dict[str, int] = {}
+    authors: dict[str, int] = {}
     for line in out.strip().splitlines():
         line = line.strip()
         if line:
@@ -223,9 +223,9 @@ def check_recent_commits(
 def infer_owner(
     repo_path: str,
     file_path: str,
-    commit: Optional[str] = None,
+    commit: str | None = None,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run heuristics in order and return the first result above threshold."""
     heuristics = [
         ("owner_map", lambda: check_owner_map(repo_path, file_path)),

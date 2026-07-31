@@ -8,9 +8,9 @@ Validates that the narrative output includes:
 """
 
 import json
+import os
 import subprocess
 import sys
-import os
 import unittest
 
 SCRIPT_DIR = os.path.join(os.path.dirname(__file__), "..", "skill", "effort-and-risk", "scripts")

@@ -247,8 +247,6 @@ class TestStatusLifecycleUnit:
         with StatusLifecycle("TEST-123"):
             pass
 
-        calls = [c.args[0] for c in mock_run.call_args_list]
-
     def test_restore_on_exit_success_restores_original(self, mock_run):
         """restore_on_exit: success restores original status, never completed.
 

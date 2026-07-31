@@ -14,6 +14,7 @@ changelog to stdout listing changes.
 import argparse
 import re
 from pathlib import Path
+
 import yaml
 
 MODEL_CANONICAL_MAP = {

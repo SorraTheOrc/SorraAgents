@@ -4,8 +4,10 @@ Written before the implementation exists (TDD).
 """
 
 
-from skill.plan.plan_helpers import validate_key_files_format, validate_key_files_in_description
-
+from skill.plan.plan_helpers import (
+    validate_key_files_format,
+    validate_key_files_in_description,
+)
 
 # =========================================================================
 # 1. validate_key_files_format — syntactic validation of a raw key-files block

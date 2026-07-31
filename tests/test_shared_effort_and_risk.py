@@ -5,8 +5,8 @@ Validates that compute_omp, pick_tshirt, TSHIRT_MAP, and DEFAULT_THRESHOLDS
 are correctly defined and behave identically to the original duplicated copies.
 """
 
-import sys
 import os
+import sys
 import unittest
 
 # Add the shared module directory to path
@@ -15,7 +15,13 @@ _SCRIPT_DIR = os.path.join(
 )
 sys.path.insert(0, _SCRIPT_DIR)
 
-from _shared import compute_omp, level_from_score, pick_tshirt, TSHIRT_MAP, DEFAULT_THRESHOLDS  # noqa: E402
+from _shared import (
+    DEFAULT_THRESHOLDS,
+    TSHIRT_MAP,
+    compute_omp,
+    level_from_score,
+    pick_tshirt,
+)
 
 
 class TestComputeOmp(unittest.TestCase):

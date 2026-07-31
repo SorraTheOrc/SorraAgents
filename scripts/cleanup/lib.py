@@ -7,10 +7,10 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Sequence
-
+from typing import Any
 
 LOG = logging.getLogger("cleanup")
 

@@ -1023,8 +1023,8 @@ class TestQualityEpicCreation:
     def test_dry_run_output_includes_computed_priority(self):
         """The --dry-run output should reflect the computed priority."""
         mod = self._import_module()
-        import io
         import contextlib
+        import io
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, MutableMapping
 from datetime import datetime
-from typing import Dict, Iterable, List, MutableMapping
 
 
 def _parse_created_at(value: str) -> datetime:
@@ -42,7 +42,7 @@ def choose_blocker(items: Iterable[dict]) -> str | None:
     return chosen.get("id")
 
 
-def group_overlaps(children: Iterable[dict]) -> Dict[str, List[dict]]:
+def group_overlaps(children: Iterable[dict]) -> dict[str, list[dict]]:
     """Group workitems by exact file path overlaps.
 
     Each child may provide an `allowed_files` list of exact paths (strings).
@@ -50,7 +50,7 @@ def group_overlaps(children: Iterable[dict]) -> Dict[str, List[dict]]:
 
     Note: this uses exact path matching. Pattern/glob support can be added later.
     """
-    groups: MutableMapping[str, List[dict]] = {}
+    groups: MutableMapping[str, list[dict]] = {}
     for child in children:
         for path in child.get("allowed_files", []) or []:
             groups.setdefault(path, []).append(child)

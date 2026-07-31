@@ -33,13 +33,13 @@ _SCHEMA_PATH = _REPO_ROOT / "docs" / "workflow" / "workflow-schema.json"
 # Reusable validator functions (from validate_state_machine.py)
 # ---------------------------------------------------------------------------
 
-from tests.validate_state_machine import (  # noqa: E402
+from tests.validate_state_machine import (
     ValidationResult,
     validate_delegation,
     validate_invariants,
     validate_roles,
     validate_state_machine,
-)  # noqa: E402
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures

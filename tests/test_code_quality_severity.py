@@ -234,9 +234,9 @@ class TestRunLinterFixMode:
 
     def test_run_linter_fix_mode_no_fixes(self):
         """Returns (empty, False) when no fixes are applied."""
-        from unittest.mock import MagicMock
         from pathlib import Path
         from subprocess import CompletedProcess
+        from unittest.mock import MagicMock
 
         mock_runner = MagicMock()
         # First call (fix) returns no issues
@@ -256,9 +256,9 @@ class TestRunLinterFixMode:
 
     def test_run_linter_fix_mode_with_fixes(self):
         """Returns (findings, True) when fixes are applied."""
-        from unittest.mock import MagicMock
         from pathlib import Path
         from subprocess import CompletedProcess
+        from unittest.mock import MagicMock
 
         mock_runner = MagicMock()
         # Fix call: returncode 1 with output
@@ -289,9 +289,9 @@ class TestRunLinterFixMode:
 
     def test_run_linter_fix_mode_error_returncode(self):
         """Returns (empty, False) when the fix command returns an error code."""
-        from unittest.mock import MagicMock
         from pathlib import Path
         from subprocess import CompletedProcess
+        from unittest.mock import MagicMock
 
         mock_runner = MagicMock()
         mock_runner.return_value = CompletedProcess(

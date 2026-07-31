@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-
 LOG = logging.getLogger("refactor.config")
 
 # ---------------------------------------------------------------------------

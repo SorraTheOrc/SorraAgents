@@ -7,11 +7,10 @@ before implementation work items.
 Related work item: SA-0MPAW77DY002QSP4
 """
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # Constants

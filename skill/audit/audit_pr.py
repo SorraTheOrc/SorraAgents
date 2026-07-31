@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
+from typing import Any
 
 from skill.scripts.pi_utils import extract_pi_text
 
@@ -40,7 +40,7 @@ class PRInfo:
     head_ref: str = ""
 
 
-def parse_input_ref(ref: str) -> Optional[Tuple[str, str, int]]:
+def parse_input_ref(ref: str) -> tuple[str, str, int] | None:
     """Parse a GitHub PR ref from a string. Returns (owner, repo, number) or None."""
     m = PR_URL_RE.search(ref)
     if m:
@@ -51,7 +51,7 @@ def parse_input_ref(ref: str) -> Optional[Tuple[str, str, int]]:
     return None
 
 
-def extract_wl_id(text: str) -> Optional[str]:
+def extract_wl_id(text: str) -> str | None:
     """Return first WL id-like token found in text."""
     if not text:
         return None
@@ -61,7 +61,7 @@ def extract_wl_id(text: str) -> Optional[str]:
     return None
 
 
-def gh_get_pr(owner: str, repo: str, number: int) -> Optional[PRInfo]:
+def gh_get_pr(owner: str, repo: str, number: int) -> PRInfo | None:
     """Fetch PR metadata using gh api; returns PRInfo or None on failure.
     Best-effort: returns None if gh is unavailable or call fails.
     """
@@ -85,7 +85,7 @@ def gh_get_pr(owner: str, repo: str, number: int) -> Optional[PRInfo]:
         return None
 
 
-def detect_build_command(path: str = '.') -> Optional[str]:
+def detect_build_command(path: str = '.') -> str | None:
     """Heuristic detection of build/test command for repository at path."""
     if os.path.exists(os.path.join(path, 'package.json')):
         return 'npm test'
@@ -96,7 +96,7 @@ def detect_build_command(path: str = '.') -> Optional[str]:
     return None
 
 
-def create_ephemeral_checkout(owner: str, repo: str, pr_number: int, head_ref: Optional[str] = None, dry_run: bool = True) -> str:
+def create_ephemeral_checkout(owner: str, repo: str, pr_number: int, head_ref: str | None = None, dry_run: bool = True) -> str:
     """Create an ephemeral checkout for the PR head and return path.
 
     Implementation notes:
@@ -132,7 +132,7 @@ def create_ephemeral_checkout(owner: str, repo: str, pr_number: int, head_ref: O
         raise RuntimeError(f"Failed to create ephemeral checkout: {e}")
 
 
-def run_build_test(path: str, build_cmd: str, timeout: int = 600, dry_run: bool = True) -> Tuple[int, str]:
+def run_build_test(path: str, build_cmd: str, timeout: int = 600, dry_run: bool = True) -> tuple[int, str]:
     """Run the build/test command in path, capture logs, and return (exit_code, log_path).
 
     In dry_run mode the function returns (0, <proposed-log-path>) without running commands.
@@ -167,7 +167,7 @@ def run_build_test(path: str, build_cmd: str, timeout: int = 600, dry_run: bool 
         return 2, log_path
 
 
-def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bool = True) -> Tuple[int, str]:
+def run_audit_in_worktree(path: str, wl_id: str, timeout: int = 600, dry_run: bool = True) -> tuple[int, str]:
     """Run the audit command against the given worktree and return (exit_code, log_path).
 
     The audit command is invoked via `pi -p --mode json "/audit <wl-id>"` (non-interactive,
@@ -257,7 +257,7 @@ def append_audit_comment(wl_id: str, audit_text: str, dry_run: bool = True) -> b
         return False
 
 
-def create_wl_from_pr(pr: PRInfo, dry_run: bool = True) -> Optional[str]:
+def create_wl_from_pr(pr: PRInfo, dry_run: bool = True) -> str | None:
     """Create a WL work item from PR metadata and return the new WL id."""
     title = f"Audit PR flow follow-up: {pr.title or f'PR #{pr.number}'}"
     description = (
@@ -280,7 +280,7 @@ def create_wl_from_pr(pr: PRInfo, dry_run: bool = True) -> Optional[str]:
         return None
 
 
-def resolve_wl_for_pr(pr: PRInfo, explicit_wl: Optional[str] = None, allow_create: bool = False, dry_run: bool = True) -> Tuple[Optional[str], str]:
+def resolve_wl_for_pr(pr: PRInfo, explicit_wl: str | None = None, allow_create: bool = False, dry_run: bool = True) -> tuple[str | None, str]:
     """Resolve WL id for a PR using explicit id, title/body extraction, or optional create flow.
 
     Returns (wl_id, resolution_note).
@@ -301,7 +301,7 @@ def resolve_wl_for_pr(pr: PRInfo, explicit_wl: Optional[str] = None, allow_creat
     return None, 'unresolved-needs-user-input'
 
 
-def gh_get_pr_checks(owner: str, repo: str, number: int) -> Dict[str, Any]:
+def gh_get_pr_checks(owner: str, repo: str, number: int) -> dict[str, Any]:
     """Get PR check/merge readiness summary using gh.
 
     Returns dict with keys:
