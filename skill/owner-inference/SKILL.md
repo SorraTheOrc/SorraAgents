@@ -30,12 +30,12 @@ Inputs / Outputs
 
 ## Script
 
-`./scripts/infer_owner.py`
+`skill/owner-inference/scripts/infer_owner.py`
 
 ## Example
 
 ```bash
-python3 ./scripts/infer_owner.py --repo . --file tests/test_foo.py --commit abc123
+python3 skill/owner-inference/scripts/infer_owner.py --repo . --file tests/test_foo.py --commit abc123
 wl show SA-0MPYMFZXO0004ZU4 --json
 ```
 

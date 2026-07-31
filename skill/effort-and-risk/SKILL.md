@@ -52,7 +52,7 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 3. Run orchestrator, capture output to `<issue-id>`-based filename:
 
    ```sh
-   python3 ./scripts/run_skill.py --issue <id> <<'JSON' > final-<id>.json
+   python3 skill/effort-and-risk/scripts/run_skill.py --issue <id> <<'JSON' > final-<id>.json
    { "items": [...], "o": ..., "m": ..., "p": ..., "overheads": {...}, "parent": {...}, "children": [...], "certainty": 85, "assumptions": [...], "unknowns": [...] }
    JSON
    ```
@@ -63,8 +63,8 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 
 ## Scripts
 
-- Orchestrator: `./scripts/orchestrate_estimate.py`
-- CLI wrapper: `./scripts/run_skill.py`
+- Orchestrator: `skill/effort-and-risk/scripts/orchestrate_estimate.py`
+- CLI wrapper: `skill/effort-and-risk/scripts/run_skill.py`
 - Calculators: `calc_effort.py`, `calc_risk.py`, `calc_effort_with_risk.py`
 - Formatters: `assemble_json.py`, `json_to_human.py`
 
@@ -76,7 +76,7 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 ### Example
 
 ```sh
-python3 ./scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > final-SA-0MPYMFZXO0004ZU4.json
+python3 skill/effort-and-risk/scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > final-SA-0MPYMFZXO0004ZU4.json
 { ... }
 JSON
 wl show SA-0MPYMFZXO0004ZU4 --format full

@@ -37,7 +37,7 @@ References
 Script
 ------
 
-`./scripts/check_or_create.py` — implementation using `wl` CLI.
+`skill/triage/scripts/check_or_create.py` — implementation using `wl` CLI.
 
 Matching Heuristics (in order)
 ------------------------------
@@ -71,7 +71,7 @@ cat <<'JSON' > payload.json
   "file_path": "tests/test_example.py"
 }
 JSON
-python3 ./scripts/check_or_create.py payload.json
+python3 skill/triage/scripts/check_or_create.py payload.json
 ```
 
 Output (new issue): `{"issueId": "SA-NEW", "created": true, "reason": "No matching incomplete test-failure issue found; created new."}`
