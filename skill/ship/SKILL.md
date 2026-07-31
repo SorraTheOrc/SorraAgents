@@ -1,59 +1,60 @@
 ---
 name: ship
-description: "Canonical push-to-dev and branch-policy enforcement for agents. Provides the push-to-dev workflow, branch naming, conflict handling, and release process guidance. Trigger with: /skill:ship push-to-dev"
+description: "Canonical dev-to-main release workflow. Provides the release process (dev → main merge) with automated gating for unmerged branches, audit readiness, critical items, worklog refs, and producer review. Trigger with: /skill:ship release"
 ---
 
 # Ship Skill
 
-Canonical agent-side push-to-dev behaviour and branch-policy enforcement, with
-automated dev-to-main release execution.
+Canonical agent-side dev-to-main release execution with automated gating.
 
 ## Purpose
 
-Provide deterministic push-to-dev and release workflow: agents push feature branches into `dev`; the release process promotes `dev` to `main` via a gated, PR-based merge.
+Provide a single, deterministic release workflow: `dev` is promoted to `main` via a gated, PR-based merge. All helper functions (branch naming, validation, unmerged-branch detection, audit readiness, etc.) are internal implementation details.
 
 ## When To Use
 
-- Push completed work into the `dev` integration branch.
-- Generate a canonical branch name for a work item.
-- Validate a branch name or check branch protection.
-- Execute a release (dev → main merge).
+- Execute a release (promote `dev` to `main`).
 
-Triggers: "release", "merge dev to main", "ship it", "promote dev", "release the changes"
+Triggers: "ship it", "shipit", "ship", "release", "promote dev", "merge dev to main", "release the changes" — all map to the `release` action.
 
 ## How Agents Invoke This Skill
 
 ```
-/skill:ship <action>
+/skill:ship release
 ```
 
-| Action | Description |
-|--------|-------------|
-| `check-unmerged-branches` | List local branches not yet merged into `dev` |
-| `push-to-dev` | Push current branch into `dev` |
-| `validate-branch <name>` | Validate against canonical pattern |
-| `generate-name <work-item-id> <short-desc>` | Generate canonical branch name |
-| `check-blocked <branch>` | Check if a branch is protected |
-| `release` | Execute dev → main release |
-| `help` | Print documentation |
+The `release` action runs the full dev→main release pipeline (see Release Process below).
 
 ## Prerequisites
 
 - **Node.js** 18+, **git**, **gh** CLI, **wl** CLI (Worklog), **jq** CLI
 
-## Scripts and Modules
+## Internal Scripts and Modules
 
-- `./scripts/ship.js` — Push-to-dev module (`pushToDev`, `pushToBranch`, `validatePushTarget`, `checkUnmergedBranches`, `checkAuditReadyToClose`)
-- `./scripts/git-helpers.js` — Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`)
-- `./scripts/check-unmerged-branches.js` — Unmerged branch detection
-- `./scripts/check-audit-gate.js` — Audit readiness gating
-- `./scripts/run-release.js` — Release wrapper (includes gating, post-release dev sync)
-- `./scripts/release/merge-dev-to-main.sh` — Canonical release merge script
+All scripts below are internal implementation details — they are not exposed as user-facing actions. The only user-facing action is `release`.
+
+| Script | Purpose |
+|--------|---------|
+| `./scripts/run-release.js` | Release wrapper (includes gating, post-release dev sync) |
+| `./scripts/release/merge-dev-to-main.sh` | Canonical release merge script |
+| `./scripts/ship.js` | Push-to-dev helper (`pushToDev`, `pushToBranch`, `validatePushTarget`) — used by the implement/implement-single workflow |
+| `./scripts/git-helpers.js` | Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`) |
+| `./scripts/check-unmerged-branches.js` | Unmerged branch detection |
+| `./scripts/check-audit-gate.js` | Audit readiness and producer-review gating |
+| `./scripts/check-critical-items.js` | Critical-items gating |
+| `./scripts/check-worklog-refs.js` | Worklog refs gating |
 
 ## Usage
 
+```bash
+# Execute a release (dev → main merge)
+node ./scripts/run-release.js
+```
+
+For programmatic access to internal helpers (used by the implement/implement-single workflow):
+
 ```javascript
-// Push completed work into dev
+// Push completed work into dev (internal to implement workflow)
 import { pushToDev } from './scripts/ship.js';
 
 const result = pushToDev('origin');
@@ -74,66 +75,19 @@ const blocked = isBranchBlocked('main');
 // Returns: true
 ```
 
-## Unmerged Branches Gating Step
+## Gating
 
-Before performing any operation that integrates branches (push-to-dev, release),
-the ship skill automatically checks for local branches that are not yet merged
-into `dev`. This is a **gating step** to prevent accidentally pushing when there
-are unmerged feature branches that should be dealt with first.
+The `release` action runs five gating checks before merging `dev` to `main`:
 
-The check works as follows:
+1. **Unmerged branches check** — aborts with report if feature branches pending; exit code 3; `--skip-checks` bypasses.
+2. **Audit readiness gate** — verifies all `in_review`/`completed` items pass audits; exit code 6; `--skip-checks` bypasses.
+3. **Critical-items gate** — aborts if non-terminal critical items exist; exit code 7; `--skip-checks` bypasses.
+4. **Worklog refs gate** — aborts if worklog refs are still present in merged code; exit code 8.
+5. **Producer-review gate** — aborts if items need producer review; exit code 9; `--skip-checks` bypasses.
 
-1. Runs `git branch --no-merged dev` to list all local branches not merged into `dev`.
-2. Excludes `dev` itself, protected branches (`main`, `master`), and the
-   **current branch** (the branch being worked on).
-3. For each remaining branch matching the canonical `wl-<work-item-id>-<slug>` pattern,
-   extracts the work item ID and queries Worklog (wl) for its title, status, and stage.
-4. Returns a structured report listing each unmerged branch with its associated
-   work item details.
+Bypass all checks: `node ./scripts/run-release.js --skip-checks`
 
-If unmerged branches are found, the operation is blocked with a report that shows:
-
-- The branch name
-- The associated work item title and ID (if the branch follows the canonical pattern)
-- The work item's status and stage
-
-### Using checkUnmergedBranches Programmatically
-
-```javascript
-import { checkUnmergedBranches } from './scripts/check-unmerged-branches.js';
-const report = checkUnmergedBranches();
-// Returns: { hasUnmergedBranches, message, unmergedBranches: [{branch, workItemId, title, status, stage}] }
-```
-
-### Gating in pushToDev and pushToBranch
-
-Both `pushToDev()` and `pushToBranch()` (when targeting `dev`) automatically
-run the unmerged branches check before executing the push. If unmerged branches
-are found, the push is rejected with the report in the error message.
-
-To bypass the gating check, resolve or merge the unmerged branches first.
-
-### Audit Readiness Gating
-
-Verifies all `in_review`/`completed` work items have passing audits before release:
-
-1. Query candidates: `wl list --stage in_review --json` + `wl list --status completed --json` (dedup, exclude `done`).
-2. For each, check `wl audit-show <id> --json` → `audit.readyToClose`.
-3. Items with `readyToClose: false`, `null`, or missing audit → blocking.
-4. Blocking items abort release with exit code 6.
-5. Gate respects `--skip-checks` flag.
-
-#### Using checkAuditReadyToClose Programmatically
-
-```javascript
-import { checkAuditReadyToClose } from './scripts/check-audit-gate.js';
-const report = await checkAuditReadyToClose();
-// report: { hasBlockingItems, message, blockingItems: [{workItemId, title, reason, summary, remediation}] }
-```
-
-#### Exit Code
-
-The audit gate uses exit code 6 to distinguish from other failure modes:
+### Exit Codes
 
 | Code | Meaning |
 |------|---------|
@@ -142,72 +96,10 @@ The audit gate uses exit code 6 to distinguish from other failure modes:
 | 3 | Unmerged branches found |
 | 4 | PR merge failed |
 | 5 | Dev sync failed |
-| **6** | **Audit gate failure (items not ready to close)** |
-| **7** | **Critical-items gate failure (critical items not in terminal state)** |
-
-### Critical-Item Gating
-
-Checks whether any critical-priority items are not in a terminal state (`status=completed`, `stage=in_review` or `done`) before release:
-
-1. Query: `wl list --priority critical --json`.
-2. For each item, check `isTerminalState()`: status must be `completed` AND stage must be `in_review` or `done`.
-3. Non-terminal items → blocking, abort release with exit code 7.
-4. Gates respects `--skip-checks`.
-
-#### Using checkCriticalItems Programmatically
-
-```javascript
-import { checkCriticalItems } from './scripts/check-critical-items.js';
-const report = checkCriticalItems();
-// Returns: { hasBlockingItems, message, blockingItems: [{workItemId, title, currentStatus, currentStage}] }
-```
-
-#### Exit Code
-
-The critical-items gate uses exit code 7 to distinguish from other failure
-modes:
-
-| Code | Meaning |
-|------|---------|
-| **7** | **Critical-items gate failure (critical items not in terminal state)** |
-
-### Gating in run-release.js
-
-Runs three gating checks before release:
-
-1. Unmerged branches check (exit code 3)
-2. Audit readiness gate (exit code 6)
-3. Critical-priority items gate (exit code 7)
-
-Any failure aborts the release. Bypass all checks: `node ./scripts/run-release.js --skip-checks`
-
-## Push-to-Dev Workflow
-
-See [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full worktree workflow and [AGENTS.md](../../AGENTS.md#implement-the-work-item) for the top-level policy.
-
-1. Create a worktree (use `makeBranchName` from `./scripts/git-helpers.js`).
-2. Make changes and commit.
-3. Validate branch name with `validateBranchName()`.
-4. Check for unmerged branches (automatic in `pushToDev()`).
-5. Push: `pushToDev()` from `./scripts/ship.js` — validates target, rejects force-push, gates unmerged branches, executes push.
-
-### Protected Branches
-
-Agents MUST NOT push to `main`, `master`, or `HEAD`. Use `isBranchBlocked()` or `validatePushTarget()`.
-
-### Conflict Handling
-
-`pushToDev()` returns `{ success: false, error }` on non-fast-forward rejection. Record conflict details in a work-item comment and resolve manually.
-
-## Branch Naming Policy
-
-All branches MUST follow: `wl-<work-item-id>-<short-description>` (e.g., `wl-SA-001-fix-login-bug`).
-
-Validation pattern: `/^wl-[A-Z0-9]+(-[A-Z0-9]+)*-[a-z0-9]+(-[a-z0-9]+)*$/`
-
-### Pre-push Hook
-
-Located at `.githooks/pre-push`. Enforce via `git config core.hooksPath .githooks`. Force-push is prohibited.
+| 6 | Audit gate failure (items not ready to close) |
+| 7 | Critical-items gate failure (critical items not in terminal state) |
+| 8 | Worklog-ref gate failure (worklog refs present) |
+| 9 | Producer-review gate failure (items need producer review) |
 
 ## Release Process
 
@@ -227,7 +119,7 @@ Steps:
 8. **Audit logging** — records merge hash, CI run IDs, PR URL in worklog.
 9. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push.
    > Release ops run from **main checkout**, not worktrees.
-10. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, logs warnings on individual failures.
+10. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Logs warnings on individual close failures.
 
 ### Fallback: Human Release Manager
 
@@ -264,7 +156,7 @@ See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md) for local test c
 
 ## Integration with AGENTS.md
 
-`pushToDev()` handles the **dev integration step** before the final PR to `main`. See [AGENTS.md](../../AGENTS.md) and [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full workflow.
+The implement/implement-single workflow uses `pushToDev()` internally to push feature branches into `dev`. The ship skill's `release` action promotes `dev` to `main`. See [AGENTS.md](../../AGENTS.md) and [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full workflow.
 
 ## Outputs
 

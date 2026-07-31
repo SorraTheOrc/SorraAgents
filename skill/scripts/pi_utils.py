@@ -11,7 +11,7 @@ Usage:
 
     raw = subprocess.run(..., capture_output=True).stdout
     text = extract_pi_text(raw)
-"""
+"""  # noqa: EXE001
 
 from __future__ import annotations
 

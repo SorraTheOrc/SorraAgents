@@ -26,7 +26,7 @@ The notice uses a prominent banner format:
     ════════════════════════════════════════════════════════
 
 And is placed as the first and last lines of the output.
-"""
+"""  # noqa: EXE001
 
 from __future__ import annotations
 

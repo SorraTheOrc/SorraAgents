@@ -118,7 +118,7 @@ class WLAdapter:
             return []
         try:
             return json.loads(out)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return []
 
     def dep_add(self, blocked: str, blocker: str) -> bool:
@@ -137,7 +137,7 @@ class WLAdapter:
             return []
         try:
             return json.loads(out)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return []
 
     def post_comment(self, id: str, text: str) -> bool:
@@ -152,7 +152,7 @@ class WLAdapter:
             return None
         try:
             return json.loads(out)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return None
 
     def detect_existing_comment_exact(self, id: str, text: str) -> bool:

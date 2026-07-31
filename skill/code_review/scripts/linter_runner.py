@@ -328,7 +328,7 @@ def _run_subprocess(cmd: list[str], cwd: str | Path | None = None) -> subprocess
     Returns the CompletedProcess on any outcome (caller checks returncode).
     """
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: PLW1510
             cmd,
             capture_output=True,
             text=True,
@@ -380,7 +380,7 @@ def _commit_changes(
         msg = f"Auto-fix: {linter_name} applied fixes"
         runner(["git", "commit", "-m", msg], cwd=root)
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Silently fail - don't block the main flow
         return False
 
@@ -863,7 +863,7 @@ def run_dotnet_format(
     # dotnet format outputs file paths for violations
     for line in output.splitlines():
         line = line.strip()
-        if line and (line.endswith(".cs") or line.endswith(".csproj")):
+        if line and (line.endswith(".cs") or line.endswith(".csproj")):  # noqa: PIE810
             findings.append({
                 "file": line,
                 "line": 0,

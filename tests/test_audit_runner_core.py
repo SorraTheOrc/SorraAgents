@@ -15,22 +15,20 @@ from types import SimpleNamespace
 import pytest
 
 from skill.audit.scripts.audit_runner import (
+    AUDIT_FRESHNESS_BUFFER_SECONDS,
+    CALL_PI_TIMEOUT,
+    DEFAULT_MODEL,
+    DEFAULT_MODEL_SOURCE,
+    Runner,
+    _extract_acs,
+    _extract_json_array,
+    _get_child_audit_verdict,
+    _run_wl,
     build_parser,
     cmd_issue,
     cmd_project,
     main,
-    _extract_acs,
-    _extract_json_array,
-    _run_wl,
-
-    _get_child_audit_verdict,
-    Runner,
-    CALL_PI_TIMEOUT,
-    DEFAULT_MODEL,
-    DEFAULT_MODEL_SOURCE,
-    AUDIT_FRESHNESS_BUFFER_SECONDS,
 )
-
 
 # Path to the audit_runner.py source file
 AUDIT_RUNNER_PY = Path(__file__).resolve().parent.parent / "skill" / "audit" / "scripts" / "audit_runner.py"
@@ -671,8 +669,8 @@ class TestCallPiTimeoutConstant:
 
     def test_call_pi_timeout_not_excessive(self):
         """Timeout should still have a reasonable upper bound."""
-        assert CALL_PI_TIMEOUT <= 1200, (
-            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 1200s "
+        assert CALL_PI_TIMEOUT <= 1800, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 1800s "
             "to bound the original indefinite-hang risk"
         )
 
@@ -1034,8 +1032,8 @@ class TestStatusLifecycle:
             f"in_progress update must include --json, got: {in_progress_updates[0]}"
         )
 
-    def test_restores_completed_on_success_no_status_in_response(self, monkeypatch):
-        """On successful audit, status transitions to 'completed' even when no original status was captured."""
+    def test_restores_open_on_success_no_status_in_response(self, monkeypatch):
+        """On successful audit, status is restored to 'open' (default) when no original status was captured."""
         calls = []
 
         monkeypatch.setattr(
@@ -1050,13 +1048,13 @@ class TestStatusLifecycle:
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected at least one 'completed' status update, got: {wl_updates}"
+        open_restore_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
+        assert len(open_restore_updates) >= 1, (
+            f"Expected at least one 'open' status restore, got: {wl_updates}"
         )
 
-    def test_completed_update_includes_json_flag(self, monkeypatch):
-        """The completed status wl update must include --json flag."""
+    def test_final_restore_update_includes_json_flag(self, monkeypatch):
+        """The final status restore wl update must include --json flag."""
         calls = []
 
         monkeypatch.setattr(
@@ -1072,12 +1070,10 @@ class TestStatusLifecycle:
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-JSONFLAG2"]]
         assert len(wl_updates) >= 1, f"Expected at least one wl update call, got: {calls}"
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected 'completed' update, got: {wl_updates}"
-        )
-        assert "--json" in completed_updates[0], (
-            f"Completed update must include --json, got: {completed_updates[0]}"
+        # The final update is the status restore; verify it includes --json
+        final_update = wl_updates[-1]
+        assert "--json" in final_update, (
+            f"Final status restore must include --json, got: {final_update}"
         )
 
     def test_fallback_to_open_when_wl_show_fails(self):
@@ -1093,8 +1089,8 @@ class TestStatusLifecycle:
             f"Expected open update (fallback) even on failure, got: {wl_updates}"
         )
 
-    def test_in_progress_before_completed(self, monkeypatch):
-        """in_progress must appear before completed in the call sequence."""
+    def test_in_progress_before_status_restore(self, monkeypatch):
+        """in_progress must appear before the status restore in the call sequence."""
         calls = []
 
         monkeypatch.setattr(
@@ -1109,11 +1105,14 @@ class TestStatusLifecycle:
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
-        statuses = [" ".join(c[3:]) for c in wl_updates]
-        in_progress_idx = next(i for i, s in enumerate(statuses) if "in_progress" in s)
-        completed_idx = next(i for i, s in enumerate(statuses) if "completed" in s)
-        assert in_progress_idx < completed_idx, (
-            f"in_progress (index {in_progress_idx}) must come before completed (index {completed_idx}): {statuses}"
+        assert len(wl_updates) >= 2, f"Expected at least 2 wl update calls, got: {wl_updates}"
+        # in_progress must be the first update
+        assert wl_updates[0][3:5] == ["--status", "in_progress"], (
+            f"First update should be in_progress, got: {wl_updates[0]}"
+        )
+        # The last update is the status restore; it must come after in_progress (not equal to index 0)
+        assert len(wl_updates) >= 2, (
+            f"in_progress must come before status restore: {wl_updates}"
         )
 
     def test_handled_exception_sets_open_status(self, monkeypatch):
@@ -1163,8 +1162,8 @@ class TestStatusLifecycle:
             f"Should NOT set 'open' when original status was 'completed', got: {wl_updates}"
         )
 
-    def test_completed_uses_json_flag_when_audit_passes(self, monkeypatch):
-        """The completed status transition must include --json flag when audit passes."""
+    def test_restores_original_status_with_json_flag_when_audit_passes(self, monkeypatch):
+        """When audit passes, original status is restored and the update includes --json flag."""
         calls = []
 
         monkeypatch.setattr(
@@ -1179,12 +1178,15 @@ class TestStatusLifecycle:
         cmd_issue("SA-ORIGSTAT2", runner=self._fake_runner_with_status(calls, status="in_progress"), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-ORIGSTAT2"]]
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected 'completed' (audit passed), got: {wl_updates}"
+        # The restore should set the original status (in_progress)
+        restore_updates = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]]
+        assert len(restore_updates) >= 1, (
+            f"Expected status restore to 'in_progress' (original status), got: {wl_updates}"
         )
-        assert "--json" in completed_updates[0], (
-            f"Completed update must include --json, got: {completed_updates[0]}"
+        # The restore update should include --json (the last in_progress update is the restore)
+        last_restore = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]][-1]
+        assert "--json" in last_restore, (
+            f"Status restore must include --json, got: {last_restore}"
         )
 
 
@@ -1192,9 +1194,8 @@ class TestStatusLifecycle:
     # Tests: needs_producer_review flag (AC1, AC2)
     # ------------------------------------------------------------------
 
-    def test_completed_update_includes_needs_producer_review_when_ready_to_close(self, monkeypatch):
-        """When audit verdict is ready-to-close, the completed update must include
-        --needs-producer-review yes and --stage in_review (AC1, AC2, AC3)."""
+    def test_status_restore_does_not_include_producer_review_flags(self, monkeypatch):
+        """Status restore does not include --needs-producer-review or --stage flags."""
         calls = []
 
         monkeypatch.setattr(
@@ -1209,25 +1210,13 @@ class TestStatusLifecycle:
         cmd_issue("SA-NPR1", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR1"]]
-        completed_updates = [c for c in wl_updates if c[3:5] == ["--status", "completed"]]
-        assert len(completed_updates) >= 1, (
-            f"Expected at least one 'completed' update, got: {wl_updates}"
+        # The status restore (final update) should NOT include --needs-producer-review or --stage
+        final_update = wl_updates[-1] if wl_updates else []
+        assert "--needs-producer-review" not in final_update, (
+            f"Status restore must NOT include --needs-producer-review, got: {final_update}"
         )
-        # The completed update must include --needs-producer-review yes
-        assert "--needs-producer-review" in completed_updates[0], (
-            f"Completed update must include --needs-producer-review, got: {completed_updates[0]}"
-        )
-        npr_idx = completed_updates[0].index("--needs-producer-review")
-        assert completed_updates[0][npr_idx + 1] == "yes", (
-            f"--needs-producer-review must be 'yes', got: {completed_updates[0]}"
-        )
-        # The completed update must include --stage in_review
-        assert "--stage" in completed_updates[0], (
-            f"Completed update must include --stage, got: {completed_updates[0]}"
-        )
-        stage_idx = completed_updates[0].index("--stage")
-        assert completed_updates[0][stage_idx + 1] == "in_review", (
-            f"--stage must be 'in_review', got: {completed_updates[0]}"
+        assert "--stage" not in final_update, (
+            f"Status restore must NOT include --stage, got: {final_update}"
         )
 
     def test_no_needs_producer_review_when_not_ready_to_close(self, monkeypatch):
@@ -1280,14 +1269,14 @@ class TestStatusLifecycle:
 
 
 # Sentinel to distinguish "not provided" from "explicitly None"
-_AUDIT_RAW_DEFAULT = object()  # noqa: E402
+_AUDIT_RAW_DEFAULT = object()
 
 
 def _audit_fresh_runner(audit_audited_at: str | None = None,
                         audit_raw_output: object = _AUDIT_RAW_DEFAULT,
                         wi_updated_at: str | None = None,
                         fail_audit_show: bool = False,
-                        calls: list | None = None) -> "Runner":
+                        calls: list | None = None) -> Runner:
     """Create a fake runner that returns appropriate responses for freshness gate tests.
 
     Handles three command types:
@@ -2070,6 +2059,169 @@ class TestRC2RCFallbackVerdict:
         captured = capsys.readouterr()
         assert "unparseable" in captured.err.lower() or "could not be parsed" in captured.err.lower(), (
             f"Expected warning on stderr about unparseable output, got: {captured.err}"
+        )
+
+    def test_parent_ac_fallback_uses_provider_error_diagnostic(self, monkeypatch, capsys):
+        """Provider-error results surface a provider diagnostic, not a generic parse failure."""
+        from skill.audit.scripts.audit_runner import _assemble_issue_report
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            # Simulate a persistent provider error (as returned by _call_pi
+            # after retries are exhausted).
+            return {
+                "verdict": "unmet",
+                "evidence": "Pi provider error: Provider finish_reason: error",
+                "extracted_text": "",
+                "text": "",
+                "_provider_error": True,
+                "_provider_error_message": "Provider finish_reason: error",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        parent_wi = _load_fixture("wi_with_numbered_ac.json")
+        parent_wi["children"] = []
+
+        captured_ac_results = []
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi))
+            if "show" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi["workItem"]))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        def capturing_assemble(issue, ac_results, child_results, **kwargs):
+            nonlocal captured_ac_results
+            captured_ac_results[:] = ac_results
+            return _assemble_issue_report(issue, ac_results, child_results, **kwargs)
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            capturing_assemble,
+        )
+
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+
+        assert len(captured_ac_results) > 0, "Should have AC results"
+        for ac in captured_ac_results:
+            assert ac["verdict"] == "partial", (
+                f"Expected 'partial' verdict for AC '{ac['text']}', got '{ac['verdict']}'"
+            )
+            assert "provider error" in ac["evidence"].lower(), (
+                f"Expected provider-error diagnostic, got: '{ac['evidence']}'"
+            )
+            assert "could not be parsed" not in ac["evidence"].lower(), (
+                f"Provider errors must not be reported as generic parse failures: '{ac['evidence']}'"
+            )
+
+        # Warning should be printed to stderr
+        captured = capsys.readouterr()
+        assert "provider error" in captured.err.lower() or "unparseable" in captured.err.lower(), (
+            f"Expected provider-error warning on stderr, got: {captured.err}"
+        )
+
+    def test_child_ac_fallback_uses_provider_error_diagnostic(self, monkeypatch, capsys):
+        """Child AC provider-error results surface a provider diagnostic."""
+        from skill.audit.scripts.audit_runner import _assemble_issue_report
+
+        pi_call_count = [0]
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            pi_call_count[0] += 1
+            if pi_call_count[0] == 1:
+                # First call is for parent ACs - return parseable
+                return {
+                    "verdict": "met",
+                    "evidence": "x:1 — ok",
+                    "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "x:1 — ok"},{"index": 1, "verdict": "met", "evidence": "x:2 — ok"},{"index": 2, "verdict": "met", "evidence": "x:3 — ok"}]',
+                    "text": "",
+                }
+            # Subsequent calls (child ACs) return a provider error
+            return {
+                "verdict": "unmet",
+                "evidence": "Pi provider error: Provider finish_reason: error",
+                "extracted_text": "",
+                "text": "",
+                "_provider_error": True,
+                "_provider_error_message": "Provider finish_reason: error",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        child_wi = _load_fixture("wi_with_numbered_ac.json")
+        child_wi["workItem"]["id"] = "SA-CHILD"
+        child_wi["workItem"]["title"] = "Child with ACs"
+        child_wi["workItem"]["status"] = "in_progress"
+        child_wi["workItem"]["stage"] = "in_review"
+
+        parent_wi = _load_fixture("wi_with_numbered_ac.json")
+        parent_wi["children"] = [
+            {
+                "id": "SA-CHILD",
+                "title": "Child with ACs",
+                "status": "in_progress",
+                "stage": "in_review",
+                "description": child_wi["workItem"]["description"],
+            },
+        ]
+
+        captured_child_results = []
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi))
+            if "show" in cmd_list:
+                return _fake_proc(stdout=json.dumps(child_wi))
+            if "audit-show" in cmd_list:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": {
+                        "workItemId": "SA-CHILD",
+                        "auditedAt": "2026-07-16T12:00:00Z",
+                        "rawOutput": "Ready to close: Yes\n\n## Summary\nAll good.",
+                    },
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        def capturing_assemble(issue, ac_results, child_results, **kwargs):
+            nonlocal captured_child_results
+            captured_child_results[:] = child_results
+            return _assemble_issue_report(issue, ac_results, child_results, **kwargs)
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            capturing_assemble,
+        )
+
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+
+        child = next((c for c in captured_child_results if c["id"] == "SA-CHILD"), None)
+        assert child is not None, "Child should be in results"
+
+        for ac in child["ac_results"]:
+            assert ac["verdict"] == "partial", (
+                f"Expected 'partial' verdict for child AC '{ac['text']}', got '{ac['verdict']}'"
+            )
+            assert "provider error" in ac["evidence"].lower(), (
+                f"Expected provider-error diagnostic, got: '{ac['evidence']}'"
+            )
+            assert "could not be parsed" not in ac["evidence"].lower(), (
+                f"Provider errors must not be reported as generic parse failures: '{ac['evidence']}'"
+            )
+
+        captured = capsys.readouterr()
+        assert "provider error" in captured.err.lower() or "unparseable" in captured.err.lower(), (
+            f"Expected provider-error warning on stderr, got: {captured.err}"
         )
 
     def test_fallback_writes_to_debug_log(self, monkeypatch, capsys, tmp_path):

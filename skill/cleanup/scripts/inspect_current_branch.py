@@ -26,7 +26,7 @@ def get_unpushed_count(runner: lib.CommandRunner, branch: str) -> int:
     )
     try:
         return int(proc.stdout.strip() or 0)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return 0
 
 

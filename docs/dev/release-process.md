@@ -102,7 +102,19 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
 
    - Use `--skip-checks` to bypass the gate in exceptional circumstances.
 
-9. **Verify CHANGELOG.md is up to date**
+9. **Producer-review gate — no items flagged for producer review**
+   - The automated release script (`run-release.js`) enforces this gate at exit code 9.
+   - Items with `needsProducerReview = true`, `null`, or `undefined` are blocking.
+   - Run the gate manually to check:
+
+     ```bash
+     node skill/ship/scripts/run-release.js --dry-run
+     ```
+
+   - If the gate fails, review the blocking items and either resolve them
+     by setting `needsProducerReview = false` or use `--skip-checks` to bypass.
+
+10. **Verify CHANGELOG.md is up to date**
    - The release script now generates `CHANGELOG.md` automatically from
      worklog items (completed / in_review) during the release flow.
    - Verify that the generated `CHANGELOG.md` section reflects the correct
@@ -202,9 +214,11 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
 2. **Work items are automatically closed** — After a successful release via
    `run-release.js`, all work items that passed the audit readiness gate
    (items in `in_review` stage or `completed` status, excluding `stage: done`)
-   are closed with the reason `"Shipped in v<version>"`. This is a
-   non-blocking step — individual close failures are logged as warnings but
-   do not affect the release outcome.
+   are closed with the reason `"Shipped in v<version>"`. Only items with
+   `needsProducerReview = false` are closed — items with `needsProducerReview`
+   set to `true`, `null`, or `undefined` are skipped and logged as
+   "Skipped (needs producer review)". This is a non-blocking step — individual
+   close failures are logged as warnings but do not affect the release outcome.
 3. Version numbering, tagging, and tag pushing are **now automated** as part
    of the merge script (`merge-dev-to-main.sh`). Before merging, the script:
    - Increments the version in `package.json` (default: patch bump).

@@ -15,7 +15,7 @@ Input fields:
   unknowns: list[str]
   wbs_items: optional list of { id, title, o, m, p } — per-work-item WBS estimates
   wbs_children: optional list of { id, title } — child work items
-"""
+"""  # noqa: EXE001
 
 import sys
 import json

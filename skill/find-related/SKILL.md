@@ -52,7 +52,7 @@ Discover related work for a work item via Worklog search, file inspection, and o
 ## Status management
 
 Status transitions are handled **automatically** by the `StatusLifecycle` context
-manager from `skill/shared/status_lifecycle.py`:
+manager from `../shared/status_lifecycle.py`:
 
 - **On entry:** Status is set to `in_progress` (original value captured)
 - **On success:** Status is set to `completed`

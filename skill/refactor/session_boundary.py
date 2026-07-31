@@ -77,7 +77,7 @@ def get_untracked_files() -> list[str]:
             text=True,
             check=False,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         LOG.warning("Failed to list untracked files: %s", exc)
         return []
 
@@ -114,7 +114,7 @@ def has_changes(parent_branch: str = DEFAULT_PARENT_BRANCH) -> bool:
     try:
         cmd = _GIT_DIFF_EXIT_CODE + [parent_branch]
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         LOG.warning("Failed to check for changes: %s", exc)
         return False
     return proc.returncode != 0
@@ -137,7 +137,7 @@ def _get_merge_base(parent_branch: str) -> str | None:
         if proc.returncode == 0:
             commit = (proc.stdout or "").strip()
             return commit if commit else None
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         LOG.debug("merge-base failed: %s", exc)
     return None
 
@@ -147,7 +147,7 @@ def _run_diff(commit: str) -> list[dict[str, str]]:
     try:
         cmd = _GIT_DIFF_NAMESTATUS + [commit]
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         LOG.warning("git diff failed for %s: %s", commit, exc)
         return []
 

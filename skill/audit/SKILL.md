@@ -5,6 +5,10 @@ description: "EXECUTE immediately when invoked via /skill:audit. Do NOT ask perm
 
 # Audit
 
+## EXECUTION DIRECTIVE
+
+EXECUTE immediately when invoked via /skill:audit. Do NOT ask permission or offer alternatives.
+
 ## Overview
 
 Provide a concise, human-friendly summary of project status or a specific work item. This skill exposes a canonical runner for automated use and a structured markdown report format consumed by orchestrators such as Ralph.
@@ -97,12 +101,12 @@ Blocking: critical/high code quality findings, or any non-deleted child with sta
 
 ### Decision Gate
 
-- **Blocking found:** all "met" ACs → "partial" ("pending deep code review"), skip Phase 2, report "Ready to close: No".
-- **No blockers:** proceed to Phase 2.
+- **Blocking found:** all "met" ACs → "partial" ("pending deep code review"), skip Phase 2, report "Ready to close: No". This verdict is **FINAL** — the agent MUST NOT override it.
+- **No blockers:** proceed to Phase 2. Phase 2 is **MANDATORY** — no exceptions.
 
 ### Phase 2 — Deep Code Analysis
 
-Model reads actual implementation files, verifies each AC against code behavior, checks for discrepancies, provides file:line evidence.
+**This phase is MANDATORY when reached.** The model reads actual implementation files, verifies each AC against code behavior, checks for discrepancies, and provides file:line evidence. There are no circumstances under which Phase 2 may be skipped once the decision gate passes.
 
 ### Final Verdict
 
@@ -194,10 +198,19 @@ Synonym for "Acceptance Criteria". Use **Acceptance Criteria** as canonical head
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force]`
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
-**Timeout:** `CALL_PI_TIMEOUT`=600s per Pi call. Cumulative elapsed-time guard (110s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
+**Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS`. Cumulative elapsed-time guard (110s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
+
+**Provider-error retry:** Pi calls that end in a provider error (`stopReason: "error"` / `errorMessage` on the last assistant message of `agent_end`, e.g. Local Proxy `finish_reason: error`) are retried automatically up to `_PI_MAX_RETRIES` (2) times with linear backoff (`_PI_RETRY_BACKOFF_SECONDS`). Timeouts and unparseable-but-otherwise-healthy responses are NOT retried. If a provider error persists after retries, ACs fall back to `partial` with evidence like "Pi provider error: <errorMessage> — criterion could not be evaluated." rather than the misleading "Pi model output could not be parsed" message, so operators can distinguish a transient model outage from a genuine parse failure.
+
+**Tools-enabled invocation (Phase 2 only):** Phase 2 deep analysis calls Pi with
+`enable_tools=True`, which appends
+`--tools read,bash,grep,find,ls --exclude-tools ask_question` to the pi command.
+This gives the model file-reading capabilities to verify ACs against
+implementation code. Non-Phase-2 calls (Phase 1 screening, project-level audit)
+remain in bare LLM pipe mode (`enable_tools=False`).
 
 ### Code Quality Integration
 
@@ -220,9 +233,24 @@ Notes:
 
 ## Guidance for models
 
+### Authority and Runner Verdicts (CRITICAL)
+
+- **The audit runner (`audit_runner.py`) is the CANONICAL audit path.** Its verdict is **authoritative** and MUST NOT be overridden by a subsequent model-driven (manual) audit.
+- **If the runner produced an audit report with "Ready to close: No", "partial", or "pending deep code review", you MUST NOT produce a contradictory override audit** claiming the item is ready to close. The runner's verdict stands.
+- **You MAY re-audit only if explicitly requested by the operator with `--force` or a clear directive to re-run.** Even then, you MUST respect the runner's original verdict and MUST NOT demote a runner-produced "ready to close: Yes" verdict without fresh, documented evidence.
+- When the runner has already run and produced a report, **do NOT run the manual audit path at all** unless forced. The runner's two-phase pipeline is complete and authoritative.
+
+### Two-Phase Pipeline (MANDATORY)
+
 - Return a structured markdown report with `Ready to close:` header and canonical sections.
-- **Follow the two-phase pipeline:** Phase 1 first; if blocking issues, skip Phase 2 and demote "met"→"partial" ("pending deep code review").
-- **Deep code analysis is mandatory when Phase 1 passes** — read actual implementation files, verify each AC against code behavior.
+- **Phase 2 deep code analysis is MANDATORY when Phase 1 passes — under NO circumstances may it be skipped.** Read actual implementation files, verify each AC against code behavior, and provide file:line evidence.
+- The runner's decision gate is the sole arbiter of whether Phase 2 is skipped:
+  - If the runner **blocks Phase 2** (due to critical/high code quality findings, or children not in `in_review`/`done`), the Phase 1 verdict of "partial" ("pending deep code review") is FINAL. You MUST NOT run Phase 2 yourself, and you MUST NOT override the verdict.
+  - If the runner **passes to Phase 2**, Phase 2 MUST execute. There is no exception.
+- **Blocking issues are narrowly defined** — only the following block Phase 2:
+  1. **Critical or high severity** code quality findings from the linter (not medium or low).
+  2. **Any active child work item** whose stage is not `in_review` or `done` (stages `idea`, `intake_complete`, `plan_complete`, or empty string on a non-deleted child). Deleted children are excluded.
+- **Nothing else blocks Phase 2.** Ambiguity in ACs, medium-severity linting warnings, or agent preference are NOT valid reasons to skip Phase 2.
 - **Ready-to-close criteria:** (1) all ACs `met` or `adjusted`, (2) all active children in `in_review`/`done`, (3) no critical/high code quality findings.
 - **Children in `in_review` do NOT block closure** — only pre-review stages (`idea`, `intake_complete`, `plan_complete`) block.
 - **Do NOT add release-process or merge-status constraints** — they are not audit concerns.
@@ -294,3 +322,18 @@ The following output was produced manually.
 - **Silent persistence failure:** `persist_audit.py` / `wl audit-set` returns success without storing. **Always verify with `wl audit-show --json`**.
 - Skipping persistence: always verify before reporting as recorded.
 - If `wl` is unavailable or returns invalid JSON, report the error, do not claim success.
+
+### Agent-mode response parsing
+
+- Phase 2 deep analysis now runs Pi in agent mode (with `--tools`). The agent-mode
+  JSON-stream output may contain additional event types (`agent_start`, `turn_start`,
+  `message_start`, `tool_execution_start`, `tool_execution_end`, `agent_end`) not
+  present in bare LLM pipe mode. The `_extract_pi_text()` and `_parse_pi_json_line()`
+  functions handle these transparently by extracting text content from
+  `message_update` events (same as bare LLM mode).
+- If response parsing fails, check debug logs (use `--debug-log`) to see the raw
+  agent output. The runner automatically falls back to Phase 1 results on Phase 2
+  failure.
+- The `_extract_json_array()` function strips prose text before/after JSON arrays,
+  so it works correctly regardless of whether the model wraps its output in
+  explanatory text (common in agent mode).

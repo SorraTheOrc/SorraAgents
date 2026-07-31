@@ -197,7 +197,7 @@ def _has_existing_worklog_item(smell: dict[str, Any]) -> bool:
         return False
 
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: PLW1510
             ["wl", "list", "--tags", REFACTOR_TAG, "--json"],
             capture_output=True,
             text=True,
@@ -231,7 +231,7 @@ def _has_existing_worklog_item(smell: dict[str, Any]) -> bool:
         combined = (title + " " + description).lower()
 
         # Check if the description or title references the same file, line, and code
-        if target_file.lower() in combined and target_code.lower() in combined:
+        if target_file.lower() in combined and target_code.lower() in combined:  # noqa: SIM102
             # Also check line number if it appears
             if str(target_line) in combined:
                 return True
@@ -311,7 +311,7 @@ def create_smell_work_item(smell: dict[str, Any]) -> str | None:
     ]
 
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: PLW1510
             cmd,
             capture_output=True,
             text=True,

@@ -32,4 +32,4 @@ _globals = globals()
 _globals["__file__"] = _canonical_path
 
 with open(_canonical_path, encoding="utf-8") as _f:
-    exec(compile(_f.read(), _canonical_path, "exec"), _globals)
+    exec(compile(_f.read(), _canonical_path, "exec"), _globals)  # noqa: S102 -- intentional delegation wrapper, loading known local file

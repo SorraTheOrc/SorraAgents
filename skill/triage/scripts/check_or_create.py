@@ -12,7 +12,7 @@ Matching heuristics (in order of preference):
 
 If multiple candidates match, prefer the most recent. If ambiguity remains,
 attach a comment to the most recent candidate and alert triage.
-"""
+"""  # noqa: EXE001
 
 import json
 import re
@@ -42,7 +42,7 @@ def run_wl(args: List[str]) -> Optional[str]:
     try:
         out = subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         return out
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(f"[triage] wl command failed: {' '.join(cmd)}: {exc}", file=sys.stderr)
         return None
 
@@ -60,7 +60,7 @@ def list_critical_issues() -> List[Dict[str, Any]]:
         if isinstance(data, list):
             return data
         return []
-    except Exception:
+    except Exception:  # noqa: BLE001
         return []
 
 
@@ -92,7 +92,7 @@ def create_issue(title: str, body: str, parent_id: Optional[str] = None) -> Opti
         return None
     try:
         return json.loads(out)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -149,7 +149,7 @@ def infer_owner(repo_path: str, file_path: Optional[str]) -> Dict[str, Any]:
         from skill.owner_inference.scripts.infer_owner import infer_owner as _infer
 
         return _infer(repo_path, file_path)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return {
             "assignee": "Build",
             "confidence": 0.0,
@@ -475,7 +475,7 @@ def check_or_create(payload: Dict[str, Any]) -> Dict[str, Any]:
 def main():
     try:
         _main()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         notice = FailureNotice(
             script_name="check_or_create.py",
             reason=f"Unhandled exception: {exc}",
@@ -498,7 +498,7 @@ def _main():
         sys.exit(2)
     try:
         payload = json.loads(sys.argv[1])
-    except Exception:
+    except Exception:  # noqa: BLE001
         err = json.dumps({"error": "invalid JSON"})
         notice = FailureNotice(
             script_name="check_or_create.py",

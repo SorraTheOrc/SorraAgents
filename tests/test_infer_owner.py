@@ -100,21 +100,21 @@ def test_codeowners_github_dir(tmp_path):
 def test_git_blame_returns_top_author(tmp_path):
     """Git blame returns the most frequent author."""
     # Set up a real git repo for blame to work
-    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
-    subprocess.run(
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)  # noqa: PLW1510
+    subprocess.run(  # noqa: PLW1510
         ["git", "config", "user.email", "a@test.com"],
         cwd=str(tmp_path),
         capture_output=True,
     )
-    subprocess.run(
+    subprocess.run(  # noqa: PLW1510
         ["git", "config", "user.name", "Author A"],
         cwd=str(tmp_path),
         capture_output=True,
     )
     test_file = tmp_path / "test_file.py"
     test_file.write_text("line1\nline2\nline3\n")
-    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
-    subprocess.run(
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)  # noqa: PLW1510
+    subprocess.run(  # noqa: PLW1510
         ["git", "commit", "-m", "init"],
         cwd=str(tmp_path),
         capture_output=True,
@@ -140,28 +140,28 @@ def test_git_blame_missing_file(tmp_path):
 
 def test_recent_commits_returns_top_committer(tmp_path):
     """Recent commits heuristic returns the most frequent committer."""
-    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
-    subprocess.run(
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)  # noqa: PLW1510
+    subprocess.run(  # noqa: PLW1510
         ["git", "config", "user.email", "b@test.com"],
         cwd=str(tmp_path),
         capture_output=True,
     )
-    subprocess.run(
+    subprocess.run(  # noqa: PLW1510
         ["git", "config", "user.name", "Author B"],
         cwd=str(tmp_path),
         capture_output=True,
     )
     test_file = tmp_path / "test_file.py"
     test_file.write_text("v1\n")
-    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
-    subprocess.run(
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)  # noqa: PLW1510
+    subprocess.run(  # noqa: PLW1510
         ["git", "commit", "-m", "c1"],
         cwd=str(tmp_path),
         capture_output=True,
     )
     test_file.write_text("v2\n")
-    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
-    subprocess.run(
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)  # noqa: PLW1510
+    subprocess.run(  # noqa: PLW1510
         ["git", "commit", "-m", "c2"],
         cwd=str(tmp_path),
         capture_output=True,
@@ -176,7 +176,7 @@ def test_recent_commits_returns_top_committer(tmp_path):
 
 def test_recent_commits_no_history(tmp_path):
     """Returns None when git log has no commits for the file."""
-    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)  # noqa: PLW1510
     result = io.check_recent_commits(str(tmp_path), "nonexistent.py")
     assert result is None
 
@@ -202,21 +202,21 @@ def test_fallback_when_no_heuristic_matches(tmp_path):
 def test_infer_owner_prefers_override_map(tmp_path):
     """Override map takes precedence over other heuristics."""
     # Set up git repo with blame data
-    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)
-    subprocess.run(
+    subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True)  # noqa: PLW1510
+    subprocess.run(  # noqa: PLW1510
         ["git", "config", "user.email", "c@test.com"],
         cwd=str(tmp_path),
         capture_output=True,
     )
-    subprocess.run(
+    subprocess.run(  # noqa: PLW1510
         ["git", "config", "user.name", "Author C"],
         cwd=str(tmp_path),
         capture_output=True,
     )
     test_file = tmp_path / "test_file.py"
     test_file.write_text("code\n")
-    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)
-    subprocess.run(
+    subprocess.run(["git", "add", "."], cwd=str(tmp_path), capture_output=True)  # noqa: PLW1510
+    subprocess.run(  # noqa: PLW1510
         ["git", "commit", "-m", "init"],
         cwd=str(tmp_path),
         capture_output=True,

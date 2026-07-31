@@ -104,22 +104,32 @@ class TestPersistAuditFailFlag:
         assert report_text in output.out
 
     def test_persist_audit_normal_operation_unchanged(self, monkeypatch):
-        """When _fail is NOT set, normal operation works."""
+        """When _fail is NOT set, normal operation works.
+
+        Verifies the stage-preservation logic: persist_audit now does three
+        wl calls: audit-set + show + update --audit-text [--stage <stage>].
+        """
         report_text = "Ready to close: Yes"
         persist_calls = []
 
         def fake_runner(cmd, **kwargs):
             persist_calls.append(list(cmd))
-            return _fake_proc(stdout='{"success": true}')
+            # Return minimal workItem with a stage so stage-preservation is tested
+            return _fake_proc(stdout='{"success": true, "workItem": {"id": "SA-TEST", "stage": "in_review", "status": "completed"}}')
 
         rc = persist_audit("SA-TEST", report_text, wl_bin="wl", runner=fake_runner, _fail=False)
         assert rc == 0
-        # persist_audit now does two wl calls: audit-set + update --audit-text
-        assert len(persist_calls) == 2
+        # persist_audit now does three wl calls: audit-set + show + update --audit-text
+        assert len(persist_calls) == 3
         assert "audit-set" in persist_calls[0]
         assert "SA-TEST" in persist_calls[0]
-        assert "update" in persist_calls[1]
-        assert "--audit-text" in persist_calls[1]
+        assert "show" in persist_calls[1]
+        assert "SA-TEST" in persist_calls[1]
+        assert "update" in persist_calls[2]
+        assert "--audit-text" in persist_calls[2]
+        # Stage should be explicitly preserved in the update call
+        assert "--stage" in persist_calls[2]
+        assert "in_review" in persist_calls[2]
 
     def test_persist_audit_normal_failure_returns_1(self, monkeypatch):
         """When wl update fails normally, return 1."""

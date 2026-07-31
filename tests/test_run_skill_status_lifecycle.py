@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Tests for StatusLifecycle integration in effort-and-risk run_skill.py.
 
 Validates that run_skill.py uses the shared StatusLifecycle context manager

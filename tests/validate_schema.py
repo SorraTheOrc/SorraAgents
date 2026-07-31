@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Validate workflow.json against workflow-schema.json using JSON Schema.
 

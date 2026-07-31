@@ -69,9 +69,9 @@ test('ship skill: description mentions the Ship subagent as the release executor
 });
 
 // ---------------------------------------------------------------------------
-// 4. Release Process section — Ship subagent is primary executor
+// 4. Release Process section — run-release.js is primary executor
 // ---------------------------------------------------------------------------
-test('ship skill: Release Process section describes Ship subagent as primary executor', () => {
+test('ship skill: Release Process section describes the release script as executor', () => {
   const content = readFileSync(SHIP_SKILL_PATH, 'utf-8');
 
   // Should have a Release Process section
@@ -82,23 +82,26 @@ test('ship skill: Release Process section describes Ship subagent as primary exe
     'SKILL.md should have a Release Process section',
   );
 
-  // Should reference the Ship subagent as the executor
+  // Should reference the release script or the release action
   assert.ok(
-    content.includes('Ship subagent') ||
-    content.includes('ship subagent'),
-    'Release Process section should reference the Ship subagent as the executor',
+    content.includes('run-release.js') ||
+    content.includes('release action') ||
+    content.includes('/skill:ship release') ||
+    content.includes('./scripts/run-release.js'),
+    'Release Process section should reference the release script or action',
   );
 });
 
 // ---------------------------------------------------------------------------
-// 5. References agent/ship.md
+// 5. References scripts/run-release.js as the release script
 // ---------------------------------------------------------------------------
-test('ship skill: references agent/ship.md as the Ship subagent configuration', () => {
+test('ship skill: references scripts/run-release.js as the release script', () => {
   const content = readFileSync(SHIP_SKILL_PATH, 'utf-8');
 
   assert.ok(
-    content.includes('agent/ship.md'),
-    'SKILL.md should reference agent/ship.md as the Ship subagent configuration',
+    content.includes('scripts/run-release.js') ||
+    content.includes('run-release.js'),
+    'SKILL.md should reference scripts/run-release.js as the release entry point',
   );
 });
 
@@ -139,23 +142,16 @@ test('ship skill: preserves human Release Manager as a fallback', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 8. agent/ship.md consistency — should reference the skill
+// 8. Skill references its own scripts as internal modules
 // ---------------------------------------------------------------------------
-test('ship skill: agent/ship.md is consistent with the skill', () => {
-  const shipAgentPath = join(REPO_ROOT, 'agent', 'ship.md');
-  assert.ok(
-    existsSync(shipAgentPath),
-    'agent/ship.md should exist',
-  );
+test('ship skill: references its own scripts directory', () => {
+  const content = readFileSync(SHIP_SKILL_PATH, 'utf-8');
 
-  const shipAgent = readFileSync(shipAgentPath, 'utf-8');
-
-  // The agent config should reference or be consistent with the skill content
+  // Should reference the scripts directory (internal modules)
   assert.ok(
-    shipAgent.includes('skill/ship') ||
-    shipAgent.includes('ship skill') ||
-    shipAgent.includes('release'),
-    'agent/ship.md should be consistent with the ship skill',
+    content.includes('./scripts/') ||
+    content.includes('scripts/'),
+    'SKILL.md should reference its own scripts directory',
   );
 });
 

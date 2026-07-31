@@ -160,10 +160,10 @@ def parse_iso_datetime(value: str) -> datetime | None:
         return None
     try:
         return datetime.strptime(value, "%Y-%m-%d %H:%M:%S %z")
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             return datetime.fromisoformat(value)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return None
 
 
@@ -210,7 +210,7 @@ def run_main(main_fn: Callable[..., int], script_name: str,
     """
     try:
         return main_fn(argv)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         notice = FailureNotice(
             script_name=script_name,
             reason=f"Unhandled exception: {exc}",
