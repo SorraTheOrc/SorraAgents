@@ -12,7 +12,11 @@ The script will:
   - assemble a JSON payload using provided O/M/P (and optional per-item estimates) and overheads (defaults applied if omitted)
  - call orchestrate_estimate.py with the assembled payload and print the final JSON output
 
-Status lifecycle is managed by StatusLifecycle context manager.
+Status lifecycle: the pre-run status is captured and restored
+deterministically. The StatusLifecycle context manager is deliberately NOT
+used here — its success exit sets status=completed, which would violate the
+documented lifecycle for intake/planning items (status stays `open` until the
+post-release close). See SA-0MS93J0ZC007IO8V.
 """
 
 import argparse
@@ -20,18 +24,27 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
-from skill.shared.status_lifecycle import StatusLifecycle
+# Ensure the repository root is on sys.path so skill package imports work
+_REPO_ROOT = Path(__file__).resolve().parents[3]  # <repo>/skill/effort-and-risk/scripts/
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from skill.shared.status_lifecycle import StatusLifecycle, run_wl
 
 
 def wl_show(issue_id):
-    p = subprocess.run(
-        ["wl", "show", issue_id, "--children", "--json"], capture_output=True, text=True, check=False
-    )
-    if p.returncode != 0:
-        print(json.dumps({"error": "wl show failed", "stderr": p.stderr}))
+    """Fetch an issue with children via the shared run_wl helper.
+
+    The shared helper resolves the target worklog dir and surfaces real
+    error detail on failure.
+    """
+    try:
+        return run_wl(["wl", "show", issue_id, "--children", "--json"])
+    except RuntimeError as exc:
+        print(json.dumps({"error": "wl show failed", "detail": str(exc)}))
         sys.exit(2)
-    return json.loads(p.stdout)
 
 
 def main():
@@ -53,9 +66,14 @@ def main():
 
     issue_id = args.issue
 
-    with StatusLifecycle(issue_id):
-        show = wl_show(issue_id)
+    # Capture the pre-run status so it can be restored deterministically.
+    # The flow itself never changes status (effort/risk fields and the comment
+    # are updated by the orchestrator); restoring guarantees the item is not
+    # left in an unintended state if that ever changes.
+    show = wl_show(issue_id)
+    original_status = (show.get("workItem") or {}).get("status", "open")
 
+    try:
         def flatten_children(children):
             out = []
             for c in children or []:
@@ -144,6 +162,16 @@ def main():
 
         # Print orchestrator output
         print(proc.stdout)
+    finally:
+        # Restore the pre-run status (never flip to completed).
+        try:
+            StatusLifecycle.update_status(issue_id, original_status)
+        except RuntimeError as exc:
+            print(
+                f"WARNING: failed to restore status {original_status!r} "
+                f"for {issue_id}: {exc}",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":

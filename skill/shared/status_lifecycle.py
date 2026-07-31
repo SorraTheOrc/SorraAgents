@@ -35,13 +35,97 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from typing import Callable, Optional
+from collections.abc import Callable
+from pathlib import Path
 
 LOG = logging.getLogger("skill.shared.status_lifecycle")
 
 # Type alias for an injectable command runner.
 # Takes a command list, returns a CompletedProcess (like subprocess.run).
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
+
+
+# ======================================================================
+# Worklog-dir resolution
+# ======================================================================
+
+
+def _detect_worklog_dir() -> Path | None:
+    """Detect the target project's ``.worklog`` directory.
+
+    Resolution order (mirrors ``audit_runner.TARGET_PROJECT_ROOT``):
+      1. ``<cwd>/.worklog``
+      2. ``<git root>/.worklog`` via ``git rev-parse --show-toplevel``
+      3. nearest ancestor directory containing ``.worklog``
+
+    Returns ``None`` when no worklog directory can be resolved (the caller
+    should then run ``wl`` without ``--worklog-dir`` and surface the error).
+    """
+    cwd = Path.cwd()
+    cand = cwd / ".worklog"
+    if cand.is_dir():
+        return cand
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            cand = Path(proc.stdout.strip()) / ".worklog"
+            if cand.is_dir():
+                return cand
+    except OSError:
+        pass
+    for parent in cwd.parents:
+        cand = parent / ".worklog"
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def worklog_dir_flag() -> list[str]:
+    """Return ``["--worklog-dir", <path>]`` when cwd is not a worklog root.
+
+    Skill scripts shell out to the ``wl`` CLI which resolves ``.worklog``
+    relative to the caller's cwd. When the cwd is not already a worklog
+    project root (e.g. the skill install dir), pass the explicit
+    ``--worklog-dir`` so the command succeeds regardless of cwd.
+
+    Returns an empty list when no worklog directory is resolvable (the
+    command will run as-is and any failure will surface real error detail).
+    """
+    if (Path.cwd() / ".worklog").is_dir():
+        return []
+    wl_dir = _detect_worklog_dir()
+    if wl_dir is None:
+        return []
+    return ["--worklog-dir", str(wl_dir)]
+
+
+def _wl_error_detail(proc: subprocess.CompletedProcess) -> str:
+    """Extract error detail from a failed ``wl`` subprocess.
+
+    ``wl`` prints its error as JSON on **stdout** (e.g.
+    ``{"success": false, "error": "..."}``) with a non-zero exit code and
+    usually empty stderr. Parse the stdout JSON ``error`` field first, then
+    fall back to stdout text, then stderr. Never returns an empty string.
+    """
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if out:
+        try:
+            data = json.loads(out)
+            if isinstance(data, dict) and data.get("error"):
+                return str(data["error"])
+        except json.JSONDecodeError:
+            pass
+        return out
+    if err:
+        return err
+    return "(no output)"
 
 
 # ======================================================================
@@ -70,13 +154,20 @@ def _run_wl_with_runner(runner: Runner, cmd: list[str]) -> dict:
         The parsed JSON response dict.
 
     Raises:
-        RuntimeError: If the command fails or returns invalid JSON.
+        RuntimeError: If the command fails or returns invalid JSON. The error
+            message includes the underlying ``wl`` error detail (stdout JSON
+            ``error`` field, stdout text, or stderr).
     """
-    LOG.debug("Running: %s", " ".join(cmd))
-    proc = runner(cmd)
+    full_cmd = list(cmd)
+    if full_cmd and full_cmd[0] == "wl":
+        # Inject --worklog-dir when cwd is not the target worklog root so the
+        # command succeeds regardless of the caller's cwd.
+        full_cmd[1:1] = worklog_dir_flag()
+    LOG.debug("Running: %s", " ".join(full_cmd))
+    proc = runner(full_cmd)
     if proc.returncode != 0:
         raise RuntimeError(
-            f"wl command failed ({' '.join(cmd)}): {proc.stderr.strip()}"
+            f"wl command failed ({' '.join(full_cmd)}): {_wl_error_detail(proc)}"
         )
     try:
         data = json.loads(proc.stdout)
@@ -96,6 +187,25 @@ def _run_wl(cmd: list[str]) -> dict:
     See :func:`_run_wl_with_runner` for details.
     """
     return _run_wl_with_runner(_default_runner, cmd)
+
+
+def run_wl(cmd: list[str], runner: Runner | None = None) -> dict:
+    """Run a ``wl`` command via the shared runner (public helper).
+
+    Thin public wrapper over :func:`_run_wl_with_runner` for skill scripts
+    that shell out to ``wl`` (worklog-dir injection + detailed errors).
+
+    Args:
+        cmd: The ``wl`` command as a list of strings.
+        runner: Optional injectable command runner for testing.
+
+    Returns:
+        The parsed JSON response dict.
+
+    Raises:
+        RuntimeError: If the command fails or returns invalid JSON.
+    """
+    return _run_wl_with_runner(runner or _default_runner, cmd)
 
 
 # ======================================================================
@@ -140,9 +250,9 @@ class StatusLifecycle:
         self,
         work_item_id: str,
         *,
-        assignee: Optional[str] = None,
-        target_stage: Optional[str] = None,
-        runner: Optional[Runner] = None,
+        assignee: str | None = None,
+        target_stage: str | None = None,
+        runner: Runner | None = None,
     ) -> None:
         self._work_item_id = work_item_id
         self._assignee = assignee
@@ -156,7 +266,7 @@ class StatusLifecycle:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def show(work_item_id: str, runner: Optional[Runner] = None) -> dict:
+    def show(work_item_id: str, runner: Runner | None = None) -> dict:
         """Fetch a work item via ``wl show`` and return the parsed JSON.
 
         Args:
@@ -176,10 +286,10 @@ class StatusLifecycle:
     def update_status(
         work_item_id: str,
         status: str,
-        stage: Optional[str] = None,
-        assignee: Optional[str] = None,
-        needs_producer_review: Optional[bool] = None,
-        runner: Optional[Runner] = None,
+        stage: str | None = None,
+        assignee: str | None = None,
+        needs_producer_review: bool | None = None,
+        runner: Runner | None = None,
     ) -> dict:
         """Update a work item's status (and optionally stage/assignee/needs_producer_review).
 
@@ -215,7 +325,7 @@ class StatusLifecycle:
     # Context manager protocol
     # ------------------------------------------------------------------
 
-    def __enter__(self) -> "StatusLifecycle":  # noqa: PYI034
+    def __enter__(self) -> StatusLifecycle:  # noqa: PYI034
         """Capture original status, set ``in_progress`` (and optional assignee)."""
         # Capture original status
         try:
@@ -257,10 +367,10 @@ class StatusLifecycle:
 
     def __exit__(
         self,
-        exc_type: Optional[type],  # noqa: PYI036
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[object],  # noqa: PYI036
-    ) -> Optional[bool]:
+        exc_type: type | None,  # noqa: PYI036
+        exc_val: BaseException | None,
+        exc_tb: object | None,  # noqa: PYI036
+    ) -> bool | None:
         """On success: set completed. On exception: restore original status."""
         if exc_type is not None:
             # Exception path — restore original status

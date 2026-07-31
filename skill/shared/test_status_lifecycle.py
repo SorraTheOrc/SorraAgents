@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from skill.shared import status_lifecycle as status_lifecycle_module
 from skill.shared.status_lifecycle import StatusLifecycle
 
 # ---------------------------------------------------------------------------
@@ -58,12 +59,12 @@ def _make_wl_update_proc():
     )
 
 
-def _make_wl_failure_proc(returncode: int = 1, stderr: str = "error"):
+def _make_wl_failure_proc(returncode: int = 1, stderr: str = "error", stdout: str = ""):
     """Build a mock CompletedProcess for a failed ``wl`` command."""
     return subprocess.CompletedProcess(
         args=["wl", "update", "TEST-123", "--status", "in_progress", "--json"],
         returncode=returncode,
-        stdout="",
+        stdout=stdout,
         stderr=stderr,
     )
 
@@ -250,6 +251,179 @@ class TestStatusLifecycleUnit:
         # Still sets in_progress on entry, completed on exit
         assert "in_progress" in calls[1]
         assert calls[2] == ["wl", "update", "TEST-123", "--status", "completed", "--json"]
+
+    # ------------------------------------------------------------------
+    # Error detail propagation (AC: no more empty error strings)
+    # ------------------------------------------------------------------
+
+    def test_error_detail_parses_stdout_json_error(self, mock_run):
+        """Failed wl command surfaces the stdout JSON error, not an empty string.
+
+        wl prints its error as JSON on stdout (e.g.
+        ``{"success": false, "error": "..."}``) with a non-zero exit code
+        and empty stderr. The raised error must include that detail.
+        """
+        mock_run.side_effect = [
+            _make_wl_failure_proc(
+                returncode=1,
+                stdout=json.dumps({
+                    "success": False,
+                    "error": "Worklog system is not initialized. Run \"worklog init\" first.",
+                }),
+                stderr="",
+            ),
+        ]
+
+        with pytest.raises(RuntimeError, match="Worklog system is not initialized"):
+            StatusLifecycle.update_status("TEST-123", "in_progress")
+
+    def test_error_detail_prefers_stdout_error_over_stderr(self, mock_run):
+        """stdout JSON error detail takes precedence over stderr text."""
+        mock_run.side_effect = [
+            _make_wl_failure_proc(
+                returncode=1,
+                stdout=json.dumps({"success": False, "error": "stdout error detail"}),
+                stderr="stderr detail",
+            ),
+        ]
+
+        with pytest.raises(RuntimeError, match="stdout error detail"):
+            StatusLifecycle.update_status("TEST-123", "in_progress")
+
+    def test_error_detail_falls_back_to_stderr(self, mock_run):
+        """When stdout is empty, stderr detail is used."""
+        mock_run.side_effect = [
+            _make_wl_failure_proc(returncode=1, stdout="", stderr="stderr detail"),
+        ]
+
+        with pytest.raises(RuntimeError, match="stderr detail"):
+            StatusLifecycle.update_status("TEST-123", "in_progress")
+
+    def test_error_detail_includes_plain_stdout(self, mock_run):
+        """Non-JSON stdout is included verbatim as fallback detail."""
+        mock_run.side_effect = [
+            _make_wl_failure_proc(returncode=1, stdout="something went wrong", stderr=""),
+        ]
+
+        with pytest.raises(RuntimeError, match="something went wrong"):
+            StatusLifecycle.update_status("TEST-123", "in_progress")
+
+    # ------------------------------------------------------------------
+    # worklog-dir injection (cwd-independent wl invocation)
+    # ------------------------------------------------------------------
+
+    def test_worklog_dir_flag_injected_when_detected(self, mock_run):
+        """When a worklog dir is resolved, --worklog-dir is injected after wl."""
+        with mock.patch(
+            "skill.shared.status_lifecycle.worklog_dir_flag",
+            return_value=["--worklog-dir", "/fake/proj/.worklog"],
+        ):
+            mock_run.side_effect = [_make_wl_update_proc()]
+
+            StatusLifecycle.update_status("TEST-123", "in_progress")
+
+            calls = [c.args[0] for c in mock_run.call_args_list]
+            assert calls[0][:4] == [
+                "wl", "--worklog-dir", "/fake/proj/.worklog", "update",
+            ]
+            assert "--status" in calls[0]
+
+    def test_no_flag_when_cwd_is_worklog_root(self, mock_run):
+        """When cwd is already a worklog root, no flag is injected."""
+        with mock.patch(
+            "skill.shared.status_lifecycle.worklog_dir_flag",
+            return_value=[],
+        ):
+            mock_run.side_effect = [_make_wl_update_proc()]
+
+            StatusLifecycle.update_status("TEST-123", "in_progress")
+
+            calls = [c.args[0] for c in mock_run.call_args_list]
+            assert calls[0] == ["wl", "update", "TEST-123", "--status", "in_progress", "--json"]
+
+
+# ===========================================================================
+# Worklog-dir detection tests
+# ===========================================================================
+
+
+class TestWorklogDirDetection:
+    """Tests for worklog-dir auto-detection (cwd-independent wl invocation)."""
+
+    def test_flag_empty_when_cwd_is_worklog_root(self):
+        """Running from the repo root: cwd/.worklog exists -> no flag needed."""
+        assert status_lifecycle_module.worklog_dir_flag() == []
+
+    def test_flag_set_when_detection_resolves_dir(self, monkeypatch, tmp_path):
+        """Non-root cwd + resolvable worklog dir -> flag returned."""
+        monkeypatch.chdir(tmp_path)  # cwd has no .worklog
+        wl_dir = tmp_path / "proj" / ".worklog"
+        with mock.patch(
+            "skill.shared.status_lifecycle._detect_worklog_dir",
+            return_value=wl_dir,
+        ):
+            assert status_lifecycle_module.worklog_dir_flag() == [
+                "--worklog-dir", str(wl_dir),
+            ]
+
+    def test_flag_empty_when_no_dir_detected(self, monkeypatch, tmp_path):
+        """Non-root cwd with no resolvable worklog dir -> no flag (graceful)."""
+        monkeypatch.chdir(tmp_path)
+        with mock.patch(
+            "skill.shared.status_lifecycle._detect_worklog_dir",
+            return_value=None,
+        ):
+            assert status_lifecycle_module.worklog_dir_flag() == []
+
+    def test_detect_cwd_direct(self, monkeypatch, tmp_path):
+        """cwd/.worklog is found first."""
+        proj = tmp_path / "proj"
+        (proj / ".worklog").mkdir(parents=True)
+        monkeypatch.chdir(proj)
+        assert status_lifecycle_module._detect_worklog_dir() == proj / ".worklog"
+
+    def test_detect_git_root(self, monkeypatch, tmp_path):
+        """git rev-parse --show-toplevel/.worklog is used when cwd is a subdir."""
+        root = tmp_path / "repo"
+        (root / ".worklog").mkdir(parents=True)
+        (root / "sub").mkdir(parents=True)
+        monkeypatch.chdir(root / "sub")
+        fake = subprocess.CompletedProcess(
+            ["git", "rev-parse", "--show-toplevel"],
+            0,
+            stdout=str(root),
+            stderr="",
+        )
+        with mock.patch("skill.shared.status_lifecycle.subprocess.run", return_value=fake):
+            assert status_lifecycle_module._detect_worklog_dir() == root / ".worklog"
+
+    def test_detect_walk_up(self, monkeypatch, tmp_path):
+        """Ancestor .worklog is found when git resolution fails."""
+        proj = tmp_path / "proj"
+        (proj / ".worklog").mkdir(parents=True)
+        deep = proj / "a" / "b"
+        deep.mkdir(parents=True)
+        monkeypatch.chdir(deep)
+        fake = subprocess.CompletedProcess(
+            ["git", "rev-parse", "--show-toplevel"],
+            1,
+            stdout="",
+            stderr="",
+        )
+        with mock.patch("skill.shared.status_lifecycle.subprocess.run", return_value=fake):
+            assert status_lifecycle_module._detect_worklog_dir() == proj / ".worklog"
+
+    def test_detect_none(self, monkeypatch, tmp_path):
+        """No .worklog anywhere -> None."""
+        monkeypatch.chdir(tmp_path)
+        fake = subprocess.CompletedProcess(
+            ["git", "rev-parse", "--show-toplevel"],
+            1,
+            stdout="",
+            stderr="",
+        )
+        with mock.patch("skill.shared.status_lifecycle.subprocess.run", return_value=fake):
+            assert status_lifecycle_module._detect_worklog_dir() is None
 
 
 # ===========================================================================

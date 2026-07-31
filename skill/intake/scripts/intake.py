@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import subprocess
 import sys
 from pathlib import Path
 
@@ -33,7 +32,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]  # e.g. <repo>/skill/intake/scr
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.shared.status_lifecycle import StatusLifecycle
+from skill.shared.status_lifecycle import StatusLifecycle, run_wl
 
 LOG = logging.getLogger("intake.scripts.intake")
 
@@ -130,7 +129,9 @@ def _run_wl_update_description(item_id: str, description_file: str) -> None:
         description_file: Path to the description file.
 
     Raises:
-        RuntimeError: If the wl command fails.
+        RuntimeError: If the wl command fails (includes the underlying wl
+            error detail). The command is routed through the shared
+            ``run_wl`` helper so it works regardless of the caller's cwd.
     """
     cmd = [
         "wl", "update", item_id,
@@ -138,11 +139,7 @@ def _run_wl_update_description(item_id: str, description_file: str) -> None:
         "--json",
     ]
     LOG.debug("Running: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"wl update --description-file failed: {proc.stderr.strip()}"
-        )
+    run_wl(cmd)
     LOG.info("Description file applied for %s: %s", item_id, description_file)
 
 
