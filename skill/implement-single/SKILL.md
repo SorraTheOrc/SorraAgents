@@ -45,7 +45,7 @@ is invoked.
 ## StatusLifecycle Integration
 
 Status transitions are managed via the shared `StatusLifecycle` module from
-`skill/shared/status_lifecycle.py`. Use `StatusLifecycle.update_status()` for
+`../shared/status_lifecycle.py`. Use `StatusLifecycle.update_status()` for
 status transitions and `with StatusLifecycle(...)` for automatic lifecycle management.
 
 Manual `wl update --status` commands (without `StatusLifecycle`) should NOT be used.
