@@ -1882,7 +1882,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     batch = json.loads(raw_text)
                 except json.JSONDecodeError:
                     batch = []
-            if isinstance(batch, list) and batch:
+            if isinstance(batch, list) and batch and any(
+                isinstance(item, dict) and "index" in item for item in batch
+            ):
                 reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
                 for i, ac in enumerate(acs):
                     item = reviewed.get(i, {})
@@ -2010,7 +2012,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         batch = json.loads(raw_text)
                     except json.JSONDecodeError:
                         batch = []
-                if isinstance(batch, list) and batch:
+                if isinstance(batch, list) and batch and any(
+                    isinstance(item, dict) and "index" in item for item in batch
+                ):
                     reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
                     for i, ac in enumerate(child_acs):
                         item = reviewed.get(i, {})
