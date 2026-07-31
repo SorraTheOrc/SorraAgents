@@ -248,9 +248,64 @@ class TestStatusLifecycleUnit:
             pass
 
         calls = [c.args[0] for c in mock_run.call_args_list]
-        # Still sets in_progress on entry, completed on exit
+
+    def test_restore_on_exit_success_restores_original(self, mock_run):
+        """restore_on_exit: success restores original status, never completed.
+
+        Read-only skills (find-related, refactor, effort-and-risk) must not
+        advance the item to `completed`, which wl only allows for
+        in_review/done stages.
+        """
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),   # __enter__: capture original
+            _make_wl_update_proc(),               # __enter__: set in_progress
+            _make_wl_update_proc(),               # __exit__: restore to open
+        ]
+
+        with StatusLifecycle("TEST-123", restore_on_exit=True):
+            pass
+
+        assert mock_run.call_count == 3
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[0] == ["wl", "show", "TEST-123", "--json"]
+        assert calls[1] == ["wl", "update", "TEST-123", "--status", "in_progress", "--json"]
+        # Restored, NOT advanced to completed
+        assert calls[2] == ["wl", "update", "TEST-123", "--status", "open", "--json"]
+
+    def test_restore_on_exit_failure_restores_original(self, mock_run):
+        """restore_on_exit: exception restores the original status."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with pytest.raises(ValueError, match="boom"):  # noqa: SIM117
+            with StatusLifecycle("TEST-123", restore_on_exit=True):
+                raise ValueError("boom")
+
+        assert mock_run.call_count == 3
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2] == ["wl", "update", "TEST-123", "--status", "open", "--json"]
+
+    def test_restore_on_exit_preserves_stage(self, mock_run):
+        """restore_on_exit: stage is never modified on exit."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open", stage="plan_complete"),
+            _make_wl_update_proc(),
+            _make_wl_update_proc(),
+        ]
+
+        with StatusLifecycle("TEST-123", restore_on_exit=True):
+            pass
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert "--stage" not in calls[2], (
+            f"restore_on_exit must not touch stage: {calls[2]}"
+        )
+        # Still sets in_progress on entry, restores original on exit
         assert "in_progress" in calls[1]
-        assert calls[2] == ["wl", "update", "TEST-123", "--status", "completed", "--json"]
+        assert calls[2] == ["wl", "update", "TEST-123", "--status", "open", "--json"]
 
     # ------------------------------------------------------------------
     # Error detail propagation (AC: no more empty error strings)

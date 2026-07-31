@@ -25,15 +25,17 @@ import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
-from typing import Any, Callable, Optional, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
+
+from skill.shared.status_lifecycle import StatusLifecycle
 
 # Add repo root to sys.path for shared utility access
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.scripts.failure_notice import FailureNotice  # noqa: E402
+from skill.scripts.failure_notice import FailureNotice
 
 logger = logging.getLogger("implementall")
 
@@ -80,7 +82,7 @@ class ImplementAllEngine:
         self.item_timeout = item_timeout
         self.verbose = verbose
         # Track the item currently being processed for signal-handler recovery
-        self._current_item_id: Optional[str] = None
+        self._current_item_id: str | None = None
         self._total_discovered: int = 0
         # Saved original signal handlers for restore
         self._original_sigint: Any = None
@@ -96,7 +98,13 @@ class ImplementAllEngine:
         Returns:
             A list of work item dicts, or an empty list on error.
         """
-        cmd = ["wl", "list", "--stage", "plan_complete", "--status", "open", "--json"]
+        # Exclude items flagged as needing producer review (e.g. items that
+        # previously hit a needs_input outcome) so they are not re-processed
+        # in an infinite loop. Such items stay status=open for visibility.
+        cmd = [
+            "wl", "list", "--stage", "plan_complete", "--status", "open",
+            "--needs-producer-review", "no", "--json",
+        ]
         logger.debug("implementall.discover cmd=%s", " ".join(cmd))
 
         try:
@@ -193,6 +201,12 @@ class ImplementAllEngine:
             if self._contains_questions(impl_result.stdout or ""):
                 result["outcome"] = "needs_input"
                 result["error_detail"] = f"Implement needs input (rc={impl_result.returncode}): {stderr}"
+                # A needs_input item was claimed (in_progress); release it back
+                # to open + plan_complete and flag producer review so the
+                # batch does not re-process it on the next run.
+                result["recovery"] = self._attempt_recovery(
+                    item_id, flag_producer_review=True,
+                )
                 return result
             # Otherwise it's an error - attempt recovery
             result["outcome"] = "error"
@@ -204,24 +218,37 @@ class ImplementAllEngine:
         if self._contains_questions(impl_result.stdout or ""):
             result["outcome"] = "needs_input"
             result["error_detail"] = "Implement output contains unanswered questions"
+            result["recovery"] = self._attempt_recovery(
+                item_id, flag_producer_review=True,
+            )
             return result
 
         result["outcome"] = "implemented"
         return result
 
-    def _attempt_recovery(self, item_id: str) -> dict:
+    def _attempt_recovery(self, item_id: str, flag_producer_review: bool = False) -> dict:
         """Attempt to recover from a failed implement by resetting the item status.
+
+        Always resets the item to a valid terminal status (``open``) so the
+        item is never left stuck in ``in_progress`` after a failure or a
+        needs_input outcome.
 
         Args:
             item_id: The work item ID to recover.
+            flag_producer_review: If True, also set ``needsProducerReview=yes``
+                so producers can triage the item and the batch excludes it
+                from re-processing.
 
         Returns:
             A dict with keys:
                 - action: description of recovery action taken
                 - success: whether recovery succeeded
         """
+        action = "reset_status_to_open_with_stage_plan_complete"
+        if flag_producer_review:
+            action += "_flagged_producer_review"
         recovery: dict[str, Any] = {
-            "action": "reset_status_to_open_with_stage_plan_complete",
+            "action": action,
             "success": False,
         }
 
@@ -230,7 +257,13 @@ class ImplementAllEngine:
             return recovery
 
         try:
-            StatusLifecycle.update_status(item_id, "open", stage="plan_complete", runner=self.runner)
+            StatusLifecycle.update_status(
+                item_id,
+                "open",
+                stage="plan_complete",
+                needs_producer_review=flag_producer_review or None,
+                runner=self.runner,
+            )
             logger.debug("implementall.recovery item=%s", item_id)
         except RuntimeError as exc:
             logger.warning("implementall.recovery.exception item=%s exc=%s", item_id, exc)

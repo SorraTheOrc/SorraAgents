@@ -599,7 +599,10 @@ def _build_pipeline_runner(args: argparse.Namespace) -> Callable[[], dict[str, A
 
     if args.work_item_id and not args.dry_run:
         def _wrapped() -> dict[str, Any]:
-            with StatusLifecycle(args.work_item_id):
+            # restore_on_exit: this is a read-only analysis skill — the item's
+            # status is restored to its pre-run value on exit (never advanced
+            # to `completed`, which wl only allows for in_review/done stages).
+            with StatusLifecycle(args.work_item_id, restore_on_exit=True):
                 return _run()
         return _wrapped
 

@@ -25,16 +25,17 @@ import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from skill.shared.status_lifecycle import StatusLifecycle  # noqa: E402
-from typing import Any, Callable, Optional, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
+
+from skill.shared.status_lifecycle import StatusLifecycle
 
 # Add repo root to sys.path for shared utility access
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.scripts.failure_notice import FailureNotice  # noqa: E402
-
+from skill.scripts.failure_notice import FailureNotice
 
 logger = logging.getLogger("intakeall")
 
@@ -123,7 +124,7 @@ class IntakeAllEngine:
         self.item_timeout = item_timeout
         self.verbose = verbose
         # Track the item currently being processed for signal-handler recovery
-        self._current_item_id: Optional[str] = None
+        self._current_item_id: str | None = None
         self._total_discovered: int = 0
 
     # -----------------------------------------------------------------------
@@ -142,7 +143,9 @@ class IntakeAllEngine:
         """
         # NOTE: No --status filter — we query ALL items in idea stage so
         # that orphaned items (e.g. completed+idea) are not invisible.
-        cmd = ["wl", "list", "--stage", "idea", "--json"]
+        # Items flagged needsProducerReview are excluded: they are awaiting
+        # producer input and must not be auto-reprocessed in a loop.
+        cmd = ["wl", "list", "--stage", "idea", "--needs-producer-review", "no", "--json"]
         logger.debug("intakeall.discover cmd=%s", " ".join(cmd))
 
         try:
@@ -213,6 +216,16 @@ class IntakeAllEngine:
                 logger.debug("intakeall.auto_complete item=%s", item_id)
             except RuntimeError as exc:
                 logger.warning("intakeall.auto_complete.error item=%s exc=%s", item_id, exc)
+                # The claim above set in_progress; on failure reset to open so
+                # the item is never left stuck in in_progress.
+                try:
+                    StatusLifecycle.update_status(item_id, "open", runner=self.runner)
+                    logger.debug("intakeall.auto_complete.recovery item=%s", item_id)
+                except RuntimeError as recover_exc:
+                    logger.warning(
+                        "intakeall.auto_complete.recovery.error item=%s exc=%s",
+                        item_id, recover_exc,
+                    )
                 return "error"
 
             # Add a comment explaining the auto-complete
@@ -293,6 +306,12 @@ class IntakeAllEngine:
             if self._contains_questions(intake_text):
                 result["outcome"] = "needs_input"
                 result["error_detail"] = f"Intake needs input (rc={intake_result.returncode}): {stderr}"
+                # A needs_input item was claimed (in_progress); release it back
+                # to open + idea and flag producer review so the batch does
+                # not re-process it on the next run.
+                result["recovery"] = self._attempt_recovery(
+                    item_id, flag_producer_review=True,
+                )
                 return result
             # Otherwise it's an error - attempt recovery
             result["outcome"] = "error"
@@ -304,6 +323,9 @@ class IntakeAllEngine:
         if self._contains_questions(intake_text):
             result["outcome"] = "needs_input"
             result["error_detail"] = "Intake output contains unanswered questions"
+            result["recovery"] = self._attempt_recovery(
+                item_id, flag_producer_review=True,
+            )
             return result
 
         # Mark the item as intake_complete via shared helper
@@ -320,7 +342,7 @@ class IntakeAllEngine:
         result["outcome"] = "intake_completed"
         return result
 
-    def _attempt_recovery(self, item_id: str, current_status: str = "") -> dict:
+    def _attempt_recovery(self, item_id: str, current_status: str = "", flag_producer_review: bool = False) -> dict:
         """Attempt to recover from a failed intake by resetting the item status.
 
         Distinguishes between two orphan scenarios:
@@ -333,6 +355,9 @@ class IntakeAllEngine:
             current_status: The item's current status value. If "completed",
                 moves to stage=done. If "in_progress", resets to status=open.
                 Empty string uses the fallback (reset both).
+            flag_producer_review: If True, also set ``needsProducerReview=yes``
+                so producers can triage the item and the batch excludes it
+                from re-processing.
 
         Returns:
             A dict with keys:
@@ -363,8 +388,15 @@ class IntakeAllEngine:
         elif current_status == "in_progress":
             # in_progress+idea → status=open (stage stays idea)
             try:
-                StatusLifecycle.update_status(item_id, "open", runner=self.runner)
+                StatusLifecycle.update_status(
+                    item_id,
+                    "open",
+                    needs_producer_review=flag_producer_review or None,
+                    runner=self.runner,
+                )
                 recovery["action"] = "reset_status_to_open"
+                if flag_producer_review:
+                    recovery["action"] += "_flagged_producer_review"
                 logger.debug("intakeall.recovery.in_progress item=%s", item_id)
             except RuntimeError as exc:
                 logger.warning(
@@ -375,8 +407,16 @@ class IntakeAllEngine:
         else:
             # Fallback: reset both status and stage (e.g. signal handler)
             try:
-                StatusLifecycle.update_status(item_id, "open", stage="idea", runner=self.runner)
+                StatusLifecycle.update_status(
+                    item_id,
+                    "open",
+                    stage="idea",
+                    needs_producer_review=flag_producer_review or None,
+                    runner=self.runner,
+                )
                 recovery["action"] = "reset_status_to_open"
+                if flag_producer_review:
+                    recovery["action"] += "_flagged_producer_review"
                 logger.debug("intakeall.recovery.fallback item=%s", item_id)
             except RuntimeError as exc:
                 logger.warning(
@@ -676,6 +716,22 @@ class IntakeAllEngine:
                     # Item needs intake - in batch mode we skip the interactive
                     # /intake subprocess (which blocks indefinitely waiting for
                     # stdin) and mark the item as needing manual input instead.
+                    # The item is never claimed (stays status=open) and is
+                    # flagged needsProducerReview so the batch does not
+                    # re-process it on the next run.
+                    if not self.dry_run:
+                        try:
+                            StatusLifecycle.update_status(
+                                item_id,
+                                "open",
+                                needs_producer_review=True,
+                                runner=self.runner,
+                            )
+                        except RuntimeError as exc:
+                            logger.warning(
+                                "intakeall.needs_input.flag.error item=%s exc=%s",
+                                item_id, exc,
+                            )
                     result = {
                         "id": item_id,
                         "title": title,

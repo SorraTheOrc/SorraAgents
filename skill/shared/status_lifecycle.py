@@ -220,6 +220,12 @@ class StatusLifecycle:
 
     - **Normal exit:** transitions to ``completed`` (optionally advancing stage)
     - **Exception exit:** restores original status (rollback)
+    - **restore_on_exit=True:** restores the original status on success too —
+      for read-only analysis skills (find-related, refactor, effort-and-risk)
+      that must NOT advance the workflow stage. This avoids setting
+      ``status=completed`` on items still in ``idea``/``intake_complete``/
+      ``plan_complete`` stages, which the wl CLI rejects (``completed`` is
+      only compatible with stages ``in_review``/``done``).
     - **Idempotent:** safe to call when work item is already in the target state
 
     Args:
@@ -227,6 +233,8 @@ class StatusLifecycle:
         assignee: Optional assignee name. Set on entry; cleared on failure exit.
         target_stage: Optional stage value (e.g. ``in_review``) to set
             on successful exit.
+        restore_on_exit: If True, restore the original status on successful
+            exit instead of advancing to ``completed``.
         runner: Optional injectable command runner for testing.
             Must have signature ``(cmd: list[str]) -> subprocess.CompletedProcess``.
 
@@ -244,6 +252,11 @@ class StatusLifecycle:
             implement()
 
         # Status is now ``completed``, stage is ``in_review``
+
+        with StatusLifecycle("SA-0ABC123", restore_on_exit=True):
+            find_related_work()
+
+        # Status is restored to its pre-run value (never ``completed``)
     """
 
     def __init__(
@@ -252,11 +265,13 @@ class StatusLifecycle:
         *,
         assignee: str | None = None,
         target_stage: str | None = None,
+        restore_on_exit: bool = False,
         runner: Runner | None = None,
     ) -> None:
         self._work_item_id = work_item_id
         self._assignee = assignee
         self._target_stage = target_stage
+        self._restore_on_exit = restore_on_exit
         self._runner = runner or _default_runner
         self._original_status: str = "open"  # safe default
         self._did_set_in_progress: bool = False
@@ -371,11 +386,26 @@ class StatusLifecycle:
         exc_val: BaseException | None,
         exc_tb: object | None,  # noqa: PYI036
     ) -> bool | None:
-        """On success: set completed. On exception: restore original status."""
+        """On success: set completed (or restore original if restore_on_exit).
+
+        On exception: restore original status.
+        """
         if exc_type is not None:
             # Exception path — restore original status
             self._restore_original()
             # Do NOT suppress the exception
+            return None
+
+        if self._restore_on_exit:
+            # Read-only mode — restore the original status on success too so
+            # the item is never advanced to ``completed`` (which the wl CLI
+            # rejects for idea/intake_complete/plan_complete stages).
+            self._restore_original()
+            LOG.info(
+                "Restored original status=%s for %s (restore_on_exit)",
+                self._original_status,
+                self._work_item_id,
+            )
             return None
 
         # Success path — transition to completed

@@ -20,18 +20,17 @@ import signal
 from pathlib import Path
 from types import SimpleNamespace
 
-
 # Ensure the repo root is on sys.path so skill packages are importable
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-import sys  # noqa: E402
+import sys
+
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.planall.scripts.planall import (  # noqa: E402
+from skill.planall.scripts.planall import (
     PlanAllEngine,
     generate_summary,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fake helpers
@@ -39,7 +38,6 @@ from skill.planall.scripts.planall import (  # noqa: E402
 
 class FakeProc(SimpleNamespace):
     """Fake subprocess.CompletedProcess used by FakeRunner."""
-    pass
 
 
 class FakeRunner:

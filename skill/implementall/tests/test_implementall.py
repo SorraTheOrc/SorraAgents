@@ -22,18 +22,17 @@ import signal
 from pathlib import Path
 from types import SimpleNamespace
 
-
 # Ensure the repo root is on sys.path so skill packages are importable
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-import sys  # noqa: E402
+import sys
+
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skill.implementall.scripts.implementall import (  # noqa: E402
+from skill.implementall.scripts.implementall import (
     ImplementAllEngine,
     generate_summary,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fake helpers
@@ -41,7 +40,6 @@ from skill.implementall.scripts.implementall import (  # noqa: E402
 
 class FakeProc(SimpleNamespace):
     """Fake subprocess.CompletedProcess used by FakeRunner."""
-    pass
 
 
 class FakeRunner:
@@ -159,11 +157,12 @@ class TestDiscovery:
         assert items[1]["id"] == "SA-IMPL-002"
         assert items[2]["id"] == "SA-IMPL-003"
 
-        # Verify the correct wl command was issued
+        # Verify the correct wl command was issued (items awaiting producer
+        # review are excluded so they are not re-processed in a loop)
         assert any(
-            "wl list --stage plan_complete --status open --json" in " ".join(cmd)
+            "wl list --stage plan_complete --status open --needs-producer-review no" in " ".join(cmd)
             for cmd in runner.calls
-        ), "Expected wl list --stage plan_complete --status open --json call"
+        ), "Expected wl list --stage plan_complete --status open --needs-producer-review no --json call"
 
     def test_discover_returns_empty_list_when_no_items(self):
         """When no items are in plan_complete, return an empty list."""

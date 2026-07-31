@@ -9,7 +9,7 @@ Use this skill when asked to run batch planning on all `intake_complete` work it
 
 ## Behavior
 
-1. Query `wl list --stage intake_complete --json` for eligible items
+1. Query `wl list --stage intake_complete --needs-producer-review no --json` for eligible items (items flagged `needsProducerReview` are awaiting producer input and are excluded to avoid re-processing loops)
 2. Claim each (`wl update <id> --status in_progress`) and invoke `/plan`
 3. Detect producer-input need (non-zero exit, question patterns, exceptions)
 4. Continue despite errors/input-needs
@@ -46,15 +46,27 @@ pi run /planall
 
 ## Producer-input detection
 
-Detected by: non-zero exit from `/plan`, question-like patterns, or exceptions. Flagged items are skipped (not retried).
+Detected by: non-zero exit from `/plan`, question-like patterns, or exceptions. Flagged items are skipped (not retried) and **recovered to a valid terminal state**: `status=open`, `stage=intake_complete`, `needsProducerReview=yes`. The producer-review flag keeps the item visible (`open`) while preventing the batch from re-processing it on the next run. Producers clear the flag via `wl reviewed <id> no` after triaging.
 
 ## Error handling
 
 - `wl list` failure: empty list returned gracefully
 - Claim failure: logged as warning, marked `error`
-- `/plan` failure: recovers (stage→`intake_complete`, status→`open`), continues
+- `/plan` failure: recovers (`stage`→`intake_complete`, `status`→`open`), continues
+- Producer-input need: recovers (`stage`→`intake_complete`, `status`→`open`, `needsProducerReview=yes`), continues
 - Timeout: same recovery as failure
 - All errors captured in summary report
+
+## Status safety invariant
+
+No matter how an item's processing ends (planned, needs input, error, or
+interruption), the item is **never left in `in_progress`** when the batch
+completes. Every terminal path resets to a valid status:
+
+- **planned** → managed by the `/plan` skill itself (`open`/`plan_complete`)
+- **needs_input** → `open` + `intake_complete` + `needsProducerReview=yes`
+- **error** → `open` + `intake_complete`
+- **signal abort** → `open` + `intake_complete`
 
 ## Signal handling
 
