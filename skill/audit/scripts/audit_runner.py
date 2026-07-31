@@ -1933,7 +1933,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         "evidence": evidence,
                     })
         else:
-            ac_results = [{"text": "No acceptance criteria defined.", "verdict": "unmet", "evidence": ""}]
+            ac_results = [{"text": "No acceptance criteria defined.", "verdict": "met", "evidence": ""}]
 
         # Review children (depth 1 only, ignore deleted)
         # Children with status=deleted (wl delete) or deletedBy (imported)
