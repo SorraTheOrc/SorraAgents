@@ -70,6 +70,22 @@ wrong (model hang, provider issue) and the timeout diagnostic should be
 produced rather than blocking indefinitely.
 """
 
+_PI_MAX_RETRIES = 2
+"""Number of retries for transient provider errors in ``_call_pi``.
+
+Providers sometimes terminate a model call with ``finish_reason: error``
+(e.g., local proxy glitches) before the model emits its final output. The
+audit runner treats these as transient and retries up to this many extra
+times before surfacing a provider-error diagnostic. Non-provider failures
+(e.g., unparseable output, timeouts) are NOT retried.
+"""
+
+_PI_RETRY_BACKOFF_SECONDS = 2.0
+"""Base backoff (seconds) between provider-error retries in ``_call_pi``.
+
+Backoff grows linearly: 1x, 2x, ... base per retry attempt.
+"""
+
 AUDIT_FRESHNESS_BUFFER_SECONDS = 60
 """Freshness buffer (seconds) for the recent-audit gate.
 
@@ -459,33 +475,58 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             "--tools", "read,bash,grep,find,ls",
             "--exclude-tools", "ask_question",
         ])
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(f"pi binary not found: {pi_bin}")
 
     effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
-    try:
-        stdout, stderr = process.communicate(timeout=effective_timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        stdout, stderr = process.communicate()
+    attempt = 0
+    provider_error: str | None = None
+    stdout = ""
+    stderr = ""
+    while True:
+        attempt += 1
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(f"pi binary not found: {pi_bin}")
+
+        try:
+            stdout, stderr = process.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            return {
+                "verdict": "unmet",
+                "evidence": (
+                    f"Pi model call timed out after {effective_timeout}s. "
+                    "Manual audit required."
+                ),
+                "raw_stdout": stdout,
+                "raw_stderr": stderr,
+                "extracted_text": "",
+                "_timeout": True,
+            }
+
+        # Detect provider errors (e.g. "finish_reason: error" where the model
+        # never emits its final structured output) and retry them with backoff.
+        provider_error = _extract_provider_error(stdout or "")
+        if provider_error is None or attempt > _PI_MAX_RETRIES:
+            break
+        time.sleep(_PI_RETRY_BACKOFF_SECONDS * attempt)
+
+    if provider_error:
         return {
             "verdict": "unmet",
-            "evidence": (
-                f"Pi model call timed out after {effective_timeout}s. "
-                "Manual audit required."
-            ),
+            "evidence": f"Pi provider error: {provider_error}",
             "raw_stdout": stdout,
             "raw_stderr": stderr,
             "extracted_text": "",
-            "_timeout": True,
+            "_provider_error": True,
+            "_provider_error_message": provider_error,
         }
 
     raw = stdout or ""
@@ -577,6 +618,12 @@ def _parse_pi_json_line(line: str):
 
     if event_type in ("message_start", "message_end", "turn_end"):
         message = obj.get("message")
+        # Only extract text from assistant messages. The user prompt echo
+        # (message_start with role=user) must never be treated as model
+        # output — it caused false parse failures when the model errored out
+        # mid-stream and the prompt was the last complete text block.
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return "", False, None
         text = _extract_text_from_assistant_message(message)
         if text:
             return "", False, text
@@ -630,6 +677,45 @@ def _extract_last_assistant_message_text(messages) -> str | None:
             if text:
                 return text
     return None
+
+
+def _extract_provider_error(raw: str) -> str | None:
+    """Return the provider error message if the Pi stream ended in a provider error.
+
+    Scans the JSON stream for ``agent_end`` events and inspects the last
+    assistant message for ``stopReason == "error"`` or an ``errorMessage``
+    field (as seen with Local Proxy ``finish_reason: error`` failures where
+    the model never emits its final structured output).
+
+    Returns the error message, or ``None`` if no provider error is present.
+    """
+    if not raw:
+        return None
+    provider_error: str | None = None
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "agent_end":
+            continue
+        messages = obj.get("messages")
+        if not isinstance(messages, list):
+            continue
+        for msg in reversed(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            stop_reason = msg.get("stopReason")
+            error_message = msg.get("errorMessage")
+            if stop_reason == "error" or error_message:
+                provider_error = error_message or f"provider stop reason: {stop_reason}"
+            break
+    return provider_error
 
 
 # ---------------------------------------------------------------------------
@@ -1200,7 +1286,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         reason = "debug_log"
         target = Path(debug_log)
     elif isinstance(result, dict) and (result.get("raw_stdout") or result.get("raw_stderr")):
-        reason = "parse_failure"
+        reason = "provider_error" if result.get("_provider_error") else "parse_failure"
         target = _default_debug_log_path(issue_id, context)
 
     if reason and target:
@@ -1212,6 +1298,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             "raw_stderr": result.get("raw_stderr"),
             "extracted_text": result.get("extracted_text"),
             "evidence": result.get("evidence"),
+            "provider_error": result.get("_provider_error_message"),
             "prompt": prompt[:1000],
         }
         try:
@@ -1550,6 +1637,41 @@ def _run_phase2_deep_analysis(
             timeout_children.append(dict(child))
             timeout_children[-1]["ac_results"] = updated_child_acs
         return timeout_acs, timeout_children, False
+
+    # Check for provider errors (e.g. finish_reason: error) before parsing.
+    # The model never emitted its structured output, so treat all ACs as
+    # partial with a provider-error diagnostic (distinct from a parse failure).
+    if result.get("_provider_error"):
+        provider_error = result.get("_provider_error_message", "unknown")
+        print(
+            f"Warning: Phase 2 deep analysis provider error: {provider_error}",
+            file=sys.stderr,
+        )
+        if script_failure_callback:
+            script_failure_callback(
+                "pi (Phase 2 deep analysis)",
+                RuntimeError(f"Pi provider error: {provider_error}"),
+            )
+        error_acs = []
+        for ac in ac_results:
+            error_acs.append({
+                "text": ac.get("text", ""),
+                "verdict": VERDICT_PARTIAL,
+                "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+            })
+        error_children = []
+        for child in child_results:
+            child_acs = child.get("ac_results", [])
+            updated_child_acs = []
+            for ac in child_acs:
+                updated_child_acs.append({
+                    "text": ac.get("text", ""),
+                    "verdict": VERDICT_PARTIAL,
+                    "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+                })
+            error_children.append(dict(child))
+            error_children[-1]["ac_results"] = updated_child_acs
+        return error_acs, error_children, False
 
     # Parse the batched result
     raw_text = (
@@ -1898,21 +2020,29 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 # parseable JSON array. Print a warning, log raw output, and use
                 # 'partial' verdict with diagnostic evidence instead of silently
                 # falling back to 'unmet' with empty evidence.
-                print(
-                    "Warning: Unparseable Pi output for AC evaluation — "
-                    "falling back to 'partial' verdict",
-                    file=sys.stderr,
-                )
+                if result.get("_provider_error"):
+                    print(
+                        "Warning: Pi provider error during AC evaluation — "
+                        "falling back to 'partial' verdict",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "Warning: Unparseable Pi output for AC evaluation — "
+                        "falling back to 'partial' verdict",
+                        file=sys.stderr,
+                    )
                 if debug_log:
                     try:
                         target = Path(debug_log) if debug_log else _default_debug_log_path(issue_id, "parent_ac_fallback")
                         _write_debug_log(target, {
                             "issue_id": issue_id,
                             "context": "parent_ac_fallback",
-                            "reason": "parse_failure",
+                            "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
                             "raw_text": raw_text,
                             "result_verdict": result.get("verdict"),
                             "result_evidence": result.get("evidence", "")[:500],
+                            "provider_error": result.get("_provider_error_message"),
                         })
                     except Exception:  # noqa: S110, BLE001 -- optional enhancement, ignore on failure
                         pass
@@ -1920,14 +2050,24 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 # cannot be trusted to represent each AC individually. Override
                 # verdict to 'partial' but preserve any diagnostic evidence
                 # from the root-level result (e.g., a timeout message).
-                outer_evidence = result.get("evidence", "")
-                if outer_evidence:
+                if result.get("_provider_error"):
+                    # Provider errors are NOT model parse failures: surface the
+                    # actual provider diagnostic so operators can distinguish a
+                    # transient model outage from a genuine unparseable response.
+                    provider_error = result.get("_provider_error_message", "unknown")
                     evidence = (
-                        f"Pi model output could not be parsed — raw output logged. "
-                        f"Root-level diagnostic: {outer_evidence[:500]}"
+                        f"Pi provider error: {provider_error} — "
+                        "criterion could not be evaluated."
                     )
                 else:
-                    evidence = "Pi model output could not be parsed — raw output logged"
+                    outer_evidence = result.get("evidence", "")
+                    if outer_evidence:
+                        evidence = (
+                            f"Pi model output could not be parsed — raw output logged. "
+                            f"Root-level diagnostic: {outer_evidence[:500]}"
+                        )
+                    else:
+                        evidence = "Pi model output could not be parsed — raw output logged"
                 for ac in acs:
                     ac_results.append({
                         "text": ac,
@@ -2028,11 +2168,18 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     # parseable JSON array. Print a warning, log raw output, and use
                     # 'partial' verdict with diagnostic evidence instead of silently
                     # falling back to 'unmet' with empty evidence.
-                    print(
-                        "Warning: Unparseable Pi output for AC evaluation — "
-                        "falling back to 'partial' verdict",
-                        file=sys.stderr,
-                    )
+                    if result.get("_provider_error"):
+                        print(
+                            "Warning: Pi provider error during child AC evaluation — "
+                            "falling back to 'partial' verdict",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            "Warning: Unparseable Pi output for AC evaluation — "
+                            "falling back to 'partial' verdict",
+                            file=sys.stderr,
+                        )
                     if debug_log:
                         try:
                             target = Path(debug_log) if debug_log else _default_debug_log_path(issue_id, f"child_{child.get('id', 'unknown')}_ac_fallback")
@@ -2040,10 +2187,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
                                 "issue_id": issue_id,
                                 "child_id": child.get("id"),
                                 "context": "child_ac_fallback",
-                                "reason": "parse_failure",
+                                "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
                                 "raw_text": raw_text,
                                 "result_verdict": result.get("verdict"),
                                 "result_evidence": result.get("evidence", "")[:500],
+                                "provider_error": result.get("_provider_error_message"),
                             })
                         except Exception:  # noqa: S110, BLE001 -- optional enhancement, ignore on failure
                             pass
@@ -2051,14 +2199,21 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     # cannot be trusted to represent each AC individually. Override
                     # verdict to 'partial' but preserve any diagnostic evidence
                     # from the root-level result (e.g., a timeout message).
-                    outer_evidence = result.get("evidence", "")
-                    if outer_evidence:
+                    if result.get("_provider_error"):
+                        provider_error = result.get("_provider_error_message", "unknown")
                         evidence = (
-                            f"Pi model output could not be parsed — raw output logged. "
-                            f"Root-level diagnostic: {outer_evidence[:500]}"
+                            f"Pi provider error: {provider_error} — "
+                            "criterion could not be evaluated."
                         )
                     else:
-                        evidence = "Pi model output could not be parsed — raw output logged"
+                        outer_evidence = result.get("evidence", "")
+                        if outer_evidence:
+                            evidence = (
+                                f"Pi model output could not be parsed — raw output logged. "
+                                f"Root-level diagnostic: {outer_evidence[:500]}"
+                            )
+                        else:
+                            evidence = "Pi model output could not be parsed — raw output logged"
                     for ac in child_acs:
                         child_ac_results.append({
                             "text": ac,

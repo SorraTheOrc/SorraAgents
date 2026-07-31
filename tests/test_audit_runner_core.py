@@ -2063,6 +2063,169 @@ class TestRC2RCFallbackVerdict:
             f"Expected warning on stderr about unparseable output, got: {captured.err}"
         )
 
+    def test_parent_ac_fallback_uses_provider_error_diagnostic(self, monkeypatch, capsys):
+        """Provider-error results surface a provider diagnostic, not a generic parse failure."""
+        from skill.audit.scripts.audit_runner import _assemble_issue_report
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            # Simulate a persistent provider error (as returned by _call_pi
+            # after retries are exhausted).
+            return {
+                "verdict": "unmet",
+                "evidence": "Pi provider error: Provider finish_reason: error",
+                "extracted_text": "",
+                "text": "",
+                "_provider_error": True,
+                "_provider_error_message": "Provider finish_reason: error",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        parent_wi = _load_fixture("wi_with_numbered_ac.json")
+        parent_wi["children"] = []
+
+        captured_ac_results = []
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi))
+            if "show" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi["workItem"]))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        def capturing_assemble(issue, ac_results, child_results, **kwargs):
+            nonlocal captured_ac_results
+            captured_ac_results[:] = ac_results
+            return _assemble_issue_report(issue, ac_results, child_results, **kwargs)
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            capturing_assemble,
+        )
+
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+
+        assert len(captured_ac_results) > 0, "Should have AC results"
+        for ac in captured_ac_results:
+            assert ac["verdict"] == "partial", (
+                f"Expected 'partial' verdict for AC '{ac['text']}', got '{ac['verdict']}'"
+            )
+            assert "provider error" in ac["evidence"].lower(), (
+                f"Expected provider-error diagnostic, got: '{ac['evidence']}'"
+            )
+            assert "could not be parsed" not in ac["evidence"].lower(), (
+                f"Provider errors must not be reported as generic parse failures: '{ac['evidence']}'"
+            )
+
+        # Warning should be printed to stderr
+        captured = capsys.readouterr()
+        assert "provider error" in captured.err.lower() or "unparseable" in captured.err.lower(), (
+            f"Expected provider-error warning on stderr, got: {captured.err}"
+        )
+
+    def test_child_ac_fallback_uses_provider_error_diagnostic(self, monkeypatch, capsys):
+        """Child AC provider-error results surface a provider diagnostic."""
+        from skill.audit.scripts.audit_runner import _assemble_issue_report
+
+        pi_call_count = [0]
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            pi_call_count[0] += 1
+            if pi_call_count[0] == 1:
+                # First call is for parent ACs - return parseable
+                return {
+                    "verdict": "met",
+                    "evidence": "x:1 — ok",
+                    "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "x:1 — ok"},{"index": 1, "verdict": "met", "evidence": "x:2 — ok"},{"index": 2, "verdict": "met", "evidence": "x:3 — ok"}]',
+                    "text": "",
+                }
+            # Subsequent calls (child ACs) return a provider error
+            return {
+                "verdict": "unmet",
+                "evidence": "Pi provider error: Provider finish_reason: error",
+                "extracted_text": "",
+                "text": "",
+                "_provider_error": True,
+                "_provider_error_message": "Provider finish_reason: error",
+            }
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        child_wi = _load_fixture("wi_with_numbered_ac.json")
+        child_wi["workItem"]["id"] = "SA-CHILD"
+        child_wi["workItem"]["title"] = "Child with ACs"
+        child_wi["workItem"]["status"] = "in_progress"
+        child_wi["workItem"]["stage"] = "in_review"
+
+        parent_wi = _load_fixture("wi_with_numbered_ac.json")
+        parent_wi["children"] = [
+            {
+                "id": "SA-CHILD",
+                "title": "Child with ACs",
+                "status": "in_progress",
+                "stage": "in_review",
+                "description": child_wi["workItem"]["description"],
+            },
+        ]
+
+        captured_child_results = []
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi))
+            if "show" in cmd_list:
+                return _fake_proc(stdout=json.dumps(child_wi))
+            if "audit-show" in cmd_list:
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": {
+                        "workItemId": "SA-CHILD",
+                        "auditedAt": "2026-07-16T12:00:00Z",
+                        "rawOutput": "Ready to close: Yes\n\n## Summary\nAll good.",
+                    },
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        def capturing_assemble(issue, ac_results, child_results, **kwargs):
+            nonlocal captured_child_results
+            captured_child_results[:] = child_results
+            return _assemble_issue_report(issue, ac_results, child_results, **kwargs)
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._assemble_issue_report",
+            capturing_assemble,
+        )
+
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+
+        child = next((c for c in captured_child_results if c["id"] == "SA-CHILD"), None)
+        assert child is not None, "Child should be in results"
+
+        for ac in child["ac_results"]:
+            assert ac["verdict"] == "partial", (
+                f"Expected 'partial' verdict for child AC '{ac['text']}', got '{ac['verdict']}'"
+            )
+            assert "provider error" in ac["evidence"].lower(), (
+                f"Expected provider-error diagnostic, got: '{ac['evidence']}'"
+            )
+            assert "could not be parsed" not in ac["evidence"].lower(), (
+                f"Provider errors must not be reported as generic parse failures: '{ac['evidence']}'"
+            )
+
+        captured = capsys.readouterr()
+        assert "provider error" in captured.err.lower() or "unparseable" in captured.err.lower(), (
+            f"Expected provider-error warning on stderr, got: {captured.err}"
+        )
+
     def test_fallback_writes_to_debug_log(self, monkeypatch, capsys, tmp_path):
         """Parse failure should write raw output to the debug log."""
         log_path = tmp_path / "audit_debug.jsonl"
