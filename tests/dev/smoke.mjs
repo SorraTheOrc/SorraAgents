@@ -72,13 +72,20 @@ test('repository structure: key files and directories exist', () => {
 // 2. Python test discovery
 // ---------------------------------------------------------------------------
 test('python: pytest can discover tests', () => {
-  const result = run('python3 -m pytest --collect-only -q 2>&1 || true');
-  // pytest --collect-only exits 0 when tests are found, 5 when none found
-  assert.ok(result.exitCode <= 1, `pytest collect failed with exit code ${result.exitCode}: ${result.stderr}`);
-  // Verify at least some test files are collected
+  // No `|| true` here — the real exit code matters. pytest --collect-only exits
+  // 0 when tests are found, 5 when none are found, and 2 on collection errors.
+  const result = run('python3 -m pytest --collect-only -q 2>&1');
+  assert.equal(
+    result.exitCode,
+    0,
+    `pytest collect failed with exit code ${result.exitCode}: ${result.stderr}`,
+  );
+  // Parse the collected count and require a non-zero number of tests.
+  const match = result.stdout.match(/(\d+) tests? collected/);
+  assert.ok(match, `pytest should report a collected count: ${result.stdout}`);
   assert.ok(
-    result.stdout.includes('test_') || result.stdout.includes('collected'),
-    'pytest should collect test items',
+    Number(match[1]) > 0,
+    `pytest should collect at least one test (got: ${match[1]})`,
   );
 });
 
@@ -94,12 +101,12 @@ test('tooling: wl CLI is available', () => {
 // ---------------------------------------------------------------------------
 // 4. Agent frontmatter lint (skip if pyyaml unavailable)
 // ---------------------------------------------------------------------------
-test('agent: frontmatter lint passes', { skip: false }, () => {
+test('agent: frontmatter lint passes', (t) => {
   // Try importing yaml first to see if pyyaml is installed
   const yamlCheck = run('python3 -c "import yaml" 2>&1');
   if (yamlCheck.exitCode !== 0) {
-    // pyyaml not installed — this test is skipped at runtime by design
-    assert.ok(true, 'pyyaml not installed; frontmatter lint skipped');
+    // pyyaml not installed — skip visibly rather than passing a no-op
+    t.skip('pyyaml not installed; frontmatter lint skipped');
     return;
   }
   const result = run('python3 scripts/agent_frontmatter_lint.py 2>&1');
