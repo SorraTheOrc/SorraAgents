@@ -793,3 +793,188 @@ class TestEffectiveTimeoutResolution:
             audit_runner.main(["project", "--timeout", "7200"])
             _args, kwargs = mock_project.call_args
             assert kwargs["timeout"] == 7200
+
+
+# ===========================================================================
+# Per-call timing instrumentation (SA-0MSAHQZN4004ZFKQ AC1-AC4)
+# ===========================================================================
+
+
+class TestCallPiTimingInstrumentation:
+    """Tests for elapsed-time instrumentation in _call_pi (AC1).
+
+    Every return path of ``_call_pi`` (success, timeout, provider error,
+    empty output) must attach a non-negative ``elapsed_seconds`` value
+    measured with ``time.monotonic``.
+    """
+
+    def _make_mock_popen(self, stdout_text: str = '{"text": "test"}'):
+        """Create a mock Popen that returns a process-like object."""
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (stdout_text, "")
+        mock_process.returncode = 0
+        return mock_process
+
+    def test_elapsed_seconds_attached_on_success(self):
+        """AC1: _call_pi attaches elapsed_seconds on a successful call."""
+        mock_process = self._make_mock_popen()
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+
+        assert "elapsed_seconds" in result
+        assert isinstance(result["elapsed_seconds"], float)
+        assert result["elapsed_seconds"] >= 0
+
+    def test_elapsed_seconds_attached_on_timeout(self):
+        """AC1: elapsed_seconds is attached on the timeout return path."""
+        mock_process = mock.MagicMock()
+        timeout_error = subprocess.TimeoutExpired(cmd="pi", timeout=10, output="", stderr="")
+        mock_process.communicate.side_effect = [timeout_error, ("", "")]
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+
+        assert result.get("_timeout") is True
+        assert "elapsed_seconds" in result
+        assert result["elapsed_seconds"] >= 0
+
+    def test_elapsed_seconds_attached_on_provider_error(self):
+        """AC1: elapsed_seconds is attached on the provider-error return path."""
+        provider_error_stream = json.dumps({
+            "type": "agent_end",
+            "messages": [{"role": "assistant", "stopReason": "error", "errorMessage": "boom"}],
+        })
+        mock_process = self._make_mock_popen(stdout_text=provider_error_stream)
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+
+        assert result.get("_provider_error") is True
+        assert "elapsed_seconds" in result
+        assert result["elapsed_seconds"] >= 0
+
+    def test_elapsed_seconds_attached_on_empty_output(self):
+        """AC1: elapsed_seconds is attached even when the output is empty."""
+        mock_process = self._make_mock_popen(stdout_text="")
+
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+
+        assert "elapsed_seconds" in result
+        assert result["elapsed_seconds"] >= 0
+
+
+class TestCallPiAndMaybeLogTiming:
+    """Tests for per-call timing emission in _call_pi_and_maybe_log (AC2/AC3)."""
+
+    def test_timing_line_emitted_to_stderr(self, capsys):
+        """AC2: a timing line with issue id, context, and elapsed seconds goes to stderr."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "met", "evidence": "ok", "elapsed_seconds": 12.34,
+            }
+            audit_runner._call_pi_and_maybe_log("SA-123", "phase2_deep", "prompt")
+
+        captured = capsys.readouterr()
+        assert "SA-123" in captured.err
+        assert "phase2_deep" in captured.err
+        assert "12.34" in captured.err
+
+    def test_timing_line_emitted_without_debug_log(self, capsys):
+        """AC2: the timing line is emitted even when no debug_log is configured."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "met", "evidence": "ok", "elapsed_seconds": 1.25,
+            }
+            audit_runner._call_pi_and_maybe_log("SA-123", "parent", "prompt")
+
+        captured = capsys.readouterr()
+        assert "timing" in captured.err.lower()
+        assert "parent" in captured.err
+        assert "1.25" in captured.err
+
+    def test_debug_log_entry_includes_elapsed(self, tmp_path):
+        """AC3: debug-log entry includes elapsed_seconds alongside issue_id and context."""
+        log = tmp_path / "debug.jsonl"
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "unmet",
+                "evidence": "",
+                "raw_stdout": "raw",
+                "raw_stderr": "",
+                "elapsed_seconds": 5.5,
+            }
+            audit_runner._call_pi_and_maybe_log(
+                "SA-123", "phase2_child:0", "prompt", debug_log=str(log),
+            )
+
+        lines = log.read_text().strip().splitlines()
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry["issue_id"] == "SA-123"
+        assert entry["context"] == "phase2_child:0"
+        assert entry["elapsed_seconds"] == 5.5
+
+
+class TestPhase2TimingInstrumentation:
+    """Tests that Phase 2 parent and child calls emit per-call timings (AC4)."""
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text",
+                 verdict: str = "met") -> dict:
+        return {"index": index, "text": text, "verdict": verdict, "evidence": ""}
+
+    def _make_child(self, child_id: str = "CHILD-1",
+                    stage: str = "in_progress",
+                    status: str = "open",
+                    ac_count: int = 1) -> dict:
+        return {
+            "id": child_id,
+            "title": "Child Issue",
+            "stage": stage,
+            "status": status,
+            "ac_results": [
+                {"index": i, "text": f"Child AC {i}", "verdict": "met", "evidence": ""}
+                for i in range(ac_count)
+            ],
+        }
+
+    def test_phase2_parent_and_child_emit_timing_lines(self, capsys):
+        """AC4: phase2_deep and phase2_child calls emit per-call timing lines to stderr.
+
+        Mocks ``_call_pi`` (so ``_call_pi_and_maybe_log`` runs for real) and
+        runs ``_run_phase2_deep_analysis`` with one active child, then asserts
+        the stderr output contains per-call timing lines for the parent
+        (context ``phase2_deep``) and child (context ``phase2_child:0``) calls.
+        """
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = self._make_child("CHILD-1", ac_count=1)
+
+        def _fake_call_pi(prompt, model="test-model", pi_bin="pi",
+                          enable_tools=False, timeout=None):
+            return {
+                "verdict": "met",
+                "evidence": "file.py:10 works",
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "file.py:10 works"}]',
+                "elapsed_seconds": 3.75,
+            }
+
+        with mock.patch.object(audit_runner, "_call_pi", side_effect=_fake_call_pi):
+            updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(issue, acs, [child], "test-model")
+            )
+
+        captured = capsys.readouterr()
+        assert "TEST-1" in captured.err
+        assert "phase2_deep" in captured.err
+        assert "CHILD-1" in captured.err
+        assert "phase2_child:0" in captured.err
+        assert "3.75" in captured.err
+        # Behavior is unchanged: verdicts still flow through and phase2 completes.
+        assert phase2_completed is True
+        assert updated_acs[0]["verdict"] == "met"
+        assert updated_children[0]["ac_results"][0]["verdict"] == "met"

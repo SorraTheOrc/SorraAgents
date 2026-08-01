@@ -521,6 +521,10 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     provider_error: str | None = None
     stdout = ""
     stderr = ""
+    # Wall-clock baseline for per-call timing instrumentation. Measures the
+    # full call including any provider-error retries so operators can see the
+    # true per-call duration in the Phase 2 performance baseline.
+    _call_start = time.monotonic()
     while True:
         attempt += 1
         try:
@@ -549,6 +553,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                 "raw_stderr": stderr,
                 "extracted_text": "",
                 "_timeout": True,
+                "elapsed_seconds": time.monotonic() - _call_start,
             }
 
         # Detect provider errors (e.g. "finish_reason: error" where the model
@@ -557,6 +562,8 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         if provider_error is None or attempt > _PI_MAX_RETRIES:
             break
         time.sleep(_PI_RETRY_BACKOFF_SECONDS * attempt)
+
+    elapsed_seconds = time.monotonic() - _call_start
 
     if provider_error:
         return {
@@ -567,16 +574,17 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             "extracted_text": "",
             "_provider_error": True,
             "_provider_error_message": provider_error,
+            "elapsed_seconds": elapsed_seconds,
         }
 
     raw = stdout or ""
     if not raw:
-        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr}
+        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds}
 
     # Parse JSON lines looking for the final agent_end message
     text = _extract_pi_text(raw)
     if not text:
-        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr}
+        return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds}
 
     # Try to parse the text as JSON with verdict/evidence
     try:
@@ -588,12 +596,13 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                 "raw_stdout": stdout,
                 "raw_stderr": stderr,
                 "extracted_text": text,
+                "elapsed_seconds": elapsed_seconds,
             }
     except json.JSONDecodeError:
         pass
 
     # If Pi returned free-form text, use it as evidence and default to met
-    return {"verdict": "met", "evidence": text.strip()[:200], "raw_stdout": stdout, "raw_stderr": stderr, "extracted_text": text}
+    return {"verdict": "met", "evidence": text.strip()[:200], "raw_stdout": stdout, "raw_stderr": stderr, "extracted_text": text, "elapsed_seconds": elapsed_seconds}
 
 
 def _extract_pi_text(raw: str) -> str:
@@ -1319,6 +1328,17 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     """
     result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout)
 
+    # Emit a per-call timing line to stderr (performance baseline). Includes
+    # issue id, call context, and elapsed seconds so Phase 2 durations are
+    # measurable and regressions are visible without a debug log.
+    elapsed = result.get("elapsed_seconds")
+    if elapsed is not None:
+        print(
+            f"Per-call timing: issue_id={issue_id} context={context} "
+            f"elapsed_seconds={float(elapsed):.2f}",
+            file=sys.stderr,
+        )
+
     # Decide whether to write a debug line
     reason = None
     target = None
@@ -1339,6 +1359,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             "extracted_text": result.get("extracted_text"),
             "evidence": result.get("evidence"),
             "provider_error": result.get("_provider_error_message"),
+            "elapsed_seconds": result.get("elapsed_seconds"),
             "prompt": prompt[:1000],
         }
         try:
