@@ -156,7 +156,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
   This signals to other agents that this item is being worked on.
 
-1. Safety gate: handle dirty working tree
+2. Safety gate: handle dirty working tree
 
 Check the git context and handle uncommitted changes before proceeding.
 
@@ -172,7 +172,7 @@ Check the git context and handle uncommitted changes before proceeding.
 
 On abort: `StatusLifecycle.update_status(<work-item-id>, "open")`
 
-1. Understand the work item
+3. Understand the work item
 
 If not already assigned (or when using the orchestration script, this is handled
 by `phase_start()`): `StatusLifecycle.update_status(<work-item-id>, "in_progress", stage="in_progress", assignee="<AGENT>")`
@@ -186,7 +186,7 @@ Fetch details: `wl show <work-item-id> --json`. Pay attention to `description`, 
 
 Restate ACs and current status. Surface blockers, dependencies, missing requirements. Inspect linked PRDs, plans, or docs. Confirm expected tests or validation steps.
 
-1.1. Definition gate (must pass before implementation)
+3.1. Definition gate (must pass before implementation)
 
 Verify:
 
@@ -202,7 +202,7 @@ If the gate fails:
 3. If too large → run plan interview (`/skill:plan`) to decompose.
 4. Inform the user and ask if they want to restart implementation review.
 
-5. Create a worktree from dev and branch inside it
+4. Create a worktree from dev and branch inside it
 
 Follow the worktree convention in [[concepts/git-worktree-best-practices-for-agent-workflows]]:
 
@@ -213,11 +213,11 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 
 See [AGENTS.md](../../AGENTS.md#implement-the-work-item) for the top-level policy.
 
-1. Implement
+5. Implement
 
 - If the work item has open/in_progress blockers or dependencies, implement them first (recursively via this procedure).
 
-4.1. Parent-advancement check (epic/parent items only)
+5.1. Parent-advancement check (epic/parent items only)
 
 After all recursive child implementations are complete, check whether this work item has children:
 
@@ -247,7 +247,7 @@ After all recursive child implementations are complete, check whether this work 
   - Summarize changes in the work item.
   - Wait for user confirmation before proceeding.
 
-1. Error/exception handling (abort on unexpected errors)
+### Error/exception handling (abort on unexpected errors)
 
 On unexpected error (API failure, network error, exception):
 
@@ -258,7 +258,7 @@ On unexpected error (API failure, network error, exception):
 
 ### User-initiated abort
 
-If the operator cancels after Step 0:
+If the operator cancels after Step 2:
 
 1. `StatusLifecycle.update_status(<work-item-id>, "open")`
 2. Return control to the operator.
@@ -266,7 +266,7 @@ If the operator cancels after Step 0:
 
 ---
 
-1. Optional refactor step
+7. Optional refactor step
 
 After implementation completes and before final commit, an automated refactor step may detect and remediate code smells:
 
@@ -283,18 +283,19 @@ After implementation completes and before final commit, an automated refactor st
 
 - See ``../refactor/SKILL.md`` for full documentation.
 
-1. Automated self-review
+6. Automated self-review
 
 - Build and lint the code; fix any issues.
 - Run all tests again using quiet test commands; fix any failures.
-- Audit the work item: `/skill:audit <work-item-id>`. If ACs are unmet, inform the user and return to step 3.
+- Audit the work item: `/skill:audit <work-item-id>`. If ACs are unmet, inform the user and return to step 5.
 - Perform sequential self-review passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff.
 - For each pass, make small, goal-aligned edits. If intent changes are discovered, create an Open Question and stop.
 - Run the full test suite; fix any failures before continuing.
 
-1. Commit, Push to dev and mark in_review
+8. Commit, Push to dev and mark in_review
 
 - Follow the mandatory build → test → commit order before committing.
+- **Do NOT create a Pull Request to `main`.** Work is integrated into `dev`; the `dev`→`main` promotion is handled separately by the release process.
 - Push the feature branch into `dev` using:
   - Ship skill (preferred): `pushToDev()` from `../ship/scripts/ship.js`
   - Direct: `git push origin HEAD:refs/heads/dev`
