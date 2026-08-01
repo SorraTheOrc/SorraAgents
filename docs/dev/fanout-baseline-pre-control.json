@@ -1,0 +1,22 @@
+{
+  "timestamp": "2026-08-01T22:39:06Z",
+  "host": "rgardler-AI-Laptop",
+  "cpu_count": 16,
+  "load": {
+    "1min": 247.66943359375,
+    "5min": 273.98046875,
+    "15min": 204.5673828125
+  },
+  "swap": {
+    "total": 8589930496,
+    "used": 3956637696,
+    "free": 4633292800
+  },
+  "processes": {
+    "pi": 18,
+    "node": 203,
+    "vitest": 39,
+    "wl_sync": 0,
+    "audit": 6
+  }
+}
