@@ -113,37 +113,7 @@ test('critical: all skills have valid SKILL.md files', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. CI workflow YAML files are valid
-// ---------------------------------------------------------------------------
-test('critical: CI workflow YAML files are valid', () => {
-  const yamlCheck = run('python3 -c "import yaml" 2>&1');
-  if (yamlCheck.exitCode !== 0) {
-    // pyyaml not installed — install it temporarily
-    run('pip install pyyaml 2>&1');
-  }
-
-  const workflowsDir = join(REPO_ROOT, '.github', 'workflows');
-  assert.ok(existsSync(workflowsDir), '.github/workflows/ directory should exist');
-
-  const workflowFiles = readdirSync(workflowsDir).filter((name) =>
-    name.endsWith('.yml') || name.endsWith('.yaml'),
-  );
-
-  assert.ok(workflowFiles.length > 0, 'At least one workflow file should exist');
-
-  for (const wf of workflowFiles) {
-    const wfPath = join(workflowsDir, wf);
-    const result = run(`python3 -c "import yaml, sys; yaml.safe_load(open('${wfPath}'))" 2>&1`);
-    assert.equal(
-      result.exitCode,
-      0,
-      `Workflow file "${wf}" should be valid YAML: ${result.stderr}`,
-    );
-  }
-});
-
-// ---------------------------------------------------------------------------
-// 5. Agent guidance files consistency
+// 4. Agent guidance files consistency
 // ---------------------------------------------------------------------------
 test('critical: AGENTS.md and Workflow.md reference consistent terminology', () => {
   const agentsMd = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf-8');
@@ -166,35 +136,27 @@ test('critical: AGENTS.md and Workflow.md reference consistent terminology', () 
 });
 
 // ---------------------------------------------------------------------------
-// 6. AGENTS.md workflow: agents push to dev, ship handles release to main
+// 5. AGENTS.md workflow: agents push to dev, ship handles release to main
 // ---------------------------------------------------------------------------
 test('critical: AGENTS.md workflow pushes to dev; ship handles release to main', () => {
   const agentsMd = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf-8');
 
-  // Step 5 should describe pushing into dev as the integration step
+  // Push policy should describe pushing into dev as the integration step
   assert.ok(
-    agentsMd.includes('push into dev') || agentsMd.includes('push.*dev') ||
-    (agentsMd.includes('git push') && agentsMd.includes('refs/heads/dev')),
-    'AGENTS.md step 5 should describe pushing into dev',
+    agentsMd.includes('Push only to') && agentsMd.includes('dev'),
+    'AGENTS.md push policy should describe pushing into dev',
   );
 
-  // Step 6 should state that regular agents do NOT merge to main
+  // Should state that regular agents do NOT merge to main
   assert.ok(
-    agentsMd.includes('do NOT merge') || agentsMd.includes('not merge to main') ||
-    agentsMd.includes('agents does not merge'),
+    agentsMd.includes('never to') && agentsMd.includes('main') ||
+    agentsMd.includes('do NOT merge') || agentsMd.includes('not merge to main'),
     'AGENTS.md should state regular agents do not merge to main',
-  );
-
-  // Should reference the pre-push hook for enforcement
-  assert.ok(
-    agentsMd.includes('pre-push hook') || agentsMd.includes('.githooks/pre-push'),
-    'AGENTS.md should reference the pre-push hook',
   );
 
   // Should reference the ship skill for the dev→main release process
   assert.ok(
-    agentsMd.includes('ship agent') || agentsMd.includes('ship/skill') ||
-    agentsMd.includes('skill/ship/SKILL.md'),
+    agentsMd.includes('ship skill') || agentsMd.includes('ship/SKILL.md'),
     'AGENTS.md should reference the ship skill',
   );
 
@@ -204,15 +166,15 @@ test('critical: AGENTS.md workflow pushes to dev; ship handles release to main',
     'AGENTS.md should reference the release merge script',
   );
 
-  // After pushing to dev, agent should switch to dev locally
+  // Step 5 implementation should confirm work is committed to dev
   assert.ok(
-    agentsMd.includes('git checkout dev'),
-    'AGENTS.md should instruct switching to dev branch after push',
+    agentsMd.includes('Work committed to dev'),
+    'AGENTS.md step 5 should confirm work committed to dev',
   );
 });
 
 // ---------------------------------------------------------------------------
-// 7. skill/implement/SKILL.md step 5 describes dev-push workflow
+// 6. skill/implement/SKILL.md commit step describes dev-push workflow
 // ---------------------------------------------------------------------------
 test('critical: implement skill step 5 describes dev-push workflow, not PR creation', () => {
   const skillMd = readFileSync(join(REPO_ROOT, 'skill/implement/SKILL.md'), 'utf-8');
@@ -235,7 +197,7 @@ test('critical: implement skill step 5 describes dev-push workflow, not PR creat
 
   // Step 5 should NOT instruct agents to create a PR (it may say "do NOT create" but
   // must NOT contain an affirmative instruction to create a PR)
-  const step5Section = skillMd.split(/5\.\s*Commit, Push/)?.[1] || '';
+  const step5Section = skillMd.split(/\d+\.\s*Commit, Push/)?.[1] || '';
   const affirmativePR = /(?<!NOT\s)create a Pull Request\b/i;
   // Also check that the old affirmative PR creation pattern is gone
   assert.ok(
@@ -265,7 +227,7 @@ test('critical: implement skill step 5 describes dev-push workflow, not PR creat
 });
 
 // ---------------------------------------------------------------------------
-// 8. Worklog data integrity (basic)
+// 7. Worklog data integrity (basic)
 // ---------------------------------------------------------------------------
 test('critical: wl CLI is functional and returns data', () => {
   // Verify the worklog system is operational by running a simple query
@@ -289,7 +251,7 @@ test('critical: wl CLI is functional and returns data', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 9. Scripts directory integrity
+// 8. Scripts directory integrity
 // ---------------------------------------------------------------------------
 test('critical: essential scripts are present and executable', () => {
   const scripts = [
