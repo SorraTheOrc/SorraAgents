@@ -57,11 +57,16 @@ test('repository structure: key files and directories exist', () => {
     'skill/audit/SKILL.md',
     'skill/implement/SKILL.md',
     'tests/conftest.py',
-    '.github/workflows/ci.yml',
   ];
   for (const p of required) {
     assertPathExists(p);
   }
+
+  // No GitHub CI workflows remain — the project operates fully locally.
+  assert.ok(
+    !existsSync('.github/workflows/ci.yml') && !existsSync('.github'),
+    'CI workflows should have been removed (.github/ must not exist)',
+  );
 });
 
 // ---------------------------------------------------------------------------

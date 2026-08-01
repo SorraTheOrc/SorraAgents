@@ -85,6 +85,8 @@ The `release` action runs five gating checks before merging `dev` to `main`:
 4. **Worklog refs gate** — aborts if worklog refs are still present in merged code; exit code 8.
 5. **Producer-review gate** — aborts if items need producer review; exit code 9; `--skip-checks` bypasses.
 
+CI is **optional**: if the PR has status checks (e.g., a CI workflow is configured) they must pass before merge; if no status checks exist, the merge proceeds without waiting. See [Release Process](#release-process) step 6.
+
 Bypass all checks: `node ./scripts/run-release.js --skip-checks`
 
 ### Exit Codes
@@ -112,14 +114,13 @@ Steps:
 1. **Unmerged branches check** — aborts with report if branches pending; `--skip-checks` bypasses.
 2. **Pre-flight checks** — verifies `gh`, `wl`, clean worktree.
 3. **Critical-priority items check** — aborts with exit 7 if non-terminal critical items exist.
-4. **CI verification** — checks `dev-full-suite` is green (hard gate); `--force` bypasses.
-5. **Merge commit** — fetch latest dev/main, create `--no-ff` merge commit.
-6. **PR creation** — push to `release/dev-to-main-<timestamp>`, create PR targeting `main`.
-7. **Status check wait & merge** — waits for required checks (default 10 min), then `gh pr merge --merge --delete-branch`. `--force` skips wait.
-8. **Audit logging** — records merge hash, CI run IDs, PR URL in worklog.
-9. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push.
+4. **Merge commit** — fetch latest dev/main, create `--no-ff` merge commit.
+5. **PR creation** — push to `release/dev-to-main-<timestamp>`, create PR targeting `main`.
+6. **Status check wait & merge** — if the PR has status checks, waits for them to pass (default 10 min), then `gh pr merge --merge --delete-branch`. If the PR has **no** status checks (no CI configured), the merge proceeds immediately. `--force` skips the wait.
+7. **Audit logging** — records merge hash, PR URL in worklog.
+8. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push.
    > Release ops run from **main checkout**, not worktrees.
-10. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Logs warnings on individual close failures.
+9. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Logs warnings on individual close failures.
 
 ### Fallback: Human Release Manager
 
@@ -133,9 +134,9 @@ For repos where the automated merge is unsuitable, follow [`docs/dev/release-pro
 
 ### Pre-merge checklist
 
-1. CI (`dev-full-suite`, `dev-smoke`) is green on `dev` HEAD.
-2. No open merge conflicts between `dev` and `main`.
-3. No open critical work items (automated by critical-items gate; `--skip-checks` bypasses).
+1. No open merge conflicts between `dev` and `main`.
+2. No open critical work items (automated by critical-items gate; `--skip-checks` bypasses).
+3. If CI status checks are configured on the PR, they must pass (automated by step 6). If no CI is configured, this is satisfied automatically.
 4. `CHANGELOG.md` is generated automatically by the release script.
 
 See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md) for local test commands.
@@ -150,7 +151,7 @@ See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md) for local test c
 ## Preconditions & safety
 
 - Never force-push or rewrite history on `main` or `dev`.
-- Never bypass the CI-green gate unless `--force` is explicitly instructed.
+- Never bypass required status checks unless `--force` is explicitly instructed.
 - Always log merge audit to worklog via `wl comment add`.
 - Agents must never push directly to `main`. All merges go through a PR satisfying branch protection rules.
 
@@ -161,5 +162,5 @@ The implement/implement-single workflow uses `pushToDev()` internally to push fe
 ## Outputs
 
 - GitHub PR from `release/dev-to-main-<timestamp>` to `main`.
-- Worklog audit comment with merge hash, CI run IDs, PR URL.
+- Worklog audit comment with merge hash and PR URL.
 - Operator notification summarising the merge.

@@ -20,7 +20,7 @@ Usage: $0 [--dry-run] [--force] [--work-item-id <id>] [--bump patch|minor|major]
 
 Options:
   --dry-run       Do not push or create/merge the PR; just show planned actions
-  --force         Proceed even if CI checks are not green or other hard gates
+  --force         Merge the PR immediately without waiting for status checks
   --work-item-id  Worklog item id to record in logs (optional)
   --bump <type>   Version bump type: patch, minor, or major (default: patch).
                   The version in package.json is incremented before the merge.
@@ -211,7 +211,7 @@ if [[ "$FORCE" == "true" ]]; then
   }
   echo "PR merged: $PR_URL"
 else
-  echo "Release prepared. The PR $PR_URL should be merged once CI checks pass and reviewers approve."
+  echo "Release prepared. The PR $PR_URL should be merged once status checks pass (if any are configured) and reviewers approve."
 fi
 
 # Audit logging could be added here (e.g., call wl comment add ...)

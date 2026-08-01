@@ -228,7 +228,13 @@ export function syncDevWithMain() {
 // ── waitForPRMerge ───────────────────────────────────────────────────────────
 
 /**
- * Wait for CI status checks to pass on a PR, then merge it.
+ * Wait for PR status checks to pass, then merge the PR.
+ *
+ * CI is OPTIONAL for a release:
+ *  - If no status checks exist on the PR (repo has no CI), the PR is merged
+ *    immediately without a CI gate.
+ *  - If status checks are present, they must all complete successfully;
+ *    any failed or cancelled check blocks the merge.
  *
  * @param {string} prUrl - The GitHub PR URL.
  * @param {number} [timeoutSeconds=600] - Maximum time to wait for checks.
@@ -239,7 +245,7 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
     return { success: false, message: 'No PR URL provided; cannot wait for merge.' };
   }
 
-  console.log(`\nWaiting for CI checks to pass on ${prUrl}...`);
+  console.log(`\nWaiting for status checks on ${prUrl}...`);
 
   const startTime = Date.now();
   const maxWait = timeoutSeconds * 1000;
@@ -255,6 +261,20 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
       const status = JSON.parse(statusJson);
 
       const checks = status.statusCheckRollup || [];
+
+      // No CI configured on this repo/branch — proceed without a CI gate.
+      if (checks.length === 0) {
+        console.log('No CI status checks present on the PR — proceeding without a CI gate.');
+        execSync(`gh pr merge ${prNumber} --merge --delete-branch`, {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'inherit', 'pipe'],
+        });
+        return {
+          success: true,
+          message: `PR ${prUrl} merged successfully.`,
+        };
+      }
+
       const allCompleted = checks.every(
         (c) => c.status === 'COMPLETED',
       );
@@ -270,7 +290,7 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
       }
 
       if (allCompleted) {
-        console.log('All CI checks passed. Merging PR...');
+        console.log('All status checks passed. Merging PR...');
         execSync(`gh pr merge ${prNumber} --merge --delete-branch`, {
           encoding: 'utf-8',
           stdio: ['pipe', 'inherit', 'pipe'],
@@ -283,7 +303,7 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
 
       // Wait 10 seconds before polling again
       const elapsed = Math.round((Date.now() - startTime) / 1000);
-      process.stdout.write(`\rWaiting for CI checks... (${elapsed}s)`);
+      process.stdout.write(`\rWaiting for status checks... (${elapsed}s)`);
     } catch {
       // If gh command fails temporarily, retry
     }
@@ -294,7 +314,7 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
   console.log(''); // newline after progress dots
   return {
     success: false,
-    message: `Timed out waiting for CI checks on ${prUrl} after ${timeoutSeconds} seconds. Merge the PR manually.`,
+    message: `Timed out waiting for status checks on ${prUrl} after ${timeoutSeconds} seconds. Merge the PR manually.`,
   };
 }
 
