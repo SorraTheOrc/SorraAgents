@@ -95,9 +95,27 @@ fi
 # so they are excluded from the gate (mirrors match the JS gate in
 # check-worklog-refs.js).
 if git for-each-ref refs/worklog/ --format="%(refname)" 2>/dev/null | grep -v '^refs/worklog/remotes/' | grep -q .; then
-  echo "Error: Worklog refs detected under refs/worklog/. Aborting release to prevent accidental merge of worklog data into main." >&2
-  echo "The worklog ref (refs/worklog/data) is separate from regular branches and must not be merged into main." >&2
-  exit 1
+  # Collect flagged refs, excluding refs/worklog/data when it holds the
+  # worklog data file (it is the worklog's own git-branch sync mechanism,
+  # never a code branch to merge into main/dev).
+  DANGEROUS_REFS=0
+  while IFS= read -r ref; do
+    case "$ref" in
+      refs/worklog/remotes/*) continue ;;
+      refs/worklog/data)
+        if git cat-file -e refs/worklog/data:.worklog/worklog-data.jsonl 2>/dev/null; then
+          continue  # legitimate worklog data sync branch
+        fi
+        ;;
+    esac
+    DANGEROUS_REFS=1
+    echo "  - $ref" >&2
+  done < <(git for-each-ref refs/worklog/ --format='%(refname)' 2>/dev/null)
+  if [ "$DANGEROUS_REFS" -eq 1 ]; then
+    echo "Error: Dangerous worklog refs detected under refs/worklog/. Aborting release to prevent accidental merge of worklog data into main." >&2
+    echo "The worklog ref (refs/worklog/data) is separate from regular branches and must not be merged into main." >&2
+    exit 1
+  fi
 fi
 
 # Fetch latest

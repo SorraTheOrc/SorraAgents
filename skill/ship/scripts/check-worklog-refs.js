@@ -32,7 +32,11 @@ import { execSync } from 'node:child_process';
  * excluded — they are harmless bookkeeping maintained by `wl sync` and
  * are never merged by `git merge`/`git pull`.
  *
- * Only local worklog refs (e.g., refs/worklog/data) are flagged as dangerous.
+ * The worklog's own git-branch sync mechanism (refs/worklog/data) is also
+ * excluded when it actually contains the worklog data file
+ * (.worklog/worklog-data.jsonl): it is worklog DATA, never a code branch,
+ * and is never merged into main/dev. Only genuinely dangerous orphan
+ * worklog refs (no data file) are flagged.
  *
  * @returns {{
  *   hasWorklogRefs: boolean,
@@ -52,10 +56,25 @@ export function checkWorklogRefs() {
       .map((line) => line.trim())
       .filter((line) => line.length > 0);
 
-    // Filter out remote-tracking mirror refs (refs/worklog/remotes/**).
-    // These are harmless bookkeeping mirrors maintained by `wl sync` and
-    // are never merged by `git merge`/`git pull` of a branch.
-    const refs = allRefs.filter((ref) => !ref.startsWith('refs/worklog/remotes/'));
+    // Filter out remote-tracking mirror refs (refs/worklog/remotes/**) and
+    // the legitimate worklog data branch (refs/worklog/data) when it holds
+    // the worklog data file. These are harmless bookkeeping maintained by
+    // `wl sync` and are never merged by `git merge`/`git pull` of a branch.
+    const refs = allRefs.filter((ref) => {
+      if (ref.startsWith('refs/worklog/remotes/')) return false;
+      if (ref === 'refs/worklog/data') {
+        try {
+          execSync('git cat-file -e refs/worklog/data:.worklog/worklog-data.jsonl', {
+            encoding: 'utf-8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+          });
+          return false; // contains worklog data → legitimate sync branch
+        } catch {
+          // fall through: flagged as a dangerous orphan
+        }
+      }
+      return true;
+    });
 
     if (refs.length === 0) {
       return {
