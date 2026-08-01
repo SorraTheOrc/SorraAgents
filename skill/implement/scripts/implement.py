@@ -41,12 +41,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from skill.shared.status_lifecycle import StatusLifecycle
+# Ensure the repository root is on sys.path so skill package imports work
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-# Ensure skill package root is on sys.path for shared imports
-_SKILLS_ROOT = Path(__file__).resolve().parents[3]  # .../.pi/agent/skills/
-if str(_SKILLS_ROOT.parent / "skill") not in sys.path:
-    sys.path.insert(0, str(_SKILLS_ROOT.parent / "skill"))
+from skill.shared.status_lifecycle import StatusLifecycle
 
 LOG = logging.getLogger("implement.scripts.implement")
 
