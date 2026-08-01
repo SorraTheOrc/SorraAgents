@@ -1056,8 +1056,9 @@ class TestStatusLifecycle:
             f"in_progress update must include --json, got: {in_progress_updates[0]}"
         )
 
-    def test_restores_open_on_success_no_status_in_response(self, monkeypatch):
-        """On successful audit, status is restored to 'open' (default) when no original status was captured."""
+    def test_advances_to_completed_in_review_on_success(self, monkeypatch):
+        """On a successful audit with a 'yes' verdict, the item advances to
+        completed/in_review even when no original status was captured."""
         calls = []
 
         monkeypatch.setattr(
@@ -1072,9 +1073,12 @@ class TestStatusLifecycle:
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
-        open_restore_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
-        assert len(open_restore_updates) >= 1, (
-            f"Expected at least one 'open' status restore, got: {wl_updates}"
+        final_update = wl_updates[-1]
+        assert final_update[3:5] == ["--status", "completed"], (
+            f"Expected 'completed' terminal transition on yes verdict, got: {wl_updates}"
+        )
+        assert final_update[5:7] == ["--stage", "in_review"], (
+            f"Expected stage in_review, got: {final_update}"
         )
 
     def test_final_restore_update_includes_json_flag(self, monkeypatch):
@@ -1140,8 +1144,9 @@ class TestStatusLifecycle:
         )
 
     def test_handled_exception_sets_open_status(self, monkeypatch):
-        """When a pi RuntimeError is caught by the body, audit cannot verify ACs
-        so ``Ready to close: No`` → status becomes ``open``."""
+        """When a pi RuntimeError is caught by the body, the audit is a failure:
+        the item is never left in_progress — it is restored to a safe state
+        ('open') with the assignee cleared."""
         calls = []
 
         def fake_call_pi(prompt, model="x", pi_bin="x", **kwargs):
@@ -1187,7 +1192,8 @@ class TestStatusLifecycle:
         )
 
     def test_restores_original_status_with_json_flag_when_audit_passes(self, monkeypatch):
-        """When audit passes, original status is restored and the update includes --json flag."""
+        """A yes verdict on an originally in_progress item advances it to
+        completed/in_review (never back to in_progress); --json is included."""
         calls = []
 
         monkeypatch.setattr(
@@ -1202,15 +1208,19 @@ class TestStatusLifecycle:
         cmd_issue("SA-ORIGSTAT2", runner=self._fake_runner_with_status(calls, status="in_progress"), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-ORIGSTAT2"]]
-        # The restore should set the original status (in_progress)
-        restore_updates = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]]
-        assert len(restore_updates) >= 1, (
-            f"Expected status restore to 'in_progress' (original status), got: {wl_updates}"
+        # The only in_progress update is the entry claim — the item must NOT be
+        # restored to in_progress after a yes verdict.
+        in_progress_updates = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]]
+        assert len(in_progress_updates) == 1, (
+            f"Expected exactly one in_progress update (the entry claim), got: {wl_updates}"
         )
-        # The restore update should include --json (the last in_progress update is the restore)
-        last_restore = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]][-1]
-        assert "--json" in last_restore, (
-            f"Status restore must include --json, got: {last_restore}"
+        # The terminal transition advances the item to completed/in_review.
+        final_update = wl_updates[-1]
+        assert final_update[3:7] == ["--status", "completed", "--stage", "in_review"], (
+            f"Expected completed/in_review terminal transition, got: {final_update}"
+        )
+        assert "--json" in final_update, (
+            f"Status transition must include --json, got: {final_update}"
         )
 
 
@@ -1219,7 +1229,7 @@ class TestStatusLifecycle:
     # ------------------------------------------------------------------
 
     def test_status_restore_does_not_include_producer_review_flags(self, monkeypatch):
-        """Status restore does not include --needs-producer-review or --stage flags."""
+        """The verdict-driven transition does not include --needs-producer-review."""
         calls = []
 
         monkeypatch.setattr(
@@ -1234,13 +1244,15 @@ class TestStatusLifecycle:
         cmd_issue("SA-NPR1", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR1"]]
-        # The status restore (final update) should NOT include --needs-producer-review or --stage
+        # The verdict-driven transition (final update) should NOT include
+        # --needs-producer-review. It DOES set a compatible stage
+        # (in_review for a yes verdict).
         final_update = wl_updates[-1] if wl_updates else []
         assert "--needs-producer-review" not in final_update, (
-            f"Status restore must NOT include --needs-producer-review, got: {final_update}"
+            f"Status transition must NOT include --needs-producer-review, got: {final_update}"
         )
-        assert "--stage" not in final_update, (
-            f"Status restore must NOT include --stage, got: {final_update}"
+        assert final_update[3:7] == ["--status", "completed", "--stage", "in_review"], (
+            f"Expected completed/in_review transition on yes verdict, got: {final_update}"
         )
 
     def test_no_needs_producer_review_when_not_ready_to_close(self, monkeypatch):

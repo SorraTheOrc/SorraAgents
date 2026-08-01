@@ -1606,3 +1606,288 @@ class TestPhase2RetryTuning:
         assert len(parent_calls) == 1
         _args, kwargs = parent_calls[0]
         assert kwargs.get("max_retries") == 1
+
+
+# ===========================================================================
+# Verdict-driven status lifecycle tests (SA-0MSAWFTZX003T042)
+# ===========================================================================
+
+
+class TestParseReadyToClose:
+    """Unit tests for _parse_ready_to_close()."""
+
+    def test_parses_yes(self):
+        """Ready to close: Yes is parsed as 'yes'."""
+        assert audit_runner._parse_ready_to_close(
+            "Ready to close: Yes\n\n## Summary"
+        ) == "yes"
+
+    def test_parses_no(self):
+        """Ready to close: No is parsed as 'no'."""
+        assert audit_runner._parse_ready_to_close(
+            "Ready to close: No\n\n## Summary"
+        ) == "no"
+
+    def test_case_insensitive(self):
+        """Verdict matching is case-insensitive."""
+        assert audit_runner._parse_ready_to_close(
+            "Ready to close: yEs"
+        ) == "yes"
+
+    def test_missing_verdict_returns_none(self):
+        """A report with no Ready to close line yields None (unparseable)."""
+        assert audit_runner._parse_ready_to_close(
+            "## Summary\nNo verdict present"
+        ) is None
+
+    def test_wrapped_report_still_parses(self):
+        """FailureNotice-wrapped reports (with a leading ==== header) still parse."""
+        report = (
+            "════════════════════════════════════════\n"
+            "Failure: something went wrong\n"
+            "Ready to close: Yes\n"
+            "## Summary"
+        )
+        assert audit_runner._parse_ready_to_close(report) == "yes"
+
+
+class TestVerdictDrivenStatusLifecycle:
+    """Tests for the verdict-driven status transition in cmd_issue's finally.
+
+    The audit runner must leave the work item in a state consistent with its
+    audit verdict (SA-0MSAWFTZX003T042):
+
+      - Ready to close: Yes → status=completed, stage=in_review (stage kept
+        as 'done' when the item is already in a terminal done stage)
+      - Ready to close: No → status=open, stage=plan_complete
+      - Failure / unparseable verdict → safe consistent state + cleared
+        assignee; the item is never left in_progress
+      - Freshness-gate skip → no lifecycle transitions
+    """
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _make_runner(self, updates, status="open", stage="plan_complete",
+                     description="", children=None, fail_children_show=False):
+        """Build a mock runner that records every ``wl update`` command.
+
+        Handles the exact ``wl`` command sequence issued by ``cmd_issue``:
+        status capture, in_progress claim, children fetch, and the
+        verdict-driven terminal transition in the ``finally`` block.
+        """
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+
+            if "update" in cmd_str:
+                updates.append(list(cmd))
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+
+            # Original status/stage capture → wl show <id> --json
+            if "show" in cmd_str and "--children" not in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": status, "stage": stage},
+                    }),
+                    stderr="",
+                )
+
+            # wl show <id> --children --json (optionally failing)
+            if "--children" in cmd_str:
+                if fail_children_show:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": description,
+                            "status": status,
+                            "stage": stage,
+                        },
+                        "children": children or [],
+                    }),
+                    stderr="",
+                )
+
+            # Fallback for any unexpected command
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def _run_issue(self, updates, verdict_report, **runner_kwargs):
+        """Run cmd_issue with a controlled report verdict and no real subprocesses."""
+        mock_runner = self._make_runner(updates, **runner_kwargs)
+        with (
+            mock.patch.object(
+                audit_runner, "_assemble_issue_report",
+                return_value=verdict_report,
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+        ):
+            return audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+    def _last_update(self, updates):
+        """Return the last wl update command recorded (the terminal transition)."""
+        assert updates, "expected at least one wl update command"
+        return updates[-1]
+
+    # ------------------------------------------------------------------
+    # Ready to close: Yes
+    # ------------------------------------------------------------------
+
+    def test_ready_yes_sets_completed_in_review(self):
+        """AC1: Ready to close: Yes → status=completed, stage=in_review.
+
+        Applies regardless of the pre-audit status (here: in_progress).
+        """
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes\n\n## Summary\nAll met.",
+            status="in_progress", stage="in_progress",
+        )
+        assert self._last_update(updates) == [
+            "wl", "update", "TEST-1",
+            "--status", "completed", "--stage", "in_review", "--json",
+        ]
+
+    def test_ready_yes_keeps_terminal_done_stage(self):
+        """AC1: Ready to close: Yes keeps a pre-existing 'done' stage."""
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes\n\n## Summary\nAll met.",
+            status="completed", stage="done",
+        )
+        last = self._last_update(updates)
+        assert "--status" in last and "completed" in last
+        assert "--stage" not in last  # stage stays 'done'
+
+    def test_ready_yes_idempotent_on_completed_in_review(self):
+        """AC6: Re-auditing a completed/in_review item with Yes stays completed/in_review."""
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes\n\n## Summary\nAll met.",
+            status="completed", stage="in_review",
+        )
+        assert self._last_update(updates) == [
+            "wl", "update", "TEST-1",
+            "--status", "completed", "--stage", "in_review", "--json",
+        ]
+
+    # ------------------------------------------------------------------
+    # Ready to close: No
+    # ------------------------------------------------------------------
+
+    def test_ready_no_sets_open_plan_complete(self):
+        """AC2: Ready to close: No → status=open, stage=plan_complete.
+
+        Applies regardless of the pre-audit status (here: completed/in_review,
+        i.e. a failing re-audit demotes the item).
+        """
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: No\n\n## Summary\n2 unmet.",
+            status="completed", stage="in_review",
+        )
+        assert self._last_update(updates) == [
+            "wl", "update", "TEST-1",
+            "--status", "open", "--stage", "plan_complete", "--json",
+        ]
+
+    def test_ready_no_moves_open_item_to_plan_complete(self):
+        """AC2: No on an already-open item still lands at open/plan_complete."""
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: No\n\n## Summary\nunmet.",
+            status="open", stage="in_progress",
+        )
+        assert self._last_update(updates) == [
+            "wl", "update", "TEST-1",
+            "--status", "open", "--stage", "plan_complete", "--json",
+        ]
+
+    # ------------------------------------------------------------------
+    # Failure / unparseable verdict
+    # ------------------------------------------------------------------
+
+    def test_failure_restores_safe_state_and_clears_assignee(self):
+        """AC4: On failure the item is never left in_progress; assignee cleared."""
+        updates = []
+        # wl show --children fails → early exit with script_failure recorded
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes",
+            status="open", stage="plan_complete",
+            fail_children_show=True,
+        )
+        last = self._last_update(updates)
+        assert "--status" in last and "open" in last
+        assert "--stage" in last and "plan_complete" in last
+        assert "--assignee" in last and "" in last
+
+    def test_failure_on_in_progress_item_falls_back_to_open(self):
+        """AC4: A failure while the pre-audit status was in_progress resets to open."""
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes",
+            status="in_progress", stage="in_progress",
+            fail_children_show=True,
+        )
+        last = self._last_update(updates)
+        assert "--status" in last and "open" in last
+        assert "--stage" in last and "plan_complete" in last
+        assert "--assignee" in last and "" in last
+
+    def test_unparseable_verdict_falls_back_to_safe_state(self):
+        """AC4: An unparseable verdict must not blindly set completed/open."""
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="## Summary\nNo verdict line present",
+            status="completed", stage="in_review",
+        )
+        last = self._last_update(updates)
+        # Restored to the captured pre-audit state, assignee cleared
+        assert "--status" in last and "completed" in last
+        assert "--stage" in last and "in_review" in last
+        assert "--assignee" in last and "" in last
+
+    # ------------------------------------------------------------------
+    # Freshness gate skip
+    # ------------------------------------------------------------------
+
+    def test_freshness_skip_performs_no_transitions(self):
+        """AC5: A fresh audit skips with zero status/stage transitions."""
+        updates = []
+        mock_runner = self._make_runner(updates)
+        with mock.patch.object(
+            audit_runner, "_check_audit_freshness",
+            return_value="Skipping: audit still fresh\n<existing report>",
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=False, runner=mock_runner,
+            )
+        assert rc == 0
+        assert updates == []

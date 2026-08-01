@@ -25,29 +25,42 @@ Verify absence before proceeding to the audit flow. Confirm that the work item i
 
 ## Status Lifecycle
 
-The audit runner manages the work item's `status` field during execution to prevent concurrent audit attempts.
+The audit runner manages the work item's `status` (and, on completion, its
+`stage`) during execution to prevent concurrent audit attempts and to leave
+the item in a state consistent with the audit verdict.
 
-1. **Capture original status** — fetched via `wl show <id> --json` at `cmd_issue()` start.
-2. **`in_progress`** — set at `cmd_issue()` start, after capturing original status.
-3. **Restore original status** — set after audit logic completes (via `try/finally`, guaranteed even on failure).
+1. **Capture original status + stage** — fetched via `wl show <id> --json` at `cmd_issue()` start.
+2. **`in_progress`** — set at `cmd_issue()` start, after capturing original status + stage.
+3. **Verdict-driven terminal transition** — applied after audit logic completes (via `try/finally`, guaranteed even on failure):
+   - `Ready to close: Yes` → `status: completed`, `stage: in_review` (stage kept as `done` when it is already terminal).
+   - `Ready to close: No` → `status: open`, `stage: plan_complete` (fixed pre-review stage).
+   - Failure, timeout, or unparseable verdict → restore a safe consistent state (the captured original status/stage; `open`/`plan_complete` when the original status was `in_progress`) and **clear the assignee** so the item returns fully to the actionable queue.
 
 Behavior:
 
-- Transition: `in_progress` → original status (captured before audit, restored in `finally`).
+- Transition on yes: `in_progress` → `completed` / `in_review` (or keep `done`).
+- Transition on no: `in_progress` → `open` / `plan_complete`.
+- Failure fallback: restore captured original status/stage (never left `in_progress`), assignee cleared.
 - Falls back to `open` if original status cannot be determined (e.g., `wl show` fails).
 - `--do-not-persist` does NOT affect the status lifecycle.
-- `stage` is NOT modified.
-- If the status update fails, the error is silently caught.
+- If the status update fails, the error is silently caught (the failure is still reported in the audit output).
 
 ### Manual Fallback
 
 When running without `audit_runner.py`:
 
 ```bash
-# Capture original status before setting in_progress
-ORIG_STATUS=$(wl show <id> --json | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','open'))")
+# Capture original status + stage before setting in_progress
+ORIG=$(wl show <id> --json)
+ORIG_STATUS=$(echo "$ORIG" | python3 -c "import json,sys; print(json.load(sys.stdin)['workItem'].get('status','open'))")
 wl update <id> --status in_progress --json   # before audit
-wl update <id> --status "$ORIG_STATUS" --json # after audit (success or failure)
+# After audit (apply the transition matching the verdict):
+#   Ready to close: Yes → advance to the review queue
+wl update <id> --status completed --stage in_review --json
+#   Ready to close: No → return to the actionable queue
+wl update <id> --status open --stage plan_complete --json
+#   Failure → restore a safe consistent state and clear the assignee
+wl update <id> --status "$ORIG_STATUS" --assignee "" --json
 ```
 
 Always include `--json` for machine-readable output.
@@ -75,7 +88,7 @@ No status lifecycle transitions occur, and no persistence is performed.
 ## Safety and prompt design
 
 - Audit executions should be read-only except for the explicit persistence step and automatic status lifecycle. Use `[READ-ONLY AUDIT]` to mark read-only phases and `[PERSIST-AUDIT]` when persisting.
-- Do NOT close, create, or delete work items during an audit. Permitted state-modifying actions: (1) storing audit text via the canonical persister, (2) runner's automatic `in_progress`→`open` lifecycle. Do NOT change `stage`.
+- Do NOT close, create, or delete work items during an audit. Permitted state-modifying actions: (1) storing audit text via the canonical persister, (2) the runner's verdict-driven status lifecycle (`in_progress` on entry; `completed`/`in_review` on `Ready to close: Yes`, `open`/`plan_complete` on `Ready to close: No`, safe-state restore + assignee cleared on failure).
 - Refuse any request to run state-modifying `wl` commands outside the authorized flow.
 - If ambiguity prevents a reliable verdict, return immediately and do NOT persist.
 - The runner supports `--debug-log` to append raw Pi output to a JSONL file.

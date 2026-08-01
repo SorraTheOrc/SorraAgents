@@ -87,9 +87,11 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     # so that the Pi extension's audit column shows the green tick / verdict.
     #
     # SAFETY: Fetch the current work item stage and pass it explicitly so that
-    # the `wl update` call never accidentally advances the stage. The audit
-    # runner's status lifecycle MUST NOT modify the stage field under any
-    # circumstances (see SA-0MS6B5ESG0056GZJ).
+    # the `wl update` call never accidentally advances the stage. The
+    # verdict-driven status transition (completed/in_review on 'Ready to
+    # close: Yes', open/plan_complete on 'No') is applied by the audit
+    # runner's finally block after persistence completes — see
+    # skill/audit/SKILL.md "Status Lifecycle".
     current_stage = ""
     try:
         fetch_cmd = [wl_bin, "show", issue_id, "--json"]

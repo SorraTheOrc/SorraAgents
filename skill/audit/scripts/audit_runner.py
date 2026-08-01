@@ -198,6 +198,24 @@ def _get_closing_sentence(report: str) -> str:
     return _CLOSING_NOT_READY
 
 
+def _parse_ready_to_close(report: str) -> str | None:
+    """Parse the ``Ready to close:`` verdict from an audit report.
+
+    Returns ``"yes"`` or ``"no"`` when a verdict line is found, ``None``
+    when the report has no parseable verdict (failure/unparseable output).
+    Also handles reports wrapped by a ``FailureNotice`` (where the first
+    line is ``═══`` rather than ``Ready to close:``).
+    """
+    for line in report.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Ready to close:"):
+            verdict = stripped.split(":", 1)[1].strip()
+            if verdict.lower() == "yes":
+                return "yes"
+            return "no"
+    return None
+
+
 def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=False, text=True, capture_output=True)
 
@@ -2292,19 +2310,34 @@ def cmd_issue(issue_id: str, persist: bool = True,
         }
 
     # ------------------------------------------------------------------
-    # Capture original status before setting in_progress, so we can
-    # restore it in the finally block (instead of always resetting to "open").
+    # Capture original status + stage before setting in_progress, so the
+    # finally block can restore a safe consistent state on failure and
+    # apply a verdict-driven terminal transition on success.
     # ------------------------------------------------------------------
     original_status = "open"  # safe default
+    original_stage = ""       # safe default (unknown)
     try:
         item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"])
         if isinstance(item_data, dict):
-            original_status = item_data.get("status", "open")
+            # wl show nests the item under "workItem" — unwrap it so the
+            # captured state reflects the item (not the response envelope).
+            wi = item_data.get("workItem")
+            if not isinstance(wi, dict):
+                wi = item_data
+            original_status = wi.get("status", "open")
+            original_stage = wi.get("stage", "")
     except RuntimeError:
-        pass  # Fall back to "open" as safe default
+        pass  # Fall back to safe defaults
+
+    # Audit verdict parsed from the assembled report ("yes"/"no"); stays
+    # None when the audit failed or the verdict could not be parsed.
+    audit_verdict: str | None = None
+    # Set True only when the audit pipeline reached a successful completion
+    # (report assembled and, when persisting, persisted + read back).
+    audit_completed: bool = False
 
     # ------------------------------------------------------------------
-    # Status lifecycle: set in_progress on entry (restored in finally)
+    # Status lifecycle: set in_progress on entry (verdict-driven on exit)
     # ------------------------------------------------------------------
     _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"])
 
@@ -2793,6 +2826,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
             )
             report = notice.wrap(report)
 
+        # Capture the audit verdict for the status lifecycle transition.
+        # The finally block only trusts this verdict when the audit pipeline
+        # completed successfully (no script failures).
+        audit_verdict = _parse_ready_to_close(report)
+
         if json_mode:
             payload = _build_issue_json(
                 work_item, ac_results, child_results,
@@ -2860,17 +2898,50 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     file=sys.stderr,
                 )
                 return 1
+            audit_completed = True
             return 0
+        audit_completed = True
         return 0
 
     finally:
         # ------------------------------------------------------------------
-        # Status lifecycle: restore original status on exit (success or failure)
-        # Always runs because of try/finally — guarantees cleanup.
-        # Falls back to "open" if original_status was not captured.
+        # Status lifecycle: verdict-driven terminal transition on exit.
+        # Always runs because of try/finally — the item is never left
+        # in_progress after the audit completes.
+        #
+        #   Ready to close: Yes → completed / in_review (stage kept 'done')
+        #   Ready to close: No  → open / plan_complete
+        #   Failure / timeout / unparseable verdict → safe consistent state
+        #       (captured original status+stage, forced open/plan_complete
+        #       when the original was in_progress) + assignee cleared so the
+        #       item returns fully to the actionable queue.
         # ------------------------------------------------------------------
         try:
-            _run_wl(runner, ["wl", "update", issue_id, "--status", original_status, "--json"])
+            if script_failure is not None or not audit_completed or audit_verdict is None:
+                # Failure / unparseable verdict: never leave in_progress.
+                was_in_progress = original_status in ("in_progress", "in-progress")
+                safe_status = "open" if was_in_progress else original_status
+                safe_stage = "plan_complete" if was_in_progress else original_stage
+                if not safe_stage:
+                    # Stage unknown (capture failed): pick a stage valid for
+                    # the restored status so wl never rejects the combo.
+                    safe_stage = "in_review" if safe_status == "completed" else "plan_complete"
+                _run_wl(runner, [
+                    "wl", "update", issue_id,
+                    "--status", safe_status,
+                    "--stage", safe_stage,
+                    "--assignee", "",
+                    "--json",
+                ])
+            elif audit_verdict == "yes":
+                # Advance to the review queue. Keep a terminal 'done' stage.
+                if original_stage == "done":
+                    _run_wl(runner, ["wl", "update", issue_id, "--status", "completed", "--json"])
+                else:
+                    _run_wl(runner, ["wl", "update", issue_id, "--status", "completed", "--stage", "in_review", "--json"])
+            else:  # audit_verdict == "no"
+                # Return to the actionable queue at a fixed pre-review stage.
+                _run_wl(runner, ["wl", "update", issue_id, "--status", "open", "--stage", "plan_complete", "--json"])
         except RuntimeError:
             pass  # Status update failure must not mask the main result
 
