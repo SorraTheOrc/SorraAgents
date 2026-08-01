@@ -59,10 +59,27 @@ For agents following this SKILL.md manually (without the orchestration script),
 use the `StatusLifecycle.update_status()` static method or the context manager
 pattern described in `../shared/status_lifecycle.py`.
 
+## Test Anti-Patterns
+
+Before writing tests, review the shared [Test Writing Guidelines
+](../shared/test-writing-guidelines.md) which documents six anti-patterns
+identified during a full audit of the Tableau-Card-Engine test suite (32
+low-value files removed). Never write tests that:
+
+1. Grep source code instead of asserting behaviour (source-code-grep tests).
+2. Contain `expect(true).toBe(true)` or zero assertions (placeholder tests).
+3. Re-implement production logic inside the test (self-referential simulations).
+4. Duplicate an existing core test under a different name (duplicates).
+5. Assert type-level satisfaction the compiler already checks (structural-only tests).
+6. Boot a browser / scene without asserting anything (zero-assertion tests).
+
+Follow the positive guidance in the same document: every test must assert
+observable behaviour via the public API.
+
 ## Best Practices
 
 - Follow the steps in order and do not skip steps.
-- **Write tests before implementation code** (test-driven development). Always create at least one test file before editing implementation code. Tests may fail on first run; write implementation code to make them pass. When external constraints prevent complete tests, create harnesses/mocks and document the limitation as a temporary placeholder.
+- **Write tests before implementation code** (test-driven development). Always create at least one test file before editing implementation code. Tests may fail on first run; write implementation code to make them pass. When external constraints prevent complete tests, create harnesses/mocks and document the limitation. **Do NOT write placeholder tests** — if the feature is not yet implemented, track the work in a work item instead (see [Test Writing Guidelines](../shared/test-writing-guidelines.md)).
 - Do not use search tools (grep, ripgrep, code search). Rely on work-item context and linked docs. If insufficient context, run intake interview.
 - Keep implementation focused on meeting acceptance criteria with minimal changes.
 - Never edit code outside `src/`, `tests/`, `docs/` unless essential configuration files.

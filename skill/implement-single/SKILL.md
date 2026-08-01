@@ -50,6 +50,14 @@ status transitions and `with StatusLifecycle(...)` for automatic lifecycle manag
 
 Manual `wl update --status` commands (without `StatusLifecycle`) should NOT be used.
 
+## Test Anti-Patterns
+
+Review the shared [Test Writing Guidelines
+](../shared/test-writing-guidelines.md) before writing tests. Never write tests
+that grep source text, contain zero assertions, re-implement production logic,
+duplicate existing core tests, assert compiler-enforced types, or boot a scene
+without asserting anything.
+
 ## Best Practices
 
 - Follow the steps in order; do not skip.
@@ -106,7 +114,7 @@ Execute the following steps in order. Do not skip steps.
 
 ### Step 3 — Implement
 
-- **Write tests first** (TDD): create at least one test file before editing implementation code. Tests may fail initially; implement code to make them pass. If external constraints prevent complete tests, use harnesses/mocks and document the limitation.
+- **Write tests first** (TDD): create at least one test file before editing implementation code. Tests may fail initially; implement code to make them pass. If external constraints prevent complete tests, use harnesses/mocks and document the limitation. **Do NOT write placeholder tests** — if the feature is not yet implemented, track the work in a work item instead (see [Test Writing Guidelines](../shared/test-writing-guidelines.md)).
 - Write implementation code to meet ACs.
 - Make minimal, focused changes.
 - Follow project style and conventions.

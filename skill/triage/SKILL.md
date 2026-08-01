@@ -33,6 +33,8 @@ References
 - Template: `./resources/test-failure-template.md`
 - Runbook: `./resources/runbook-test-failure.md`
 - Owner inference: `../owner-inference/SKILL.md`
+- Test-writing anti-patterns to avoid when creating test-failure work items:
+  [Test Writing Guidelines](../shared/test-writing-guidelines.md)
 
 Script
 ------
