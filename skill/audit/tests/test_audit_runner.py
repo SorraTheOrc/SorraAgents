@@ -1157,3 +1157,152 @@ class TestPhase2FileScopeManifest:
         assert len(prompts) == 2
         assert "FILE SCOPE" in prompts[1]
         assert "test_audit_runner.py" in prompts[1]
+
+
+# ===========================================================================
+# Phase 2 child-verdict reuse (SA-0MSAIXNXF002W7I3 AC1-AC4)
+# ===========================================================================
+
+
+class TestPhase2ChildVerdictReuse:
+    """Tests for reusing fresh child audit verdicts in Phase 2 (AC1-AC4).
+
+    When a child's own fresh audit produced a ready verdict
+    (``child_audit_ready=True``), the parent Phase 2 must skip the duplicated
+    child deep-analysis call and reuse the child's existing verdicts.
+    """
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text",
+                 verdict: str = "met") -> dict:
+        return {"index": index, "text": text, "verdict": verdict, "evidence": ""}
+
+    def _make_child(self, child_id: str = "CHILD-1",
+                    child_audit_ready: bool = False,
+                    stage: str = "plan_complete",
+                    status: str = "open",
+                    ac_count: int = 1) -> dict:
+        return {
+            "id": child_id,
+            "title": "Child Issue",
+            "stage": stage,
+            "status": status,
+            "child_audit_ready": child_audit_ready,
+            "ac_results": [
+                {"index": i, "text": f"Child AC {i}", "verdict": "met", "evidence": ""}
+                for i in range(ac_count)
+            ],
+        }
+
+    def test_skips_deep_analysis_when_child_audit_ready(self):
+        """AC1: no phase2_child call is made for a child_audit_ready=True child."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = self._make_child("CHILD-1", child_audit_ready=True)
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model",
+                )
+            )
+
+        # Only the parent phase2_deep call should be made
+        child_calls = [
+            c for c in mock_call.call_args_list
+            if c[0][0] == "CHILD-1"
+        ]
+        assert child_calls == []
+        # Parent ACs still processed
+        assert updated_acs[0]["verdict"] == "met"
+        # Child AC results are preserved (reused), unchanged
+        assert updated_children[0]["ac_results"][0]["verdict"] == "met"
+        assert phase2_completed is True
+
+    def test_runs_deep_analysis_when_child_audit_not_ready(self):
+        """AC2: a child_audit_ready=False child still gets parent deep analysis."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = self._make_child("CHILD-1", child_audit_ready=False)
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model",
+            )
+
+        child_calls = [
+            c for c in mock_call.call_args_list
+            if c[0][0] == "CHILD-1"
+        ]
+        assert len(child_calls) == 1
+
+    def test_runs_deep_analysis_when_child_audit_ready_missing(self):
+        """AC2 (guard): children without child_audit_ready default to analysis.
+
+        Backward compatibility: existing callers that do not populate
+        ``child_audit_ready`` must see unchanged behavior.
+        """
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = self._make_child("CHILD-1")
+        child.pop("child_audit_ready")  # Simulate pre-P2 callers
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model",
+            )
+
+        child_calls = [
+            c for c in mock_call.call_args_list
+            if c[0][0] == "CHILD-1"
+        ]
+        assert len(child_calls) == 1
+
+    def test_mixed_children_skip_only_ready_ones(self):
+        """AC3: only child_audit_ready=True children are skipped in a mixed set."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        ready_child = self._make_child("READY-1", child_audit_ready=True)
+        not_ready_child = self._make_child("PENDING-1", child_audit_ready=False)
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [ready_child, not_ready_child], "test-model",
+            )
+
+        ready_calls = [c for c in mock_call.call_args_list if c[0][0] == "READY-1"]
+        pending_calls = [c for c in mock_call.call_args_list if c[0][0] == "PENDING-1"]
+        assert ready_calls == []
+        assert len(pending_calls) == 1
+
+    def test_completed_done_child_still_skipped(self):
+        """AC3 (guard): completed/done children remain exempt regardless of flag."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = self._make_child("DONE-1", child_audit_ready=False,
+                                 stage="done", status="completed")
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model",
+            )
+
+        done_calls = [c for c in mock_call.call_args_list if c[0][0] == "DONE-1"]
+        assert done_calls == []

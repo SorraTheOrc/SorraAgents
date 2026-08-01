@@ -1981,6 +1981,14 @@ def _run_phase2_deep_analysis(
         if child.get("status") == "completed" and child.get("stage") == "done":
             continue  # Skip already-closed children
 
+        # Reuse the child's own fresh audit verdict when available (P2).
+        # A child with child_audit_ready=True already had its code verified
+        # by its own Phase 1 + Phase 2 audit (auto-triggered in cmd_issue), so
+        # re-running deep analysis here is duplicated work. Keep the child's
+        # existing ac_results and skip the extra agent-mode Pi call.
+        if child.get("child_audit_ready") is True:
+            continue
+
         child_acs = child.get("ac_results", [])
         if not child_acs:
             continue
