@@ -39,6 +39,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -98,6 +99,24 @@ _PI_RETRY_BACKOFF_SECONDS = 2.0
 """Base backoff (seconds) between provider-error retries in ``_call_pi``.
 
 Backoff grows linearly: 1x, 2x, ... base per retry attempt.
+"""
+
+AUDIT_PHASE2_PARALLELISM_ENV = "AUDIT_PHASE2_PARALLELISM"
+"""Environment variable controlling Phase 2 child deep-analysis concurrency.
+
+When set (an integer >= 1), this is the maximum number of independent child
+``phase2_child:<i>`` Pi calls that may run concurrently inside
+``_run_phase2_deep_analysis``. The parent deep-analysis call always runs
+first and is never parallelized. Setting this to 1 restores the historical
+strictly-sequential behavior. Invalid values are ignored with a warning.
+"""
+
+_PHASE2_DEFAULT_PARALLELISM = 2
+"""Default bounded concurrency cap for Phase 2 child deep-analysis calls.
+
+Chosen conservatively so the local model proxy is not overwhelmed while
+still collapsing the N-sequential-calls wall-clock to N/cap. Operators can
+override via ``AUDIT_PHASE2_PARALLELISM``.
 """
 
 AUDIT_FRESHNESS_BUFFER_SECONDS = 60
@@ -368,6 +387,31 @@ def _resolve_effective_timeout(cli_timeout: int | None) -> int | None:
                 file=sys.stderr,
             )
     return None
+
+
+def _resolve_phase2_parallelism() -> int:
+    """Resolve the bounded concurrency cap for Phase 2 child deep analysis.
+
+    Precedence:
+      1. ``AUDIT_PHASE2_PARALLELISM`` environment variable (integer >= 1)
+      2. ``_PHASE2_DEFAULT_PARALLELISM`` (2)
+
+    Values below 1 are clamped to 1. An invalid (non-integer) value is
+    ignored with a warning so a misconfigured environment cannot break the
+    audit run.
+    """
+    env_value = os.environ.get(AUDIT_PHASE2_PARALLELISM_ENV)
+    if env_value:
+        try:
+            parsed = int(env_value)
+            return max(1, parsed)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_PHASE2_PARALLELISM_ENV} value {env_value!r}; "
+                "using default parallelism",
+                file=sys.stderr,
+            )
+    return _PHASE2_DEFAULT_PARALLELISM
 
 
 def _normalize_model_source(source: str | None) -> str:
@@ -1781,6 +1825,123 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     }
 
 
+def _deep_analyze_child(
+    ci: int,
+    child: dict,
+    resolved_model: str,
+    pi_bin: str,
+    debug_log: str | None,
+    timeout: int | None,
+    runner: Runner,
+) -> tuple[int, dict, bool]:
+    """Run Phase 2 deep analysis for a single child (worker for parallelism).
+
+    Returns ``(ci, updated_child, timeout_occurred)``. Never raises on Pi
+    failures: a ``RuntimeError`` from ``_call_pi_and_maybe_log`` falls back to
+    the child's existing ``ac_results`` unchanged. A timeout marks the child's
+    ACs ``partial`` and reports ``timeout_occurred=True`` (so the caller can
+    set ``phase2_completed=False``).
+    """
+    child_acs = child.get("ac_results", [])
+    if not child_acs:
+        return ci, child, False
+
+    child_ac_list = json.dumps([
+        {"index": i, "text": r["text"], "initial_verdict": r["verdict"]}
+        for i, r in enumerate(child_acs)
+    ])
+    child_file_scope = _build_file_scope_manifest(child, child_acs, runner=runner)
+    child_prompt = (
+        "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — CHILD] "
+        "Do NOT close, modify, create, or delete any work items. "
+        "Return ONLY a structured JSON array.\n\n"
+        f"Deep code analysis for child: {child.get('title', '')} ({child.get('id', '')})\n\n"
+        "FILE SCOPE — Read ONLY the files listed in the manifest below. "
+        "Do not explore the whole repository. If a criterion requires a "
+        "file not listed here, state that in the evidence instead of "
+        "searching for it.\n\n"
+        f"{child_file_scope}\n\n"
+        "For each criterion, read the actual implementation files and verify "
+        "the code genuinely satisfies the stated requirements. "
+        "Use the same verdict guidance as the parent deep analysis.\n\n"
+        f"Criteria: {child_ac_list}"
+    )
+
+    try:
+        child_result = _call_pi_and_maybe_log(
+            child.get("id", ""), f"phase2_child:{ci}", child_prompt,
+            model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+            enable_tools=True, timeout=timeout,
+        )
+    except RuntimeError:
+        return ci, child, False
+
+    # Handle child timeout: mark all child ACs as partial
+    if child_result.get("_timeout"):
+        print(
+            f"Warning: Child deep analysis timed out for {child.get('id', '')}",
+            file=sys.stderr,
+        )
+        timeout_acs = []
+        for ac in child_acs:
+            timeout_acs.append({
+                "text": ac.get("text", ""),
+                "verdict": VERDICT_PARTIAL,
+                "evidence": "Deep analysis timed out \u2014 manual review required.",
+            })
+        updated = dict(child)
+        updated["ac_results"] = timeout_acs
+        return ci, updated, True
+
+    child_raw = (
+        child_result.get("extracted_text", "")
+        or child_result.get("evidence", "")
+        or child_result.get("text", "")
+    )
+    child_batch = _extract_json_array(child_raw)
+    if child_batch is None:
+        try:
+            child_batch = json.loads(child_raw)
+        except json.JSONDecodeError:
+            child_batch = []
+
+    updated_child_acs = list(child_acs)
+    if isinstance(child_batch, list):
+        reviewed = {
+            item["index"]: item
+            for item in child_batch
+            if isinstance(item, dict) and "index" in item
+        }
+        for i in range(len(updated_child_acs)):
+            item = reviewed.get(i, {})
+            deep_verdict = item.get("verdict", "")
+            deep_evidence = item.get("evidence", "")
+            if deep_verdict:
+                initial = updated_child_acs[i]["verdict"]
+                if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
+                    updated_child_acs[i] = {
+                        "text": updated_child_acs[i]["text"],
+                        "verdict": VERDICT_MET,
+                        "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
+                    }
+                elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
+                    updated_child_acs[i] = {
+                        "text": updated_child_acs[i]["text"],
+                        "verdict": deep_verdict,
+                        "evidence": f"Phase 1: {updated_child_acs[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
+                    }
+                else:
+                    updated_child_acs[i] = {
+                        "text": updated_child_acs[i]["text"],
+                        "verdict": deep_verdict,
+                        "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
+                    }
+
+    updated = dict(child)
+    updated["ac_results"] = updated_child_acs
+    return ci, updated, False
+
+
 def _run_phase2_deep_analysis(
     issue: dict,
     ac_results: list[dict],
@@ -1977,117 +2138,60 @@ def _run_phase2_deep_analysis(
     # Also run deep analysis on active children
     updated_children = list(child_results)
     child_timeout_occurred = False
+
+    # Collect the (index, child) pairs that need parent deep analysis.
+    # - Completed/done children are skipped (already closed).
+    # - child_audit_ready=True children are skipped (P2 reuse — their own
+    #   fresh audit already verified the code).
+    # - Children without ac_results are skipped (nothing to verify).
+    pending: list[tuple[int, dict]] = []
     for ci, child in enumerate(updated_children):
         if child.get("status") == "completed" and child.get("stage") == "done":
-            continue  # Skip already-closed children
-
-        # Reuse the child's own fresh audit verdict when available (P2).
-        # A child with child_audit_ready=True already had its code verified
-        # by its own Phase 1 + Phase 2 audit (auto-triggered in cmd_issue), so
-        # re-running deep analysis here is duplicated work. Keep the child's
-        # existing ac_results and skip the extra agent-mode Pi call.
+            continue
         if child.get("child_audit_ready") is True:
             continue
-
-        child_acs = child.get("ac_results", [])
-        if not child_acs:
+        if not child.get("ac_results"):
             continue
+        pending.append((ci, child))
 
-        child_ac_list = json.dumps([
-            {"index": i, "text": r["text"], "initial_verdict": r["verdict"]}
-            for i, r in enumerate(child_acs)
-        ])
-        child_file_scope = _build_file_scope_manifest(
-            child, child_acs, runner=runner,
-        )
-        child_prompt = (
-            "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — CHILD] "
-            "Do NOT close, modify, create, or delete any work items. "
-            "Return ONLY a structured JSON array.\n\n"
-            f"Deep code analysis for child: {child.get('title', '')} ({child.get('id', '')})\n\n"
-            "FILE SCOPE — Read ONLY the files listed in the manifest below. "
-            "Do not explore the whole repository. If a criterion requires a "
-            "file not listed here, state that in the evidence instead of "
-            "searching for it.\n\n"
-            f"{child_file_scope}\n\n"
-            "For each criterion, read the actual implementation files and verify "
-            "the code genuinely satisfies the stated requirements. "
-            "Use the same verdict guidance as the parent deep analysis.\n\n"
-            f"Criteria: {child_ac_list}"
-        )
+    parallelism = _resolve_phase2_parallelism()
 
-        try:
-            child_result = _call_pi_and_maybe_log(
-                child.get("id", ""), f"phase2_child:{ci}", child_prompt,
-                model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
-                enable_tools=True, timeout=timeout,
-            )
-        except RuntimeError:
-            continue
-
-        # Handle child timeout: mark all child ACs as partial
-        if child_result.get("_timeout"):
-            print(
-                f"Warning: Child deep analysis timed out for {child.get('id', '')}",
-                file=sys.stderr,
-            )
+    def _merge_result(result: tuple[int, dict, bool]) -> None:
+        nonlocal child_timeout_occurred
+        ci, updated, timed_out = result
+        updated_children[ci] = updated
+        if timed_out:
             child_timeout_occurred = True
-            timeout_acs = []
-            for ac in child_acs:
-                timeout_acs.append({
-                    "text": ac.get("text", ""),
-                    "verdict": VERDICT_PARTIAL,
-                    "evidence": "Deep analysis timed out \u2014 manual review required.",
-                })
-            updated_children[ci] = dict(child)
-            updated_children[ci]["ac_results"] = timeout_acs
-            continue
 
-        child_raw = (
-            child_result.get("extracted_text", "")
-            or child_result.get("evidence", "")
-            or child_result.get("text", "")
-        )
-        child_batch = _extract_json_array(child_raw)
-        if child_batch is None:
-            try:
-                child_batch = json.loads(child_raw)
-            except json.JSONDecodeError:
-                child_batch = []
-
-        if isinstance(child_batch, list):
-            reviewed = {
-                item["index"]: item
-                for item in child_batch
-                if isinstance(item, dict) and "index" in item
-            }
-            updated_child_acs = list(child_acs)
-            for i in range(len(updated_child_acs)):
-                item = reviewed.get(i, {})
-                deep_verdict = item.get("verdict", "")
-                deep_evidence = item.get("evidence", "")
-                if deep_verdict:
-                    initial = updated_child_acs[i]["verdict"]
-                    if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
-                        updated_child_acs[i] = {
-                            "text": updated_child_acs[i]["text"],
-                            "verdict": VERDICT_MET,
-                            "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
-                        }
-                    elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
-                        updated_child_acs[i] = {
-                            "text": updated_child_acs[i]["text"],
-                            "verdict": deep_verdict,
-                            "evidence": f"Phase 1: {updated_child_acs[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
-                        }
-                    else:
-                        updated_child_acs[i] = {
-                            "text": updated_child_acs[i]["text"],
-                            "verdict": deep_verdict,
-                            "evidence": deep_evidence or updated_child_acs[i].get("evidence", ""),
-                        }
-            updated_children[ci] = dict(child)
-            updated_children[ci]["ac_results"] = updated_child_acs
+    if pending and parallelism > 1 and len(pending) > 1:
+        # Bounded-concurrency parallel execution of independent child calls.
+        # The parent deep-analysis call above already ran first; children are
+        # independent of each other so they may run concurrently up to the cap.
+        # A failure in one child must not prevent the others from completing,
+        # so each worker is exception-safe (_deep_analyze_child never raises).
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            futures = [
+                executor.submit(
+                    _deep_analyze_child, ci, child, resolved_model, pi_bin,
+                    debug_log, timeout, runner,
+                )
+                for ci, child in pending
+            ]
+            for future in futures:
+                try:
+                    _merge_result(future.result())
+                except Exception as exc:  # noqa: BLE001 -- isolation: one bad child must not fail the audit
+                    print(
+                        f"Warning: Child deep analysis worker failed: {exc}",
+                        file=sys.stderr,
+                    )
+    else:
+        # Sequential fallback: parallelism=1, a single pending child, or an
+        # executor failure path — preserves the historical call order.
+        for ci, child in pending:
+            _merge_result(_deep_analyze_child(
+                ci, child, resolved_model, pi_bin, debug_log, timeout, runner,
+            ))
 
     return updated_ac, updated_children, not child_timeout_occurred
 

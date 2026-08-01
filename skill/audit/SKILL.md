@@ -217,6 +217,8 @@ where `<context>` is the call type (e.g. `parent`, `phase2_deep`, `phase2_child:
 
 **Child verdict reuse (Phase 2):** When a child's own fresh audit already produced a ready verdict (`child_audit_ready=True`, from `cmd_issue`'s auto-triggered child audit), the parent Phase 2 **skips** the duplicated child deep-analysis call (`phase2_child:<i>`) and reuses the child's existing `ac_results`. Children without a ready verdict (not ready / stale / no audit) still get parent deep analysis. This eliminates duplicated child verification work without changing verdict semantics.
 
+**Parallel child deep analysis (Phase 2):** Independent child deep-analysis calls (`phase2_child:<i>`) run concurrently with bounded concurrency (default 2; configurable via the `AUDIT_PHASE2_PARALLELISM` env var, set to `1` for strictly-sequential historical behavior). The parent deep-analysis call always runs first and is never parallelized. Child workers are exception-isolated: a failure or timeout in one child degrades that child to `partial` (or falls back to its existing ACs) without affecting the others; on persistent executor failure the runner falls back to sequential execution. This collapses Phase 2 wall-clock from N sequential calls to ~N/cap while preserving per-child verdict isolation.
+
 **Tools-enabled invocation (Phase 2 only):** Phase 2 deep analysis calls Pi with
 `enable_tools=True`, which appends
 `--tools read,bash,grep,find,ls --exclude-tools ask_question` to the pi command.

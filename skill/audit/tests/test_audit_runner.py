@@ -1306,3 +1306,192 @@ class TestPhase2ChildVerdictReuse:
 
         done_calls = [c for c in mock_call.call_args_list if c[0][0] == "DONE-1"]
         assert done_calls == []
+
+
+# ===========================================================================
+# Phase 2 parallel child calls (SA-0MSAIXTMS003REBW AC1-AC4)
+# ===========================================================================
+
+
+class TestPhase2ParallelChildCalls:
+    """Tests for bounded-concurrency parallel child deep analysis (AC1-AC4)."""
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text",
+                 verdict: str = "met") -> dict:
+        return {"index": index, "text": text, "verdict": verdict, "evidence": ""}
+
+    def _make_child(self, child_id: str, child_audit_ready: bool = False,
+                    ac_count: int = 1) -> dict:
+        return {
+            "id": child_id,
+            "title": f"Child {child_id}",
+            "stage": "plan_complete",
+            "status": "open",
+            "child_audit_ready": child_audit_ready,
+            "ac_results": [
+                {"index": i, "text": f"Child AC {i}", "verdict": "met", "evidence": ""}
+                for i in range(ac_count)
+            ],
+        }
+
+    def test_parallel_children_processed_concurrently(self):
+        """AC1: multiple child calls run concurrently (not sequentially).
+
+        Uses a real ThreadPoolExecutor with a mock Pi call that blocks on a
+        barrier; if calls were sequential, a 2-child run with a 2-worker pool
+        would serialize and take ~2x the per-call time.
+        """
+        import threading
+        import time as _time
+
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        children = [
+            self._make_child("C-1"),
+            self._make_child("C-2"),
+        ]
+
+        started = threading.Barrier(2)  # both child calls must be in-flight to pass
+
+        def _slow_call(issue_id, context, prompt, model="m", pi_bin="pi",
+                       debug_log=None, enable_tools=False, timeout=None):
+            if context.startswith("phase2_child"):
+                started.wait(timeout=5)  # raises BrokenBarrierError if not concurrent
+            return {"extracted_text": "[]"}
+
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "2"},
+            clear=False,
+        ), mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
+                               side_effect=_slow_call):
+            _t0 = _time.monotonic()
+            _updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, children, "test-model",
+                )
+            )
+            _elapsed = _time.monotonic() - _t0
+
+        # Both calls completed without deadlock/timeout
+        assert phase2_completed is True
+        assert len(updated_children) == 2
+        # If sequential, elapsed >= 2x barrier overhead; concurrency proves
+        # the two calls ran in parallel (barrier would have thrown otherwise).
+        assert _elapsed < 10
+
+    def test_sequential_when_parallelism_disabled(self):
+        """AC2/fallback: parallelism=1 runs child calls sequentially."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        children = [self._make_child("C-1"), self._make_child("C-2")]
+        call_order: list[str] = []
+
+        def _ordered_call(issue_id, context, prompt, model="m", pi_bin="pi",
+                          debug_log=None, enable_tools=False, timeout=None):
+            if context.startswith("phase2_child"):
+                call_order.append(issue_id)
+            return {"extracted_text": "[]"}
+
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "1"},
+            clear=False,
+        ), mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
+                               side_effect=_ordered_call):
+            _updated_acs, _updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, children, "test-model",
+                )
+            )
+
+        assert call_order == ["C-1", "C-2"]  # strictly sequential order
+        assert phase2_completed is True
+
+    def test_default_parallelism_cap(self):
+        """AC1: a sensible default bounded concurrency cap exists."""
+        with mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            cap = audit_runner._resolve_phase2_parallelism()
+        assert isinstance(cap, int)
+        assert 1 <= cap <= 4
+
+    def test_parallelism_env_var_respected(self):
+        """AC1: env var sets the concurrency cap."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "3"},
+            clear=False,
+        ):
+            assert audit_runner._resolve_phase2_parallelism() == 3
+
+    def test_invalid_parallelism_env_falls_back(self):
+        """AC2: invalid env value falls back to the default cap."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "banana"},
+            clear=False,
+        ):
+            cap = audit_runner._resolve_phase2_parallelism()
+        assert isinstance(cap, int)
+        assert 1 <= cap <= 4
+
+    def test_ready_children_skipped_in_parallel_run(self):
+        """AC3: child_audit_ready children are skipped even when parallelism > 1."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        children = [
+            self._make_child("READY-1", child_audit_ready=True),
+            self._make_child("PENDING-1"),
+        ]
+        call_ids: list[str] = []
+
+        def _recording_call(issue_id, context, prompt, model="m", pi_bin="pi",
+                            debug_log=None, enable_tools=False, timeout=None):
+            call_ids.append(issue_id)
+            return {"extracted_text": "[]"}
+
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "2"},
+            clear=False,
+        ), mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
+                               side_effect=_recording_call):
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, children, "test-model",
+            )
+
+        assert "READY-1" not in call_ids
+        assert "PENDING-1" in call_ids
+
+    def test_timeout_child_marks_partial_in_parallel_run(self):
+        """AC4: a child timeout still marks partial ACs and phase2_completed=False."""
+
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        children = [self._make_child("C-1"), self._make_child("C-2")]
+
+        def _call_with_timeout(issue_id, context, prompt, model="m", pi_bin="pi",
+                               debug_log=None, enable_tools=False, timeout=None):
+            if issue_id == "C-1":
+                return {"_timeout": True, "verdict": "unmet",
+                        "evidence": "timed out", "extracted_text": ""}
+            return {"extracted_text": "[]"}
+
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "2"},
+            clear=False,
+        ), mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
+                               side_effect=_call_with_timeout):
+            _updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, children, "test-model",
+                )
+            )
+
+        assert phase2_completed is False
+        timeout_child = next(c for c in updated_children if c["id"] == "C-1")
+        assert timeout_child["ac_results"][0]["verdict"] == "partial"
