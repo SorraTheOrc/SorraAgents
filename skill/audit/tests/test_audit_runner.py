@@ -978,3 +978,182 @@ class TestPhase2TimingInstrumentation:
         assert phase2_completed is True
         assert updated_acs[0]["verdict"] == "met"
         assert updated_children[0]["ac_results"][0]["verdict"] == "met"
+
+
+# ===========================================================================
+# Phase 2 file-scope manifest (SA-0MSAIXI1E005SZPV AC1-AC4)
+# ===========================================================================
+
+
+class TestPhase2FileScopeManifest:
+    """Tests for the Phase 2 file-scope manifest (AC1-AC4).
+
+    The Phase 2 prompt must include a file-scope manifest (Key Files + git
+    changed files + repo index) and Phase 1 file:line evidence (P4) so the
+    model verifies in-scope files instead of exploring the whole repo.
+    """
+
+    def _make_issue(self, issue_id: str = "TEST-1",
+                    description: str = "") -> dict:
+        return {"id": issue_id, "title": "Test Issue", "description": description}
+
+    def _make_ac(self, index: int, text: str = "AC text",
+                 verdict: str = "met", evidence: str = "") -> dict:
+        return {"index": index, "text": text, "verdict": verdict, "evidence": evidence}
+
+    def _make_git_runner(self, changed: list[str] | None = None,
+                         index: list[str] | None = None):
+        """Build a mock runner returning canned git outputs."""
+        changed = changed or []
+        index = index or ["skill/audit/scripts/audit_runner.py",
+                          "skill/audit/tests/test_audit_runner.py",
+                          "README.md"]
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if "--name-only" in cmd_str:
+                out = "\n".join(changed)
+            elif "--porcelain=v1" in cmd_str:
+                out = "\n".join(f" M {f}" for f in changed)
+            elif "ls-files" in cmd_str:
+                out = "\n".join(index)
+            else:
+                out = ""
+            return SimpleNamespace(returncode=0, stdout=out + "\n", stderr="")
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def _fake_call(self, captured):
+        """Return a side_effect that matches _call_pi_and_maybe_log's signature."""
+        def _side_effect(issue_id, context, prompt, model="m", pi_bin="pi",
+                         debug_log=None, enable_tools=False, timeout=None):
+            captured["prompt"] = prompt
+            return {"extracted_text": "[]"}
+        return _side_effect
+
+    def test_prompt_includes_file_scope_manifest(self):
+        """AC1/AC2: phase2_deep prompt includes a FILE SCOPE section."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        runner = self._make_git_runner(changed=["skill/audit/SKILL.md"])
+        captured = {}
+
+        with mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
+                               side_effect=self._fake_call(captured)):
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model", runner=runner,
+            )
+
+        prompt = captured["prompt"]
+        assert "FILE SCOPE" in prompt
+        assert "in-scope" in prompt.lower() or "only the files" in prompt.lower()
+
+    def test_prompt_includes_key_files_from_description(self):
+        """AC1: Key Files extracted from the work item description appear in the prompt."""
+        desc = (
+            "## Summary\n\nThing.\n\n"
+            "## Key Files (predicted)\n\n"
+            "- `skill/audit/scripts/audit_runner.py` — primary\n"
+            "- `skill/audit/tests/test_audit_runner.py` — tests\n"
+        )
+        issue = self._make_issue(description=desc)
+        acs = [self._make_ac(0)]
+        runner = self._make_git_runner()
+        captured = {}
+
+        with mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
+                               side_effect=self._fake_call(captured)):
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model", runner=runner,
+            )
+
+        prompt = captured["prompt"]
+        assert "audit_runner.py" in prompt
+        assert "test_audit_runner.py" in prompt
+
+    def test_prompt_includes_changed_files_from_git(self):
+        """AC1: git changed files appear in the Phase 2 prompt."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        runner = self._make_git_runner(changed=["skill/audit/SKILL.md"])
+        captured = {}
+
+        with mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
+                               side_effect=self._fake_call(captured)):
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model", runner=runner,
+            )
+
+        assert "SKILL.md" in captured["prompt"]
+
+    def test_prompt_includes_phase1_evidence_file_lines(self):
+        """AC3 (P4): Phase 1 evidence file:line refs are fed forward."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, evidence="skill/audit/scripts/audit_runner.py:1608")]
+        runner = self._make_git_runner()
+        captured = {}
+
+        with mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
+                               side_effect=self._fake_call(captured)):
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model", runner=runner,
+            )
+
+        assert "audit_runner.py:1608" in captured["prompt"]
+
+    def test_manifest_builder_returns_text(self):
+        """AC1: _build_file_scope_manifest returns non-empty manifest text."""
+        desc = "## Key Files\n\n- `skill/audit/scripts/audit_runner.py`\n"
+        issue = self._make_issue(description=desc)
+        acs = [self._make_ac(0, evidence="skill/audit/scripts/audit_runner.py:10")]
+        runner = self._make_git_runner(changed=["skill/audit/SKILL.md"])
+
+        manifest = audit_runner._build_file_scope_manifest(issue, acs, runner=runner)
+        assert "audit_runner.py" in manifest
+        assert "SKILL.md" in manifest
+        assert "audit_runner.py:10" in manifest
+
+    def test_manifest_builder_graceful_without_git(self):
+        """AC4: manifest builder degrades gracefully when git fails."""
+        issue = self._make_issue(description="")
+        acs = [self._make_ac(0)]
+        runner = mock.MagicMock()
+        runner.side_effect = RuntimeError("git not available")
+
+        manifest = audit_runner._build_file_scope_manifest(issue, acs, runner=runner)
+        assert isinstance(manifest, str)
+        assert manifest  # non-empty
+
+    def test_child_prompt_includes_file_scope(self):
+        """AC2: child deep-analysis prompts also carry the FILE SCOPE section."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = {
+            "id": "CHILD-1",
+            "title": "Child Issue",
+            "stage": "in_progress",
+            "status": "open",
+            "ac_results": [
+                {"index": 0, "text": "Child AC", "verdict": "met",
+                 "evidence": "skill/audit/tests/test_audit_runner.py:1"},
+            ],
+        }
+        runner = self._make_git_runner()
+        prompts = []
+
+        def _fake_call(issue_id, context, prompt, model="m", pi_bin="pi",
+                       debug_log=None, enable_tools=False, timeout=None):
+            prompts.append(prompt)
+            return {"extracted_text": "[]"}
+
+        with mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
+                               side_effect=_fake_call):
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model", runner=runner,
+            )
+
+        assert len(prompts) == 2
+        assert "FILE SCOPE" in prompts[1]
+        assert "test_audit_runner.py" in prompts[1]

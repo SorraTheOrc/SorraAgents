@@ -866,6 +866,182 @@ def _extract_acs(description: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 file-scope manifest (SA-0MSAIXI1E005SZPV)
+# ---------------------------------------------------------------------------
+
+_FILE_SCOPE_MAX_FILES = 50
+"""Maximum number of files to include in the Phase 2 file-scope manifest."""
+
+_FILE_SCOPE_MAX_INDEX = 25
+"""Maximum number of repo-index entries in the Phase 2 file-scope manifest."""
+
+
+def _extract_key_files(description: str) -> list[str]:
+    """Extract file paths from the work item's Key Files section.
+
+    Scans *description* for a markdown heading like ``## Key Files`` or
+    ``## Key Files (predicted)`` and returns the backtick-quoted paths listed
+    beneath it (one per bullet/numbered line). Returns an empty list when no
+    Key Files section is present.
+    """
+    if not description:
+        return []
+    pattern = re.compile(
+        r"^#{0,4}\s*Key Files.*?$",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    match = pattern.search(description)
+    if not match:
+        return []
+    files: list[str] = []
+    for line in description[match.end():].splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^#{1,6}\s", stripped):
+            break  # next heading ends the Key Files section
+        # Match a backtick-quoted path, e.g. ``- `path/to/file.py` — desc``
+        m = re.search(r"`([^`]+)`", stripped)
+        if m:
+            candidate = m.group(1).strip()
+        else:
+            # Fall back to the first whitespace-delimited token on a bullet line
+            bullet = re.match(r"^[-*]\s+(\S+)", stripped)
+            candidate = bullet.group(1) if bullet else ""
+        if candidate:
+            files.append(candidate)
+    return files
+
+
+def _git_changed_files(runner: Runner) -> list[str]:
+    """Return the list of changed/untracked files from git (bounded).
+
+    Combines ``git diff --name-only HEAD`` and ``git status --porcelain=v1``
+    so both tracked modifications and untracked files are captured. Any git
+    failure returns an empty list so the audit never breaks on VCS errors.
+    """
+    changed: list[str] = []
+    try:
+        proc = runner(["git", "diff", "--name-only", "HEAD"])
+        if proc.returncode == 0 and proc.stdout:
+            changed.extend(
+                ln.strip() for ln in proc.stdout.splitlines() if ln.strip()
+            )
+    except Exception:  # noqa: S110, BLE001 -- git is best-effort for the manifest
+        pass
+    try:
+        proc = runner(["git", "status", "--porcelain=v1"])
+        if proc.returncode == 0 and proc.stdout:
+            for ln in proc.stdout.splitlines():
+                # porcelain format: "XY path" (2 status chars + space + path)
+                if len(ln) >= 4:
+                    path = ln[3:].strip()
+                    if path and path not in changed:
+                        changed.append(path)
+    except Exception:  # noqa: S110, BLE001 -- git is best-effort for the manifest
+        pass
+    return changed[:_FILE_SCOPE_MAX_FILES]
+
+
+def _repo_index(runner: Runner, max_entries: int = _FILE_SCOPE_MAX_INDEX) -> list[str]:
+    """Return a lightweight repo index (top-level entries with file counts).
+
+    Uses ``git ls-files`` to count files per top-level path and returns the
+    ``max_entries`` largest buckets as ``path/ (N files)`` strings. On git
+    failure, falls back to a best-effort directory listing of
+    ``TARGET_PROJECT_ROOT``.
+    """
+    buckets: dict[str, int] = {}
+    try:
+        proc = runner(["git", "ls-files"])
+        if proc.returncode == 0 and proc.stdout:
+            for ln in proc.stdout.splitlines():
+                rel = ln.strip()
+                if not rel:
+                    continue
+                top = rel.split("/", 1)[0] if "/" in rel else "(root)"
+                buckets[top] = buckets.get(top, 0) + 1
+    except Exception:  # noqa: S110, BLE001 -- git is best-effort for the manifest
+        pass
+
+    if not buckets:
+        # Best-effort fallback: list top-level dirs of TARGET_PROJECT_ROOT
+        try:
+            root = TARGET_PROJECT_ROOT
+            for entry in sorted(root.iterdir()):
+                if entry.is_dir() and not entry.name.startswith("."):
+                    buckets[entry.name] = len(list(entry.iterdir()))
+        except OSError:
+            return []
+
+    ordered = sorted(buckets.items(), key=lambda kv: -kv[1])[:max_entries]
+    return [f"{name}/ ({count} files)" for name, count in ordered]
+
+
+def _phase1_evidence_refs(ac_results: list[dict],
+                          max_refs: int = _FILE_SCOPE_MAX_FILES) -> list[str]:
+    """Extract file:line references from Phase 1 evidence (P4).
+
+    Scans each AC result's ``evidence`` for ``path:line`` patterns and
+    returns them (bounded) so Phase 2 verifies named files rather than
+    re-exploring the repo.
+    """
+    refs: list[str] = []
+    seen: set[str] = set()
+    for r in ac_results:
+        evidence = r.get("evidence", "") or ""
+        for m in re.finditer(r"([\w./-]+\.\w+):(\d+)", evidence):
+            ref = f"{m.group(1)}:{m.group(2)}"
+            if ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
+        if len(refs) >= max_refs:
+            break
+    return refs
+
+
+def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
+                               runner: Runner | None = None) -> str:
+    """Build the file-scope manifest injected into the Phase 2 prompt.
+
+    Combines the work item's Key Files, the git changed-file list, a
+    lightweight repo index, and Phase 1 evidence file:line refs (P4). The
+    manifest lets the model verify in-scope files without unbounded
+    repository exploration (the dominant Phase 2 cost).
+
+    *runner* is used for git queries and defaults to ``_default_runner``.
+    """
+    if runner is None:
+        runner = _default_runner
+
+    sections: list[str] = []
+
+    key_files = _extract_key_files(issue.get("description", ""))
+    if key_files:
+        key_lines = "\n".join(f"- `{f}`" for f in key_files[:_FILE_SCOPE_MAX_FILES])
+        sections.append(f"Key Files (from the work item):\n{key_lines}")
+
+    changed = _git_changed_files(runner)
+    if changed:
+        changed_lines = "\n".join(f"- `{f}`" for f in changed)
+        sections.append(f"Changed files (git diff / status):\n{changed_lines}")
+
+    refs = _phase1_evidence_refs(ac_results)
+    if refs:
+        ref_lines = "\n".join(f"- `{f}`" for f in refs)
+        sections.append(f"Phase 1 evidence file:line references:\n{ref_lines}")
+
+    index = _repo_index(runner)
+    if index:
+        index_lines = "\n".join(f"- {f}" for f in index)
+        sections.append(f"Repository index (top-level layout):\n{index_lines}")
+
+    if not sections:
+        return "No file scope manifest available — verify criteria against the most relevant implementation files."
+    return "\n\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
 # Report assembly
 # ---------------------------------------------------------------------------
 
@@ -1614,17 +1790,28 @@ def _run_phase2_deep_analysis(
     debug_log: str | None = None,
     script_failure_callback=None,
     timeout: int | None = None,
+    runner: Runner | None = None,
 ) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
     Calls Pi with a detailed prompt asking the model to read the actual
     implementation files and verify each acceptance criterion against
-    what the code actually does.
+    what the code actually does. The prompt includes a file-scope manifest
+    (Key Files, git changed files, repo index, Phase 1 evidence refs) so
+    the model verifies in-scope files instead of exploring the whole repo.
+
+    *runner* is used for git queries when building the file-scope manifest
+    and defaults to ``_default_runner``.
 
     Returns (updated_ac_results, updated_child_results, phase2_completed).
     The ``phase2_completed`` flag is ``False`` when the Pi call times out,
     allowing the caller to set appropriate diagnostic evidence.
     """
+    if runner is None:
+        runner = _default_runner
+
+    file_scope = _build_file_scope_manifest(issue, ac_results, runner=runner)
+
     # Build a detailed prompt for deep analysis
     ac_list_json = json.dumps([
         {"index": i, "text": r["text"], "initial_verdict": r["verdict"]}
@@ -1638,6 +1825,11 @@ def _run_phase2_deep_analysis(
         "Do NOT execute any wl, git, or other state-modifying commands. "
         "Return ONLY a structured JSON array.\n\n"
         "Phase 1 automated screening has PASSED. You must now perform deep code analysis.\n\n"
+        "FILE SCOPE — Read ONLY the files listed in the manifest below. "
+        "Do not explore the whole repository (no unbounded `find`, `grep -r`, "
+        "or `ls -R` across the repo). If a criterion requires a file not listed "
+        "here, state that in the evidence instead of searching for it.\n\n"
+        f"{file_scope}\n\n"
         "For each acceptance criterion:\n"
         "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
         "2. **Verify the code actually does what the criterion claims.**\n"
@@ -1797,11 +1989,19 @@ def _run_phase2_deep_analysis(
             {"index": i, "text": r["text"], "initial_verdict": r["verdict"]}
             for i, r in enumerate(child_acs)
         ])
+        child_file_scope = _build_file_scope_manifest(
+            child, child_acs, runner=runner,
+        )
         child_prompt = (
             "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — CHILD] "
             "Do NOT close, modify, create, or delete any work items. "
             "Return ONLY a structured JSON array.\n\n"
             f"Deep code analysis for child: {child.get('title', '')} ({child.get('id', '')})\n\n"
+            "FILE SCOPE — Read ONLY the files listed in the manifest below. "
+            "Do not explore the whole repository. If a criterion requires a "
+            "file not listed here, state that in the evidence instead of "
+            "searching for it.\n\n"
+            f"{child_file_scope}\n\n"
             "For each criterion, read the actual implementation files and verify "
             "the code genuinely satisfies the stated requirements. "
             "Use the same verdict guidance as the parent deep analysis.\n\n"
@@ -2420,6 +2620,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 debug_log=debug_log,
                 script_failure_callback=_record_script_failure,
                 timeout=timeout,
+                runner=runner,
             )
 
         # ------------------------------------------------------------------
