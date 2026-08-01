@@ -17,8 +17,8 @@ Core principles for AI Agents working with work-items tracked in Worklog (wl) an
 Follow the steps below when completing tasks. If you already have a current work-item id, continue using it. Otherwise, ask the operator to create one or give permission to create one. If the operator allows skipping work-item creation, proceed without tracking steps.
 
 1. **Claim the work-item** — Run `wl update <id> --status in_progress --assignee <agent>`.
-2. **Ensure the work-item is clearly defined** — Fetch with `wl show <id> --children --json`. Verify it has a clear goal (user story) and testable acceptance criteria. If unclear, search worklog/repo for context, clarify with the operator, or document open questions. Advance stage: `wl update <id> --stage intake_complete`. See [skill/intakeall/SKILL.md](skill/intakeall/SKILL.md).
-3. **Plan the work** — Break into sub-tasks. Verify descriptions and ACs are clear, measurable, and testable. Create child work-items: `wl create -t "<title>" -d "<description>" --parent <id> --issue-type <type> --priority <level> --json`. Advance stage: `wl update <id> --stage plan_complete`. See [skill/plan/SKILL.md](skill/plan/SKILL.md).
+2. **Ensure the work-item is clearly defined** — Fetch with `wl show <id> --children --json`. Verify it has a clear goal (user story) and testable acceptance criteria. If unclear, search worklog/repo for context, clarify with the operator, or document open questions. Advance stage: `wl update <id> --stage intake_complete`. See [intakeall skill](/home/rgardler/.pi/agent/skills/intakeall/SKILL.md).
+3. **Plan the work** — Break into sub-tasks. Verify descriptions and ACs are clear, measurable, and testable. Create child work-items: `wl create -t "<title>" -d "<description>" --parent <id> --issue-type <type> --priority <level> --json`. Advance stage: `wl update <id> --stage plan_complete`. See [plan skill](/home/rgardler/.pi/agent/skills/plan/SKILL.md).
 4. **Decide what to work on next** — Use `wl next --json`. If the recommended item has children, claim it and recurse until reaching a leaf item. If no descendants remain, go to End session.
 5. **Implement the work-item** — Use the implement orchestration script to manage the deterministic lifecycle:
 
@@ -46,13 +46,13 @@ Follow the steps below when completing tasks. If you already have a current work
 
    Work committed to dev
 
-   See [skill/implement/SKILL.md](skill/implement/SKILL.md) for the full implementation workflow (test-driven development, commit discipline, worktree lifecycle, error handling).
+   See [implement skill](/home/rgardler/.pi/agent/skills/implement/SKILL.md) for the full implementation workflow (test-driven development, commit discipline, worktree lifecycle, error handling).
 
 6. **Update the operator** — Provide a concise summary with relevant links (id, commits, PRs). Do not suggest next steps.
 7. **Repeat** — Return to step 4.
-8. **End session** — When no descendants remain, inform operator, summarize remaining tasks, clean up worktrees. See [skill/cleanup/SKILL.md](skill/cleanup/SKILL.md).
+8. **End session** — When no descendants remain, inform operator, summarize remaining tasks, clean up worktrees. See [cleanup skill](/home/rgardler/.pi/agent/skills/cleanup/SKILL.md).
 
-> **Push policy:** Push only to `dev` — never to `main`. The release process ([skill/ship/SKILL.md](skill/ship/SKILL.md) / `skill/ship/scripts/release/merge-dev-to-main.sh`) promotes `dev` to `main`. See also [docs/dev/release-process.md](docs/dev/release-process.md).
+> **Push policy:** Push only to `dev` — never to `main`. The release process ([ship skill](/home/rgardler/.pi/agent/skills/ship/SKILL.md) / `/home/rgardler/.pi/agent/skills/ship/scripts/release/merge-dev-to-main.sh`) promotes `dev` to `main`. See also [docs/dev/release-process.md](docs/dev/release-process.md).
 
 > **Do NOT close the work-item at this stage.** Work-items are closed only after the `dev`→`main` release is complete. When a human operator says "close a work item", they mean update the stage to `in_review` or mark as `completed` — NOT initiate a release. Agents may perform the release by invoking the Ship skill, or a Release Manager may do it manually. Agents SHOULD NOT push directly to `main` unless explicitly authorized.
 
@@ -160,11 +160,11 @@ Other dependency types can be tracked in descriptions: `discovered-from:<id>`, `
 When an agent discovers a failing test outside its ownership/scope, call the triage helper script:
 
 ```bash
-python3 skill/triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<current-id>"}'
+python3 /home/rgardler/.pi/agent/skills/triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<current-id>"}'
 ```
 
 - Any incomplete work item tagged `test-failure` matching the test name is linked/updated.
-- If no match exists, a `critical` work item is created using the template at `skill/triage/resources/test-failure-template.md`.
+- If no match exists, a `critical` work item is created using the template at `/home/rgardler/.pi/agent/skills/triage/resources/test-failure-template.md`.
 - The child is then implemented via `implement-single`, fixed, committed, and tests re-run.
 - **All tests must pass** before a work item reaches `in_review` — including pre-existing failures.
 
