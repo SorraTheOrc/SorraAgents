@@ -170,8 +170,23 @@ fi
 if git merge --no-ff origin/dev -m "Merge origin/dev into main (automated)"; then
   echo "Created merge commit on $BRANCH"
 else
-  echo "Merge failed; please resolve conflicts manually." >&2
-  exit 1
+  # Auto-resolve CHANGELOG.md conflicts: dev's CHANGELOG carries both the
+  # previously released history and the unreleased entries for this release
+  # (generate-changelog.js rewrites it for the new version afterwards).
+  if git ls-files -u | grep -q 'CHANGELOG.md'; then
+    echo "Resolving CHANGELOG.md merge conflict (taking dev's version)" >&2
+    git checkout --theirs CHANGELOG.md
+    git add CHANGELOG.md
+    if git merge --continue --no-edit 2>/dev/null || git commit -m "Merge origin/dev into main (automated, CHANGELOG resolved)"; then
+      echo "Created merge commit on $BRANCH (with CHANGELOG resolution)"
+    else
+      echo "Merge failed; please resolve conflicts manually." >&2
+      exit 1
+    fi
+  else
+    echo "Merge failed; please resolve conflicts manually." >&2
+    exit 1
+  fi
 fi
 
 # ── Create git tag (only on actual release) ───────────────────────
