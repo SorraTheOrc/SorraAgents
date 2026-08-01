@@ -955,7 +955,7 @@ class TestPhase2TimingInstrumentation:
         child = self._make_child("CHILD-1", ac_count=1)
 
         def _fake_call_pi(prompt, model="test-model", pi_bin="pi",
-                          enable_tools=False, timeout=None):
+                          enable_tools=False, timeout=None, max_retries=None):
             return {
                 "verdict": "met",
                 "evidence": "file.py:10 works",
@@ -1028,7 +1028,7 @@ class TestPhase2FileScopeManifest:
     def _fake_call(self, captured):
         """Return a side_effect that matches _call_pi_and_maybe_log's signature."""
         def _side_effect(issue_id, context, prompt, model="m", pi_bin="pi",
-                         debug_log=None, enable_tools=False, timeout=None):
+                         debug_log=None, enable_tools=False, timeout=None, max_retries=None):
             captured["prompt"] = prompt
             return {"extracted_text": "[]"}
         return _side_effect
@@ -1144,7 +1144,7 @@ class TestPhase2FileScopeManifest:
         prompts = []
 
         def _fake_call(issue_id, context, prompt, model="m", pi_bin="pi",
-                       debug_log=None, enable_tools=False, timeout=None):
+                       debug_log=None, enable_tools=False, timeout=None, max_retries=None):
             prompts.append(prompt)
             return {"extracted_text": "[]"}
 
@@ -1357,7 +1357,7 @@ class TestPhase2ParallelChildCalls:
         started = threading.Barrier(2)  # both child calls must be in-flight to pass
 
         def _slow_call(issue_id, context, prompt, model="m", pi_bin="pi",
-                       debug_log=None, enable_tools=False, timeout=None):
+                       debug_log=None, enable_tools=False, timeout=None, max_retries=None):
             if context.startswith("phase2_child"):
                 started.wait(timeout=5)  # raises BrokenBarrierError if not concurrent
             return {"extracted_text": "[]"}
@@ -1391,7 +1391,7 @@ class TestPhase2ParallelChildCalls:
         call_order: list[str] = []
 
         def _ordered_call(issue_id, context, prompt, model="m", pi_bin="pi",
-                          debug_log=None, enable_tools=False, timeout=None):
+                          debug_log=None, enable_tools=False, timeout=None, max_retries=None):
             if context.startswith("phase2_child"):
                 call_order.append(issue_id)
             return {"extracted_text": "[]"}
@@ -1449,7 +1449,7 @@ class TestPhase2ParallelChildCalls:
         call_ids: list[str] = []
 
         def _recording_call(issue_id, context, prompt, model="m", pi_bin="pi",
-                            debug_log=None, enable_tools=False, timeout=None):
+                            debug_log=None, enable_tools=False, timeout=None, max_retries=None):
             call_ids.append(issue_id)
             return {"extracted_text": "[]"}
 
@@ -1474,7 +1474,7 @@ class TestPhase2ParallelChildCalls:
         children = [self._make_child("C-1"), self._make_child("C-2")]
 
         def _call_with_timeout(issue_id, context, prompt, model="m", pi_bin="pi",
-                               debug_log=None, enable_tools=False, timeout=None):
+                               debug_log=None, enable_tools=False, timeout=None, max_retries=None):
             if issue_id == "C-1":
                 return {"_timeout": True, "verdict": "unmet",
                         "evidence": "timed out", "extracted_text": ""}
@@ -1495,3 +1495,114 @@ class TestPhase2ParallelChildCalls:
         assert phase2_completed is False
         timeout_child = next(c for c in updated_children if c["id"] == "C-1")
         assert timeout_child["ac_results"][0]["verdict"] == "partial"
+
+
+# ===========================================================================
+# Phase 2 retry tuning (SA-0MSAIXZB2007N0F0 AC1-AC4)
+# ===========================================================================
+
+
+class TestPhase2RetryTuning:
+    """Tests for bounded provider-error retries on long Phase 2 calls (AC1-AC4).
+
+    Long agent-mode Phase 2 calls (phase2_deep / phase2_child) must NOT
+    restart the entire call on provider error beyond a bounded retry cap
+    (1, per the performance evaluation). Short Phase 1 bare calls keep the
+    existing ``_PI_MAX_RETRIES`` behavior.
+    """
+
+    def _make_provider_error_stream(self) -> str:
+        return json.dumps({
+            "type": "agent_end",
+            "messages": [{"role": "assistant", "stopReason": "error", "errorMessage": "boom"}],
+        })
+
+    def _make_valid_stream(self) -> str:
+        return json.dumps({
+            "type": "agent_end",
+            "messages": [{"role": "assistant", "content": '{"verdict": "met", "evidence": "file.py:1"}'}],
+        })
+
+    def test_phase2_deep_uses_reduced_retry_cap(self):
+        """AC1: phase2_deep calls pass a reduced retry cap (1)."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {"extracted_text": "[]"}
+            audit_runner._call_pi_and_maybe_log(
+                "SA-1", "phase2_deep", "prompt",
+                model="m", enable_tools=True, max_retries=1,
+            )
+        _args, kwargs = mock_call.call_args
+        assert kwargs.get("max_retries") == 1
+
+    def test_phase2_child_uses_reduced_retry_cap(self):
+        """AC1: phase2_child calls pass a reduced retry cap (1)."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {"extracted_text": "[]"}
+            audit_runner._call_pi_and_maybe_log(
+                "SA-2", "phase2_child:0", "prompt",
+                model="m", enable_tools=True, max_retries=1,
+            )
+        _args, kwargs = mock_call.call_args
+        assert kwargs.get("max_retries") == 1
+
+    def test_default_retries_unchanged_for_phase1(self):
+        """AC3: Phase 1 bare calls keep the default _PI_MAX_RETRIES (2)."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {"extracted_text": "[]"}
+            audit_runner._call_pi_and_maybe_log(
+                "SA-3", "parent", "prompt", model="m",
+            )
+        _args, kwargs = mock_call.call_args
+        # max_retries not passed → _call_pi uses its default
+        assert kwargs.get("max_retries") is None
+
+    def test_call_pi_retries_bounded_by_max_retries(self):
+        """AC1/AC2: _call_pi with max_retries=1 makes at most 2 attempts on provider error."""
+        provider_stream = self._make_provider_error_stream()
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (provider_stream, "")
+
+        with mock.patch.object(audit_runner.subprocess, "Popen",
+                               return_value=mock_process) as mock_popen:
+            result = audit_runner._call_pi(
+                "prompt", model="m", max_retries=1,
+            )
+
+        # 1 initial attempt + 1 retry = 2 attempts, then provider error surfaced
+        assert mock_popen.call_count == 2
+        assert result.get("_provider_error") is True
+
+    def test_call_pi_default_retries_full_budget(self):
+        """AC3: default (no max_retries) keeps _PI_MAX_RETRIES=2 extra attempts."""
+        provider_stream = self._make_provider_error_stream()
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (provider_stream, "")
+
+        with mock.patch.object(audit_runner.subprocess, "Popen",
+                               return_value=mock_process) as mock_popen:
+            result = audit_runner._call_pi("prompt", model="m")
+
+        # 1 initial + 2 retries = 3 attempts
+        assert mock_popen.call_count == 3
+        assert result.get("_provider_error") is True
+
+    def test_phase2_deep_analysis_forwards_reduced_retries(self):
+        """AC1 (integration): _run_phase2_deep_analysis forwards max_retries=1."""
+        issue = {"id": "TEST-1", "title": "Test"}
+        acs = [{"index": 0, "text": "AC", "verdict": "met", "evidence": ""}]
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model",
+            )
+
+        parent_calls = [
+            c for c in mock_call.call_args_list
+            if c[0][1] == "phase2_deep"
+        ]
+        assert len(parent_calls) == 1
+        _args, kwargs = parent_calls[0]
+        assert kwargs.get("max_retries") == 1

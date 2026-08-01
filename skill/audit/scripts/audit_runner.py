@@ -101,6 +101,17 @@ _PI_RETRY_BACKOFF_SECONDS = 2.0
 Backoff grows linearly: 1x, 2x, ... base per retry attempt.
 """
 
+_PHASE2_MAX_RETRIES = 1
+"""Provider-error retry cap for long agent-mode Phase 2 calls.
+
+Phase 2 deep analysis (``phase2_deep`` / ``phase2_child``) runs Pi in agent
+mode with file-reading tools, so each call is long. A provider error late in
+such a call must not restart the entire call multiple times (worst case
+~3 x 1800s before this change); retrying at most once bounds the cost while
+still giving transient provider glitches a chance to recover. Short Phase 1
+bare calls keep ``_PI_MAX_RETRIES`` (2).
+"""
+
 AUDIT_PHASE2_PARALLELISM_ENV = "AUDIT_PHASE2_PARALLELISM"
 """Environment variable controlling Phase 2 child deep-analysis concurrency.
 
@@ -533,7 +544,8 @@ def _resolve_model_for_phase(phase: str, config: dict,
 def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              pi_bin: str = "pi",
              enable_tools: bool = False,
-             timeout: int | None = None) -> dict:
+             timeout: int | None = None,
+             max_retries: int | None = None) -> dict:
     """Call Pi via subprocess and parse the JSON-stream response.
 
     Args:
@@ -543,6 +555,10 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         enable_tools: If True, adds ``--tools read,bash,grep,find,ls
                        --exclude-tools ask_question`` to enable file-reading
                        capabilities in the Pi agent session.
+        max_retries: Maximum number of extra attempts after a provider error.
+            When None, falls back to ``_PI_MAX_RETRIES`` (2). Long
+            agent-mode Phase 2 calls pass 1 so a provider error does not
+            restart a long call multiple times (evaluation lever P5).
 
     Returns a dict with keys ``verdict`` and ``evidence``.
     On success, implementations may also include additional diagnostic keys
@@ -561,6 +577,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         ])
 
     effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
+    effective_max_retries = _PI_MAX_RETRIES if max_retries is None else max_retries
     attempt = 0
     provider_error: str | None = None
     stdout = ""
@@ -603,7 +620,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         # Detect provider errors (e.g. "finish_reason: error" where the model
         # never emits its final structured output) and retry them with backoff.
         provider_error = _extract_provider_error(stdout or "")
-        if provider_error is None or attempt > _PI_MAX_RETRIES:
+        if provider_error is None or attempt > effective_max_retries:
             break
         time.sleep(_PI_RETRY_BACKOFF_SECONDS * attempt)
 
@@ -1527,7 +1544,8 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            pi_bin: str = "pi",
                            debug_log: str | None = None,
                            enable_tools: bool = False,
-                           timeout: int | None = None) -> dict:
+                           timeout: int | None = None,
+                           max_retries: int | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
     Args:
@@ -1539,6 +1557,10 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         debug_log: Optional path for debug log output.
         enable_tools: If True, forwards to _call_pi() to enable file-reading
                        tools in the Pi agent session.
+        max_retries: Maximum extra provider-error attempts; forwarded to
+            _call_pi(). Phase 2 deep analysis passes 1 (see
+            ``_PHASE2_MAX_RETRIES``) so long agent-mode calls are not
+            restarted multiple times on a provider error.
 
     If *debug_log* is provided the entry reason will be "debug_log" and the
     provided path will be used. If *debug_log* is not provided but the pi
@@ -1546,7 +1568,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     default path from ``_default_debug_log_path`` will be used and the reason
     will be "parse_failure".
     """
-    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout)
+    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout, max_retries=max_retries)
 
     # Emit a per-call timing line to stderr (performance baseline). Includes
     # issue id, call context, and elapsed seconds so Phase 2 durations are
@@ -1872,6 +1894,7 @@ def _deep_analyze_child(
             child.get("id", ""), f"phase2_child:{ci}", child_prompt,
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
             enable_tools=True, timeout=timeout,
+            max_retries=_PHASE2_MAX_RETRIES,
         )
     except RuntimeError:
         return ci, child, False
@@ -2012,6 +2035,7 @@ def _run_phase2_deep_analysis(
             issue_id, "phase2_deep", prompt,
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
             enable_tools=True, timeout=timeout,
+            max_retries=_PHASE2_MAX_RETRIES,
         )
     except RuntimeError as exc:
         # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
