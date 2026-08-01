@@ -826,7 +826,7 @@ def _extract_json_array(text: str) -> list | None:
 def _extract_acs(description: str) -> list[str]:
     """Extract acceptance criteria lines from a markdown description."""
     pattern = re.compile(
-        r"^#{0,3}\s*(?:Acceptance|Success)\s+Criteria\s*$",
+        r"^#{0,3}\s*(?:Acceptance|Success)\s+Criteria:?\s*$",
         re.MULTILINE | re.IGNORECASE,
     )
     match = pattern.search(description)

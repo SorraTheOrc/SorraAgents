@@ -400,6 +400,30 @@ class TestExtractACs:
         acs = _extract_acs(desc)
         assert acs == ["Must be fast"]
 
+    def test_heading_with_trailing_colon(self):
+        """Headers like 'Acceptance Criteria:' (canonical AGENTS.md format)
+        must be recognized — the colon is optional."""
+        desc = (
+            "Acceptance Criteria:\n"
+            "- [ ] runWl-init-detection.test.ts passes reliably (25/25)\n"
+            "- [ ] mock-timeout.test.ts passes (8/8)\n"
+            "- [ ] Full suite green\n"
+        )
+        acs = _extract_acs(desc)
+        assert len(acs) == 3
+        assert "runWl-init-detection.test.ts passes reliably (25/25)" in acs[0]
+        assert "mock-timeout.test.ts passes (8/8)" in acs[1]
+        assert "Full suite green" in acs[2]
+
+    def test_h2_heading_with_trailing_colon(self):
+        desc = (
+            "## Acceptance Criteria:\n"
+            "1. Must do X\n"
+            "2. Must do Y\n\n## Notes\n"
+        )
+        acs = _extract_acs(desc)
+        assert acs == ["Must do X", "Must do Y"]
+
 
 # ---------------------------------------------------------------------------
 # Persistence delegation tests
