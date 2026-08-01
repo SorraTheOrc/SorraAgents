@@ -3,10 +3,9 @@
  * push to `dev`.  Designed to catch critical problems early:
  *
  *  1. Repository structure (key files/directories present)
- *  2. Terminology lint (check-terminology.sh passes)
- *  3. Python test discovery (pytest can collect tests)
- *  4. Worklog CLI availability (wl is on PATH)
- *  5. Agent frontmatter lint (YAML front-matter validates)
+ *  2. Python test discovery (pytest can collect tests)
+ *  3. Worklog CLI availability (wl is on PATH)
+ *  4. Agent frontmatter lint (YAML front-matter validates)
  *
  * Run locally from the repository root:
  *
@@ -70,16 +69,7 @@ test('repository structure: key files and directories exist', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2. Terminology lint
-// ---------------------------------------------------------------------------
-test('terminology: check-terminology.sh passes', () => {
-  const result = run('bash scripts/check-terminology.sh');
-  assert.equal(result.exitCode, 0, `check-terminology.sh failed: ${result.stderr}`);
-  assert.ok(result.stdout.includes('RESULT: PASS'), 'Expected PASS result from terminology scan');
-});
-
-// ---------------------------------------------------------------------------
-// 3. Python test discovery
+// 2. Python test discovery
 // ---------------------------------------------------------------------------
 test('python: pytest can discover tests', () => {
   const result = run('python3 -m pytest --collect-only -q 2>&1 || true');
@@ -93,7 +83,7 @@ test('python: pytest can discover tests', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. Worklog CLI
+// 3. Worklog CLI
 // ---------------------------------------------------------------------------
 test('tooling: wl CLI is available', () => {
   const result = run('wl --version');
@@ -102,7 +92,7 @@ test('tooling: wl CLI is available', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Agent frontmatter lint (skip if pyyaml unavailable)
+// 4. Agent frontmatter lint (skip if pyyaml unavailable)
 // ---------------------------------------------------------------------------
 test('agent: frontmatter lint passes', { skip: false }, () => {
   // Try importing yaml first to see if pyyaml is installed

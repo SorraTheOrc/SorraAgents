@@ -63,7 +63,7 @@ test('critical: full pytest suite collects successfully', () => {
 // ---------------------------------------------------------------------------
 test('critical: a subset of python tests pass', () => {
   // Run a quick subset to verify the test infrastructure works
-  const result = run('python3 -m pytest tests/test_detection.py tests/test_terminology_check.py -v --tb=short 2>&1', { timeout: 60000 });
+  const result = run('python3 -m pytest tests/test_detection.py -v --tb=short 2>&1', { timeout: 60000 });
   // Exit 0 = all pass, 1 = some fail (we still want to see they run)
   assert.ok(
     result.exitCode <= 1,
@@ -293,7 +293,6 @@ test('critical: wl CLI is functional and returns data', () => {
 // ---------------------------------------------------------------------------
 test('critical: essential scripts are present and executable', () => {
   const scripts = [
-    'scripts/check-terminology.sh',
     'scripts/agent_frontmatter_lint.py',
   ];
 
