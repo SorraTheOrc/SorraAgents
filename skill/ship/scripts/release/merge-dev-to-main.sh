@@ -177,12 +177,21 @@ else
     echo "Resolving CHANGELOG.md merge conflict (taking dev's version)" >&2
     git checkout --theirs CHANGELOG.md
     git add CHANGELOG.md
-    if git merge --continue --no-edit 2>/dev/null || git commit -m "Merge origin/dev into main (automated, CHANGELOG resolved)"; then
-      echo "Created merge commit on $BRANCH (with CHANGELOG resolution)"
-    else
-      echo "Merge failed; please resolve conflicts manually." >&2
-      exit 1
-    fi
+  fi
+  # Auto-resolve package.json conflicts: keep the bumped release version
+  # (the release branch bumped it before the merge; dev may be behind).
+  if git ls-files -u | grep -q 'package.json'; then
+    echo "Resolving package.json merge conflict (keeping bumped version)" >&2
+    git checkout --ours package.json
+    git add package.json
+  fi
+  if git ls-files -u | grep -q .; then
+    echo "Merge failed; please resolve conflicts manually." >&2
+    git status --short >&2
+    exit 1
+  fi
+  if git merge --continue --no-edit 2>/dev/null || git commit -m "Merge origin/dev into main (automated, CHANGELOG resolved)"; then
+    echo "Created merge commit on $BRANCH (with CHANGELOG resolution)"
   else
     echo "Merge failed; please resolve conflicts manually." >&2
     exit 1
