@@ -49,6 +49,24 @@ def _fake_proc(returncode: int = 0, stdout: str = "", stderr: str = ""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _strip_worklog_dir(cmd: list[str]) -> list[str]:
+    """Remove an injected ``--worklog-dir <path>`` flag pair from a wl argv.
+
+    The audit runner injects ``--worklog-dir`` into every wl command to make
+    wl invocation cwd-independent. Tests that pin the exact wl argv should
+    strip the injected pair so assertions remain stable across environments.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(cmd):
+        if cmd[i] == "--worklog-dir" and i + 1 < len(cmd):
+            i += 2
+            continue
+        out.append(cmd[i])
+        i += 1
+    return out
+
+
 # ---------------------------------------------------------------------------
 # CLI parsing tests
 # ---------------------------------------------------------------------------
@@ -221,7 +239,7 @@ class TestRunWl:
 
         result = _run_wl(fake_runner, ["wl", "show", "SA-123", "--children", "--json"])
         assert result == {"success": True}
-        assert calls == [["wl", "show", "SA-123", "--children", "--json"]]
+        assert _strip_worklog_dir(calls[0]) == ["wl", "show", "SA-123", "--children", "--json"]
 
     def test_run_wl_nonzero_exit_raises(self):
         def fake_runner(cmd, **kwargs):
@@ -246,7 +264,7 @@ class TestRunWl:
 
         result = _run_wl(fake_runner, ["wl", "dep", "list", "SA-123", "--json"])
         assert result == []
-        assert calls == [["wl", "dep", "list", "SA-123", "--json"]]
+        assert _strip_worklog_dir(calls[0]) == ["wl", "dep", "list", "SA-123", "--json"]
 
 
 # ---------------------------------------------------------------------------
@@ -955,7 +973,7 @@ class TestStatusLifecycle:
 
         def fake_runner(cmd, **kwargs):
             nonlocal _show_called
-            cmd_list = list(cmd)
+            cmd_list = _strip_worklog_dir(list(cmd))
             calls.append(cmd_list)
             # If fail_show is True and this is a "wl show" call, return failure
             if fail_show and "show" in cmd_list:
@@ -994,7 +1012,7 @@ class TestStatusLifecycle:
 
         def fake_runner(cmd, **kwargs):
             nonlocal _show_called
-            cmd_list = list(cmd)
+            cmd_list = _strip_worklog_dir(list(cmd))
             calls.append(cmd_list)
             # The original-status capture uses "wl show <id> --json" (no --children).
             # Match commands where "show" is present but "--children" is absent.

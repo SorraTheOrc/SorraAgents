@@ -30,7 +30,8 @@ def _extract_ready_to_close(report_text: str) -> bool:
 
 
 def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
-                  runner: Callable = None, _fail: bool = False) -> int:  # noqa: RUF013
+                  runner: Callable = None, _fail: bool = False,  # noqa: RUF013
+                  worklog_dir: str | None = None) -> int:
     """Persist the given report_text to the work item using wl audit-set.
 
     Returns the wl subprocess return code (0 on success).
@@ -39,6 +40,9 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
       report to stdout as a fallback, and return 1 to simulate a persistence
       failure.  This allows tests to verify the fallback behaviour of
       callers (e.g. audit_runner.py).
+    * worklog_dir: optional explicit ``--worklog-dir`` value injected into
+      every wl command so the store is targeted regardless of the caller's
+      cwd (used by the audit runner; standalone CLI usage is unaffected).
     """
     if _fail:
         # Simulate failure: print report to stdout (fallback for operator)
@@ -60,6 +64,8 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
         "--raw-output", report_text,
         "--json"
     ]
+    if worklog_dir:
+        cmd[1:1] = ["--worklog-dir", worklog_dir]
 
     proc = runner(cmd, check=False, text=True, capture_output=True)
 
@@ -95,6 +101,8 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     current_stage = ""
     try:
         fetch_cmd = [wl_bin, "show", issue_id, "--json"]
+        if worklog_dir:
+            fetch_cmd[1:1] = ["--worklog-dir", worklog_dir]
         fetch_proc = runner(fetch_cmd, check=False, text=True, capture_output=True)
         if fetch_proc.returncode == 0:
             fetch_data = json.loads(fetch_proc.stdout)
@@ -107,6 +115,8 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
         wl_bin, "update", issue_id,
         "--audit-text", report_text,
     ]
+    if worklog_dir:
+        update_cmd[1:1] = ["--worklog-dir", worklog_dir]
     # Explicitly preserve current stage to prevent accidental advancement
     if current_stage:
         update_cmd.extend(["--stage", current_stage])

@@ -48,6 +48,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from skill.audit.scripts.persist_audit import persist_audit
 from skill.scripts.failure_notice import FailureNotice
+from skill.shared.status_lifecycle import _wl_error_detail, worklog_dir_flag
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -220,12 +221,84 @@ def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=False, text=True, capture_output=True)
 
 
-def _run_wl(runner: Runner, cmd: Sequence[str]) -> dict:
-    """Run a ``wl`` command via the injectable *runner* and return parsed JSON."""
-    proc = runner(cmd)
+def _extract_work_item_prefix(cmd: Sequence[str]) -> str | None:
+    """Extract the work-item id prefix (e.g. ``OSL``) from a wl command.
+
+    Returns the prefix before the first ``-`` in an argument that looks like a
+    work item id (e.g. ``OSL-0MSABC7SB001NVUN``), or ``None`` when no such
+    argument is present (e.g. ``wl list``).
+    """
+    for arg in cmd:
+        m = re.match(r"^([A-Z]{2,5})-[A-Z0-9]+$", arg)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _find_worklog_dir_by_prefix(prefix: str) -> Path | None:
+    """Find the ``.worklog`` dir of a sibling project with matching config prefix.
+
+    Scans ``TARGET_PROJECT_ROOT.parent/*/.worklog/config.yaml`` and returns the
+    first ``.worklog`` directory whose ``prefix:`` value equals *prefix*.
+    Returns ``None`` when no sibling project matches (or the scan is not
+    possible, e.g. TARGET_PROJECT_ROOT.parent does not exist).
+    """
+    projects_root = TARGET_PROJECT_ROOT.parent
+    try:
+        configs = sorted(projects_root.glob("*/.worklog/config.yaml"))
+    except OSError:
+        return None
+    for config in configs:
+        try:
+            text = config.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("prefix:"):
+                value = stripped.split(":", 1)[1].strip().strip('"\'')
+                if value == prefix:
+                    return config.parent
+    return None
+
+
+def _resolve_worklog_flags(cmd: Sequence[str],
+                           explicit_dir: str | None = None) -> list[str]:
+    """Resolve ``--worklog-dir`` flags for a wl command.
+
+    Resolution order:
+      1. explicit ``--worklog-dir`` value (from CLI / caller)
+      2. prefix-to-project sibling scan: extract the work-item id prefix from
+         the command and match it against
+         ``TARGET_PROJECT_ROOT.parent/*/.worklog/config.yaml``
+      3. cwd-chain fallback (shared :func:`worklog_dir_flag`)
+      4. no flag (wl resolves from cwd)
+    """
+    if explicit_dir:
+        return ["--worklog-dir", explicit_dir]
+    prefix = _extract_work_item_prefix(cmd)
+    if prefix:
+        wl_dir = _find_worklog_dir_by_prefix(prefix)
+        if wl_dir is not None:
+            return ["--worklog-dir", str(wl_dir)]
+    return worklog_dir_flag()
+
+
+def _run_wl(runner: Runner, cmd: Sequence[str],
+            worklog_dir: str | None = None) -> dict:
+    """Run a ``wl`` command via the injectable *runner* and return parsed JSON.
+
+    Injects ``--worklog-dir`` flags (resolved per :func:`_resolve_worklog_flags`)
+    so the command targets the correct worklog store regardless of the caller's
+    cwd. ``worklog_dir`` is an explicit override (highest precedence).
+    """
+    full_cmd = list(cmd)
+    if full_cmd and full_cmd[0] == "wl":
+        full_cmd[1:1] = _resolve_worklog_flags(full_cmd, explicit_dir=worklog_dir)
+    proc = runner(full_cmd)
     if proc.returncode != 0:
         raise RuntimeError(
-            f"wl command failed ({' '.join(cmd)}): {proc.stderr.strip()}"
+            f"wl command failed ({' '.join(full_cmd)}): {_wl_error_detail(proc)}"
         )
     try:
         data = json.loads(proc.stdout)
@@ -271,7 +344,8 @@ repository is not the working directory.
 # ---------------------------------------------------------------------------
 
 
-def _check_audit_freshness(runner: Runner, issue_id: str) -> str | None:
+def _check_audit_freshness(runner: Runner, issue_id: str,
+                           worklog_dir: str | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
 
     Fetches the latest audit via ``wl audit-show <id> --json`` and compares
@@ -288,7 +362,8 @@ def _check_audit_freshness(runner: Runner, issue_id: str) -> str | None:
     from datetime import datetime, timedelta, timezone
 
     try:
-        data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"])
+        data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"],
+                       worklog_dir=worklog_dir)
     except RuntimeError:
         return None  # No audit data or command failure
 
@@ -306,7 +381,8 @@ def _check_audit_freshness(runner: Runner, issue_id: str) -> str | None:
 
     # Get the work item's updatedAt
     try:
-        wi_data = _run_wl(runner, ["wl", "show", issue_id, "--json"])
+        wi_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                          worklog_dir=worklog_dir)
     except RuntimeError:
         return None
 
@@ -1498,11 +1574,14 @@ def _persist_child_audit(
     pi_bin: str = "pi",
     model: str | None = None,
     model_source: str | None = None,
+    worklog_dir: str | None = None,
 ) -> tuple[bool, str]:
     """Assemble and persist an audit report for a single child work item.
 
     *model* and *model_source* are passed through to
     ``_assemble_child_audit_report()`` for inclusion in the child report.
+    *worklog_dir* is forwarded to ``persist_audit`` so the wl invocation
+    targets the correct worklog store regardless of the caller's cwd.
 
     Returns (success, report_text).
     On failure the report text is still returned so callers can log it.
@@ -1515,7 +1594,7 @@ def _persist_child_audit(
     }
     report = _assemble_child_audit_report(child, ac_results, model=model, model_source=model_source)
 
-    rc = persist_audit(child_id, report)
+    rc = persist_audit(child_id, report, worklog_dir=worklog_dir)
     success = rc == 0
     return success, report
 
@@ -1653,7 +1732,8 @@ def _demote_met_to_partial(results: list[dict]) -> list[dict]:
     return demoted
 
 
-def _get_child_audit_verdict(runner: Runner, child_id: str) -> tuple[bool | None, str]:
+def _get_child_audit_verdict(runner: Runner, child_id: str,
+                             worklog_dir: str | None = None) -> tuple[bool | None, str]:
     """Check a child's persisted audit verdict via wl audit-show.
 
     Returns a (verdict, reason) tuple:
@@ -1669,7 +1749,8 @@ def _get_child_audit_verdict(runner: Runner, child_id: str) -> tuple[bool | None
     from datetime import datetime, timedelta, timezone
 
     try:
-        data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"])
+        data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"],
+                       worklog_dir=worklog_dir)
     except RuntimeError:
         return None, "error"
 
@@ -1690,7 +1771,8 @@ def _get_child_audit_verdict(runner: Runner, child_id: str) -> tuple[bool | None
 
     # Check freshness against the child's updatedAt
     try:
-        wi_data = _run_wl(runner, ["wl", "show", child_id, "--json"])
+        wi_data = _run_wl(runner, ["wl", "show", child_id, "--json"],
+                          worklog_dir=worklog_dir)
     except RuntimeError:
         # Can't check freshness; treat as fresh since we have an audit
         pass
@@ -2244,7 +2326,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
               model_source: str = DEFAULT_MODEL_SOURCE,
               runner: Runner | None = None, json_mode: bool = False,
               debug_log: str | None = None,
-              force: bool = False) -> int:
+              force: bool = False,
+              worklog_dir: str | None = None) -> int:
     """Audit a single work item.
 
     The resolved model name and source are included as a metadata line
@@ -2257,6 +2340,10 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
     When *force* is ``True``, the freshness gate is bypassed and a full
     audit pipeline is always run, even if a recent audit already exists.
+
+    *worklog_dir* is an explicit ``--worklog-dir`` value that overrides
+    auto-resolution for every wl call made by this run (see
+    ``_resolve_worklog_flags``).
 
     For each active child (not completed/done), the child's persisted audit
     verdict is checked via ``wl audit-show``. If no audit exists or the audit
@@ -2280,7 +2367,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
     # (before status lifecycle to avoid unnecessary in_progress transitions)
     # ------------------------------------------------------------------
     if not force:
-        fresh_report = _check_audit_freshness(runner, issue_id)
+        fresh_report = _check_audit_freshness(runner, issue_id,
+                                              worklog_dir=worklog_dir)
         if fresh_report is not None:
             print("Skipping: audit still fresh")
             print(fresh_report)
@@ -2317,7 +2405,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
     original_status = "open"  # safe default
     original_stage = ""       # safe default (unknown)
     try:
-        item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"])
+        item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                            worklog_dir=worklog_dir)
         if isinstance(item_data, dict):
             # wl show nests the item under "workItem" — unwrap it so the
             # captured state reflects the item (not the response envelope).
@@ -2339,11 +2428,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
     # ------------------------------------------------------------------
     # Status lifecycle: set in_progress on entry (verdict-driven on exit)
     # ------------------------------------------------------------------
-    _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"])
+    _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"],
+            worklog_dir=worklog_dir)
 
     try:
         try:
-            data = _run_wl(runner, ["wl", "show", issue_id, "--children", "--json"])
+            data = _run_wl(runner, ["wl", "show", issue_id, "--children", "--json"],
+                           worklog_dir=worklog_dir)
         except RuntimeError as exc:
             _record_script_failure("wl show", exc)
             print(f"Warning: wl show failed: {exc}", file=sys.stderr)
@@ -2672,7 +2763,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 child["child_audit_ready"] = True  # Exempt - treat as ready
                 continue
 
-            verdict, reason = _get_child_audit_verdict(runner, child["id"])
+            verdict, reason = _get_child_audit_verdict(runner, child["id"],
+                                                       worklog_dir=worklog_dir)
 
             if verdict is None and persist:
                 if _elapsed() < 110:
@@ -2694,6 +2786,14 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         ]
                         if timeout is not None:
                             audit_cmd.extend(["--timeout", str(timeout)])
+                        # Thread the resolved worklog flags through to the child
+                        # runner process so it targets the same worklog store.
+                        child_flags = _resolve_worklog_flags(
+                            ["wl", "show", child["id"], "--json"],
+                            explicit_dir=worklog_dir,
+                        )
+                        if child_flags:
+                            audit_cmd.extend(child_flags)
                         effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
                         subprocess.run(
                             audit_cmd,
@@ -2703,7 +2803,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
                             timeout=effective_timeout,
                         )
                         # Re-check verdict after triggered audit
-                        verdict, reason = _get_child_audit_verdict(runner, child["id"])
+                        verdict, reason = _get_child_audit_verdict(runner, child["id"],
+                                                                   worklog_dir=worklog_dir)
                     except subprocess.TimeoutExpired:
                         print(
                             f"Warning: Auto-triggered audit for child {child['id']} "
@@ -2740,6 +2841,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     pi_bin=pi_bin,
                     model=resolved_model,
                     model_source=model_source,
+                    worklog_dir=worklog_dir,
                 )
                 child_persist_results.append({
                     "id": child["id"],
@@ -2854,7 +2956,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
             print(_get_closing_sentence(report))
 
         if persist:
-            persist_rc = persist_audit(issue_id, report)
+            persist_rc = persist_audit(issue_id, report, worklog_dir=worklog_dir)
             if persist_rc != 0:
                 print(
                     f"Error: Failed to persist audit for {issue_id} "
@@ -2864,7 +2966,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 return persist_rc
             # Readback verification: confirm the stored audit is retrievable
             try:
-                rb_data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"])
+                rb_data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"],
+                                  worklog_dir=worklog_dir)
             except RuntimeError as exc:
                 print(
                     f"Error: Readback verification failed for {issue_id}: {exc}",
@@ -2932,16 +3035,19 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     "--stage", safe_stage,
                     "--assignee", "",
                     "--json",
-                ])
+                ], worklog_dir=worklog_dir)
             elif audit_verdict == "yes":
                 # Advance to the review queue. Keep a terminal 'done' stage.
                 if original_stage == "done":
-                    _run_wl(runner, ["wl", "update", issue_id, "--status", "completed", "--json"])
+                    _run_wl(runner, ["wl", "update", issue_id, "--status", "completed", "--json"],
+                            worklog_dir=worklog_dir)
                 else:
-                    _run_wl(runner, ["wl", "update", issue_id, "--status", "completed", "--stage", "in_review", "--json"])
+                    _run_wl(runner, ["wl", "update", issue_id, "--status", "completed", "--stage", "in_review", "--json"],
+                            worklog_dir=worklog_dir)
             else:  # audit_verdict == "no"
                 # Return to the actionable queue at a fixed pre-review stage.
-                _run_wl(runner, ["wl", "update", issue_id, "--status", "open", "--stage", "plan_complete", "--json"])
+                _run_wl(runner, ["wl", "update", issue_id, "--status", "open", "--stage", "plan_complete", "--json"],
+                        worklog_dir=worklog_dir)
         except RuntimeError:
             pass  # Status update failure must not mask the main result
 
@@ -2963,13 +3069,18 @@ def cmd_project(timeout: int | None = None,
                 pi_bin: str = "pi", model: str | None = None,
                 model_source: str = DEFAULT_MODEL_SOURCE,
                 runner: Runner | None = None, json_mode: bool = False,
-                debug_log: str | None = None) -> int:
+                debug_log: str | None = None,
+                worklog_dir: str | None = None) -> int:
     """Audit the overall project.
 
     Model resolution order (highest first):
       1. --model CLI flag (explicit override)
       2. Config-driven: model.audit from .ralph.json resolved via model_source
       3. Hardcoded fallback: DEFAULT_MODEL
+
+    *worklog_dir* is an explicit ``--worklog-dir`` value that overrides
+    auto-resolution for every wl call made by this run (see
+    ``_resolve_worklog_flags``).
     """
     # Resolve the effective model from config + CLI
     config = _load_config()
@@ -2999,7 +3110,8 @@ def cmd_project(timeout: int | None = None,
         }
 
     try:
-        data = _run_wl(runner, ["wl", "list", "--json"])
+        data = _run_wl(runner, ["wl", "list", "--json"],
+                       worklog_dir=worklog_dir)
     except RuntimeError as exc:
         _record_script_failure("wl list", exc)
         fail_notice = FailureNotice(
@@ -3104,6 +3216,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Append Pi debug output to this file (JSONL)")
     p_issue.add_argument("--force", action="store_true",
                          help="Bypass the freshness gate and force a full audit")
+    p_issue.add_argument("--worklog-dir", default=None,
+                         help="Explicit .worklog directory to target (overrides auto-resolution)")
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--timeout", type=int, default=None,
@@ -3118,6 +3232,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Emit machine-readable JSON output instead of markdown")
     p_project.add_argument("--debug-log", default=None,
                            help="Append Pi debug output to this file (JSONL)")
+    p_project.add_argument("--worklog-dir", default=None,
+                           help="Explicit .worklog directory to target (overrides auto-resolution)")
 
     return p
 
@@ -3136,12 +3252,14 @@ def main(argv: list[str] | None = None) -> int:
                          pi_bin=args.pi_bin, model=args.model,
                          model_source=args.model_source, json_mode=args.json,
                          debug_log=args.debug_log,
-                         force=args.force)
+                         force=args.force,
+                         worklog_dir=args.worklog_dir)
     elif args.command == "project":
         return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
                            pi_bin=args.pi_bin, model=args.model,
                            model_source=args.model_source, json_mode=args.json,
-                           debug_log=args.debug_log)
+                           debug_log=args.debug_log,
+                           worklog_dir=args.worklog_dir)
 
     return 2
 

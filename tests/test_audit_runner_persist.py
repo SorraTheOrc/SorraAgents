@@ -139,6 +139,28 @@ class TestPersistAuditFailFlag:
         rc = persist_audit("SA-TEST", report_text, wl_bin="wl", runner=fake_runner, _fail=False)
         assert rc == 1
 
+    def test_persist_audit_injects_worklog_dir_flag(self):
+        """When a worklog_dir is provided, every wl command carries
+        ``--worklog-dir`` after ``wl`` (standalone CLI usage stays unaffected
+        because the param defaults to None).
+        """
+        report_text = "Ready to close: Yes"
+        persist_calls = []
+
+        def fake_runner(cmd, **kwargs):
+            persist_calls.append(list(cmd))
+            return _fake_proc(stdout='{"success": true, "workItem": {"id": "SA-TEST", "stage": "in_review", "status": "completed"}}')
+
+        rc = persist_audit("SA-TEST", report_text, wl_bin="wl",
+                           runner=fake_runner, _fail=False,
+                           worklog_dir="/explicit/.worklog")
+        assert rc == 0
+        assert len(persist_calls) == 3
+        for cmd in persist_calls:
+            assert cmd[0] == "wl"
+            assert cmd[1] == "--worklog-dir"
+            assert cmd[2] == "/explicit/.worklog"
+
 
 # ---------------------------------------------------------------------------
 # Test: audit_runner.py prints report even on persist failure

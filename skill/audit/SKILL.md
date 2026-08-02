@@ -211,8 +211,38 @@ Synonym for "Acceptance Criteria". Use **Acceptance Criteria** as canonical head
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force]`
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
+
+**Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
+(including the status lifecycle and `persist_audit`) targets the correct
+worklog store regardless of the caller's working directory. Resolution order
+for each `wl` command:
+
+1. Explicit `--worklog-dir DIR` (highest precedence — overrides everything).
+2. Prefix-to-project sibling scan: the work-item id prefix (e.g. `OSL-…`)
+   is matched against sibling projects' `.worklog/config.yaml`
+   (relative to the framework repo root's parent).
+3. Cwd-chain fallback: detect the worklog root from the current directory,
+   git root, or nearest ancestor.
+4. No flag — `wl` resolves from cwd.
+
+This means the runner can be launched from the skill install directory (or any
+other cwd) and still audit items in a *different* project's worklog, e.g.:
+
+```bash
+python3 skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN --do-not-persist
+```
+
+If auto-resolution cannot determine the target store, pass an explicit dir:
+
+```bash
+python3 skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN \
+    --worklog-dir /path/to/project/.worklog
+```
+
+Failure diagnostics surface the real `wl` error (stdout JSON error field first,
+then stdout text, then stderr) instead of empty stderr.
 
 **Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard (110s) skips remaining child audits to prevent silent kill. On timeout, returns `unmet` with evidence "Pi model call timed out."
 
