@@ -49,6 +49,24 @@ if str(REPO_ROOT) not in sys.path:
 from skill.audit.scripts.persist_audit import persist_audit
 from skill.scripts.failure_notice import FailureNotice
 from skill.shared.status_lifecycle import _wl_error_detail, worklog_dir_flag
+from skill.shared.process_semaphore import (
+    DEFAULT_MAX_WORKERS,
+    ENV_MAX_WORKERS,
+    Semaphore,
+)
+
+# ---------------------------------------------------------------------------
+# Concurrency control (fan-out bounding, SA-0MSAEKOQE009TEB4)
+# ---------------------------------------------------------------------------
+AUDIT_SEMAPHORE_NAME = "audit"
+AUDIT_LOCK_TIMEOUT_ENV = "AUDIT_LOCK_TIMEOUT"
+AUDIT_LOCK_TIMEOUT_DEFAULT = 300.0
+"""Bounded wait (seconds) for a free audit concurrency slot.
+
+Configurable via ``AUDIT_LOCK_TIMEOUT``. When the ceiling is saturated
+for longer than this, the pi call returns an ``unmet`` verdict with a
+clear message instead of launching yet another unbounded process.
+"""
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -494,9 +512,75 @@ def _resolve_effective_timeout(cli_timeout: int | None) -> int | None:
     return None
 
 
+def _audit_semaphore_max_workers(cli_value: int | None = None) -> int:
+    """Resolve the audit concurrency ceiling.
+
+    Precedence:
+      1. ``--max-concurrency`` CLI flag (explicit override)
+      2. ``AUDIT_MAX_CONCURRENCY`` environment variable
+      3. ``DEFAULT_MAX_WORKERS`` (2)
+
+    An invalid (non-integer) env value is ignored with a warning so a
+    misconfigured environment cannot break the audit run.
+    """
+    if cli_value is not None:
+        return max(1, int(cli_value))
+    env_value = os.environ.get(ENV_MAX_WORKERS)
+    if env_value:
+        try:
+            return max(1, int(env_value))
+        except ValueError:
+            print(
+                f"Warning: invalid {ENV_MAX_WORKERS} value {env_value!r}; "
+                "using default ceiling",
+                file=sys.stderr,
+            )
+    return DEFAULT_MAX_WORKERS
+
+
+def _audit_lock_timeout() -> float:
+    """Resolve the bounded wait for a free audit concurrency slot.
+
+    Configurable via ``AUDIT_LOCK_TIMEOUT`` (seconds); default
+    ``AUDIT_LOCK_TIMEOUT_DEFAULT`` (300). An invalid value is ignored with
+    a warning.
+    """
+    env_value = os.environ.get(AUDIT_LOCK_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return float(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_LOCK_TIMEOUT_ENV} value {env_value!r}; "
+                "using default lock timeout",
+                file=sys.stderr,
+            )
+    return AUDIT_LOCK_TIMEOUT_DEFAULT
+
+
+def _acquire_audit_slot(max_concurrency: int | None = None) -> Semaphore:
+    """Acquire one audit concurrency slot (shared across processes).
+
+    Bounds concurrent pi/audit subprocesses host-wide via the shared
+    flock-based semaphore (skill/shared/process_semaphore.py). Returns a
+    held :class:`Semaphore` whose :meth:`release` must be called (or use
+    it as a context manager) to free the slot.
+
+    Raises:
+        TimeoutError: When the ceiling stays saturated past the bounded
+            wait (``AUDIT_LOCK_TIMEOUT``).
+    """
+    sem = Semaphore(
+        AUDIT_SEMAPHORE_NAME,
+        max_workers=_audit_semaphore_max_workers(max_concurrency),
+        timeout=_audit_lock_timeout(),
+    )
+    sem.acquire()
+    return sem
+
+
 def _resolve_phase2_parallelism() -> int:
     """Resolve the bounded concurrency cap for Phase 2 child deep analysis.
-
     Precedence:
       1. ``AUDIT_PHASE2_PARALLELISM`` environment variable (integer >= 1)
       2. ``_PHASE2_DEFAULT_PARALLELISM`` (2)
@@ -683,31 +767,52 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     while True:
         attempt += 1
         try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-        except FileNotFoundError:
-            raise RuntimeError(f"pi binary not found: {pi_bin}")
+            # Concurrency cap: bound concurrent pi subprocesses host-wide
+            # (fan-out investigation SA-0MSAEKOQE009TEB4). Each pi launch
+            # holds one audit slot; the bounded wait is AUDIT_LOCK_TIMEOUT.
+            with _acquire_audit_slot():
+                try:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
+                    )
+                except FileNotFoundError:
+                    raise RuntimeError(f"pi binary not found: {pi_bin}")
 
-        try:
-            stdout, stderr = process.communicate(timeout=effective_timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout, stderr = process.communicate()
+                try:
+                    stdout, stderr = process.communicate(timeout=effective_timeout)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    return {
+                        "verdict": "unmet",
+                        "evidence": (
+                            f"Pi model call timed out after {effective_timeout}s. "
+                            "Manual audit required."
+                        ),
+                        "raw_stdout": stdout,
+                        "raw_stderr": stderr,
+                        "extracted_text": "",
+                        "_timeout": True,
+                        "elapsed_seconds": time.monotonic() - _call_start,
+                    }
+        except TimeoutError as exc:
+            # Ceiling saturated past the bounded wait: do not launch yet
+            # another unbounded pi process. Report a clear unmet verdict so
+            # the audit completes gracefully and the operator can retry.
             return {
                 "verdict": "unmet",
                 "evidence": (
-                    f"Pi model call timed out after {effective_timeout}s. "
-                    "Manual audit required."
+                    f"Audit concurrency limit reached: {exc}. "
+                    "Retry when fewer audits are running."
                 ),
-                "raw_stdout": stdout,
-                "raw_stderr": stderr,
+                "raw_stdout": "",
+                "raw_stderr": "",
                 "extracted_text": "",
-                "_timeout": True,
+                "_concurrency_timeout": True,
                 "elapsed_seconds": time.monotonic() - _call_start,
             }
 
@@ -3218,6 +3323,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Bypass the freshness gate and force a full audit")
     p_issue.add_argument("--worklog-dir", default=None,
                          help="Explicit .worklog directory to target (overrides auto-resolution)")
+    p_issue.add_argument("--max-concurrency", type=int, default=None,
+                         help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 2)")
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--timeout", type=int, default=None,
@@ -3234,6 +3341,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Append Pi debug output to this file (JSONL)")
     p_project.add_argument("--worklog-dir", default=None,
                            help="Explicit .worklog directory to target (overrides auto-resolution)")
+    p_project.add_argument("--max-concurrency", type=int, default=None,
+                           help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 2)")
 
     return p
 
@@ -3245,6 +3354,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_usage(sys.stderr)
         return 2
+
+    # CLI --max-concurrency overrides AUDIT_MAX_CONCURRENCY for this process.
+    # _call_pi reads the env var via _audit_semaphore_max_workers().
+    max_concurrency = getattr(args, "max_concurrency", None)
+    if max_concurrency is not None:
+        os.environ[ENV_MAX_WORKERS] = str(max_concurrency)
 
     if args.command == "issue":
         return cmd_issue(args.issue_id, persist=not args.do_not_persist,
