@@ -940,7 +940,9 @@ def phase_start(
     if is_dirty:
         msg = (
             f"Dirty working tree detected. Uncommitted changes exist outside .worklog/.\n"
-            f"Please stash, commit, or revert changes before proceeding.\n"
+            f"Do NOT stash, commit, or revert the user's uncommitted changes.\n"
+            f"STOP and ask the operator how to proceed (commit, stash, revert, or abort)\n"
+            f"— never touch the user's working tree without explicit permission.\n"
             f"\nTo abort and release the work item, run:\n"
             f"  python3 {Path(__file__).resolve()} abort {work_item_id}\n"
             f"\nGit status:\n{status_output}"
@@ -951,7 +953,7 @@ def phase_start(
             print("=" * 60)
             print(status_output)
             print("=" * 60)
-            print("Please resolve before proceeding.\n")
+            print("Ask the operator how to proceed — do not stash, commit, or revert user changes without permission.\n")
         report["success"] = False
         report["message"] = msg
         report["dirty_worktree"] = True

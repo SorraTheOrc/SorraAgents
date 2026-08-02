@@ -162,13 +162,25 @@ Check the git context and handle uncommitted changes before proceeding.
 
 - Run `git rev-parse --is-inside-work-tree` to detect if inside a worktree.
 - Run `git status --porcelain=v1 -b` to check for uncommitted changes.
+
+**CRITICAL: Never stash, commit, or revert the user's uncommitted changes
+without explicit permission.** Uncommitted changes in the working tree may be
+user-authored work; stashing them without asking can strand that work and is
+forbidden. When uncommitted changes exist, STOP and ask the operator how to
+proceed (commit, stash, revert, or abort) — act only after the operator
+explicitly chooses an option.
+
 - **Inside a worktree:**
   - If changes are limited to `.worklog/`, carry them forward.
-  - If other changes exist, present choices: carry, commit, stash, revert, or abort.
+  - If other changes exist, stop and ask the operator how to proceed (commit,
+    stash, revert, or abort); never stash/commit/revert unilaterally.
 - **In the main checkout:**
   - If changes are limited to `.worklog/`, carry them forward.
-  - Otherwise, report dirty files (they may be stale), proceed to create a worktree for isolation.
-  - If dirty files prevent worktree creation, follow the carry/commit/stash/revert/abort prompt.
+  - Otherwise, report the dirty files to the operator (they may be stale) and
+    proceed to create a worktree for isolation — without touching the user's
+    uncommitted changes.
+  - If dirty files prevent worktree creation, stop and ask the operator how to
+    proceed, and act only on their explicit choice.
 
 On abort: `StatusLifecycle.update_status(<work-item-id>, "open")`
 
