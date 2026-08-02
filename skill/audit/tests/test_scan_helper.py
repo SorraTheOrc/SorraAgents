@@ -89,8 +89,9 @@ class TestFindWorkitem:
             spec.loader.exec_module(scan)
             rc = scan.main(["find-workitem", "SA-X"])
         assert rc == 0
-        called_cmds = [c.args for c in mock_run.call_args_list]
-        assert any("wl" in c and "search" in c for c in called_cmds)
+        called_cmds = [c.args[0] for c in mock_run.call_args_list]
+        joined = " ".join(" ".join(str(a) for a in c) for c in called_cmds)
+        assert "wl" in joined and "search" in joined
         assert not any("grep" in c for c in called_cmds)
 
     def test_find_workitem_not_found_exits_nonzero_with_message(self) -> None:
@@ -149,9 +150,10 @@ class TestSearchCode:
             spec.loader.exec_module(scan)
             rc = scan.main(["search-code", "FIXME_TODO", "--path", "src"])
         assert rc == 0
-        called_cmds = [c.args for c in mock_run.call_args_list]
-        assert any("rg" in c for c in called_cmds)
-        joined = " ".join(" ".join(str(a) for a in c) for c in called_cmds)
+        called_cmds = [c.args[0] for c in mock_run.call_args_list]
+        joined_all = " ".join(" ".join(str(a) for a in c) for c in called_cmds)
+        assert "rg" in joined_all
+        joined = joined_all
         # Prunes present: node_modules, .git, .worklog, audit_debug jsonl.
         assert "!node_modules" in joined
         assert "!.git" in joined
@@ -174,7 +176,7 @@ class TestSearchCode:
             spec.loader.exec_module(scan)
             scan.main(["search-code", "needle"])
         joined = " ".join(
-            " ".join(str(a) for a in c.args) for c in mock_run.call_args_list
+            " ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list
         )
         assert "--max-filesize" in joined
 
@@ -231,7 +233,7 @@ class TestListFiles:
             rc = scan.main(["list-files", "--path", "src", "--type", "py"])
         assert rc == 0
         joined = " ".join(
-            " ".join(str(a) for a in c.args) for c in mock_run.call_args_list
+            " ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list
         )
         assert "!node_modules" in joined
         assert "!.git" in joined
@@ -251,7 +253,7 @@ class TestListFiles:
             spec.loader.exec_module(scan)
             scan.main(["list-files"])
         joined = " ".join(
-            " ".join(str(a) for a in c.args) for c in mock_run.call_args_list
+            " ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list
         )
         assert "node_modules" not in joined.replace("!node_modules", "")
         assert ".git" not in joined.replace("!.git", "")
