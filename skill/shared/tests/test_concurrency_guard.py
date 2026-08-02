@@ -62,11 +62,12 @@ try:
         sem = Semaphore(name)  # ceiling from env var
     else:
         sem = Semaphore(name, max_workers=max_workers, timeout=timeout)
-    t0 = time.monotonic()
+    t0 = None
     with sem:
-        result["acquired"] = t0
+        result["acquired"] = time.time()  # recorded AFTER acquire succeeds
+        print(json.dumps(result), file=sys.stderr, flush=True)  # acquisition signal
         time.sleep(hold)
-        result["released"] = time.monotonic()
+        result["released"] = time.time()
 except Exception as exc:  # noqa: BLE001
     result["error"] = f"{type(exc).__name__}: {exc}"
 
@@ -202,27 +203,74 @@ def test_env_ceiling_default_without_var():
 # ---------------------------------------------------------------------------
 
 
+def _launch_holder(sem_name, hold=3.0, max_workers=1):
+    """Launch a background worker that holds one slot for *hold* seconds.
+
+    Returns (proc, env) so the caller can acquire while the holder runs.
+    Blocks until the holder reports acquisition (bounded by 15s).
+    """
+    env = dict(os.environ)
+    env.update(
+        {
+            "REPO_ROOT": str(REPO_ROOT),
+            "SEM_NAME": sem_name,
+            "SEM_MAX": str(max_workers),
+            "SEM_HOLD": str(hold),
+            "SEM_TIMEOUT": "30",
+        }
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", WORKER_TEMPLATE],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    # Poll the holder's stderr until it reports acquisition (JSON line).
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        line = proc.stderr.readline()
+        if not line:
+            break
+        try:
+            parsed = json.loads(line.strip())
+            if parsed.get("acquired") is not None:
+                return proc, env
+        except json.JSONDecodeError:
+            continue
+    # Holder never acquired (or already finished); fail fast is not possible.
+    proc.kill()
+    proc.wait(timeout=10)
+    raise RuntimeError("holder worker failed to acquire slot")
+
+
 def test_timeout_raises_when_busy():
     """A bounded acquire must raise once the wait deadline is exceeded."""
     name = f"guard-timeout-{int(time.time())}"
-    holder = _run_workers(1, name, max_workers=1, hold=2.0, timeout=10)
-    assert holder[0].get("acquired") is not None
-    # Slot is busy for ~2s; a 0.2s bounded acquire must time out.
-    sem = Semaphore(name, max_workers=1, timeout=0.2)
-    with pytest.raises(TimeoutError):
-        sem.acquire()
-    sem.release()  # idempotent no-op after failed acquire
+    proc, _env = _launch_holder(name, hold=3.0)
+    try:
+        # Slot is busy; a 0.2s bounded acquire must time out.
+        sem = Semaphore(name, max_workers=1, timeout=0.2)
+        with pytest.raises(TimeoutError):
+            sem.acquire()
+        sem.release()  # idempotent no-op after failed acquire
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
 
 
 def test_fail_fast_option():
     """timeout=0 means fail fast (raise) when no slot is free."""
     name = f"guard-fast-{int(time.time())}"
-    holder = _run_workers(1, name, max_workers=1, hold=2.0, timeout=10)
-    assert holder[0].get("acquired") is not None
-    sem = Semaphore(name, max_workers=1, timeout=0)
-    with pytest.raises(TimeoutError):
-        sem.acquire()
-    sem.release()
+    proc, _env = _launch_holder(name, hold=3.0)
+    try:
+        sem = Semaphore(name, max_workers=1, timeout=0)
+        with pytest.raises(TimeoutError):
+            sem.acquire()
+        sem.release()
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
 
 
 # ---------------------------------------------------------------------------
