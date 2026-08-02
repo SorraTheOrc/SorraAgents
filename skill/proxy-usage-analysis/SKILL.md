@@ -63,8 +63,9 @@ Written to `--output-dir` (default `~/proxy-usage-reports`):
   (sessions, requests, local/remote split, classifications, fallback events,
   dispatch denials, context sizes — each with **Total / Day / Night**
   columns), fallback-reason and routing-skip breakdowns, per-model
-  breakdown, and highlighted recommendations. All tables carry day/night
-  columns so the daytime vs nighttime comparison is available everywhere.
+  breakdown, and highlighted recommendations. Every day/night count carries
+  its share of the metric's total (e.g. `285 (74.4%)`), and each
+  recommendation's evidence cites the total plus the day/night split.
 
 CSV columns: session id, start/end time, duration, number of messages,
 start/avg/max context size, avg/max response size, initial model assignment

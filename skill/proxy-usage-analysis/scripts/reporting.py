@@ -155,8 +155,10 @@ def build_report(summary: AnalysisResult, config: dict | None) -> str:
     ap("| Metric | Total | Day | Night |")
     ap("|---|---|---|---|")
     d, n = profile["day"], profile["night"]
-    ap(f"| Sessions | {len(sessions)} | {d['sessions']} | {n['sessions']} |")
-    ap(f"| Requests | {total} | {d['requests']} | {n['requests']} |")
+    ap(f"| Sessions | {len(sessions)} | {d['sessions']} ({_pct(d['sessions'], len(sessions)):.1f}%) | "
+       f"{n['sessions']} ({_pct(n['sessions'], len(sessions)):.1f}%) |")
+    ap(f"| Requests | {total} | {d['requests']} ({_pct(d['requests'], total):.1f}%) | "
+       f"{n['requests']} ({_pct(n['requests'], total):.1f}%) |")
     ap(f"| Local requests | {summary.local_requests} ({_pct(summary.local_requests, total):.1f}%) | "
        f"{d['local']} ({_pct(d['local'], d['requests']):.1f}%) | "
        f"{n['local']} ({_pct(n['local'], n['requests']):.1f}%) |")
@@ -172,10 +174,14 @@ def build_report(summary: AnalysisResult, config: dict | None) -> str:
     ap(f"| Remote-only (never used local) | {len(remote_only)} ({_pct(len(remote_only), len(sessions)):.1f}%) | "
        f"{d['remote_only']} ({_pct(d['remote_only'], d['sessions']):.1f}%) | "
        f"{n['remote_only']} ({_pct(n['remote_only'], n['sessions']):.1f}%) |")
+    day_fb = sum(d["fallback_reasons"].values())
+    night_fb = sum(n["fallback_reasons"].values())
     ap(f"| Fallback events | {len(summary.fallback_events)} ({fallback_rate * 100:.1f}%) | "
-       f"{sum(d['fallback_reasons'].values())} | "
-       f"{sum(n['fallback_reasons'].values())} |")
-    ap(f"| Dispatch denied | {summary.dispatch_denied_count} | {d['dispatch_denied']} | {n['dispatch_denied']} |")
+       f"{day_fb} ({_pct(day_fb, len(summary.fallback_events)):.1f}%) | "
+       f"{night_fb} ({_pct(night_fb, len(summary.fallback_events)):.1f}%) |")
+    ap(f"| Dispatch denied | {summary.dispatch_denied_count} | "
+       f"{d['dispatch_denied']} ({_pct(d['dispatch_denied'], summary.dispatch_denied_count):.1f}%) | "
+       f"{n['dispatch_denied']} ({_pct(n['dispatch_denied'], summary.dispatch_denied_count):.1f}%) |")
     total_avg, total_max = _ctx_stats(
         [s.max_context_size for s in sessions if s.max_context_size is not None]
     )
@@ -193,7 +199,8 @@ def build_report(summary: AnalysisResult, config: dict | None) -> str:
         for reason, count in summary.fallback_reason_counts.most_common():
             d = profile["day"]["fallback_reasons"].get(reason, 0)
             n = profile["night"]["fallback_reasons"].get(reason, 0)
-            ap(f"| {reason} | {count} | {_pct(count, len(summary.fallback_events)):.1f}% | {d} | {n} |")
+            ap(f"| {reason} | {count} | {_pct(count, len(summary.fallback_events)):.1f}% | "
+               f"{d} ({_pct(d, count):.1f}%) | {n} ({_pct(n, count):.1f}%) |")
 
     if summary.routing_skip_reason_counts:
         ap("")
@@ -204,7 +211,8 @@ def build_report(summary: AnalysisResult, config: dict | None) -> str:
         for reason, count in summary.routing_skip_reason_counts.most_common():
             d = profile["day"]["routing_skip_reasons"].get(reason, 0)
             n = profile["night"]["routing_skip_reasons"].get(reason, 0)
-            ap(f"| {reason} | {count} | {_pct(count, len(summary.routing_skip_events)):.1f}% | {d} | {n} |")
+            ap(f"| {reason} | {count} | {_pct(count, len(summary.routing_skip_events)):.1f}% | "
+               f"{d} ({_pct(d, count):.1f}%) | {n} ({_pct(n, count):.1f}%) |")
 
     initial = Counter((s.initial_provider, s.initial_model) for s in sessions)
     ap("")
@@ -215,9 +223,11 @@ def build_report(summary: AnalysisResult, config: dict | None) -> str:
     for (provider, model), count in initial.most_common():
         s_list = [s for s in sessions if s.initial_provider == provider and s.initial_model == model]
         day = sum(1 for s in s_list if _bucket_key(s.bucket) == "day")
+        night = len(s_list) - day
         reqs = sum(s.messages for s in s_list)
         fb = sum(1 for s in s_list if s.fell_back)
-        ap(f"| {provider} | {model} | {count} | {day} | {len(s_list) - day} | {reqs} | {fb} |")
+        ap(f"| {provider} | {model} | {count} | {day} ({_pct(day, count):.1f}%) | "
+           f"{night} ({_pct(night, count):.1f}%) | {reqs} | {fb} |")
 
     ap("")
     ap("## Recommendations")

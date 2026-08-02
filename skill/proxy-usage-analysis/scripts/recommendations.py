@@ -76,6 +76,32 @@ def _pct(part: int, total: int) -> float:
     return (part / total * 100.0) if total else 0.0
 
 
+def _bucket_key(bucket: str | None) -> str:
+    return "night" if bucket == "night" else "day"
+
+
+def _dn(total: int, day: int, night: int) -> str:
+    """Format a total as a day/night split with shares of the total."""
+    return f"Day {day} ({_pct(day, total):.1f}%) / Night {night} ({_pct(night, total):.1f}%)"
+
+
+def _reason_counts_by_bucket(result: AnalysisResult, schedule) -> dict[str, Counter]:
+    """Per-bucket fallback-reason counts (combined global + per-session).
+
+    Mirrors ``_combined_reason_counts``: per-session reasons are bucketed by
+    the session's bucket, global fallback events by their own timestamp.
+    """
+    buckets: dict[str, Counter] = {"day": Counter(), "night": Counter()}
+    for s in result.sessions.values():
+        if s.fallback_reason:
+            buckets[_bucket_key(s.bucket)][s.fallback_reason] += 1
+    for ev in result.fallback_events:
+        if ev.reason:
+            label = schedule.period_for(ev.ts).label if schedule.periods else "day"
+            buckets[_bucket_key(label)][ev.reason] += 1
+    return buckets
+
+
 def _combined_reason_counts(result: AnalysisResult) -> Counter:
     """Global fallback-event reasons + per-session attributed reasons.
 
@@ -128,6 +154,10 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
     fallback_rate = (total_fallbacks / total_requests) if total_requests else 0.0
     day_slots, night_slots = _slot_counts(config, result)
     bucket_stats = _bucket_stats(result)
+    schedule = bucketing.schedule_from_config(
+        config, (config or {}).get("session_slot_pool_size")
+    )
+    bucket_reasons = _reason_counts_by_bucket(result, schedule)
 
     slot_counts_str = _slot_counts_str(day_slots, night_slots)
     cfg_ctx = (config or {}).get("local_model_ctx_size")
@@ -138,6 +168,8 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
         breakdown = ", ".join(
             f"{r}: {reason_counts[r]}" for r in sorted(reason_counts) if r in SLOT_CONTENTION_REASONS and reason_counts[r]
         )
+        contention_day = sum(bucket_reasons["day"][r] for r in SLOT_CONTENTION_REASONS)
+        contention_night = sum(bucket_reasons["night"][r] for r in SLOT_CONTENTION_REASONS)
         recs.append(
             Recommendation(
                 severity="high",
@@ -150,7 +182,9 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                 ),
                 evidence=(
                     f"{contention} of {total_fallbacks} fallback events ({_pct(contention, total_fallbacks):.1f}%) "
-                    f"were slot-contention related ({breakdown}). Current slot counts: {slot_counts_str}."
+                    f"were slot-contention related ({breakdown}). "
+                    f"{_dn(contention, contention_day, contention_night)}. "
+                    f"Current slot counts: {slot_counts_str}."
                 ),
             )
         )
@@ -160,6 +194,16 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
         reason_counts[r] for r in reason_counts if r and "large_context" in r.lower()
     )
     if large_ctx >= MIN_EVENTS and _pct(large_ctx, total_fallbacks) >= REASON_SHARE * 100:
+        large_ctx_day = sum(
+            bucket_reasons["day"][r]
+            for r in bucket_reasons["day"]
+            if r and "large_context" in r.lower()
+        )
+        large_ctx_night = sum(
+            bucket_reasons["night"][r]
+            for r in bucket_reasons["night"]
+            if r and "large_context" in r.lower()
+        )
         thresholds = (
             f"Configured thresholds: cold={config.get('local_large_context_cold_cache_threshold')}, "
             f"warm={config.get('local_large_context_warm_cache_threshold')}, "
@@ -180,7 +224,7 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                 ),
                 evidence=(
                     f"{large_ctx} of {total_fallbacks} fallback events ({_pct(large_ctx, total_fallbacks):.1f}%) "
-                    f"were `large_context_bypass`. {thresholds}"
+                    f"were `large_context_bypass`. {_dn(large_ctx, large_ctx_day, large_ctx_night)}. {thresholds}"
                 ),
             )
         )
@@ -188,6 +232,8 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
     # --- 3. Warm-cache bypass ----------------------------------------------
     warm = reason_counts.get("warm_cache_bypass", 0)
     if warm >= MIN_EVENTS and _pct(warm, total_fallbacks) >= REASON_SHARE * 100:
+        warm_day = bucket_reasons["day"].get("warm_cache_bypass", 0)
+        warm_night = bucket_reasons["night"].get("warm_cache_bypass", 0)
         recs.append(
             Recommendation(
                 severity="medium",
@@ -200,7 +246,7 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                 ),
                 evidence=(
                     f"{warm} of {total_fallbacks} fallback events ({_pct(warm, total_fallbacks):.1f}%) "
-                    "had reason `warm_cache_bypass`."
+                    f"had reason `warm_cache_bypass`. {_dn(warm, warm_day, warm_night)}."
                 ),
             )
         )
@@ -214,10 +260,12 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
             per_slot = cfg_ctx / s.slots
             ratio = s.max_context_size / per_slot
             if ratio >= CONTEXT_PRESSURE_RATIO:
-                pressured.append((s.session_id, s.max_context_size, per_slot, ratio))
+                pressured.append((s.session_id, s.max_context_size, per_slot, ratio, s.bucket))
         if pressured:
             worst = max(pressured, key=lambda t: t[3])
             critical = any(t[3] >= CONTEXT_CRITICAL_RATIO for t in pressured)
+            pressured_day = sum(1 for t in pressured if _bucket_key(t[4]) == "day")
+            pressured_night = len(pressured) - pressured_day
             recs.append(
                 Recommendation(
                     severity="high" if critical else "medium",
@@ -232,6 +280,7 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                         f"{len(pressured)} session(s) peaked at >= {int(CONTEXT_PRESSURE_RATIO * 100)}% of "
                         "per-slot context; worst: session " + worst[0][:8] + f" at {worst[1]} tokens "
                         f"(per-slot {worst[2]:.0f}, {worst[3] * 100:.0f}%). "
+                        f"{_dn(len(pressured), pressured_day, pressured_night)}. "
                         f"Configured local_model_ctx_size={cfg_ctx}."
                     ),
                 )
@@ -245,6 +294,8 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
         if ratio >= IMBALANCE_RATIO:
             low_name = next(n for n, b in bucket_stats.items() if b is low)
             high_name = next(n for n, b in bucket_stats.items() if b is high)
+            total_fb = sum(b["fell_back"] for b in bucket_stats.values())
+            total_sess = sum(b["sessions"] for b in bucket_stats.values())
             recs.append(
                 Recommendation(
                     severity="medium",
@@ -257,7 +308,8 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                     evidence=(
                         f"{high_name.capitalize()}time fallback rate {high['fallback_rate'] * 100:.1f}% "
                         f"({high['fell_back']}/{high['sessions']} sessions) vs {low_name}time "
-                        f"{low['fallback_rate'] * 100:.1f}% ({low['fell_back']}/{low['sessions']}). "
+                        f"{low['fallback_rate'] * 100:.1f}% ({low['fell_back']}/{low['sessions']}); "
+                        f"overall {_pct(total_fb, total_sess):.1f}% ({total_fb}/{total_sess}). "
                         f"Current slot counts: {slot_counts_str}."
                     ),
                 )
@@ -269,6 +321,9 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
     ]
     if remote_errors:
         counts = ", ".join(f"{r}: {reason_counts[r]}" for r in sorted(remote_errors, key=lambda r: -reason_counts[r]))
+        remote_day = sum(bucket_reasons["day"][r] for r in remote_errors)
+        remote_night = sum(bucket_reasons["night"][r] for r in remote_errors)
+        remote_total = sum(reason_counts[r] for r in remote_errors)
         recs.append(
             Recommendation(
                 severity="info",
@@ -278,12 +333,17 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                     "responses, timeouts). They are not slot-related; check the remote provider "
                     "configuration, credentials, and rate limits."
                 ),
-                evidence=f"Fallback events with remote-error reasons: {counts}.",
+                evidence=(
+                    f"Fallback events with remote-error reasons: {counts}. "
+                    f"{_dn(remote_total, remote_day, remote_night)}."
+                ),
             )
         )
 
     # --- 7. No change needed --------------------------------------------------
     if not recs and fallback_rate < FALLBACK_RATE_LOW:
+        day_fb_total = sum(bucket_reasons["day"].values())
+        night_fb_total = sum(bucket_reasons["night"].values())
         recs.append(
             Recommendation(
                 severity="info",
@@ -295,7 +355,8 @@ def generate_recommendations(result: AnalysisResult, config: dict | None) -> lis
                 ),
                 evidence=(
                     f"Fallback rate {fallback_rate * 100:.1f}% ({total_fallbacks}/{total_requests} "
-                    "events per request); no slot contention, large-context, or warm-cache issues detected."
+                    f"events per request); {_dn(total_fallbacks, day_fb_total, night_fb_total)}. "
+                    "No slot contention, large-context, or warm-cache issues detected."
                 ),
             )
         )

@@ -538,6 +538,38 @@ class TestRecommendations:
             assert r.evidence, f"recommendation {r.title} must cite evidence"
             assert r.title and r.detail
 
+    def test_recommendation_evidence_has_day_night_breakdown(self):
+        sessions = [
+            _session(f"d{i}", bucket="day", remote_move=True, reason="local_concurrency_limit")
+            for i in range(3)
+        ] + [
+            _session(f"n{i}", bucket="night", remote_move=True, reason="local_concurrency_limit")
+            for i in range(2)
+        ]
+        res = _result_with_sessions(sessions)
+        recs = recommendations.generate_recommendations(res, config=None)
+        slot = [r for r in recs if "session_slot_pool_size" in r.title.lower()]
+        assert slot, "expected slot-contention recommendation"
+        assert "Day 3 (60.0%) / Night 2 (40.0%)" in slot[0].evidence
+
+    def test_all_recommendation_evidence_includes_day_night(self):
+        sessions = (
+            [
+                _session(f"d{i}", bucket="day", remote_move=True, reason="local_concurrency_limit", max_context=40000)
+                for i in range(5)
+            ]
+            + [
+                _session(f"n{i}", bucket="night", remote_move=True, reason="warm_cache_bypass", max_context=40000)
+                for i in range(5)
+            ]
+            + [_session(f"r{i}", bucket="day", remote_move=True, reason="HTTP 400") for i in range(2)]
+        )
+        res = _result_with_sessions(sessions)
+        recs = recommendations.generate_recommendations(res, config={"local_model_ctx_size": 262144})
+        assert recs, "expected recommendations"
+        for r in recs:
+            assert "Day" in r.evidence and "Night" in r.evidence, f"{r.title}: {r.evidence}"
+
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -685,7 +717,7 @@ class TestEndToEnd:
         # ...and the report row buckets ALL dispatch events by their timestamp.
         md = (tmp_path / "out_d" / "report.md").read_text()
         section = md.split("## Session summary", 1)[1].split("## ", 1)[0]
-        assert "| Dispatch denied | 2 | 2 | 0 |" in section
+        assert "| Dispatch denied | 2 | 2 (100.0%) | 0 (0.0%) |" in section
 
     def test_json_summary(self, tmp_path):
         log_dir = self._write_logs(tmp_path)
@@ -807,8 +839,9 @@ class TestReportRestructure:
         md = self._run(tmp_path)
         section = md.split("## Session summary", 1)[1].split("## ", 1)[0]
         assert "| Metric | Total | Day | Night |" in section
-        # Both fixture sessions start during day hours (14:00-15:00 window).
-        assert "| Sessions | 2 | 2 | 0 |" in section
+        # Both fixture sessions start during day hours (14:00-15:00 window);
+        # day/night cells carry the share of the metric's total.
+        assert "| Sessions | 2 | 2 (100.0%) | 0 (0.0%) |" in section
         assert "| Requests |" in section
         assert "| Local requests |" in section
         assert "| Remote requests |" in section
@@ -820,13 +853,16 @@ class TestReportRestructure:
         md = self._run(tmp_path)
         section = md.split("## Fallback reasons", 1)[1].split("## ", 1)[0]
         assert "| Reason | Total | % of fallbacks | Day | Night |" in section
+        assert "| local_concurrency_limit | 1 | 100.0% | 1 (100.0%) | 0 (0.0%) |" in section
 
     def test_routing_skip_reasons_have_day_night(self, tmp_path):
         md = self._run(tmp_path)
         section = md.split("## routing_skip_local reasons", 1)[1].split("## ", 1)[0]
         assert "| Reason | Total | % of skips | Day | Night |" in section
+        assert "| local_concurrency_limit | 1 | 100.0% | 1 (100.0%) | 0 (0.0%) |" in section
 
     def test_per_model_breakdown_has_day_night(self, tmp_path):
         md = self._run(tmp_path)
         section = md.split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
         assert "| Provider | Model | Sessions | Day | Night | Requests | Fell back |" in section
+        assert "| local | Qwen3 | 2 | 2 (100.0%) | 0 (0.0%) |" in section
