@@ -43,6 +43,7 @@ PRUNE_GLOBS = [
     "!node_modules/**",
     "!.git/**",
     "!.worklog/**",
+    "!.audit_debug/**",
     "!**/audit_debug_*.jsonl",
 ]
 

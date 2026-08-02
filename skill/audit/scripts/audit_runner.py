@@ -1725,13 +1725,28 @@ def _assemble_project_report(summary: str, recommendation: str) -> str:
 # Debug / debug-log helpers
 # ---------------------------------------------------------------------------
 
+def _debug_log_dir() -> Path:
+    """Return the debug-log scratch directory (outside .worklog/ and repo).
+
+    Defaults to ``~/.audit_debug/<project-slug>/`` so debug files never sit in
+    scanned paths (the 9.5 GB .worklog audit_debug dump was a scan trap).
+    The directory is created lazily by callers via ``_write_debug_log``.
+    """
+    home = Path.home()
+    slug = "".join(c if (c.isalnum() or c in "-_") else "-" for c in TARGET_PROJECT_ROOT.name)
+    return home / ".audit_debug" / (slug or "project")
+
+
 def _default_debug_log_path(issue_id: str, context: str) -> Path:
     """Return a sensible default path for debug logs.
 
     Tests monkeypatch this helper so callers should use it rather than
-    hard-coding a path.
+    hard-coding a path. Debug logs are transient forensics: they live under
+    ``~/.audit_debug/<project>/`` (outside ``.worklog/`` and outside the repo
+    tree) so recursive greps never walk them, and are swept by
+    ``cleanup_debug_logs.py``.
     """
-    p = TARGET_PROJECT_ROOT / ".worklog" / f"audit_debug_{issue_id}.jsonl"
+    p = _debug_log_dir() / f"audit_debug_{issue_id}.jsonl"
     return p
 
 
@@ -1739,6 +1754,39 @@ def _write_debug_log(path: Path, entry: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _remove_debug_log(debug_log: str | None, issue_id: str, *contexts: str) -> None:
+    """Remove a run's debug log file after a successful audit run.
+
+    Debug logs are transient forensics: a successful run leaves nothing
+    behind (including explicit ``--debug-log`` runs). A failed run keeps the
+    file for forensics — the caller only invokes this on success. Any
+    deletion error is swallowed so cleanup can never mask the main result.
+
+    Args:
+        debug_log: explicit ``--debug-log`` path (if given, only it is removed).
+        issue_id: work item id for the default-path lookup.
+        *contexts: contexts the run may have written under (default-path only).
+    """
+    try:
+        if debug_log:
+            target = Path(debug_log)
+        else:
+            candidates = [
+                _default_debug_log_path(issue_id, ctx) for ctx in (contexts or ("parent",))
+            ]
+            target = candidates[0] if len(set(candidates)) == 1 else None
+            if target is None:
+                # Multiple distinct default paths: remove each.
+                for cand in set(candidates):
+                    if cand.exists():
+                        cand.unlink()
+                return
+        if target.exists():
+            target.unlink()
+    except OSError:
+        pass  # Cleanup must never mask the audit result
 
 
 def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,

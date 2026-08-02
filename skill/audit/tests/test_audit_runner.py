@@ -98,25 +98,26 @@ class TestDetectProjectRoot:
 
 
 class TestDefaultDebugLogPath:
-    """Tests for _default_debug_log_path() using TARGET_PROJECT_ROOT (AC3)."""
+    """Tests for _default_debug_log_path() (SA-0MSBSOAEM0078LAO)."""
 
     def test_uses_target_project_root(self):
-        """AC3: Debug log path uses TARGET_PROJECT_ROOT, not REPO_ROOT.
+        """Debug log path is outside .worklog/ and outside the repo tree.
 
         Calls ``_default_debug_log_path`` and asserts the returned path is
-        rooted under ``TARGET_PROJECT_ROOT /.worklog / audit_debug_<id>...``.
+        rooted under ``~/.audit_debug/<project>/audit_debug_<id>...`` — never
+        under ``TARGET_PROJECT_ROOT/.worklog`` (the 9.5 GB scan trap).
         """
         log_path = audit_runner._default_debug_log_path("TEST-123", "parent")
 
-        # The path should be TARGET_PROJECT_ROOT / .worklog / audit_debug_<id>.jsonl
-        assert log_path.parent == audit_runner.TARGET_PROJECT_ROOT / ".worklog"
         assert log_path.name == "audit_debug_TEST-123.jsonl"
+        assert ".worklog" not in log_path.parts
+        assert str(audit_runner.TARGET_PROJECT_ROOT) not in str(log_path)
 
     def test_uses_context_in_filename(self):
         """Verify the context parameter is used when constructing the file name."""
         log_path = audit_runner._default_debug_log_path("CHILD-456", "child")
-        assert log_path.parent == audit_runner.TARGET_PROJECT_ROOT / ".worklog"
         assert log_path.name == "audit_debug_CHILD-456.jsonl"
+        assert ".worklog" not in log_path.parts
 
     def test_returns_path_object(self):
         """_default_debug_log_path returns a Path instance."""
