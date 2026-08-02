@@ -50,7 +50,7 @@ def setup_worklog() -> tuple[Path, list[str]]:
     _git(tmp, "init", "-q")
     _git(tmp, "config", "user.email", "f7@test.local")
     _git(tmp, "config", "user.name", "F7 Validation")
-    mkdir = subprocess.run(["mkdir", "-p", ".worklog"], cwd=tmp, check=True)
+    subprocess.run(["mkdir", "-p", ".worklog"], cwd=tmp, check=True)
     # Non-interactive init: no workflow, auto-export on, auto-sync off.
     subprocess.run(
         [
@@ -103,11 +103,11 @@ class FanoutSampler(threading.Thread):
             # pi processes are not missed while the heavier full snapshot runs.
             try:
                 self.batch_pi_peak = max(self.batch_pi_peak, _count_batch_pi(self._batch_marker))
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110 -- sampler is best-effort; ignore on failure
                 pass
             try:
                 self.samples.append(collect())
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110 -- sampler is best-effort; ignore on failure
                 pass
             self._stop.wait(self._interval)
 

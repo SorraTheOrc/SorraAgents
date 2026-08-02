@@ -106,7 +106,7 @@ def _swap_stats() -> dict[str, Any]:
         try:
             sm = psutil.swap_memory()
             return {"total": sm.total, "used": sm.used, "free": sm.free}
-        except Exception:  # pragma: no cover
+        except Exception:  # noqa: S110, BLE001 -- psutil unavailable; fall back to /proc/meminfo
             pass
     try:
         with open("/proc/meminfo", encoding="utf-8") as fh:

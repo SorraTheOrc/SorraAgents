@@ -10,7 +10,6 @@ Validates the F7 load-validation harness:
 """
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path

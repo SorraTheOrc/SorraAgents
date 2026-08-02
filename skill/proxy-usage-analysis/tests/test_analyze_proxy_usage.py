@@ -815,7 +815,7 @@ class TestReportRestructure:
         # Rotated file (rotation 14:00, inside window) + live log.
         (log_dir / "proxy.log.2026-08-02_14").write_text("\n".join(fixtures.E2E_LINES[:3]) + "\n")
         (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES[3:]) + "\n")
-        result = reporting.run_analysis(
+        reporting.run_analysis(
             log_dir=log_dir,
             window_start=WINDOW_START,
             window_end=WINDOW_END,

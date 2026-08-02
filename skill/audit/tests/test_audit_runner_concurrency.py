@@ -14,8 +14,6 @@ via the shared flock-based semaphore (SA-0MSAK2P3J0065POO):
 """
 
 import json
-import os
-import subprocess
 import sys
 import threading
 import time

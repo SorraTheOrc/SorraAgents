@@ -126,8 +126,8 @@ def _slot_counts(config: dict | None, result: AnalysisResult) -> tuple[int | Non
     # Fall back to the slot counts observed per bucket in the data.
     day_slots = {s.slots for s in result.sessions.values() if s.bucket == "day" and s.slots}
     night_slots = {s.slots for s in result.sessions.values() if s.bucket == "night" and s.slots}
-    return (sorted(day_slots)[-1] if day_slots else None), (
-        sorted(night_slots)[-1] if night_slots else None
+    return (max(day_slots) if day_slots else None), (
+        max(night_slots) if night_slots else None
     )
 
 
