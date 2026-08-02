@@ -40,9 +40,9 @@ def test_explicit_max_workers_wins_over_env(monkeypatch):
     assert sem.max_workers == 4
 
 
-def test_env_ceiling_respected():
+def test_env_ceiling_respected(monkeypatch):
     """AUDIT_MAX_CONCURRENCY overrides the default ceiling."""
-    os.environ[ENV_MAX_WORKERS] = "3"
+    monkeypatch.setenv(ENV_MAX_WORKERS, "3")
     sem = Semaphore("unit-env")
     assert sem.max_workers == 3
 
