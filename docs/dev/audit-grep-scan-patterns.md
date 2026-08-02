@@ -254,3 +254,32 @@ eliminates worklog content scans entirely.
   list-files) and wire its guidance into the audit prompts and SKILL.md.
 - After F4 lands, re-run `benchmark_grep_scans.py` and, on the workstation,
   re-measure a real audit's scan CPU-time to verify AC4 in production.
+
+## 8. Post-F4 verification (2026-08-02)
+
+F4 (SA-0MSBR0SRK0035HB1) wired the SCANNING guidance into the Phase 2
+parent/child prompts (`skill/audit/scripts/audit_runner.py`) and the
+Tools-Enabled section of `skill/audit/SKILL.md`; F5 (SA-0MSBSOAEM0078LAO)
+relocated debug logs to `~/.audit_debug/<project>/` and added the retention
+sweep (`cleanup_debug_logs.py`).
+
+**Benchmark re-run (1 GB fixture, best of 3):**
+
+| Recipe | Wall (best) | CPU (best) |
+|--------|-------------|------------|
+| `legacy:grep-r-worklog` | 265 ms | 258 ms |
+| `legacy:grep-rln-repo-root` | 315 ms | 281 ms |
+| `replacement:rg-worklog` | **64 ms** | 321 ms* |
+| `replacement:rg-bounded-glob` | **64 ms** | 326 ms* |
+
+Speedups: **4.1x** (`rg-worklog`) and **4.9x** (`rg-bounded-glob`).
+
+\* rg is multi-threaded; CPU seconds exceed wall-clock. Wall-clock is the
+operator-relevant metric (scans hold a CPU core).
+
+**AC4 status:** helper recipes complete with significantly lower wall-clock
+than legacy patterns on the synthetic fixture (4-5x); the real-worklog gap is
+larger (9.5 GB vs 1 GB fixture, plus node_modules/.git walking eliminated by
+prunes). Full pytest suite passes (374 audit tests + fanout); no regression in
+audit evidence quality (verdict semantics unchanged — only scanning guidance
+and debug-log location changed).

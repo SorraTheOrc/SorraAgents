@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import benchmark_grep_scans as bench  # noqa: E402
+import benchmark_grep_scans as bench
 
 # ===========================================================================
 # Fixture generation
@@ -78,6 +78,7 @@ def _recipe_matches(recipe: dict, root: Path) -> set[str]:
     """
     proc = subprocess.run(
         recipe["cmd"], cwd=root, capture_output=True, text=True, timeout=120,
+        check=False,
     )
     assert proc.returncode == 0, f"{recipe['cmd']} failed: {proc.stderr[:200]}"
     names: set[str] = set()
@@ -144,7 +145,7 @@ def test_harness_emits_json_with_timings() -> None:
         bench.generate_fixture(root, 2 * 1024 * 1024)
         results: list[dict] = []
         for name, recipe in bench.RECIPES.items():
-            run = bench._run_and_measure(recipe["cmd"], root)  # noqa: SLF001
+            run = bench._run_and_measure(recipe["cmd"], root)
             assert run["returncode"] == 0
             assert run["wall_seconds"] >= 0
             assert run["cpu_seconds"] >= 0
@@ -165,6 +166,7 @@ def test_main_json_flag_outputs_parseable_json() -> None:
         [sys.executable, str(Path(__file__).parent / "benchmark_grep_scans.py"),
          "--json", "--iterations", "1"],
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=300,
+        check=False,
     )
     assert proc.returncode == 0, proc.stderr[:500]
     report = json.loads(proc.stdout)

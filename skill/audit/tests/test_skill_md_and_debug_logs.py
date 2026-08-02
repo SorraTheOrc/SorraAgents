@@ -33,7 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts import audit_runner  # noqa: E402
+from skill.audit.scripts import audit_runner
 
 SKILL_MD = REPO_ROOT / "skill" / "audit" / "SKILL.md"
 
@@ -69,10 +69,9 @@ class TestDebugLogLocation:
     def test_default_path_outside_worklog_and_repo(self) -> None:
         """_default_debug_log_path resolves outside .worklog/ and repo tree."""
         with mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT",
-                               Path("/tmp/fake-repo")):
-            with mock.patch("pathlib.Path.home",
-                            return_value=Path("/home/fakeuser")):
-                p = audit_runner._default_debug_log_path("SA-1", "parent")
+                               Path("/tmp/fake-repo")), mock.patch("pathlib.Path.home",
+                        return_value=Path("/home/fakeuser")):
+            p = audit_runner._default_debug_log_path("SA-1", "parent")
         p = Path(p)
         assert ".worklog" not in p.parts
         assert str(p).startswith("/home/fakeuser")
@@ -89,11 +88,10 @@ class TestDebugLogLocation:
                 "verdict": "met", "evidence": "ok",
                 "raw_stdout": "", "raw_stderr": "", "elapsed_seconds": 1.0,
             }
-        ):
-            with mock.patch.object(audit_runner, "_write_debug_log") as mock_write:
-                audit_runner._call_pi_and_maybe_log(
-                    "SA-1", "parent", "prompt", debug_log=explicit,
-                )
+        ), mock.patch.object(audit_runner, "_write_debug_log") as mock_write:
+            audit_runner._call_pi_and_maybe_log(
+                "SA-1", "parent", "prompt", debug_log=explicit,
+            )
         assert mock_write.called
         written_path = mock_write.call_args[0][0]
         assert str(written_path) == explicit
@@ -144,6 +142,7 @@ class TestCleanupDebugLogs:
         proc = subprocess.run(
             [sys.executable, str(self.CLEANUP_SCRIPT), "--dir", str(root)],
             capture_output=True, text=True, timeout=60,
+            check=False,
         )
         assert proc.returncode == 0
         assert (root / "audit_debug_OLD.jsonl").exists()
@@ -156,6 +155,7 @@ class TestCleanupDebugLogs:
             [sys.executable, str(self.CLEANUP_SCRIPT),
              "--dir", str(root), "--apply", "--older-than", "14"],
             capture_output=True, text=True, timeout=60,
+            check=False,
         )
         assert proc.returncode == 0
         assert not (root / "audit_debug_OLD.jsonl").exists()
@@ -168,6 +168,7 @@ class TestCleanupDebugLogs:
             [sys.executable, str(self.CLEANUP_SCRIPT),
              "--dir", str(root), "--apply", "--older-than", "14"],
             capture_output=True, text=True, timeout=60,
+            check=False,
         )
         assert proc.returncode == 0
         assert (root / "audit_debug_OLD.jsonl").exists()

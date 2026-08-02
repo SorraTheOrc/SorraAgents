@@ -42,6 +42,7 @@ def _run_scan(*args: str, cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(SCAN_SCRIPT), *args],
         cwd=cwd, capture_output=True, text=True, timeout=120,
+        check=False,
     )
 
 
@@ -73,7 +74,6 @@ def _make_fixture() -> Path:
 class TestFindWorkitem:
     def test_find_workitem_uses_wl_search_not_grep(self) -> None:
         """find-workitem resolves via `wl search`, not a recursive grep."""
-        root = _make_fixture()
         # Mock subprocess so no real wl/grep runs; verify the *constructed*
         # command uses `wl search` and never `grep -r` over .worklog.
         proc = subprocess.run  # noqa: F841 (documentation)
@@ -96,7 +96,6 @@ class TestFindWorkitem:
 
     def test_find_workitem_not_found_exits_nonzero_with_message(self) -> None:
         """Not found -> non-zero exit and a clear message, no crash."""
-        root = _make_fixture()
         with mock.patch("subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 ["wl", "search"], 0,
@@ -112,7 +111,6 @@ class TestFindWorkitem:
 
     def test_find_workitem_no_recursive_grep_over_worklog(self) -> None:
         """The recipe must never run `grep -r ... .worklog/`."""
-        root = _make_fixture()
         with mock.patch("subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 ["wl", "search"], 0,
@@ -138,7 +136,6 @@ class TestFindWorkitem:
 class TestSearchCode:
     def test_search_code_runs_bounded_rg(self) -> None:
         """search-code invokes rg with prune globs and an explicit path."""
-        root = _make_fixture()
         with mock.patch("subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 ["rg"], 0, stdout="src/mod.py\n",
@@ -164,7 +161,6 @@ class TestSearchCode:
 
     def test_search_code_uses_size_cap(self) -> None:
         """search-code caps file size so huge jsonl files are skipped."""
-        root = _make_fixture()
         with mock.patch("subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 ["rg"], 0, stdout="",
@@ -182,7 +178,6 @@ class TestSearchCode:
 
     def test_search_code_no_match_exits_nonzero(self) -> None:
         """No matches -> non-zero exit (mirrors rg exit code 1)."""
-        root = _make_fixture()
         with mock.patch("subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 ["rg"], 1, stdout="",
@@ -197,7 +192,6 @@ class TestSearchCode:
 
     def test_search_code_returns_matches(self) -> None:
         """Matching files are printed to stdout."""
-        root = _make_fixture()
         with mock.patch("subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 ["rg"], 0, stdout="src/mod.py\n",
@@ -220,7 +214,6 @@ class TestSearchCode:
 class TestListFiles:
     def test_list_files_bounded_with_maxdepth(self) -> None:
         """list-files is depth-limited and prunes node_modules/.git/.worklog."""
-        root = _make_fixture()
         with mock.patch("subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 ["rg"], 0, stdout="src/mod.py\n",
@@ -241,7 +234,6 @@ class TestListFiles:
 
     def test_list_files_no_descent_into_traps(self) -> None:
         """The rg command must not include node_modules/.git/.worklog as roots."""
-        root = _make_fixture()
         with mock.patch("subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 ["rg"], 0, stdout="",

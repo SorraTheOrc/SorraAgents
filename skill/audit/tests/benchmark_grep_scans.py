@@ -35,7 +35,6 @@ import argparse
 import json
 import os
 import resource
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -47,7 +46,7 @@ from pathlib import Path
 # recipes must actually search file contents (not just names).
 NEEDLE = "WL-0MS4FHW290053SH4"
 
-DEFAULT_FIXTURE_BYTES = int(os.environ.get("AUDIT_BENCH_FIXTURE_BYTES", 1024 * 1024 * 1024))
+DEFAULT_FIXTURE_BYTES = int(os.environ.get("AUDIT_BENCH_FIXTURE_BYTES", "1073741824"))
 
 # Number of fake audit_debug jsonl "files" (each entry mirrors a debug-log line).
 FAKE_DEBUG_FILES = 12
@@ -150,7 +149,7 @@ def _run_and_measure(cmd: list[str], cwd: Path) -> dict:
     try:
         proc = subprocess.run(
             cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=600,
+            timeout=600, check=False,
         )
         rc = proc.returncode
     except subprocess.TimeoutExpired:
@@ -165,6 +164,7 @@ def _matching_files(cmd: list[str], cwd: Path) -> set[str]:
     """Run a scan and return the set of matching files (for equivalence checks)."""
     proc = subprocess.run(
         cmd, cwd=cwd, capture_output=True, text=True, timeout=600,
+        check=False,
     )
     if proc.returncode != 0:
         return set()

@@ -271,6 +271,33 @@ This gives the model file-reading capabilities to verify ACs against
 implementation code. Non-Phase-2 calls (Phase 1 screening, project-level audit)
 remain in bare LLM pipe mode (`enable_tools=False`).
 
+**Bounded scanning (Phase 2):** The Phase 2 prompts include a **SCANNING** block
+that directs agents to the bounded helper `skill/audit/scripts/scan.py` instead
+of improvised recursive greps:
+
+- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>`
+  (delegates to `wl search`; never greps the `.worklog/` tree).
+- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py`
+  (bounded rg with prunes for node_modules/.git/.worklog/.audit_debug and
+  `audit_debug_*.jsonl`, max file size, explicit path).
+- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`
+  (maxdepth 2, same prunes).
+
+Unbounded recursive greps over the repo root or `.worklog/` (e.g.
+`grep -r ... .` or `grep -r ... .worklog/`) are forbidden. Single-file greps of
+`.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).
+See `docs/dev/audit-grep-scan-patterns.md` (SA-0MSBR06GX0051T1Q) for the
+pattern catalogue and benchmark.
+
+**Debug logs are transient (Phase 2):** Debug files (`audit_debug_*.jsonl`)
+are written only on parse_failure/provider_error or explicit `--debug-log`, live
+under `~/.audit_debug/<project>/` (outside `.worklog/` and the repo tree, so
+scans never walk them), and are swept by
+`skill/audit/scripts/cleanup_debug_logs.py` (dry-run default, `--apply`,
+`--older-than N` days, default 14). Successful audit runs delete their own
+debug file; failed runs keep full-content forensics. Never read them back
+programmatically — use `scan.py find-workitem` / `wl search` instead.
+
 ### Code Quality Integration
 
 Runner performs code quality checks before AC verification (invokes `../code-review/scripts/code_quality.py`):
