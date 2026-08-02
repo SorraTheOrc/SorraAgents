@@ -148,6 +148,12 @@ def run_batch(worklog_dir: Path, ids: list[str], pi_bin: Path, max_concurrency: 
     env = dict(os.environ)
     env["AUDIT_MAX_CONCURRENCY"] = str(max_concurrency)
     env["AUDIT_LOCK_TIMEOUT"] = "120"
+    # Isolate the concurrency semaphore to this batch: without this, the
+    # batch's audits share the host-wide "audit" semaphore (PI_SEMAPHORE_DIR)
+    # with every other live audit/pi session on the machine and can queue
+    # behind them for many seconds each, making the wall-clock budget a
+    # measure of unrelated host load rather than this batch's own fan-out.
+    env["PI_SEMAPHORE_DIR"] = str(worklog_dir / "semaphores")
 
     stop = threading.Event()
     sampler = FanoutSampler(stop, interval=0.25)
