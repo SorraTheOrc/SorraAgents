@@ -3,7 +3,7 @@ per-session CSVs (daytime/nighttime) and an operator-facing report.
 
 Usage:
     python3 analyze_proxy_usage.py --log-dir /var/log/llama-proxy \\
-        --hours 24 --output-dir usage-reports [--json]
+        --hours 24 [--output-dir ~/proxy-usage-reports] [--json]
 
 See SKILL.md for the full usage and interpretation guide.
 """
@@ -25,7 +25,7 @@ import reporting  # noqa: E402
 
 DEFAULT_LOG_DIR = "/var/log/llama-proxy"
 DEFAULT_HOURS = 24
-DEFAULT_OUTPUT_DIR = "usage-reports"
+DEFAULT_OUTPUT_DIR = "~/proxy-usage-reports"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
             log_dir=Path(args.log_dir),
             window_start=window_start,
             window_end=window_end,
-            output_dir=Path(args.output_dir),
+            output_dir=Path(args.output_dir).expanduser(),
             config=config,
         )
     except OSError as exc:

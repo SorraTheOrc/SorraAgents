@@ -711,3 +711,40 @@ class TestEndToEnd:
             config=None,
         )
         assert list(result.summary.sessions) == ["new"]
+
+
+class TestDefaultOutputDir:
+    """The default output directory is ~/proxy-usage-reports (expanded)."""
+
+    def test_constant_and_cli_default(self):
+        import analyze_proxy_usage as cli
+
+        assert cli.DEFAULT_OUTPUT_DIR == "~/proxy-usage-reports"
+        assert cli.parse_args([]).output_dir == "~/proxy-usage-reports"
+
+    def test_main_writes_to_home_dir_by_default(self, tmp_path, monkeypatch):
+        import analyze_proxy_usage as cli
+
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        log_dir = tmp_path / "logs3"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES) + "\n")
+
+        rc = cli.main(
+            [
+                "--log-dir",
+                str(log_dir),
+                "--start",
+                "2026-08-02 14:00:00",
+                "--end",
+                "2026-08-02 15:00:00",
+                "--quiet",
+            ]
+        )
+        assert rc == 0
+        out = home / "proxy-usage-reports"
+        assert out.is_dir()
+        assert (out / "report.md").exists()
+        assert (out / "daytime_sessions.csv").exists()
+        assert (out / "nighttime_sessions.csv").exists()

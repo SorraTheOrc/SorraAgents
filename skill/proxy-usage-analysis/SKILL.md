@@ -32,9 +32,11 @@ data-backed recommendations.
 ```bash
 python3 ~/.pi/agent/skills/proxy-usage-analysis/scripts/analyze_proxy_usage.py \
     --log-dir /var/log/llama-proxy \
-    --hours 24 \
-    --output-dir usage-reports
+    --hours 24
 ```
+
+Outputs go to `~/proxy-usage-reports/` by default (override with
+`--output-dir`).
 
 Options:
 
@@ -43,14 +45,14 @@ Options:
 | `--log-dir` | `/var/log/llama-proxy` | Directory containing `proxy.log*` |
 | `--hours` | `24` | Analysis window length |
 | `--start` / `--end` | — | Explicit ISO window (`YYYY-MM-DD HH:MM:SS`); overrides `--hours` |
-| `--output-dir` | `usage-reports` | Where the CSVs and report are written |
+| `--output-dir` | `~/proxy-usage-reports` | Where the CSVs and report are written |
 | `--config` | auto-discovered | Path to `proxy/config.yaml` |
 | `--json` | off | Print a machine-readable JSON summary instead of the text summary |
 | `--quiet` | off | Suppress the stdout summary |
 
 ## Outputs
 
-Written to `--output-dir`:
+Written to `--output-dir` (default `~/proxy-usage-reports`):
 
 - `daytime_sessions.csv` — one row per **daytime** session (10:00–23:59,
   6 slots per the configured schedule). One row per session, covering ALL
