@@ -15,10 +15,10 @@ and log-format drift do not break the analysis.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
 
 # Log timestamps carry no timezone; the proxy runs in server-local time, so
 # interpret naive log times as the server's local timezone.

@@ -7,7 +7,6 @@ ceiling, timeout/fail-fast, and cleanup. Cross-process behaviour is covered
 by the guard suite.
 """
 
-import os
 
 import pytest
 
@@ -83,9 +82,8 @@ def test_context_manager_releases_on_success():
 def test_context_manager_releases_on_exception():
     """`with` block releases the slot even when an exception propagates."""
     sem = Semaphore("unit-ctx-exc", max_workers=1, timeout=5)
-    with pytest.raises(RuntimeError):
-        with sem:
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), sem:
+        raise RuntimeError("boom")
     assert sem._held_fd is None
 
 

@@ -20,13 +20,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-import aggregation  # noqa: E402
-import bucketing  # noqa: E402
-import config_loader  # noqa: E402
-import log_parser  # noqa: E402
-import recommendations  # noqa: E402
-import reporting  # noqa: E402
-from tests import fixtures  # noqa: E402
+import aggregation
+import bucketing
+import config_loader
+import log_parser
+import recommendations
+import reporting
+
+from tests import fixtures
 
 # Parsed log timestamps are server-local; test datetimes must match.
 LOCAL_TZ = log_parser.LOCAL_TZ

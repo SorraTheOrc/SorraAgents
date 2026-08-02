@@ -35,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]  # .../skill/shared -> repo root
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.shared.measure_fanout import collect  # noqa: E402
+from skill.shared.measure_fanout import collect
 
 AUDIT_RUNNER = REPO_ROOT / "skill" / "audit" / "scripts" / "audit_runner.py"
 

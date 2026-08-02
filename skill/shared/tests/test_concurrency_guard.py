@@ -34,7 +34,7 @@ SEMAPHORE_MODULE = "skill.shared.process_semaphore"
 
 pytest.importorskip(SEMAPHORE_MODULE)
 
-from skill.shared.process_semaphore import Semaphore  # noqa: E402
+from skill.shared.process_semaphore import Semaphore
 
 # ---------------------------------------------------------------------------
 # Helpers

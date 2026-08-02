@@ -15,7 +15,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 # Scalar keys the skill reads (recommendations + slot schedule fallback).
 SCALAR_KEYS = (
     "session_slot_pool_size",
@@ -91,7 +90,7 @@ def _parse_config_text_regex(text: str) -> dict:
 
     cfg: dict = {}
     for key in SCALAR_KEYS:
-        m = re.search(rf"^\s*{re.escape(key)}:\s*(\d+)\s*$", body, re.M)
+        m = re.search(rf"^\s*{re.escape(key)}:\s*(\d+)\s*$", body, re.MULTILINE)
         if m:
             cfg[key] = int(m.group(1))
 

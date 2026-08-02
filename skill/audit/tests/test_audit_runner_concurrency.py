@@ -29,8 +29,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts import audit_runner  # noqa: E402
-from skill.shared.process_semaphore import ENV_LOCK_DIR, ENV_MAX_WORKERS  # noqa: E402
+from skill.audit.scripts import audit_runner
+from skill.shared.process_semaphore import ENV_LOCK_DIR, ENV_MAX_WORKERS
 
 
 @pytest.fixture(autouse=True)
@@ -269,9 +269,9 @@ def test_cli_has_max_concurrency_flags():
     """Both `issue` and `project` subparsers expose --max-concurrency."""
     parser = audit_runner.build_parser()
     args = parser.parse_args(["issue", "SA-TEST-001", "--max-concurrency", "3"])
-    assert getattr(args, "max_concurrency") == 3
+    assert args.max_concurrency == 3
     args = parser.parse_args(["project", "--max-concurrency", "3"])
-    assert getattr(args, "max_concurrency") == 3
+    assert args.max_concurrency == 3
 
 
 def test_cli_max_concurrency_applied_to_env(monkeypatch):
@@ -299,6 +299,5 @@ def test_pi_missing_binary_still_raises():
 
     with _mock.patch.object(
         audit_runner.subprocess, "Popen", side_effect=FileNotFoundError("pi")
-    ):
-        with pytest.raises(RuntimeError):
-            audit_runner._call_pi("prompt", model="m", pi_bin="missing-pi")
+    ), pytest.raises(RuntimeError):
+        audit_runner._call_pi("prompt", model="m", pi_bin="missing-pi")

@@ -18,7 +18,6 @@ from datetime import datetime
 from itertools import chain
 from pathlib import Path
 
-
 import aggregation
 import bucketing
 import config_loader

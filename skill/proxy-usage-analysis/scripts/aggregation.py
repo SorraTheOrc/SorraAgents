@@ -24,9 +24,9 @@ aggregated. A session is included iff it has at least one in-window
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, Iterable, List
 
 import bucketing
 from log_parser import (
@@ -74,14 +74,14 @@ class SessionStats:
 class AnalysisResult:
     window_start: datetime
     window_end: datetime
-    sessions: Dict[str, SessionStats]
-    fallback_events: List[LogEvent]
-    routing_skip_events: List[LogEvent]
+    sessions: dict[str, SessionStats]
+    fallback_events: list[LogEvent]
+    routing_skip_events: list[LogEvent]
     dispatch_denied_count: int
     unattributed_events: int
     lines_skipped: int
     total_lines: int
-    dispatch_denied_events: List[LogEvent] = field(default_factory=list)
+    dispatch_denied_events: list[LogEvent] = field(default_factory=list)
 
     @property
     def total_requests(self) -> int:
@@ -109,11 +109,11 @@ class _SessionBuilder:
 
     def __init__(self, session_id: str):
         self.session_id = session_id
-        self.started: List[LogEvent] = []
-        self.finished: List[LogEvent] = []
+        self.started: list[LogEvent] = []
+        self.finished: list[LogEvent] = []
         self.last_seen: datetime | None = None
         self.dispatch_denied = 0
-        self.routing_skips: List[LogEvent] = []
+        self.routing_skips: list[LogEvent] = []
 
     def add(self, ev: LogEvent) -> None:
         self.last_seen = ev.ts
@@ -141,8 +141,8 @@ def _first_remote(events: Iterable[LogEvent]) -> LogEvent | None:
 def _attribute_fallback(
     session_id: str,
     first_remote_ts: datetime,
-    routing_skips: Dict[str, List[LogEvent]],
-    fallback_events: List[LogEvent],
+    routing_skips: dict[str, list[LogEvent]],
+    fallback_events: list[LogEvent],
 ) -> tuple[datetime | None, str | None]:
     """Find (move_time, reason) for a session that reached a remote provider.
 
@@ -167,8 +167,8 @@ def _attribute_fallback(
 
 def _build_session(
     builder: _SessionBuilder,
-    routing_skips: Dict[str, List[LogEvent]],
-    fallback_events: List[LogEvent],
+    routing_skips: dict[str, list[LogEvent]],
+    fallback_events: list[LogEvent],
     schedule: bucketing.SlotSchedule,
 ) -> SessionStats:
     started = sorted(builder.started, key=lambda e: e.ts)
@@ -238,11 +238,11 @@ def aggregate(
     ``events`` may be any iterable of parsed :class:`LogEvent` (e.g. chained
     across multiple log files). Events outside the window are ignored.
     """
-    builders: Dict[str, _SessionBuilder] = {}
-    routing_skips: Dict[str, List[LogEvent]] = {}
-    fallback_events: List[LogEvent] = []
-    routing_skip_events: List[LogEvent] = []
-    dispatch_denied_events: List[LogEvent] = []
+    builders: dict[str, _SessionBuilder] = {}
+    routing_skips: dict[str, list[LogEvent]] = {}
+    fallback_events: list[LogEvent] = []
+    routing_skip_events: list[LogEvent] = []
+    dispatch_denied_events: list[LogEvent] = []
     dispatch_denied = 0
     unattributed = 0
     lines_skipped = 0
@@ -276,7 +276,7 @@ def aggregate(
             continue
         lines_skipped += 1
 
-    sessions: Dict[str, SessionStats] = {}
+    sessions: dict[str, SessionStats] = {}
     for sid, builder in builders.items():
         # Require at least one in-window stream *started* event (events have
         # already been window-filtered above).

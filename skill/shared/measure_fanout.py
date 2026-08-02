@@ -81,9 +81,7 @@ def classify_processes() -> dict[str, int]:
         is_pi = False
         if cmdline:
             first = os.path.basename(cmdline[0])
-            if first == "pi" or first.startswith("pi-"):
-                is_pi = True
-            elif any(
+            if first == "pi" or first.startswith("pi-") or any(
                 os.path.basename(a) == "pi" or a.endswith("/pi")
                 for a in cmdline[1:3]
             ):
