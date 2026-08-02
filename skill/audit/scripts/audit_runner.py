@@ -1395,6 +1395,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         ready = ready_before_cq
 
     # Build model line (only when model/model_source was explicitly provided)
+    issue_id_label = issue.get("id", "") or "unknown"
     if model is not _MISSING:
         effective_model = (model or "").strip() or "manual"
         effective_source = ((model_source or "") if model_source is not _MISSING else "").strip()
@@ -1402,9 +1403,21 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             model_line = f"Model: {effective_model} (provider: {effective_source})"
         else:
             model_line = f"Model: {effective_model} (no provider)"
-        lines = [f"Ready to close: {ready}", "", model_line, "", "## Summary", ""]
+        lines = [
+            f"Ready to close: {ready}",
+            "",
+            f"Audit report for work item {issue_id_label}",
+            "",
+            model_line,
+            "", "## Summary", "",
+        ]
     else:
-        lines = [f"Ready to close: {ready}", "", "## Summary", ""]
+        lines = [
+            f"Ready to close: {ready}",
+            "",
+            f"Audit report for work item {issue_id_label}",
+            "", "## Summary", "",
+        ]
 
     # Count verdicts across all criteria (parent + children)
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
@@ -3103,6 +3116,19 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 print(
                     f"Error: Readback verification for {issue_id}: "
                     f"stored audit is null or both rawOutput and summary are empty",
+                    file=sys.stderr,
+                )
+                return 1
+            # Content identity check (AC4): the stored audit must reference
+            # the target work-item ID. This confirms the persisted audit
+            # belongs to the intended item — not just that *some* non-empty
+            # audit was stored (which would not catch the stale-report
+            # contamination class of bug).
+            if issue_id not in (raw_output or ""):
+                print(
+                    f"Error: Readback verification for {issue_id}: "
+                    f"stored audit does not reference {issue_id}; "
+                    f"suspected cross-work-item contamination",
                     file=sys.stderr,
                 )
                 return 1

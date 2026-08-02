@@ -475,7 +475,7 @@ class TestPersistenceDelegation:
                     "success": True,
                     "audit": {
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: No\n\n## Summary\nTest.",
+                        "rawOutput": "Audit report for work item SA-TEST-001\nReady to close: No\n\n## Summary\nTest.",
                     },
                 }))
             return _fake_proc(
