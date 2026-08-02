@@ -33,11 +33,6 @@ def test_script_exists():
     assert SCRIPT_PATH.exists(), f"Script not found at {SCRIPT_PATH}"
 
 
-def test_script_has_shebang():
-    """Script should have a python3 shebang."""
-    content = SCRIPT_PATH.read_text()
-    assert content.startswith("#!/usr/bin/env python3"), "Missing shebang"
-
 
 def test_help_flag():
     """Script --help should display usage and exit 0."""

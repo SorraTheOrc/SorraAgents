@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Tests for audit_runner concurrency cap (SA-0MSAK2SNN005HCM5).
 
 Validates that audit_runner.py bounds concurrent pi subprocess launches

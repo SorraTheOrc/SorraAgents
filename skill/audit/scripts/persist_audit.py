@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -27,6 +28,63 @@ def _extract_ready_to_close(report_text: str) -> bool:
         if line.strip().lower().startswith("ready to close:"):
             return "yes" in line.lower()
     return False
+
+
+# Work-item id pattern: 2-5 uppercase letters, dash, then base62-ish suffix
+# (e.g. ``SA-0MSAS108O009DYKT``, ``OSL-0MSABC7SB001NVUN``).
+_WORK_ITEM_ID_RE = r"\b[A-Z]{2,5}-[A-Z0-9]{12,20}\b"
+
+
+def extract_work_item_ids(report_text: str) -> list[str]:
+    """Extract all work-item IDs mentioned in *report_text*.
+
+    Returns the list of unique IDs in order of first appearance.
+    """
+    seen: list[str] = []
+    for m in re.finditer(_WORK_ITEM_ID_RE, report_text or ""):
+        if m.group(0) not in seen:
+            seen.append(m.group(0))
+    return seen
+
+
+def check_report_identity(issue_id: str, report_text: str) -> tuple[str | None, str | None]:
+    """Verify the report text belongs to *issue_id*.
+
+    Returns ``(error, warning)`` where:
+
+    - *error* is set (non-None) when the report must be rejected, or None
+      when it may be persisted.
+    - *warning* is set when the report should be persisted but carries a
+      cautionary note (e.g. it does not name any work item).
+
+    The check is conservative:
+
+    - A report mentioning the target ID is always accepted, even when it
+      also mentions other work-item IDs (e.g. child-audit sections that
+      reference child IDs while the overall audit targets the parent).
+    - A report that mentions one or more work-item IDs but NOT the target
+      ID is rejected (clear cross-work-item contamination).
+    - A report mentioning no work-item ID at all is accepted but produces a
+      warning: the audit should identify the work item it audits, but the
+      absence of any ID does not "clearly reference a different work item"
+      and must not block persistence (conservative per AC3).
+    """
+    ids = extract_work_item_ids(report_text)
+    if not ids:
+        return None, (
+            "Warning: report does not reference any work-item ID; "
+            f"cannot confirm it belongs to {issue_id}. Persisting anyway "
+            "(conservative guard). Ensure report text names the audited "
+            "work item."
+        )
+    if issue_id not in ids:
+        mentioned = ", ".join(ids[:5])
+        error_msg = (
+            f"Error: report references work item(s) {mentioned} but not the "
+            f"target {issue_id}; refusing to persist a possibly mismatched report."
+        )
+        return error_msg, None
+    return None, None
 
 
 def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
@@ -43,7 +101,20 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     * worklog_dir: optional explicit ``--worklog-dir`` value injected into
       every wl command so the store is targeted regardless of the caller's
       cwd (used by the audit runner; standalone CLI usage is unaffected).
+
+    The report is checked against *issue_id* before persisting (identity
+    guard): a report that clearly references a different work item (one
+    that names other work-item IDs but not the target) is rejected with a
+    clear error and a non-zero exit code.  A report naming no work-item ID
+    is accepted with a warning (conservative).
     """
+    identity_error, identity_warning = check_report_identity(issue_id, report_text)
+    if identity_warning:
+        print(identity_warning, file=sys.stderr)
+    if identity_error:
+        print(identity_error, file=sys.stderr)
+        return 3
+
     if _fail:
         # Simulate failure: print report to stdout (fallback for operator)
         # and return 1.

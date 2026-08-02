@@ -220,7 +220,7 @@ class TestAuditRunnerReportOnPersistFailure:
                     "audit": {
                         "workItemId": "SA-SUCCESS",
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nOK.",
+                        "rawOutput": "Audit report for work item SA-SUCCESS\nReady to close: Yes\n\n## Summary\nOK.",
                     },
                 }))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
@@ -256,7 +256,7 @@ class TestAuditRunnerReportOnPersistFailure:
                     "success": True,
                     "audit": {
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nOK.",
+                        "rawOutput": "Audit report for work item SA-PARENT\nReady to close: Yes\n\n## Summary\nOK.",
                     },
                 }))
             return _fake_proc(stdout=json.dumps(WI_WITH_CHILDREN))
@@ -374,7 +374,7 @@ class TestReadbackVerification:
                     "audit": {
                         "workItemId": "SA-READBACK-OK",
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nAll good.",
+                        "rawOutput": "Audit report for work item SA-READBACK-OK\nReady to close: Yes\n\n## Summary\nAll good.",
                     },
                 }
                 return _fake_proc(stdout=json.dumps(audit_data))
@@ -533,7 +533,7 @@ class TestReadbackVerification:
                         "workItemId": "SA-SUMMARY-ONLY",
                         "auditedAt": "2026-07-20T10:00:00.000Z",
                         "rawOutput": None,
-                        "summary": "Ready to close: Yes\n\n## Summary\nStored in summary field.",
+                        "summary": "Audit report for work item SA-SUMMARY-ONLY\nReady to close: Yes\n\n## Summary\nStored in summary field.",
                     },
                 }
                 return _fake_proc(stdout=json.dumps(audit_data))
@@ -566,7 +566,7 @@ class TestReadbackVerification:
                     "audit": {
                         "workItemId": "SA-BOTH",
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nPrimary content.",
+                        "rawOutput": "Audit report for work item SA-BOTH\nReady to close: Yes\n\n## Summary\nPrimary content.",
                         "summary": "Audit result persisted via persist_audit.py",
                     },
                 }
@@ -635,7 +635,7 @@ class TestExitCodes:
                     "success": True,
                     "audit": {
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nOK.",
+                        "rawOutput": "Audit report for work item SA-OK\nReady to close: Yes\n\n## Summary\nOK.",
                     },
                 }))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))

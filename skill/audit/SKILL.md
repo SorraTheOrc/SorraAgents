@@ -311,10 +311,32 @@ Runner performs code quality checks before AC verification (invokes `../code-rev
 - Persist from a file: `python3 ./scripts/persist_audit.py --issue-id SA-123 --file report.md`
 - Persist from a CLI string: `python3 ./scripts/persist_audit.py --issue-id SA-123 --report "Ready to close: Yes\n..."`
 
+**Unique report file naming convention:**
+
+- When persisting an audit report from a *file* (or writing a report to disk for later
+  persistence), the file MUST use a unique name per work item:
+  `audit_report_<work-item-id>.md` (e.g. `audit_report_OSL-0MSABC7SB001NVUN.md`).
+- Never use a fixed/shared path such as `/tmp/audit_report.md` — a stale report left over
+  from a previous audit of a *different* work item can be read back and persisted to the
+  wrong item (cross-work-item contamination).
+- This convention applies to any file-based persistence flow: the runner, manual agent
+  workflows, and `persist_audit.py --file`.
+
+**Identity guard (mandatory):**
+
+- `persist_audit.py` rejects a report that clearly references a *different* work item than
+  the target `--issue-id` (it names one or more work-item IDs but not the target). The
+  rejection prints a clear error to stderr and exits non-zero — the report is NOT persisted.
+- A report that mentions the target ID is always accepted, even when it also references
+  other IDs (e.g. parent reports that include child-audit sections).
+- A report that mentions *no* work-item ID is accepted with a warning (conservative: absence
+  of any ID does not "clearly reference a different work item", so it must not block
+  persistence).
+
 Notes:
 
 - **Persistence + readback verification is an invariant of the runner.** Unless `--do-not-persist` is given, the runner ALWAYS persists the audit and then performs a readback verification via `wl audit-show --json` to confirm the stored audit is retrievable. If either step fails, the runner exits non-zero. Use `--do-not-persist` for dry runs. The `--require-persist` flag has been removed — persist+verify is now unconditional.
-- The persister (and the runner when persisting) call: `wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json` and return a non-zero exit code on failure. After a successful return code, the runner calls `wl audit-show <issue-id> --json` and exits non-zero if the stored audit is null or has empty `rawOutput`.
+- The persister (and the runner when persisting) call: `wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json` and return a non-zero exit code on failure. After a successful return code, the runner calls `wl audit-show <issue-id> --json` and exits non-zero if the stored audit is null, has empty `rawOutput`/`summary`, **or the stored content does not reference the target work-item ID** (content identity check — catches a stale report persisted to the wrong item).
 - **Child item audit persistence:** When auditing a parent work item with children, the runner also persists an individual audit report to each child work item. Each child receives a focused report covering only its own acceptance criteria. Child persistence is controlled by the same `--do-not-persist` flag — if persistence is disabled for the parent, child persistence is also skipped. Child persist failures are logged as warnings to stderr but do not prevent the parent audit from succeeding. Child readback verification is out of scope for the current release.
 
 ## Guidance for models
@@ -352,8 +374,9 @@ Notes:
    - Runner default: `python3 ./scripts/audit_runner.py issue <id>` (persists **and verifies** unless `--do-not-persist`)
 
    > **Readback verification:** After persisting, the runner always reads back the stored audit via
-   > `wl audit-show <id> --json` and checks that the `audit` object exists and `rawOutput` is not
-   > empty. This is an invariant — not a configurable step. If readback fails, the runner exits non-zero.
+   > `wl audit-show <id> --json` and checks that the `audit` object exists, `rawOutput` is not
+   > empty, and the stored content references the target work-item ID (content identity check).
+   > This is an invariant — not a configurable step. If readback fails, the runner exits non-zero.
 
    > **Child audits:** Runner persists individual audits to each child automatically.
 
