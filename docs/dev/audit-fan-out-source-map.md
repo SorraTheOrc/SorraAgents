@@ -108,7 +108,7 @@ Measured impact on the rgardler workstation (16-core, 30 GiB RAM,
 | Source | Control | Status |
 |--------|---------|--------|
 | 1–2 (audit runner) | Shared flock-based semaphore around pi spawns + child triggers, ceiling via `AUDIT_MAX_CONCURRENCY` | Child SA-0MSAK2P3J0065POO / SA-0MSAK2SNN005HCM5 |
-| 3 (vitest) | `maxWorkers` cap on Tableau-Card-Engine unit project; ContextHub already capped | Child SA-0MSAK2ZH6009Z3TW |
+| 3 (vitest) | `maxWorkers: 4` cap on Tableau-Card-Engine unit project (added, mirrors ContextHub); ContextHub already capped (`maxWorkers: 4`, `singleFork: true`); SorraAgents is pytest-based (no vitest) | Child SA-0MSAK2ZH6009Z3TW — DONE |
 | 4 (`wl sync`) | Serialize concurrent `wl sync` via shared semaphore/lock | Child SA-0MSAK2W0F0027ZP7 |
 | 5 (batch overlap) | Bounded via per-item controls above + configurable ceilings | Covered by parent |
 | 6 (operator sessions) | Documented; not directly controllable | N/A |
