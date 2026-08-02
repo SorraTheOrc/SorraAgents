@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Measure process fan-out on the host (pi, node/vitest, wl sync, audits).
 
 Read-only diagnostic for the concurrent-audit fan-out investigation
