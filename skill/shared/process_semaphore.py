@@ -18,7 +18,7 @@ Configuration
 - ``max_workers`` (explicit argument) — highest priority.
 - ``AUDIT_MAX_CONCURRENCY`` environment variable — override for audit-style
   workloads (default ceiling documented below).
-- Default: 2 concurrent workers when neither is provided.
+- Default: 5 concurrent workers when neither is provided.
 
 Timeout semantics
 -----------------
@@ -60,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None  # type: ignore[assignment]
 
-DEFAULT_MAX_WORKERS = 2
+DEFAULT_MAX_WORKERS = 5
 ENV_MAX_WORKERS = "AUDIT_MAX_CONCURRENCY"
 ENV_LOCK_DIR = "PI_SEMAPHORE_DIR"
 _RETRY_DELAY_SECONDS = 0.05

@@ -569,7 +569,7 @@ def _audit_semaphore_max_workers(cli_value: int | None = None) -> int:
     Precedence:
       1. ``--max-concurrency`` CLI flag (explicit override)
       2. ``AUDIT_MAX_CONCURRENCY`` environment variable
-      3. ``DEFAULT_MAX_WORKERS`` (2)
+      3. ``DEFAULT_MAX_WORKERS`` (5)
 
     An invalid (non-integer) env value is ignored with a warning so a
     misconfigured environment cannot break the audit run.

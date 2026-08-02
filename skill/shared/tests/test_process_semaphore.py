@@ -30,7 +30,7 @@ def test_default_max_workers():
     """No explicit arg and no env var -> documented default."""
     sem = Semaphore("unit-default")
     assert sem.max_workers == DEFAULT_MAX_WORKERS
-    assert sem.max_workers == 2
+    assert sem.max_workers == 5
 
 
 def test_explicit_max_workers_wins_over_env(monkeypatch):
