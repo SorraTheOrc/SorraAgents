@@ -59,9 +59,12 @@ Written to `--output-dir` (default `~/proxy-usage-reports`):
   sessions in the window (local-only and fallback).
 - `nighttime_sessions.csv` — one row per **nighttime** session (00:00–09:59,
   8 slots).
-- `report.md` — the aggregate report: session/request counts, local vs remote
-  split, fallback rate and reasons, per-model breakdown, daytime vs nighttime
-  comparison, and highlighted recommendations.
+- `report.md` — the aggregate report: a single **Session summary** table
+  (sessions, requests, local/remote split, classifications, fallback events,
+  dispatch denials, context sizes — each with **Total / Day / Night**
+  columns), fallback-reason and routing-skip breakdowns, per-model
+  breakdown, and highlighted recommendations. All tables carry day/night
+  columns so the daytime vs nighttime comparison is available everywhere.
 
 CSV columns: session id, start/end time, duration, number of messages,
 start/avg/max context size, avg/max response size, initial model assignment

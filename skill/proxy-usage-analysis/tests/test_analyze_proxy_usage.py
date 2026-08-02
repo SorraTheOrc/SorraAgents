@@ -657,12 +657,35 @@ class TestEndToEnd:
 
         # Report contains the key sections.
         md = report_md.read_text()
-        for section in ["# Proxy Usage Analysis", "## Recommendations", "local_concurrency_limit", fixtures.S2[:8]]:
+        for section in ["# Proxy Usage Analysis", "## Recommendations", "local_concurrency_limit"]:
             assert section in md
 
         # Night CSV has no rows (all sessions start during day hours).
         with night_csv.open() as f:
             assert len(list(csv.DictReader(f))) == 0
+
+    def test_dispatch_denied_attributed_to_session(self, tmp_path):
+        log_dir = tmp_path / "logs_d"
+        log_dir.mkdir()
+        (log_dir / "proxy.log").write_text(
+            f"2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session={fixtures.S1} request=[]\n"
+            f"2026-08-02 14:01:00,000 - INFO - local_dispatch_denied session={fixtures.S1} owner={fixtures.S2} active=4\n"
+            f"2026-08-02 14:30:00,000 - INFO - local_dispatch_denied session=33333333-3333-3333-3333-333333333333 owner={fixtures.S2} active=6\n"
+        )
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out_d",
+            config=None,
+        )
+        assert result.summary.dispatch_denied_count == 2
+        # Session-attributed where the UUID matches a stream session...
+        assert result.summary.sessions[fixtures.S1].dispatch_denied == 1
+        # ...and the report row buckets ALL dispatch events by their timestamp.
+        md = (tmp_path / "out_d" / "report.md").read_text()
+        section = md.split("## Session summary", 1)[1].split("## ", 1)[0]
+        assert "| Dispatch denied | 2 | 2 | 0 |" in section
 
     def test_json_summary(self, tmp_path):
         log_dir = self._write_logs(tmp_path)
@@ -748,3 +771,62 @@ class TestDefaultOutputDir:
         assert (out / "report.md").exists()
         assert (out / "daytime_sessions.csv").exists()
         assert (out / "nighttime_sessions.csv").exists()
+
+
+class TestReportRestructure:
+    """Report layout: consolidated tables with total/day/night columns, and
+    no per-session fallback list."""
+
+    def _run(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        # Rotated file (rotation 14:00, inside window) + live log.
+        (log_dir / "proxy.log.2026-08-02_14").write_text("\n".join(fixtures.E2E_LINES[:3]) + "\n")
+        (log_dir / "proxy.log").write_text("\n".join(fixtures.E2E_LINES[3:]) + "\n")
+        result = reporting.run_analysis(
+            log_dir=log_dir,
+            window_start=WINDOW_START,
+            window_end=WINDOW_END,
+            output_dir=tmp_path / "out",
+            config=None,
+        )
+        return (tmp_path / "out" / "report.md").read_text()
+
+    def test_old_sections_removed(self, tmp_path):
+        md = self._run(tmp_path)
+        for section in [
+            "## Session classification",
+            "## Local vs remote",
+            "## Sessions that fell back",
+            "## Daytime vs nighttime",
+            "## Context usage",
+        ]:
+            assert section not in md, f"section should be removed: {section}"
+
+    def test_session_summary_has_total_day_night(self, tmp_path):
+        md = self._run(tmp_path)
+        section = md.split("## Session summary", 1)[1].split("## ", 1)[0]
+        assert "| Metric | Total | Day | Night |" in section
+        # Both fixture sessions start during day hours (14:00-15:00 window).
+        assert "| Sessions | 2 | 2 | 0 |" in section
+        assert "| Requests |" in section
+        assert "| Local requests |" in section
+        assert "| Remote requests |" in section
+        assert "| Local-only sessions |" in section
+        assert "| Fell back (local → remote) |" in section
+        assert "| Fallback events |" in section
+
+    def test_fallback_reasons_have_day_night(self, tmp_path):
+        md = self._run(tmp_path)
+        section = md.split("## Fallback reasons", 1)[1].split("## ", 1)[0]
+        assert "| Reason | Total | % of fallbacks | Day | Night |" in section
+
+    def test_routing_skip_reasons_have_day_night(self, tmp_path):
+        md = self._run(tmp_path)
+        section = md.split("## routing_skip_local reasons", 1)[1].split("## ", 1)[0]
+        assert "| Reason | Total | % of skips | Day | Night |" in section
+
+    def test_per_model_breakdown_has_day_night(self, tmp_path):
+        md = self._run(tmp_path)
+        section = md.split("## Per-model breakdown", 1)[1].split("## ", 1)[0]
+        assert "| Provider | Model | Sessions | Day | Night | Requests | Fell back |" in section

@@ -24,7 +24,7 @@ aggregated. A session is included iff it has at least one in-window
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List
 
@@ -81,6 +81,7 @@ class AnalysisResult:
     unattributed_events: int
     lines_skipped: int
     total_lines: int
+    dispatch_denied_events: List[LogEvent] = field(default_factory=list)
 
     @property
     def total_requests(self) -> int:
@@ -241,6 +242,7 @@ def aggregate(
     routing_skips: Dict[str, List[LogEvent]] = {}
     fallback_events: List[LogEvent] = []
     routing_skip_events: List[LogEvent] = []
+    dispatch_denied_events: List[LogEvent] = []
     dispatch_denied = 0
     unattributed = 0
     lines_skipped = 0
@@ -255,6 +257,9 @@ def aggregate(
             continue
         if ev.kind == "dispatch_denied":
             dispatch_denied += 1
+            dispatch_denied_events.append(ev)
+            if ev.session:
+                builders.setdefault(ev.session, _SessionBuilder(ev.session)).add(ev)
             continue
         if ev.kind == "routing_skip":
             routing_skip_events.append(ev)
@@ -289,4 +294,5 @@ def aggregate(
         unattributed_events=unattributed,
         lines_skipped=lines_skipped,
         total_lines=total_lines,
+        dispatch_denied_events=dispatch_denied_events,
     )

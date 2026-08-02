@@ -125,6 +125,16 @@ def build_report(summary: AnalysisResult, config: dict | None) -> str:
     remote_only = [s for s in sessions if s.local_requests == 0 and s.remote_requests > 0]
 
     fallback_rate = (len(summary.fallback_events) / total) if total else 0.0
+    schedule = bucketing.schedule_from_config(
+        config, (config or {}).get("session_slot_pool_size")
+    )
+    profile = _bucket_profile(
+        sessions,
+        schedule,
+        summary.fallback_events,
+        summary.routing_skip_events,
+        summary.dispatch_denied_events,
+    )
 
     lines: list[str] = []
     ap = lines.append
@@ -140,92 +150,74 @@ def build_report(summary: AnalysisResult, config: dict | None) -> str:
     ap(f"- Lines parsed: {summary.total_lines} | lines skipped: {summary.lines_skipped}")
 
     ap("")
-    ap("## Session classification")
+    ap("## Session summary")
     ap("")
-    ap("| Class | Sessions | % of sessions |")
-    ap("|---|---|---|")
-    ap(f"| Local-only | {len(local_only)} | {_pct(len(local_only), len(sessions)):.1f}% |")
-    ap(f"| Fell back (local → remote) | {len(fell_back)} | {_pct(len(fell_back), len(sessions)):.1f}% |")
-    ap(f"| Remote-only (never used local) | {len(remote_only)} | {_pct(len(remote_only), len(sessions)):.1f}% |")
-
-    ap("")
-    ap("## Local vs remote")
-    ap("")
-    ap("| Metric | Value |")
-    ap("|---|---|")
-    ap(f"| Local requests | {summary.local_requests} ({_pct(summary.local_requests, total):.1f}%) |")
-    ap(f"| Remote requests | {summary.remote_requests} ({_pct(summary.remote_requests, total):.1f}%) |")
-    ap(f"| Local-only sessions | {len(local_only)} |")
-    ap(f"| Sessions that fell back | {len(fell_back)} |")
+    ap("| Metric | Total | Day | Night |")
+    ap("|---|---|---|---|")
+    d, n = profile["day"], profile["night"]
+    ap(f"| Sessions | {len(sessions)} | {d['sessions']} | {n['sessions']} |")
+    ap(f"| Requests | {total} | {d['requests']} | {n['requests']} |")
+    ap(f"| Local requests | {summary.local_requests} ({_pct(summary.local_requests, total):.1f}%) | "
+       f"{d['local']} ({_pct(d['local'], d['requests']):.1f}%) | "
+       f"{n['local']} ({_pct(n['local'], n['requests']):.1f}%) |")
+    ap(f"| Remote requests | {summary.remote_requests} ({_pct(summary.remote_requests, total):.1f}%) | "
+       f"{d['remote']} ({_pct(d['remote'], d['requests']):.1f}%) | "
+       f"{n['remote']} ({_pct(n['remote'], n['requests']):.1f}%) |")
+    ap(f"| Local-only sessions | {len(local_only)} ({_pct(len(local_only), len(sessions)):.1f}%) | "
+       f"{d['local_only']} ({_pct(d['local_only'], d['sessions']):.1f}%) | "
+       f"{n['local_only']} ({_pct(n['local_only'], n['sessions']):.1f}%) |")
+    ap(f"| Fell back (local → remote) | {len(fell_back)} ({_pct(len(fell_back), len(sessions)):.1f}%) | "
+       f"{d['fell_back']} ({_pct(d['fell_back'], d['sessions']):.1f}%) | "
+       f"{n['fell_back']} ({_pct(n['fell_back'], n['sessions']):.1f}%) |")
+    ap(f"| Remote-only (never used local) | {len(remote_only)} ({_pct(len(remote_only), len(sessions)):.1f}%) | "
+       f"{d['remote_only']} ({_pct(d['remote_only'], d['sessions']):.1f}%) | "
+       f"{n['remote_only']} ({_pct(n['remote_only'], n['sessions']):.1f}%) |")
+    ap(f"| Fallback events | {len(summary.fallback_events)} ({fallback_rate * 100:.1f}%) | "
+       f"{sum(d['fallback_reasons'].values())} | "
+       f"{sum(n['fallback_reasons'].values())} |")
+    ap(f"| Dispatch denied | {summary.dispatch_denied_count} | {d['dispatch_denied']} | {n['dispatch_denied']} |")
+    total_avg, total_max = _ctx_stats(
+        [s.max_context_size for s in sessions if s.max_context_size is not None]
+    )
+    day_avg, day_max = _ctx_stats(d["ctx"])
+    night_avg, night_max = _ctx_stats(n["ctx"])
+    ap(f"| Avg max context | {total_avg} | {day_avg} | {night_avg} |")
+    ap(f"| Highest context | {total_max} | {day_max} | {night_max} |")
 
     if summary.fallback_reason_counts:
         ap("")
         ap("## Fallback reasons")
         ap("")
-        ap("| Reason | Events | % of fallbacks |")
-        ap("|---|---|---|")
+        ap("| Reason | Total | % of fallbacks | Day | Night |")
+        ap("|---|---|---|---|---|")
         for reason, count in summary.fallback_reason_counts.most_common():
-            ap(f"| {reason} | {count} | {_pct(count, len(summary.fallback_events)):.1f}% |")
+            d = profile["day"]["fallback_reasons"].get(reason, 0)
+            n = profile["night"]["fallback_reasons"].get(reason, 0)
+            ap(f"| {reason} | {count} | {_pct(count, len(summary.fallback_events)):.1f}% | {d} | {n} |")
 
     if summary.routing_skip_reason_counts:
         ap("")
         ap("## routing_skip_local reasons")
         ap("")
-        ap("| Reason | Events | % of skips |")
-        ap("|---|---|---|")
+        ap("| Reason | Total | % of skips | Day | Night |")
+        ap("|---|---|---|---|---|")
         for reason, count in summary.routing_skip_reason_counts.most_common():
-            ap(f"| {reason} | {count} | {_pct(count, len(summary.routing_skip_events)):.1f}% |")
+            d = profile["day"]["routing_skip_reasons"].get(reason, 0)
+            n = profile["night"]["routing_skip_reasons"].get(reason, 0)
+            ap(f"| {reason} | {count} | {_pct(count, len(summary.routing_skip_events)):.1f}% | {d} | {n} |")
 
     initial = Counter((s.initial_provider, s.initial_model) for s in sessions)
     ap("")
     ap("## Per-model breakdown (initial assignment)")
     ap("")
-    ap("| Provider | Model | Sessions | Requests | Fell back |")
-    ap("|---|---|---|---|---|")
+    ap("| Provider | Model | Sessions | Day | Night | Requests | Fell back |")
+    ap("|---|---|---|---|---|---|---|")
     for (provider, model), count in initial.most_common():
         s_list = [s for s in sessions if s.initial_provider == provider and s.initial_model == model]
+        day = sum(1 for s in s_list if _bucket_key(s.bucket) == "day")
         reqs = sum(s.messages for s in s_list)
         fb = sum(1 for s in s_list if s.fell_back)
-        ap(f"| {provider} | {model} | {count} | {reqs} | {fb} |")
-
-    fell_back_rows = sorted((s for s in sessions if s.fell_back), key=lambda s: s.remote_move_time or s.start)
-    if fell_back_rows:
-        ap("")
-        ap("## Sessions that fell back (first 20)")
-        ap("")
-        ap("| Session | Start | Moved to remote | Fallback reason |")
-        ap("|---|---|---|---|")
-        for s in fell_back_rows[:20]:
-            ap(f"| {s.session_id} | {_fmt_ts(s.start)} | {_fmt_ts(s.remote_move_time)} | {s.fallback_reason or ''} |")
-
-    bucket_stats = _bucket_stats(sessions)
-    ap("")
-    ap("## Daytime vs nighttime")
-    ap("")
-    ap("| Bucket | Sessions | Requests | Fell back | Fallback rate | Avg ctx | Max ctx |")
-    ap("|---|---|---|---|---|---|---|")
-    for bucket in ("day", "night"):
-        b = bucket_stats.get(bucket)
-        if b is None:
-            ap(f"| {bucket} | 0 | 0 | 0 | - | - | - |")
-            continue
-        ctx_vals = [s.max_context_size for s in b["sessions_list"] if s.max_context_size is not None]
-        avg_ctx = round(sum(ctx_vals) / len(ctx_vals)) if ctx_vals else "-"
-        max_ctx = max(ctx_vals) if ctx_vals else "-"
-        ap(
-            f"| {bucket} | {b['count']} | {b['requests']} | {b['fell_back']} | "
-            f"{b['fallback_rate'] * 100:.1f}% | {avg_ctx} | {max_ctx} |"
-        )
-
-    ctx_vals = [s.max_context_size for s in sessions if s.max_context_size is not None]
-    if ctx_vals:
-        ap("")
-        ap("## Context usage")
-        ap("")
-        ap("| Metric | Tokens |")
-        ap("|---|---|")
-        ap(f"| Avg max context per session | {round(sum(ctx_vals) / len(ctx_vals))} |")
-        ap(f"| Highest context | {max(ctx_vals)} |")
+        ap(f"| {provider} | {model} | {count} | {day} | {len(s_list) - day} | {reqs} | {fb} |")
 
     ap("")
     ap("## Recommendations")
@@ -270,21 +262,73 @@ def _pct(part: int, total: int) -> float:
     return (part / total * 100.0) if total else 0.0
 
 
-def _bucket_stats(sessions: list[SessionStats]) -> dict:
-    stats: dict = {}
+def _bucket_key(bucket: str | None) -> str:
+    return "night" if bucket == "night" else "day"
+
+
+def _ctx_stats(values: list[int]) -> tuple[object, object]:
+    """Return (avg, max) for context sizes, or ("-", "-") when empty."""
+    if not values:
+        return "-", "-"
+    return round(sum(values) / len(values)), max(values)
+
+
+def _bucket_profile(
+    sessions: list[SessionStats],
+    schedule: bucketing.SlotSchedule,
+    fallback_events: list[log_parser.LogEvent],
+    routing_skip_events: list[log_parser.LogEvent],
+    dispatch_denied_events: list[log_parser.LogEvent],
+) -> dict:
+    """Per-bucket (day/night) totals for the report's summary tables.
+
+    Covers sessions, requests, local/remote split, classification counts,
+    context sizes, dispatch denials, and per-reason counters. Events without a
+    session (fallbacks, routing skips, dispatch denials) are bucketed by their
+    own timestamp.
+    """
+    buckets = {
+        "day": {
+            "sessions": 0, "requests": 0, "local": 0, "remote": 0,
+            "local_only": 0, "fell_back": 0, "remote_only": 0,
+            "dispatch_denied": 0, "ctx": [],
+            "fallback_reasons": Counter(), "routing_skip_reasons": Counter(),
+        },
+        "night": {
+            "sessions": 0, "requests": 0, "local": 0, "remote": 0,
+            "local_only": 0, "fell_back": 0, "remote_only": 0,
+            "dispatch_denied": 0, "ctx": [],
+            "fallback_reasons": Counter(), "routing_skip_reasons": Counter(),
+        },
+    }
     for s in sessions:
-        b = stats.setdefault(
-            s.bucket or "day",
-            {"count": 0, "requests": 0, "fell_back": 0, "sessions_list": []},
-        )
-        b["count"] += 1
+        b = buckets[_bucket_key(s.bucket)]
+        b["sessions"] += 1
         b["requests"] += s.messages
-        b["sessions_list"].append(s)
+        b["local"] += s.local_requests
+        b["remote"] += s.remote_requests
+        if s.remote_requests == 0:
+            b["local_only"] += 1
         if s.fell_back:
             b["fell_back"] += 1
-    for b in stats.values():
-        b["fallback_rate"] = (b["fell_back"] / b["count"]) if b["count"] else 0.0
-    return stats
+        if s.local_requests == 0 and s.remote_requests > 0:
+            b["remote_only"] += 1
+        if s.max_context_size is not None:
+            b["ctx"].append(s.max_context_size)
+    for ev in fallback_events:
+        if not ev.reason:
+            continue
+        label = schedule.period_for(ev.ts).label if schedule.periods else "day"
+        buckets[_bucket_key(label)]["fallback_reasons"][ev.reason] += 1
+    for ev in routing_skip_events:
+        if not ev.reason:
+            continue
+        label = schedule.period_for(ev.ts).label if schedule.periods else "day"
+        buckets[_bucket_key(label)]["routing_skip_reasons"][ev.reason] += 1
+    for ev in dispatch_denied_events:
+        label = schedule.period_for(ev.ts).label if schedule.periods else "day"
+        buckets[_bucket_key(label)]["dispatch_denied"] += 1
+    return buckets
 
 
 # ---------------------------------------------------------------------------
