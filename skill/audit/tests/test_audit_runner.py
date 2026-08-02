@@ -1994,3 +1994,219 @@ class TestPhase2ScanningGuidance:
         prompt = child_call[0][0][2]
         assert "grep" in prompt
         assert "unbounded" in prompt or "explore the whole repository" in prompt
+# Cumulative elapsed-time guard configuration (SA-0MSABZO2T004B95X)
+# ===========================================================================
+
+
+class TestParentTimeoutResolution:
+    """Tests for parent-timeout resolution (--parent-timeout flag vs env var).
+
+    The cumulative elapsed-time guard (hardcoded 110s before this work item)
+    skips remaining child audits when the parent run approaches the parent
+    bash-tool timeout. SA-0MSABZO2T004B95X makes that threshold configurable
+    via ``--parent-timeout`` / ``AUDIT_PARENT_TIMEOUT``.
+    """
+
+    def test_default_guard_constant_preserves_behavior(self):
+        """AC1/AC5: The default threshold preserves current behavior (110s)."""
+        assert audit_runner.PARENT_TIMEOUT_DEFAULT == 110
+
+    def test_env_var_constant_defined(self):
+        """AC1: The AUDIT_PARENT_TIMEOUT env var constant is defined."""
+        assert audit_runner.AUDIT_PARENT_TIMEOUT_ENV == "AUDIT_PARENT_TIMEOUT"
+
+    def test_cli_flag_wins_over_env_var(self):
+        """AC1: The --parent-timeout CLI flag takes precedence over the env var."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PARENT_TIMEOUT_ENV: "600"},
+            clear=False,
+        ):
+            assert audit_runner._resolve_parent_timeout(900) == 900
+
+    def test_env_var_used_when_no_cli_flag(self):
+        """AC1: AUDIT_PARENT_TIMEOUT is used when --parent-timeout is not passed."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PARENT_TIMEOUT_ENV: "600"},
+            clear=False,
+        ):
+            assert audit_runner._resolve_parent_timeout(None) == 600
+
+    def test_default_when_nothing_set(self):
+        """AC1/AC5: Returns the default (110s) when neither flag nor env is set."""
+        with mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            assert audit_runner._resolve_parent_timeout(None) == audit_runner.PARENT_TIMEOUT_DEFAULT
+
+    def test_invalid_env_value_falls_back_to_default(self):
+        """AC1: An invalid AUDIT_PARENT_TIMEOUT value falls back to the default."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PARENT_TIMEOUT_ENV: "not-a-number"},
+            clear=False,
+        ):
+            assert audit_runner._resolve_parent_timeout(None) == audit_runner.PARENT_TIMEOUT_DEFAULT
+
+    def test_main_resolves_env_var_parent_timeout(self):
+        """AC1: main() resolves the parent timeout from env var and passes it through."""
+        with (
+            mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
+            mock.patch.dict(
+                audit_runner.os.environ,
+                {audit_runner.AUDIT_PARENT_TIMEOUT_ENV: "600"},
+                clear=False,
+            ),
+        ):
+            rc = audit_runner.main(["issue", "SA-123", "--do-not-persist"])
+            assert rc == mock_cmd.return_value
+            _args, kwargs = mock_cmd.call_args
+            assert kwargs["parent_timeout"] == 600
+
+    def test_main_uses_cli_flag_over_env_var(self):
+        """AC1: main() prefers the CLI --parent-timeout flag over the env var."""
+        with (
+            mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
+            mock.patch.dict(
+                audit_runner.os.environ,
+                {audit_runner.AUDIT_PARENT_TIMEOUT_ENV: "600"},
+                clear=False,
+            ),
+        ):
+            audit_runner.main(
+                ["issue", "SA-123", "--do-not-persist", "--parent-timeout", "900"]
+            )
+            _args, kwargs = mock_cmd.call_args
+            assert kwargs["parent_timeout"] == 900
+
+
+class TestParentTimeoutGuardBehavior:
+    """AC3: An explicit --parent-timeout override audits children that the
+    default 110s elapsed-time guard would skip."""
+
+    def _make_runner(self, child_stage="in_review"):
+        """Build a mock runner returning a parent with one child."""
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+
+            # StatusLifecycle.show -> wl show <id> --json
+            if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": "open"},
+                    }),
+                    stderr="",
+                )
+
+            # StatusLifecycle.update_status -> wl update <id> --status ...
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}),
+                    stderr="",
+                )
+
+            # _run_wl -> wl show <id> --children --json
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": "## Acceptance Criteria\n- AC1: parent criterion",
+                            "status": "in_progress",
+                        },
+                        "children": [{
+                            "id": "CHILD-1",
+                            "title": "Child Issue",
+                            "status": "completed",
+                            "stage": child_stage,
+                            "description": "## Acceptance Criteria\n- CAC1: child criterion",
+                        }],
+                    }),
+                    stderr="",
+                )
+
+            # Fallback (audit-show etc.) -> no audit data
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"success": True}),
+                stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def _run(self, parent_timeout=None, elapsed=120.0):
+        """Run cmd_issue with a fake clock reporting `elapsed` seconds since
+        the guard start marker; pi and code quality are mocked.
+
+        Returns (rc, json_payload).
+        """
+        clock = {"n": 0, "t0": 1000.0}
+
+        def _fake_monotonic():
+            clock["n"] += 1
+            # Call #1 is the guard start marker (_audit_start); every call
+            # after that is `elapsed` seconds in.
+            if clock["n"] == 1:
+                return clock["t0"]
+            return clock["t0"] + elapsed
+
+        pi_result = {
+            "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "mocked"}]',
+        }
+
+        def _passthrough_phase2(work_item, ac_results, child_results, **kwargs):
+            return (ac_results, child_results, True)
+
+        with (
+            mock.patch.object(
+                audit_runner.time, "monotonic", side_effect=_fake_monotonic
+            ),
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+            mock.patch.object(
+                audit_runner, "_run_phase2_deep_analysis",
+                side_effect=_passthrough_phase2,
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True,
+                runner=self._make_runner(),
+                json_mode=True,
+                parent_timeout=parent_timeout,
+            )
+        return rc
+
+    def test_default_guard_skips_child_after_110s(self, capsys):
+        """AC5/AC3: With the default threshold, a child is skipped at 120s elapsed."""
+        rc = self._run(parent_timeout=None, elapsed=120.0)
+        payload = json.loads(capsys.readouterr().out)
+
+        assert rc == 0
+        child = payload["children"][0]
+        ac = child["ac_results"][0]
+        assert ac["verdict"] == "unmet"
+        assert ac["text"] == "Skipped due to audit timeout. Manual audit required."
+        assert "(110s budget)" in ac["evidence"]
+
+    def test_override_audits_child_previously_skipped(self, capsys):
+        """AC3: With --parent-timeout 600, the same run audits the child."""
+        rc = self._run(parent_timeout=600, elapsed=120.0)
+        payload = json.loads(capsys.readouterr().out)
+
+        assert rc == 0
+        child = payload["children"][0]
+        ac = child["ac_results"][0]
+        assert ac["verdict"] == "met"
+        assert ac["text"] == "CAC1: child criterion"

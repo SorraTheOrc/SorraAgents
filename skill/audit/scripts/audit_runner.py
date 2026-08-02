@@ -48,12 +48,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from skill.audit.scripts.persist_audit import persist_audit
 from skill.scripts.failure_notice import FailureNotice
-from skill.shared.status_lifecycle import _wl_error_detail, worklog_dir_flag
 from skill.shared.process_semaphore import (
     DEFAULT_MAX_WORKERS,
     ENV_MAX_WORKERS,
     Semaphore,
 )
+from skill.shared.status_lifecycle import _wl_error_detail, worklog_dir_flag
 
 # ---------------------------------------------------------------------------
 # Concurrency control (fan-out bounding, SA-0MSAEKOQE009TEB4)
@@ -82,9 +82,12 @@ tools), which is inherently slower than bare LLM calls. 1800s (30 min)
 accommodates typical agent-mode analyses where the model reads and searches
 multiple implementation files.
 
-The cumulative elapsed-time guard in ``cmd_issue`` (110s threshold for
-child audit skipping) provides the primary protection against the parent
-bash-tool execution timeout (~120s), not this per-call timeout.
+The cumulative elapsed-time guard in ``cmd_issue`` (``PARENT_TIMEOUT_DEFAULT``
+= 110s threshold for child audit skipping) provides the primary protection
+against the parent bash-tool execution timeout (~120s), not this per-call
+timeout. The guard threshold is configurable via the ``--parent-timeout`` CLI
+flag or the ``AUDIT_PARENT_TIMEOUT`` environment variable (see
+``_resolve_parent_timeout``) for harnesses whose bash tool allows longer runs.
 
 If the Pi model itself takes longer than this value, something is likely
 wrong (model hang, provider issue) and the timeout diagnostic should be
@@ -95,6 +98,18 @@ or the ``AUDIT_PI_TIMEOUT`` environment variable (see
 ``_resolve_effective_timeout``).
 """
 
+PARENT_TIMEOUT_DEFAULT = 110
+"""Default cumulative elapsed-time guard threshold (seconds) in ``cmd_issue``.
+
+When the total elapsed time since the audit start marker exceeds this value,
+remaining child audits are skipped with a clear diagnostic instead of risking
+a silent kill by the parent bash-tool execution timeout (~120s).
+
+The threshold can be raised via the ``--parent-timeout`` CLI flag or the
+``AUDIT_PARENT_TIMEOUT`` environment variable (see
+``_resolve_parent_timeout``) for harnesses that allow longer parent runs.
+"""
+
 AUDIT_PI_TIMEOUT_ENV = "AUDIT_PI_TIMEOUT"
 """Environment variable name for overriding the per-call Pi timeout.
 
@@ -102,6 +117,16 @@ When set (and ``--timeout`` is not passed), this value (seconds) is used as
 the effective per-call Pi model timeout instead of ``CALL_PI_TIMEOUT``.
 This lets release operators raise the audit runner's tolerance for slow
 Pi model calls (e.g. ``AUDIT_PI_TIMEOUT=3600``) without changing defaults.
+"""
+
+AUDIT_PARENT_TIMEOUT_ENV = "AUDIT_PARENT_TIMEOUT"
+"""Environment variable name for overriding the cumulative elapsed-time guard.
+
+When set (and ``--parent-timeout`` is not passed), this value (seconds)
+replaces ``PARENT_TIMEOUT_DEFAULT`` as the elapsed-time threshold for
+skipping remaining child audits in ``cmd_issue``. This lets release
+operators extend the overall audit run budget (e.g.
+``AUDIT_PARENT_TIMEOUT=3600``) without changing defaults.
 """
 
 _PI_MAX_RETRIES = 2
@@ -484,6 +509,32 @@ def _load_config() -> dict:
                 pass
 
     return config
+
+
+def _resolve_parent_timeout(cli_value: int | None) -> int:
+    """Resolve the cumulative elapsed-time guard threshold in seconds.
+
+    Precedence:
+      1. ``--parent-timeout`` CLI flag (explicit override)
+      2. ``AUDIT_PARENT_TIMEOUT`` environment variable (seconds)
+      3. ``PARENT_TIMEOUT_DEFAULT`` (110s — preserves current behavior)
+
+    An invalid ``AUDIT_PARENT_TIMEOUT`` value (non-integer) is ignored with a
+    warning so a misconfigured environment cannot break the audit run.
+    """
+    if cli_value is not None:
+        return int(cli_value)
+    env_value = os.environ.get(AUDIT_PARENT_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_PARENT_TIMEOUT_ENV} value {env_value!r}; "
+                f"using default guard ({PARENT_TIMEOUT_DEFAULT}s)",
+                file=sys.stderr,
+            )
+    return PARENT_TIMEOUT_DEFAULT
 
 
 def _resolve_effective_timeout(cli_timeout: int | None) -> int | None:
@@ -2499,6 +2550,7 @@ def _run_phase2_deep_analysis(
 
 def cmd_issue(issue_id: str, persist: bool = True,
               timeout: int | None = None,
+              parent_timeout: int | None = None,
               pi_bin: str = "pi", model: str | None = None,
               model_source: str = DEFAULT_MODEL_SOURCE,
               runner: Runner | None = None, json_mode: bool = False,
@@ -2659,8 +2711,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
         acs = _extract_acs(description)
 
         # Track elapsed time so we can skip remaining child audits if we
-        # approach the parent bash-tool timeout (~120s). This ensures a
-        # graceful degradation instead of a silent external kill.
+        # approach the parent bash-tool timeout. This ensures a graceful
+        # degradation instead of a silent external kill. The threshold is
+        # configurable via --parent-timeout / AUDIT_PARENT_TIMEOUT
+        # (default PARENT_TIMEOUT_DEFAULT).
+        elapsed_guard = (
+            parent_timeout if parent_timeout is not None else PARENT_TIMEOUT_DEFAULT
+        )
         _audit_start = time.monotonic()
 
         def _elapsed():
@@ -2788,9 +2845,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
         ]
         for child in active_children:
             # Skip remaining children if we're too close to the parent
-            # timeout (~120s). This prevents a silent external kill and
-            # instead produces a clear diagnostic for skipped audits.
-            if _elapsed() >= 110:
+            # timeout (elapsed_guard). This prevents a silent external kill
+            # and instead produces a clear diagnostic for skipped audits.
+            if _elapsed() >= elapsed_guard:
                 print(
                     f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
                     f"Skipping child {child.get('id', '')} ({child.get('title', '')}). "
@@ -2808,8 +2865,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         "evidence": (
                             f"Audit runner skipped this child after "
                             f"{_elapsed():.0f}s total elapsed time to avoid "
-                            f"the parent process timeout (~120s). "
-                            "Manual audit required."
+                            f"the parent process timeout ({elapsed_guard}s "
+                            f"budget). Manual audit required."
                         ),
                     }],
                 })
@@ -2944,7 +3001,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                                                        worklog_dir=worklog_dir)
 
             if verdict is None and persist:
-                if _elapsed() < 110:
+                if _elapsed() < elapsed_guard:
                     print(
                         f"Auto-triggering audit for child {child['id']} "
                         f"({child['title']}) — reason: {reason}",
@@ -2963,6 +3020,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         ]
                         if timeout is not None:
                             audit_cmd.extend(["--timeout", str(timeout)])
+                        if parent_timeout is not None:
+                            audit_cmd.extend(["--parent-timeout", str(parent_timeout)])
                         # Thread the resolved worklog flags through to the child
                         # runner process so it targets the same worklog store.
                         child_flags = _resolve_worklog_flags(
@@ -3392,6 +3451,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_issue.add_argument("issue_id", help="Work item id to audit")
     p_issue.add_argument("--timeout", type=int, default=None,
                          help="Override the per-call Pi model timeout in seconds")
+    p_issue.add_argument("--parent-timeout", type=int, default=None,
+                         help=(
+                             "Override the cumulative elapsed-time guard in seconds "
+                             "(default: " + str(PARENT_TIMEOUT_DEFAULT) + "); raise this to "
+                             "audit children that would otherwise be skipped "
+                             "(env: AUDIT_PARENT_TIMEOUT)"
+                         ))
     p_issue.add_argument("--do-not-persist", action="store_true",
                          help="Do not persist the audit report via wl update")
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
@@ -3449,6 +3515,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "issue":
         return cmd_issue(args.issue_id, persist=not args.do_not_persist,
                          timeout=_resolve_effective_timeout(args.timeout),
+                         parent_timeout=_resolve_parent_timeout(args.parent_timeout),
                          pi_bin=args.pi_bin, model=args.model,
                          model_source=args.model_source, json_mode=args.json,
                          debug_log=args.debug_log,
