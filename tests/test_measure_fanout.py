@@ -225,9 +225,9 @@ def test_non_intrusive_no_side_effects(monkeypatch, tmp_path):
     monkeypatch.setattr(mf.time, "strftime", lambda *a, **k: "2026-08-01T00:00:00Z")
 
     # No --out: nothing should be written anywhere under tmp_path
-    before = set(str(p) for p in tmp_path.rglob("*"))
+    before = {str(p) for p in tmp_path.rglob("*")}
     mf.collect()
-    after = set(str(p) for p in tmp_path.rglob("*"))
+    after = {str(p) for p in tmp_path.rglob("*")}
     assert before == after
 
 

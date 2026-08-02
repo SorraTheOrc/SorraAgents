@@ -68,7 +68,7 @@ def parse_config_text(text: str) -> dict | None:
         import yaml  # type: ignore
 
         cfg = yaml.safe_load(text)
-    except Exception:  # intentionally broad: fall back to the regex parser
+    except Exception:  # noqa: BLE001 -- intentionally broad: fall back to the regex parser
         cfg = None
     if cfg is None:
         cfg = _parse_config_text_regex(text)

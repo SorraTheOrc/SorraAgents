@@ -119,8 +119,8 @@ class FanoutSampler(threading.Thread):
         for s in self.samples:
             for k, v in s.get("processes", {}).items():
                 peak_proc[k] = max(peak_proc.get(k, 0), int(v))
-            for k in peak_load:
-                peak_load[k] = max(peak_load[k], float(s.get("load", {}).get(k, 0)))
+            for k, value in peak_load.items():
+                peak_load[k] = max(value, float(s.get("load", {}).get(k, 0)))
         peak_proc["batch_pi"] = self.batch_pi_peak
         return {"processes": peak_proc, "load": peak_load}
 
@@ -173,7 +173,7 @@ def run_batch(worklog_dir: Path, ids: list[str], pi_bin: Path, max_concurrency: 
         )
     results = []
     for p in procs:
-        out, err = p.communicate(timeout=300)
+        _out, err = p.communicate(timeout=300)
         results.append({"exit_code": p.returncode, "stderr_tail": err.strip()[-200:]})
     elapsed = time.monotonic() - started
 

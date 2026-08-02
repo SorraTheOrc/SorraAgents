@@ -96,7 +96,7 @@ def schedule_from_entries(entries: Sequence[tuple[str, int]]) -> SlotSchedule:
             SlotPeriod(prev_start, float(MINUTES_PER_DAY), prev_slots, _label(prev_slots, min_count, max_count))
         )
 
-    day_slots = min_count if min_count != max_count else min_count
+    day_slots = min_count
     night_slots = max_count if min_count != max_count else None
     return SlotSchedule(periods=periods, day_slots=day_slots, night_slots=night_slots, source="config")
 

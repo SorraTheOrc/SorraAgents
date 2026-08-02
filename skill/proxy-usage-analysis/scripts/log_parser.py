@@ -20,6 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
+# Log timestamps carry no timezone; the proxy runs in server-local time, so
+# interpret naive log times as the server's local timezone.
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+
 # Log line prefix: "2026-08-02 13:58:32,260 - INFO - <message>"
 LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{3}) - (\w+) - (.*)$")
 
@@ -102,7 +106,7 @@ def parse_log_line(line: str) -> LogEvent | None:
     date_part, ms_part, _level, msg = m.groups()
     try:
         ts = datetime.strptime(date_part, "%Y-%m-%d %H:%M:%S").replace(
-            microsecond=int(ms_part) * 1000
+            microsecond=int(ms_part) * 1000, tzinfo=LOCAL_TZ
         )
     except ValueError:
         return None
@@ -137,7 +141,7 @@ def parse_log_line(line: str) -> LogEvent | None:
         m2 = RE_FALLBACK.search(msg)
         if m2 is None:
             return None
-        fmodel, src, dst, reason = m2.groups()
+        _fmodel, src, dst, reason = m2.groups()
         return LogEvent("fallback", ts, reason=reason, src=src, dst=dst)
     if msg.startswith(ROUTING_SKIP):
         return LogEvent(
@@ -200,12 +204,12 @@ def discover_log_files(log_dir: Path, window_start: datetime) -> list[Path]:
         m = ROTATED_NAME_RE.match(p.name)
         if m is not None:
             y, mo, d, h = (int(x) for x in m.groups())
-            rotation = datetime(y, mo, d, h)
+            rotation = datetime(y, mo, d, h, tzinfo=LOCAL_TZ)
             if rotation >= window_start:
                 candidates.append(p)
         else:
             try:
-                mtime = datetime.fromtimestamp(p.stat().st_mtime)
+                mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=LOCAL_TZ)
             except OSError:
                 continue
             if mtime >= window_start:

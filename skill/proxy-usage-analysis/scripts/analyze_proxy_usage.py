@@ -27,6 +27,9 @@ DEFAULT_LOG_DIR = "/var/log/llama-proxy"
 DEFAULT_HOURS = 24
 DEFAULT_OUTPUT_DIR = "~/proxy-usage-reports"
 
+# The proxy logs and the CLI window arguments are server-local times.
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -48,10 +51,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _parse_iso(value: str) -> datetime:
+    """Parse an ISO window argument; naive values are server-local time."""
     try:
-        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=LOCAL_TZ)
     except ValueError:
-        return datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(value)
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=LOCAL_TZ)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.end:
         window_end = _parse_iso(args.end)
     else:
-        window_end = datetime.now()
+        window_end = datetime.now(LOCAL_TZ)
     if args.start:
         window_start = _parse_iso(args.start)
     else:

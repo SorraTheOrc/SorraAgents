@@ -194,9 +194,11 @@ E2E_LINES = [
     f"2026-08-02 14:01:00,000 - INFO - Stream started: provider=local model=Qwen3 session={S2} request=[{{'type': 'text', 'text': 'hello'}}]",
     f"2026-08-02 14:01:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 session={S2} provider=local model=Qwen3 request=[{{'type': 'text', 'text': 'hello'}}]",
     FALLBACK_CONCURRENCY.replace("13:58:04,301", "14:01:06,000"),
-    f"2026-08-02 14:01:06,100 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
-    f"estimated_tokens=5000 cold_threshold=39594 warm_threshold=39594 new_tokens=50 cached_ratio=0.50 "
-    f"reason=local_concurrency_limit → skipping local, routing to next remote provider session={S2}",
+    (
+        f"2026-08-02 14:01:06,100 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+        f"estimated_tokens=5000 cold_threshold=39594 warm_threshold=39594 new_tokens=50 cached_ratio=0.50 "
+        f"reason=local_concurrency_limit → skipping local, routing to next remote provider session={S2}"
+    ),
     f"2026-08-02 14:01:06,200 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session={S2} request=[{{'type': 'text', 'text': 'hello'}}]",
     f"2026-08-02 14:01:09,000 - INFO - Stream finished: reason=stop tokens=950/200/1150 session={S2} provider=opencode-go model=deepseek-v4-flash request=[{{'type': 'text', 'text': 'hello'}}]",
     f"2026-08-02 14:02:00,000 - INFO - local_dispatch_denied session=33333333-3333-3333-3333-333333333333 owner={S2} active=6",

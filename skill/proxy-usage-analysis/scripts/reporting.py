@@ -26,6 +26,9 @@ import log_parser
 import recommendations
 from aggregation import AnalysisResult, SessionStats
 
+# The report timestamps and analysis windows are server-local times.
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+
 CSV_COLUMNS = [
     "session_id",
     "start_time",
@@ -140,7 +143,7 @@ def build_report(summary: AnalysisResult, config: dict | None) -> str:
     ap = lines.append
     ap("# Proxy Usage Analysis Report")
     ap("")
-    ap(f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    ap(f"- Generated: {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
     ap(f"- Window: {_fmt_dt(summary.window_start)} → {_fmt_dt(summary.window_end)} ({hours:.1f}h)")
     ap(f"- Sessions in window: **{len(sessions)}** | Requests: **{total}** "
        f"(local {summary.local_requests} / remote {summary.remote_requests})")

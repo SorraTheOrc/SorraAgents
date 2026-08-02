@@ -28,8 +28,11 @@ import recommendations  # noqa: E402
 import reporting  # noqa: E402
 from tests import fixtures  # noqa: E402
 
-WINDOW_START = datetime(2026, 8, 2, 14, 0, 0)
-WINDOW_END = datetime(2026, 8, 2, 15, 0, 0)
+# Parsed log timestamps are server-local; test datetimes must match.
+LOCAL_TZ = log_parser.LOCAL_TZ
+
+WINDOW_START = datetime(2026, 8, 2, 14, 0, 0, tzinfo=LOCAL_TZ)
+WINDOW_END = datetime(2026, 8, 2, 15, 0, 0, tzinfo=LOCAL_TZ)
 
 
 def _schedule() -> bucketing.SlotSchedule:
@@ -51,7 +54,7 @@ class TestLogLineParsing:
         ev = log_parser.parse_log_line(fixtures.STREAM_STARTED_LOCAL)
         assert ev is not None
         assert ev.kind == "stream_started"
-        assert ev.ts == datetime(2026, 8, 2, 13, 58, 32, 260000)
+        assert ev.ts == datetime(2026, 8, 2, 13, 58, 32, 260000, tzinfo=LOCAL_TZ)
         assert ev.provider == "local"
         assert ev.model == "Qwen3"
         assert ev.session == "019fc284-dcb8-74ca-9a64-9306b6f9d286"
@@ -159,8 +162,8 @@ class TestSessionAggregation:
         # Fixture lines are at 13:58-13:59; use a window that includes them.
         res = aggregation.aggregate(
             _events(lines),
-            datetime(2026, 8, 2, 13, 0),
-            datetime(2026, 8, 2, 15, 0),
+            datetime(2026, 8, 2, 13, 0, tzinfo=LOCAL_TZ),
+            datetime(2026, 8, 2, 15, 0, tzinfo=LOCAL_TZ),
             _schedule(),
         )
         assert len(res.sessions) == 1
@@ -201,16 +204,16 @@ class TestSessionAggregation:
         lines = [
             "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s2 request=[]",
             "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 session=s2 provider=local model=Qwen3 request=[]",
-            "2026-08-02 14:01:06,100 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
-            "estimated_tokens=5000 cold_threshold=39594 warm_threshold=39594 new_tokens=50 "
-            "cached_ratio=0.50 reason=local_concurrency_limit → skipping local, routing to next remote "
-            "provider session=s2",
+            ("2026-08-02 14:01:06,100 - INFO - routing_skip_local provider=local-qwen3 model=Qwen3 "
+                "estimated_tokens=5000 cold_threshold=39594 warm_threshold=39594 new_tokens=50 "
+                "cached_ratio=0.50 reason=local_concurrency_limit → skipping local, routing to next remote "
+                "provider session=s2"),
             "2026-08-02 14:01:06,200 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s2 request=[]",
             "2026-08-02 14:01:09,000 - INFO - Stream finished: reason=stop tokens=950/200/1150 session=s2 provider=opencode-go model=deepseek-v4-flash request=[]",
         ]
         res = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
         s = res.sessions["s2"]
-        assert s.remote_move_time == datetime(2026, 8, 2, 14, 1, 6, 100000)
+        assert s.remote_move_time == datetime(2026, 8, 2, 14, 1, 6, 100000, tzinfo=LOCAL_TZ)
         assert s.fallback_reason == "local_concurrency_limit"
         assert s.remote_provider == "opencode-go"
         assert s.remote_model == "deepseek-v4-flash"
@@ -221,20 +224,20 @@ class TestSessionAggregation:
         lines = [
             "2026-08-02 14:00:00,000 - INFO - Stream started: provider=local model=Qwen3 session=s3 request=[]",
             "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=900/40/940 session=s3 provider=local model=Qwen3 request=[]",
-            "2026-08-02 14:00:50,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-            "from=local-qwen3, to=opencode-go-deepseek, reason=HTTP 400",
+            ("2026-08-02 14:00:50,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+                "from=local-qwen3, to=opencode-go-deepseek, reason=HTTP 400"),
             "2026-08-02 14:00:51,000 - INFO - Stream started: provider=deepseek model=deepseek-v4-flash session=s3 request=[]",
             "2026-08-02 14:00:55,000 - INFO - Stream finished: reason=stop tokens=950/200/1150 session=s3 provider=deepseek model=deepseek-v4-flash request=[]",
         ]
         res = aggregation.aggregate(_events(lines), WINDOW_START, WINDOW_END, _schedule())
         s = res.sessions["s3"]
-        assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 50)
+        assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 50, tzinfo=LOCAL_TZ)
         assert s.fallback_reason == "HTTP 400"
 
     def test_remote_only_session(self):
         lines = [
-            "2026-08-02 14:00:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
-            "from=local-qwen3, to=opencode-go-deepseek, reason=warm_cache_bypass",
+            ("2026-08-02 14:00:00,000 - INFO - Fallback triggered for model=v1/chat/completions, "
+                "from=local-qwen3, to=opencode-go-deepseek, reason=warm_cache_bypass"),
             "2026-08-02 14:00:02,000 - INFO - Stream started: provider=opencode-go model=deepseek-v4-flash session=s4 request=[]",
             "2026-08-02 14:00:05,000 - INFO - Stream finished: reason=stop tokens=950/200/1150 session=s4 provider=opencode-go model=deepseek-v4-flash request=[]",
         ]
@@ -242,7 +245,7 @@ class TestSessionAggregation:
         s = res.sessions["s4"]
         assert s.initial_provider == "opencode-go"
         assert s.initial_model == "deepseek-v4-flash"
-        assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 0)
+        assert s.remote_move_time == datetime(2026, 8, 2, 14, 0, 0, tzinfo=LOCAL_TZ)
         assert s.fallback_reason == "warm_cache_bypass"
         assert s.local_requests == 0
         assert s.remote_requests == 1
@@ -278,7 +281,7 @@ class TestSessionAggregation:
         assert "span" in res.sessions
         s = res.sessions["span"]
         # Only in-window events count: start = first in-window stream.
-        assert s.start == datetime(2026, 8, 2, 14, 0, 10)
+        assert s.start == datetime(2026, 8, 2, 14, 0, 10, tzinfo=LOCAL_TZ)
         assert s.messages == 1
         assert s.start_context_size == 1300
 
@@ -295,8 +298,8 @@ class TestSessionAggregation:
         lines = [fixtures.FALLBACK_CONCURRENCY, fixtures.FALLBACK_WARM_CACHE]
         res = aggregation.aggregate(
             _events(lines),
-            datetime(2026, 8, 2, 13, 0),
-            datetime(2026, 8, 2, 15, 0),
+            datetime(2026, 8, 2, 13, 0, tzinfo=LOCAL_TZ),
+            datetime(2026, 8, 2, 15, 0, tzinfo=LOCAL_TZ),
             _schedule(),
         )
         assert len(res.fallback_events) == 2
@@ -325,8 +328,8 @@ class TestSessionAggregation:
         res = aggregation.aggregate(ev1 + ev2, WINDOW_START, WINDOW_END, _schedule())
         s = res.sessions["multi"]
         assert s.messages == 1
-        assert s.start == datetime(2026, 8, 2, 14, 0, 5)
-        assert s.end == datetime(2026, 8, 2, 14, 0, 10)
+        assert s.start == datetime(2026, 8, 2, 14, 0, 5, tzinfo=LOCAL_TZ)
+        assert s.end == datetime(2026, 8, 2, 14, 0, 10, tzinfo=LOCAL_TZ)
         assert s.start_context_size == 200
         assert s.max_context_size == 200
 
@@ -335,8 +338,8 @@ class TestSessionAggregation:
         night_line = "2026-08-02 23:59:30,000 - INFO - Stream started: provider=local model=Qwen3 session=night1 request=[]"
         res = aggregation.aggregate(
             _events([day_line, night_line]),
-            datetime(2026, 8, 2, 0, 0),
-            datetime(2026, 8, 3, 0, 0),
+            datetime(2026, 8, 2, 0, 0, tzinfo=LOCAL_TZ),
+            datetime(2026, 8, 3, 0, 0, tzinfo=LOCAL_TZ),
             _schedule(),
         )
         assert res.sessions["day1"].bucket == "day"
@@ -368,12 +371,12 @@ class TestBucketing:
     @pytest.mark.parametrize(
         "ts,expected_label",
         [
-            (datetime(2026, 8, 2, 0, 0, 0), "night"),
-            (datetime(2026, 8, 2, 9, 59, 59), "night"),
-            (datetime(2026, 8, 2, 10, 0, 0), "day"),
-            (datetime(2026, 8, 2, 23, 58, 59), "day"),
-            (datetime(2026, 8, 2, 23, 59, 0), "night"),
-            (datetime(2026, 8, 2, 23, 59, 59), "night"),
+            (datetime(2026, 8, 2, 0, 0, 0, tzinfo=LOCAL_TZ), "night"),
+            (datetime(2026, 8, 2, 9, 59, 59, tzinfo=LOCAL_TZ), "night"),
+            (datetime(2026, 8, 2, 10, 0, 0, tzinfo=LOCAL_TZ), "day"),
+            (datetime(2026, 8, 2, 23, 58, 59, tzinfo=LOCAL_TZ), "day"),
+            (datetime(2026, 8, 2, 23, 59, 0, tzinfo=LOCAL_TZ), "night"),
+            (datetime(2026, 8, 2, 23, 59, 59, tzinfo=LOCAL_TZ), "night"),
         ],
     )
     def test_bucket_boundaries(self, ts, expected_label):
@@ -399,9 +402,9 @@ class TestBucketing:
         assert sch.day_slots == 4
         assert sch.night_slots == 12
         # 10:00-12:00 is the only period with 4 slots -> day
-        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 11, 0)).label == "day"
-        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 13, 0)).label == "night"
-        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 1, 0)).label == "night"
+        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 11, 0, tzinfo=LOCAL_TZ)).label == "day"
+        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 13, 0, tzinfo=LOCAL_TZ)).label == "night"
+        assert bucketing.bucket_for_time(sch, datetime(2026, 8, 2, 1, 0, tzinfo=LOCAL_TZ)).label == "night"
 
     def test_equal_slot_counts_all_day(self):
         sch = bucketing.schedule_from_entries([("10:00", 6), ("23:59", 6)])
@@ -409,7 +412,7 @@ class TestBucketing:
         assert sch.night_slots is None
 
     def test_minute_of_day_uses_fractional_minutes(self):
-        assert bucketing.minute_of_day(datetime(2026, 8, 2, 23, 58, 30)) == pytest.approx(1438.5)
+        assert bucketing.minute_of_day(datetime(2026, 8, 2, 23, 58, 30, tzinfo=LOCAL_TZ)) == pytest.approx(1438.5)
 
 
 # ---------------------------------------------------------------------------

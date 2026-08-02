@@ -154,8 +154,10 @@ def format_human(data: dict[str, Any]) -> str:
         f"  CPU count : {data['cpu_count']}",
         f"  Load      : {load['1min']:.2f} (1m) {load['5min']:.2f} (5m) {load['15min']:.2f} (15m)",
         f"  Swap      : {swap_gib:.2f} GiB used / {swap_total_gib:.2f} GiB total",
-        f"  Processes : pi={proc['pi']} node={proc['node']} vitest={proc['vitest']} "
-        f"wl_sync={proc['wl_sync']} audit={proc['audit']}",
+        (
+            f"  Processes : pi={proc['pi']} node={proc['node']} vitest={proc['vitest']} "
+            f"wl_sync={proc['wl_sync']} audit={proc['audit']}"
+        ),
     ]
     return "\n".join(lines)
 

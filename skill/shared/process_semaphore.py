@@ -43,10 +43,17 @@ from __future__ import annotations
 import errno
 import os
 import re
+import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 from typing import Any
+
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    Self = Any  # pragma: no cover
 
 try:
     import fcntl
@@ -205,9 +212,14 @@ class Semaphore:
     # Context manager
     # ------------------------------------------------------------------
 
-    def __enter__(self) -> "Semaphore":
+    def __enter__(self) -> Self:
         self.acquire()
         return self
 
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
+    ) -> None:
         self.release()
