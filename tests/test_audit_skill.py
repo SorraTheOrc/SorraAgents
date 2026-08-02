@@ -21,10 +21,16 @@ def test_persist_audit_calls_wl_update_with_report():
 
     rc = persist_audit("SA-TEST", "Ready to close: Yes\nDetails", runner=fake_runner)
     assert rc == 0
-    # persist_audit now does three wl calls: audit-set + show + update --audit-text
-    assert len(calls) == 3
-    cmd = calls[0]
-    # ensure wl audit-set was invoked
+    # persist_audit now does four wl calls for a 'Ready to close: Yes'
+    # report: show (priority check) + audit-set + show (stage) +
+    # update --audit-text
+    assert len(calls) == 4
+    # first call: wl show for the priority check
+    cmd0 = calls[0]
+    assert cmd0[:3] == ["wl", "show", "SA-TEST"]
+    assert "--json" in cmd0
+    # second call: wl audit-set
+    cmd = calls[1]
     assert cmd[:3] == ["wl", "audit-set", "SA-TEST"]
     assert "--ready-to-close" in cmd
     assert "yes" in cmd
@@ -33,11 +39,11 @@ def test_persist_audit_calls_wl_update_with_report():
     assert cmd[raw_idx + 1] == "Ready to close: Yes\nDetails"
     assert cmd[-1] == "--json"
     # ensure wl show was invoked for stage preservation
-    cmd2 = calls[1]
+    cmd2 = calls[2]
     assert cmd2[:3] == ["wl", "show", "SA-TEST"]
     assert "--json" in cmd2
     # ensure wl update --audit-text was invoked
-    cmd3 = calls[2]
+    cmd3 = calls[3]
     assert cmd3[:3] == ["wl", "update", "SA-TEST"]
     assert "--audit-text" in cmd3
     assert cmd3[-1] == "--json"

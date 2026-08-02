@@ -87,6 +87,62 @@ def check_report_identity(issue_id: str, report_text: str) -> tuple[str | None, 
     return None, None
 
 
+def _maybe_lower_priority(issue_id: str, wl_bin: str, runner: Callable,
+                        worklog_dir: str | None, ready_to_close: bool) -> None:
+    """Best-effort: lower a critical work item's priority to high.
+
+    When *ready_to_close* is True and the work item currently carries
+    ``critical`` priority, issue ``wl update <id> --priority high --json``
+    so the item leaves the critical queue once the audit says it is ready
+    to close (SA-0MSBRMXS800625RR).
+
+    The adjustment is strictly best-effort: any failure (unparseable wl
+    output, non-zero exit, unexpected JSON shape) logs a warning to stderr
+    and returns without blocking audit persistence.
+    """
+    if not ready_to_close:
+        return
+
+    try:
+        fetch_cmd = [wl_bin, "show", issue_id, "--json"]
+        if worklog_dir:
+            fetch_cmd[1:1] = ["--worklog-dir", worklog_dir]
+        fetch_proc = runner(fetch_cmd, check=False, text=True, capture_output=True)
+        if getattr(fetch_proc, "returncode", 1) != 0:
+            stderr = getattr(fetch_proc, "stderr", "") or ""
+            print(
+                f"wl show failed while checking priority (rc={getattr(fetch_proc, 'returncode', 'unknown')}): "
+                f"{stderr.strip()}",
+                file=sys.stderr,
+            )
+            return
+        data = json.loads(getattr(fetch_proc, "stdout", "") or "{}")
+        wi = data.get("workItem", {}) if isinstance(data, dict) else {}
+        priority = (wi.get("priority") or "").strip().lower()
+    except (json.JSONDecodeError, KeyError, TypeError):
+        print("Failed to read priority from wl show output; skipping priority adjustment", file=sys.stderr)
+        return
+
+    if priority != "critical":
+        return
+
+    update_cmd = [wl_bin, "update", issue_id, "--priority", "high", "--json"]
+    if worklog_dir:
+        update_cmd[1:1] = ["--worklog-dir", worklog_dir]
+    try:
+        update_proc = runner(update_cmd, check=False, text=True, capture_output=True)
+    except Exception as exc:  # noqa: BLE001 - best-effort; never block persistence
+        print(f"wl update --priority high failed: {exc}", file=sys.stderr)
+        return
+    if getattr(update_proc, "returncode", 1) != 0:
+        stderr = getattr(update_proc, "stderr", "") or ""
+        print(
+            f"wl update --priority high failed (rc={getattr(update_proc, 'returncode', 'unknown')}): "
+            f"{stderr.strip()}",
+            file=sys.stderr,
+        )
+
+
 def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
                   runner: Callable = None, _fail: bool = False,  # noqa: RUF013
                   worklog_dir: str | None = None) -> int:
@@ -107,6 +163,10 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     that names other work-item IDs but not the target) is rejected with a
     clear error and a non-zero exit code.  A report naming no work-item ID
     is accepted with a warning (conservative).
+
+    When the report says 'Ready to close: Yes', a work item carrying
+    ``critical`` priority is first lowered to ``high`` (best-effort) so it
+    leaves the critical queue before the audit is persisted (SA-0MSBRMXS800625RR).
     """
     identity_error, identity_warning = check_report_identity(issue_id, report_text)
     if identity_warning:
@@ -126,6 +186,10 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
 
     ready = "yes" if _extract_ready_to_close(report_text) else "no"
     summary = "Audit result persisted via persist_audit.py"
+
+    # Lower critical → high priority before persisting when the audit
+    # verdict is 'Ready to close: Yes' (best-effort; AC1-AC5).
+    _maybe_lower_priority(issue_id, wl_bin, runner, worklog_dir, ready == "yes")
 
     # Build the command as an argv list to avoid shell quoting pitfalls.
     cmd = [
