@@ -1891,3 +1891,105 @@ class TestVerdictDrivenStatusLifecycle:
             )
         assert rc == 0
         assert updates == []
+
+
+# ===========================================================================
+# Phase 2 prompt scanning-guidance tests (SA-0MSBR0E8Y0022Z4V)
+#
+# These tests encode the prompt-guidance wiring delivered by
+# SA-0MSBR0SRK0035HB1: Phase 2 prompts must reference the bounded scan.py
+# helper and forbid unbounded recursive grep / repo-root scans.
+# ===========================================================================
+
+
+class TestPhase2ScanningGuidance:
+    """Phase 2 prompts contain scanning guidance (scan.py + no unbounded grep)."""
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text",
+                  verdict: str = "met") -> dict:
+        return {"index": index, "text": text, "verdict": verdict, "evidence": ""}
+
+    def _capture_prompt(self, children: list[dict] | None = None,
+                        ac_count: int = 1) -> str:
+        """Run _run_phase2_deep_analysis and return the parent prompt text."""
+        issue = self._make_issue()
+        acs = [self._make_ac(i) for i in range(ac_count)]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log"
+        ) as mock_call:
+            mock_call.return_value = {"extracted_text": "[]"}
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, children or [], "test-model",
+            )
+        parent_call = [
+            call for call in mock_call.call_args_list
+            if call[0][1] == "phase2_deep"
+        ]
+        assert parent_call
+        return parent_call[0][0][2]  # prompt is the 3rd positional arg
+
+    def test_parent_prompt_references_scan_helper(self) -> None:
+        """The parent phase2_deep prompt references scan.py."""
+        prompt = self._capture_prompt()
+        assert "scan.py" in prompt
+
+    def test_parent_prompt_forbids_unbounded_recursive_grep(self) -> None:
+        """The parent prompt forbids unbounded grep -r over repo root."""
+        prompt = self._capture_prompt()
+        assert "grep -r" in prompt
+        assert "unbounded" in prompt
+
+    def test_child_prompt_references_scan_helper(self) -> None:
+        """The child phase2_child prompt references scan.py."""
+        child = {
+            "id": "CHILD-1", "title": "Child", "stage": "in_progress",
+            "status": "open",
+            "ac_results": [
+                {"index": 0, "text": "Child AC", "verdict": "met", "evidence": ""}
+            ],
+        }
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log"
+        ) as mock_call:
+            mock_call.return_value = {"extracted_text": "[]"}
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model",
+            )
+        child_call = [
+            call for call in mock_call.call_args_list
+            if call[0][1].startswith("phase2_child")
+        ]
+        assert child_call
+        prompt = child_call[0][0][2]
+        assert "scan.py" in prompt
+
+    def test_child_prompt_forbids_repo_root_scan(self) -> None:
+        """The child prompt forbids unbounded repo-root exploration."""
+        child = {
+            "id": "CHILD-1", "title": "Child", "stage": "in_progress",
+            "status": "open",
+            "ac_results": [
+                {"index": 0, "text": "Child AC", "verdict": "met", "evidence": ""}
+            ],
+        }
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log"
+        ) as mock_call:
+            mock_call.return_value = {"extracted_text": "[]"}
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model",
+            )
+        child_call = [
+            call for call in mock_call.call_args_list
+            if call[0][1].startswith("phase2_child")
+        ]
+        prompt = child_call[0][0][2]
+        assert "grep" in prompt
+        assert "unbounded" in prompt or "explore the whole repository" in prompt
