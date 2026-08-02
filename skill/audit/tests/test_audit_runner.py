@@ -8,6 +8,7 @@ Tests cover:
 """  # noqa: EXE001
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 import sys
@@ -24,6 +25,27 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from skill.audit.scripts import audit_runner
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _free_audit_slot():
+    """Neutralize the host-wide audit semaphore for deterministic unit tests.
+
+    ``_call_pi`` acquires the real cross-process audit semaphore before
+    launching the (mocked) subprocess. Under concurrent audit load the
+    semaphore can saturate, making these timing-path unit tests flaky (see
+    SA-0MSCDC4750019G9Y, SA-0MSCDC76A007JCJK). Replace it with a
+    null-context so the mocked return paths are exercised directly.
+
+    The real semaphore behavior is covered separately by
+    ``test_audit_runner_concurrency.py``.
+    """
+    with mock.patch.object(
+        audit_runner, "_acquire_audit_slot", return_value=contextlib.nullcontext()
+    ):
+        yield
 
 # ===========================================================================
 # _detect_project_root unit tests
