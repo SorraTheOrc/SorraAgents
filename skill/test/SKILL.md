@@ -47,13 +47,13 @@ Workflow
 ### 1. Run the full suite in quiet mode
 
 ```bash
-python3 skill/test/scripts/run_tests.py --json
+python3 ./scripts/run_tests.py --json
 ```
 
 The runner executes, in quiet mode:
 
 - **pytest**: `pytest -q -r a --disable-warnings` (canonicalized via
-  `canonicalize_quiet_test_command` from `skill/test_runner.py`)
+  `canonicalize_quiet_test_command` from `../test_runner.py`)
 - **Node**: `node --test tests/node tests/cli tests/unit` (or
   `npm --silent test` per suite directory when an npm test script exists)
 - **bats**: `bats tests/install-worklog-plugin.bats`
@@ -67,7 +67,7 @@ For each failure record, invoke the triage helper to create or link a critical
 `test-failure` work item (no duplicates):
 
 ```bash
-python3 skill/triage/scripts/check_or_create.py '{"test_name":"<test_name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<current-id>"}'
+python3 ../triage/scripts/check_or_create.py '{"test_name":"<test_name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<current-id>"}'
 ```
 
 - If no `test-failure` items exist after triage and the suite is green, the
@@ -82,7 +82,7 @@ Perform code-path analysis — what the test actually asserts and exercises —
 using the evaluator:
 
 ```bash
-python3 skill/test/scripts/evaluate_usefulness.py <test-file> --json
+python3 ./scripts/evaluate_usefulness.py <test-file> --json
 ```
 
 The evaluator detects the anti-patterns from the

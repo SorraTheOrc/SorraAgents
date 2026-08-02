@@ -272,15 +272,15 @@ implementation code. Non-Phase-2 calls (Phase 1 screening, project-level audit)
 remain in bare LLM pipe mode (`enable_tools=False`).
 
 **Bounded scanning (Phase 2):** The Phase 2 prompts include a **SCANNING** block
-that directs agents to the bounded helper `skill/audit/scripts/scan.py` instead
+that directs agents to the bounded helper `./scripts/scan.py` instead
 of improvised recursive greps:
 
-- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>`
+- Worklog lookups: `python3 ./scripts/scan.py find-workitem <id>`
   (delegates to `wl search`; never greps the `.worklog/` tree).
-- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py`
+- Code search: `python3 ./scripts/scan.py search-code <pattern> --path <dir> --type py`
   (bounded rg with prunes for node_modules/.git/.worklog/.audit_debug and
   `audit_debug_*.jsonl`, max file size, explicit path).
-- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`
+- File listing: `python3 ./scripts/scan.py list-files --path <dir> --type py`
   (maxdepth 2, same prunes).
 
 Unbounded recursive greps over the repo root or `.worklog/` (e.g.
@@ -293,7 +293,7 @@ pattern catalogue and benchmark.
 are written only on parse_failure/provider_error or explicit `--debug-log`, live
 under `~/.audit_debug/<project>/` (outside `.worklog/` and the repo tree, so
 scans never walk them), and are swept by
-`skill/audit/scripts/cleanup_debug_logs.py` (dry-run default, `--apply`,
+`./scripts/cleanup_debug_logs.py` (dry-run default, `--apply`,
 `--older-than N` days, default 14). Successful audit runs delete their own
 debug file; failed runs keep full-content forensics. Never read them back
 programmatically — use `scan.py find-workitem` / `wl search` instead.
