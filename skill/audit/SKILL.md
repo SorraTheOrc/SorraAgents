@@ -231,13 +231,13 @@ This means the runner can be launched from the skill install directory (or any
 other cwd) and still audit items in a *different* project's worklog, e.g.:
 
 ```bash
-python3 skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN --do-not-persist
+python3 ./scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN --do-not-persist
 ```
 
 If auto-resolution cannot determine the target store, pass an explicit dir:
 
 ```bash
-python3 skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN \
+python3 ./scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN \
     --worklog-dir /path/to/project/.worklog
 ```
 
