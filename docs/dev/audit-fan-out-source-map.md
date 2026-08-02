@@ -66,19 +66,22 @@ Measured impact on the rgardler workstation (16-core, 30 GiB RAM,
 - **SorraAgents:** pytest-based; no vitest config exists — excluded from
   vitest capping.
 
-## 4. `wl sync` — no synchronization between sessions
+## 4. `wl sync` — serialized via process-level file lock
 
 - **File:** Worklog CLI (`worklog@1.0.6`), source
   `/home/rgardler/projects/ContextHub/src/commands/sync.ts`, shipped to
   `/home/rgardler/projects/ContextHub/dist/cli.js`, installed globally as
   `/usr/local/lib/node_modules/worklog` (symlink).
-- **Line refs:** sync command at `src/commands/sync.ts` L350+; a per-file
-  advisory lock (`withFileLock`) protects the JSONL data file itself, but
-  **no process-level lock prevents concurrent `wl sync` runs** from
-  different sessions (pull/merge/push steps still race).
-- **Mechanism:** multiple agent sessions each call `wl sync`; each run
-  spawns git subprocesses and rewrites the worklog data file, compounding
-  load and risking lock contention.
+- **Line refs:** sync command at `src/commands/sync.ts` L350+; the entire
+  pull/merge/push runs inside `withFileLock(getLockPathForJsonl(...))`
+  (L367–L390) — a process-level `O_EXCL` mutex on
+  `.worklog/worklog-data.jsonl.lock` with stale-lock cleanup
+  (`src/file-lock.ts`). `--if-idle` skips (exit 0, `skipped: true`) when
+  another sync holds the lock; otherwise a second sync waits up to 30 s then
+  fails with a clear message.
+- **Mechanism:** at most one sync runs per worklog at a time across all
+  sessions; concurrent `wl sync` invocations serialize (verified by
+  `tests/cli/sync-concurrent.test.ts`).
 
 ## 5. Batch skills: sequential per item, heavy children per step
 
@@ -109,7 +112,7 @@ Measured impact on the rgardler workstation (16-core, 30 GiB RAM,
 |--------|---------|--------|
 | 1–2 (audit runner) | Shared flock-based semaphore around pi spawns + child triggers, ceiling via `AUDIT_MAX_CONCURRENCY` | Child SA-0MSAK2P3J0065POO / SA-0MSAK2SNN005HCM5 |
 | 3 (vitest) | `maxWorkers: 4` cap on Tableau-Card-Engine unit project (added, mirrors ContextHub); ContextHub already capped (`maxWorkers: 4`, `singleFork: true`); SorraAgents is pytest-based (no vitest) | Child SA-0MSAK2ZH6009Z3TW — DONE |
-| 4 (`wl sync`) | Serialize concurrent `wl sync` via shared semaphore/lock | Child SA-0MSAK2W0F0027ZP7 |
+| 4 (`wl sync`) | Process-level file lock (O_EXCL mutex) serializes concurrent syncs; `--if-idle` skips; stale-lock cleanup | Child SA-0MSAK2W0F0027ZP7 — DONE |
 | 5 (batch overlap) | Bounded via per-item controls above + configurable ceilings | Covered by parent |
 | 6 (operator sessions) | Documented; not directly controllable | N/A |
 

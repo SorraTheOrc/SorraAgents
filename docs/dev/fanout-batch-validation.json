@@ -1,0 +1,105 @@
+{
+  "batch": {
+    "n": 8,
+    "ok": true,
+    "elapsed_seconds": 13.04
+  },
+  "before": {
+    "timestamp": "2026-08-02T01:11:09Z",
+    "host": "rgardler-AI-Laptop",
+    "cpu_count": 16,
+    "load": {
+      "1min": 9.49853515625,
+      "5min": 15.19091796875,
+      "15min": 24.2314453125
+    },
+    "swap": {
+      "total": 8589930496,
+      "used": 3606663168,
+      "free": 4983267328
+    },
+    "processes": {
+      "pi": 6,
+      "node": 36,
+      "vitest": 3,
+      "wl_sync": 0,
+      "audit": 0
+    }
+  },
+  "after": {
+    "timestamp": "2026-08-02T01:11:23Z",
+    "host": "rgardler-AI-Laptop",
+    "cpu_count": 16,
+    "load": {
+      "1min": 10.17236328125,
+      "5min": 15.06591796875,
+      "15min": 24.04541015625
+    },
+    "swap": {
+      "total": 8589930496,
+      "used": 3606663168,
+      "free": 4983267328
+    },
+    "processes": {
+      "pi": 6,
+      "node": 36,
+      "vitest": 3,
+      "wl_sync": 0,
+      "audit": 0
+    }
+  },
+  "peak": {
+    "processes": {
+      "pi": 8,
+      "node": 50,
+      "vitest": 3,
+      "wl_sync": 0,
+      "audit": 8,
+      "batch_pi": 2
+    },
+    "load": {
+      "1min": 10.623046875,
+      "5min": 15.236328125,
+      "15min": 24.1494140625
+    }
+  },
+  "results": [
+    {
+      "exit_code": 0,
+      "stderr_tail": "utput for AC evaluation \u2014 falling back to 'partial' verdict\nPhase 1 passed: running Phase 2 deep code analysis...\nPer-call timing: issue_id=F7-0MSB3TOBZ0057S93 context=phase2_deep elapsed_seconds=2.44"
+    },
+    {
+      "exit_code": 0,
+      "stderr_tail": "utput for AC evaluation \u2014 falling back to 'partial' verdict\nPhase 1 passed: running Phase 2 deep code analysis...\nPer-call timing: issue_id=F7-0MSB3TOMW007WF9P context=phase2_deep elapsed_seconds=7.53"
+    },
+    {
+      "exit_code": 0,
+      "stderr_tail": "utput for AC evaluation \u2014 falling back to 'partial' verdict\nPhase 1 passed: running Phase 2 deep code analysis...\nPer-call timing: issue_id=F7-0MSB3TOW90020CL2 context=phase2_deep elapsed_seconds=1.24"
+    },
+    {
+      "exit_code": 0,
+      "stderr_tail": "utput for AC evaluation \u2014 falling back to 'partial' verdict\nPhase 1 passed: running Phase 2 deep code analysis...\nPer-call timing: issue_id=F7-0MSB3TP520056F88 context=phase2_deep elapsed_seconds=1.24"
+    },
+    {
+      "exit_code": 0,
+      "stderr_tail": "utput for AC evaluation \u2014 falling back to 'partial' verdict\nPhase 1 passed: running Phase 2 deep code analysis...\nPer-call timing: issue_id=F7-0MSB3TPEF004UDK3 context=phase2_deep elapsed_seconds=8.69"
+    },
+    {
+      "exit_code": 0,
+      "stderr_tail": "utput for AC evaluation \u2014 falling back to 'partial' verdict\nPhase 1 passed: running Phase 2 deep code analysis...\nPer-call timing: issue_id=F7-0MSB3TPPO005PK8Y context=phase2_deep elapsed_seconds=1.23"
+    },
+    {
+      "exit_code": 0,
+      "stderr_tail": "utput for AC evaluation \u2014 falling back to 'partial' verdict\nPhase 1 passed: running Phase 2 deep code analysis...\nPer-call timing: issue_id=F7-0MSB3TPZK005TFXA context=phase2_deep elapsed_seconds=1.29"
+    },
+    {
+      "exit_code": 0,
+      "stderr_tail": "utput for AC evaluation \u2014 falling back to 'partial' verdict\nPhase 1 passed: running Phase 2 deep code analysis...\nPer-call timing: issue_id=F7-0MSB3TQA40069354 context=phase2_deep elapsed_seconds=1.25"
+    }
+  ],
+  "success": true,
+  "config": {
+    "max_concurrency": 2,
+    "n_items": 8
+  }
+}
