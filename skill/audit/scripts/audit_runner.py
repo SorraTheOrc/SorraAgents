@@ -654,6 +654,30 @@ def _resolve_phase2_parallelism() -> int:
     return _PHASE2_DEFAULT_PARALLELISM
 
 
+AUDIT_PHASE2_BATCH_ENV = "AUDIT_PHASE2_BATCH"
+"""Environment variable enabling Phase 2 batch deep analysis (P6).
+
+When set to a truthy value (and ``--batch-phase2`` is not passed), Phase 2
+folds the parent ACs and each pending child's ACs into ONE indexed pi call
+(``phase2_batch``), falling back to the per-child path on failure. This
+eliminates the N+1 Phase 2 calls for parents with many children.
+"""
+
+
+def _phase2_batch_enabled(cli_value: bool | None = None) -> bool:
+    """Resolve whether Phase 2 batch deep analysis is enabled.
+
+    Precedence:
+      1. ``--batch-phase2`` CLI flag (explicit override)
+      2. ``AUDIT_PHASE2_BATCH`` environment variable (truthy)
+      3. ``False`` (default — preserves the existing per-child call pattern)
+    """
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get(AUDIT_PHASE2_BATCH_ENV, "")
+    return env_value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _normalize_model_source(source: str | None) -> str:
     """Normalize a model_source value to a valid value (remote|local)."""
     if not source:
@@ -2287,6 +2311,182 @@ def _deep_analyze_child(
     return ci, updated, False
 
 
+def _apply_deep_verdicts(
+    initial_acs: list[dict], reviewed: dict[int, dict],
+) -> list[dict]:
+    """Apply Phase 2 deep-analysis verdicts to a list of ACs.
+
+    Standard merge semantics shared by the parent and child Phase 2 paths:
+      - Phase 1 met + Phase 2 met      -> met (deep evidence wins)
+      - Phase 1 met + Phase 2 not met  -> downgrade to the deep verdict
+      - otherwise                       -> deep verdict (deep override)
+    Entries absent from *reviewed* keep their initial verdict unchanged.
+    """
+    updated = list(initial_acs)
+    for i in range(len(updated)):
+        item = reviewed.get(i, {})
+        deep_verdict = item.get("verdict", "")
+        deep_evidence = item.get("evidence", "")
+        if not deep_verdict:
+            continue
+        initial = updated[i]["verdict"]
+        if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
+            updated[i] = {
+                "text": updated[i]["text"],
+                "verdict": VERDICT_MET,
+                "evidence": deep_evidence or updated[i].get("evidence", ""),
+            }
+        elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
+            updated[i] = {
+                "text": updated[i]["text"],
+                "verdict": deep_verdict,
+                "evidence": (
+                    f"Phase 1: {updated[i].get('evidence', '')}; "
+                    f"Phase 2 deep analysis: {deep_evidence}"
+                ),
+            }
+        else:
+            updated[i] = {
+                "text": updated[i]["text"],
+                "verdict": deep_verdict,
+                "evidence": deep_evidence or updated[i].get("evidence", ""),
+            }
+    return updated
+
+
+def _run_batch_phase2(
+    issue: dict,
+    ac_results: list[dict],
+    pending: list[tuple[int, dict]],
+    updated_children: list[dict],
+    resolved_model: str,
+    pi_bin: str,
+    debug_log: str | None,
+    timeout: int | None,
+    runner: Runner,
+) -> tuple[list[dict], list[dict], bool] | None:
+    """Attempt Phase 2 batch deep analysis (P6).
+
+    Folds the parent ACs and each pending child's ACs into ONE indexed list
+    and makes a single ``phase2_batch`` pi call, then routes the indexed
+    verdicts back to the parent and per-child AC lists.
+
+    Returns ``(updated_ac, updated_children, True)`` on success, or ``None``
+    when the batch call fails (RuntimeError, timeout, provider error, or
+    unparseable output) so the caller falls back to the existing per-child
+    deep-analysis path.
+    """
+    ac_list: list[dict] = []
+    for i, r in enumerate(ac_results):
+        ac_list.append({
+            "index": i,
+            "scope": "parent",
+            "local_index": i,
+            "text": r["text"],
+            "initial_verdict": r["verdict"],
+        })
+    next_index = len(ac_results)
+    child_ranges: list[tuple[int, int, int]] = []
+    child_manifest_blocks: list[tuple[int, dict, str]] = []
+    for ci, child in pending:
+        child_acs = child.get("ac_results", [])
+        start = next_index
+        for j, r in enumerate(child_acs):
+            ac_list.append({
+                "index": start + j,
+                "scope": f"child:{ci}",
+                "local_index": j,
+                "text": r["text"],
+                "initial_verdict": r["verdict"],
+            })
+        next_index += len(child_acs)
+        child_ranges.append((ci, start, len(child_acs)))
+        child_manifest_blocks.append((ci, child, _build_file_scope_manifest(
+            child, child_acs, runner=runner,
+        )))
+
+    parent_manifest = _build_file_scope_manifest(issue, ac_results, runner=runner)
+
+    batch_prompt = (
+        "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS — BATCH] "
+        "Do NOT close, modify, create, or delete any work items. "
+        "Return ONLY a structured JSON array.\n\n"
+        "Deep code analysis for the parent work item and its active children. "
+        "The criteria below form ONE indexed list: the parent's acceptance "
+        "criteria first, then each child's criteria in order. Return one "
+        "object per criterion with keys 'index' (the index given here), "
+        "'verdict' (met/unmet/partial/adjusted) and 'evidence' (a file:line "
+        "reference).\n\n"
+        "PARENT FILE SCOPE — Read ONLY the files listed below; do not explore "
+        "the whole repository.\n\n"
+        f"{parent_manifest}\n\n"
+    )
+    for _ci, child, manifest in child_manifest_blocks:
+        batch_prompt += (
+            f"CHILD FILE SCOPE — {child.get('title', '')} "
+            f"({child.get('id', '')}):\n{manifest}\n\n"
+        )
+    batch_prompt += (
+        "SCANNING — When you need to look something up, use the bounded helpers:\n"
+        "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
+        "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
+        "- NEVER run unbounded recursive grep over the repo root or .worklog/.\n\n"
+        "For each criterion, read the actual implementation files and verify "
+        "the code genuinely satisfies the stated requirement. Provide a "
+        "specific file:line reference as evidence.\n\n"
+        "Verdict guidance: 'met' only if the code genuinely satisfies the "
+        "criterion; 'unmet' if not satisfied at all; 'partial' if partially "
+        "satisfied; 'adjusted' if the implementation differs from the original "
+        "spec but the user story intent is preserved.\n\n"
+        f"Criteria: {json.dumps(ac_list)}"
+    )
+
+    try:
+        result = _call_pi_and_maybe_log(
+            issue.get("id", ""), "phase2_batch", batch_prompt,
+            model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+            enable_tools=True, timeout=timeout,
+            max_retries=_PHASE2_MAX_RETRIES,
+        )
+    except RuntimeError:
+        return None
+
+    if result.get("_timeout") or result.get("_provider_error"):
+        return None
+
+    raw = (
+        result.get("extracted_text", "")
+        or result.get("evidence", "")
+        or result.get("text", "")
+    )
+    batch = _extract_json_array(raw)
+    if batch is None:
+        try:
+            batch = json.loads(raw)
+        except json.JSONDecodeError:
+            batch = []
+    if not isinstance(batch, list):
+        return None
+
+    reviewed = {
+        item["index"]: item
+        for item in batch
+        if isinstance(item, dict) and "index" in item
+    }
+
+    parent_reviewed = {i: reviewed.get(i, {}) for i in range(len(ac_results))}
+    updated_ac = _apply_deep_verdicts(ac_results, parent_reviewed)
+
+    for ci, start, count in child_ranges:
+        child_reviewed = {j: reviewed.get(start + j, {}) for j in range(count)}
+        child_acs = updated_children[ci].get("ac_results", [])
+        new_child = dict(updated_children[ci])
+        new_child["ac_results"] = _apply_deep_verdicts(child_acs, child_reviewed)
+        updated_children[ci] = new_child
+
+    return updated_ac, updated_children, True
+
+
 def _run_phase2_deep_analysis(
     issue: dict,
     ac_results: list[dict],
@@ -2297,6 +2497,7 @@ def _run_phase2_deep_analysis(
     script_failure_callback=None,
     timeout: int | None = None,
     runner: Runner | None = None,
+    batch_phase2: bool = False,
 ) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
@@ -2315,6 +2516,33 @@ def _run_phase2_deep_analysis(
     """
     if runner is None:
         runner = _default_runner
+
+    # Active children needing Phase 2 deep analysis (shared by the batch
+    # path and the per-child path below).
+    # - Completed/done children are skipped (already closed).
+    # - child_audit_ready=True children are skipped (P2 reuse — their own
+    #   fresh audit already verified the code).
+    # - Children without ac_results are skipped (nothing to verify).
+    updated_children = list(child_results)
+    pending: list[tuple[int, dict]] = []
+    for ci, child in enumerate(updated_children):
+        if child.get("status") == "completed" and child.get("stage") == "done":
+            continue
+        if child.get("child_audit_ready") is True:
+            continue
+        if not child.get("ac_results"):
+            continue
+        pending.append((ci, child))
+
+    # Batch mode (P6): fold parent + pending child ACs into one indexed
+    # call. On any failure fall back to the per-child path below.
+    if batch_phase2 and pending:
+        batch_outcome = _run_batch_phase2(
+            issue, ac_results, pending, updated_children,
+            resolved_model, pi_bin, debug_log, timeout, runner,
+        )
+        if batch_outcome is not None:
+            return batch_outcome
 
     file_scope = _build_file_scope_manifest(issue, ac_results, runner=runner)
 
@@ -2488,23 +2716,7 @@ def _run_phase2_deep_analysis(
                     }
 
     # Also run deep analysis on active children
-    updated_children = list(child_results)
     child_timeout_occurred = False
-
-    # Collect the (index, child) pairs that need parent deep analysis.
-    # - Completed/done children are skipped (already closed).
-    # - child_audit_ready=True children are skipped (P2 reuse — their own
-    #   fresh audit already verified the code).
-    # - Children without ac_results are skipped (nothing to verify).
-    pending: list[tuple[int, dict]] = []
-    for ci, child in enumerate(updated_children):
-        if child.get("status") == "completed" and child.get("stage") == "done":
-            continue
-        if child.get("child_audit_ready") is True:
-            continue
-        if not child.get("ac_results"):
-            continue
-        pending.append((ci, child))
 
     parallelism = _resolve_phase2_parallelism()
 
@@ -2556,7 +2768,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
               runner: Runner | None = None, json_mode: bool = False,
               debug_log: str | None = None,
               force: bool = False,
-              worklog_dir: str | None = None) -> int:
+              worklog_dir: str | None = None,
+              batch_phase2: bool = False) -> int:
     """Audit a single work item.
 
     The resolved model name and source are included as a metadata line
@@ -3128,6 +3341,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 script_failure_callback=_record_script_failure,
                 timeout=timeout,
                 runner=runner,
+                batch_phase2=batch_phase2,
             )
 
         # ------------------------------------------------------------------
@@ -3458,6 +3672,12 @@ def build_parser() -> argparse.ArgumentParser:
                              "audit children that would otherwise be skipped "
                              "(env: AUDIT_PARENT_TIMEOUT)"
                          ))
+    p_issue.add_argument("--batch-phase2", action="store_true",
+                         help=(
+                             "Enable Phase 2 batch deep analysis: fold the parent ACs and "
+                             "pending child ACs into ONE indexed pi call (env: "
+                             "AUDIT_PHASE2_BATCH; default off)"
+                         ))
     p_issue.add_argument("--do-not-persist", action="store_true",
                          help="Do not persist the audit report via wl update")
     p_issue.add_argument("--pi-bin", default="pi", help="Path to the pi binary (default: pi)")
@@ -3520,7 +3740,8 @@ def main(argv: list[str] | None = None) -> int:
                          model_source=args.model_source, json_mode=args.json,
                          debug_log=args.debug_log,
                          force=args.force,
-                         worklog_dir=args.worklog_dir)
+                         worklog_dir=args.worklog_dir,
+                         batch_phase2=_phase2_batch_enabled(args.batch_phase2))
     elif args.command == "project":
         return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
                            pi_bin=args.pi_bin, model=args.model,

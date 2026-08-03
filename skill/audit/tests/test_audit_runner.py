@@ -24,9 +24,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts import audit_runner
-
 import pytest
+
+from skill.audit.scripts import audit_runner
 
 
 @pytest.fixture(autouse=True)
@@ -2232,3 +2232,329 @@ class TestParentTimeoutGuardBehavior:
         ac = child["ac_results"][0]
         assert ac["verdict"] == "met"
         assert ac["text"] == "CAC1: child criterion"
+
+
+# ===========================================================================
+# Phase 2 batch deep analysis (SA-0MSAIY59V001KECF / P6)
+# ===========================================================================
+
+
+class TestPhase2BatchResolution:
+    """Tests for batch-mode enablement (env var / default)."""
+
+    def test_env_constant_defined(self):
+        """AC1: The AUDIT_PHASE2_BATCH env var constant is defined."""
+        assert audit_runner.AUDIT_PHASE2_BATCH_ENV == "AUDIT_PHASE2_BATCH"
+
+    def test_default_disabled(self):
+        """AC1/AC5: Batching is off by default (existing N+1 path preserved)."""
+        with mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            assert audit_runner._phase2_batch_enabled(None) is False
+
+    def test_env_enables(self):
+        """AC1: AUDIT_PHASE2_BATCH=1 enables batching."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PHASE2_BATCH_ENV: "1"},
+            clear=False,
+        ):
+            assert audit_runner._phase2_batch_enabled(None) is True
+
+    def test_cli_flag_wins_over_env(self):
+        """AC1: Explicit --batch-phase2 flag overrides a disabled env value."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PHASE2_BATCH_ENV: "0"},
+            clear=False,
+        ):
+            assert audit_runner._phase2_batch_enabled(True) is True
+
+
+class TestPhase2BatchRouting:
+    """AC1/AC2/AC4: Batch mode folds parent + pending child ACs into one
+    indexed call and routes results back to the correct lists."""
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text",
+                  verdict: str = "met") -> dict:
+        return {"index": index, "text": text, "verdict": verdict, "evidence": ""}
+
+    def _make_child(self, child_id: str, ac_text: str = "Child AC") -> dict:
+        return {
+            "id": child_id,
+            "title": f"Child {child_id}",
+            "stage": "in_progress",
+            "status": "open",
+            "ac_results": [
+                {"index": 0, "text": ac_text, "verdict": "met", "evidence": "phase1"},
+            ],
+        }
+
+    def test_single_batch_call_covers_parent_and_child(self):
+        """AC1: One phase2_batch call replaces the parent + child calls."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        child = self._make_child("C-1", "Child AC 1")
+
+        batch_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "parent file.py:1"},
+                {"index": 1, "verdict": "unmet", "evidence": "child file.py:2"},
+            ]),
+        }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=batch_result
+        ) as mock_call:
+            updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model", batch_phase2=True,
+                )
+            )
+
+        assert phase2_completed is True
+        # Exactly one call, batched
+        assert mock_call.call_count == 1
+        context = mock_call.call_args.args[1]
+        assert context == "phase2_batch"
+        prompt = mock_call.call_args.args[2]
+        assert "Parent AC" in prompt
+        assert "Child AC 1" in prompt
+
+        # Routing: parent AC got its verdict, child AC got its own
+        assert updated_acs[0]["verdict"] == "met"
+        assert updated_acs[0]["evidence"] == "parent file.py:1"
+        assert updated_children[0]["ac_results"][0]["verdict"] == "unmet"
+        assert "Phase 1" in updated_children[0]["ac_results"][0]["evidence"]
+        assert "child file.py:2" in updated_children[0]["ac_results"][0]["evidence"]
+
+    def test_index_routing_multiple_children(self):
+        """AC2: Results route per-child by index offset."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC"), self._make_ac(1, "Parent AC 2")]
+        children = [
+            self._make_child("C-1", "C1 AC"),
+            self._make_child("C-2", "C2 AC"),
+        ]
+
+        batch_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "p0"},
+                {"index": 1, "verdict": "adjusted", "evidence": "p1"},
+                {"index": 2, "verdict": "unmet", "evidence": "c1"},
+                {"index": 3, "verdict": "met", "evidence": "c2"},
+            ]),
+        }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=batch_result
+        ):
+            updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, children, "test-model", batch_phase2=True,
+                )
+            )
+
+        assert phase2_completed is True
+        assert updated_acs[0]["verdict"] == "met"
+        assert updated_acs[1]["verdict"] == "adjusted"
+        assert updated_children[0]["ac_results"][0]["verdict"] == "unmet"
+        assert updated_children[1]["ac_results"][0]["verdict"] == "met"
+
+    def test_batch_skips_done_and_ready_children(self):
+        """AC1: completed/done and child_audit_ready children are not batched."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        done_child = self._make_child("DONE-1", "done AC")
+        done_child["status"] = "completed"
+        done_child["stage"] = "done"
+        ready_child = self._make_child("READY-1", "ready AC")
+        ready_child["child_audit_ready"] = True
+        pending_child = self._make_child("PEND-1", "pending AC")
+
+        batch_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "p"},
+                {"index": 1, "verdict": "met", "evidence": "c"},
+            ]),
+        }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=batch_result
+        ) as mock_call:
+            _updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs,
+                    [done_child, ready_child, pending_child],
+                    "test-model", batch_phase2=True,
+                )
+            )
+
+        assert phase2_completed is True
+        prompt = mock_call.call_args.args[2]
+        assert "done AC" not in prompt
+        assert "ready AC" not in prompt
+        assert "pending AC" in prompt
+        # Skipped children keep their Phase 1 results unchanged
+        assert updated_children[0]["ac_results"][0]["verdict"] == "met"
+        assert updated_children[1]["ac_results"][0]["verdict"] == "met"
+        assert updated_children[2]["ac_results"][0]["verdict"] == "met"
+
+    def test_batch_verdict_semantics_unchanged(self):
+        """AC4: Phase 1 met + Phase 2 met -> met; Phase 1 met + Phase 2 disagree -> downgrade."""
+        issue = self._make_issue()
+        acs = [
+            {"index": 0, "text": "AC1", "verdict": "met", "evidence": "p1"},
+            {"index": 1, "text": "AC2", "verdict": "met", "evidence": "p1"},
+        ]
+
+        batch_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "deep ok"},
+                {"index": 1, "verdict": "unmet", "evidence": "deep disagree"},
+            ]),
+        }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=batch_result
+        ):
+            updated_acs, _, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [], "test-model", batch_phase2=True,
+                )
+            )
+
+        assert phase2_completed is True
+        assert updated_acs[0]["verdict"] == "met"
+        assert updated_acs[0]["evidence"] == "deep ok"
+        assert updated_acs[1]["verdict"] == "unmet"
+        assert "Phase 1" in updated_acs[1]["evidence"]
+        assert "deep disagree" in updated_acs[1]["evidence"]
+
+
+class TestPhase2BatchFallback:
+    """AC3: Batch failure/timeout falls back to per-child calls."""
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text") -> dict:
+        return {"index": index, "text": text, "verdict": "met", "evidence": ""}
+
+    def _make_child(self, child_id: str) -> dict:
+        return {
+            "id": child_id,
+            "title": f"Child {child_id}",
+            "stage": "in_progress",
+            "status": "open",
+            "ac_results": [
+                {"index": 0, "text": "Child AC", "verdict": "met", "evidence": "phase1"},
+            ],
+        }
+
+    def _run_with_side_effects(self, side_effects):
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        child = self._make_child("C-1")
+        return audit_runner._run_phase2_deep_analysis(
+            issue, acs, [child], "test-model", batch_phase2=True,
+        ), audit_runner._call_pi_and_maybe_log
+
+    def test_batch_timeout_falls_back_to_per_child(self):
+        """AC3: A batch timeout falls back to the existing per-child path."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        child = self._make_child("C-1")
+
+        timeout_result = {
+            "_timeout": True,
+            "verdict": "unmet",
+            "evidence": "timed out",
+            "extracted_text": "",
+        }
+        success_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+            ]),
+        }
+
+        # Batch call (timeout) + fallback parent call + fallback child call
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            side_effect=[timeout_result, success_result, success_result],
+        ) as mock_call:
+            updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model", batch_phase2=True,
+                )
+            )
+
+        # Batch call + fallback per-child call both happened
+        contexts = [c.args[1] for c in mock_call.call_args_list]
+        assert contexts[0] == "phase2_batch"
+        assert any(ctx == "phase2_child:0" for ctx in contexts[1:])
+        assert updated_acs[0]["verdict"] == "met"
+        assert updated_children[0]["ac_results"][0]["verdict"] == "met"
+        assert phase2_completed is True
+
+    def test_batch_runtime_error_falls_back(self):
+        """AC3: A batch RuntimeError falls back to the per-child path."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        child = self._make_child("C-1")
+
+        def _side_effect(issue_id, context, prompt, **kwargs):
+            if context == "phase2_batch":
+                raise RuntimeError("batch failed")
+            return {
+                "extracted_text": json.dumps([
+                    {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+                ]),
+            }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_side_effect
+        ) as mock_call:
+            updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model", batch_phase2=True,
+                )
+            )
+
+        contexts = [c.args[1] for c in mock_call.call_args_list]
+        assert contexts[0] == "phase2_batch"
+        assert "phase2_deep" in contexts
+        assert "phase2_child:0" in contexts
+        assert updated_acs[0]["verdict"] == "met"
+        assert updated_children[0]["ac_results"][0]["verdict"] == "met"
+        assert phase2_completed is True
+
+    def test_batch_disabled_uses_existing_path(self):
+        """AC5: With batching disabled the existing parent + child calls run."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        child = self._make_child("C-1")
+
+        success = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+            ]),
+        }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=success
+        ) as mock_call:
+            updated_acs, _updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model", batch_phase2=False,
+                )
+            )
+
+        contexts = [c.args[1] for c in mock_call.call_args_list]
+        assert "phase2_batch" not in contexts
+        assert "phase2_deep" in contexts
+        assert "phase2_child:0" in contexts
+        assert updated_acs[0]["verdict"] == "met"
+        assert phase2_completed is True
