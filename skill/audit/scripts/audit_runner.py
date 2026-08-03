@@ -189,6 +189,30 @@ VERDICT_PARTIAL = "partial"
 VERDICT_ADJUSTED = "adjusted"
 _ACCEPTABLE_VERDICTS = {VERDICT_MET, VERDICT_ADJUSTED}
 
+
+def _normalize_verdict(verdict: str | None) -> str:
+    """Normalize a model-provided verdict to the runner vocabulary.
+
+    The audit prompts request verdicts from {met, unmet, partial, adjusted},
+    but models occasionally use synonyms (e.g. "pass" for "met"). Without
+    normalization a satisfied criterion blocks closure
+    (SA-0MSDOU2SV006J91X). Known synonyms are mapped to the canonical
+    verdict; unknown values pass through unchanged so the caller's strict
+    acceptable-verdict check still flags them for review.
+    """
+    v = (verdict or "").strip().lower()
+    synonyms = {
+        "pass": VERDICT_MET,
+        "passed": VERDICT_MET,
+        "ok": VERDICT_MET,
+        "satisfied": VERDICT_MET,
+        "fail": VERDICT_UNMET,
+        "failed": VERDICT_UNMET,
+        "not met": VERDICT_UNMET,
+        "not-met": VERDICT_UNMET,
+    }
+    return synonyms.get(v, v)
+
 # ---------------------------------------------------------------------------
 # Closing-sentence constants (AC1–3)
 # ---------------------------------------------------------------------------
@@ -926,7 +950,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         obj = json.loads(text)
         if isinstance(obj, dict):
             return {
-                "verdict": obj.get("verdict", "unmet").lower(),
+                "verdict": _normalize_verdict(obj.get("verdict", "unmet")),
                 "evidence": obj.get("evidence", ""),
                 "raw_stdout": stdout,
                 "raw_stderr": stderr,
@@ -2283,7 +2307,7 @@ def _deep_analyze_child(
         }
         for i in range(len(updated_child_acs)):
             item = reviewed.get(i, {})
-            deep_verdict = item.get("verdict", "")
+            deep_verdict = _normalize_verdict(item.get("verdict", ""))
             deep_evidence = item.get("evidence", "")
             if deep_verdict:
                 initial = updated_child_acs[i]["verdict"]
@@ -2325,7 +2349,7 @@ def _apply_deep_verdicts(
     updated = list(initial_acs)
     for i in range(len(updated)):
         item = reviewed.get(i, {})
-        deep_verdict = item.get("verdict", "")
+        deep_verdict = _normalize_verdict(item.get("verdict", ""))
         deep_evidence = item.get("evidence", "")
         if not deep_verdict:
             continue
@@ -2689,7 +2713,7 @@ def _run_phase2_deep_analysis(
         }
         for i in range(len(updated_ac)):
             item = reviewed.get(i, {})
-            deep_verdict = item.get("verdict", "")
+            deep_verdict = _normalize_verdict(item.get("verdict", ""))
             deep_evidence = item.get("evidence", "")
             if deep_verdict:
                 # Final verdict = Phase 1 passes AND Phase 2 confirms
@@ -2980,7 +3004,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     item = reviewed.get(i, {})
                     ac_results.append({
                         "text": ac,
-                        "verdict": item.get("verdict", "unmet"),
+                        "verdict": _normalize_verdict(item.get("verdict", "unmet")),
                         "evidence": item.get("evidence", ""),
                     })
             else:
@@ -3128,7 +3152,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         item = reviewed.get(i, {})
                         child_ac_results.append({
                             "text": ac,
-                            "verdict": item.get("verdict", "unmet"),
+                            "verdict": _normalize_verdict(item.get("verdict", "unmet")),
                             "evidence": item.get("evidence", ""),
                         })
                 else:

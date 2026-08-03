@@ -2558,3 +2558,249 @@ class TestPhase2BatchFallback:
         assert "phase2_child:0" in contexts
         assert updated_acs[0]["verdict"] == "met"
         assert phase2_completed is True
+
+
+# ===========================================================================
+# Verdict synonym normalization (SA-0MSDOU2SV006J91X)
+# ===========================================================================
+
+
+class TestNormalizeVerdict:
+    """AC1: _normalize_verdict maps model synonyms to the runner vocabulary."""
+
+    def test_pass_maps_to_met(self):
+        assert audit_runner._normalize_verdict("pass") == audit_runner.VERDICT_MET
+
+    def test_met_unchanged_and_case_insensitive(self):
+        assert audit_runner._normalize_verdict("met") == audit_runner.VERDICT_MET
+        assert audit_runner._normalize_verdict("MET") == audit_runner.VERDICT_MET
+        assert audit_runner._normalize_verdict("Pass") == audit_runner.VERDICT_MET
+
+    def test_fail_maps_to_unmet(self):
+        assert audit_runner._normalize_verdict("fail") == audit_runner.VERDICT_UNMET
+        assert audit_runner._normalize_verdict("failed") == audit_runner.VERDICT_UNMET
+
+    def test_unknown_verdict_passes_through(self):
+        assert audit_runner._normalize_verdict("weird") == "weird"
+
+    def test_empty_and_none(self):
+        assert audit_runner._normalize_verdict("") == ""
+        assert audit_runner._normalize_verdict(None) == ""
+
+
+class TestPhase2NormalizesDeepVerdicts:
+    """AC3: Phase 2 deep-analysis verdicts are normalized before merge."""
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text") -> dict:
+        return {"index": index, "text": text, "verdict": "met", "evidence": ""}
+
+    def _make_child(self, child_id: str) -> dict:
+        return {
+            "id": child_id,
+            "title": f"Child {child_id}",
+            "stage": "in_progress",
+            "status": "open",
+            "ac_results": [
+                {"index": 0, "text": "Child AC", "verdict": "met", "evidence": "phase1"},
+            ],
+        }
+
+    def test_batch_path_normalizes_pass_to_met(self):
+        """A batch deep verdict of 'pass' merges as 'met' (met+pass -> met)."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        child = self._make_child("C-1")
+        batch_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "pass", "evidence": "parent file.py:1"},
+                {"index": 1, "verdict": "pass", "evidence": "child file.py:2"},
+            ]),
+        }
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=batch_result
+        ):
+            updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model", batch_phase2=True,
+                )
+            )
+        assert phase2_completed is True
+        assert updated_acs[0]["verdict"] == audit_runner.VERDICT_MET
+        assert updated_children[0]["ac_results"][0]["verdict"] == audit_runner.VERDICT_MET
+
+    def test_per_child_path_normalizes_pass_to_met(self):
+        """The per-child deep path (phase2_child) normalizes 'pass' to 'met'."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        child = self._make_child("C-1")
+        success = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+            ]),
+        }
+        child_pass = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "pass", "evidence": "child file.py:2"},
+            ]),
+        }
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            side_effect=[success, child_pass],
+        ):
+            updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model", batch_phase2=False,
+                )
+            )
+        assert phase2_completed is True
+        assert updated_acs[0]["verdict"] == audit_runner.VERDICT_MET
+        assert updated_children[0]["ac_results"][0]["verdict"] == audit_runner.VERDICT_MET
+
+    def test_batch_pass_downgrade_still_applies(self):
+        """AC3: Phase 1 met + deep 'pass' stays met, but deep 'unmet' still downgrades."""
+        issue = self._make_issue()
+        acs = [
+            {"index": 0, "text": "AC1", "verdict": "met", "evidence": "p1"},
+            {"index": 1, "text": "AC2", "verdict": "met", "evidence": "p1"},
+        ]
+        batch_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "pass", "evidence": "deep ok"},
+                {"index": 1, "verdict": "unmet", "evidence": "deep fail"},
+            ]),
+        }
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=batch_result
+        ):
+            updated_acs, _, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [], "test-model", batch_phase2=True,
+                )
+            )
+        assert phase2_completed is True
+        assert updated_acs[0]["verdict"] == audit_runner.VERDICT_MET
+        assert updated_acs[1]["verdict"] == audit_runner.VERDICT_UNMET
+
+
+class TestCallPiParseNormalizesVerdict:
+    """AC4: _call_pi's JSON parse normalizes the verdict field."""
+
+    def _make_mock_popen(self, stdout_text: str):
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (stdout_text, "")
+        mock_process.returncode = 0
+        return mock_process
+
+    def test_json_parse_normalizes_pass(self):
+        """A single-object 'pass' verdict is normalized to 'met'."""
+        mock_process = self._make_mock_popen(
+            '{"verdict": "pass", "evidence": "ok"}'
+        )
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ), mock.patch.object(
+            audit_runner, "_extract_pi_text",
+            return_value='{"verdict": "pass", "evidence": "ok"}',
+        ):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result["verdict"] == audit_runner.VERDICT_MET
+
+    def test_json_parse_keeps_met(self):
+        mock_process = self._make_mock_popen(
+            '{"verdict": "met", "evidence": "ok"}'
+        )
+        with mock.patch.object(
+            audit_runner.subprocess, "Popen", return_value=mock_process
+        ), mock.patch.object(
+            audit_runner, "_extract_pi_text",
+            return_value='{"verdict": "met", "evidence": "ok"}',
+        ):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result["verdict"] == audit_runner.VERDICT_MET
+
+
+class TestPhase1IntakeNormalizesVerdict:
+    """AC2: Phase 1 parent AC review records normalized verdicts.
+
+    Drives ``cmd_issue`` end-to-end with a mocked wl runner and a mocked pi
+    returning 'pass' verdicts for the parent AC review; the assembled report
+    must show the criteria as met and ready-to-close Yes.
+    """
+
+    def _make_mock_runner(self, description: str):
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": "open"},
+                    }),
+                    stderr="",
+                )
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}),
+                    stderr="",
+                )
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": description,
+                            "status": "in_progress",
+                        },
+                        "children": [],
+                    }),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"success": True}),
+                stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def test_parent_ac_review_normalizes_pass(self, capsys):
+        """A Phase 1 'pass' batch produces met verdicts and Ready to close: Yes."""
+        description = (
+            "# Test\n\n## Acceptance Criteria\n\n"
+            "- AC1: The first criterion\n- AC2: The second criterion\n"
+        )
+        mock_runner = self._make_mock_runner(description)
+        pass_batch = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "pass", "evidence": "file.py:1"},
+                {"index": 1, "verdict": "pass", "evidence": "file.py:2"},
+            ]),
+        }
+
+        mock_cq = mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=pass_batch
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality", mock_cq
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        report = capsys.readouterr().out
+        assert "Ready to close: Yes" in report
+        assert "| 1 |" in report
