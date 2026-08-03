@@ -46,6 +46,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from skill.shared.code_freeze import is_code_freeze_active
 from skill.shared.status_lifecycle import StatusLifecycle
 
 LOG = logging.getLogger("implement.scripts.implement")
@@ -879,12 +880,13 @@ def phase_start(
 
     Steps:
     1. Validate the work item ID
-    2. Claim the work item (status → in_progress)
-    3. Safety gate: check for dirty working tree
-    4. Fetch work item details (audit)
-    5. Create a worktree from the parent branch
-    6. Register signal handlers
-    7. Write persistent state
+    2. Code Freeze gate: refuse when a release is in progress
+    3. Claim the work item (status → in_progress)
+    4. Safety gate: check for dirty working tree
+    5. Fetch work item details (audit)
+    6. Create a worktree from the parent branch
+    7. Register signal handlers
+    8. Write persistent state
 
     Args:
         work_item_id: The work item ID.
@@ -918,7 +920,23 @@ def phase_start(
             LOG.error(msg)
         return report
 
-    # ── Step 2: Claim the work item via shared helper ─────────────
+    # ── Step 2: Code Freeze gate (before claiming) ────────────────
+    if is_code_freeze_active():
+        msg = (
+            "Project is in Code Freeze — implementation blocked until the "
+            "release completes."
+        )
+        LOG.error(msg)
+        report["success"] = False
+        report["message"] = msg
+        report["code_freeze"] = True
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {msg}\n")
+        return report
+
+    # ── Step 3: Claim the work item via shared helper ─────────────
     LOG.info("Claiming work item %s...", work_item_id)
     try:
         StatusLifecycle.update_status(work_item_id, "in_progress")
@@ -932,7 +950,7 @@ def phase_start(
             LOG.error(msg)
         return report
 
-    # ── Step 3: Safety gate (dirty working tree) ───────────────────
+    # ── Step 4: Safety gate (dirty working tree) ───────────────────
     LOG.info("Checking git working tree...")
     status_output = git_status()
     is_dirty = git_has_dirty_files(status_output)
@@ -966,7 +984,7 @@ def phase_start(
             print(format_json_output(report))
         return report
 
-    # ── Step 4: Fetch work item details ────────────────────────────
+    # ── Step 5: Fetch work item details ────────────────────────────
     LOG.info("Fetching work item %s...", work_item_id)
     work_item = wl_show(work_item_id)
     if not work_item:
@@ -986,7 +1004,7 @@ def phase_start(
     title = work_item.get("title", work_item_id)
     slug = slug_from_title(title)
 
-    # ── Step 5: Create worktree ────────────────────────────────────
+    # ── Step 6: Create worktree ────────────────────────────────────
     wt_path = worktree_path_override or worktree_path_for(work_item_id, slug)
     branch = branch_name_for(work_item_id, slug)
 
@@ -1016,12 +1034,12 @@ def phase_start(
         f"Implementation started\n- Worktree: {abs_wt_path}\n- Branch: {branch}",
     )
 
-    # ── Step 6: Register signal handlers ───────────────────────────
+    # ── Step 7: Register signal handlers ───────────────────────────
     repo_root = str(Path.cwd().resolve())
     _store_signal_globals(abs_wt_path, work_item_id, repo_root)
     _register_signal_handlers()
 
-    # ── Step 7: Write state ────────────────────────────────────────
+    # ── Step 8: Write state ────────────────────────────────────────
     state = ImplementState(
         work_item_id=work_item_id,
         worktree_path=abs_wt_path,

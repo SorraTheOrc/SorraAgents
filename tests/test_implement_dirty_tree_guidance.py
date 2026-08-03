@@ -194,6 +194,10 @@ with LOG.open("a") as f:
     f.write(" ".join(sys.argv[1:]) + "\\n")
 
 args = sys.argv[1:]
+# StatusLifecycle may inject --worklog-dir <path> (cwd-independent wl calls).
+# Strip it so the fake parses the real subcommand.
+if len(args) >= 2 and args[0] == "--worklog-dir":
+    args = args[2:]
 sub = args[0]
 if sub == "update":
     status = "open"

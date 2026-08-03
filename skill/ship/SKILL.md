@@ -89,6 +89,23 @@ CI is **optional**: if the PR has status checks (e.g., a CI workflow is configur
 
 Bypass all checks: `node ./scripts/run-release.js --skip-checks`
 
+### Code Freeze
+
+While a release is running, the ship skill sets a **Code Freeze marker** at
+`.worklog/code-freeze.json` (cross-repo contract WL-0MSBU4KMA004PKSR):
+
+```json
+{ "active": true, "reason": "ship release in progress", "startedAt": "<ISO>", "pid": <pid> }
+```
+
+The marker is written **before** the gating checks run and cleared on **every**
+exit path (success, failure, abort, `--dry-run`, and gating failures) via a
+`try/finally` in `run-release.js` and an `EXIT` trap in
+`merge-dev-to-main.sh`. While the marker is present, the implement skill
+refuses to start new implementation work (fail-open: a missing/corrupt marker
+never blocks implementation). A stale marker from a crashed release can be
+removed manually by deleting `.worklog/code-freeze.json`.
+
 ### Exit Codes
 
 | Code | Meaning |

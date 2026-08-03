@@ -86,6 +86,10 @@ def _make_skill_layout(tmp_path: Path, use_symlink: bool) -> tuple[Path, Path]:
         _REPO_ROOT / "skill" / "shared" / "status_lifecycle.py"
     ).read_text()
     (skill_pkg / "shared" / "status_lifecycle.py").write_text(real_slc)
+    # Provide the code_freeze module (SA-0MSBU4OBU005WJNB) — implement.py
+    # imports is_code_freeze_active from it at module load.
+    real_cf = (_REPO_ROOT / "skill" / "shared" / "code_freeze.py").read_text()
+    (skill_pkg / "shared" / "code_freeze.py").write_text(real_cf)
     (skill_pkg / "__init__.py").touch()
     (skill_pkg / "shared" / "__init__.py").touch()
 

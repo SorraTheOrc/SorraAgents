@@ -79,6 +79,12 @@ Execute the following steps in order. Do not skip steps.
   `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
 - Detect git context: `git rev-parse --is-inside-work-tree`
 - Run `git status --porcelain=v1 -b`.
+- **Code Freeze gate:** `implement.py start <id>` (the orchestration path used
+  by this skill) checks the Code Freeze marker (`.worklog/code-freeze.json`,
+  contract WL-0MSBU4KMA004PKSR) **before** claiming the work item. If a
+  release is in progress it refuses with a clear message, exits non-zero, and
+  does **not** change the work item status. There is no `--force` bypass;
+  fail-open (missing/corrupt marker never blocks).
 - **Inside a worktree:**
   - `.worklog/` changes only → carry forward.
   - Other changes → abort via `StatusLifecycle.update_status(<work-item-id>, "open")` and return `no_safe_path`.

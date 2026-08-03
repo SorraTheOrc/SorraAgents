@@ -76,6 +76,24 @@ if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
   exit 1
 fi
 
+# ── Code Freeze marker (contract: WL-0MSBU4KMA004PKSR) ──────────────────────
+# Set a Code Freeze marker for the duration of the release so implement skills
+# refuse to start new implementation work. Cleared on every exit path (success,
+# failure, abort, dry-run) via the EXIT trap. This is a fallback for when the
+# run-release.js wrapper is bypassed; the wrapper sets/clears the same marker.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+FREEZE_MARKER="$REPO_ROOT/.worklog/code-freeze.json"
+write_code_freeze_marker() {
+  mkdir -p "$REPO_ROOT/.worklog"
+  printf '{"active": true, "reason": "ship release in progress", "startedAt": "%s", "pid": %s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" > "$FREEZE_MARKER"
+}
+clear_code_freeze_marker() {
+  rm -f "$FREEZE_MARKER"
+}
+write_code_freeze_marker
+trap clear_code_freeze_marker EXIT
+
 # Ensure clean workspace unless dry-run
 if [[ "$DRY_RUN" != "true" ]]; then
   if [[ -n "$(git status --porcelain)" ]]; then

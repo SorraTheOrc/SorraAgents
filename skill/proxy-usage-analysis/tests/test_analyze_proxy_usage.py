@@ -19,6 +19,12 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+# The tests dir is not a package (the skill dir name contains hyphens and
+# cannot be a valid Python package name), so import fixtures by path rather
+# than `from tests import fixtures` which collides with the repo-root tests
+# package under pytest's prepend import mode.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import aggregation
 import bucketing
@@ -27,7 +33,7 @@ import log_parser
 import recommendations
 import reporting
 
-from tests import fixtures
+import fixtures
 
 # Parsed log timestamps are server-local; test datetimes must match.
 LOCAL_TZ = log_parser.LOCAL_TZ

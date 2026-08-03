@@ -156,7 +156,11 @@ def run_batch(worklog_dir: Path, ids: list[str], pi_bin: Path, max_concurrency: 
     env["PI_SEMAPHORE_DIR"] = str(worklog_dir / "semaphores")
 
     stop = threading.Event()
-    sampler = FanoutSampler(stop, interval=0.25)
+    # Use this batch's unique mock-pi binary path as the marker so that
+    # mock-pi processes from OTHER concurrent sessions (shared hosts run many
+    # audit batches in parallel) are not counted in this batch's peak. The
+    # default generic marker "mockpi" would count every session's processes.
+    sampler = FanoutSampler(stop, interval=0.25, batch_marker=str(pi_bin))
     sampler.start()
 
     before = collect()

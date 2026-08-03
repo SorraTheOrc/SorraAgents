@@ -6,7 +6,7 @@
 // (merge-dev-to-main.sh) and controls which part of the semver is
 // incremented before the merge. Default is 'patch'.
 
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { spawnSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
@@ -22,6 +22,80 @@ const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
 // Skill layout: <skill-dir>/scripts/release/merge-dev-to-main.sh
 const skillDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const SKILL_RELEASE_SCRIPT = join(skillDir, 'scripts', 'release', 'merge-dev-to-main.sh');
+
+// ── Code Freeze marker (contract: WL-0MSBU4KMA004PKSR) ──────────────────────
+
+/**
+ * Resolve the project root directory (where .worklog/ lives).
+ *
+ * Resolution order:
+ *   1. The git top-level (``git rev-parse --show-toplevel``) when inside a
+ *      git worktree/checkout.
+ *   2. ``process.cwd()`` as a fallback.
+ *
+ * @returns {string} Absolute project root path.
+ */
+export function resolveProjectRoot() {
+  try {
+    const out = execSync('git rev-parse --show-toplevel', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const root = (out || '').trim();
+    if (root) return root;
+  } catch {
+    // not a git checkout — fall through to cwd
+  }
+  return process.cwd();
+}
+
+/**
+ * Absolute path to the Code Freeze marker file for a project root.
+ *
+ * @param {string} [projectRoot] - Project root (default: resolveProjectRoot()).
+ * @returns {string} Absolute path to <root>/.worklog/code-freeze.json.
+ */
+export function codeFreezeMarkerPath(projectRoot = resolveProjectRoot()) {
+  return join(projectRoot, '.worklog', 'code-freeze.json');
+}
+
+/**
+ * Write the Code Freeze marker file.
+ *
+ * Contract (WL-0MSBU4KMA004PKSR):
+ *   `{ "active": true, "reason": "ship release in progress",
+ *      "startedAt": "<ISO>", "pid": <pid> }`
+ *
+ * @param {string} [projectRoot] - Project root (default: resolveProjectRoot()).
+ * @returns {string} Absolute path to the marker file written.
+ */
+export function setCodeFreezeMarker(projectRoot = resolveProjectRoot()) {
+  const markerPath = codeFreezeMarkerPath(projectRoot);
+  mkdirSync(dirname(markerPath), { recursive: true });
+  const marker = {
+    active: true,
+    reason: 'ship release in progress',
+    startedAt: new Date().toISOString(),
+    pid: process.pid,
+  };
+  writeFileSync(markerPath, JSON.stringify(marker, null, 2));
+  return markerPath;
+}
+
+/**
+ * Remove the Code Freeze marker file (idempotent; missing file is a no-op).
+ *
+ * @param {string} [projectRoot] - Project root (default: resolveProjectRoot()).
+ * @returns {void}
+ */
+export function clearCodeFreezeMarker(projectRoot = resolveProjectRoot()) {
+  const markerPath = codeFreezeMarkerPath(projectRoot);
+  try {
+    rmSync(markerPath, { force: true });
+  } catch {
+    // ignore — removal is best-effort
+  }
+}
 
 // ── parsePRUrl ───────────────────────────────────────────────────────────────
 
@@ -339,6 +413,18 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * @returns {number} Exit code (0 = success).
  */
 export async function runRelease(cliArgs = []) {
+  const projectRoot = resolveProjectRoot();
+  setCodeFreezeMarker(projectRoot);
+  try {
+    return await runReleaseImpl(cliArgs);
+  } finally {
+    // Cleared on EVERY exit path: success, failure, abort, dry-run, and
+    // gating failures (trap/finally-equivalent, contract WL-0MSBU4KMA004PKSR).
+    clearCodeFreezeMarker(projectRoot);
+  }
+}
+
+async function runReleaseImpl(cliArgs = []) {
   const args = [...cliArgs];
   const skipChecks = args.includes('--skip-checks');
   const isDryRun = args.includes('--dry-run');

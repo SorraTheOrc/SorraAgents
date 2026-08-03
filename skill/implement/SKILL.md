@@ -156,6 +156,15 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
   This signals to other agents that this item is being worked on.
 
+> **Code Freeze gate:** when using `implement.py start <id>`, the script checks
+> the Code Freeze marker (`.worklog/code-freeze.json`, contract
+> WL-0MSBU4KMA004PKSR) **before** claiming the work item. If a release is in
+> progress the script refuses with "Project is in Code Freeze — implementation
+> blocked until the release completes", exits non-zero, and does **not** change
+> the work item status. There is no `--force` bypass. Fail-open: a missing or
+> corrupt marker never blocks implementation. `implement-single` inherits the
+> gate because it delegates to `implement.py`.
+
 2. Safety gate: handle dirty working tree
 
 Check the git context and handle uncommitted changes before proceeding.

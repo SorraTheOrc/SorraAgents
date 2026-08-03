@@ -257,6 +257,15 @@ release; there is no CI pipeline. After the gates pass, the script merges
 `dev` into `main`, pushes the result, and records an audit comment in the
 worklog.
 
+While a release runs, the ship skill sets a **Code Freeze marker** at
+`.worklog/code-freeze.json` (contract WL-0MSBU4KMA004PKSR). The marker is
+written before the gating checks and cleared on every exit path (success,
+failure, abort, dry-run) via `try/finally` in `run-release.js` and an `EXIT`
+trap in `merge-dev-to-main.sh`. While the marker is present, `implement.py`
+refuses to start new implementation work (no `--force` bypass; fail-open on
+missing/corrupt marker). A stale marker from a crashed release can be removed
+manually by deleting `.worklog/code-freeze.json`.
+
 ## Getting started
 
 1. Read the main workflow: [Workflow.md](Workflow.md).
