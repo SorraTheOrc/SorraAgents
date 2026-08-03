@@ -339,7 +339,7 @@ After implementation completes and before final commit, an automated refactor st
   `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>." --author "<AGENT>" --json`
 - Close your response with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
 
-  > **Parent/epic items already advanced at Step 4.1:** if this item has children and parent advancement was already performed, skip the status update.
+  > **Parent/epic items already advanced at Step 5.1:** if this item has children and parent advancement was already performed, skip the status update.
   > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`
 
   > The work-item stays `in_review` until the release process promotes `dev` to `main`. See `../ship/SKILL.md` for push-to-dev workflow and `../ship/scripts/run-release.js` for release.
@@ -376,7 +376,7 @@ workflow phase. All transitions are managed via `StatusLifecycle` — ad-hoc
 |-------|-----------|--------|-------|
 | Start (Step 0 - Set status) | `StatusLifecycle.update_status(id, "in_progress")` or `phase_start()` | in_progress | (unchanged) |
 | Claim (Step 1) | `StatusLifecycle.update_status(id, "in_progress", stage="in_progress", assignee="<AGENT>")` | in_progress | in_progress |
-| Epic / parent: all children done (Step 4.1) | `StatusLifecycle.update_status(id, "completed", stage="in_review")` | completed | in_review |
+| Epic / parent: all children done (Step 5.1) | `StatusLifecycle.update_status(id, "completed", stage="in_review")` | completed | in_review |
 | Final (Step 6 - Mark in_review) | `with StatusLifecycle(id, target_stage="in_review"):` or `phase_start()`+`phase_finish()` | completed | in_review |
 | Abort - dirty work tree | `StatusLifecycle.update_status(id, "open")` via `phase_abort()` | open | (unchanged) |
 | Abort - definition gate failure | `StatusLifecycle.update_status(id, "open")` | open | (unchanged) |

@@ -104,7 +104,7 @@ def _find_section(content: str, heading: str) -> str | None:
 
 
 class TestImplementSkillTDD:
-    """Verify implement SKILL.md enforces tests-first in Step 4."""
+    """Verify implement SKILL.md enforces tests-first in Step 5."""
 
     def test_implement_step_4_requires_tests_first(self, implement_content: str) -> None:
         """Step 5 must include explicit instruction to write tests first
@@ -123,7 +123,7 @@ class TestImplementSkillTDD:
             re.search(pat, step4, re.IGNORECASE)
             for pat in tests_first_patterns
         ), (
-            "Step 4 must include explicit instruction to write tests before "
+            "Step 5 must include explicit instruction to write tests before "
             "implementation code. Expected language like 'Write tests first' "
             "or 'Create at least one test file before adding or editing "
             "implementation code'."
@@ -148,7 +148,7 @@ class TestImplementSkillTDD:
             re.search(pat, step4, re.IGNORECASE)
             for pat in harness_patterns
         ), (
-            "Step 4 must include guidance for using harnesses, mocks, or "
+            "Step 5 must include guidance for using harnesses, mocks, or "
             "placeholders when external constraints prevent writing complete tests."
         )
 
