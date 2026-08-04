@@ -83,18 +83,16 @@ Measured impact on the rgardler workstation (16-core, 30 GiB RAM,
   sessions; concurrent `wl sync` invocations serialize (verified by
   `tests/cli/sync-concurrent.test.ts`).
 
-## 5. Batch skills: sequential per item, heavy children per step
+## 5. Batch skills: removed (no longer a fan-out source)
 
-- **Files:**
-  - `skill/implementall/SKILL.md` (batch implementation loop)
-  - `skill/intakeall/SKILL.md` (batch intake)
-  - `skill/planall/SKILL.md` (batch planning)
-- **Mechanism:** these skills process work items **sequentially by design**,
-  but each step spawns heavy children (pi sessions via implement/intake,
-  audit subprocesses, `wl sync`, test suites). When multiple batch runs
-  overlap (e.g., operator session + agent batch + heartbeat audit), the
-  per-step fan-out compounds without any global ceiling.
-- **Note:** this is orchestration-level overlap; the per-item fan-out is
+- **Status:** the batch skills were removed in commit `1b56b64` and no longer
+  exist under `skill/`; they no longer contribute to fan-out.
+- **Prior mechanism (historical):** these skills processed work items
+  **sequentially by design**, but each step spawned heavy children (pi sessions
+  via implement/intake, audit subprocesses, `wl sync`, test suites). When
+  multiple batch runs overlapped (e.g., operator session + agent batch +
+  heartbeat audit), the per-step fan-out compounded without any global ceiling.
+- **Note:** this was orchestration-level overlap; the per-item fan-out is
   covered by sources 1–4.
 
 ## 6. Operator-launched pi sessions
@@ -113,7 +111,7 @@ Measured impact on the rgardler workstation (16-core, 30 GiB RAM,
 | 1–2 (audit runner) | Shared flock-based semaphore around pi spawns + child triggers, ceiling via `AUDIT_MAX_CONCURRENCY` | Child SA-0MSAK2P3J0065POO / SA-0MSAK2SNN005HCM5 |
 | 3 (vitest) | `maxWorkers: 4` cap on Tableau-Card-Engine unit project (added, mirrors ContextHub); ContextHub already capped (`maxWorkers: 4`, `singleFork: true`); SorraAgents is pytest-based (no vitest) | Child SA-0MSAK2ZH6009Z3TW — DONE |
 | 4 (`wl sync`) | Process-level file lock (O_EXCL mutex) serializes concurrent syncs; `--if-idle` skips; stale-lock cleanup | Child SA-0MSAK2W0F0027ZP7 — DONE |
-| 5 (batch overlap) | Bounded via per-item controls above + configurable ceilings | Covered by parent |
+| 5 (batch overlap) | Removed — batch skills deleted in `1b56b64`; no longer a fan-out source | N/A |
 | 6 (operator sessions) | Documented; not directly controllable | N/A |
 
 ## Related work items

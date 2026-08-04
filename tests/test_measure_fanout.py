@@ -271,12 +271,12 @@ def test_source_map_documents_wl_sync():
     assert "sync.ts" in text
 
 
-def test_source_map_documents_batch_skills():
-    """Doc must reference implementall/intakeall/planall overlap."""
+def test_source_map_notes_batch_skill_removal():
+    """Doc must note that the batch skills were removed and no longer fan out."""
     text = SOURCE_MAP_PATH.read_text()
-    assert "implementall" in text
-    assert "intakeall" in text
-    assert "planall" in text
+    assert "1b56b64" in text
+    assert "removed" in text
+    assert "batch" in text.lower()
 
 
 def test_source_map_lists_related_work_items():

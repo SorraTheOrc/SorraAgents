@@ -131,7 +131,7 @@ The remaining 4 skill files (implement, audit, ship, implement-single) do NOT ha
 | `skill/ship/SKILL.md` | No | — |
 | `skill/implement-single/SKILL.md` | No | — |
 
-> **Note:** The epic description identifies these command↔skill pairs: `command/plan.md` ↔ `skill/plan/SKILL.md`, ~~`command/intake.md`~~ ↔ `skill/intake/SKILL.md` (migrated in SA-0MS3CIU0F00066CD, replaced `skill/intakeall/SKILL.md` mapping), `command/refactor.md` ↔ `skill/refactor/SKILL.md`, `command/author_skill.md` ↔ `skill/author-command/SKILL.md`. Of these, only `plan/SKILL.md` is among the 5 largest files.
+> **Note:** The epic description identifies these command↔skill pairs: `command/plan.md` ↔ `skill/plan/SKILL.md`, ~~`command/intake.md`~~ ↔ `skill/intake/SKILL.md` (migrated in SA-0MS3CIU0F00066CD, replaced the ~~`skill/intakeall/SKILL.md`~~ mapping, which was removed in commit `1b56b64`), `command/refactor.md` ↔ `skill/refactor/SKILL.md`, `command/author_skill.md` ↔ `skill/author-command/SKILL.md`. Of these, only `plan/SKILL.md` is among the 5 largest files.
 
 ---
 
@@ -236,9 +236,9 @@ The project has no test files configured for vitest discovery, so the baseline s
 The following directories contain test files but are not configured in vitest's `include` pattern:
 
 - `command/tests/`
-- `skill/implementall/tests/`
-- `skill/intakeall/tests/`
-- `skill/planall/tests/`
+- ~~`skill/implementall/tests/`~~ (skill removed in commit `1b56b64`)
+- ~~`skill/intakeall/tests/`~~ (skill removed in commit `1b56b64`)
+- ~~`skill/planall/tests/`~~ (skill removed in commit `1b56b64`)
 - `skill/plan/tests/`
 - `tests/`
 

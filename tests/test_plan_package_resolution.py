@@ -1,7 +1,7 @@
 """Regression test for the root ``plan`` package resolution (SA-0MS8WCP3E006NPA3).
 
 When the full test suite is collected, pytest puts ``skill/`` on ``sys.path``
-(e.g. while collecting ``skill/planall/tests`` and ``skill/implementall/tests``).
+(e.g. while collecting ``skill/plan/tests`` and ``skill/audit/tests``).
 Because ``skill/plan/__init__.py`` is a regular package while the root ``plan/``
 directory is a namespace portion, ``import plan`` previously resolved to
 ``skill/plan`` (regular packages beat namespace portions per PEP 420), which
