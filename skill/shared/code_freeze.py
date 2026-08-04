@@ -24,12 +24,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 LOG = logging.getLogger("skill.shared.code_freeze")
 
 MARKER_FILENAME = "code-freeze.json"
+
+# A marker whose recording pid is dead is only trusted within this window
+# after ``startedAt``. Beyond it the marker is stale (the release cannot
+# still be running) and must not block implementation forever
+# (SA-0MSDX3EYZ005SGIK).
+CODE_FREEZE_STALE_GRACE_SECONDS = 900  # 15 minutes
 
 
 # ======================================================================
@@ -101,6 +109,39 @@ def code_freeze_marker_path(project_root: str | Path | None = None) -> Path:
 # ======================================================================
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Return ``True`` when *pid* refers to a live process on this host.
+
+    Uses the zero-signal probe (``os.kill(pid, 0)``). ``PermissionError``
+    means the process exists but belongs to another user — still alive.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _marker_age_seconds(started_at: object) -> float | None:
+    """Age of the marker in seconds, or ``None`` when unparseable."""
+    if not isinstance(started_at, str) or not started_at:
+        return None
+    try:
+        # Tolerate the trailing "Z" and any timezone offset.
+        parsed = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - parsed).total_seconds()
+
+
 def is_code_freeze_active(project_root: str | Path | None = None) -> bool:
     """Return True when a Code Freeze is active for the project.
 
@@ -112,6 +153,15 @@ def is_code_freeze_active(project_root: str | Path | None = None) -> bool:
     - valid object with ``active`` falsy → ``False``
     - valid object with ``active`` truthy → ``True``
 
+    Stale-marker protection (SA-0MSDX3EYZ005SGIK): when the marker records a
+    ``pid``, that process must still be alive — or, if it died, the marker
+    must be within ``CODE_FREEZE_STALE_GRACE_SECONDS`` of ``startedAt``.
+    A marker whose pid is dead and older than the grace window is treated as
+    stale (not frozen) so a crashed release (SIGKILL/reboot — the ship-side
+    finally/EXIT-trap cleanup never ran) cannot block implementation forever.
+    A missing pid, a live pid, or an unparseable ``startedAt`` keeps the
+    conservative default (frozen).
+
     Args:
         project_root: Explicit project root. When ``None`` the marker path is
             resolved from cwd / git root / nearest ancestor (same resolution
@@ -119,7 +169,8 @@ def is_code_freeze_active(project_root: str | Path | None = None) -> bool:
             checkout, a worktree, or any subdirectory.
 
     Returns:
-        ``True`` when the marker exists and declares ``active: true``.
+        ``True`` when the marker exists and declares ``active: true`` and is
+        not stale.
     """
     marker = code_freeze_marker_path(project_root)
     try:
@@ -140,4 +191,21 @@ def is_code_freeze_active(project_root: str | Path | None = None) -> bool:
         LOG.warning("Code Freeze marker is not a JSON object (%s)", marker)
         return False
 
-    return bool(data.get("active", False))
+    if not data.get("active", False):
+        return False
+
+    # Stale-marker protection: a recorded pid that is dead and beyond the
+    # grace window means the release process is gone — unfreeze.
+    pid = data.get("pid")
+    if isinstance(pid, int) and pid > 0 and not _pid_is_alive(pid):
+        age = _marker_age_seconds(data.get("startedAt"))
+        if age is not None and age > CODE_FREEZE_STALE_GRACE_SECONDS:
+            LOG.warning(
+                "Code Freeze marker stale (pid %s not alive, age %.0fs); "
+                "treating as not frozen",
+                pid,
+                age,
+            )
+            return False
+
+    return True

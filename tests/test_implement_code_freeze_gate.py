@@ -14,8 +14,10 @@ Contract (per work item ACs):
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -53,11 +55,14 @@ def _make_repo(tmp_path: Path, marker_active: bool | None = None) -> Path:
     if marker_active is not None:
         worklog = repo_root / ".worklog"
         worklog.mkdir()
+        # Use a live pid + recent startedAt so the marker is genuinely active
+        # (stale-marker detection, SA-0MSDX3EYZ005SGIK, ignores markers whose
+        # recording pid is dead beyond the grace window).
         (worklog / "code-freeze.json").write_text(json.dumps({
             "active": marker_active,
             "reason": "ship release in progress",
-            "startedAt": "2026-08-03T00:00:00Z",
-            "pid": 9999,
+            "startedAt": datetime.now(timezone.utc).isoformat(),
+            "pid": os.getpid(),
         }))
     return repo_root
 

@@ -17,6 +17,10 @@ Contract (fail-open, per work item AC):
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -105,6 +109,105 @@ class TestFailOpen:
         assert is_code_freeze_active(project_root) is False
 
 
+def _dead_pid() -> int:
+    """Return a pid that is guaranteed no longer alive on this host."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.01)"])
+    proc.wait(timeout=10)
+    return proc.pid
+
+
+def _recent_iso() -> str:
+    """An ISO timestamp "now", well inside the stale grace period."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _old_iso() -> str:
+    """An ISO timestamp well beyond the stale grace period."""
+    return (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Pid liveness (stale-marker auto-expiry, SA-0MSDX3EYZ005SGIK)
+# ---------------------------------------------------------------------------
+
+
+class TestPidLiveness:
+    def test_active_marker_with_live_pid_is_frozen(self, project_root: Path):
+        """active:true + live pid → frozen (the release process is running)."""
+        _write_marker(
+            project_root,
+            {
+                "active": True,
+                "reason": "ship release in progress",
+                "startedAt": _recent_iso(),
+                "pid": os.getpid(),
+            },
+        )
+        assert is_code_freeze_active(project_root) is True
+
+    def test_active_marker_without_pid_is_frozen(self, project_root: Path):
+        """active:true without a pid → frozen (cannot verify liveness)."""
+        _write_marker(
+            project_root,
+            {"active": True, "reason": "ship release in progress"},
+        )
+        assert is_code_freeze_active(project_root) is True
+
+    def test_dead_pid_older_than_grace_is_stale_not_frozen(self, project_root: Path):
+        """A marker whose recording pid is dead and older than the grace
+        period is stale — it must NOT block implementation forever."""
+        _write_marker(
+            project_root,
+            {
+                "active": True,
+                "reason": "ship release in progress",
+                "startedAt": _old_iso(),
+                "pid": _dead_pid(),
+            },
+        )
+        assert is_code_freeze_active(project_root) is False
+
+    def test_dead_pid_within_grace_is_frozen(self, project_root: Path):
+        """A recently-started release whose pid just died stays frozen within
+        the grace window (conservative — the merge child may still be running)."""
+        _write_marker(
+            project_root,
+            {
+                "active": True,
+                "reason": "ship release in progress",
+                "startedAt": _recent_iso(),
+                "pid": _dead_pid(),
+            },
+        )
+        assert is_code_freeze_active(project_root) is True
+
+    def test_dead_pid_with_unparseable_started_at_stays_frozen(self, project_root: Path):
+        """If startedAt cannot be parsed, keep the freeze (fail-safe)."""
+        _write_marker(
+            project_root,
+            {
+                "active": True,
+                "reason": "ship release in progress",
+                "startedAt": "not-a-timestamp",
+                "pid": _dead_pid(),
+            },
+        )
+        assert is_code_freeze_active(project_root) is True
+
+    def test_missing_pid_field_stays_frozen(self, project_root: Path):
+        """Marker written without the optional pid field (older writer) still
+        freezes — liveness cannot be verified, so keep the conservative default."""
+        _write_marker(
+            project_root,
+            {
+                "active": True,
+                "reason": "ship release in progress",
+                "startedAt": _old_iso(),
+            },
+        )
+        assert is_code_freeze_active(project_root) is True
+
+
 # ---------------------------------------------------------------------------
 # Active marker
 # ---------------------------------------------------------------------------
@@ -112,14 +215,14 @@ class TestFailOpen:
 
 class TestActiveMarker:
     def test_active_marker_is_frozen(self, project_root: Path):
-        """Marker with active:true → frozen."""
+        """Marker with active:true + live pid → frozen."""
         _write_marker(
             project_root,
             {
                 "active": True,
                 "reason": "ship release in progress",
-                "startedAt": "2026-08-03T00:00:00Z",
-                "pid": 1234,
+                "startedAt": _recent_iso(),
+                "pid": os.getpid(),
             },
         )
         assert is_code_freeze_active(project_root) is True
@@ -130,14 +233,14 @@ class TestActiveMarker:
         assert is_code_freeze_active(project_root) is True
 
     def test_contract_marker_format_round_trip(self, project_root: Path):
-        """The exact cross-repo contract marker is detected as frozen."""
+        """The exact cross-repo contract marker (live pid) is detected as frozen."""
         _write_marker(
             project_root,
             {
                 "active": True,
                 "reason": "ship release in progress",
-                "startedAt": "2026-08-03T00:00:00Z",
-                "pid": 1234,
+                "startedAt": _recent_iso(),
+                "pid": os.getpid(),
             },
         )
         assert is_code_freeze_active(project_root) is True
