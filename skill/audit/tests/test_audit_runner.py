@@ -1683,8 +1683,9 @@ class TestVerdictDrivenStatusLifecycle:
       - Ready to close: Yes → status=completed, stage=in_review (stage kept
         as 'done' when the item is already in a terminal done stage)
       - Ready to close: No → status=open, stage=plan_complete
-      - Failure / unparseable verdict → safe consistent state + cleared
-        assignee; the item is never left in_progress
+      - Failure / unparseable verdict (infrastructure failure) → restore the
+        captured pre-audit status/stage + cleared assignee; the item is
+        never demoted to open unless the verdict was an explicit No
       - Freshness-gate skip → no lifecycle transitions
     """
 
@@ -1869,8 +1870,10 @@ class TestVerdictDrivenStatusLifecycle:
         assert "--stage" in last and "plan_complete" in last
         assert "--assignee" in last and "" in last
 
-    def test_failure_on_in_progress_item_falls_back_to_open(self):
-        """AC4: A failure while the pre-audit status was in_progress resets to open."""
+    def test_failure_on_in_progress_item_restores_pre_audit_state(self):
+        """AC2: An infra failure while the pre-audit status was in_progress
+        restores in_progress (assignee cleared) — never demotes to open.
+        """
         updates = []
         self._run_issue(
             updates,
@@ -1879,9 +1882,46 @@ class TestVerdictDrivenStatusLifecycle:
             fail_children_show=True,
         )
         last = self._last_update(updates)
-        assert "--status" in last and "open" in last
-        assert "--stage" in last and "plan_complete" in last
+        assert "--status" in last and "in_progress" in last
+        assert "--stage" in last and "in_progress" in last
         assert "--assignee" in last and "" in last
+
+    def test_failure_on_in_review_item_keeps_in_review(self):
+        """AC2: An infra failure on a completed/in_review item (e.g. a re-audit
+        hitting a model timeout) keeps it at completed/in_review so the item is
+        not kicked back to the actionable queue.
+        """
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes",
+            status="completed", stage="in_review",
+            fail_children_show=True,
+        )
+        last = self._last_update(updates)
+        assert "--status" in last and "completed" in last
+        assert "--stage" in last and "in_review" in last
+        assert "--assignee" in last and "" in last
+
+    def test_failure_takes_precedence_over_parseable_yes_report(self):
+        """AC7: An infra failure combined with an otherwise-parseable Yes report
+        must NOT advance the item — the failure means the audit did not complete
+        cleanly, so the verdict cannot be trusted. The item stays at its
+        pre-audit state (here in_progress), never completed/in_review.
+        """
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes\n\n## Summary\nAll met.",
+            status="in_progress", stage="in_progress",
+            fail_children_show=True,
+        )
+        last = self._last_update(updates)
+        assert "--status" in last and "in_progress" in last
+        assert "--stage" in last and "in_progress" in last
+        assert "--assignee" in last and "" in last
+        # The item must NOT advance to completed — failure takes precedence.
+        assert "completed" not in last
 
     def test_unparseable_verdict_falls_back_to_safe_state(self):
         """AC4: An unparseable verdict must not blindly set completed/open."""

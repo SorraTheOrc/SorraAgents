@@ -34,13 +34,13 @@ the item in a state consistent with the audit verdict.
 3. **Verdict-driven terminal transition** — applied after audit logic completes (via `try/finally`, guaranteed even on failure):
    - `Ready to close: Yes` → `status: completed`, `stage: in_review` (stage kept as `done` when it is already terminal).
    - `Ready to close: No` → `status: open`, `stage: plan_complete` (fixed pre-review stage).
-   - Failure, timeout, or unparseable verdict → restore a safe consistent state (the captured original status/stage; `open`/`plan_complete` when the original status was `in_progress`) and **clear the assignee** so the item returns fully to the actionable queue.
+   - Failure, timeout, or unparseable verdict (infrastructure failure) → restore the captured pre-audit status/stage (falling back to `open`/`plan_complete` only when the original could not be determined) and **clear the assignee** so the item stays observable for a re-audit. An item is moved to `open` only by an explicit `Ready to close: No` verdict — a transient model timeout never demotes an `in_review` item back to the actionable queue.
 
 Behavior:
 
 - Transition on yes: `in_progress` → `completed` / `in_review` (or keep `done`).
 - Transition on no: `in_progress` → `open` / `plan_complete`.
-- Failure fallback: restore captured original status/stage (never left `in_progress`), assignee cleared.
+- Failure fallback: restore the captured pre-audit status/stage (an `in_review` item stays `in_review`; a transient timeout never demotes to `open`), assignee cleared. Only an explicit `Ready to close: No` moves an item to `open`.
 - Falls back to `open` if original status cannot be determined (e.g., `wl show` fails).
 - `--do-not-persist` does NOT affect the status lifecycle.
 - If the status update fails, the error is silently caught (the failure is still reported in the audit output).
@@ -59,7 +59,7 @@ wl update <id> --status in_progress --json   # before audit
 wl update <id> --status completed --stage in_review --json
 #   Ready to close: No → return to the actionable queue
 wl update <id> --status open --stage plan_complete --json
-#   Failure → restore a safe consistent state and clear the assignee
+#   Failure → restore the pre-audit status/stage and clear the assignee
 wl update <id> --status "$ORIG_STATUS" --assignee "" --json
 ```
 
@@ -88,7 +88,7 @@ No status lifecycle transitions occur, and no persistence is performed.
 ## Safety and prompt design
 
 - Audit executions should be read-only except for the explicit persistence step and automatic status lifecycle. Use `[READ-ONLY AUDIT]` to mark read-only phases and `[PERSIST-AUDIT]` when persisting.
-- Do NOT close, create, or delete work items during an audit. Permitted state-modifying actions: (1) storing audit text via the canonical persister, (2) the runner's verdict-driven status lifecycle (`in_progress` on entry; `completed`/`in_review` on `Ready to close: Yes`, `open`/`plan_complete` on `Ready to close: No`, safe-state restore + assignee cleared on failure).
+- Do NOT close, create, or delete work items during an audit. Permitted state-modifying actions: (1) storing audit text via the canonical persister, (2) the runner's verdict-driven status lifecycle (`in_progress` on entry; `completed`/`in_review` on `Ready to close: Yes`, `open`/`plan_complete` on `Ready to close: No`, pre-audit status/stage restore + assignee cleared on infrastructure failure).
 - Refuse any request to run state-modifying `wl` commands outside the authorized flow.
 - If ambiguity prevents a reliable verdict, return immediately and do NOT persist.
 - The runner supports `--debug-log` to append raw Pi output to a JSONL file.

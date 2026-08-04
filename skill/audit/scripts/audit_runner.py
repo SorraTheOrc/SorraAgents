@@ -3514,10 +3514,12 @@ def cmd_issue(issue_id: str, persist: bool = True,
         #
         #   Ready to close: Yes → completed / in_review (stage kept 'done')
         #   Ready to close: No  → open / plan_complete
-        #   Failure / timeout / unparseable verdict → safe consistent state
-        #       (captured original status+stage, forced open/plan_complete
-        #       when the original was in_progress) + assignee cleared so the
-        #       item returns fully to the actionable queue.
+        #   Failure / timeout / unparseable verdict (infrastructure failure) →
+        #       restore the captured pre-audit status+stage (fall back to
+        #       open/plan_complete only when the original is unknowable) +
+        #       assignee cleared so the item stays observable for a re-audit.
+        #       An in_review item that hit a model timeout stays in_review —
+        #       only an explicit No verdict demotes an item to open.
         #
         # The transition is retried on transient wl failures so a single
         # hiccup never leaves the item stuck in_progress; if it still fails a
@@ -3530,10 +3532,18 @@ def cmd_issue(issue_id: str, persist: bool = True,
         restore_cmd: list[str] | None = None
         try:
             if script_failure is not None or not audit_completed or audit_verdict is None:
-                # Failure / unparseable verdict: never leave in_progress.
-                was_in_progress = original_status in ("in_progress", "in-progress")
-                safe_status = "open" if was_in_progress else original_status
-                safe_stage = "plan_complete" if was_in_progress else original_stage
+                # Infrastructure failure / unparseable verdict: restore the
+                # pre-audit state captured on entry (status + stage). A
+                # transient failure (model timeout, provider error, wl hiccup)
+                # must never demote the item — an in_review item re-audited
+                # during a timeout stays in_review for a re-run. Only an
+                # explicit 'Ready to close: No' verdict moves an item to open
+                # (SA-0MSF5PG1Y005P3AR). Falls back to open/plan_complete only
+                # when the original state could not be determined (capture
+                # failed / unknown). The assignee is cleared so the item stays
+                # observable in the actionable queue for a re-audit.
+                safe_status = original_status
+                safe_stage = original_stage
                 if not safe_stage:
                     # Stage unknown (capture failed): pick a stage valid for
                     # the restored status so wl never rejects the combo.
