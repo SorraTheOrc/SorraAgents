@@ -54,8 +54,11 @@ The runner executes, in quiet mode:
 
 - **pytest**: `pytest -q -r a --disable-warnings` (canonicalized via
   `canonicalize_quiet_test_command` from `../test_runner.py`)
-- **Node**: `node --test tests/node tests/cli tests/unit` (or
-  `npm --silent test` per suite directory when an npm test script exists)
+- **Node**: `node --test "tests/node/**/*.mjs" "tests/cli/**/*.mjs" "tests/unit/**/*.mjs"`
+  (or `npm --silent test` per suite directory when an npm test script exists).
+  Glob patterns are required — on node v22.22.1 `node --test <dir>` treats a
+  bare directory as a module entry point and fails with `MODULE_NOT_FOUND`
+  (see SA-0MSF8KNE3003JDVD).
 - **bats**: `bats tests/install-worklog-plugin.bats`
 
 Output is a JSON document with per-suite results and a flat `failures` array;

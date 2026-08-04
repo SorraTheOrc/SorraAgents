@@ -3,7 +3,7 @@
 
 Suites:
   - pytest:  pytest -q -r a --disable-warnings   (canonicalized via skill/test_runner.py)
-  - node:    node --test tests/node tests/cli tests/unit   (npm --silent test when a test script exists)
+  - node:    node --test "tests/<dir>/**/*.mjs"   (npm --silent test when a test script exists)
   - bats:    bats tests/install-worklog-plugin.bats
 
 Emits structured per-failure records (test_name, stdout_excerpt, stack_trace)
@@ -61,8 +61,12 @@ def node_suite_commands() -> list[str]:
     """Return one quiet node test command per Node suite directory.
 
     Prefers ``npm --silent test`` when the repo has an npm test script;
-    otherwise falls back to ``node --test <dir>`` (the built-in runner used
-    by this repo's Node suites).
+    otherwise falls back to ``node --test <glob>`` for each suite dir.
+
+    Globs are required (SA-0MSF8KNE3003JDVD): on node v22.22.1 ``node --test
+    <dir>`` treats a bare directory argument as a module entry point and fails
+    with ``MODULE_NOT_FOUND``; only glob patterns (e.g.
+    ``node --test "tests/node/**/*.mjs"``) are scanned as test files.
     """
     pkg_json = REPO_ROOT / "package.json"
     has_npm_test_script = False
@@ -79,7 +83,7 @@ def node_suite_commands() -> list[str]:
         if has_npm_test_script:
             cmds.append(canonicalize_quiet_test_command(f"npm test -- {suite_dir}"))
         else:
-            cmds.append(f"node --test {suite_dir}")
+            cmds.append(f'node --test "{suite_dir}/**/*.mjs"')
     return cmds
 
 

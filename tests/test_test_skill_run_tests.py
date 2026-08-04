@@ -91,13 +91,24 @@ def test_pytest_command_reuses_quiet_canonicalization() -> None:
 
 
 def test_node_suite_commands_cover_suite_dirs() -> None:
-    """Node suite commands must cover tests/node, tests/cli, tests/unit."""
+    """Node suite commands must cover tests/node, tests/cli, tests/unit via globs.
+
+    Regression (SA-0MSF8KNE3003JDVD): ``node --test <dir>`` fails on node
+    v22.22.1 with MODULE_NOT_FOUND because a bare directory argument is
+    treated as a module entry point, not a scan target. Commands must use
+    glob patterns (e.g. ``node --test "tests/node/**/*.mjs"``).
+    """
     cmds = node_suite_commands()
     assert len(cmds) == 3
     joined = " | ".join(cmds)
     assert "tests/node" in joined
     assert "tests/cli" in joined
     assert "tests/unit" in joined
+    # Each command must use a glob pattern, not a bare directory (which node
+    # v22 tries to load as a module).
+    for cmd in cmds:
+        assert cmd.startswith("node --test ")
+        assert "/**/*.mjs" in cmd, f"expected glob pattern in: {cmd}"
 
 
 def test_bats_command_targets_install_worklog_plugin() -> None:
@@ -224,3 +235,5 @@ def test_run_suite_node_runs_each_directory_separately(monkeypatch: pytest.Monke
     assert any("tests/node" in c for c in commands_run)
     assert any("tests/cli" in c for c in commands_run)
     assert any("tests/unit" in c for c in commands_run)
+    # Regression (SA-0MSF8KNE3003JDVD): commands must glob, not pass bare dirs.
+    assert all("/**/*.mjs" in c for c in commands_run)
