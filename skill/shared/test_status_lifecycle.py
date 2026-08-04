@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -466,9 +467,22 @@ class TestWorklogDirDetection:
         with mock.patch("skill.shared.status_lifecycle.subprocess.run", return_value=fake):
             assert status_lifecycle_module._detect_worklog_dir() == proj / ".worklog"
 
-    def test_detect_none(self, monkeypatch, tmp_path):
-        """No .worklog anywhere -> None."""
-        monkeypatch.chdir(tmp_path)
+    def test_detect_none(self, monkeypatch):
+        """No .worklog anywhere -> None.
+
+        Hermetic: ``_detect_worklog_dir`` scans the real filesystem up the
+        cwd ancestor chain, so chdir'ing to ``tmp_path`` (under ``/tmp``) is
+        not isolated — a stray ``.worklog`` left in ``/tmp`` by other tooling
+        makes the scan return it instead of ``None``. Point ``Path.cwd`` at a
+        synthetic clean root so the test is order/environment independent
+        (SA-0MSDXF3BP0022NDE).
+        """
+        clean_cwd = Path(f"/__no-worklog-{uuid.uuid4().hex}__/project/sub")
+        monkeypatch.setattr(
+            status_lifecycle_module.Path,
+            "cwd",
+            classmethod(lambda cls: clean_cwd),
+        )
         fake = subprocess.CompletedProcess(
             ["git", "rev-parse", "--show-toplevel"],
             1,
