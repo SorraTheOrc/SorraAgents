@@ -230,3 +230,48 @@ describe('code-freeze marker: runRelease lifecycle', () => {
     assert.ok(content.includes('finally'), 'runRelease must use finally to clear the marker');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Release-script spawn timeout (SA-0MSDX3KTV0092B7N)
+// ---------------------------------------------------------------------------
+// A hung git/gh operation inside the release script must fail the release
+// loudly after a bounded time instead of blocking indefinitely — while the
+// release runs, the Code Freeze marker blocks all implementation work, so an
+// unbounded spawn = an unbounded project-wide freeze.
+
+test('release-script timeout: spawn is bounded, exit 10, marker cleared', () => {
+  const { tmpDir, skillScriptDir } = makeTempSkillDir();
+
+  // Fake release script that hangs — must be killed by the wrapper timeout.
+  const releaseDir = join(skillScriptDir, 'release');
+  mkdirSync(releaseDir, { recursive: true });
+  writeFileSync(
+    join(releaseDir, 'merge-dev-to-main.sh'),
+    '#!/bin/bash\nsleep 30\nexit 0\n',
+  );
+
+  const res = spawnSync(process.execPath, [
+    join(tmpDir, 'skill', 'ship', 'scripts', 'run-release.js'),
+    '--skip-checks',
+  ], {
+    cwd: tmpDir,
+    encoding: 'utf-8',
+    timeout: 30_000,
+    env: { ...process.env, SHIP_RELEASE_TIMEOUT_MS: '500' },
+  });
+
+  assert.equal(
+    res.status,
+    10,
+    `expected exit code 10 (timeout), got ${res.status}; stderr: ${res.stderr}`,
+  );
+  assert.match(
+    res.stderr,
+    /timed out|timeout/i,
+    `stderr should report the timeout, got: ${res.stderr}`,
+  );
+  assert.ok(
+    !existsSync(join(tmpDir, '.worklog', 'code-freeze.json')),
+    'Code Freeze marker must be cleared after a timed-out release',
+  );
+});

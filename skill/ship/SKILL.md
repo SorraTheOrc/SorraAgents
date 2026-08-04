@@ -119,6 +119,7 @@ removed manually by deleting `.worklog/code-freeze.json`.
 | 7 | Critical-items gate failure (critical items not in terminal state) |
 | 8 | Worklog-ref gate failure (worklog refs present) |
 | 9 | Producer-review gate failure (items need producer review) |
+| 10 | Release script timed out (killed after `SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
 
 ## Release Process
 

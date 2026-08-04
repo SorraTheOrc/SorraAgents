@@ -23,6 +23,13 @@ const REPO_RELEASE_SCRIPT = 'scripts/release/merge-dev-to-main.sh';
 const skillDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const SKILL_RELEASE_SCRIPT = join(skillDir, 'scripts', 'release', 'merge-dev-to-main.sh');
 
+// Timeout (ms) for the release-script subprocess. A hung git/gh operation
+// must fail the release loudly after a bounded time instead of blocking
+// indefinitely — the Code Freeze marker stays set for the whole run, so an
+// unbounded spawn means an unbounded project-wide freeze (SA-0MSDX3KTV0092B7N).
+// Overridable via SHIP_RELEASE_TIMEOUT_MS (operators/tests).
+const RELEASE_SCRIPT_TIMEOUT_MS = Number(process.env.SHIP_RELEASE_TIMEOUT_MS) || 600000;
+
 // ── Code Freeze marker (contract: WL-0MSBU4KMA004PKSR) ──────────────────────
 
 /**
@@ -539,7 +546,21 @@ async function runReleaseImpl(cliArgs = []) {
   const child = spawnSync('bash', [selectedScript, ...args], {
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: RELEASE_SCRIPT_TIMEOUT_MS,
   });
+
+  // Timeout: spawnSync reports a timed-out child with `error.code ===
+  // 'ETIMEDOUT'` (status null, signal SIGTERM). Fail loudly — the Code Freeze
+  // marker is cleared by the caller's finally on every exit path (exit code
+  // 10, see SKILL.md).
+  if (child.error && child.error.code === 'ETIMEDOUT') {
+    console.error(
+      `Release script timed out after ${Math.round(RELEASE_SCRIPT_TIMEOUT_MS / 1000)}s ` +
+      'and was terminated. The Code Freeze marker has been cleared. ' +
+      'Check for partially-created branches/PRs/refs, then re-run the release.'
+    );
+    return 10;
+  }
 
   const exitCode = child.status || 0;
   const stdout = child.stdout || '';
