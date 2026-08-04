@@ -204,3 +204,74 @@ test('close-work-items: release-process.md mentions producer-review filtering', 
     'release-process.md should mention producer-review filtering in close step',
   );
 });
+
+// ---------------------------------------------------------------------------
+// F4: closeWorkItemsAfterRelease force-closes candidates (AC3)
+// ---------------------------------------------------------------------------
+// The audit gate (check-audit-gate.js) already verified audit readiness for
+// every candidate before the release proceeds. The close step therefore uses
+// `wl close --force` so a parent is closed even when a descendant is stuck in
+// a non-terminal state (e.g. left at in_progress by a crashed audit) — the
+// release close completes in a single pass instead of leaving items dangling.
+
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+
+test('close-work-items: wl close is invoked with --force for candidates', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'close-work-items-force-test-'));
+
+  // Mock `wl` on PATH: answers the candidate queries used by
+  // getCandidateItems() and records every `wl close` invocation.
+  const closeLog = join(tmpDir, 'close.log');
+  const binDir = join(tmpDir, 'bin');
+  mkdirSync(binDir, { recursive: true });
+  const wlMock = join(binDir, 'wl');
+  writeFileSync(wlMock, `#!/usr/bin/env bash
+case "$1" in
+  list)
+    if [[ "$*" == *"--stage in_review"* ]]; then
+      echo '{"success":true,"workItems":[{"id":"SA-PARENT1","title":"Parent One","needsProducerReview":false},{"id":"SA-PARENT2","title":"Parent Two","needsProducerReview":false}]}'
+    else
+      echo '{"success":true,"workItems":[]}'
+    fi
+    ;;
+  close)
+    echo "$@" >> "$WL_CLOSE_LOG"
+    echo '{"success":true}'
+    ;;
+  *)
+    echo '{"success":true}'
+    ;;
+esac
+`, { mode: 0o755 });
+  writeFileSync(join(binDir, 'gh'), '#!/usr/bin/env bash\nexit 0\n', { mode: 0o755 });
+
+  // Driver script: import the real run-release.js and exercise the close step.
+  const driver = join(tmpDir, 'driver.mjs');
+  writeFileSync(driver, `
+import { closeWorkItemsAfterRelease } from ${JSON.stringify(RUN_RELEASE_PATH)};
+const result = closeWorkItemsAfterRelease('9.9.9');
+console.log(JSON.stringify(result));
+`);
+
+  const res = spawnSync('node', [driver], {
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH}`,
+      WL_CLOSE_LOG: closeLog,
+    },
+    timeout: 30000,
+  });
+  assert.equal(res.status, 0, `driver failed: ${res.stderr}`);
+
+  const closeLines = readFileSync(closeLog, 'utf-8').trim().split('\n').filter(Boolean);
+  assert.equal(closeLines.length, 2, `expected 2 close invocations, got: ${closeLines}`);
+  for (const line of closeLines) {
+    assert.ok(
+      line.includes('--force'),
+      `wl close should include --force (single-pass close, AC3), got: ${line}`,
+    );
+  }
+});

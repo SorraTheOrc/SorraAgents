@@ -145,6 +145,19 @@ _PI_RETRY_BACKOFF_SECONDS = 2.0
 Backoff grows linearly: 1x, 2x, ... base per retry attempt.
 """
 
+_STATUS_RESTORE_MAX_ATTEMPTS = 3
+"""Total attempts (1 initial + retries) for the terminal status restore.
+
+The verdict-driven status transition in ``cmd_issue``'s ``finally`` block is
+retried on transient ``wl`` failures so a single hiccup never leaves the work
+item stuck ``in_progress`` (which breaks the release close step — see
+SA-0MSAL2NQV0008HY5). The update is idempotent, so retrying after a partially
+applied update is harmless.
+"""
+
+_STATUS_RESTORE_RETRY_DELAY_S = 0.5
+"""Base delay (seconds) between status-restore retries; grows linearly."""
+
 _PHASE2_MAX_RETRIES = 1
 """Provider-error retry cap for long agent-mode Phase 2 calls.
 
@@ -3505,7 +3518,16 @@ def cmd_issue(issue_id: str, persist: bool = True,
         #       (captured original status+stage, forced open/plan_complete
         #       when the original was in_progress) + assignee cleared so the
         #       item returns fully to the actionable queue.
+        #
+        # The transition is retried on transient wl failures so a single
+        # hiccup never leaves the item stuck in_progress; if it still fails a
+        # visible warning is printed (SA-0MSAL2NQV0008HY5) instead of being
+        # silently swallowed — a stuck in_progress child breaks the release
+        # close step.
         # ------------------------------------------------------------------
+        # Compute the intended terminal state first (no wl calls), so the
+        # failure warning can tell the operator exactly what to apply.
+        restore_cmd: list[str] | None = None
         try:
             if script_failure is not None or not audit_completed or audit_verdict is None:
                 # Failure / unparseable verdict: never leave in_progress.
@@ -3516,27 +3538,62 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     # Stage unknown (capture failed): pick a stage valid for
                     # the restored status so wl never rejects the combo.
                     safe_stage = "in_review" if safe_status == "completed" else "plan_complete"
-                _run_wl(runner, [
+                restore_cmd = [
                     "wl", "update", issue_id,
                     "--status", safe_status,
                     "--stage", safe_stage,
                     "--assignee", "",
                     "--json",
-                ], worklog_dir=worklog_dir)
+                ]
             elif audit_verdict == "yes":
                 # Advance to the review queue. Keep a terminal 'done' stage.
                 if original_stage == "done":
-                    _run_wl(runner, ["wl", "update", issue_id, "--status", "completed", "--json"],
-                            worklog_dir=worklog_dir)
+                    restore_cmd = ["wl", "update", issue_id, "--status", "completed", "--json"]
                 else:
-                    _run_wl(runner, ["wl", "update", issue_id, "--status", "completed", "--stage", "in_review", "--json"],
-                            worklog_dir=worklog_dir)
+                    restore_cmd = ["wl", "update", issue_id, "--status", "completed", "--stage", "in_review", "--json"]
             else:  # audit_verdict == "no"
                 # Return to the actionable queue at a fixed pre-review stage.
-                _run_wl(runner, ["wl", "update", issue_id, "--status", "open", "--stage", "plan_complete", "--json"],
-                        worklog_dir=worklog_dir)
-        except RuntimeError:
-            pass  # Status update failure must not mask the main result
+                restore_cmd = ["wl", "update", issue_id, "--status", "open", "--stage", "plan_complete", "--json"]
+        except RuntimeError as exc:  # pragma: no cover -- computation makes no wl calls
+            print(
+                f"Warning: could not compute terminal status for {issue_id}: {exc}",
+                file=sys.stderr,
+            )
+
+        if restore_cmd is not None:
+            # Apply the terminal transition, retrying transient failures. The
+            # update is idempotent, so retrying after a partially-applied
+            # update is harmless.
+            last_error: Exception | None = None
+            for attempt in range(_STATUS_RESTORE_MAX_ATTEMPTS):
+                try:
+                    _run_wl(runner, restore_cmd, worklog_dir=worklog_dir)
+                    last_error = None
+                    break
+                except RuntimeError as exc:
+                    last_error = exc
+                    if attempt < _STATUS_RESTORE_MAX_ATTEMPTS - 1:
+                        time.sleep(_STATUS_RESTORE_RETRY_DELAY_S * (attempt + 1))
+
+            if last_error is not None:
+                # Best-effort readback so the operator knows the item's actual
+                # state (the update may have applied but the response was lost).
+                actual_status = "unknown"
+                try:
+                    rb = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                                 worklog_dir=worklog_dir)
+                    wi = rb.get("workItem") if isinstance(rb, dict) else None
+                    if isinstance(wi, dict):
+                        actual_status = wi.get("status", "unknown")
+                except RuntimeError:
+                    pass
+                print(
+                    f"Warning: Failed to restore work item {issue_id} status after "
+                    f"audit ({last_error}); item status is '{actual_status}'. "
+                    f"If it was left in_progress, recover it manually, e.g. "
+                    f"`wl update {issue_id} --status <terminal-status> --stage <stage>`.",
+                    file=sys.stderr,
+                )
 
 
 # ---------------------------------------------------------------------------

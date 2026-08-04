@@ -209,7 +209,13 @@ export function closeWorkItemsAfterRelease(version) {
   for (const item of toClose) {
     try {
       const reason = `Shipped in v${version}`;
-      execSync(`wl close ${item.id} --reason "${reason}" --json`, {
+      // --force: the audit gate (Step 2) already verified audit readiness for
+      // every candidate, so the close step may bypass the per-item stage/audit
+      // re-check. Without it, a parent whose descendant is stuck in a
+      // non-terminal state (e.g. left at in_progress by a crashed audit) fails
+      // to close recursively, leaving items dangling after the release
+      // (SA-0MSAL2NQV0008HY5).
+      execSync(`wl close ${item.id} --force --reason "${reason}" --json`, {
         encoding: 'utf-8',
         stdio: ['pipe', 'pipe', 'pipe'],
       });

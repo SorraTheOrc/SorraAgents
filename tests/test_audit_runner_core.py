@@ -1242,6 +1242,142 @@ class TestStatusLifecycle:
         )
 
 
+    def _fake_runner_with_restore_failure(self, calls, fail_restore_count):
+        """Fake runner that fails the terminal status-restore ``wl update``
+        the first ``fail_restore_count`` times, then succeeds.
+
+        The entry ``in_progress`` claim is never failed — only the final
+        verdict-driven restore update (any status other than in_progress).
+        """
+        _show_called = False
+        restore_failures = {"remaining": fail_restore_count}
+
+        def fake_runner(cmd, **kwargs):
+            nonlocal _show_called
+            cmd_list = _strip_worklog_dir(list(cmd))
+            calls.append(cmd_list)
+            if (
+                cmd_list[:3] == ["wl", "update", cmd_list[2]]
+                and "--status" in cmd_list
+                and "in_progress" not in cmd_list
+                and restore_failures["remaining"] > 0
+            ):
+                restore_failures["remaining"] -= 1
+                return _fake_proc(returncode=1, stderr="wl: transient error")
+            if "show" in cmd_list and "--children" in cmd_list and not _show_called:
+                _show_called = True
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": cmd_list[2],
+                        "title": "Test Item",
+                        "description": (
+                            "## Acceptance Criteria\n"
+                            "1. The system passes the test\n"
+                        ),
+                    },
+                    "children": [],
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+        return fake_runner
+
+    def test_restore_failure_retries_then_succeeds(self, monkeypatch, capsys):
+        """A transient failure on the terminal status restore is retried, so
+        the item is not left in_progress; no warning is printed when the
+        retry succeeds."""
+        calls = []
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
+        )
+
+        rc = cmd_issue(
+            "SA-RETRY",
+            runner=self._fake_runner_with_restore_failure(calls, fail_restore_count=1),
+            persist=False,
+        )
+        assert rc == 0, f"Expected exit 0 on successful audit, got {rc}"
+
+        # The restore update was attempted twice: first attempt failed, retry succeeded.
+        restore_updates = [
+            c for c in calls
+            if c[:3] == ["wl", "update", "SA-RETRY"]
+            and "--status" in c
+            and "in_progress" not in c
+        ]
+        assert len(restore_updates) >= 2, (
+            f"Expected the restore update to be retried after a transient failure, got: {calls}"
+        )
+        err = capsys.readouterr().err
+        assert "Failed to restore" not in err, (
+            f"No warning expected when the retry succeeds, got: {err}"
+        )
+
+    def test_restore_failure_prints_visible_warning(self, monkeypatch, capsys):
+        """AC2: when the terminal status restore ultimately fails, a visible
+        warning is printed to stderr (not silently swallowed) naming the work
+        item, so the operator can recover an item left in_progress."""
+        calls = []
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
+        )
+
+        rc = cmd_issue(
+            "SA-RESTOREFAIL",
+            runner=self._fake_runner_with_restore_failure(calls, fail_restore_count=999),
+            persist=False,
+        )
+        assert rc == 0, "Audit result must not be masked by status-restore failure"
+
+        err = capsys.readouterr().err
+        assert "Failed to restore" in err, (
+            f"Expected a visible restore-failure warning on stderr, got: {err}"
+        )
+        assert "SA-RESTOREFAIL" in err, (
+            f"Warning should name the affected work item, got: {err}"
+        )
+
+    def test_restore_failure_preserves_audit_exit_code(self, monkeypatch, capsys):
+        """A status-restore failure must not mask the main audit result: the
+        exit code still reflects the audit outcome (0 = success)."""
+        calls = []
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
+        )
+
+        rc = cmd_issue(
+            "SA-EXITCODE",
+            runner=self._fake_runner_with_restore_failure(calls, fail_restore_count=999),
+            persist=False,
+        )
+        assert rc == 0, (
+            f"Status-restore failure must not mask the audit result (expected 0), got {rc}"
+        )
+
+
     # ------------------------------------------------------------------
     # Tests: needs_producer_review flag (AC1, AC2)
     # ------------------------------------------------------------------
