@@ -37,6 +37,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -318,6 +319,41 @@ def _parse_ready_to_close(report: str) -> str | None:
                 return "yes"
             return "no"
     return None
+
+
+# Diagnostic evidence strings produced by the audit runner's infrastructure-
+# failure fallback blocks (SA-0MSG9SLGI002OF7V). When any AC verdict carries
+# one of these markers, the audit verdict cannot be trusted as an explicit
+# model assessment — the run degraded to diagnostic 'partial' fallbacks.
+_INFRA_FALLBACK_MARKERS = (
+    "Pi model output could not be parsed",
+    "Pi provider error",
+    "Audit concurrency limit reached",
+    "timed out \u2014 manual review required",
+)
+
+
+def _evidence_has_infra_failure_markers(ac_results: list[dict],
+                                        child_results: list[dict]) -> bool:
+    """Return True when any parent/child AC evidence carries an infra-failure marker.
+
+    Backstop for the ``ac_fallback_used`` flag: if a future fallback site
+    forgets to set the flag, the diagnostic evidence it writes still carries
+    a recognizable marker (e.g. ``Pi model output could not be parsed``,
+    ``Pi provider error``, ``Audit concurrency limit reached``, ``timed out
+    \u2014 manual review required``), so a "No" verdict produced solely from
+    infrastructure failure is still restored rather than demoted.
+    """
+    for r in ac_results:
+        evidence = r.get("evidence", "") or ""
+        if any(marker in evidence for marker in _INFRA_FALLBACK_MARKERS):
+            return True
+    for cr in child_results:
+        for r in cr.get("ac_results", []):
+            evidence = r.get("evidence", "") or ""
+            if any(marker in evidence for marker in _INFRA_FALLBACK_MARKERS):
+                return True
+    return False
 
 
 def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
@@ -872,7 +908,8 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              pi_bin: str = "pi",
              enable_tools: bool = False,
              timeout: int | None = None,
-             max_retries: int | None = None) -> dict:
+             max_retries: int | None = None,
+             ac_fallback_used: threading.Event | None = None) -> dict:
     """Call Pi via subprocess and parse the JSON-stream response.
 
     Args:
@@ -937,6 +974,8 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                 except subprocess.TimeoutExpired:
                     process.kill()
                     stdout, stderr = process.communicate()
+                    if ac_fallback_used is not None:
+                        ac_fallback_used.set()
                     return {
                         "verdict": "unmet",
                         "evidence": (
@@ -953,6 +992,8 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             # Ceiling saturated past the bounded wait: do not launch yet
             # another unbounded pi process. Report a clear unmet verdict so
             # the audit completes gracefully and the operator can retry.
+            if ac_fallback_used is not None:
+                ac_fallback_used.set()
             return {
                 "verdict": "unmet",
                 "evidence": (
@@ -976,6 +1017,8 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     elapsed_seconds = time.monotonic() - _call_start
 
     if provider_error:
+        if ac_fallback_used is not None:
+            ac_fallback_used.set()
         return {
             "verdict": "unmet",
             "evidence": f"Pi provider error: {provider_error}",
@@ -1958,7 +2001,8 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            debug_log: str | None = None,
                            enable_tools: bool = False,
                            timeout: int | None = None,
-                           max_retries: int | None = None) -> dict:
+                           max_retries: int | None = None,
+                           ac_fallback_used: threading.Event | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
     Args:
@@ -1981,7 +2025,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     default path from ``_default_debug_log_path`` will be used and the reason
     will be "parse_failure".
     """
-    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout, max_retries=max_retries)
+    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout, max_retries=max_retries, ac_fallback_used=ac_fallback_used)
 
     # Emit a per-call timing line to stderr (performance baseline). Includes
     # issue id, call context, and elapsed seconds so Phase 2 durations are
@@ -2206,7 +2250,8 @@ def _child_acs_from_own_audit(child: dict, runner: Runner,
 def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
                              pi_bin: str, debug_log: str | None,
                              timeout: int | None, runner: Runner,
-                             script_failure_callback: Callable[[str, Exception], None]
+                             script_failure_callback: Callable[[str, Exception], None],
+                             ac_fallback_used: threading.Event | None = None
                              ) -> tuple[int, list[dict]]:
     """Phase 1 child AC review worker (P7, parallel-safe).
 
@@ -2253,6 +2298,7 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
                 child.get("id", ""), f"child:{child.get('id', '')}", prompt,
                 model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
                 enable_tools=True, timeout=timeout,
+                ac_fallback_used=ac_fallback_used,
             )
         except RuntimeError as exc:
             script_failure_callback("pi (child AC review)", exc)
@@ -2285,6 +2331,12 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
             # parseable JSON array. Print a warning, log raw output, and use
             # 'partial' verdict with diagnostic evidence instead of silently
             # falling back to 'unmet' with empty evidence.
+            # Infra-failure provenance: the batch JSON could not be parsed
+            # (unparseable output, provider error, or concurrency-limit
+            # timeout), so any 'No' derived from these verdicts must restore
+            # the pre-audit state rather than demote (SA-0MSG9SLGI002OF7V).
+            if ac_fallback_used is not None:
+                ac_fallback_used.set()
             if result.get("_provider_error"):
                 print(
                     "Warning: Pi provider error during child AC evaluation — "
@@ -2488,6 +2540,7 @@ def _deep_analyze_child(
     debug_log: str | None,
     timeout: int | None,
     runner: Runner,
+    ac_fallback_used: threading.Event | None = None,
 ) -> tuple[int, dict, bool]:
     """Run Phase 2 deep analysis for a single child (worker for parallelism).
 
@@ -2533,12 +2586,15 @@ def _deep_analyze_child(
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
             enable_tools=True, timeout=timeout,
             max_retries=_PHASE2_MAX_RETRIES,
+            ac_fallback_used=ac_fallback_used,
         )
     except RuntimeError:
         return ci, child, False
 
     # Handle child timeout: mark all child ACs as partial
     if child_result.get("_timeout"):
+        if ac_fallback_used is not None:
+            ac_fallback_used.set()
         print(
             f"Warning: Child deep analysis timed out for {child.get('id', '')}",
             file=sys.stderr,
@@ -2559,6 +2615,8 @@ def _deep_analyze_child(
     # structured output, so degrade all child ACs to partial instead of
     # silently keeping Phase 1 verdicts (met-only-when-confirmed invariant).
     if child_result.get("_provider_error"):
+        if ac_fallback_used is not None:
+            ac_fallback_used.set()
         provider_error = child_result.get("_provider_error_message", "unknown")
         print(
             f"Warning: Child deep analysis provider error for {child.get('id', '')}: "
@@ -2679,6 +2737,7 @@ def _run_batch_phase2(
     debug_log: str | None,
     timeout: int | None,
     runner: Runner,
+    ac_fallback_used: threading.Event | None = None,
 ) -> tuple[list[dict], list[dict], bool] | None:
     """Attempt Phase 2 batch deep analysis (P6).
 
@@ -2762,11 +2821,14 @@ def _run_batch_phase2(
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
             enable_tools=True, timeout=timeout,
             max_retries=_PHASE2_MAX_RETRIES,
+            ac_fallback_used=ac_fallback_used,
         )
     except RuntimeError:
         return None
 
     if result.get("_timeout") or result.get("_provider_error"):
+        if ac_fallback_used is not None:
+            ac_fallback_used.set()
         return None
 
     raw = (
@@ -2781,10 +2843,16 @@ def _run_batch_phase2(
         except json.JSONDecodeError:
             # Unparseable output: fall back to the per-child path rather
             # than silently succeeding with an empty verdict map.
+            if ac_fallback_used is not None:
+                ac_fallback_used.set()
             return None
     if not isinstance(batch, list) or not batch:
+        if ac_fallback_used is not None:
+            ac_fallback_used.set()
         return None
     if not any(isinstance(item, dict) and "index" in item for item in batch):
+        if ac_fallback_used is not None:
+            ac_fallback_used.set()
         return None
 
     reviewed = {
@@ -2818,6 +2886,7 @@ def _run_phase2_deep_analysis(
     runner: Runner | None = None,
     batch_phase2: bool = False,
     worklog_dir: str | None = None,
+    ac_fallback_used: threading.Event | None = None,
 ) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
@@ -2876,6 +2945,7 @@ def _run_phase2_deep_analysis(
         batch_outcome = _run_batch_phase2(
             issue, ac_results, pending, updated_children,
             resolved_model, pi_bin, debug_log, timeout, runner,
+            ac_fallback_used=ac_fallback_used,
         )
         if batch_outcome is not None:
             return batch_outcome
@@ -2928,6 +2998,7 @@ def _run_phase2_deep_analysis(
             model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
             enable_tools=True, timeout=timeout,
             max_retries=_PHASE2_MAX_RETRIES,
+            ac_fallback_used=ac_fallback_used,
         )
     except RuntimeError as exc:
         # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
@@ -2938,6 +3009,8 @@ def _run_phase2_deep_analysis(
 
     # Check for timeout before attempting to parse results
     if result.get("_timeout"):
+        if ac_fallback_used is not None:
+            ac_fallback_used.set()
         evidence = result.get("evidence", "Deep analysis timed out.")
         print(f"Warning: Phase 2 deep analysis timed out: {evidence}", file=sys.stderr)
         if script_failure_callback:
@@ -2972,6 +3045,8 @@ def _run_phase2_deep_analysis(
     # The model never emitted its structured output, so treat all ACs as
     # partial with a provider-error diagnostic (distinct from a parse failure).
     if result.get("_provider_error"):
+        if ac_fallback_used is not None:
+            ac_fallback_used.set()
         provider_error = result.get("_provider_error_message", "unknown")
         print(
             f"Warning: Phase 2 deep analysis provider error: {provider_error}",
@@ -3074,6 +3149,7 @@ def _run_phase2_deep_analysis(
                 executor.submit(
                     _deep_analyze_child, ci, child, resolved_model, pi_bin,
                     debug_log, timeout, runner,
+                    ac_fallback_used=ac_fallback_used,
                 )
                 for ci, child in pending
             ]
@@ -3091,6 +3167,7 @@ def _run_phase2_deep_analysis(
         for ci, child in pending:
             _merge_result(_deep_analyze_child(
                 ci, child, resolved_model, pi_bin, debug_log, timeout, runner,
+                ac_fallback_used=ac_fallback_used,
             ))
 
     return updated_ac, updated_children, not child_timeout_occurred
@@ -3292,6 +3369,21 @@ def cmd_issue(issue_id: str, persist: bool = True,
     # Set True only when the audit pipeline reached a successful completion
     # (report assembled and, when persisting, persisted + read back).
     audit_completed: bool = False
+    # Pre-initialized verdict containers so the finally block can scan AC
+    # evidence for infra-failure markers even on early-exit paths (e.g. a
+    # `wl show --children` failure that returns before ac_results is built).
+    ac_results: list[dict] = []
+    child_results: list[dict] = []
+
+    # Infra-failure provenance flag (SA-0MSG9SLGI002OF7V): set whenever any
+    # parent/child AC evaluation falls back to a diagnostic 'partial'
+    # because of an infrastructure failure (concurrency-limit timeout,
+    # provider error, unparseable Pi output, Phase-2 deep-analysis timeout).
+    # A "Ready to close: No" produced solely from such fallbacks must
+    # restore the pre-audit status/stage instead of demoting the item.
+    # threading.Event is thread-safe: child AC screening and Phase-2 child
+    # deep analysis run under a ThreadPoolExecutor.
+    ac_fallback_used = threading.Event()
 
     # ------------------------------------------------------------------
     # Status lifecycle: set in_progress on entry (verdict-driven on exit)
@@ -3390,7 +3482,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 f"Criteria: {ac_list_json}"
             )
             try:
-                result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, enable_tools=True, timeout=timeout)
+                result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, enable_tools=True, timeout=timeout, ac_fallback_used=ac_fallback_used)
             except RuntimeError as exc:
                 _record_script_failure("pi (parent AC review)", exc)
                 print(f"Warning: Pi call failed for parent AC review: {exc}", file=sys.stderr)
@@ -3421,6 +3513,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 # parseable JSON array. Print a warning, log raw output, and use
                 # 'partial' verdict with diagnostic evidence instead of silently
                 # falling back to 'unmet' with empty evidence.
+                # Infra-failure provenance (SA-0MSG9SLGI002OF7V): the batch
+                # JSON could not be parsed (unparseable output, provider error,
+                # or concurrency-limit timeout), so any 'No' derived from these
+                # verdicts must restore the pre-audit state rather than demote.
+                ac_fallback_used.set()
                 if result.get("_provider_error"):
                     print(
                         "Warning: Pi provider error during AC evaluation — "
@@ -3587,6 +3684,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                             ci, child,
                             resolved_model, pi_bin, debug_log, timeout,
                             runner, _record_script_failure,
+                            ac_fallback_used=ac_fallback_used,
                         )
                         for ci, child in pending_children
                     ]
@@ -3599,6 +3697,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         ci, child,
                         resolved_model, pi_bin, debug_log, timeout,
                         runner, _record_script_failure,
+                        ac_fallback_used=ac_fallback_used,
                     )
                     child_results[ci]["ac_results"] = acs
 
@@ -3756,6 +3855,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 runner=runner,
                 batch_phase2=batch_phase2,
                 worklog_dir=worklog_dir,
+                ac_fallback_used=ac_fallback_used,
             )
 
         # ------------------------------------------------------------------
@@ -3840,6 +3940,10 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 )
                 if repaired_acs is not None:
                     ac_results = repaired_acs
+                    # The bounded re-ask recovered a genuine verdict array:
+                    # clear the infra-fallback flag so a genuine "No" from the
+                    # repaired verdicts still demotes (SA-0MSGMR7CX00588TZ AC4).
+                    ac_fallback_used.clear()
                     report = _assemble_report()
                     persist_rc = persist_audit(
                         issue_id, report, worklog_dir=worklog_dir
@@ -3924,13 +4028,21 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # in_progress after the audit completes.
         #
         #   Ready to close: Yes → completed / in_review (stage kept 'done')
-        #   Ready to close: No  → open / plan_complete
+        #   Ready to close: No  → open / plan_complete (only when the "No" is
+        #       a genuine explicit model verdict with parseable AC evidence)
         #   Failure / timeout / unparseable verdict (infrastructure failure) →
         #       restore the captured pre-audit status+stage (fall back to
         #       open/plan_complete only when the original is unknowable) +
         #       assignee cleared so the item stays observable for a re-audit.
         #       An in_review item that hit a model timeout stays in_review —
         #       only an explicit No verdict demotes an item to open.
+        #   Infra-failure fallback "No" (SA-0MSG9SLGI002OF7V): a "No"
+        #       verdict produced solely from AC verdicts degraded to partial
+        #       by infrastructure failure (concurrency limit, provider error,
+        #       unparseable output, Phase-2 timeout) is NOT an explicit model
+        #       assessment — it takes the restore branch. The flag is set at
+        #       every fallback site; an evidence-marker backstop defends
+        #       against future fallback sites that forget to set it.
         #
         # The transition is retried on transient wl failures so a single
         # hiccup never leaves the item stuck in_progress; if it still fails a
@@ -3942,7 +4054,19 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # failure warning can tell the operator exactly what to apply.
         restore_cmd: list[str] | None = None
         try:
-            if script_failure is not None or not audit_completed or audit_verdict is None:
+            # Infra-fallback provenance: a "No" derived from infrastructure-
+            # failure fallbacks must restore, never demote. A "Yes" verdict
+            # with the flag set also restores (conservative — a fallback
+            # implies the assessment is incomplete).
+            fallback_tainted = ac_fallback_used.is_set()
+            if audit_verdict == "no" and not fallback_tainted:
+                # Evidence-marker backstop: if any AC evidence carries a known
+                # infra-failure diagnostic, treat the "No" as fallback-tainted
+                # even if a future fallback site forgot to set the flag.
+                fallback_tainted = _evidence_has_infra_failure_markers(
+                    ac_results, child_results,
+                )
+            if script_failure is not None or not audit_completed or audit_verdict is None or fallback_tainted:
                 # Infrastructure failure / unparseable verdict: restore the
                 # pre-audit state captured on entry (status + stage). A
                 # transient failure (model timeout, provider error, wl hiccup)
