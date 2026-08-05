@@ -5,11 +5,13 @@ so that the F4 implementation has a deterministic target.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 from types import SimpleNamespace
 
 import pytest
+
 from skill.audit.scripts.audit_runner import (
     _CHILDREN_CAP,
     _PI_MAX_RETRIES,
@@ -103,6 +105,27 @@ def _make_pi_response(verdict: str, evidence: str) -> str:
 # _call_pi tests
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture
+def _no_audit_slot(monkeypatch):
+    """Isolate _call_pi tests from the host-wide audit semaphore.
+
+    ``_call_pi`` acquires a slot from the host-wide flock semaphore
+    (``skill/shared/process_semaphore.py``) before spawning pi. Under heavy
+    concurrent audit load the slot pool saturates and ``_acquire_audit_slot()``
+    raises ``TimeoutError``, making these otherwise-deterministic contract tests
+    flaky (observed intermittently; triaged as SA-0MSGGM4HK002YTV9). These tests
+    verify the pi invocation contract, not slot acquisition — the semaphore
+    itself is covered by tests/test_measure_fanout.py and
+    tests/test_validate_fanout.py.
+    """
+    monkeypatch.setattr(
+        "skill.audit.scripts.audit_runner._acquire_audit_slot",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+
+
+@pytest.mark.usefixtures("_no_audit_slot")
 class TestCallPi:
     """Stub the Pi subprocess invocation and verify the contract."""
 
