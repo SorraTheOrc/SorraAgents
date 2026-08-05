@@ -120,7 +120,7 @@ Execute the following steps in order. Do not skip steps.
 
 ### Step 3 — Implement
 
-- **Write tests first** (TDD): create at least one test file before editing implementation code. Tests may fail initially; implement code to make them pass. If external constraints prevent complete tests, use harnesses/mocks and document the limitation. **Do NOT write placeholder tests** — if the feature is not yet implemented, track the work in a work item instead (see [Test Writing Guidelines](../shared/test-writing-guidelines.md)).
+- **Test adequately — TDD preferred.** Writing tests first (TDD) is the preferred approach, but alternative strategies (e.g., test-after) are acceptable when they better suit the implementation. Ensure excellent test coverage with meaningful tests; if external constraints prevent complete tests, use harnesses/mocks and document the limitation. **Do NOT write placeholder tests** — if the feature is not yet implemented, track the work in a work item instead (see [Test Writing Guidelines](../shared/test-writing-guidelines.md)).
 - Write implementation code to meet ACs.
 - Make minimal, focused changes.
 - Follow project style and conventions.

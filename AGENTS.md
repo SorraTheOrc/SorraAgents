@@ -3,7 +3,7 @@ Core principles for AI Agents working with work-items tracked in Worklog (wl) an
 - Tasks require a work-item id; if not provided, ask for one to be created or get permission to create one.
 - When asked to complete a task, follow the workflow below: claim, define, plan, decide, implement, update, repeat, end.
 - Do NOT ask unnecessary questions. Check existing information first before asking.
-- Write tests *before* writing code. If requirements are unclear, seek clarification before proceeding.
+- Ensure code has excellent test coverage, with every test serving a meaningful purpose. TDD is preferred but alternatives are permitted; see the implement skill for testing guidance. If requirements are unclear, seek clarification before proceeding.
 - Reasonable assumptions are OK but must be documented in the work-item and communicated upon completion.
 - Do not stop working on a task until you hit an explicit gating step.
 - A task is not complete until all acceptance criteria are satisfied, all tests pass, and the work-item is ready for review. Use the `audit` skill to verify before marking as ready.
@@ -30,7 +30,7 @@ Follow the steps below when completing tasks. If you already have a current work
    cd .worklog/worktrees/wl-<WIP-id>-<slug>
    ```
 
-   Write tests first, then code. Follow build → test → commit order (never reverse). When done:
+   Ensure the code is well-tested (TDD preferred, alternatives permitted). Follow build → test → commit order (never reverse). When done:
 
    ```bash
    # Finish: refactor, build, test (fix loop), commit, cleanup, push, mark in_review
@@ -46,7 +46,7 @@ Follow the steps below when completing tasks. If you already have a current work
 
    Work committed to dev
 
-   See [implement skill](/home/rgardler/.pi/agent/skills/implement/SKILL.md) for the full implementation workflow (test-driven development, commit discipline, worktree lifecycle, error handling).
+   See [implement skill](/home/rgardler/.pi/agent/skills/implement/SKILL.md) for the full implementation workflow (testing guidance, commit discipline, worktree lifecycle, error handling).
 
 6. **Update the operator** — Provide a concise summary with relevant links (id, commits, PRs). Do not suggest next steps.
 7. **Repeat** — Return to step 4.
@@ -304,8 +304,8 @@ Transform imperative tasks into verifiable goals:
 
 | Instead of... | Transform to... |
 |--------------|-----------------|
-| "Add validation" | "Write tests for invalid inputs, then make them pass" |
-| "Fix the bug" | "Write a test that reproduces it, then make them pass" |
+| "Add validation" | "Ensure invalid inputs are rejected, verified by tests" |
+| "Fix the bug" | "Ensure the bug no longer reproduces, verified by a regression test" |
 | "Refactor X" | "Ensure tests pass before and after" |
 
 For multi-step tasks, state a brief plan:

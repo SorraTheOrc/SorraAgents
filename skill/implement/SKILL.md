@@ -79,7 +79,7 @@ observable behaviour via the public API.
 ## Best Practices
 
 - Follow the steps in order and do not skip steps.
-- **Write tests before implementation code** (test-driven development). Always create at least one test file before editing implementation code. Tests may fail on first run; write implementation code to make them pass. When external constraints prevent complete tests, create harnesses/mocks and document the limitation. **Do NOT write placeholder tests** — if the feature is not yet implemented, track the work in a work item instead (see [Test Writing Guidelines](../shared/test-writing-guidelines.md)).
+- **Testing is required — TDD is preferred, not mandatory.** Ensure code has excellent test coverage with meaningful tests. TDD (writing tests before implementation code) is the preferred approach, but alternative strategies (e.g., test-after) are permitted when TDD would complicate implementation. When external constraints prevent complete tests, create harnesses/mocks and document the limitation. **Do NOT write placeholder tests** — if the feature is not yet implemented, track the work in a work item instead (see [Test Writing Guidelines](../shared/test-writing-guidelines.md)).
 - Do not use search tools (grep, ripgrep, code search). Rely on work-item context and linked docs. If insufficient context, run intake interview.
 - Keep implementation focused on meeting acceptance criteria with minimal changes.
 - Never edit code outside `src/`, `tests/`, `docs/` unless essential configuration files.
@@ -254,7 +254,7 @@ After all recursive child implementations are complete, check whether this work 
 - Check for a recent audit record; if none, run `/skill:audit <work-item-id>` to establish work needed.
 - Write tests and code to meet acceptance criteria:
   - Make minimal, focused changes.
-  - **Write tests first** (TDD): create at least one test file before editing implementation code. Tests may fail initially; implement code to make them pass. If external constraints prevent complete tests, use harnesses/mocks and document the limitation.
+  - **Test adequately — TDD preferred.** Writing tests first (TDD) is the preferred approach, but alternative strategies (e.g., test-after) are acceptable when they better suit the implementation. Ensure excellent test coverage with meaningful tests; if external constraints prevent complete tests, use harnesses/mocks and document the limitation.
   - Follow project style and conventions.
   - Comment on significant design decisions.
   - If additional work is discovered, create linked work items: `wl create "<title>" --deps discovered-from:<work-item-id> --json`
