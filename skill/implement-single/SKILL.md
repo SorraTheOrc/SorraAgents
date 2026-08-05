@@ -150,12 +150,12 @@ python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py finish <w
 This will:
 1. Run the refactor step (auto-fix session-introduced smells)
 2. Build the project
-3. Run the full test suite with a fix-and-re-run loop (up to 3 retries)
+3. Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`) — run → triage → evaluate → loop until green (fix-and-re-run loop, up to 3 retries)
 4. Commit changes with a descriptive message
 
 **Alternative (manual):** If the script is unavailable:
 - Build the project and verify no errors.
-- Run the entire test suite. Fix any failing tests.
+- Run the entire test suite via the [test skill](../test/SKILL.md) (`/skill:test`). Fix any failing tests.
 - Commit changes with a message referencing the work item id.
 - Add a comment to the work item with the commit hash.
 
@@ -200,9 +200,9 @@ python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py abort <wo
 ```bash
 # Fetch work item
 wl show <work-item-id> --json --children
-# Build and test
+# Build and test via the test skill (run → triage → evaluate → loop until green)
+python3 skill/test/scripts/run_tests.py --json
 npm run build 2>/dev/null || echo "No build script"
-npm test
 # Mark in_review when complete
 python3 -c "from skill.shared.status_lifecycle import StatusLifecycle; StatusLifecycle.update_status('<work-item-id>', 'completed', stage='in_review')"
 ```
