@@ -100,7 +100,13 @@ class TestIntakeCwdIndependence:
 
     def test_cmd_finish_preserves_statuses(self):
         """finish still sets open + intake_complete (no behaviour change)."""
-        with mock.patch("skill.shared.status_lifecycle.subprocess.run") as m:
+        with (
+            mock.patch("skill.shared.status_lifecycle.subprocess.run") as m,
+            mock.patch(
+                "skill.shared.status_lifecycle.worklog_dir_flag",
+                return_value=[],
+            ),
+        ):
             m.return_value = _ok_proc(["wl"])
             result = intake.cmd_finish("TEST-123")
             assert result == {"success": True, "action": "finished", "item_id": "TEST-123"}

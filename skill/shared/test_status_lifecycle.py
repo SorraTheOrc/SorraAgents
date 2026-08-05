@@ -27,8 +27,22 @@ from skill.shared.status_lifecycle import StatusLifecycle
 
 @pytest.fixture
 def mock_run():
-    """Fixture that patches subprocess.run and returns the mock."""
-    with mock.patch("skill.shared.status_lifecycle.subprocess.run") as m:
+    """Fixture that patches subprocess.run and returns the mock.
+
+    Also neutralizes ``worklog_dir_flag`` so the wl command contents in
+    these lifecycle tests are deterministic regardless of where pytest
+    was invoked (e.g. from inside a git worktree, where the flag would
+    otherwise be injected to point at the main checkout's .worklog).
+    Flag-injection logic is covered separately by
+    ``TestWorklogDirDetection`` and the dedicated injection tests.
+    """
+    with (
+        mock.patch("skill.shared.status_lifecycle.subprocess.run") as m,
+        mock.patch(
+            "skill.shared.status_lifecycle.worklog_dir_flag",
+            return_value=[],
+        ),
+    ):
         yield m
 
 
@@ -404,8 +418,12 @@ class TestStatusLifecycleUnit:
 class TestWorklogDirDetection:
     """Tests for worklog-dir auto-detection (cwd-independent wl invocation)."""
 
-    def test_flag_empty_when_cwd_is_worklog_root(self):
-        """Running from the repo root: cwd/.worklog exists -> no flag needed."""
+    def test_flag_empty_when_cwd_is_worklog_root(self, tmp_path, monkeypatch):
+        """Running from an initialized worklog root: no flag needed."""
+        proj = tmp_path / "proj"
+        (proj / ".worklog").mkdir(parents=True)
+        (proj / ".worklog" / "initialized").write_text("{}")
+        monkeypatch.chdir(proj)
         assert status_lifecycle_module.worklog_dir_flag() == []
 
     def test_flag_set_when_detection_resolves_dir(self, monkeypatch, tmp_path):

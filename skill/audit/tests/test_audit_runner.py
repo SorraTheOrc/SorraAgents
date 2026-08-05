@@ -1914,9 +1914,17 @@ class TestVerdictDrivenStatusLifecycle:
             )
 
     def _last_update(self, updates):
-        """Return the last wl update command recorded (the terminal transition)."""
+        """Return the last wl update command recorded (the terminal transition).
+
+        Strips a leading ``--worklog-dir <path>`` pair that StatusLifecycle
+        injects when the audit runner is invoked from inside a git worktree,
+        so the assertions below are cwd-independent.
+        """
         assert updates, "expected at least one wl update command"
-        return updates[-1]
+        cmd = updates[-1]
+        if cmd[:1] == ["wl"] and len(cmd) >= 3 and cmd[1] == "--worklog-dir":
+            cmd = ["wl"] + cmd[3:]
+        return cmd
 
     # ------------------------------------------------------------------
     # Ready to close: Yes

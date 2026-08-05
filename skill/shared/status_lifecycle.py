@@ -50,6 +50,25 @@ Runner = Callable[[list[str]], subprocess.CompletedProcess]
 # ======================================================================
 
 
+def _is_initialized_worklog(path: Path) -> bool:
+    """True when *path* is a usable (initialized) worklog directory.
+
+    An initialized worklog has an ``initialized`` marker file (or a
+    ``worklog.db``). A directory holding only ``config.yaml`` — e.g. a
+    git worktree's committed copy of ``.worklog/`` — is NOT initialized
+    and pointing ``wl`` at it fails with "Worklog system is not initialized".
+
+    Args:
+        path: Candidate ``.worklog`` directory.
+
+    Returns:
+        True if the directory exists and is initialized.
+    """
+    return path.is_dir() and (
+        (path / "initialized").is_file() or (path / "worklog.db").is_file()
+    )
+
+
 def _detect_worklog_dir() -> Path | None:
     """Detect the target project's ``.worklog`` directory.
 
@@ -94,10 +113,26 @@ def worklog_dir_flag() -> list[str]:
     project root (e.g. the skill install dir), pass the explicit
     ``--worklog-dir`` so the command succeeds regardless of cwd.
 
+    A git worktree's ``.worklog/`` contains only the committed
+    ``config.yaml`` and is NOT initialized, so ``wl`` fails from inside a
+    worktree. Since worktrees live under the main checkout's
+    ``.worklog/worktrees/``, the nearest ancestor with an initialized
+    ``.worklog`` is the main checkout — point ``wl`` at it.
+
     Returns an empty list when no worklog directory is resolvable (the
     command will run as-is and any failure will surface real error detail).
     """
-    if (Path.cwd() / ".worklog").is_dir():
+    cwd_worklog = Path.cwd() / ".worklog"
+    if cwd_worklog.is_dir():
+        if _is_initialized_worklog(cwd_worklog):
+            return []
+        # cwd/.worklog exists but is not initialized (e.g. a git worktree
+        # with only the committed config.yaml): resolve the nearest
+        # ancestor project .worklog that IS initialized (the main checkout).
+        for parent in Path.cwd().parents:
+            cand = parent / ".worklog"
+            if _is_initialized_worklog(cand):
+                return ["--worklog-dir", str(cand)]
         return []
     wl_dir = _detect_worklog_dir()
     if wl_dir is None:

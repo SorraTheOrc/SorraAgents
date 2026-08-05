@@ -22,11 +22,13 @@ Follow the steps below when completing tasks. If you already have a current work
 4. **Decide what to work on next** — Use `wl next --json`. If the recommended item has children, claim it and recurse until reaching a leaf item. If no descendants remain, go to End session.
 5. **Implement the work-item** — Use the implement orchestration script to manage the deterministic lifecycle:
 
+   > **MANDATORY — worktree requirement:** All implementation work MUST be done in the git worktree created by `implement.py start`. `cd` into the worktree (`.worklog/worktrees/wl-<WIP-id>-<slug>`) and make ALL changes there — never edit, commit, or push directly from the main checkout. `implement.py finish` refuses to complete if it detects changes outside the worktree.
+
    ```bash
    # Start: claim, safety gate, create worktree
    python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py start <WIP-id>
 
-   # Switch to the worktree
+   # Switch to the worktree (MANDATORY — all work happens here)
    cd .worklog/worktrees/wl-<WIP-id>-<slug>
    ```
 
@@ -73,6 +75,7 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - Never commit changes without associating them with a work item.
 - Never commit without ensuring the build completes without errors and all tests pass.
 - Always follow build → test → commit order. Never reverse or skip steps.
+- ALL implementation work MUST be done in a git worktree created by the implement workflow (`implement.py start` → `cd .worklog/worktrees/wl-<WIP-id>-<slug>`). Never commit implementation changes directly from the main checkout — `implement.py finish` enforces this by refusing when changes exist outside the worktree.
 - Before reporting work as done, rebuild and run the full test suite. Confirm the build succeeds and no tests fail.
 - Always record the commit message and hash in a comment on the relevant work item(s).
 - When making comments, include the changes made, files affected, and the commit hash.

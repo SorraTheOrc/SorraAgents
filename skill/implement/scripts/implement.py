@@ -47,7 +47,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from skill.shared.code_freeze import is_code_freeze_active
-from skill.shared.status_lifecycle import StatusLifecycle
+from skill.shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
 
 LOG = logging.getLogger("implement.scripts.implement")
 
@@ -279,10 +279,9 @@ def wl_show(work_item_id: str) -> dict[str, Any]:
     Returns:
         Parsed JSON dict from ``wl show``.
     """
-    result = run_cmd(
-        ["wl", "show", work_item_id, "--json"],
-        check=False,
-    )
+    cmd = ["wl", "show", work_item_id, "--json"]
+    cmd[1:1] = worklog_dir_flag()
+    result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.error("Failed to fetch work item %s: %s", work_item_id, result.stderr.strip())
         return {}
@@ -306,10 +305,12 @@ def wl_add_comment(work_item_id: str, comment: str) -> bool:
     Returns:
         True if the comment was added.
     """
-    result = run_cmd(
-        ["wl", "comment", "add", work_item_id, "--comment", comment, "--author", "implement"],
-        check=False,
-    )
+    cmd = [
+        "wl", "comment", "add", work_item_id,
+        "--comment", comment, "--author", "implement",
+    ]
+    cmd[1:1] = worklog_dir_flag()
+    result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.warning("Failed to add comment to %s: %s", work_item_id, result.stderr.strip())
         return False
@@ -355,10 +356,18 @@ def git_rev_parse_is_inside_work_tree() -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
-def git_status() -> str:
-    """Get the current git status (porcelain v1)."""
+def git_status(cwd: str | None = None) -> str:
+    """Get the current git status (porcelain v1).
+
+    Args:
+        cwd: Working directory to check (defaults to current directory).
+
+    Returns:
+        Porcelain status output, or empty string on error.
+    """
     result = run_cmd(
         ["git", "status", "--porcelain=v1", "-b"],
+        cwd=cwd,
         capture=True,
         check=False,
     )
@@ -1088,6 +1097,7 @@ def phase_finish(
     """Phase 2: Complete the implementation.
 
     Steps:
+    0. Worktree placement gate (refuse if changes were made outside the worktree)
     1. Read state to find worktree
     2. Refactor step (unless --no-refactor)
     3. Build
@@ -1098,6 +1108,10 @@ def phase_finish(
     8. Push to dev
     9. Restore repo state
     10. Mark in_review
+
+    All implementation work MUST be done inside the worktree created by
+    ``phase_start``. If the current directory is outside the worktree and the
+    main checkout holds uncommitted changes, finish refuses (step 0).
 
     Args:
         work_item_id: The work item ID.
@@ -1149,6 +1163,36 @@ def phase_finish(
             print(format_json_output(report))
         else:
             LOG.error(msg)
+        return report
+
+    # ── Step 0.5: Worktree placement gate ──────────────────────────
+    # All implementation work must happen inside the worktree created by
+    # `implement.py start`. If changes were made in the main checkout
+    # instead, refuse rather than silently build/test/commit an empty
+    # worktree and mark the item in_review.
+    violation = _worktree_placement_violation(
+        worktree_path,
+        parent_branch=state.parent_branch if state else DEFAULT_PARENT_BRANCH,
+    )
+    if violation:
+        msg = violation
+        LOG.error(msg)
+        report["success"] = False
+        report["message"] = msg
+        report["worktree_enforcement"] = True
+        wl_add_comment(
+            work_item_id,
+            "Finish phase refused: implementation changes found outside the "
+            f"worktree.\n```\n{msg}\n```",
+        )
+        try:
+            StatusLifecycle.update_status(work_item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {msg}\n")
         return report
 
     # ── Step 1: Refactor step ──────────────────────────────────────
@@ -1452,6 +1496,84 @@ def _is_worktree(path: Path) -> bool:
     """
     git_path = path / ".git"
     return git_path.is_file()
+
+
+def _worktree_placement_violation(
+    worktree_path: str,
+    cwd: str | None = None,
+    repo_root: str | None = None,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> str | None:
+    """Return an error message when implementation work landed outside the worktree.
+
+    All implementation work must happen inside the worktree created by
+    ``implement.py start``. A violation exists only when ALL of:
+
+    1. the current directory is not the worktree (or a subdirectory of it),
+    2. the main checkout holds uncommitted changes outside ``.worklog/``, and
+    3. the worktree itself holds NO changes (clean and at the parent branch
+       HEAD) — i.e. the work was done in the main checkout, not the worktree.
+
+    Condition 3 keeps the gate precise: pre-existing/unrelated dirt in the
+    main checkout does not block a legitimate finish when the work actually
+    lives in the worktree.
+
+    Args:
+        worktree_path: Absolute path to the worktree.
+        cwd: Directory to treat as the current directory (defaults to
+            ``os.getcwd()``).
+        repo_root: Main repo root (defaults to discovery from *cwd*).
+        parent_branch: Branch the worktree forked from (default: ``dev``).
+
+    Returns:
+        An actionable error message string if placement is violated,
+        otherwise ``None``.
+    """
+    wt = Path(worktree_path).resolve()
+    cur = Path(cwd or os.getcwd()).resolve()
+    if cur == wt or wt in cur.parents:
+        return None  # already inside the worktree
+
+    root = Path(repo_root or _get_repo_root(cur) or cur).resolve()
+    if not git_has_dirty_files(git_status(cwd=str(root))):
+        return None  # main checkout clean; work must be in the worktree
+
+    if _git_path_has_changes(wt, parent_branch):
+        return None  # work lives in the worktree; main-checkout dirt is unrelated
+
+    return (
+        f"Work done outside the worktree: uncommitted changes were found in "
+        f"the main checkout at {root} while the worktree {wt} contains no "
+        f"changes. All implementation work MUST be done in the worktree "
+        f"created by `implement.py start`. Move your changes into the "
+        f"worktree and re-run `implement.py finish`."
+    )
+
+
+def _git_path_has_changes(path: Path, parent_branch: str) -> bool:
+    """True when the git directory at *path* contains implementation changes.
+
+    Detects both uncommitted changes and commits ahead of *parent_branch*.
+
+    Args:
+        path: Directory to check (e.g. the worktree root).
+        parent_branch: Branch the directory forked from (e.g. ``dev``).
+
+    Returns:
+        True if the directory is dirty or its HEAD differs from the parent
+        branch; False only when it is clean AND at the parent branch HEAD.
+    """
+    if git_has_dirty_files(git_status(cwd=str(path))):
+        return True
+    head = run_cmd(
+        ["git", "rev-parse", "HEAD"], cwd=str(path), check=False, capture=True
+    )
+    parent = run_cmd(
+        ["git", "rev-parse", parent_branch], cwd=str(path), check=False, capture=True
+    )
+    if head.returncode == 0 and parent.returncode == 0:
+        return head.stdout.strip() != parent.stdout.strip()
+    return True  # cannot compare; fail open
 
 
 def _discover_worktree(work_item_id: str) -> str | None:

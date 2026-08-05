@@ -225,6 +225,13 @@ If the gate fails:
 
 4. Create a worktree from dev and branch inside it
 
+> **MANDATORY — worktree requirement:** All implementation work MUST be done
+> in a git worktree created from `dev`. Never edit, commit, or push directly
+> from the main checkout. `implement.py finish` enforces this: it refuses to
+> complete when it detects changes outside the worktree. When using the
+> orchestration script, `implement.py start` creates the worktree for you —
+> you must `cd` into it and do all work there.
+
 Follow the worktree convention in [[concepts/git-worktree-best-practices-for-agent-workflows]]:
 
 ```bash

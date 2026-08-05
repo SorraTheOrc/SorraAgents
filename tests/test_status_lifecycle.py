@@ -1,13 +1,18 @@
 """Unit tests for StatusLifecycle module (skill/shared/status_lifecycle.py).
 
 Tests the update_status() static method, particularly the new optional
-``needs_producer_review`` parameter (AC2).
+``needs_producer_review`` parameter (AC2), and the worklog-dir resolution
+that makes ``wl`` work from inside git worktrees (SA-0MSGKAWXQ009VVG2).
 """
 from __future__ import annotations
 
 import json
+import subprocess
 from types import SimpleNamespace
 
+import pytest
+
+from skill.shared import status_lifecycle as status_lifecycle_module
 from skill.shared.status_lifecycle import StatusLifecycle
 
 # ---------------------------------------------------------------------------
@@ -134,9 +139,131 @@ class TestStatusLifecycleUpdateStatus:
         def fake_runner(cmd, **kwargs):
             return _fake_proc(returncode=1, stderr="wl: work item not found")
 
-        import pytest
-
         with pytest.raises(RuntimeError, match="wl command failed"):
             StatusLifecycle.update_status(
                 "SA-NONEXIST", "completed", runner=fake_runner
             )
+
+
+# ---------------------------------------------------------------------------
+# Tests: worklog-dir resolution from inside git worktrees (SA-0MSGKAWXQ009VVG2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def worktree_project(tmp_path):
+    """A git repo with an initialized .worklog in the MAIN checkout and a
+    worktree under ``<main>/.worklog/worktrees/`` whose .worklog holds only
+    the committed config.yaml (mimicking a real project worktree).
+    """
+    repo_root = tmp_path / "project"
+    repo_root.mkdir()
+    subprocess.run(["git", "init"], cwd=str(repo_root), check=True,
+                   capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"],
+                   cwd=str(repo_root), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"],
+                   cwd=str(repo_root), check=True, capture_output=True)
+    (repo_root / "README.md").write_text("# Project")
+    subprocess.run(["git", "add", "-A"], cwd=str(repo_root), check=True,
+                   capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Initial commit"],
+                   cwd=str(repo_root), check=True, capture_output=True)
+    subprocess.run(["git", "branch", "dev"], cwd=str(repo_root), check=True,
+                   capture_output=True)
+
+    # Initialize .worklog in the MAIN checkout only
+    main_worklog = repo_root / ".worklog"
+    main_worklog.mkdir()
+    (main_worklog / "initialized").write_text('{"version": "1.0.3"}')
+    (main_worklog / "config.yaml").write_text("projectName: Test\n")
+
+    # Worktree under the main checkout's .worklog/worktrees/ (as created by
+    # `implement.py start`); its .worklog holds only config.yaml (not initialized)
+    worktree_dir = (main_worklog / "worktrees" / "wl-test").resolve()
+    worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "--track", "-b",
+         "wl-test", str(worktree_dir), "dev"],
+        cwd=str(repo_root), check=True, capture_output=True,
+    )
+    wt_worklog = worktree_dir / ".worklog"
+    wt_worklog.mkdir(exist_ok=True)
+    (wt_worklog / "config.yaml").write_text("projectName: Test\n")
+
+    return {
+        "repo_root": repo_root.resolve(),
+        "worktree_dir": worktree_dir,
+    }
+
+
+class TestWorklogDirResolutionFromWorktree:
+    """wl commands must resolve the main checkout's initialized .worklog
+    when run from inside a git worktree (whose own .worklog is not
+    initialized). Without this, `implement.py finish` (run from the
+    worktree as documented) fails with 'Worklog system is not initialized'.
+    """
+
+    def test_worklog_dir_flag_from_worktree_points_at_main(
+        self, worktree_project, monkeypatch
+    ):
+        main = worktree_project["repo_root"]
+        wt = worktree_project["worktree_dir"]
+        monkeypatch.chdir(wt)
+
+        flag = status_lifecycle_module.worklog_dir_flag()
+
+        assert flag == ["--worklog-dir", str(main / ".worklog")], (
+            f"Expected --worklog-dir flag for main checkout, got {flag}"
+        )
+
+    def test_worklog_dir_flag_empty_at_initialized_root(
+        self, worktree_project, monkeypatch
+    ):
+        main = worktree_project["repo_root"]
+        monkeypatch.chdir(main)
+
+        flag = status_lifecycle_module.worklog_dir_flag()
+
+        assert flag == [], (
+            f"Expected empty flag at initialized project root, got {flag}"
+        )
+
+    def test_run_wl_injects_worklog_dir_from_worktree(
+        self, worktree_project, monkeypatch
+    ):
+        main = worktree_project["repo_root"]
+        wt = worktree_project["worktree_dir"]
+        monkeypatch.chdir(wt)
+
+        calls = []
+
+        def fake_runner(cmd):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0,
+                stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        status_lifecycle_module.run_wl(
+            ["wl", "show", "SA-X", "--json"], runner=fake_runner
+        )
+
+        assert calls, "Expected a wl command to run"
+        assert calls[0][0] == "wl"
+        assert calls[0][1] == "--worklog-dir"
+        assert calls[0][2] == str(main / ".worklog"), (
+            f"Expected --worklog-dir to point at the main checkout, got {calls[0]}"
+        )
+
+    def test_worklog_dir_flag_empty_when_only_config_worklog(
+        self, tmp_path, monkeypatch
+    ):
+        """A config-only .worklog with no initialized ancestor must yield no
+        flag (wl runs as-is and surfaces the real 'not initialized' error)."""
+        d = tmp_path / "somedir"
+        (d / ".worklog").mkdir(parents=True)
+        (d / ".worklog" / "config.yaml").write_text("x: 1\n")
+        monkeypatch.chdir(d)
+
+        assert status_lifecycle_module.worklog_dir_flag() == []
