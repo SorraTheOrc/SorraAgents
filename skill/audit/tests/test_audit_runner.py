@@ -1694,6 +1694,39 @@ class TestPhase2RetryTuning:
         _args, kwargs = parent_calls[0]
         assert kwargs.get("max_retries") == 1
 
+    def test_deep_analyze_child_forwards_reduced_retries(self):
+        """AC4 (SA-0MSGAUD3H007P8Y4): the production phase2_child path
+        (_deep_analyze_child) forwards max_retries=_PHASE2_MAX_RETRIES to
+        _call_pi_and_maybe_log."""
+        child = {
+            "id": "C-1",
+            "title": "Child",
+            "ac_results": [
+                {"index": 0, "text": "AC", "verdict": "met", "evidence": ""}
+            ],
+        }
+        result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"}
+            ]),
+        }
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=result
+        ) as mock_call:
+            _ci, _updated_child, _timeout = audit_runner._deep_analyze_child(
+                0, child, "test-model", "pi", None, None, mock.MagicMock()
+            )
+
+        _args, kwargs = mock_call.call_args
+        assert kwargs.get("max_retries") == audit_runner._PHASE2_MAX_RETRIES
+        assert audit_runner._PHASE2_MAX_RETRIES == 1
+
+    def test_call_pi_timeout_default_exactly_1800(self):
+        """AC5 (SA-0MSGAUD3H007P8Y4): the default CALL_PI_TIMEOUT remains
+        exactly 1800s (operator overrides via --timeout/AUDIT_PI_TIMEOUT are
+        intentional and documented in SKILL.md)."""
+        assert audit_runner.CALL_PI_TIMEOUT == 1800
+
     def test_child_provider_error_degrades_to_partial(self):
         """AC2 (child path): a provider error in phase2_child degrades ACs.
 
