@@ -1330,6 +1330,70 @@ class TestPhase2ChildVerdictReuse:
         done_calls = [c for c in mock_call.call_args_list if c[0][0] == "DONE-1"]
         assert done_calls == []
 
+    def test_stale_child_audit_maps_to_not_ready(self):
+        """AC5 (SA-0MSGAU5RZ00137JZ): a stale child audit is detected as
+        stale by _get_child_audit_verdict (audit older than updatedAt +
+        freshness buffer)."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        stale_audit_time = (now - timedelta(seconds=600)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        updated_time = now.isoformat().replace("+00:00", "Z")
+
+        def _fake_run_wl(runner, cmd, worklog_dir=None):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return {
+                    "success": True,
+                    "audit": {
+                        "auditedAt": stale_audit_time,
+                        "rawOutput": "Ready to close: Yes\n...",
+                    },
+                }
+            if "wl show" in cmd_str:
+                return {
+                    "success": True,
+                    "workItem": {"id": "STALE-1", "updatedAt": updated_time},
+                }
+            raise AssertionError(f"unexpected wl command: {cmd_str}")
+
+        with mock.patch.object(
+            audit_runner, "_run_wl", side_effect=_fake_run_wl
+        ) as mock_wl:
+            verdict, reason = audit_runner._get_child_audit_verdict(
+                mock.MagicMock(), "STALE-1"
+            )
+
+        assert verdict is None
+        assert reason == "stale"
+        # The freshness check queried both the audit and the work item
+        assert mock_wl.call_count == 2
+
+    def test_stale_child_receives_phase2_analysis(self):
+        """AC5 (SA-0MSGAU5RZ00137JZ): a child whose audit is stale maps to
+        child_audit_ready=False (same code path as not-ready), so the parent
+        Phase 2 loop still deep-analyzes it (phase2_child call runs)."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        # Stale audits resolve to child_audit_ready=False in cmd_issue
+        # (audit_runner.py:3429) — exercise that mapping here.
+        child = self._make_child("STALE-1", child_audit_ready=False)
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model",
+            )
+
+        stale_calls = [
+            c for c in mock_call.call_args_list if c[0][0] == "STALE-1"
+        ]
+        assert len(stale_calls) == 1
+
 
 # ===========================================================================
 # Phase 2 parallel child calls (SA-0MSAIXTMS003REBW AC1-AC4)
