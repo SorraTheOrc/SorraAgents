@@ -97,7 +97,7 @@ the autoplan decision logic).
 
    - **If `decision == "skip"`**: The work item is small enough to implement
      directly without decomposition. However, before marking it as
-     `plan_complete`, run the five automated review stages (see
+     `plan_complete`, run the six automated review stages (see
      **Automated review on existing content** below) against the existing
      work item content (description and any existing child work items).
      The review stages will identify and address any gaps before the work
@@ -129,7 +129,7 @@ the autoplan decision logic).
 
 ## Automated review on existing content (auto-complete path)
 
-When the pre-check returns `decision: "skip"`, the skill runs the five
+When the pre-check returns `decision: "skip"`, the skill runs the six
 review stages against whatever content exists in the work item
 description and any existing child work items. Unlike Process step 6
 (which reviews a freshly generated feature plan), this auto-complete
@@ -147,7 +147,16 @@ Each review stage MUST:
 
 Review stages (adapted for existing content):
 
-1. **Completeness review** — Ensure the work item has all required fields
+1. **Requirements & AC alignment review** — Verify the acceptance criteria
+   are a faithful match to the work item's requirements and use cases.
+   For each stated requirement or use case in the description (and any
+   referenced PRD), confirm there is at least one corresponding acceptance
+   criterion that would verify it, and that every acceptance criterion
+   traces back to a stated requirement or use case. Flag ACs that are
+   missing, contradictory, or cover requirements that were never stated;
+   add missing ACs only where the intent is clear and unambiguous,
+   otherwise record an Open Question and continue.
+2. **Completeness review** — Ensure the work item has all required fields
    (description, acceptance criteria) and that any existing child items
    are complete. Add missing fields if clearly definable from context.
 
@@ -166,19 +175,19 @@ Review stages (adapted for existing content):
    Any corrections (additions, removals, or corrections) to the ``**Key
    Files:**`` list identified during this review should be reflected in the
    work item description before the plan process completes.
-2. **Sequencing & dependencies review** — Verify any existing child item
+3. **Sequencing & dependencies review** — Verify any existing child item
    dependencies are coherent. Check that test/verification items appear
    before implementation items if both exist. Ensure test features come first
    when ordering child items.
-3. **Scope sizing review** — Ensure any existing features are sized as
+4. **Scope sizing review** — Ensure any existing features are sized as
    deliverable increments. If no child items exist, this stage is a no-op.
-4. **Acceptance & testability review** — Verify acceptance criteria are
+5. **Acceptance & testability review** — Verify acceptance criteria are
    pass/fail and testable. Improve vague or untestable criteria where
    the intent is clear and unambiguous.
-5. **Polish & handoff review** — Ensure the work item description is
+6. **Polish & handoff review** — Ensure the work item description is
    clear, well-formatted, and actionable.
 
-After all five stages complete, output a summary to the console listing
+After all six stages complete, output a summary to the console listing
 what each review stage checked and what (if anything) was found or changed.
 Then proceed to mark the work item as `plan_complete` (see skip path
 instructions above).
@@ -244,7 +253,7 @@ instructions above).
 
 6. Automated review stages (must follow; no human intervention required)
 
-   After the user approves the feature list, run five review iterations.
+   After the user approves the feature list, run six review iterations.
    Each review MUST provide a new draft if any changes are recommended
    and then output exactly: "Finished <Stage Name> review: <brief notes
    of improvements>"
@@ -257,7 +266,14 @@ instructions above).
        automatically; instead record an Open Question and continue.
 
    Review stages and expected behavior:
-   1. Completeness review — Ensure every feature has all required fields.
+   1. Requirements & AC alignment review — Verify each feature's acceptance
+      criteria faithfully match its stated requirements and use cases.
+      For every requirement/use case there must be at least one AC that
+      verifies it, and every AC must trace back to a stated requirement.
+      Flag missing, contradictory, or invented ACs; add missing ACs only
+      where intent is clear and unambiguous, otherwise record an Open
+      Question and continue.
+   2. Completeness review — Ensure every feature has all required fields.
 
       Additionally, if the work item contains a ``**Key Files:**`` section
       (predicted during intake), validate the listed file paths:
@@ -274,14 +290,14 @@ instructions above).
       Any corrections (additions, removals, or corrections) to the ``**Key
       Files:**`` list identified during this review should be reflected in the
       work item description before the plan process completes.
-   2. Sequencing & dependencies review — Ensure dependencies are coherent
+   3. Sequencing & dependencies review — Ensure dependencies are coherent
       and actionable. Verify that test/verification features appear before
       implementation features.
-   3. Scope sizing review — Ensure features are sized as deliverable
+   4. Scope sizing review — Ensure features are sized as deliverable
       increments.
-   4. Acceptance & testability review — Ensure acceptance criteria are
+   5. Acceptance & testability review — Ensure acceptance criteria are
       pass/fail and testable.
-   5. Polish & handoff review — Make the plan copy-pasteable and easy to
+   6. Polish & handoff review — Make the plan copy-pasteable and easy to
       execute.
 
 7. Update work items (agent)
