@@ -139,6 +139,14 @@ This lets release operators raise the audit runner's tolerance for slow
 Pi model calls (e.g. ``AUDIT_PI_TIMEOUT=3600``) without changing defaults.
 """
 
+AUDIT_GREEN_RUN_ENV = "AUDIT_GREEN_RUN"
+"""Environment variable name for the operator-attested green test run.
+
+When set (and ``--green-run`` is not passed), this value (an exact commit
+sha or the alias ``HEAD``) is used as the green-run attestation. Precedence:
+``--green-run`` flag > ``AUDIT_GREEN_RUN`` env var > unset (no attestation).
+"""
+
 AUDIT_PARENT_TIMEOUT_ENV = "AUDIT_PARENT_TIMEOUT"
 """Environment variable name for overriding the cumulative elapsed-time guard.
 
@@ -621,6 +629,98 @@ def _resolve_effective_timeout(cli_timeout: int | None) -> int | None:
                 file=sys.stderr,
             )
     return None
+
+
+def _green_run_prompt_block(sha: str) -> str:
+    """Build the GREEN-RUN attestation block injected into audit prompts.
+
+    The block tells the model that the operator attests the full project test
+    suite passed at *sha* (the audited HEAD), so execution-dependent criteria
+    (e.g. 'full test suite passes') MAY be marked met based on that
+    attestation — while the read-only mandate otherwise remains in force and
+    the suite must NOT be executed. Returns a string ending in a blank line
+    so callers can splice it between existing prompt sections.
+    """
+    return (
+        "GREEN-RUN ATTESTATION — The operator attests the full project test "
+        f"suite passed at commit {sha} (== current HEAD). "
+        "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
+        "marked met based on this attestation. Do NOT execute the test suite "
+        "or any other state-modifying command — the read-only mandate "
+        "otherwise remains in force.\n\n"
+    )
+
+
+def _resolve_green_run_value(cli_value: str | None) -> str | None:
+    """Resolve the raw green-run value (exact sha or ``HEAD`` alias).
+
+    Precedence:
+      1. ``--green-run`` CLI flag (explicit override)
+      2. ``AUDIT_GREEN_RUN`` environment variable
+      3. ``None`` — no attestation
+
+    Empty/whitespace-only values are treated as unset.
+    """
+    if cli_value is not None:
+        return cli_value.strip() or None
+    env_value = os.environ.get(AUDIT_GREEN_RUN_ENV, "")
+    return env_value.strip() or None
+
+
+def _resolve_audited_head(runner: Runner) -> str | None:
+    """Resolve the audited HEAD commit sha via ``git rev-parse HEAD``.
+
+    Returns the full sha, or ``None`` when git is unavailable / the runner
+    fails (graceful fallback — a missing HEAD simply means no attestation is
+    accepted; execution-dependent ACs stay partial).
+    """
+    try:
+        proc = runner(["git", "rev-parse", "HEAD"])
+    except Exception:  # noqa: BLE001 -- git is best-effort for the attestation
+        return None
+    if proc.returncode != 0:
+        return None
+    sha = proc.stdout.strip()
+    return sha or None
+
+
+def _resolve_green_run_attestation(
+    cli_value: str | None, runner: Runner,
+) -> tuple[str | None, str | None]:
+    """Resolve and validate the operator-attested green test run.
+
+    Returns ``(prompt_block, attested_sha)``. Both are ``None`` when there is
+    no attestation (no flag/env) or when the attestation cannot be validated:
+    a mismatched sha, an unresolvable ``HEAD`` alias, or git being unavailable
+    all print a clear error to stderr and yield NO attestation — so
+    execution-dependent ACs stay partial (never silently accepted).
+    """
+    value = _resolve_green_run_value(cli_value)
+    if value is None:
+        return None, None
+
+    head_sha = _resolve_audited_head(runner)
+    if head_sha is None:
+        print(
+            f"Error: --green-run/AUDIT_GREEN_RUN value {value!r} cannot be "
+            "verified: the audited HEAD could not be resolved (git "
+            "unavailable or not a git repository). No attestation accepted — "
+            "execution-dependent acceptance criteria stay partial.",
+            file=sys.stderr,
+        )
+        return None, None
+
+    if value == "HEAD" or value == head_sha:
+        return _green_run_prompt_block(head_sha), head_sha
+
+    print(
+        f"Error: --green-run/AUDIT_GREEN_RUN value {value!r} does not match "
+        f"the audited HEAD {head_sha!r}. Attestation rejected — "
+        "execution-dependent acceptance criteria stay partial. Re-run with "
+        "the exact HEAD sha or the alias 'HEAD'.",
+        file=sys.stderr,
+    )
+    return None, None
 
 
 def _audit_semaphore_max_workers(cli_value: int | None = None) -> int:
@@ -1453,7 +1553,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            code_quality_skipped_reason: str | None = None,
                            model: str | None = _MISSING,
                            model_source: str | None = _MISSING,
-                           phase2_completed: bool = False) -> str:
+                           phase2_completed: bool = False,
+                           green_run_sha: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -1471,6 +1572,11 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     *model_source* is the source of the model (``"local"`` or ``"remote"``).
       When provided alongside *model*, produces
       ``Model: <model> (provider: <source>)``.
+    *green_run_sha* is the operator-attested green-run commit sha (when a
+      valid ``--green-run``/``AUDIT_GREEN_RUN`` attestation was accepted).
+      When provided, a ``Green run attestation: <sha>`` line is emitted near
+      the ``Ready to close`` header so the report records the external
+      evidence the execution-dependent ACs were marked met on.
 
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
@@ -1546,15 +1652,21 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             f"Audit report for work item {issue_id_label}",
             "",
             model_line,
-            "", "## Summary", "",
         ]
+        if green_run_sha:
+            lines.append("")
+            lines.append(f"Green run attestation: {green_run_sha}")
+        lines.extend(["", "## Summary", ""])
     else:
         lines = [
             f"Ready to close: {ready}",
             "",
             f"Audit report for work item {issue_id_label}",
-            "", "## Summary", "",
         ]
+        if green_run_sha:
+            lines.append("")
+            lines.append(f"Green run attestation: {green_run_sha}")
+        lines.extend(["", "## Summary", ""])
 
     # Count verdicts across all criteria (parent + children)
     all_criteria = ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
@@ -2475,6 +2587,7 @@ def _deep_analyze_child(
     debug_log: str | None,
     timeout: int | None,
     runner: Runner,
+    green_run_block: str | None = None,
 ) -> tuple[int, dict, bool]:
     """Run Phase 2 deep analysis for a single child (worker for parallelism).
 
@@ -2483,6 +2596,10 @@ def _deep_analyze_child(
     the child's existing ``ac_results`` unchanged. A timeout marks the child's
     ACs ``partial`` and reports ``timeout_occurred=True`` (so the caller can
     set ``phase2_completed=False``).
+
+    *green_run_block* is the GREEN-RUN attestation block (or ``None``); when
+    set it is injected into the child deep-analysis prompt so the model may
+    mark execution-dependent criteria met based on the operator attestation.
     """
     child_acs = child.get("ac_results", [])
     if not child_acs:
@@ -2508,6 +2625,7 @@ def _deep_analyze_child(
         "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
         "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n"
         "- Single-file greps of `.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).\n\n"
+        f"{green_run_block or ''}"
         "For each criterion, read the actual implementation files and verify "
         "the code genuinely satisfies the stated requirements. "
         "Use the same verdict guidance as the parent deep analysis.\n\n"
@@ -2666,6 +2784,7 @@ def _run_batch_phase2(
     debug_log: str | None,
     timeout: int | None,
     runner: Runner,
+    green_run_block: str | None = None,
 ) -> tuple[list[dict], list[dict], bool] | None:
     """Attempt Phase 2 batch deep analysis (P6).
 
@@ -2677,6 +2796,9 @@ def _run_batch_phase2(
     when the batch call fails (RuntimeError, timeout, provider error, or
     unparseable output) so the caller falls back to the existing per-child
     deep-analysis path.
+
+    *green_run_block* is the GREEN-RUN attestation block (or ``None``); when
+    set it is injected into the batch prompt.
     """
     ac_list: list[dict] = []
     for i, r in enumerate(ac_results):
@@ -2733,6 +2855,7 @@ def _run_batch_phase2(
         "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
         "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
         "- NEVER run unbounded recursive grep over the repo root or .worklog/.\n\n"
+        f"{green_run_block or ''}"
         "For each criterion, read the actual implementation files and verify "
         "the code genuinely satisfies the stated requirement. Provide a "
         "specific file:line reference as evidence.\n\n"
@@ -2805,6 +2928,7 @@ def _run_phase2_deep_analysis(
     runner: Runner | None = None,
     batch_phase2: bool = False,
     worklog_dir: str | None = None,
+    green_run_block: str | None = None,
 ) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
@@ -2816,6 +2940,12 @@ def _run_phase2_deep_analysis(
 
     *runner* is used for git queries when building the file-scope manifest
     and defaults to ``_default_runner``.
+
+    *green_run_block* is the GREEN-RUN attestation block (or ``None``); when
+    set it is injected into the parent deep prompt and forwarded to the
+    child (``phase2_child``) and batch (``phase2_batch``) prompts so the
+    model may mark execution-dependent criteria met based on the operator
+    attestation.
 
     Returns (updated_ac_results, updated_child_results, phase2_completed).
     The ``phase2_completed`` flag is ``False`` when the Pi call times out,
@@ -2863,6 +2993,7 @@ def _run_phase2_deep_analysis(
         batch_outcome = _run_batch_phase2(
             issue, ac_results, pending, updated_children,
             resolved_model, pi_bin, debug_log, timeout, runner,
+            green_run_block=green_run_block,
         )
         if batch_outcome is not None:
             return batch_outcome
@@ -2893,6 +3024,7 @@ def _run_phase2_deep_analysis(
         "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
         "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n"
         "- Single-file greps of `.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).\n\n"
+        f"{green_run_block or ''}"
         "For each acceptance criterion:\n"
         "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
         "2. **Verify the code actually does what the criterion claims.**\n"
@@ -3060,7 +3192,7 @@ def _run_phase2_deep_analysis(
             futures = [
                 executor.submit(
                     _deep_analyze_child, ci, child, resolved_model, pi_bin,
-                    debug_log, timeout, runner,
+                    debug_log, timeout, runner, green_run_block,
                 )
                 for ci, child in pending
             ]
@@ -3078,6 +3210,7 @@ def _run_phase2_deep_analysis(
         for ci, child in pending:
             _merge_result(_deep_analyze_child(
                 ci, child, resolved_model, pi_bin, debug_log, timeout, runner,
+                green_run_block,
             ))
 
     return updated_ac, updated_children, not child_timeout_occurred
@@ -3182,7 +3315,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
               debug_log: str | None = None,
               force: bool = False,
               worklog_dir: str | None = None,
-              batch_phase2: bool = False) -> int:
+              batch_phase2: bool = False,
+              green_run: str | None = None) -> int:
     """Audit a single work item.
 
     The resolved model name and source are included as a metadata line
@@ -3200,6 +3334,15 @@ def cmd_issue(issue_id: str, persist: bool = True,
     auto-resolution for every wl call made by this run (see
     ``_resolve_worklog_flags``).
 
+    *green_run* is the operator-attested green test run value (an exact
+    commit sha or the alias ``HEAD``; resolution precedence flag > env
+    ``AUDIT_GREEN_RUN`` > unset). When the value matches the audited HEAD,
+    the GREEN-RUN attestation block is injected into the Phase 1 parent
+    prompt and all Phase 2 prompts, and the attested sha is recorded in the
+    persisted report. A mismatched or unverifiable value prints a clear
+    error and the run proceeds WITHOUT the attestation (execution-dependent
+    ACs stay partial) — never silently accepted.
+
     For each active child (not completed/done), the child's persisted audit
     verdict is checked via ``wl audit-show``. If no audit exists or the audit
     is stale, an audit is auto-triggered for that child (via the same audit
@@ -3216,6 +3359,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
     if runner is None:
         runner = _default_runner
+
+    # Resolve the operator-attested green test run (if any). The attestation
+    # is external evidence: the runner NEVER executes the test suite itself
+    # (the read-only mandate otherwise remains in force).
+    green_run_block, green_run_sha = _resolve_green_run_attestation(
+        green_run, runner,
+    )
 
     # ------------------------------------------------------------------
     # Freshness gate: skip if a recent audit already exists
@@ -3374,6 +3524,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 f"here, state that in the evidence instead of searching for it.\n\n"
                 f"{file_scope}\n\n"
                 f"{_PHASE1_SCANNING_BLOCK}"
+                f"{green_run_block or ''}"
                 f"Criteria: {ac_list_json}"
             )
             try:
@@ -3743,6 +3894,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 runner=runner,
                 batch_phase2=batch_phase2,
                 worklog_dir=worklog_dir,
+                green_run_block=green_run_block,
             )
 
         # ------------------------------------------------------------------
@@ -3771,6 +3923,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 model=resolved_model,
                 model_source=model_source,
                 phase2_completed=phase2_completed,
+                green_run_sha=green_run_sha,
             )
             # Wrap report with failure notice if any subprocess calls failed
             if script_failure:
@@ -4185,6 +4338,16 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_issue.add_argument("--max-concurrency", type=int, default=None,
                          help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 2)")
+    p_issue.add_argument("--green-run", default=None, metavar="SHA|HEAD",
+                         help=(
+                             "Operator-attested green test run: the full project test "
+                             "suite passed at this commit. Accepts 'HEAD' (resolved to "
+                             "the current HEAD sha) or an exact sha that must match the "
+                             "audited HEAD. When valid, execution-dependent acceptance "
+                             "criteria (e.g. 'full test suite passes') MAY be marked met "
+                             "based on the attestation; the runner never executes the "
+                             "suite (env: AUDIT_GREEN_RUN; flag wins)"
+                         ))
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--timeout", type=int, default=None,
@@ -4230,7 +4393,8 @@ def main(argv: list[str] | None = None) -> int:
                          debug_log=args.debug_log,
                          force=args.force,
                          worklog_dir=args.worklog_dir,
-                         batch_phase2=_phase2_batch_enabled(args.batch_phase2))
+                         batch_phase2=_phase2_batch_enabled(args.batch_phase2),
+                         green_run=args.green_run)
     elif args.command == "project":
         return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
                            pi_bin=args.pi_bin, model=args.model,
