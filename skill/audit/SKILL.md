@@ -222,7 +222,9 @@ for each `wl` command:
 1. Explicit `--worklog-dir DIR` (highest precedence — overrides everything).
 2. Prefix-to-project sibling scan: the work-item id prefix (e.g. `OSL-…`)
    is matched against sibling projects' `.worklog/config.yaml`
-   (relative to the framework repo root's parent).
+   (relative to the framework repo root's parent — the scan base is derived
+   from this module's own location, never from the caller's cwd, so it works
+   from the skill install directory or any other non-project cwd).
 3. Cwd-chain fallback: detect the worklog root from the current directory,
    git root, or nearest ancestor.
 4. No flag — `wl` resolves from cwd.

@@ -335,12 +335,12 @@ def _extract_work_item_prefix(cmd: Sequence[str]) -> str | None:
 def _find_worklog_dir_by_prefix(prefix: str) -> Path | None:
     """Find the ``.worklog`` dir of a sibling project with matching config prefix.
 
-    Scans ``TARGET_PROJECT_ROOT.parent/*/.worklog/config.yaml`` and returns the
+    Scans ``SIBLING_SCAN_ROOT/*/.worklog/config.yaml`` and returns the
     first ``.worklog`` directory whose ``prefix:`` value equals *prefix*.
     Returns ``None`` when no sibling project matches (or the scan is not
-    possible, e.g. TARGET_PROJECT_ROOT.parent does not exist).
+    possible, e.g. SIBLING_SCAN_ROOT does not exist).
     """
-    projects_root = TARGET_PROJECT_ROOT.parent
+    projects_root = SIBLING_SCAN_ROOT
     try:
         configs = sorted(projects_root.glob("*/.worklog/config.yaml"))
     except OSError:
@@ -367,7 +367,7 @@ def _resolve_worklog_flags(cmd: Sequence[str],
       1. explicit ``--worklog-dir`` value (from CLI / caller)
       2. prefix-to-project sibling scan: extract the work-item id prefix from
          the command and match it against
-         ``TARGET_PROJECT_ROOT.parent/*/.worklog/config.yaml``
+         ``SIBLING_SCAN_ROOT/*/.worklog/config.yaml``
       3. cwd-chain fallback (shared :func:`worklog_dir_flag`)
       4. no flag (wl resolves from cwd)
     """
@@ -433,6 +433,19 @@ TARGET_PROJECT_ROOT: Path = _detect_project_root()
 Defaults to the git root (or ``Path.cwd()`` as fallback) at import time.
 This may differ from ``REPO_ROOT`` when the audit runner's framework
 repository is not the working directory.
+"""
+
+
+SIBLING_SCAN_ROOT: Path = REPO_ROOT.parent
+"""Directory scanned by the prefix-to-project sibling worklog resolution.
+
+Sibling projects (whose ``.worklog/config.yaml`` carries a ``prefix:`` marker)
+live alongside the framework repository that ships this runner, i.e. under
+``REPO_ROOT.parent``. Basing the scan on ``REPO_ROOT`` — a cwd-independent
+path derived from this module's own location — rather than the import-time
+cwd-derived ``TARGET_PROJECT_ROOT.parent`` keeps worklog resolution correct
+when the runner is launched from the skill install directory or any other
+non-project cwd (SA-0MSG48MEI0083K82).
 """
 
 

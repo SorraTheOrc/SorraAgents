@@ -69,7 +69,10 @@ def _make_sibling_projects(tmp_path: Path, prefix: str = "OSL") -> tuple[Path, m
 
     Returns ``(target_worklog_dir, patcher)`` where *target_worklog_dir* is the
     target project's ``.worklog`` directory and *patcher* is a ``mock.patch``
-    on ``audit_runner.TARGET_PROJECT_ROOT`` (call ``patcher.start()`` to apply).
+    on ``audit_runner.SIBLING_SCAN_ROOT`` (call ``patcher.start()`` to apply).
+    The sibling scan base is patched (not ``TARGET_PROJECT_ROOT``) because the
+    scan must resolve sibling projects relative to the framework repo root's
+    parent, independent of the cwd-derived target root (SA-0MSG48MEI0083K82).
     """
     projects = tmp_path / "projects"
     framework = projects / "SorraAgents" / ".worklog"
@@ -82,9 +85,9 @@ def _make_sibling_projects(tmp_path: Path, prefix: str = "OSL") -> tuple[Path, m
     (target / "config.yaml").write_text(
         f"projectName: Open Source LLM\nprefix: {prefix}\n", encoding="utf-8"
     )
-    # Patch TARGET_PROJECT_ROOT so the sibling scan finds the target project.
-    patcher = mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT",
-                                projects / "SorraAgents")
+    # Patch SIBLING_SCAN_ROOT so the sibling scan finds the target project.
+    patcher = mock.patch.object(audit_runner, "SIBLING_SCAN_ROOT",
+                                projects)
     return target, patcher
 
 
@@ -235,6 +238,68 @@ class TestChildAuditWorklogDirThreading:
         assert "--worklog-dir" in child_cmd
         idx = child_cmd.index("--worklog-dir")
         assert child_cmd[idx + 1] == str(target)
+
+
+class TestSiblingScanBaseCwdIndependence:
+    """Regression tests for SA-0MSG48MEI0083K82.
+
+    The prefix-to-project sibling scan must resolve sibling projects relative
+    to the framework repo root's parent (``SIBLING_SCAN_ROOT``), NOT the
+    import-time cwd-derived ``TARGET_PROJECT_ROOT.parent``. These tests
+    simulate launching the runner from a non-project cwd (the skill install
+    dir): ``TARGET_PROJECT_ROOT`` points at a wrong root that does NOT contain
+    the target project, yet the scan must still inject the correct
+    ``--worklog-dir`` for both the parent and its children.
+    """
+
+    def test_scan_base_is_framework_repo_parent(self):
+        """AC2: the scan base is derived from REPO_ROOT, not the cwd."""
+        assert audit_runner.SIBLING_SCAN_ROOT == audit_runner.REPO_ROOT.parent
+
+    def test_resolves_from_non_project_cwd_when_target_root_is_wrong(self, tmp_path):
+        """AC1/AC4: a wrong (cwd-derived) TARGET_PROJECT_ROOT must not break
+        resolution when SIBLING_SCAN_ROOT holds the sibling projects.
+        """
+        target, patcher = _make_sibling_projects(tmp_path, prefix="OSL")
+        # Simulate the skill-install-dir launch: the cwd's git root is NOT the
+        # audited project and does not contain the sibling projects either.
+        wrong_root = tmp_path / "skill-install-dir"
+        wrong_root.mkdir()
+
+        with patcher, mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT",
+                                        wrong_root):
+            parent_flags = audit_runner._resolve_worklog_flags(
+                ["wl", "show", "OSL-0MSABC7SB001NVUN", "--json"])
+            child_flags = audit_runner._resolve_worklog_flags(
+                ["wl", "update", "OSL-2", "--status", "in_progress", "--json"])
+
+        assert parent_flags == ["--worklog-dir", str(target)]
+        assert child_flags == ["--worklog-dir", str(target)]
+
+    def test_run_wl_injects_dir_from_non_project_cwd(self, tmp_path):
+        """AC3: every wl command (incl. child persistence) from a non-project
+        cwd carries the resolved --worklog-dir for parent and children.
+        """
+        target, patcher = _make_sibling_projects(tmp_path, prefix="OSL")
+        wrong_root = tmp_path / "skill-install-dir"
+        wrong_root.mkdir()
+        recorded: list[list[str]] = []
+
+        with patcher, mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT",
+                                        wrong_root):
+            audit_runner._run_wl(
+                _make_recording_runner(recorded),
+                ["wl", "show", "OSL-1", "--children", "--json"],
+            )
+            audit_runner._run_wl(
+                _make_recording_runner(recorded),
+                ["wl", "audit-set", "OSL-2", "--json"],
+            )
+
+        assert len(recorded) == 2
+        for cmd in recorded:
+            assert cmd[1] == "--worklog-dir"
+            assert cmd[2] == str(target)
 
 
 # ===========================================================================
