@@ -157,6 +157,31 @@ For repos where the automated merge is unsuitable, follow [`docs/dev/release-pro
 3. If CI status checks are configured on the PR, they must pass (automated by step 6). If no CI is configured, this is satisfied automatically.
 4. `CHANGELOG.md` is generated automatically by the release script.
 
+### Cached test verification at release time
+
+Repeated full-suite verification at the same HEAD is expensive (minutes per
+run). Route release-time test checks through the **cached runner** so
+repeat verifications reuse the prior run instead of re-executing (see
+`skill/test_cache.py`, SA-0MSGN5OJ4002OZKY):
+
+```bash
+# Fresh full run (populates the cache)
+python3 skill/test/scripts/run_tests.py --json
+
+# Subsequent verification at the same state reuses the cache (fast)
+python3 skill/test/scripts/run_tests.py --json
+
+# Read-only summary query — never executes the suite
+python3 skill/test/scripts/run_tests.py --summary --suite all
+
+# Force a genuinely fresh run for the final release gate
+python3 skill/test/scripts/run_tests.py --force --json
+```
+
+Cached results are valid for the same git state within the 2-hour TTL; a
+changed tree, expired TTL, or corrupt entry always triggers a fresh run.
+This complements the planned release test gate (SA-0MSBXQZCG0078SEW).
+
 See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md) for local test commands.
 
 ## Preferred execution behaviour (policy)

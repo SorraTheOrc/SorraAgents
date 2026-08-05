@@ -17,6 +17,17 @@ Run the full test suite:
 python3 -m pytest -q
 ```
 
+Or via the cached test runner (recommended — repeated verification at the
+same git state is served from a per-repo cache instead of re-running the
+whole suite; see [`skill/test_cache.py`](../../skill/test_cache.py) and
+SA-0MSGN5OJ4002OZKY):
+
+```bash
+python3 skill/test/scripts/run_tests.py --json        # full suite, cached
+python3 skill/test/scripts/run_tests.py --summary     # cached summary lines only
+python3 skill/test/scripts/run_tests.py --force       # fresh run, refresh cache
+```
+
 Run only the smoke tests (fast, high-confidence checks):
 
 ```bash

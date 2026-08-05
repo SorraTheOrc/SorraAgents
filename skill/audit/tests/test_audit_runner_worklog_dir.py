@@ -69,10 +69,13 @@ def _make_sibling_projects(tmp_path: Path, prefix: str = "OSL") -> tuple[Path, m
 
     Returns ``(target_worklog_dir, patcher)`` where *target_worklog_dir* is the
     target project's ``.worklog`` directory and *patcher* is a ``mock.patch``
-    on ``audit_runner.SIBLING_SCAN_ROOT`` (call ``patcher.start()`` to apply).
-    The sibling scan base is patched (not ``TARGET_PROJECT_ROOT``) because the
-    scan must resolve sibling projects relative to the framework repo root's
-    parent, independent of the cwd-derived target root (SA-0MSG48MEI0083K82).
+    on the shared ``skill.shared.status_lifecycle.SIBLING_SCAN_ROOT`` constant
+    (call ``patcher.start()`` to apply). The sibling scan base is patched (not
+    ``TARGET_PROJECT_ROOT``) because the scan must resolve sibling projects
+    relative to the framework repo root's parent, independent of the
+    cwd-derived target root (SA-0MSG48MEI0083K82). Since the prefix-to-sibling
+    scan was promoted into the shared module (SA-0MSG57UNY009DE51), the patch
+    targets the shared constant, not ``audit_runner.SIBLING_SCAN_ROOT``.
     """
     projects = tmp_path / "projects"
     framework = projects / "SorraAgents" / ".worklog"
@@ -85,9 +88,11 @@ def _make_sibling_projects(tmp_path: Path, prefix: str = "OSL") -> tuple[Path, m
     (target / "config.yaml").write_text(
         f"projectName: Open Source LLM\nprefix: {prefix}\n", encoding="utf-8"
     )
-    # Patch SIBLING_SCAN_ROOT so the sibling scan finds the target project.
-    patcher = mock.patch.object(audit_runner, "SIBLING_SCAN_ROOT",
-                                projects)
+    # Patch the SHARED SIBLING_SCAN_ROOT so the sibling scan finds the target
+    # project (the shared module owns the scan; audit_runner delegates).
+    patcher = mock.patch(
+        "skill.shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
+    )
     return target, patcher
 
 
@@ -253,8 +258,13 @@ class TestSiblingScanBaseCwdIndependence:
     """
 
     def test_scan_base_is_framework_repo_parent(self):
-        """AC2: the scan base is derived from REPO_ROOT, not the cwd."""
-        assert audit_runner.SIBLING_SCAN_ROOT == audit_runner.REPO_ROOT.parent
+        """AC2: the scan base is derived from the shared framework root's
+        parent — cwd-independent and worktree-safe (SA-0MSG57UNY009DE51) —
+        not from the import-time cwd-derived TARGET_PROJECT_ROOT.
+        """
+        from skill.shared.status_lifecycle import REPO_ROOT as SHARED_REPO_ROOT
+
+        assert audit_runner.SIBLING_SCAN_ROOT == SHARED_REPO_ROOT.parent
 
     def test_resolves_from_non_project_cwd_when_target_root_is_wrong(self, tmp_path):
         """AC1/AC4: a wrong (cwd-derived) TARGET_PROJECT_ROOT must not break

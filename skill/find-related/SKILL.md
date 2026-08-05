@@ -72,6 +72,25 @@ manager from `../shared/status_lifecycle.py`:
 
 > **Note:** The script probes semantic search availability and auto-detects the correct `wl search` response format. No manual configuration needed.
 
+## Worklog resolution
+
+`find_related.py` pins the target worklog store from the work-item id and
+injects the resolved `--worklog-dir` into **every** `wl` subprocess call
+(show, update, search, and the `--semantic` probe) via the shared resolution
+in `../shared/status_lifecycle.py`:
+
+1. **Explicit `--worklog-dir` value** (from a CLI flag / caller)
+2. **Prefix-to-sibling scan** — the work-item id prefix (e.g. `OSL`) is matched
+   against sibling projects' `config.yaml` so a non-SorraAgents item resolves
+   to its own worklog store even when the harness cwd is the framework repo
+3. **cwd chain** — `<cwd>/.worklog`, git root, nearest initialized ancestor
+4. **No flag** — `wl` resolves from cwd (failures surface real error detail)
+
+Search and the semantic probe carry no work-item id of their own, so their
+store is pinned from the id of the item being analyzed (`_wl_flags_for`). The
+script resolves the correct worklog store regardless of the directory it is
+invoked from. See `docs/dev/worklog-sync.md` for the shared resolution order.
+
 ## Script
 
 `./scripts/find_related.py` (Python 3.8+, `wl` CLI required)

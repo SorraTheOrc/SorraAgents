@@ -38,6 +38,12 @@ if not args:
     print('{{}}')
     sys.exit(0)
 
+# Real wl accepts a leading `--worklog-dir <path>` pair (injected by the
+# shared worklog-dir resolution); normalize it away so the fake behaves
+# like real wl regardless of the caller's cwd.
+if len(args) >= 2 and args[0] == '--worklog-dir':
+    args = args[2:]
+
 cmd = args[0]
 
 missing_ids = state.get('missing_show_ids', [])

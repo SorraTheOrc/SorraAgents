@@ -140,6 +140,13 @@ Promoting changes from `dev` to `main` requires a human-reviewed merge.
 See the full [release process documentation](docs/dev/release-process.md) for
 the checklist and role definition.
 
+Test verification during releases (and repeated audits/implement loops) is
+routed through a per-repo cache so identical full-suite runs at the same git
+state are not re-executed: use
+`python3 skill/test/scripts/run_tests.py --json` (cached) and
+`--summary` (read-only query). See [`skill/test_cache.py`](skill/test_cache.py)
+and [`docs/dev/release-tests.md`](docs/dev/release-tests.md).
+
 ### For Release Managers
 
 The canonical release script lives under the ship skill at

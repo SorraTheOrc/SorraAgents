@@ -48,6 +48,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from skill.shared.code_freeze import is_code_freeze_active
 from skill.shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
+from skill.test_cache import run_cached
 
 LOG = logging.getLogger("implement.scripts.implement")
 
@@ -727,56 +728,68 @@ def run_build(cwd: str) -> dict[str, Any]:
 
 
 def run_tests(cwd: str) -> dict[str, Any]:
-    """Run the full test suite.
+    """Run the full test suite, routed through the per-repo run cache.
+
+    The pytest (and, on failure, npm test) command runs through
+    ``skill.test_cache.run_cached``: a valid cached result for the same
+    worktree git state within the TTL is reused without re-executing the
+    suite (see SA-0MSGN5OJ4002OZKY). Caching is worktree-aware — the
+    fingerprint reflects *cwd*'s HEAD + working-tree changes, so edits in the
+    worktree invalidate stale entries automatically.
 
     Args:
         cwd: Working directory (worktree root).
 
     Returns:
         A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
-        ``exit_code`` (int), ``failures`` (list[str]).
+        ``exit_code`` (int), ``failures`` (list[str]) — semantics unchanged
+        from the raw-execution version.
     """
-    # Try pytest first, then npm test
-    result = run_cmd(
-        ["python3", "-m", "pytest", "-x", "--tb=short", "-q"],
+    # Route through the cache so repeated verification at the same git state
+    # reuses the prior run instead of re-executing a multi-minute suite.
+    pytest_run = run_cached(
+        "python3 -m pytest -x --tb=short -q",
         cwd=cwd,
-        check=False,
         timeout=600,
-        capture=True,
+        runner=lambda command, cwd_, timeout_: run_cmd(
+            command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+        ),
     )
 
-    if result.returncode != 0:
-        # Try npm test as fallback
-        npm_result = run_cmd(
-            ["npm", "test"],
+    result = pytest_run
+    if result["exit_code"] != 0:
+        # Try npm test as fallback (also cached)
+        npm_run = run_cached(
+            "npm test",
             cwd=cwd,
-            check=False,
             timeout=600,
-            capture=True,
+            runner=lambda command, cwd_, timeout_: run_cmd(
+                command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+            ),
         )
-        if npm_result.returncode == 0:
+        if npm_run["exit_code"] == 0:
             return {
                 "success": True,
-                "stdout": npm_result.stdout.strip(),
-                "stderr": npm_result.stderr.strip(),
+                "stdout": npm_run["stdout"].strip(),
+                "stderr": npm_run["stderr"].strip(),
                 "exit_code": 0,
                 "failures": [],
             }
         # Use the npm result if pytest also failed
-        result = npm_result
+        result = npm_run
 
     # Parse failures from output
     failures: list[str] = []
-    combined = f"{result.stdout}\n{result.stderr}"
+    combined = f"{result['stdout']}\n{result['stderr']}"
     for line in combined.splitlines():
         if "FAILED" in line or "failed" in line.lower():
             failures.append(line.strip())
 
     return {
-        "success": result.returncode == 0,
-        "stdout": result.stdout.strip(),
-        "stderr": result.stderr.strip(),
-        "exit_code": result.returncode,
+        "success": result["exit_code"] == 0,
+        "stdout": result["stdout"].strip(),
+        "stderr": result["stderr"].strip(),
+        "exit_code": result["exit_code"],
         "failures": failures,
     }
 
