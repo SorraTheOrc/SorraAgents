@@ -162,20 +162,20 @@ For repos where the automated merge is unsuitable, follow [`docs/dev/release-pro
 Repeated full-suite verification at the same HEAD is expensive (minutes per
 run). Route release-time test checks through the **cached runner** so
 repeat verifications reuse the prior run instead of re-executing (see
-`skill/test_cache.py`, SA-0MSGN5OJ4002OZKY):
+`test_cache.py` at the repo root, SA-0MSGN5OJ4002OZKY):
 
 ```bash
 # Fresh full run (populates the cache)
-python3 skill/test/scripts/run_tests.py --json
+python3 ../test/scripts/run_tests.py --json
 
 # Subsequent verification at the same state reuses the cache (fast)
-python3 skill/test/scripts/run_tests.py --json
+python3 ../test/scripts/run_tests.py --json
 
 # Read-only summary query — never executes the suite
-python3 skill/test/scripts/run_tests.py --summary --suite all
+python3 ../test/scripts/run_tests.py --summary --suite all
 
 # Force a genuinely fresh run for the final release gate
-python3 skill/test/scripts/run_tests.py --force --json
+python3 ../test/scripts/run_tests.py --force --json
 ```
 
 Cached results are valid for the same git state within the 2-hour TTL; a

@@ -201,7 +201,7 @@ python3 /home/rgardler/.pi/agent/skills/implement/scripts/implement.py abort <wo
 # Fetch work item
 wl show <work-item-id> --json --children
 # Build and test via the test skill (run → triage → evaluate → loop until green)
-python3 skill/test/scripts/run_tests.py --json
+python3 ../test/scripts/run_tests.py --json
 npm run build 2>/dev/null || echo "No build script"
 # Mark in_review when complete
 python3 -c "from skill.shared.status_lifecycle import StatusLifecycle; StatusLifecycle.update_status('<work-item-id>', 'completed', stage='in_review')"

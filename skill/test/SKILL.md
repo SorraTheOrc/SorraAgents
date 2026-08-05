@@ -67,7 +67,7 @@ each failure record carries `test_name`, `stdout_excerpt` and `stack_trace`.
 ### 0. Cached execution (default)
 
 `run_tests.py` caches each suite run per-repo by default (see
-[`skill/test_cache.py`](../test_cache.py)): re-running the same command at the
+[`test_cache.py`](../test_cache.py)): re-running the same command at the
 same git state within the **2-hour TTL** is served from cache **without
 re-executing the suite**. This prevents agents from burning 1.5–7 minutes
 re-running an identical suite just to extract summary lines.
