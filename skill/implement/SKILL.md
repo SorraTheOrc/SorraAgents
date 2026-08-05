@@ -267,7 +267,7 @@ After all recursive child implementations are complete, check whether this work 
   - If additional work is discovered, create linked work items: `wl create "<title>" --deps discovered-from:<work-item-id> --json`
 - Once all ACs are met:
   - **Build** the project and verify no errors.
-  - **Run the full test suite**. Report results. Fix any failures.
+  - **Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`)** — run → triage → evaluate → loop until green. Report results. Fix any failures.
   - If failing tests are outside this work item's scope, invoke the triage helper:
     `python3 ../triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`
     - If a new or incomplete critical issue is returned, implement it, fix the test, and re-run until all pass.
@@ -314,11 +314,11 @@ After implementation completes and before final commit, an automated refactor st
 6. Automated self-review
 
 - Build and lint the code; fix any issues.
-- Run all tests again using quiet test commands; fix any failures.
+- Run all tests again using the [test skill](../test/SKILL.md) (`/skill:test`) quiet-run discipline; fix any failures.
 - Audit the work item: `/skill:audit <work-item-id>`. If ACs are unmet, inform the user and return to step 5.
 - Perform sequential self-review passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff.
 - For each pass, make small, goal-aligned edits. If intent changes are discovered, create an Open Question and stop.
-- Run the full test suite; fix any failures before continuing.
+- Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`); fix any failures before continuing.
 
 8. Commit, Push to dev and mark in_review
 
