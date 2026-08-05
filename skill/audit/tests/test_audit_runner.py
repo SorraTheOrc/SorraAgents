@@ -2648,6 +2648,81 @@ class TestPhase2BatchFallback:
         assert updated_acs[0]["verdict"] == "met"
         assert phase2_completed is True
 
+    def test_batch_unparseable_output_falls_back(self):
+        """AC3 (SA-0MSGATYJR006XMIJ): Unparseable batch output must fall
+        back to the per-child path instead of silently succeeding with an
+        empty reviewed map."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        child = self._make_child("C-1")
+
+        unparseable_result = {
+            "extracted_text": "I could not produce JSON: the model output was garbled.",
+            "evidence": "",
+            "text": "",
+        }
+        success_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+            ]),
+        }
+
+        # Batch call (unparseable) + fallback parent call + fallback child call
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            side_effect=[unparseable_result, success_result, success_result],
+        ) as mock_call:
+            updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model", batch_phase2=True,
+                )
+            )
+
+        # The batch call was attempted first, then the per-child fallback ran
+        contexts = [c.args[1] for c in mock_call.call_args_list]
+        assert contexts[0] == "phase2_batch"
+        assert "phase2_deep" in contexts[1:]
+        assert "phase2_child:0" in contexts[1:]
+        # Verdicts come from the fallback deep analysis, not a silent empty map
+        assert updated_acs[0]["verdict"] == "met"
+        assert updated_children[0]["ac_results"][0]["verdict"] == "met"
+        assert phase2_completed is True
+
+    def test_batch_empty_array_falls_back(self):
+        """AC3 (SA-0MSGATYJR006XMIJ): An empty batch array (no usable items)
+        must also fall back to the per-child path."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        child = self._make_child("C-1")
+
+        empty_result = {
+            "extracted_text": json.dumps([]),
+            "evidence": "",
+            "text": "",
+        }
+        success_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+            ]),
+        }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            side_effect=[empty_result, success_result, success_result],
+        ) as mock_call:
+            updated_acs, _updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model", batch_phase2=True,
+                )
+            )
+
+        contexts = [c.args[1] for c in mock_call.call_args_list]
+        assert contexts[0] == "phase2_batch"
+        assert "phase2_deep" in contexts[1:]
+        assert "phase2_child:0" in contexts[1:]
+        assert updated_acs[0]["verdict"] == "met"
+        assert phase2_completed is True
+
 
 # ===========================================================================
 # Verdict synonym normalization (SA-0MSDOU2SV006J91X)

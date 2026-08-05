@@ -2766,8 +2766,12 @@ def _run_batch_phase2(
         try:
             batch = json.loads(raw)
         except json.JSONDecodeError:
-            batch = []
-    if not isinstance(batch, list):
+            # Unparseable output: fall back to the per-child path rather
+            # than silently succeeding with an empty verdict map.
+            return None
+    if not isinstance(batch, list) or not batch:
+        return None
+    if not any(isinstance(item, dict) and "index" in item for item in batch):
         return None
 
     reviewed = {
