@@ -60,12 +60,15 @@ from skill.shared.status_lifecycle import _wl_error_detail, worklog_dir_flag
 # ---------------------------------------------------------------------------
 AUDIT_SEMAPHORE_NAME = "audit"
 AUDIT_LOCK_TIMEOUT_ENV = "AUDIT_LOCK_TIMEOUT"
-AUDIT_LOCK_TIMEOUT_DEFAULT = 300.0
-"""Bounded wait (seconds) for a free audit concurrency slot.
+AUDIT_LOCK_TIMEOUT_DEFAULT = 0.0
+"""Fail-fast wait (seconds) for a free audit concurrency slot.
 
-Configurable via ``AUDIT_LOCK_TIMEOUT``. When the ceiling is saturated
-for longer than this, the pi call returns an ``unmet`` verdict with a
-clear message instead of launching yet another unbounded process.
+Default is 0s: when the ceiling is saturated, the pi call fails
+immediately with an ``unmet`` verdict ("Audit concurrency limit reached")
+instead of blocking. The parent bash-tool execution timeout (~120s) is
+shorter than any long bounded wait, so a long default wait previously
+killed audits mid-wait. Operators can opt into a bounded wait via the
+``AUDIT_LOCK_TIMEOUT`` environment variable.
 """
 
 # ---------------------------------------------------------------------------
@@ -657,10 +660,11 @@ def _audit_semaphore_max_workers(cli_value: int | None = None) -> int:
 
 
 def _audit_lock_timeout() -> float:
-    """Resolve the bounded wait for a free audit concurrency slot.
+    """Resolve the wait for a free audit concurrency slot.
 
-    Configurable via ``AUDIT_LOCK_TIMEOUT`` (seconds); default
-    ``AUDIT_LOCK_TIMEOUT_DEFAULT`` (300). An invalid value is ignored with
+    Precedence: ``AUDIT_LOCK_TIMEOUT`` env var > fail-fast default (0s).
+    Default 0s means a saturated ceiling fails immediately (see
+    ``AUDIT_LOCK_TIMEOUT_DEFAULT``). An invalid value is ignored with
     a warning.
     """
     env_value = os.environ.get(AUDIT_LOCK_TIMEOUT_ENV)
@@ -686,7 +690,7 @@ def _acquire_audit_slot(max_concurrency: int | None = None) -> Semaphore:
 
     Raises:
         TimeoutError: When the ceiling stays saturated past the bounded
-            wait (``AUDIT_LOCK_TIMEOUT``).
+            wait (``AUDIT_LOCK_TIMEOUT``; default 0s = fail fast).
     """
     sem = Semaphore(
         AUDIT_SEMAPHORE_NAME,
@@ -911,7 +915,8 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         try:
             # Concurrency cap: bound concurrent pi subprocesses host-wide
             # (fan-out investigation SA-0MSAEKOQE009TEB4). Each pi launch
-            # holds one audit slot; the bounded wait is AUDIT_LOCK_TIMEOUT.
+            # holds one audit slot; the wait is AUDIT_LOCK_TIMEOUT (default
+            # 0s = fail fast when the ceiling is saturated).
             with _acquire_audit_slot():
                 try:
                     process = subprocess.Popen(

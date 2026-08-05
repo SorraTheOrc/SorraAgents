@@ -106,6 +106,18 @@ def _make_pi_response(verdict: str, evidence: str) -> str:
 class TestCallPi:
     """Stub the Pi subprocess invocation and verify the contract."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_audit_semaphore(self, tmp_path, monkeypatch):
+        """Isolate the host-wide audit semaphore so these unit tests are hermetic.
+
+        These tests stub the pi subprocess; they must not contend with real
+        host-wide audit semaphore slots (saturated when live audits run on the
+        machine). With the fail-fast lock default (SA-0MSGEAZMC009LHKL) a
+        saturated host would otherwise make _call_pi return "concurrency limit
+        reached" without ever spawning the stub subprocess.
+        """
+        monkeypatch.setenv("PI_SEMAPHORE_DIR", str(tmp_path / "semaphores"))
+
     def test_call_pi_spawns_correct_command(self, monkeypatch):
         """Assert the Pi command shape: pi -p --mode json --model <model> <prompt>."""
         captured_cmds = []

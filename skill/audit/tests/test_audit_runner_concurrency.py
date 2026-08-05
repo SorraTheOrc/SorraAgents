@@ -233,6 +233,58 @@ def test_invalid_env_ceiling_falls_back(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# SA-0MSGEAZMC009LHKL: fail fast when the concurrency ceiling is saturated
+# ---------------------------------------------------------------------------
+
+
+def test_default_lock_timeout_is_fail_fast(monkeypatch):
+    """The default bounded wait for a concurrency slot is 0s (fail fast).
+
+    Regression for SA-0MSGEAZMC009LHKL: the default was 300s, which
+    exceeded the parent bash-tool execution timeout (~120s) and killed
+    audits mid-wait. The default must now be 0.0 so a saturated ceiling
+    fails immediately with the graceful 'unmet' verdict.
+    """
+    monkeypatch.delenv("AUDIT_LOCK_TIMEOUT", raising=False)
+    assert audit_runner.AUDIT_LOCK_TIMEOUT_DEFAULT == 0.0
+    assert audit_runner._audit_lock_timeout() == 0.0
+
+
+def test_lock_timeout_env_override_still_wins(monkeypatch):
+    """AUDIT_LOCK_TIMEOUT env var overrides the fail-fast default (AC2)."""
+    monkeypatch.setenv("AUDIT_LOCK_TIMEOUT", "30")
+    assert audit_runner._audit_lock_timeout() == 30.0
+
+
+def test_call_pi_saturated_ceiling_fails_fast_without_env_override(monkeypatch):
+    """With no env override, a saturated ceiling returns 'unmet' promptly
+    instead of blocking for the old 300s default wait."""
+    from skill.shared.process_semaphore import Semaphore
+
+    # Saturate all slots: hold 1 slot in this process, then attempt another.
+    monkeypatch.setenv(ENV_MAX_WORKERS, "1")
+    monkeypatch.delenv("AUDIT_LOCK_TIMEOUT", raising=False)
+
+    sem = Semaphore("audit", max_workers=1, timeout=10)
+    sem.acquire()
+    try:
+        start = time.monotonic()
+        with _mock_popen():
+            result = audit_runner._call_pi("prompt", model="m", pi_bin="pi")
+        elapsed = time.monotonic() - start
+    finally:
+        sem.release()
+
+    assert result.get("verdict") == "unmet"
+    assert "concurr" in result.get("evidence", "").lower()
+    assert result.get("_concurrency_timeout") is True
+    # Fail fast: must return well inside the parent bash-tool timeout
+    # (~120s) and far below the old 300s default wait. Generous bound to
+    # keep the test robust on slow CI.
+    assert elapsed < 5.0, f"_call_pi blocked {elapsed:.1f}s on saturated ceiling"
+
+
+# ---------------------------------------------------------------------------
 # AC2/AC4: bounded wait -> clear verdict on timeout (no crash)
 # ---------------------------------------------------------------------------
 
