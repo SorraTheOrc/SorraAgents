@@ -2154,15 +2154,20 @@ def _parse_audit_report_acs(raw_output: str) -> list[dict] | None:
 
 
 def _child_acs_from_own_audit(child: dict, runner: Runner,
-                              worklog_dir: str | None = None) -> list[dict]:
-    """Reuse the AC verdicts persisted in a child's own fresh audit (P7).
+                              worklog_dir: str | None = None,
+                              fallback: list[dict] | None = None) -> list[dict]:
+    """Reuse the AC verdicts persisted in a child's own fresh audit (P7/P12).
 
     Called for children whose persisted audit verdict is ``ready``
     (``child_audit_ready=True``) so the Phase 1 child AC review call can be
-    skipped. Parses the child's own audit report table for per-AC verdicts;
-    if the table cannot be parsed, falls back to marking each extracted AC as
-    ``met`` with a reuse note (a fresh ready audit means all ACs were deemed
-    acceptable). Never raises: any failure falls back to the extracted ACs.
+    skipped, and for children whose own fresh audit returned ``not ready``
+    (P12) so the parent's Phase 2 skips the duplicated deep-analysis call.
+    Parses the child's own audit report table for per-AC verdicts; if the
+    table cannot be parsed, falls back to the provided *fallback* (e.g. the
+    child's existing Phase 1 screening results) when given, otherwise marks
+    each extracted AC as ``met`` with a reuse note (a fresh ready audit means
+    all ACs were deemed acceptable). Never raises: any failure falls back to
+    the same fallback chain.
     """
     child_desc = child.get("description", "")
     child_acs = _extract_acs(child_desc)
@@ -2183,19 +2188,19 @@ def _child_acs_from_own_audit(child: dict, runner: Runner,
         data = _run_wl(runner, ["wl", "audit-show", child.get("id", ""), "--json"],
                        worklog_dir=worklog_dir)
     except RuntimeError:
-        return fallback_met
+        return fallback if fallback is not None else fallback_met
     if not isinstance(data, dict):
-        return fallback_met
+        return fallback if fallback is not None else fallback_met
     audit = data.get("audit")
     if not audit:
-        return fallback_met
+        return fallback if fallback is not None else fallback_met
     raw_output = audit.get("rawOutput")
     if not raw_output:
-        return fallback_met
+        return fallback if fallback is not None else fallback_met
     parsed = _parse_audit_report_acs(raw_output)
     if parsed:
         return parsed
-    return fallback_met
+    return fallback if fallback is not None else fallback_met
 
 
 def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
@@ -2812,6 +2817,7 @@ def _run_phase2_deep_analysis(
     timeout: int | None = None,
     runner: Runner | None = None,
     batch_phase2: bool = False,
+    worklog_dir: str | None = None,
 ) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
@@ -2836,6 +2842,10 @@ def _run_phase2_deep_analysis(
     # - Completed/done children are skipped (already closed).
     # - child_audit_ready=True children are skipped (P2 reuse — their own
     #   fresh audit already verified the code).
+    # - child_audit_not_ready=True children are skipped (P12 reuse — their
+    #   own fresh audit already deep-analyzed the ACs and returned an
+    #   explicit 'not ready to close' verdict; the duplicated phase2_child
+    #   call is skipped and the child's own persisted findings reused).
     # - Children without ac_results are skipped (nothing to verify).
     updated_children = list(child_results)
     pending: list[tuple[int, dict]] = []
@@ -2843,6 +2853,18 @@ def _run_phase2_deep_analysis(
         if child.get("status") == "completed" and child.get("stage") == "done":
             continue
         if child.get("child_audit_ready") is True:
+            continue
+        if child.get("child_audit_not_ready") is True:
+            # P12: this child's own fresh audit produced an explicit
+            # 'not ready to close' verdict — its own pipeline already ran
+            # deep analysis on these ACs. Skip the duplicated phase2_child
+            # call and reuse the child's own persisted audit findings,
+            # falling back to the Phase 1 screening results if the child's
+            # audit report table cannot be parsed.
+            child["ac_results"] = _child_acs_from_own_audit(
+                child, runner, worklog_dir=worklog_dir,
+                fallback=child.get("ac_results", []),
+            )
             continue
         if not child.get("ac_results"):
             continue
@@ -3542,6 +3564,12 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 )
             else:
                 cr["child_audit_ready"] = False
+                # P12: record whether the child's own fresh audit produced an
+                # explicit 'not ready to close' verdict. Such children have
+                # already had their ACs deep-analyzed by their own audit
+                # pipeline, so the parent's Phase 2 can skip the duplicated
+                # phase2_child call (see _run_phase2_deep_analysis).
+                cr["child_audit_not_ready"] = verdict is False
                 cr["ac_results"] = []
                 pending_children.append((len(child_results), child))
             child_results.append(cr)
@@ -3654,6 +3682,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
             # Set child_audit_ready: True/False if verdict is known, False otherwise
             child["child_audit_ready"] = verdict if verdict is not None else False
+            # P12: record whether the child's own audit produced an explicit
+            # 'not ready to close' verdict (e.g. after the auto-triggered
+            # child audit above). The parent Phase 2 then skips the duplicated
+            # deep-analysis call and reuses the child's own persisted findings.
+            child["child_audit_not_ready"] = verdict is False
 
         # Initialize child_persist_results for reporting
         child_persist_results = []
@@ -3722,6 +3755,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 timeout=timeout,
                 runner=runner,
                 batch_phase2=batch_phase2,
+                worklog_dir=worklog_dir,
             )
 
         # ------------------------------------------------------------------

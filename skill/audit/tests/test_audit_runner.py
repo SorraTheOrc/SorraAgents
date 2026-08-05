@@ -3529,3 +3529,282 @@ class TestPhase1ChildWorkerExceptionSafety:
         # matching the sequential Phase 1 child path.
         assert acs[0]["text"] == "CAC1: child criterion 1"
         assert acs[0]["verdict"] == "partial"
+
+
+# ===========================================================================
+# P12 (SA-0MSF4TPCN0095MIB): not-ready children skip the duplicated
+# phase2_child deep-analysis call; the parent reuses the child's own
+# persisted audit findings (falling back to Phase 1 screening results).
+# ===========================================================================
+
+
+_PHASE1_NOT_READY_RAW = (
+    "Audit report for work item CHILD-1\n"
+    "Ready to close: No\n\n"
+    "## Summary\nChild audit not ready.\n"
+)
+
+
+class TestPhase2NotReadyChildReuse:
+    """P12: children whose own fresh audit returned 'not ready to close'
+    (child_audit_not_ready=True) skip the duplicated phase2_child call and
+    the parent reuses the child's own persisted audit findings."""
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text",
+                 verdict: str = "met") -> dict:
+        return {"index": index, "text": text, "verdict": verdict, "evidence": ""}
+
+    def _make_child(self, child_id: str = "CHILD-1",
+                    child_audit_ready: bool = False,
+                    child_audit_not_ready: bool = True,
+                    stage: str = "in_review",
+                    status: str = "open",
+                    ac_count: int = 1) -> dict:
+        return {
+            "id": child_id,
+            "title": f"Child {child_id}",
+            "stage": stage,
+            "status": status,
+            "child_audit_ready": child_audit_ready,
+            "child_audit_not_ready": child_audit_not_ready,
+            "ac_results": [
+                {"index": i, "text": f"Child AC {i}", "verdict": "met", "evidence": "phase1"}
+                for i in range(ac_count)
+            ],
+        }
+
+    def test_skips_deep_analysis_when_child_audit_not_ready(self):
+        """AC1: no phase2_child call is made for a child whose own audit
+        returned 'not ready'; its own persisted findings are reused."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = self._make_child("CHILD-1", child_audit_ready=False,
+                                 child_audit_not_ready=True)
+        reused = [{"text": "Child AC 0", "verdict": "unmet", "evidence": "child.py:9"}]
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call, mock.patch.object(
+            audit_runner, "_child_acs_from_own_audit", return_value=reused,
+        ) as mock_reuse:
+            updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model",
+                )
+            )
+
+        # Only the parent phase2_deep call is made; no phase2_child call.
+        child_calls = [
+            c for c in mock_call.call_args_list if c[0][0] == "CHILD-1"
+        ]
+        assert child_calls == []
+        # The child's own findings were fetched via the reuse helper.
+        mock_reuse.assert_called_once()
+        # Parent ACs still processed normally.
+        assert updated_acs[0]["verdict"] == "met"
+        assert phase2_completed is True
+        # Child ACs now reflect its own audit findings (not the parent's).
+        assert updated_children[0]["ac_results"] == reused
+
+    def test_not_ready_reuse_keeps_phase1_results_on_parse_failure(self):
+        """AC1 fallback: when the child's own audit table cannot be parsed,
+        the parent keeps the child's Phase 1 screening results."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = self._make_child("CHILD-1", child_audit_ready=False,
+                                 child_audit_not_ready=True)
+        phase1_acs = list(child["ac_results"])
+
+        def _reuse_with_fallback(child, runner, worklog_dir=None, fallback=None):
+            return fallback
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ), mock.patch.object(
+            audit_runner, "_child_acs_from_own_audit",
+            side_effect=_reuse_with_fallback,
+        ) as mock_reuse:
+            _updated_acs, updated_children, _completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, [child], "test-model",
+                )
+            )
+
+        # The Phase 1 screening results were passed as the fallback and kept.
+        assert mock_reuse.call_args.kwargs["fallback"] == phase1_acs
+        assert updated_children[0]["ac_results"] == phase1_acs
+
+    def test_mixed_children_skip_only_ready_and_not_ready(self):
+        """AC1: in a mixed set, only child_audit_ready=True and
+        child_audit_not_ready=True children skip phase2_child; authentic
+        pending children (no own audit) still get deep analysis."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        ready_child = self._make_child("READY-1", child_audit_ready=True,
+                                       child_audit_not_ready=False)
+        not_ready_child = self._make_child("NOTREADY-1", child_audit_ready=False,
+                                           child_audit_not_ready=True)
+        pending_child = self._make_child("PENDING-1", child_audit_ready=False,
+                                         child_audit_not_ready=False)
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call, mock.patch.object(
+            audit_runner, "_child_acs_from_own_audit",
+            return_value=[{"text": "x", "verdict": "partial", "evidence": ""}],
+        ):
+            _updated_acs, _updated_children, _completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs,
+                    [ready_child, not_ready_child, pending_child],
+                    "test-model",
+                )
+            )
+
+        ready_calls = [c for c in mock_call.call_args_list if c[0][0] == "READY-1"]
+        not_ready_calls = [
+            c for c in mock_call.call_args_list if c[0][0] == "NOTREADY-1"
+        ]
+        pending_calls = [c for c in mock_call.call_args_list if c[0][0] == "PENDING-1"]
+        assert ready_calls == []
+        assert not_ready_calls == []
+        assert len(pending_calls) == 1
+
+    def test_not_ready_child_not_batched(self):
+        """AC1 (batch path): a not-ready child is excluded from the
+        phase2_batch call and its reused findings are preserved."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC")]
+        not_ready_child = self._make_child("NOTREADY-1", child_audit_ready=False,
+                                           child_audit_not_ready=True)
+        pending_child = self._make_child("PEND-1", child_audit_ready=False,
+                                         child_audit_not_ready=False)
+
+        batch_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "p"},
+                {"index": 1, "verdict": "met", "evidence": "c"},
+            ]),
+        }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=batch_result
+        ) as mock_call, mock.patch.object(
+            audit_runner, "_child_acs_from_own_audit",
+            return_value=[
+                {"text": "Child AC 0", "verdict": "partial", "evidence": "own"}
+            ],
+        ):
+            _updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs,
+                    [not_ready_child, pending_child],
+                    "test-model", batch_phase2=True,
+                )
+            )
+
+        assert phase2_completed is True
+        prompt = mock_call.call_args.args[2]
+        assert "NOTREADY-1" not in prompt
+        assert "PEND-1" in prompt
+        assert updated_children[0]["ac_results"][0]["verdict"] == "partial"
+
+    def test_cmd_issue_marks_not_ready_child_for_phase2_reuse(self, capsys):
+        """P12 wiring: a child whose own fresh audit says 'not ready to close'
+        is marked child_audit_not_ready=True so Phase 2 skips the duplicated
+        phase2_child call (verified via the field passed to
+        _run_phase2_deep_analysis)."""
+        child = _phase1_child(1, stage="in_review")
+        mock_runner, _audit_shows = _make_phase1_runner(
+            [child],
+            child_audit_raw={"CHILD-1": _PHASE1_NOT_READY_RAW},
+        )
+        captured: dict = {}
+
+        def _fake_phase2(issue, ac_results, child_results, **kwargs):
+            captured["child_results"] = child_results
+            return ac_results, child_results, True
+
+        def _capture(issue_id, context, prompt, **kwargs):
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+            ])}
+
+        with mock.patch.object(
+            audit_runner, "_run_phase2_deep_analysis", side_effect=_fake_phase2
+        ), mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            mock.MagicMock(
+                return_value={"success": True, "findings": [], "fixes_applied": 0}
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        assert captured["child_results"][0]["child_audit_not_ready"] is True
+
+
+class TestChildAcsFromOwnAuditFallback:
+    """P12: _child_acs_from_own_audit honors an explicit fallback for the
+    not-ready reuse path (unparseable child audit table)."""
+
+    def test_fallback_used_when_table_unparseable(self):
+        child = _phase1_child(1)
+        raw_no_table = "Ready to close: No\n\n## Summary\nno table here\n"
+        mock_runner, _audit_shows = _make_phase1_runner(
+            [], child_audit_raw={"CHILD-1": raw_no_table},
+        )
+        fallback = [
+            {"text": "CAC1: child criterion 1", "verdict": "partial",
+             "evidence": "phase1"}
+        ]
+        acs = audit_runner._child_acs_from_own_audit(
+            child, mock_runner, fallback=fallback,
+        )
+        assert acs == fallback
+
+    def test_parsed_table_beats_fallback(self):
+        child = _phase1_child(1)
+        raw_with_table = (
+            "Audit report for work item CHILD-1\n"
+            "Ready to close: No\n\n"
+            "## Acceptance Criteria Status\n\n"
+            "| # | Criterion | Verdict | Evidence |\n"
+            "|---|-----------|---------|----------|\n"
+            "| 1 | CAC1: child criterion 1 | unmet | child.py:10 |\n"
+        )
+        mock_runner, _audit_shows = _make_phase1_runner(
+            [], child_audit_raw={"CHILD-1": raw_with_table},
+        )
+        fallback = [
+            {"text": "CAC1: child criterion 1", "verdict": "met",
+             "evidence": "phase1"}
+        ]
+        acs = audit_runner._child_acs_from_own_audit(
+            child, mock_runner, fallback=fallback,
+        )
+        assert acs[0]["verdict"] == "unmet"
+        assert acs[0]["evidence"] == "child.py:10"
+
+    def test_no_fallback_keeps_met_fallback(self):
+        """Backward compatibility: without a fallback the met-with-reuse-note
+        fallback is used, matching the P7 ready-child path."""
+        child = _phase1_child(1)
+        raw_no_table = "Ready to close: Yes\n\n## Summary\nno table here\n"
+        mock_runner, _audit_shows = _make_phase1_runner(
+            [], child_audit_raw={"CHILD-1": raw_no_table},
+        )
+        acs = audit_runner._child_acs_from_own_audit(child, mock_runner)
+        assert len(acs) == 1
+        assert acs[0]["verdict"] == "met"
+        assert "child's own fresh audit" in acs[0]["evidence"]
