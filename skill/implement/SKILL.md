@@ -79,7 +79,7 @@ observable behaviour via the public API.
 ## Best Practices
 
 - Follow the steps in order and do not skip steps.
-- **Testing is required — TDD is preferred, not mandatory.** Ensure code has excellent test coverage with meaningful tests. TDD (writing tests before implementation code) is the preferred approach, but alternative strategies (e.g., test-after) are permitted when TDD would complicate implementation. When external constraints prevent complete tests, create harnesses/mocks and document the limitation. **Do NOT write placeholder tests** — if the feature is not yet implemented, track the work in a work item instead (see [Test Writing Guidelines](../shared/test-writing-guidelines.md)).
+- **Testing is required — TDD is preferred, not mandatory.** Ensure code has excellent test coverage with meaningful tests. Write tests first (test-driven development) whenever practical; alternative strategies (e.g., test-after) are permitted when TDD would complicate implementation. When external constraints prevent complete tests, create harnesses/mocks and document the limitation. **Do NOT write placeholder tests** — if the feature is not yet implemented, track the work in a work item instead (see [Test Writing Guidelines](../shared/test-writing-guidelines.md)).
 - Do not use search tools (grep, ripgrep, code search). Rely on work-item context and linked docs. If insufficient context, run intake interview.
 - Keep implementation focused on meeting acceptance criteria with minimal changes.
 - Never edit code outside `src/`, `tests/`, `docs/` unless essential configuration files.
