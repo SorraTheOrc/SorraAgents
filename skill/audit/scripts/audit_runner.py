@@ -46,7 +46,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from skill.audit.scripts.persist_audit import persist_audit
+from skill.audit.scripts.persist_audit import (
+    PERSIST_CONTENT_INVALID,
+    persist_audit,
+)
 from skill.scripts.failure_notice import FailureNotice
 from skill.shared.process_semaphore import (
     DEFAULT_MAX_WORKERS,
@@ -3071,6 +3074,96 @@ def _run_phase2_deep_analysis(
     return updated_ac, updated_children, not child_timeout_occurred
 
 
+def _reask_verdict_array_once(
+    issue: dict,
+    ac_results: list[dict],
+    resolved_model: str,
+    pi_bin: str = "pi",
+    debug_log: str | None = None,
+    timeout: int | None = None,
+) -> list[dict] | None:
+    """Bounded re-ask (≤1 additional model call) to re-emit the verdict array.
+
+    Triggered only when the final persistence step rejected the assembled
+    report's verdict content (malformed JSON, SA-0MSF3RXUB000NLOI). Re-asks
+    the model exactly ONCE to re-emit the acceptance-criteria verdicts as a
+    single valid JSON array. Never re-runs the full audit pipeline.
+
+    Returns the repaired ``ac_results`` (verdict/evidence refreshed per
+    index, ``text`` preserved) on success, or None when the single re-ask
+    fails (RuntimeError, timeout, provider error, or unparseable output) —
+    the caller then keeps the fallback-persisted report.
+    """
+    if not ac_results:
+        return None
+    current = json.dumps([
+        {
+            "index": i,
+            "text": r.get("text", ""),
+            "verdict": r.get("verdict", "unmet"),
+            "evidence": (r.get("evidence", "") or "")[:200],
+        }
+        for i, r in enumerate(ac_results)
+    ])
+    prompt = (
+        "[READ-ONLY AUDIT] [VERDICT RE-EMIT] Do NOT close, modify, create, "
+        "or delete any work items. Do NOT execute any wl, git, or other "
+        "state-modifying commands. Return ONLY a single valid JSON array.\n\n"
+        "The acceptance-criteria verdict array from a previous audit pass was "
+        "rejected as malformed JSON during persistence. Re-emit the verdicts "
+        "for the criteria below as ONE valid JSON array. Each element MUST "
+        "have keys 'index' (integer), 'verdict' (one of met, unmet, partial, "
+        "adjusted) and 'evidence' (a one-line note with file:line reference). "
+        "Preserve the original verdicts unless the evidence strongly "
+        "indicates a correction.\n\n"
+        f"Criteria: {current}"
+    )
+    try:
+        result = _call_pi_and_maybe_log(
+            issue.get("id", ""), "verdict_reask", prompt,
+            model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+            timeout=timeout,
+        )
+    except RuntimeError:
+        return None
+
+    if result.get("_timeout") or result.get("_provider_error"):
+        return None
+
+    raw = (
+        result.get("extracted_text", "")
+        or result.get("evidence", "")
+        or result.get("text", "")
+    )
+    batch = _extract_json_array(raw)
+    if batch is None:
+        try:
+            batch = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(batch, list) or not batch:
+        return None
+    if not any(isinstance(item, dict) and "index" in item for item in batch):
+        return None
+
+    reviewed = {
+        item["index"]: item
+        for item in batch
+        if isinstance(item, dict) and "index" in item
+    }
+    repaired: list[dict] = []
+    for i, r in enumerate(ac_results):
+        item = reviewed.get(i, {})
+        repaired.append({
+            "text": r.get("text", ""),
+            "verdict": _normalize_verdict(
+                item.get("verdict", r.get("verdict", "unmet"))
+            ),
+            "evidence": item.get("evidence", r.get("evidence", "")),
+        })
+    return repaired
+
+
 def cmd_issue(issue_id: str, persist: bool = True,
               timeout: int | None = None,
               parent_timeout: int | None = None,
@@ -3645,25 +3738,30 @@ def cmd_issue(issue_id: str, persist: bool = True,
             except Exception as exc:  # noqa: BLE001 -- epic creation failure
                 _epic_result = {"epic_id": None, "error": str(exc)}
 
-        # Assemble and output report
-        report = _assemble_issue_report(
-            work_item, ac_results, child_results,
-            code_quality_findings=cq_findings,
-            code_quality_fixes_applied=cq_fixes_applied,
-            code_quality_skipped_reason=cq_skipped_reason,
-            model=resolved_model,
-            model_source=model_source,
-            phase2_completed=phase2_completed,
-        )
-
-        # Wrap report with failure notice if any subprocess calls failed
-        if script_failure:
-            notice = FailureNotice(
-                script_name=script_failure["script_name"],
-                reason=script_failure["reason"],
-                stderr_context=script_failure["stderr"],
+        # Assemble and output report. The assembly is reusable: the bounded
+        # re-ask path (SA-0MSF3RXUB000NLOI) reassembles the report after a
+        # single model re-emit of the verdict array.
+        def _assemble_report() -> str:
+            assembled = _assemble_issue_report(
+                work_item, ac_results, child_results,
+                code_quality_findings=cq_findings,
+                code_quality_fixes_applied=cq_fixes_applied,
+                code_quality_skipped_reason=cq_skipped_reason,
+                model=resolved_model,
+                model_source=model_source,
+                phase2_completed=phase2_completed,
             )
-            report = notice.wrap(report)
+            # Wrap report with failure notice if any subprocess calls failed
+            if script_failure:
+                notice = FailureNotice(
+                    script_name=script_failure["script_name"],
+                    reason=script_failure["reason"],
+                    stderr_context=script_failure["stderr"],
+                )
+                assembled = notice.wrap(assembled)
+            return assembled
+
+        report = _assemble_report()
 
         # Capture the audit verdict for the status lifecycle transition.
         # The finally block only trusts this verdict when the audit pipeline
@@ -3694,6 +3792,35 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
         if persist:
             persist_rc = persist_audit(issue_id, report, worklog_dir=worklog_dir)
+            if persist_rc == PERSIST_CONTENT_INVALID:
+                # The final persistence step rejected the assembled verdict
+                # content (malformed JSON). Bounded recovery: re-ask the
+                # model ONCE to re-emit the verdict array in valid JSON —
+                # never re-run the full audit pipeline (SA-0MSF3RXUB000NLOI).
+                repaired_acs = _reask_verdict_array_once(
+                    work_item, ac_results,
+                    resolved_model=resolved_model,
+                    pi_bin=pi_bin,
+                    debug_log=debug_log,
+                    timeout=timeout,
+                )
+                if repaired_acs is not None:
+                    ac_results = repaired_acs
+                    report = _assemble_report()
+                    persist_rc = persist_audit(
+                        issue_id, report, worklog_dir=worklog_dir
+                    )
+                if persist_rc == PERSIST_CONTENT_INVALID:
+                    # persist_audit already persisted the compact fallback
+                    # notice (usable, identity/readback guards pass); surface
+                    # a warning instead of failing the run.
+                    print(
+                        f"Warning: persisted audit for {issue_id} with fallback "
+                        "content — the verdict JSON could not be recovered "
+                        "after the bounded re-ask.",
+                        file=sys.stderr,
+                    )
+                    persist_rc = 0
             if persist_rc != 0:
                 print(
                     f"Error: Failed to persist audit for {issue_id} "

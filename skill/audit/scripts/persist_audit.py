@@ -22,6 +22,211 @@ from collections.abc import Callable
 from pathlib import Path
 
 
+def _build_fallback_text(issue_id: str, ready: str) -> str:
+    """Compact markdown fallback persisted when the full report is rejected.
+
+    Starts with the wl-required ``Ready to close:`` line, names *issue_id*
+    (so the identity and readback guards still pass) and carries a clear
+    failure notice explaining that the assembled verdict content was rejected.
+    """
+    return (
+        f"Ready to close: {ready}\n"
+        "\n"
+        "# Audit persistence notice\n"
+        "\n"
+        f"**Work item:** {issue_id}\n"
+        "\n"
+        "The audit pipeline completed, but the final persistence step "
+        "rejected the assembled verdict content (malformed JSON / validation "
+        "error). The full report could not be stored in the audit text field. "
+        "The complete report is preserved in the audit raw output "
+        "(`wl audit-show`). A re-audit may be required if the verdict data "
+        "is needed in this field."
+    )
+
+
+def _find_json_fragment_end(line: str, start: int, content_end: int) -> tuple[int, bool]:
+    """Return ``(end_exclusive, is_valid)`` for a JSON fragment at *start*.
+
+    Scans *line* from *start* (which must be ``{`` or ``[``) to
+    *content_end* (the line content, excluding the trailing newline).
+    ``is_valid`` is True when the fragment parses as JSON; when the fragment
+    is unbalanced or malformed, *end_exclusive* is the balanced-close
+    position (or *content_end* when unterminated).
+    """
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, content_end):
+        ch = line[i]
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "({[":
+            depth += 1
+        elif ch in ")}]":
+            depth -= 1
+            if depth == 0:
+                candidate = line[start:i + 1]
+                try:
+                    json.loads(candidate)
+                    return i + 1, True
+                except json.JSONDecodeError:
+                    return i + 1, False
+    candidate = line[start:content_end]
+    try:
+        json.loads(candidate)
+        return content_end, True
+    except json.JSONDecodeError:
+        return content_end, False
+
+
+def _salvage_json_prefix(fragment: str) -> str | None:
+    """Extract the longest valid JSON prefix of a broken JSON fragment.
+
+    Truncates *fragment* at each position outside string literals, longest
+    first, and returns the first prefix (optionally completed with the
+    fragment's own missing closing bracket) that parses as JSON. Returns
+    None when nothing parses — conservative: never fabricates verdicts.
+    """
+    if not fragment or fragment[0] not in "{[":
+        return None
+    closer = "}" if fragment[0] == "{" else "]"
+
+    # Forward pass: record string spans so cuts only happen outside strings.
+    string_ranges: list[tuple[int, int]] = []
+    in_string = False
+    escape = False
+    start = -1
+    for i, ch in enumerate(fragment):
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+                string_ranges.append((start, i))
+            continue
+        if ch == '"':
+            in_string = True
+            start = i
+    if in_string:
+        string_ranges.append((start, len(fragment)))
+
+    def _inside_string(pos: int) -> bool:
+        return any(a <= pos <= b for a, b in string_ranges)
+
+    for end in range(len(fragment) - 1, 0, -1):
+        if _inside_string(end):
+            continue
+        prefix = fragment[:end]
+        for candidate in (prefix + closer, prefix):
+            try:
+                parsed = json.loads(candidate)
+                return json.dumps(parsed)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def _repair_json_fragment_in_line(line: str) -> tuple[str, bool]:
+    """Salvage broken JSON fragments in a single report line.
+
+    Conservative: only fragments that fail to parse as JSON are touched;
+    valid JSON and prose without JSON-like fragments pass through unchanged.
+    Returns ``(line, changed)``.
+    """
+    content_end = len(line)
+    if line.endswith("\n"):
+        content_end -= 1
+    if content_end > 0 and line[content_end - 1] == "\r":
+        content_end -= 1
+
+    pieces: list[str] = []
+    cursor = 0
+    changed = False
+    i = 0
+    while i < content_end:
+        ch = line[i]
+        if ch == '"':
+            # Skip string contents (brackets inside strings are not JSON
+            # structure).
+            j = i + 1
+            while j < content_end:
+                if line[j] == "\\":
+                    j += 2
+                    continue
+                if line[j] == '"':
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if ch in "{[":
+            rest = line[i + 1:content_end].lstrip()
+            if rest and rest[0] in ('"', "{", "[", "]", "}",
+                                     "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-"):
+                end, valid = _find_json_fragment_end(line, i, content_end)
+                if not valid:
+                    salvaged = _salvage_json_prefix(line[i:end])
+                    pieces.append(line[cursor:i])
+                    if salvaged is not None:
+                        pieces.append(salvaged + " \u2026(truncated malformed JSON)")
+                    else:
+                        pieces.append("`(unparseable verdict data)`")
+                    cursor = end
+                    changed = True
+                    i = end
+                    continue
+                i = end
+                continue
+        i += 1
+    if not changed:
+        return line, False
+    pieces.append(line[cursor:])
+    return "".join(pieces), True
+
+
+def _salvage_report_text(report_text: str, issue_id: str) -> tuple[str, bool]:
+    """Repair pass: salvage broken JSON fragments from the report.
+
+    On the final persistence path, when ``wl update --audit-text`` rejects
+    the assembled verdict content (malformed JSON), this pass extracts valid
+    JSON prefixes from broken fragments and appends a clear failure notice,
+    so a repaired (usable) report can be retried once. Per-AC rows already
+    parsed are preserved verbatim; verdicts are never fabricated.
+
+    Returns ``(repaired_text, changed)``; ``changed`` is False when the
+    report contained no broken JSON.
+    """
+    repaired_lines: list[str] = []
+    changed = False
+    for line in report_text.splitlines(keepends=True):
+        repaired, line_changed = _repair_json_fragment_in_line(line)
+        repaired_lines.append(repaired)
+        changed = changed or line_changed
+    if not changed:
+        return report_text, False
+    notice = (
+        "\n\n> **Audit persistence notice:** the assembled audit report "
+        "contained malformed JSON (verdict data) that failed validation "
+        f"during persistence for {issue_id}. The affected fragment(s) were "
+        "salvaged \u2014 valid JSON prefixes were extracted and preserved. "
+        "Per-AC verdict rows above were not modified. The complete model "
+        "output remains available in the audit raw output."
+    )
+    return "".join(repaired_lines).rstrip("\n") + notice + "\n", True
+
+
 def _extract_ready_to_close(report_text: str) -> bool:
     """Extract the Ready to close: Yes/No value from the report text."""
     for line in report_text.splitlines():
@@ -33,6 +238,13 @@ def _extract_ready_to_close(report_text: str) -> bool:
 # Work-item id pattern: 2-5 uppercase letters, dash, then base62-ish suffix
 # (e.g. ``SA-0MSAS108O009DYKT``, ``OSL-0MSABC7SB001NVUN``).
 _WORK_ITEM_ID_RE = r"\b[A-Z]{2,5}-[A-Z0-9]{12,20}\b"
+
+# Sentinel return code: the final ``wl update --audit-text`` step rejected the
+# assembled verdict content (malformed JSON), and only the compact fallback
+# markdown notice could be persisted. The audit is usable (identity/readback
+# guards pass) but degraded; the audit runner uses this signal to trigger a
+# bounded model re-ask (SA-0MSF3RXUB000NLOI).
+PERSIST_CONTENT_INVALID = 4
 
 
 def extract_work_item_ids(report_text: str) -> list[str]:
@@ -148,7 +360,18 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
                   worklog_dir: str | None = None) -> int:
     """Persist the given report_text to the work item using wl audit-set.
 
-    Returns the wl subprocess return code (0 on success).
+    Return codes:
+
+    - ``0`` — a usable audit was persisted (the original report, or a
+      repaired report after the resilience pass salvaged malformed JSON).
+    - ``PERSIST_CONTENT_INVALID`` (4) — the final ``wl update --audit-text``
+      step rejected the assembled verdict content (malformed JSON) and only
+      the compact fallback markdown notice (with a clear failure notice and
+      the target work-item ID) could be persisted. The audit is usable and
+      the identity/readback guards pass; the caller may trigger a bounded
+      model re-ask (SA-0MSF3RXUB000NLOI).
+    - non-zero — nothing could be persisted (e.g. ``wl audit-set`` failed,
+      or every ``--audit-text`` attempt including the fallback failed).
 
     * _fail (internal/testing only): when True, skip the wl call, print the
       report to stdout as a fallback, and return 1 to simulate a persistence
@@ -246,18 +469,16 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     except (json.JSONDecodeError, KeyError, TypeError):
         pass  # Best-effort; audit text persistence must not fail on fetch errors
 
-    update_cmd = [
-        wl_bin, "update", issue_id,
-        "--audit-text", report_text,
-    ]
-    if worklog_dir:
-        update_cmd[1:1] = ["--worklog-dir", worklog_dir]
-    # Explicitly preserve current stage to prevent accidental advancement
-    if current_stage:
-        update_cmd.extend(["--stage", current_stage])
-    update_cmd.append("--json")
-    update_proc = runner(update_cmd, check=False, text=True, capture_output=True)
+    def _run_audit_text_update(text: str):
+        cmd = [wl_bin, "update", issue_id, "--audit-text", text]
+        if worklog_dir:
+            cmd[1:1] = ["--worklog-dir", worklog_dir]
+        if current_stage:
+            cmd.extend(["--stage", current_stage])
+        cmd.append("--json")
+        return runner(cmd, check=False, text=True, capture_output=True)
 
+    update_proc = _run_audit_text_update(report_text)
     if getattr(update_proc, "returncode", 1) != 0:
         stderr = getattr(update_proc, "stderr", "") or ""
         print(
@@ -265,9 +486,51 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
             f"{stderr.strip()}",
             file=sys.stderr
         )
-        # Non-fatal: audit data was stored via wl audit-set; the work item
-        # field is a convenience for the UI. Return 0 from persist_audit
-        # if audit-set succeeded.
+        # ── Resilience repair pass (SA-0MSF3RXUB000NLOI, P8) ──
+        # The final `wl update --audit-text` step is the last write of the
+        # run. A failure here (e.g. wl rejecting the assembled verdict JSON)
+        # must not lose the completed audit: repair the report (salvage
+        # broken JSON fragments, zero model calls) and retry once, then fall
+        # back to a compact markdown notice so the audit text field never
+        # stays the 43-char stub.
+        repaired, changed = _salvage_report_text(report_text, issue_id)
+        if changed:
+            repair_proc = _run_audit_text_update(repaired)
+            if getattr(repair_proc, "returncode", 1) == 0:
+                print(
+                    "wl update --audit-text succeeded after salvaging "
+                    "malformed JSON from the report.",
+                    file=sys.stderr,
+                )
+                return 0
+            rerr = getattr(repair_proc, "stderr", "") or ""
+            print(
+                f"wl update --audit-text (repaired) failed (rc={getattr(repair_proc, 'returncode', 'unknown')}): "
+                f"{rerr.strip()}",
+                file=sys.stderr,
+            )
+
+        # Fallback: persist a compact markdown notice so the audit text field
+        # carries usable content (with a clear failure notice and the target
+        # work-item ID so the identity/readback guards still pass) instead of
+        # the 43-char stub. The audit runner maps PERSIST_CONTENT_INVALID to
+        # a bounded model re-ask (≤1 additional call).
+        fallback = _build_fallback_text(issue_id, "Yes" if ready == "yes" else "No")
+        fb_proc = _run_audit_text_update(fallback)
+        if getattr(fb_proc, "returncode", 1) != 0:
+            ferr = getattr(fb_proc, "stderr", "") or ""
+            print(
+                f"wl update --audit-text (fallback) failed (rc={getattr(fb_proc, 'returncode', 'unknown')}): "
+                f"{ferr.strip()}",
+                file=sys.stderr,
+            )
+            return int(getattr(update_proc, "returncode", 1) or 1)
+        print(
+            f"Persisted fallback audit notice for {issue_id} after the "
+            "assembled verdict content was rejected.",
+            file=sys.stderr,
+        )
+        return PERSIST_CONTENT_INVALID
 
     return 0
 
