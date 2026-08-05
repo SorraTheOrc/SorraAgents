@@ -10,7 +10,6 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
-
 from skill.audit.scripts.audit_runner import (
     _CHILDREN_CAP,
     _PI_MAX_RETRIES,

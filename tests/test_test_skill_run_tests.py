@@ -10,7 +10,6 @@ import json
 from types import SimpleNamespace
 
 import pytest
-
 from skill.test.scripts.run_tests import (
     bats_command,
     node_suite_commands,

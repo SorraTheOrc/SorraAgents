@@ -36,7 +36,6 @@ from _shared import (
     level_from_score,
     pick_tshirt,
 )
-
 from skill.scripts.failure_notice import FailureNotice
 from skill.shared.status_lifecycle import worklog_dir_flag
 

@@ -9,7 +9,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from skill.test.scripts.evaluate_usefulness import (
     VERDICT_KEEP,
     VERDICT_REMOVE,

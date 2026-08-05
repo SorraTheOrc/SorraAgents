@@ -3,7 +3,6 @@ import os
 import subprocess
 
 import pytest
-
 from skill.audit import audit_pr
 
 

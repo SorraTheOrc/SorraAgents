@@ -29,11 +29,10 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 import aggregation
 import bucketing
 import config_loader
+import fixtures
 import log_parser
 import recommendations
 import reporting
-
-import fixtures
 
 # Parsed log timestamps are server-local; test datetimes must match.
 LOCAL_TZ = log_parser.LOCAL_TZ
