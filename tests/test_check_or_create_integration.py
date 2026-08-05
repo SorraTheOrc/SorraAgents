@@ -42,7 +42,9 @@ if not args:
     sys.exit(0)
 cmd = args[0]
 if cmd == 'list':
-    print(json.dumps(state.get('list', [])))
+    # Real wl list --json output shape: {"success": true, "count": N, "workItems": [...]}
+    items = state.get('list', [])
+    print(json.dumps({'success': True, 'count': len(items), 'workItems': items}))
     sys.exit(0)
 if cmd == 'create':
     # create returns an id and appends a representative item to list

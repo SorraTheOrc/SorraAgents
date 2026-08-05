@@ -6,25 +6,96 @@ import sys
 import skill.triage.scripts.check_or_create as cc
 
 # ---------------------------------------------------------------------------
+# list_critical_issues() output-shape parsing
+# ---------------------------------------------------------------------------
+
+
+def test_list_critical_issues_parses_workitems_wrapper(monkeypatch):
+    """list_critical_issues() parses the real wl list output {"workItems": [...]}."""
+
+    def fake_run_wl(args):
+        return json.dumps(
+            {
+                "success": True,
+                "count": 2,
+                "workItems": [
+                    {
+                        "id": "SA-WRAP-1",
+                        "title": "[test-failure] test_wrap_a — failing",
+                        "description": "Test name: test_wrap_a",
+                        "status": "open",
+                        "updatedAt": "2026-02-20T00:00:00Z",
+                    },
+                    {
+                        "id": "SA-WRAP-2",
+                        "title": "[test-failure] test_wrap_b — failing",
+                        "description": "Test name: test_wrap_b",
+                        "status": "in_progress",
+                        "updatedAt": "2026-02-21T00:00:00Z",
+                    },
+                ],
+            }
+        )
+
+    monkeypatch.setattr(cc, "run_wl", fake_run_wl)
+    items = cc.list_critical_issues()
+    assert len(items) == 2
+    assert items[0]["id"] == "SA-WRAP-1"
+    assert items[1]["id"] == "SA-WRAP-2"
+
+
+def test_list_critical_issues_legacy_items_wrapper(monkeypatch):
+    """list_critical_issues() still parses the legacy {"items": [...]} shape."""
+
+    def fake_run_wl(args):
+        return json.dumps(
+            {
+                "items": [
+                    {
+                        "id": "SA-LEGACY",
+                        "title": "[test-failure] test_legacy — failing",
+                        "description": "Test name: test_legacy",
+                        "status": "open",
+                        "updatedAt": "2026-02-20T00:00:00Z",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(cc, "run_wl", fake_run_wl)
+    items = cc.list_critical_issues()
+    assert len(items) == 1
+    assert items[0]["id"] == "SA-LEGACY"
+
+
+# ---------------------------------------------------------------------------
 # Heuristic 1: exact test name match
 # ---------------------------------------------------------------------------
 
 
 def test_match_existing_exact_name(monkeypatch, capsys):
-    """If an incomplete test-failure issue exists matching the test name, return it."""
+    """If an incomplete test-failure issue exists matching the test name, return it.
+
+    Uses the real `wl list --json` output shape ({"success", "count", "workItems"})
+    so the full check_or_create path is exercised against the wrapper.
+    """
 
     def fake_run_wl(args):
         if args and args[0] == "list":
             return json.dumps(
-                [
-                    {
-                        "id": "SA-EX",
-                        "title": "[test-failure] test_foo — failing",
-                        "description": "Test name: test_foo",
-                        "status": "open",
-                        "updatedAt": "2026-02-20T00:00:00Z",
-                    }
-                ]
+                {
+                    "success": True,
+                    "count": 1,
+                    "workItems": [
+                        {
+                            "id": "SA-EX",
+                            "title": "[test-failure] test_foo — failing",
+                            "description": "Test name: test_foo",
+                            "status": "open",
+                            "updatedAt": "2026-02-20T00:00:00Z",
+                        }
+                    ],
+                }
             )
         if args and args[0] == "comment":
             return "{}"
