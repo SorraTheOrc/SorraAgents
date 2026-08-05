@@ -36,7 +36,7 @@ Follow the steps below when completing tasks. If you already have a current work
    cd .worklog/worktrees/wl-<WIP-id>-<slug>
    ```
 
-   Ensure the code is well-tested (TDD preferred, alternatives permitted). Follow build → test → commit order (never reverse). When done:
+   Ensure the code is well-tested (TDD preferred, alternatives permitted). Follow build → test → commit order (never reverse). Before marking `in_review`, run the full suite via the [test skill](/home/rgardler/.pi/agent/skills/test/SKILL.md) (`/skill:test`) — run → triage → evaluate → loop until green. When done:
 
    ```bash
    # Finish: refactor, build, test (fix loop), commit, cleanup, push, mark in_review
@@ -80,7 +80,7 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - Never commit without ensuring the build completes without errors and all tests pass.
 - Always follow build → test → commit order. Never reverse or skip steps.
 - ALL implementation work MUST be done in a git worktree created by the implement workflow (`implement.py start` → `cd .worklog/worktrees/wl-<WIP-id>-<slug>`). Never commit implementation changes directly from the main checkout — `implement.py finish` enforces this by refusing when changes exist outside the worktree.
-- Before reporting work as done, rebuild and run the full test suite. Confirm the build succeeds and no tests fail.
+- Before reporting work as done, run the full test suite (pytest + Node + bats, quiet mode) and confirm the build succeeds and no tests fail. Use the [test skill](/home/rgardler/.pi/agent/skills/test/SKILL.md) (`/skill:test`) which runs the suite, triages every failure into critical `test-failure` work items, evaluates usefulness, and loops until green.
 - Always record the commit message and hash in a comment on the relevant work item(s).
 - When making comments, include the changes made, files affected, and the commit hash.
 - If push fails, resolve and retry until it succeeds.
@@ -163,6 +163,8 @@ Other dependency types can be tracked in descriptions: `discovered-from:<id>`, `
 - Use `risk` and `effort` fields for complexity tracking. If available, use the `effort_and_risk` agent skill to estimate.
 
 ## Test-failure triage policy
+
+Before marking any work item `in_review`, run the full project test suite and triage every failure. The [test skill](/home/rgardler/.pi/agent/skills/test/SKILL.md) (`/skill:test`) orchestrates this discipline: run the suite in quiet mode → triage each failure into a critical `test-failure` work item → evaluate whether each failing test is genuinely useful via code-path analysis → fix or remove (respecting change authorization) → loop until green.
 
 When an agent discovers a failing test outside its ownership/scope, call the triage helper script:
 
