@@ -978,7 +978,8 @@ class TestPhase2TimingInstrumentation:
         child = self._make_child("CHILD-1", ac_count=1)
 
         def _fake_call_pi(prompt, model="test-model", pi_bin="pi",
-                          enable_tools=False, timeout=None, max_retries=None):
+                          enable_tools=False, timeout=None, max_retries=None,
+                          ac_fallback_used=None):
             return {
                 "verdict": "met",
                 "evidence": "file.py:10 works",
@@ -1051,7 +1052,8 @@ class TestPhase2FileScopeManifest:
     def _fake_call(self, captured):
         """Return a side_effect that matches _call_pi_and_maybe_log's signature."""
         def _side_effect(issue_id, context, prompt, model="m", pi_bin="pi",
-                         debug_log=None, enable_tools=False, timeout=None, max_retries=None):
+                         debug_log=None, enable_tools=False, timeout=None, max_retries=None,
+                         ac_fallback_used=None):
             captured["prompt"] = prompt
             return {"extracted_text": "[]"}
         return _side_effect
@@ -1167,7 +1169,8 @@ class TestPhase2FileScopeManifest:
         prompts = []
 
         def _fake_call(issue_id, context, prompt, model="m", pi_bin="pi",
-                       debug_log=None, enable_tools=False, timeout=None, max_retries=None):
+                       debug_log=None, enable_tools=False, timeout=None, max_retries=None,
+                       ac_fallback_used=None):
             prompts.append(prompt)
             return {"extracted_text": "[]"}
 
@@ -1444,7 +1447,8 @@ class TestPhase2ParallelChildCalls:
         started = threading.Barrier(2)  # both child calls must be in-flight to pass
 
         def _slow_call(issue_id, context, prompt, model="m", pi_bin="pi",
-                       debug_log=None, enable_tools=False, timeout=None, max_retries=None):
+                       debug_log=None, enable_tools=False, timeout=None, max_retries=None,
+                       ac_fallback_used=None):
             if context.startswith("phase2_child"):
                 started.wait(timeout=5)  # raises BrokenBarrierError if not concurrent
             return {"extracted_text": "[]"}
@@ -1478,7 +1482,8 @@ class TestPhase2ParallelChildCalls:
         call_order: list[str] = []
 
         def _ordered_call(issue_id, context, prompt, model="m", pi_bin="pi",
-                          debug_log=None, enable_tools=False, timeout=None, max_retries=None):
+                          debug_log=None, enable_tools=False, timeout=None, max_retries=None,
+                          ac_fallback_used=None):
             if context.startswith("phase2_child"):
                 call_order.append(issue_id)
             return {"extracted_text": "[]"}
@@ -1536,7 +1541,8 @@ class TestPhase2ParallelChildCalls:
         call_ids: list[str] = []
 
         def _recording_call(issue_id, context, prompt, model="m", pi_bin="pi",
-                            debug_log=None, enable_tools=False, timeout=None, max_retries=None):
+                            debug_log=None, enable_tools=False, timeout=None, max_retries=None,
+                            ac_fallback_used=None):
             call_ids.append(issue_id)
             return {"extracted_text": "[]"}
 
@@ -1561,7 +1567,8 @@ class TestPhase2ParallelChildCalls:
         children = [self._make_child("C-1"), self._make_child("C-2")]
 
         def _call_with_timeout(issue_id, context, prompt, model="m", pi_bin="pi",
-                               debug_log=None, enable_tools=False, timeout=None, max_retries=None):
+                               debug_log=None, enable_tools=False, timeout=None, max_retries=None,
+                               ac_fallback_used=None):
             if issue_id == "C-1":
                 return {"_timeout": True, "verdict": "unmet",
                         "evidence": "timed out", "extracted_text": ""}
@@ -1749,7 +1756,7 @@ class TestPhase2RetryTuning:
         def _provider_error_call(issue_id, context, prompt, model="m",
                                  pi_bin="pi", debug_log=None,
                                  enable_tools=False, timeout=None,
-                                 max_retries=None):
+                                 max_retries=None, ac_fallback_used=None):
             if context.startswith("phase2_child"):
                 return {
                     "verdict": "unmet",
@@ -2108,6 +2115,185 @@ class TestVerdictDrivenStatusLifecycle:
             )
         assert rc == 0
         assert updates == []
+
+    # ------------------------------------------------------------------
+    # Infra-failure fallback verdicts (SA-0MSG9SLGI002OF7V)
+    #
+    # A "Ready to close: No" verdict produced solely from infrastructure-
+    # failure fallbacks (concurrency-limit timeout, provider error,
+    # unparseable Pi output, Phase-2 deep-analysis timeout) must restore the
+    # captured pre-audit status/stage (assignee cleared) — it must NEVER
+    # demote a completed/in_review item to open/plan_complete. Only an
+    # explicit model "No" with genuine parseable verdicts may demote.
+    # ------------------------------------------------------------------
+
+    def _run_issue_fallback(self, updates, pi_side_effect, *,
+                            description="", children=None,
+                            status="completed", stage="in_review"):
+        """Run cmd_issue through the REAL AC-screening fallback blocks.
+
+        *pi_side_effect* is a callable(issue_id, context, prompt, **kwargs)
+        returning the Pi result dict for each call. *description* must
+        contain acceptance criteria so the parent AC screening executes and
+        its fallback block is reachable. The terminal ``wl update`` is
+        recorded in *updates* for assertion.
+        """
+        mock_runner = self._make_runner(
+            updates, status=status, stage=stage,
+            description=description, children=children,
+        )
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log",
+                side_effect=pi_side_effect,
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+        ):
+            return audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+    def _assert_restored_completed_in_review(self, updates):
+        """Assert the terminal wl update restores completed/in_review with a
+        cleared assignee and does NOT demote to open/plan_complete."""
+        last = self._last_update(updates)
+        assert "--status" in last and "completed" in last
+        assert "--stage" in last and "in_review" in last
+        assert "--assignee" in last and "" in last
+        assert "open" not in last  # never demoted to the actionable queue
+
+    @staticmethod
+    def _met_array(num_acs):
+        """A parseable all-met verdict array covering *num_acs* criteria."""
+        return {
+            "verdict": "met",
+            "evidence": "file.py:1",
+            "extracted_text": json.dumps([
+                {"index": i, "verdict": "met", "evidence": "file.py:1"}
+                for i in range(num_acs)
+            ]),
+            "elapsed_seconds": 0.1,
+        }
+
+    def test_concurrency_fallback_restores_completed_in_review(self):
+        """AC1: concurrency-limit fallback restores, never demotes.
+
+        A parent AC-screening Pi result carrying ``_concurrency_timeout``
+        falls back to diagnostic ``partial`` verdicts. The assembled report
+        ends "Ready to close: No" but the item must be restored to its
+        pre-audit completed/in_review state (assignee cleared), not demoted.
+        """
+        updates = []
+
+        def _pi(issue_id, context, prompt, **kwargs):
+            return {
+                "verdict": "unmet",
+                "evidence": (
+                    "Audit concurrency limit reached: semaphore 'audit' busy: "
+                    "no slot free within 300.0s (max_workers=5)"
+                ),
+                "raw_stdout": "", "raw_stderr": "", "extracted_text": "",
+                "_concurrency_timeout": True,
+                "elapsed_seconds": 0.1,
+            }
+
+        self._run_issue_fallback(
+            updates, _pi,
+            description="## Acceptance Criteria\n1. AC one\n2. AC two",
+        )
+        self._assert_restored_completed_in_review(updates)
+
+    def test_provider_error_fallback_restores_completed_in_review(self):
+        """AC2: provider-error fallback restores, never demotes.
+
+        A parent AC-screening Pi result carrying ``_provider_error`` degrades
+        the verdicts to ``partial`` with provider diagnostics; Phase 2
+        output is unparseable (no error markers) so no script_failure is
+        recorded — the fallback "No" must still restore, not demote.
+        """
+        updates = []
+
+        def _pi(issue_id, context, prompt, **kwargs):
+            if context == "parent":
+                return {
+                    "verdict": "unmet",
+                    "evidence": "Pi provider error: finish_reason: error",
+                    "raw_stdout": "", "raw_stderr": "",
+                    "extracted_text": "",
+                    "_provider_error": True,
+                    "_provider_error_message": "finish_reason: error",
+                    "elapsed_seconds": 0.1,
+                }
+            # Phase 2: unparseable output (no error markers) so no
+            # script_failure is recorded — the fallback "No" is the only
+            # signal driving the lifecycle decision.
+            return {"verdict": "unmet", "evidence": "", "extracted_text": "not json"}
+
+        self._run_issue_fallback(
+            updates, _pi,
+            description="## Acceptance Criteria\n1. AC one\n2. AC two",
+        )
+        self._assert_restored_completed_in_review(updates)
+
+    def test_unparseable_output_fallback_restores_completed_in_review(self):
+        """AC3: unparseable-output fallback restores, never demotes.
+
+        A parent AC-screening Pi result with non-JSON text and no error
+        markers falls back to ``partial`` verdicts; the fallback "No" must
+        restore the pre-audit completed/in_review state.
+        """
+        updates = []
+
+        def _pi(issue_id, context, prompt, **kwargs):
+            return {
+                "verdict": "unmet", "evidence": "",
+                "extracted_text": "the model output is not json",
+            }
+
+        self._run_issue_fallback(
+            updates, _pi,
+            description="## Acceptance Criteria\n1. AC one\n2. AC two",
+        )
+        self._assert_restored_completed_in_review(updates)
+
+    def test_phase2_child_timeout_restores_completed_in_review(self):
+        """AC4: Phase-2 child deep-analysis timeout restores, never demotes.
+
+        The child's Phase 2 deep-analysis call times out (``_timeout``
+        marker): the child ACs degrade to ``partial`` WITHOUT recording a
+        script_failure (the child timeout path has no failure callback), so
+        the report ends "Ready to close: No" with script_failure=None — the
+        item must be restored, not demoted.
+        """
+        updates = []
+        child = {
+            "id": "CHILD-1", "title": "Child", "status": "open",
+            "stage": "in_review",
+            "description": "## Acceptance Criteria\n1. Child AC one",
+        }
+
+        def _pi(issue_id, context, prompt, **kwargs):
+            if context.startswith("phase2_child"):
+                return {
+                    "verdict": "unmet",
+                    "evidence": (
+                        "Pi model call timed out after 600s. Manual audit required."
+                    ),
+                    "raw_stdout": "", "raw_stderr": "", "extracted_text": "",
+                    "_timeout": True,
+                    "elapsed_seconds": 0.1,
+                }
+            return self._met_array(2)
+
+        self._run_issue_fallback(
+            updates, _pi,
+            description="## Acceptance Criteria\n1. AC one\n2. AC two",
+            children=[child],
+        )
+        self._assert_restored_completed_in_review(updates)
 
 
 # ===========================================================================
