@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
 from skill.audit.scripts.audit_runner import (
     AUDIT_FRESHNESS_BUFFER_SECONDS,
     CALL_PI_TIMEOUT,
