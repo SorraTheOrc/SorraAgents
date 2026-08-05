@@ -59,6 +59,28 @@ class TestSkillMdScanningGuidance:
         text = SKILL_MD.read_text()
         assert "transient" in text.lower() or "forensic" in text.lower()
 
+    def test_skill_md_documents_batch_phase2(self) -> None:
+        """SKILL.md documents --batch-phase2 and AUDIT_PHASE2_BATCH."""
+        text = SKILL_MD.read_text()
+        assert "--batch-phase2" in text
+        assert "AUDIT_PHASE2_BATCH" in text
+
+    def test_skill_md_documents_max_concurrency(self) -> None:
+        """SKILL.md documents --max-concurrency and AUDIT_MAX_CONCURRENCY."""
+        text = SKILL_MD.read_text()
+        assert "--max-concurrency" in text
+        assert "AUDIT_MAX_CONCURRENCY" in text
+
+    def test_skill_md_runner_line_includes_batch_and_concurrency(self) -> None:
+        """The Runner usage line lists --batch-phase2 and --max-concurrency."""
+        text = SKILL_MD.read_text()
+        runner_line = next(
+            line for line in text.splitlines()
+            if line.strip().startswith("- **Runner:**")
+        )
+        assert "--batch-phase2" in runner_line
+        assert "--max-concurrency" in runner_line
+
 
 # ===========================================================================
 # Debug-log lifecycle (for SA-0MSBSOAEM0078LAO)
