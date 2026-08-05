@@ -2844,3 +2844,467 @@ class TestPhase1IntakeNormalizesVerdict:
         report = capsys.readouterr().out
         assert "Ready to close: Yes" in report
         assert "| 1 |" in report
+
+# ===========================================================================
+# Phase 1 performance treatment (P7) — file-scope manifest + SCANNING block,
+# read-only tools, bounded parallelism, and child_audit_ready reuse in
+# Phase 1 AC review (SA-0MSF3RXU8005CFGD).
+# ===========================================================================
+
+
+_PHASE1_READY_RAW = (
+    "Audit report for work item CHILD-1\n"
+    "Ready to close: Yes\n\n"
+    "## Summary\nChild audit passed.\n"
+)
+
+
+def _phase1_parent_desc(key_file: str | None = None) -> str:
+    desc = (
+        "# Parent\n\n"
+        "## Acceptance Criteria\n\n"
+        "- AC1: parent criterion\n"
+    )
+    if key_file:
+        desc += f"\n## Key Files\n- {key_file}\n"
+    return desc
+
+
+def _phase1_child(ci: int, child_id: str = "CHILD-1",
+                  stage: str = "in_progress",
+                  key_file: str | None = None) -> dict:
+    desc = f"## Acceptance Criteria\n1. CAC{ci}: child criterion {ci}\n"
+    if key_file:
+        desc += f"\n## Key Files\n- {key_file}\n"
+    return {
+        "id": child_id,
+        "title": f"Child {child_id}",
+        "status": "in_progress",
+        "stage": stage,
+        "description": desc,
+    }
+
+
+def _make_phase1_runner(children: list[dict],
+                        parent_desc: str | None = None,
+                        child_audit_raw: dict | None = None):
+    """Mock runner driving cmd_issue through Phase 1 with the given children.
+
+    *child_audit_raw* maps child id -> rawOutput returned by ``wl audit-show``.
+    Children absent from the map have no persisted audit and go through the
+    Phase 1 child AC review path. Returns (runner, audit_show_call_log).
+    """
+    if parent_desc is None:
+        parent_desc = _phase1_parent_desc()
+    audit_shows: list[str] = []
+
+    def _side_effect(cmd):
+        cmd_list = list(cmd)
+        cmd_str = " ".join(cmd_list)
+        if "audit-show" in cmd_list:
+            child_id = cmd_list[cmd_list.index("audit-show") + 1]
+            audit_shows.append(child_id)
+            raw = (child_audit_raw or {}).get(child_id)
+            if raw is None:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "success": True,
+                    "workItemId": child_id,
+                    "audit": {
+                        "workItemId": child_id,
+                        "auditedAt": "2026-07-20T10:00:00.000Z",
+                        "rawOutput": raw,
+                    },
+                }),
+                stderr="",
+            )
+        if "show" in cmd_str and "--children" not in cmd_str:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "TEST-1", "status": "open"},
+                }),
+                stderr="",
+            )
+        if "update" in cmd_str:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"success": True}),
+                stderr="",
+            )
+        if "--children" in cmd_str:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": "TEST-1",
+                        "description": parent_desc,
+                        "status": "in_progress",
+                    },
+                    "children": children,
+                }),
+                stderr="",
+            )
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"success": True}),
+            stderr="",
+        )
+
+    mock_runner = mock.MagicMock()
+    mock_runner.side_effect = _side_effect
+    return mock_runner, audit_shows
+
+
+class TestPhase1PromptFileScope:
+    """AC1: Phase 1 parent and child AC review prompts include the
+    file-scope manifest and SCANNING block (Phase 2 performance pattern)."""
+
+    def _mock_cq(self):
+        return mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+    def test_parent_prompt_includes_manifest_and_scanning(self, capsys):
+        key_file = "skill/audit/scripts/audit_runner.py"
+        mock_runner, _audit_shows = _make_phase1_runner(
+            [_phase1_child(1)], parent_desc=_phase1_parent_desc(key_file),
+        )
+        prompts: dict[str, str] = {}
+
+        def _capture(issue_id, context, prompt, **kwargs):
+            if context == "parent":
+                prompts["parent"] = prompt
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+            ])}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        prompt = prompts["parent"]
+        assert "READ-ONLY" in prompt  # existing guard language preserved
+        assert "FILE SCOPE" in prompt
+        assert "SCANNING" in prompt
+        assert "scan.py" in prompt
+        assert "list-files" in prompt
+        assert key_file in prompt  # Key Files manifest injected
+
+    def test_child_prompt_includes_manifest_and_scanning(self, capsys):
+        key_file = "skill/audit/scripts/audit_runner.py"
+        child = _phase1_child(1, key_file=key_file)
+        mock_runner, _audit_shows = _make_phase1_runner([child])
+        prompts: dict[str, str] = {}
+
+        def _capture(issue_id, context, prompt, **kwargs):
+            if context == "child:CHILD-1":
+                prompts["child"] = prompt
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+            ])}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        prompt = prompts["child"]
+        assert "READ-ONLY" in prompt
+        assert "FILE SCOPE" in prompt
+        assert "SCANNING" in prompt
+        assert "scan.py" in prompt
+        assert key_file in prompt  # child's Key Files manifest injected
+
+
+class TestPhase1EnableTools:
+    """AC2: Phase 1 parent and child AC review calls run with read-only tools
+    (enable_tools=True, which adds --tools read,bash,grep,find,ls)."""
+
+    def _mock_cq(self):
+        return mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+    def test_parent_and_child_phase1_calls_enable_tools(self, capsys):
+        mock_runner, _audit_shows = _make_phase1_runner([_phase1_child(1)])
+        seen: dict[str, bool] = {}
+
+        def _capture(issue_id, context, prompt, **kwargs):
+            seen[context] = kwargs.get("enable_tools")
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+            ])}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        assert seen.get("parent") is True
+        assert seen.get("child:CHILD-1") is True
+
+
+class TestPhase1ChildAuditReuse:
+    """AC3/AC5: ready children skip the Phase 1 child AC review; the
+    pre-computed verdict is reused (no second lookup in the auto-trigger
+    loop) and their AC results come from their own persisted audit."""
+
+    def _mock_cq(self):
+        return mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+    def test_ready_child_skips_phase1_review_and_reuses_verdict(self, capsys):
+        child = _phase1_child(1, stage="in_review")
+        mock_runner, audit_shows = _make_phase1_runner(
+            [child], child_audit_raw={"CHILD-1": _PHASE1_READY_RAW},
+        )
+        contexts: list[str] = []
+
+        def _capture(issue_id, context, prompt, **kwargs):
+            contexts.append(context)
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+            ])}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        # No Phase 1 child AC review call for the ready child.
+        assert "child:CHILD-1" not in contexts
+        # Verdict computed once in the pre-pass and reused: exactly two
+        # audit-show calls (pre-pass verdict + own-audit AC extraction),
+        # none from the auto-trigger loop.
+        assert audit_shows.count("CHILD-1") == 2
+        report = capsys.readouterr().out
+        assert "CHILD-1" in report
+        assert "CAC1: child criterion" in report
+
+    def test_child_acs_from_own_audit_falls_back_to_met(self):
+        child = _phase1_child(1)
+        mock_runner, _audit_shows = _make_phase1_runner(
+            [], child_audit_raw={"CHILD-1": _PHASE1_READY_RAW},
+        )
+        acs = audit_runner._child_acs_from_own_audit(child, mock_runner)
+        assert len(acs) == 1
+        assert acs[0]["text"] == "CAC1: child criterion 1"
+        assert acs[0]["verdict"] == "met"
+        assert "child's own fresh audit" in acs[0]["evidence"]
+
+    def test_child_acs_from_own_audit_uses_parsed_table(self):
+        child = _phase1_child(1)
+        raw_with_table = (
+            "Audit report for work item CHILD-1\n"
+            "Ready to close: Yes\n\n"
+            "## Acceptance Criteria Status\n\n"
+            "| # | Criterion | Verdict | Evidence |\n"
+            "|---|-----------|---------|----------|\n"
+            "| 1 | CAC1: child criterion 1 | met | child.py:10 |\n"
+        )
+        mock_runner, _audit_shows = _make_phase1_runner(
+            [], child_audit_raw={"CHILD-1": raw_with_table},
+        )
+        acs = audit_runner._child_acs_from_own_audit(child, mock_runner)
+        assert acs == [
+            {"text": "CAC1: child criterion 1", "verdict": "met", "evidence": "child.py:10"}
+        ]
+
+    def test_no_audit_child_still_phase1_reviewed(self, capsys):
+        """Children without a persisted audit keep the Phase 1 review call."""
+        mock_runner, _audit_shows = _make_phase1_runner([_phase1_child(1)])
+        contexts: list[str] = []
+
+        def _capture(issue_id, context, prompt, **kwargs):
+            contexts.append(context)
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+            ])}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        assert "child:CHILD-1" in contexts
+
+
+class TestPhase1ChildParallelism:
+    """AC3: pending Phase 1 child AC reviews run with bounded parallelism,
+    falling back to sequential execution when parallelism=1."""
+
+    def _mock_cq(self):
+        return mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+    def test_pending_children_reviewed_concurrently(self, capsys):
+        import threading
+        import time as _time
+
+        children = [_phase1_child(1, "CHILD-1"), _phase1_child(2, "CHILD-2")]
+        mock_runner, _audit_shows = _make_phase1_runner(children)
+        started = threading.Barrier(2)  # both child calls must be in-flight
+
+        def _slow(issue_id, context, prompt, **kwargs):
+            if context.startswith("child:"):
+                started.wait(timeout=5)  # raises if not concurrent
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+            ])}
+
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "2"},
+            clear=False,
+        ), mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_slow
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            _t0 = _time.monotonic()
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+            _elapsed = _time.monotonic() - _t0
+
+        assert rc == 0
+        # If sequential, the barrier would have raised (deadlock/timeout).
+        assert _elapsed < 10
+
+    def test_pending_children_sequential_when_parallelism_one(self, capsys):
+        children = [_phase1_child(1, "CHILD-1"), _phase1_child(2, "CHILD-2")]
+        mock_runner, _audit_shows = _make_phase1_runner(children)
+        order: list[str] = []
+
+        def _ordered(issue_id, context, prompt, **kwargs):
+            if context.startswith("child:"):
+                order.append(context)
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+            ])}
+
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "1"},
+            clear=False,
+        ), mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_ordered
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        assert order == ["child:CHILD-1", "child:CHILD-2"]
+
+
+class TestPhase1ParseAuditReportAcs:
+    """The persisted-audit AC table parser used to reuse ready children."""
+
+    def test_parses_acceptance_criteria_table(self):
+        raw = (
+            "Audit report for work item SA-X\n"
+            "Ready to close: Yes\n\n"
+            "## Acceptance Criteria Status\n\n"
+            "| # | Criterion | Verdict | Evidence |\n"
+            "|---|-----------|---------|----------|\n"
+            "| 1 | AC one | met | file.py:1 |\n"
+            "| 2 | AC two | adjusted | file.py:2 — acceptable variance |\n"
+        )
+        acs = audit_runner._parse_audit_report_acs(raw)
+        assert acs == [
+            {"text": "AC one", "verdict": "met", "evidence": "file.py:1"},
+            {
+                "text": "AC two",
+                "verdict": "adjusted",
+                "evidence": "file.py:2 — acceptable variance",
+            },
+        ]
+
+    def test_returns_none_when_no_table(self):
+        assert (
+            audit_runner._parse_audit_report_acs(
+                "Ready to close: Yes\n\n## Summary\nOK."
+            )
+            is None
+        )
+
+
+class TestPhase1ChildWorkerExceptionSafety:
+    """The Phase 1 child AC review worker never raises and records failures."""
+
+    def test_worker_records_script_failure_on_pi_error(self):
+        child = _phase1_child(1)
+        mock_runner, _audit_shows = _make_phase1_runner([])
+        failures: list[tuple[str, str]] = []
+
+        def _boom(issue_id, context, prompt, **kwargs):
+            raise RuntimeError("pi exploded")
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_boom
+        ):
+            ci, acs = audit_runner._phase1_review_child_acs(
+                0, child,
+                resolved_model="test-model",
+                pi_bin="pi",
+                debug_log=None,
+                timeout=None,
+                runner=mock_runner,
+                script_failure_callback=lambda ctx, exc: failures.append(
+                    (ctx, str(exc))
+                ),
+            )
+
+        assert ci == 0
+        assert failures and "child AC review" in failures[0][0]
+        # Parse-failure fallback yields a diagnostic 'partial' verdict,
+        # matching the sequential Phase 1 child path.
+        assert acs[0]["text"] == "CAC1: child criterion 1"
+        assert acs[0]["verdict"] == "partial"

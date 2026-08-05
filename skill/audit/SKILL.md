@@ -264,12 +264,12 @@ where `<context>` is the call type (e.g. `parent`, `phase2_deep`, `phase2_child:
 
 **Retry tuning (Phase 2):** Long agent-mode Phase 2 calls (`phase2_deep` / `phase2_child`) retry provider errors at most once (`_PHASE2_MAX_RETRIES = 1`), instead of the `_PI_MAX_RETRIES`=2 budget used by short Phase 1 bare calls. A provider error late in a long agent-mode call no longer restarts it multiple times (worst case was ~3 x 1800s before this change); the call degrades to `partial` with the existing provider-error diagnostic after the bounded retry.
 
-**Tools-enabled invocation (Phase 2 only):** Phase 2 deep analysis calls Pi with
+**Tools-enabled invocation (Phase 1 and Phase 2):** Phase 1 (parent AC screening + child AC screening) and Phase 2 deep analysis call Pi with
 `enable_tools=True`, which appends
 `--tools read,bash,grep,find,ls --exclude-tools ask_question` to the pi command.
 This gives the model file-reading capabilities to verify ACs against
-implementation code. Non-Phase-2 calls (Phase 1 screening, project-level audit)
-remain in bare LLM pipe mode (`enable_tools=False`).
+implementation code. Only the project-level audit summary call remains in bare
+LLM pipe mode (`enable_tools=False`).
 
 **Bounded scanning (Phase 2):** The Phase 2 prompts include a **SCANNING** block
 that directs agents to the bounded helper `./scripts/scan.py` instead
@@ -297,6 +297,41 @@ scans never walk them), and are swept by
 `--older-than N` days, default 14). Successful audit runs delete their own
 debug file; failed runs keep full-content forensics. Never read them back
 programmatically — use `scan.py find-workitem` / `wl search` instead.
+
+**Phase 1 performance treatment (P7):** Phase 1 (automated screening) now
+mirrors the Phase 2 performance pattern, which removed the dominant Phase 1
+wall-clock cost (unbounded repository exploration during AC screening):
+
+- **File-scope manifest + SCANNING block (Phase 1 prompts):** Both the parent
+  AC screening prompt (`context=parent`) and every Phase 1 child AC screening
+  prompt (`context=child:<id>`) now include a **FILE SCOPE** manifest (Key
+  Files + git changed-file list + repository index) and the same **SCANNING**
+  block used by Phase 2, so the model verifies in-scope files with the bounded
+  `scan.py` helpers instead of unbounded `find`/`grep -r`/`ls -R` exploration.
+  Phase 1 prompts keep the same verdict guidance (met/unmet/partial/adjusted
+  with the same normalization) — only the reading strategy changed.
+- **Child verdict reuse (Phase 1):** The child persisted-audit verdict
+  (`child_audit_ready`) is now computed **before** the Phase 1 child AC review
+  loop. A child whose own fresh audit already produced a ready verdict
+  (`child_audit_ready=True`) **skips the Phase 1 child AC screening call** and
+  reuses the AC verdicts persisted in its own audit report (parsed from the
+  report's AC table; if the table cannot be parsed, each extracted AC falls
+  back to `met` with a reuse note, since a fresh ready audit deems all ACs
+  acceptable). Completed/done children remain exempt (AC5). The auto-trigger
+  loop reuses these pre-computed verdicts instead of re-querying
+  `wl audit-show` per child.
+- **Parallel Phase 1 child screening:** Pending (no-audit / not-ready)
+  children are reviewed concurrently with the same bounded concurrency used by
+  Phase 2 (`_resolve_phase2_parallelism()` — default 2, configurable via the
+  `AUDIT_PHASE2_PARALLELISM` env var; set to `1` for strictly-sequential
+  behavior). A single pending child or parallelism=1 falls back to the
+  sequential path. Workers are exception-isolated exactly like Phase 2: a Pi
+  failure degrades that child to diagnostic `partial` verdicts without
+  affecting the others, and the elapsed-time guard still skips remaining
+  children near the parent timeout.
+
+See `docs/dev/audit-phase1-performance-evaluation.md`
+(SA-0MSF3RXU8005CFGD) for the measured Phase 1 wall-clock reduction.
 
 ### Code Quality Integration
 

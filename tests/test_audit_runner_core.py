@@ -2210,13 +2210,16 @@ class TestRC2RCFallbackVerdict:
             if "show" in cmd_list:
                 return _fake_proc(stdout=json.dumps(child_wi))
             if "audit-show" in cmd_list:
+                # Non-ready persisted audit: under P7 reuse the child goes
+                # through the Phase 1 screening path, exercising the RC2
+                # unparseable-output fallback below.
                 return _fake_proc(stdout=json.dumps({
                     "success": True,
                     "workItemId": "SA-CHILD",
                     "audit": {
                         "workItemId": "SA-CHILD",
                         "auditedAt": "2026-07-16T12:00:00Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nAll good.",
+                        "rawOutput": "Ready to close: No\n\n## Summary\nNeeds work.",
                     },
                 }))
             return _fake_proc(stdout=json.dumps({"success": True}))

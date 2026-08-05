@@ -158,6 +158,23 @@ applied update is harmless.
 _STATUS_RESTORE_RETRY_DELAY_S = 0.5
 """Base delay (seconds) between status-restore retries; grows linearly."""
 
+_PHASE1_SCANNING_BLOCK = (
+    "SCANNING — When you need to look something up, use the bounded helpers:\n"
+    "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
+    "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
+    "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
+    "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n"
+    "- Single-file greps of `.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).\n\n"
+)
+"""Bounded-scanning guidance injected into Phase 1 AC review prompts (P7).
+
+Phase 1 (automated screening) now mirrors the Phase 2 performance pattern:
+the model reads only in-scope files and uses the bounded ``scan.py`` helpers
+instead of unbounded repository exploration. The parent Phase 2 prompt also
+includes the ``list-files`` bullet; we reuse that fuller version for both
+Phase 1 parent and child prompts for consistency.
+"""
+
 _PHASE2_MAX_RETRIES = 1
 """Provider-error retry cap for long agent-mode Phase 2 calls.
 
@@ -2085,6 +2102,218 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
     return None, "no_audit"
 
 
+# Matches the canonical audit report AC table row:
+#   | 1 | criterion text | met | evidence text |
+# The criterion/evidence fields are lazy (may contain pipes, rarely).
+_AUDIT_AC_TABLE_ROW = re.compile(
+    r"^\|\s*(\d+)\s*\|\s*(.*?)\s*\|\s*(met|unmet|partial|adjusted)\s*\|\s*(.*?)\s*\|$"
+)
+
+
+def _parse_audit_report_acs(raw_output: str) -> list[dict] | None:
+    """Parse the Acceptance Criteria Status table from a persisted audit report.
+
+    Both the issue-level and child-level audit reports use the canonical
+    ``| # | Criterion | Verdict | Evidence |`` table (see
+    ``_assemble_issue_report`` / ``_assemble_child_audit_report``). Returns a
+    list of ``{"text", "verdict", "evidence"}`` dicts, or ``None`` when no
+    parseable rows are found.
+    """
+    rows: list[dict] = []
+    for line in raw_output.splitlines():
+        match = _AUDIT_AC_TABLE_ROW.match(line.strip())
+        if not match:
+            continue
+        rows.append({
+            "text": match.group(2).strip(),
+            "verdict": match.group(3).strip(),
+            "evidence": match.group(4).strip(),
+        })
+    return rows if rows else None
+
+
+def _child_acs_from_own_audit(child: dict, runner: Runner,
+                              worklog_dir: str | None = None) -> list[dict]:
+    """Reuse the AC verdicts persisted in a child's own fresh audit (P7).
+
+    Called for children whose persisted audit verdict is ``ready``
+    (``child_audit_ready=True``) so the Phase 1 child AC review call can be
+    skipped. Parses the child's own audit report table for per-AC verdicts;
+    if the table cannot be parsed, falls back to marking each extracted AC as
+    ``met`` with a reuse note (a fresh ready audit means all ACs were deemed
+    acceptable). Never raises: any failure falls back to the extracted ACs.
+    """
+    child_desc = child.get("description", "")
+    child_acs = _extract_acs(child_desc)
+    fallback_met = [
+        {
+            "text": ac,
+            "verdict": VERDICT_MET,
+            "evidence": (
+                "Verified by the child's own fresh audit "
+                "(child_audit_ready=True); Phase 1 screening call skipped."
+            ),
+        }
+        for ac in child_acs
+        if ac != "No acceptance criteria defined."
+    ]
+
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", child.get("id", ""), "--json"],
+                       worklog_dir=worklog_dir)
+    except RuntimeError:
+        return fallback_met
+    if not isinstance(data, dict):
+        return fallback_met
+    audit = data.get("audit")
+    if not audit:
+        return fallback_met
+    raw_output = audit.get("rawOutput")
+    if not raw_output:
+        return fallback_met
+    parsed = _parse_audit_report_acs(raw_output)
+    if parsed:
+        return parsed
+    return fallback_met
+
+
+def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
+                             pi_bin: str, debug_log: str | None,
+                             timeout: int | None, runner: Runner,
+                             script_failure_callback: Callable[[str, Exception], None]
+                             ) -> tuple[int, list[dict]]:
+    """Phase 1 child AC review worker (P7, parallel-safe).
+
+    Runs the batched Phase 1 acceptance-criteria screening for one child and
+    returns ``(ci, child_ac_results)``. The prompt includes the file-scope
+    manifest and SCANNING block, and the call runs with read-only tools
+    (``enable_tools=True``) — mirroring the Phase 2 performance pattern.
+
+    Never raises: a Pi ``RuntimeError`` records a script failure and falls
+    back to diagnostic ``partial`` verdicts (identical to the historical
+    sequential Phase 1 child path).
+    """
+    child_desc = child.get("description", "")
+    child_acs = _extract_acs(child_desc)
+    child_ac_results: list[dict] = []
+    if child_acs and child_acs[0] != "No acceptance criteria defined.":
+        child_ac_list = json.dumps([
+            {"index": i, "text": ac} for i, ac in enumerate(child_acs)
+        ])
+        file_scope = _build_file_scope_manifest(child, [], runner=runner)
+        prompt = (
+            f"[READ-ONLY AUDIT] You are performing a read-only audit. "
+            f"Do NOT close, modify, create, or delete any work items. "
+            f"Do NOT execute any wl, git, or other state-modifying commands. "
+            f"Return ONLY a structured JSON array.\n\n"
+            f"Review the following acceptance criteria for child work item '{child.get('title', '')}' "
+            f"against the codebase. "
+            f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
+            f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
+            f"(a one-line note with file:line reference).\n\n"
+            f"FILE SCOPE — Read ONLY the files listed in the manifest below. "
+            f"Do not explore the whole repository (no unbounded `find`, `grep -r`, "
+            f"or `ls -R` across the repo). If a criterion requires a file not listed "
+            f"here, state that in the evidence instead of searching for it.\n\n"
+            f"{file_scope}\n\n"
+            f"{_PHASE1_SCANNING_BLOCK}"
+            f"If a criterion has acceptable variance (implementation differs from original "
+            f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
+            f"Include justification in the evidence field.\n\n"
+            f"Criteria: {child_ac_list}"
+        )
+        try:
+            result = _call_pi_and_maybe_log(
+                child.get("id", ""), f"child:{child.get('id', '')}", prompt,
+                model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+                enable_tools=True, timeout=timeout,
+            )
+        except RuntimeError as exc:
+            script_failure_callback("pi (child AC review)", exc)
+            print(
+                f"Warning: Pi call failed for child AC review: {exc}",
+                file=sys.stderr,
+            )
+            result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
+        # Use extracted_text (full response) instead of evidence (may be truncated)
+        raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
+        batch = _extract_json_array(raw_text)
+        if batch is None:
+            try:
+                batch = json.loads(raw_text)
+            except json.JSONDecodeError:
+                batch = []
+        if isinstance(batch, list) and batch and any(
+            isinstance(item, dict) and "index" in item for item in batch
+        ):
+            reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
+            for i, ac in enumerate(child_acs):
+                item = reviewed.get(i, {})
+                child_ac_results.append({
+                    "text": ac,
+                    "verdict": _normalize_verdict(item.get("verdict", "unmet")),
+                    "evidence": item.get("evidence", ""),
+                })
+        else:
+            # Fallback: this path is reached when the Pi response was not a
+            # parseable JSON array. Print a warning, log raw output, and use
+            # 'partial' verdict with diagnostic evidence instead of silently
+            # falling back to 'unmet' with empty evidence.
+            if result.get("_provider_error"):
+                print(
+                    "Warning: Pi provider error during child AC evaluation — "
+                    "falling back to 'partial' verdict",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "Warning: Unparseable Pi output for AC evaluation — "
+                    "falling back to 'partial' verdict",
+                    file=sys.stderr,
+                )
+            if debug_log:
+                try:
+                    target = Path(debug_log) if debug_log else _default_debug_log_path(child.get("id", "unknown"), f"child_{child.get('id', 'unknown')}_ac_fallback")
+                    _write_debug_log(target, {
+                        "issue_id": child.get("id"),
+                        "child_id": child.get("id"),
+                        "context": "child_ac_fallback",
+                        "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
+                        "raw_text": raw_text,
+                        "result_verdict": result.get("verdict"),
+                        "result_evidence": result.get("evidence", "")[:500],
+                        "provider_error": result.get("_provider_error_message"),
+                    })
+                except Exception:  # noqa: S110, BLE001 -- optional enhancement, ignore on failure
+                    pass
+            # When batched parsing fails, the root-level verdict from Pi
+            # cannot be trusted to represent each AC individually. Override
+            # verdict to 'partial' but preserve any diagnostic evidence
+            # from the root-level result (e.g., a timeout message).
+            if result.get("_provider_error"):
+                provider_error = result.get("_provider_error_message", "unknown")
+                evidence = (
+                    f"Pi provider error: {provider_error} — "
+                    "criterion could not be evaluated."
+                )
+            else:
+                outer_evidence = result.get("evidence", "")
+                if outer_evidence:
+                    evidence = (
+                        f"Pi model output could not be parsed — raw output logged. "
+                        f"Root-level diagnostic: {outer_evidence[:500]}"
+                    )
+                else:
+                    evidence = "Pi model output could not be parsed — raw output logged"
+            for ac in child_acs:
+                child_ac_results.append({
+                    "text": ac,
+                    "verdict": "partial",
+                    "evidence": evidence,
+                })
+    return ci, child_ac_results
+
+
 def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict]) -> tuple[bool, str]:
     """Check whether Phase 1 automated screening has blocking issues.
 
@@ -2977,6 +3206,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         ac_results = []
         if acs and acs[0] != "No acceptance criteria defined.":
             ac_list_json = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(acs)])
+            file_scope = _build_file_scope_manifest(work_item, [], runner=runner)
             prompt = (
                 f"[READ-ONLY AUDIT] You are performing a read-only audit. "
                 f"Do NOT close, modify, create, or delete any work items. "
@@ -2991,10 +3221,16 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 f"If a criterion has acceptable variance (implementation differs from original "
                 f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
                 f"Include justification in the evidence field.\n\n"
+                f"FILE SCOPE — Read ONLY the files listed in the manifest below. "
+                f"Do not explore the whole repository (no unbounded `find`, `grep -r`, "
+                f"or `ls -R` across the repo). If a criterion requires a file not listed "
+                f"here, state that in the evidence instead of searching for it.\n\n"
+                f"{file_scope}\n\n"
+                f"{_PHASE1_SCANNING_BLOCK}"
                 f"Criteria: {ac_list_json}"
             )
             try:
-                result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, timeout=timeout)
+                result = _call_pi_and_maybe_log(issue_id, "parent", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, enable_tools=True, timeout=timeout)
             except RuntimeError as exc:
                 _record_script_failure("pi (parent AC review)", exc)
                 print(f"Warning: Pi call failed for parent AC review: {exc}", file=sys.stderr)
@@ -3088,12 +3324,37 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # Pass ALL active children to the assembler; it handles the cap.
         # Note: children with status=completed/stage=done are included for
         # reporting but exempted from blocking checks by _has_phase1_blocking_issues.
+        # ------------------------------------------------------------------
+        # Phase 1 child AC review (P7 performance treatment).
+        #
+        #  1. Pre-compute each active child's persisted audit verdict BEFORE
+        #     the Phase 1 child AC review so children with a fresh ready audit
+        #     (child_audit_ready=True) skip the screening call and reuse the AC
+        #     verdicts persisted in their own audit report.
+        #  2. Pending children are reviewed with bounded parallelism
+        #     (ThreadPoolExecutor capped by _resolve_phase2_parallelism()).
+        #  3. The auto-trigger loop below reuses these pre-computed verdicts
+        #     instead of re-querying wl audit-show per child.
+        #
+        # Children with status=deleted (wl delete) or deletedBy (imported)
+        # are excluded from active children so they don't block parent closure.
+        # Children with status=completed/stage=done are included for reporting
+        # but exempted from blocking checks by _has_phase1_blocking_issues.
+        # ------------------------------------------------------------------
         child_results = []
         active_children = [
             c for c in children
             if c.get("status") != "deleted" and not c.get("deletedBy")
         ]
+        pending_children: list[tuple[int, dict]] = []
+        pre_verdicts: dict[str, tuple[bool | None, str]] = {}
         for child in active_children:
+            cr = {
+                "title": child.get("title", ""),
+                "id": child.get("id", ""),
+                "status": child.get("status", ""),
+                "stage": child.get("stage", ""),
+            }
             # Skip remaining children if we're too close to the parent
             # timeout (elapsed_guard). This prevents a silent external kill
             # and instead produces a clear diagnostic for skipped audits.
@@ -3104,134 +3365,77 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     "Manual audit required for this child.",
                     file=sys.stderr,
                 )
-                child_results.append({
-                    "title": child.get("title", ""),
-                    "id": child.get("id", ""),
-                    "status": child.get("status", ""),
-                    "stage": child.get("stage", ""),
-                    "ac_results": [{
-                        "text": "Skipped due to audit timeout. Manual audit required.",
-                        "verdict": "unmet",
-                        "evidence": (
-                            f"Audit runner skipped this child after "
-                            f"{_elapsed():.0f}s total elapsed time to avoid "
-                            f"the parent process timeout ({elapsed_guard}s "
-                            f"budget). Manual audit required."
-                        ),
-                    }],
-                })
+                cr["ac_results"] = [{
+                    "text": "Skipped due to audit timeout. Manual audit required.",
+                    "verdict": "unmet",
+                    "evidence": (
+                        f"Audit runner skipped this child after "
+                        f"{_elapsed():.0f}s total elapsed time to avoid "
+                        f"the parent process timeout ({elapsed_guard}s "
+                        f"budget). Manual audit required."
+                    ),
+                }]
+                cr["child_audit_ready"] = False
+                child_results.append(cr)
                 continue
 
-            child_desc = child.get("description", "")
-            child_acs = _extract_acs(child_desc)
-            child_ac_results = []
-            if child_acs and child_acs[0] != "No acceptance criteria defined.":
-                # Batch child ACs into a single pi call
-                child_ac_list = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(child_acs)])
-                prompt = (
-                    f"[READ-ONLY AUDIT] You are performing a read-only audit. "
-                    f"Do NOT close, modify, create, or delete any work items. "
-                    f"Do NOT execute any wl, git, or other state-modifying commands. "
-                    f"Return ONLY a structured JSON array.\n\n"
-                    f"Review the following acceptance criteria for child work item '{child.get('title', '')}' "
-                    f"against the codebase. "
-                    f"Return ONLY a JSON array of objects, each with keys 'index' (integer), "
-                    f"'verdict' (one of: met, unmet, partial, adjusted) and 'evidence' "
-                    f"(a one-line note with file:line reference).\n\n"
-                    f"If a criterion has acceptable variance (implementation differs from original "
-                    f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
-                    f"Include justification in the evidence field.\n\n"
-                    f"Criteria: {child_ac_list}"
+            # Completed/done children are exempt (AC5): their audits are not
+            # re-checked and the Phase 1 child AC review is skipped; AC results
+            # are sourced from their own persisted audit (fallback to met).
+            if child.get("status") == "completed" and child.get("stage") == "done":
+                cr["child_audit_ready"] = True
+                cr["ac_results"] = _child_acs_from_own_audit(
+                    child, runner, worklog_dir=worklog_dir,
                 )
-                try:
-                    result = _call_pi_and_maybe_log(issue_id, f"child:{child.get('id', '')}", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, timeout=timeout)
-                except RuntimeError as exc:
-                    _record_script_failure("pi (child AC review)", exc)
-                    print(f"Warning: Pi call failed for child AC review: {exc}", file=sys.stderr)
-                    result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
-                # Use extracted_text (full response) instead of evidence (may be truncated)
-                raw_text = result.get("extracted_text", "") or result.get("evidence", "") or result.get("text", "")
-                batch = _extract_json_array(raw_text)
-                if batch is None:
-                    try:
-                        batch = json.loads(raw_text)
-                    except json.JSONDecodeError:
-                        batch = []
-                if isinstance(batch, list) and batch and any(
-                    isinstance(item, dict) and "index" in item for item in batch
-                ):
-                    reviewed = {item["index"]: item for item in batch if isinstance(item, dict) and "index" in item}
-                    for i, ac in enumerate(child_acs):
-                        item = reviewed.get(i, {})
-                        child_ac_results.append({
-                            "text": ac,
-                            "verdict": _normalize_verdict(item.get("verdict", "unmet")),
-                            "evidence": item.get("evidence", ""),
-                        })
-                else:
-                    # Fallback: this path is reached when the Pi response was not a
-                    # parseable JSON array. Print a warning, log raw output, and use
-                    # 'partial' verdict with diagnostic evidence instead of silently
-                    # falling back to 'unmet' with empty evidence.
-                    if result.get("_provider_error"):
-                        print(
-                            "Warning: Pi provider error during child AC evaluation — "
-                            "falling back to 'partial' verdict",
-                            file=sys.stderr,
+                child_results.append(cr)
+                continue
+
+            verdict, reason = _get_child_audit_verdict(
+                runner, child["id"], worklog_dir=worklog_dir,
+            )
+            pre_verdicts[child["id"]] = (verdict, reason)
+            if verdict is True:
+                # Fresh ready audit: skip the Phase 1 child AC review and reuse
+                # the AC verdicts persisted in the child's own audit report
+                # (fallback to met when the table cannot be parsed).
+                cr["child_audit_ready"] = True
+                cr["ac_results"] = _child_acs_from_own_audit(
+                    child, runner, worklog_dir=worklog_dir,
+                )
+            else:
+                cr["child_audit_ready"] = False
+                cr["ac_results"] = []
+                pending_children.append((len(child_results), child))
+            child_results.append(cr)
+
+        # Review pending (no-audit / not-ready / not_ready) children with
+        # bounded parallelism; fall back to a sequential loop for a single
+        # pending child or parallelism=1 (mirrors the Phase 2 parallel pattern).
+        if pending_children:
+            parallelism = _resolve_phase2_parallelism()
+            if parallelism > 1 and len(pending_children) > 1:
+                with ThreadPoolExecutor(max_workers=parallelism) as executor:
+                    futures = [
+                        executor.submit(
+                            _phase1_review_child_acs,
+                            ci, child,
+                            resolved_model, pi_bin, debug_log, timeout,
+                            runner, _record_script_failure,
                         )
-                    else:
-                        print(
-                            "Warning: Unparseable Pi output for AC evaluation — "
-                            "falling back to 'partial' verdict",
-                            file=sys.stderr,
-                        )
-                    if debug_log:
-                        try:
-                            target = Path(debug_log) if debug_log else _default_debug_log_path(issue_id, f"child_{child.get('id', 'unknown')}_ac_fallback")
-                            _write_debug_log(target, {
-                                "issue_id": issue_id,
-                                "child_id": child.get("id"),
-                                "context": "child_ac_fallback",
-                                "reason": "provider_error" if result.get("_provider_error") else "parse_failure",
-                                "raw_text": raw_text,
-                                "result_verdict": result.get("verdict"),
-                                "result_evidence": result.get("evidence", "")[:500],
-                                "provider_error": result.get("_provider_error_message"),
-                            })
-                        except Exception:  # noqa: S110, BLE001 -- optional enhancement, ignore on failure
-                            pass
-                    # When batched parsing fails, the root-level verdict from Pi
-                    # cannot be trusted to represent each AC individually. Override
-                    # verdict to 'partial' but preserve any diagnostic evidence
-                    # from the root-level result (e.g., a timeout message).
-                    if result.get("_provider_error"):
-                        provider_error = result.get("_provider_error_message", "unknown")
-                        evidence = (
-                            f"Pi provider error: {provider_error} — "
-                            "criterion could not be evaluated."
-                        )
-                    else:
-                        outer_evidence = result.get("evidence", "")
-                        if outer_evidence:
-                            evidence = (
-                                f"Pi model output could not be parsed — raw output logged. "
-                                f"Root-level diagnostic: {outer_evidence[:500]}"
-                            )
-                        else:
-                            evidence = "Pi model output could not be parsed — raw output logged"
-                    for ac in child_acs:
-                        child_ac_results.append({
-                            "text": ac,
-                            "verdict": "partial",
-                            "evidence": evidence,
-                        })
-            child_results.append({
-                "title": child.get("title", ""),
-                "id": child.get("id", ""),
-                "status": child.get("status", ""),
-                "stage": child.get("stage", ""),
-                "ac_results": child_ac_results,
-            })
+                        for ci, child in pending_children
+                    ]
+                    for future in futures:
+                        ci, acs = future.result()
+                        child_results[ci]["ac_results"] = acs
+            else:
+                for ci, child in pending_children:
+                    _ci, acs = _phase1_review_child_acs(
+                        ci, child,
+                        resolved_model, pi_bin, debug_log, timeout,
+                        runner, _record_script_failure,
+                    )
+                    child_results[ci]["ac_results"] = acs
+
 
         # ------------------------------------------------------------------
         # Check each active child's persisted audit verdict.
@@ -3247,8 +3451,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 child["child_audit_ready"] = True  # Exempt - treat as ready
                 continue
 
-            verdict, reason = _get_child_audit_verdict(runner, child["id"],
-                                                       worklog_dir=worklog_dir)
+            # Reuse the pre-computed verdict from the Phase 1 pre-pass (P7) to
+            # avoid a second wl audit-show lookup per child.
+            verdict, reason = pre_verdicts.get(child["id"], (None, "unknown"))
 
             if verdict is None and persist:
                 if _elapsed() < elapsed_guard:
