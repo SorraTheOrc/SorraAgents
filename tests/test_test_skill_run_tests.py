@@ -186,7 +186,9 @@ def test_run_suite_surfaces_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> Non
         return SimpleNamespace(returncode=1, stdout=PYTEST_FAILURE_OUTPUT, stderr="")
 
     monkeypatch.setattr("skill.test.scripts.run_tests._run_cmd", fake_run)
-    result = run_suite("pytest")
+    # use_cache=False: this test exercises execution/parsing, not caching
+    # (cache behaviour is covered in tests/test_run_tests_cache.py).
+    result = run_suite("pytest", use_cache=False)
     assert result["returncode"] == 1
     assert len(result["failures"]) == 2
     assert result["success"] is False
@@ -199,7 +201,7 @@ def test_run_suite_reports_passing_suite(monkeypatch: pytest.MonkeyPatch) -> Non
         return SimpleNamespace(returncode=0, stdout="5 passed in 0.03s", stderr="")
 
     monkeypatch.setattr("skill.test.scripts.run_tests._run_cmd", fake_run)
-    result = run_suite("pytest")
+    result = run_suite("pytest", use_cache=False)
     assert result["returncode"] == 0
     assert result["success"] is True
     assert result["failures"] == []
@@ -212,7 +214,7 @@ def test_run_suite_missing_binary_surfaces_notice(monkeypatch: pytest.MonkeyPatc
         raise FileNotFoundError("bats not installed")
 
     monkeypatch.setattr("skill.test.scripts.run_tests._run_cmd", fake_run)
-    result = run_suite("bats")
+    result = run_suite("bats", use_cache=False)
     assert result["success"] is False
     assert result["notice"]
     assert "bats" in result["notice"].lower() or "not installed" in result["notice"].lower()
@@ -228,7 +230,7 @@ def test_run_suite_node_runs_each_directory_separately(monkeypatch: pytest.Monke
         return SimpleNamespace(returncode=0, stdout="# tests 2\n# pass 2\n# fail 0", stderr="")
 
     monkeypatch.setattr("skill.test.scripts.run_tests._run_cmd", fake_run)
-    result = run_suite("node")
+    result = run_suite("node", use_cache=False)
     assert result["success"] is True
     assert len(commands_run) == 3
     assert all("&&" not in c for c in commands_run)

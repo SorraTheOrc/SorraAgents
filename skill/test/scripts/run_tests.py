@@ -6,15 +6,20 @@ Suites:
   - node:    node --test "tests/<dir>/**/*.mjs"   (npm --silent test when a test script exists)
   - bats:    bats tests/install-worklog-plugin.bats
 
+Results are cached per-repo (see skill/test_cache.py) by default so repeated
+verification at the same git state is served without re-executing the suite.
+
 Emits structured per-failure records (test_name, stdout_excerpt, stack_trace)
 compatible with the triage skill's check_or_create.py input.
 
 Usage:
   run_tests.py [--suite pytest|node|bats|all] [--json] [--parent-work-item-id ID] [--rerun-failures]
+  run_tests.py --summary [--summary-grep PATTERN]   (read cached summary lines, no execution)
+  run_tests.py --force | --no-cache                (bypass the cache)
 
 Exit codes:
   0 - all suites passed
-  1 - at least one test failed
+  1 - at least one test failed (or --summary cache miss)
   2 - runner error (missing suite binary etc.)
 """  # noqa: EXE001
 
@@ -23,19 +28,30 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from skill.test_cache import (
+    DEFAULT_TTL_SECONDS,
+    query_cached,
+    run_cached,
+    summary_lines,
+)
 from skill.test_runner import canonicalize_quiet_test_command
 
 REPO_ROOT = _REPO_ROOT
+
+# Cache TTL exposed as a module constant so CLI tests can backdate entries.
+CACHE_TTL_SECONDS = DEFAULT_TTL_SECONDS
 
 PYTEST_CMD = canonicalize_quiet_test_command("pytest")
 NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
@@ -230,13 +246,35 @@ def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.Comple
     )
 
 
+def _cached_runner(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Adapter exposing _run_cmd to the cache runner protocol.
+
+    Uses shlex.split (not str.split) so quoted args like
+    ``node --test "tests/node/**/*.mjs"`` pass the glob without literal
+    quotes — otherwise node matches zero files and the suite trivially
+    "passes" with 0 tests (pre-existing bug fixed with SA-0MSGN5OJ4002OZKY).
+    """
+    return _run_cmd(shlex.split(command), cwd=Path(cwd), timeout=timeout)
+
+
 def run_suite(
-    name: str, cwd: Path | None = None, timeout: int = 600
+    name: str,
+    cwd: Path | None = None,
+    timeout: int = 600,
+    use_cache: bool = True,
+    force: bool = False,
+    no_cache: bool = False,
 ) -> dict[str, Any]:
     """Run a single named suite and return structured results.
 
-    Returns a dict with ``success``, ``returncode``, ``failures``, ``command``
-    and (on missing binary) ``notice``.
+    By default each command is routed through the per-repo cache: a valid
+    cached result (same git state, within TTL) is served without executing.
+    ``force`` bypasses lookup (still stores), ``no_cache`` bypasses lookup
+    and storage. The result carries ``cached`` (True when every command in
+    the suite was served from cache) and ``command`` for display.
+
+    Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
+    ``cached`` and (on missing binary) ``notice``.
     """
     cwd = cwd or REPO_ROOT
     if name == "pytest":
@@ -251,7 +289,11 @@ def run_suite(
     else:
         raise ValueError(f"unknown suite: {name}")
 
-    if name == "bats" and shutil.which("bats") is None:
+    if (
+        name == "bats"
+        and shutil.which("bats") is None
+        and not use_cache
+    ):
         return {
             "success": False,
             "returncode": None,
@@ -262,9 +304,26 @@ def run_suite(
 
     all_failures: list[dict[str, str]] = []
     overall_returncode = 0
+    cached_flags: list[bool] = []
     for cmd in commands:
         try:
-            proc = _run_cmd(cmd.split(), cwd=cwd, timeout=timeout)
+            if use_cache:
+                run = run_cached(
+                    cmd,
+                    cwd=str(cwd),
+                    force=force,
+                    no_cache=no_cache,
+                    ttl=CACHE_TTL_SECONDS,
+                    timeout=timeout,
+                    runner=_cached_runner,
+                )
+                proc = SimpleNamespace(
+                    stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
+                )
+                cached_flags.append(run["cached"])
+            else:
+                proc = _run_cmd(shlex.split(cmd), cwd=cwd, timeout=timeout)
+                cached_flags.append(False)
         except FileNotFoundError as exc:
             return {
                 "success": False,
@@ -298,6 +357,7 @@ def run_suite(
         "returncode": overall_returncode,
         "command": command,
         "failures": all_failures,
+        "cached": use_cache and all(cached_flags) if cached_flags else False,
         "notice": "",
     }
 
@@ -306,13 +366,23 @@ def run_all(
     suites: tuple[str, ...] = ("pytest", "node", "bats"),
     cwd: Path | None = None,
     timeout: int = 600,
+    use_cache: bool = True,
+    force: bool = False,
+    no_cache: bool = False,
 ) -> dict[str, Any]:
     """Run the selected suites and aggregate failures."""
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
     notices: list[str] = []
     for name in suites:
-        result = run_suite(name, cwd=cwd, timeout=timeout)
+        result = run_suite(
+            name,
+            cwd=cwd,
+            timeout=timeout,
+            use_cache=use_cache,
+            force=force,
+            no_cache=no_cache,
+        )
         results[name] = result
         for failure in result["failures"]:
             all_failures.append({**failure, "suite": name})
@@ -392,13 +462,86 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-run failing tests once to verify flakiness before triage.",
     )
     parser.add_argument("--timeout", type=int, default=600, help="Per-suite timeout in seconds.")
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Bypass the run cache entirely (execute fresh, do not store).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force a fresh run, refreshing the cache entry.",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print summary lines (e.g. 'Test Files', 'Tests', 'failed') from a cached run without executing.",
+    )
+    parser.add_argument(
+        "--summary-grep",
+        default=None,
+        help="Custom grep pattern for --summary line filtering.",
+    )
     return parser
+
+
+def run_summary(
+    suites: tuple[str, ...],
+    cwd: Path | None = None,
+    pattern: str | None = None,
+) -> dict[str, Any]:
+    """Return summary lines for each suite from the cache, executing nothing.
+
+    Suites with no cached entry report a clear miss. The result carries
+    ``success`` (True only when every selected suite had a cached entry),
+    ``lines`` per suite, and ``missing`` (list of suite names).
+    """
+    cwd = cwd or REPO_ROOT
+    result: dict[str, Any] = {"lines": {}, "missing": [], "success": True}
+    for name in suites:
+        if name == "pytest":
+            commands = [pytest_command()]
+        elif name == "node":
+            commands = node_suite_commands()
+        else:
+            commands = [bats_command()]
+        lines: list[str] = []
+        for cmd in commands:
+            entry = query_cached(cmd, cwd=str(cwd), ttl=CACHE_TTL_SECONDS)
+            if entry is None:
+                result["missing"].append(name)
+                result["success"] = False
+                continue
+            lines.extend(summary_lines(entry["stdout"], entry["stderr"], pattern=pattern))
+        result["lines"][name] = lines
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     suites = ("pytest", "node", "bats") if args.suite == "all" else (args.suite,)
-    result = run_all(suites=suites, timeout=args.timeout)
+
+    if args.summary:
+        summary = run_summary(suites, pattern=args.summary_grep)
+        if args.json:
+            print(json.dumps(summary, indent=2))
+        else:
+            for name, lines in summary["lines"].items():
+                if name in summary["missing"]:
+                    print(f"{name}: no cached result — run the suite first or use --force")
+                else:
+                    print(f"{name} summary:")
+                    for line in lines:
+                        print(f"  {line}")
+        return 0 if summary["success"] else 1
+
+    result = run_all(
+        suites=suites,
+        timeout=args.timeout,
+        use_cache=not args.no_cache,
+        force=args.force,
+        no_cache=args.no_cache,
+    )
 
     if args.rerun_failures and result["failures"]:
         result["failures"] = rerun_failures(result["failures"], timeout=args.timeout)
@@ -409,7 +552,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         for name, suite_result in result["suites"].items():
             status = "PASS" if suite_result["success"] else "FAIL"
-            print(f"{name}: {status} ({suite_result['command']})")
+            cached = " [cached]" if suite_result.get("cached") else ""
+            print(f"{name}: {status}{cached} ({suite_result['command']})")
             if suite_result.get("notice"):
                 print(f"  notice: {suite_result['notice']}")
             for failure in suite_result["failures"]:
