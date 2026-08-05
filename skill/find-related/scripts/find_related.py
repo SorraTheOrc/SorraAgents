@@ -26,7 +26,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from skill.scripts.failure_notice import FailureNotice
-from skill.shared.status_lifecycle import StatusLifecycle
+from skill.shared.status_lifecycle import StatusLifecycle, resolve_worklog_flags
 
 # ---------------------------------------------------------------------------
 # Stop words
@@ -142,14 +142,32 @@ def extract_keywords(title: str, description: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def run_wl_show(work_item_id: str) -> dict[str, Any] | None:
+def _wl_flags_for(work_item_id: str) -> list[str]:
+    """Resolve ``--worklog-dir`` flags pinned from the work-item id.
+
+    Search and semantic-probe commands carry no work-item id of their own,
+    so their target store is pinned from the id of the item being analyzed
+    (prefix-to-sibling scan, then cwd-chain fallback — see the shared
+    :func:`resolve_worklog_flags`). Commands that DO carry the id
+    (show/update) resolve the same way from the id embedded in the command.
+    """
+    return resolve_worklog_flags(["wl", "show", work_item_id, "--json"])
+
+
+def run_wl_show(work_item_id: str, worklog_flags: list[str] | None = None) -> dict[str, Any] | None:
     """Fetch a work item via `wl show <id> --json` and return parsed JSON.
 
     Unwraps the nested 'workItem' object from the wl response.
+    Injects the resolved ``--worklog-dir`` (prefix-to-sibling scan) into the
+    subprocess call so the item is fetched from its own worklog store
+    regardless of the caller's cwd.
     Returns None if the command fails or output is not valid JSON.
     """
     try:
         cmd = ["wl", "show", work_item_id, "--json"]
+        if worklog_flags is None:
+            worklog_flags = _wl_flags_for(work_item_id)
+        cmd[1:1] = worklog_flags
         out = subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         data = json.loads(out)
         # wl show --json returns {success: true, workItem: {...}}
@@ -160,18 +178,25 @@ def run_wl_show(work_item_id: str) -> dict[str, Any] | None:
         return None
 
 
-def run_wl_search(keyword: str, use_semantic: bool = False) -> list[dict[str, Any]]:
+def run_wl_search(keyword: str, use_semantic: bool = False,
+                  worklog_flags: list[str] | None = None) -> list[dict[str, Any]]:
     """Search Worklog for items matching a keyword.
 
     When use_semantic is True, includes the --semantic flag for hybrid
     lexical+semantic ranking. Falls back to keyword-only search on error.
 
+    ``worklog_flags`` pins the target worklog store (resolved from the
+    work-item id being analyzed); when None, wl resolves from cwd.
+
     Returns a list of matching work items (empty list on failure).
     """
     try:
-        cmd = ["wl", "search", keyword, "--json"]
+        cmd = ["wl"]
+        cmd.extend(worklog_flags or [])
+        cmd.append("search")
         if use_semantic:
-            cmd.insert(2, "--semantic")
+            cmd.append("--semantic")
+        cmd.extend([keyword, "--json"])
         out = subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         data = json.loads(out)
         # wl search returns {"success": true, "workItems": [...]}
@@ -187,13 +212,20 @@ def run_wl_search(keyword: str, use_semantic: bool = False) -> list[dict[str, An
         return []
 
 
-def run_wl_update(work_item_id: str, description: str) -> bool:
+def run_wl_update(work_item_id: str, description: str,
+                  worklog_flags: list[str] | None = None) -> bool:
     """Update a work item description via `wl update <id> --description <text>`.
+
+    Injects the resolved ``--worklog-dir`` (prefix-to-sibling scan) into the
+    subprocess call so the item is updated in its own worklog store.
 
     Returns True on success, False on failure.
     """
     try:
         cmd = ["wl", "update", work_item_id, "--description", description, "--json"]
+        if worklog_flags is None:
+            worklog_flags = _wl_flags_for(work_item_id)
+        cmd[1:1] = worklog_flags
         subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         return True
     except Exception:  # noqa: BLE001 -- update failure handled gracefully
@@ -205,14 +237,19 @@ def run_wl_update(work_item_id: str, description: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def is_semantic_available() -> bool:
+def is_semantic_available(worklog_flags: list[str] | None = None) -> bool:
     """Probe whether `wl search --semantic` is functional.
 
     Runs a simple probe query. Returns True if the command succeeds
     and returns a valid response. Falls back gracefully on any error.
+
+    ``worklog_flags`` pins the target worklog store (resolved from the
+    work-item id being analyzed); when None, wl resolves from cwd.
     """
     try:
-        cmd = ["wl", "search", "--semantic", "probe", "--json"]
+        cmd = ["wl"]
+        cmd.extend(worklog_flags or [])
+        cmd.extend(["search", "--semantic", "probe", "--json"])
         out = subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         json.loads(out)
         # Any valid response (successful or with items) means --semantic is available
@@ -241,6 +278,7 @@ def _score_key(item: dict[str, Any]) -> float:
 def search_and_dedup(
     keywords: list[str],
     use_semantic: bool = False,
+    worklog_flags: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Search Worklog for each keyword, aggregate results, deduplicate, rank, and limit.
 
@@ -249,6 +287,9 @@ def search_and_dedup(
     without a score sort last. The final list is capped at
     MAX_WORK_ITEM_RESULTS.
 
+    ``worklog_flags`` pins the target worklog store (resolved from the
+    work-item id being analyzed) so every search targets the same store.
+
     Ranking heuristic: scored items are sorted by descending score
     (higher = more relevant). Unscored items sort after all scored items.
     """
@@ -256,7 +297,8 @@ def search_and_dedup(
     results: list[dict[str, Any]] = []
 
     for keyword in keywords:
-        items = run_wl_search(keyword, use_semantic=use_semantic)
+        items = run_wl_search(keyword, use_semantic=use_semantic,
+                              worklog_flags=worklog_flags)
         for item in items:
             item_id = item.get("id")
             if item_id and item_id not in seen:
@@ -510,12 +552,17 @@ def _main() -> None:
     #   - On exception: restores original status
     with StatusLifecycle(args.work_item_id, restore_on_exit=True):
 
+        # Pin the target worklog store from the work-item id so every wl call
+        # (show/update/search/probe) targets the same store regardless of the
+        # caller's cwd (prefix-to-sibling scan, SA-0MSG57UNY009DE51).
+        wl_flags = _wl_flags_for(args.work_item_id)
+
         if args.verbose:
             print(f"[find-related] Work item: {args.work_item_id}", file=sys.stderr)
             print(f"[find-related] Repo path: {args.repo_path}", file=sys.stderr)
 
         # Fetch the work item
-        work_item = run_wl_show(args.work_item_id)
+        work_item = run_wl_show(args.work_item_id, worklog_flags=wl_flags)
         if work_item is None:
             msg = f"Failed to fetch work item {args.work_item_id}"
             notice = FailureNotice(
@@ -543,12 +590,13 @@ def _main() -> None:
             print(f"[find-related] Keywords: {keywords}", file=sys.stderr)
 
         # Probe semantic search availability
-        use_semantic = is_semantic_available()
+        use_semantic = is_semantic_available(worklog_flags=wl_flags)
         if args.verbose:
             print(f"[find-related] Semantic search available: {use_semantic}", file=sys.stderr)
 
         # Search Worklog (with semantic ranking when available)
-        related_items = search_and_dedup(keywords, use_semantic=use_semantic)
+        related_items = search_and_dedup(keywords, use_semantic=use_semantic,
+                                         worklog_flags=wl_flags)
 
         # Search repository (ranked and limited)
         repo_matches = search_repo(args.repo_path, keywords)
@@ -572,7 +620,8 @@ def _main() -> None:
         # Update description
         original_desc = work_item.get("description", "")
         updated_desc = update_description(original_desc, report_section)
-        update_success = run_wl_update(args.work_item_id, updated_desc)
+        update_success = run_wl_update(args.work_item_id, updated_desc,
+                                       worklog_flags=wl_flags)
 
         if args.verbose and not update_success:
             print("[find-related] Warning: Failed to update work item description",

@@ -448,7 +448,7 @@ def test_search_and_dedup_aggregates_results(monkeypatch):
 
     search_calls = []
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         search_calls.append((keyword, use_semantic))
         if "script" in keyword:
             return [{"id": "REL-001", "title": "Script related"}]
@@ -472,7 +472,7 @@ def test_search_and_dedup_removes_duplicates(monkeypatch):
     """Duplicate work items from different keywords should be removed."""
     mod = _import_find_related()
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         # Both keywords return the same item (duplicate)
         return [{"id": "REL-001", "title": "Same item"}]
 
@@ -495,7 +495,7 @@ def test_search_and_dedup_handles_search_failures(monkeypatch):
     """Search failures for individual keywords should not break the pipeline."""
     mod = _import_find_related()
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         if keyword == "broken":
             return []  # Simulating a failed/empty search
         return [{"id": "REL-001", "title": "Working item"}]
@@ -534,7 +534,7 @@ def test_search_and_dedup_limits_to_top_3_by_score(monkeypatch):
         {"id": "REL-005", "title": "Fifth item", "score": -2.0},
     ]
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         return items_with_scores
 
     monkeypatch.setattr(mod, "run_wl_search", mock_search)
@@ -561,7 +561,7 @@ def test_search_and_dedup_all_items_when_under_limit(monkeypatch):
         {"id": "REL-001", "title": "Only item", "score": -0.5},
     ]
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         return items
 
     monkeypatch.setattr(mod, "run_wl_search", mock_search)
@@ -581,7 +581,7 @@ def test_search_and_dedup_items_without_score_go_last(monkeypatch):
         {"id": "REL-003", "title": "Scored high", "score": -0.1},
     ]
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         return items
 
     monkeypatch.setattr(mod, "run_wl_search", mock_search)

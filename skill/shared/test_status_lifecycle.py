@@ -29,18 +29,23 @@ from skill.shared.status_lifecycle import StatusLifecycle
 def mock_run():
     """Fixture that patches subprocess.run and returns the mock.
 
-    Also neutralizes ``worklog_dir_flag`` so the wl command contents in
-    these lifecycle tests are deterministic regardless of where pytest
-    was invoked (e.g. from inside a git worktree, where the flag would
-    otherwise be injected to point at the main checkout's .worklog).
-    Flag-injection logic is covered separately by
-    ``TestWorklogDirDetection`` and the dedicated injection tests.
+    Also neutralizes ``worklog_dir_flag`` and the prefix-to-sibling scan so
+    the wl command contents in these lifecycle tests are deterministic
+    regardless of where pytest was invoked (e.g. from inside a git worktree,
+    where the flag would otherwise be injected to point at the main
+    checkout's .worklog). Flag-injection logic is covered separately by
+    ``TestWorklogDirDetection``, the dedicated injection tests, and
+    ``skill/shared/tests/test_shared_worklog_resolution.py``.
     """
     with (
         mock.patch("skill.shared.status_lifecycle.subprocess.run") as m,
         mock.patch(
             "skill.shared.status_lifecycle.worklog_dir_flag",
             return_value=[],
+        ),
+        mock.patch(
+            "skill.shared.status_lifecycle._find_worklog_dir_by_prefix",
+            return_value=None,
         ),
     ):
         yield m

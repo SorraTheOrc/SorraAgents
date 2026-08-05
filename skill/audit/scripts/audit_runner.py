@@ -56,7 +56,21 @@ from skill.shared.process_semaphore import (
     ENV_MAX_WORKERS,
     Semaphore,
 )
-from skill.shared.status_lifecycle import _wl_error_detail, worklog_dir_flag
+from skill.shared.status_lifecycle import (
+    SIBLING_SCAN_ROOT as SHARED_SIBLING_SCAN_ROOT,
+)
+from skill.shared.status_lifecycle import (
+    _extract_work_item_prefix as _extract_work_item_prefix_shared,
+)
+from skill.shared.status_lifecycle import (
+    _find_worklog_dir_by_prefix as _find_worklog_dir_by_prefix_shared,
+)
+from skill.shared.status_lifecycle import (
+    _wl_error_detail,
+)
+from skill.shared.status_lifecycle import (
+    resolve_worklog_flags as shared_resolve_worklog_flags,
+)
 
 # ---------------------------------------------------------------------------
 # Concurrency control (fan-out bounding, SA-0MSAEKOQE009TEB4)
@@ -327,64 +341,31 @@ def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
 def _extract_work_item_prefix(cmd: Sequence[str]) -> str | None:
     """Extract the work-item id prefix (e.g. ``OSL``) from a wl command.
 
-    Returns the prefix before the first ``-`` in an argument that looks like a
-    work item id (e.g. ``OSL-0MSABC7SB001NVUN``), or ``None`` when no such
-    argument is present (e.g. ``wl list``).
+    Thin wrapper over the shared implementation in
+    ``skill.shared.status_lifecycle`` (SA-0MSG57UNY009DE51).
     """
-    for arg in cmd:
-        m = re.match(r"^([A-Z]{2,5})-[A-Z0-9]+$", arg)
-        if m:
-            return m.group(1)
-    return None
+    return _extract_work_item_prefix_shared(cmd)
 
 
 def _find_worklog_dir_by_prefix(prefix: str) -> Path | None:
     """Find the ``.worklog`` dir of a sibling project with matching config prefix.
 
-    Scans ``SIBLING_SCAN_ROOT/*/.worklog/config.yaml`` and returns the
-    first ``.worklog`` directory whose ``prefix:`` value equals *prefix*.
-    Returns ``None`` when no sibling project matches (or the scan is not
-    possible, e.g. SIBLING_SCAN_ROOT does not exist).
+    Thin wrapper over the shared implementation in
+    ``skill.shared.status_lifecycle`` (SA-0MSG57UNY009DE51).
     """
-    projects_root = SIBLING_SCAN_ROOT
-    try:
-        configs = sorted(projects_root.glob("*/.worklog/config.yaml"))
-    except OSError:
-        return None
-    for config in configs:
-        try:
-            text = config.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("prefix:"):
-                value = stripped.split(":", 1)[1].strip().strip('"\'')
-                if value == prefix:
-                    return config.parent
-    return None
+    return _find_worklog_dir_by_prefix_shared(prefix)
 
 
 def _resolve_worklog_flags(cmd: Sequence[str],
                            explicit_dir: str | None = None) -> list[str]:
     """Resolve ``--worklog-dir`` flags for a wl command.
 
-    Resolution order:
-      1. explicit ``--worklog-dir`` value (from CLI / caller)
-      2. prefix-to-project sibling scan: extract the work-item id prefix from
-         the command and match it against
-         ``SIBLING_SCAN_ROOT/*/.worklog/config.yaml``
-      3. cwd-chain fallback (shared :func:`worklog_dir_flag`)
-      4. no flag (wl resolves from cwd)
+    Thin wrapper over the shared :func:`resolve_worklog_flags` in
+    ``skill.shared.status_lifecycle`` (SA-0MSG57UNY009DE51). Resolution
+    order (unchanged): explicit dir > prefix-to-sibling scan > cwd-chain
+    fallback > no flag.
     """
-    if explicit_dir:
-        return ["--worklog-dir", explicit_dir]
-    prefix = _extract_work_item_prefix(cmd)
-    if prefix:
-        wl_dir = _find_worklog_dir_by_prefix(prefix)
-        if wl_dir is not None:
-            return ["--worklog-dir", str(wl_dir)]
-    return worklog_dir_flag()
+    return shared_resolve_worklog_flags(cmd, explicit_dir=explicit_dir)
 
 
 def _run_wl(runner: Runner, cmd: Sequence[str],
@@ -442,8 +423,14 @@ repository is not the working directory.
 """
 
 
-SIBLING_SCAN_ROOT: Path = REPO_ROOT.parent
-"""Directory scanned by the prefix-to-project sibling worklog resolution.
+SIBLING_SCAN_ROOT: Path = SHARED_SIBLING_SCAN_ROOT
+"""Compatibility alias for the shared prefix-to-sibling scan root.
+
+The scan itself is implemented in ``skill.shared.status_lifecycle``
+(SA-0MSG57UNY009DE51); this alias preserves the historical name for
+callers that referenced ``audit_runner.SIBLING_SCAN_ROOT``. Patch the
+shared ``skill.shared.status_lifecycle.SIBLING_SCAN_ROOT`` constant in
+tests — the resolution no longer reads this module attribute.
 
 Sibling projects (whose ``.worklog/config.yaml`` carries a ``prefix:`` marker)
 live alongside the framework repository that ships this runner, i.e. under

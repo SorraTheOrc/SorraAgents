@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -245,9 +246,16 @@ class TestWorklogDirResolutionFromWorktree:
                 stdout=json.dumps({"success": True}), stderr="",
             )
 
-        status_lifecycle_module.run_wl(
-            ["wl", "show", "SA-X", "--json"], runner=fake_runner
-        )
+        # Neutralize the prefix-to-sibling scan (test id "SA-X" would
+        # otherwise match the real framework project's prefix): this test
+        # exercises the cwd-chain worktree resolution, not prefix resolution.
+        with mock.patch(
+            "skill.shared.status_lifecycle._find_worklog_dir_by_prefix",
+            return_value=None,
+        ):
+            status_lifecycle_module.run_wl(
+                ["wl", "show", "SA-X", "--json"], runner=fake_runner
+            )
 
         assert calls, "Expected a wl command to run"
         assert calls[0][0] == "wl"
