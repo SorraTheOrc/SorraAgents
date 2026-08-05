@@ -211,7 +211,7 @@ Synonym for "Acceptance Criteria". Use **Acceptance Criteria** as canonical head
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--max-concurrency N] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR]`
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--max-concurrency N] [--green-run SHA|HEAD] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
 **Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
@@ -247,6 +247,25 @@ Failure diagnostics surface the real `wl` error (stdout JSON error field first,
 then stdout text, then stderr) instead of empty stderr.
 
 **Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard (default 110s) skips remaining child audits to prevent silent kill; override with `--parent-timeout SECONDS` or the `AUDIT_PARENT_TIMEOUT` env var (e.g. `AUDIT_PARENT_TIMEOUT=3600`) to audit items with many children in one pass on harnesses whose bash tool allows longer runs. Precedence: `--parent-timeout` flag > `AUDIT_PARENT_TIMEOUT` env var > 110s default. On timeout, returns `unmet` with evidence "Pi model call timed out."
+
+**Operator-attested green test run (`--green-run` / `AUDIT_GREEN_RUN`):** Some acceptance criteria are inherently execution-dependent — e.g. "Full project test suite passes with the new changes" — and the audit's read-only mandate forbids the runner (and its Phase 1/2 models) from executing the suite. Without external evidence such criteria can NEVER be verified inside the audit, so they always return `partial`. An operator who has verifiably run the full suite at the audited commit can attest that fact and unblock those criteria:
+
+```bash
+python3 ./scripts/audit_runner.py issue SA-123 --green-run HEAD
+# or with an exact sha
+python3 ./scripts/audit_runner.py issue SA-123 --green-run <full-commit-sha>
+# or via env var
+AUDIT_GREEN_RUN=HEAD python3 ./scripts/audit_runner.py issue SA-123
+```
+
+Semantics:
+
+- The value is an exact commit sha or the alias `HEAD` (resolved to the current HEAD sha). Precedence: `--green-run` flag > `AUDIT_GREEN_RUN` env var > unset.
+- The value MUST match the audited HEAD (resolved via `git rev-parse HEAD`). A mismatch (or an unresolvable HEAD when git is unavailable) prints a clear error naming both shas and the run proceeds WITHOUT the attestation — execution-dependent ACs stay `partial`. The runner never silently accepts a mis-attested sha.
+- When accepted, a **GREEN-RUN attestation block** is injected into the Phase 1 parent screening prompt and ALL Phase 2 prompts (`phase2_deep`, `phase2_child`, `phase2_batch`): the model MAY mark execution-dependent criteria (e.g. "full test suite passes") met based on the attestation, but MUST NOT execute the test suite or any other state-modifying command — the read-only mandate otherwise remains in force.
+- The accepted sha is recorded in the persisted report as a `Green run attestation: <sha>` line near the `Ready to close:` header, so the report remains auditable.
+- **The runner never executes the test suite.** The attestation is external, operator-provided evidence; a false attestation is an operator/process violation the runner cannot detect — the operator is responsible for attesting truthfully and only for commits whose full suite they have actually run green.
+- Without an attestation, execution-dependent ACs remain `partial` and block closure exactly as before — this flag only adds an evidence path, it never relaxes the default read-only behavior.
 
 **Concurrency:** `--max-concurrency N` bounds the number of concurrent pi/audit subprocesses host-wide (default: `AUDIT_MAX_CONCURRENCY` env var or 2). Each pi launch holds one audit slot; when the ceiling is saturated the call **fails fast by default** (no wait) and returns `unmet` with evidence "Audit concurrency limit reached" immediately, so the audit completes gracefully and the operator can retry later. To opt into a bounded wait instead, set the `AUDIT_LOCK_TIMEOUT` env var (seconds), e.g. `AUDIT_LOCK_TIMEOUT=30` waits up to 30s for a free slot before returning the `unmet` verdict. Precedence: `--max-concurrency` flag > `AUDIT_MAX_CONCURRENCY` env var > 2 default.
 

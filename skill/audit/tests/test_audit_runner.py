@@ -3871,3 +3871,538 @@ class TestChildAcsFromOwnAuditFallback:
         assert len(acs) == 1
         assert acs[0]["verdict"] == "met"
         assert "child's own fresh audit" in acs[0]["evidence"]
+
+# ===========================================================================
+# Operator-attested green test run (--green-run / AUDIT_GREEN_RUN)
+# (SA-0MSGLAVCZ002LVZ4 AC1-AC6)
+# ===========================================================================
+
+_GREEN_RUN_HEAD = "a1b2c3d4e5f67890abcdef1234567890abcdef12"
+_GREEN_RUN_OTHER = "f1e2d3c4b5a67890fedcba0987654321fedcba98"
+_GREEN_RUN_DESC = (
+    "# Test\n\n## Acceptance Criteria\n\n"
+    "- AC1: full project test suite passes with the new changes\n"
+)
+
+
+def _green_run_git_runner(head_sha: str | None = _GREEN_RUN_HEAD):
+    """Build a mock runner answering ``git rev-parse HEAD``.
+
+    *head_sha* of ``None`` simulates git being unavailable (non-zero rc).
+    """
+    mock_runner = mock.MagicMock()
+
+    def _side_effect(cmd):
+        if list(cmd[:2]) == ["git", "rev-parse"]:
+            if head_sha is None:
+                return SimpleNamespace(
+                    returncode=128, stdout="", stderr="fatal: not a git repository"
+                )
+            return SimpleNamespace(returncode=0, stdout=head_sha + "\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    mock_runner.side_effect = _side_effect
+    return mock_runner
+
+
+class TestGreenRunResolution:
+    """Unit tests for green-run value resolution and HEAD validation."""
+
+    def test_env_var_constant_defined(self):
+        """AC5: the AUDIT_GREEN_RUN env var constant is defined."""
+        assert audit_runner.AUDIT_GREEN_RUN_ENV == "AUDIT_GREEN_RUN"
+
+    def test_no_flag_no_env_no_attestation(self):
+        """AC1: with neither flag nor env there is no attestation (unchanged)."""
+        block, sha = audit_runner._resolve_green_run_attestation(
+            None, _green_run_git_runner(),
+        )
+        assert block is None
+        assert sha is None
+
+    def test_head_alias_resolves_to_head_sha(self):
+        """AC2/AC5: the HEAD alias resolves to the audited HEAD sha."""
+        block, sha = audit_runner._resolve_green_run_attestation(
+            "HEAD", _green_run_git_runner(),
+        )
+        assert sha == _GREEN_RUN_HEAD
+        assert block is not None
+        assert _GREEN_RUN_HEAD in block
+
+    def test_exact_sha_match_accepted(self):
+        """AC2/AC5: an exact sha matching the audited HEAD is accepted."""
+        block, sha = audit_runner._resolve_green_run_attestation(
+            _GREEN_RUN_HEAD, _green_run_git_runner(),
+        )
+        assert sha == _GREEN_RUN_HEAD
+        assert block is not None
+
+    def test_sha_mismatch_rejected(self, capsys):
+        """AC3: a non-matching sha is rejected with an error naming both shas."""
+        block, sha = audit_runner._resolve_green_run_attestation(
+            _GREEN_RUN_OTHER, _green_run_git_runner(),
+        )
+        assert block is None
+        assert sha is None
+        err = capsys.readouterr().err
+        assert _GREEN_RUN_OTHER in err
+        assert _GREEN_RUN_HEAD in err
+        assert "does not match" in err
+
+    def test_env_var_fallback(self):
+        """AC5: AUDIT_GREEN_RUN is used when no CLI flag is passed."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_GREEN_RUN_ENV: _GREEN_RUN_HEAD},
+            clear=False,
+        ):
+            block, sha = audit_runner._resolve_green_run_attestation(
+                None, _green_run_git_runner(),
+            )
+        assert sha == _GREEN_RUN_HEAD
+        assert block is not None
+
+    def test_cli_flag_wins_over_env(self):
+        """AC1: the --green-run CLI flag wins over the env var."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_GREEN_RUN_ENV: _GREEN_RUN_OTHER},
+            clear=False,
+        ):
+            block, sha = audit_runner._resolve_green_run_attestation(
+                _GREEN_RUN_HEAD, _green_run_git_runner(),
+            )
+        assert sha == _GREEN_RUN_HEAD
+        assert block is not None
+
+    def test_git_unavailable_rejected(self, capsys):
+        """A green-run value cannot be verified without git → rejected.
+
+        Fail-closed: without the audited HEAD the attestation is never
+        silently accepted, so execution-dependent ACs stay partial.
+        """
+        block, sha = audit_runner._resolve_green_run_attestation(
+            "HEAD", _green_run_git_runner(head_sha=None),
+        )
+        assert block is None
+        assert sha is None
+        assert "could not be resolved" in capsys.readouterr().err
+
+    def test_prompt_block_keeps_read_only_mandate(self):
+        """The block permits met-on-attestation but forbids executing the suite."""
+        block, _ = audit_runner._resolve_green_run_attestation(
+            "HEAD", _green_run_git_runner(),
+        )
+        assert "GREEN-RUN ATTESTATION" in block
+        assert "MAY be marked met based on this attestation" in block
+        assert "Do NOT execute the test suite" in block
+        assert "read-only mandate" in block
+
+
+class TestGreenRunPromptInjection:
+    """Prompt-content assertions (AC2): the GREEN-RUN block is present in the
+    Phase 1 parent prompt and all Phase 2 prompts when the attestation is
+    accepted, and absent otherwise."""
+
+    def _make_cmd_issue_runner(self, description: str = _GREEN_RUN_DESC,
+                               head_sha: str | None = _GREEN_RUN_HEAD):
+        """Build a mock runner handling all wl commands + git for cmd_issue."""
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if list(cmd[:2]) == ["git", "rev-parse"]:
+                if head_sha is None:
+                    return SimpleNamespace(returncode=128, stdout="", stderr="fatal")
+                return SimpleNamespace(returncode=0, stdout=head_sha + "\n", stderr="")
+            if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": "open"},
+                    }),
+                    stderr="",
+                )
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}),
+                    stderr="",
+                )
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": description,
+                            "status": "in_progress",
+                        },
+                        "children": [],
+                    }),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"success": True}),
+                stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def _mock_cq(self):
+        return mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+    def _capture_context_prompts(self, **cmd_kwargs):
+        """Run cmd_issue and return prompts keyed by pi call context."""
+        mock_runner = self._make_cmd_issue_runner()
+        prompts: dict[str, str] = {}
+
+        def _fake_call(*args, **kwargs):
+            prompts[args[1]] = args[2]
+            return {"extracted_text": "[]"}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+                **cmd_kwargs,
+            )
+        return prompts
+
+    def test_phase1_parent_prompt_includes_block(self):
+        """AC2: the Phase 1 parent prompt includes the GREEN-RUN block."""
+        prompts = self._capture_context_prompts(green_run="HEAD")
+        assert "parent" in prompts
+        assert "GREEN-RUN ATTESTATION" in prompts["parent"]
+        assert _GREEN_RUN_HEAD in prompts["parent"]
+
+    def test_no_flag_prompts_lack_block(self):
+        """AC5: without an attestation the Phase 1 parent prompt is unchanged."""
+        prompts = self._capture_context_prompts()
+        assert "parent" in prompts
+        assert "GREEN-RUN ATTESTATION" not in prompts["parent"]
+
+    def test_phase2_deep_prompt_includes_block(self):
+        """AC2: the phase2_deep prompt includes the GREEN-RUN block."""
+        block, _ = audit_runner._resolve_green_run_attestation(
+            "HEAD", _green_run_git_runner(),
+        )
+        issue = {"id": "TEST-1", "title": "Test", "description": ""}
+        acs = [{"index": 0, "text": "full suite passes", "verdict": "met", "evidence": ""}]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model", green_run_block=block,
+            )
+        deep_calls = [c for c in mock_call.call_args_list if c[0][1] == "phase2_deep"]
+        assert deep_calls
+        assert "GREEN-RUN ATTESTATION" in deep_calls[0][0][2]
+
+    def test_phase2_child_prompt_includes_block(self):
+        """AC2: the phase2_child prompt includes the GREEN-RUN block."""
+        block, _ = audit_runner._resolve_green_run_attestation(
+            "HEAD", _green_run_git_runner(),
+        )
+        child = {
+            "id": "CHILD-1", "title": "Child", "stage": "in_progress",
+            "status": "open",
+            "ac_results": [
+                {"index": 0, "text": "Child AC", "verdict": "met", "evidence": ""}
+            ],
+        }
+        issue = {"id": "TEST-1", "title": "Test", "description": ""}
+        acs = [{"index": 0, "text": "AC", "verdict": "met", "evidence": ""}]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model", green_run_block=block,
+            )
+        child_calls = [
+            c for c in mock_call.call_args_list if c[0][1].startswith("phase2_child")
+        ]
+        assert child_calls
+        assert "GREEN-RUN ATTESTATION" in child_calls[0][0][2]
+
+    def test_phase2_batch_prompt_includes_block(self):
+        """AC2: the phase2_batch prompt includes the GREEN-RUN block."""
+        block, _ = audit_runner._resolve_green_run_attestation(
+            "HEAD", _green_run_git_runner(),
+        )
+        child = {
+            "id": "CHILD-1", "title": "Child", "stage": "in_progress",
+            "status": "open",
+            "ac_results": [
+                {"index": 0, "text": "Child AC", "verdict": "met", "evidence": ""}
+            ],
+        }
+        issue = {"id": "TEST-1", "title": "Test", "description": ""}
+        acs = [{"index": 0, "text": "AC", "verdict": "met", "evidence": ""}]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model",
+                batch_phase2=True, green_run_block=block,
+            )
+        batch_calls = [c for c in mock_call.call_args_list if c[0][1] == "phase2_batch"]
+        assert batch_calls
+        assert "GREEN-RUN ATTESTATION" in batch_calls[0][0][2]
+
+    def test_phase2_prompts_without_block_unchanged(self):
+        """AC5: without an attestation Phase 2 prompts carry no block."""
+        issue = {"id": "TEST-1", "title": "Test", "description": ""}
+        acs = [{"index": 0, "text": "AC", "verdict": "met", "evidence": ""}]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(issue, acs, [], "test-model")
+        deep_calls = [c for c in mock_call.call_args_list if c[0][1] == "phase2_deep"]
+        assert deep_calls
+        assert "GREEN-RUN ATTESTATION" not in deep_calls[0][0][2]
+
+    def test_main_forwards_green_run_flag(self):
+        """AC1: main() accepts --green-run on the issue subcommand and forwards it."""
+        with mock.patch.object(audit_runner, "cmd_issue") as mock_cmd:
+            rc = audit_runner.main(
+                ["issue", "SA-123", "--do-not-persist", "--green-run", "HEAD"]
+            )
+            assert rc == mock_cmd.return_value
+            _args, kwargs = mock_cmd.call_args
+            assert kwargs["green_run"] == "HEAD"
+
+
+class TestGreenRunReportLine:
+    """The persisted report records the accepted attestation (AC4)."""
+
+    def test_report_includes_attestation_line(self):
+        """AC4: 'Green run attestation: <sha>' appears near the header."""
+        issue = {"id": "TEST-1"}
+        acs = [{"text": "AC", "verdict": "met", "evidence": ""}]
+        report = audit_runner._assemble_issue_report(
+            issue, acs, [], model="m", model_source="local",
+            green_run_sha=_GREEN_RUN_HEAD,
+        )
+        assert f"Green run attestation: {_GREEN_RUN_HEAD}" in report
+        # Ready to close remains the first line (parsers depend on it).
+        assert report.startswith("Ready to close:")
+
+    def test_report_without_attestation_has_no_line(self):
+        """Backward compatibility: no attestation line without a sha."""
+        issue = {"id": "TEST-1"}
+        acs = [{"text": "AC", "verdict": "met", "evidence": ""}]
+        report = audit_runner._assemble_issue_report(
+            issue, acs, [], model="m", model_source="local",
+        )
+        assert "Green run attestation" not in report
+
+    def test_report_no_model_with_attestation(self):
+        """The attestation line also renders on the no-model header path."""
+        issue = {"id": "TEST-1"}
+        acs = [{"text": "AC", "verdict": "met", "evidence": ""}]
+        report = audit_runner._assemble_issue_report(
+            issue, acs, [], green_run_sha=_GREEN_RUN_HEAD,
+        )
+        assert f"Green run attestation: {_GREEN_RUN_HEAD}" in report
+
+
+class TestGreenRunCmdIssue:
+    """End-to-end cmd_issue behavior (AC3, AC4)."""
+
+    def _make_cmd_issue_runner(self, description: str = _GREEN_RUN_DESC,
+                               head_sha: str | None = _GREEN_RUN_HEAD):
+        """Build a mock runner handling all wl commands + git for cmd_issue."""
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if list(cmd[:2]) == ["git", "rev-parse"]:
+                if head_sha is None:
+                    return SimpleNamespace(returncode=128, stdout="", stderr="fatal")
+                return SimpleNamespace(returncode=0, stdout=head_sha + "\n", stderr="")
+            if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": "open"},
+                    }),
+                    stderr="",
+                )
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}),
+                    stderr="",
+                )
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": description,
+                            "status": "in_progress",
+                        },
+                        "children": [],
+                    }),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"success": True}),
+                stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def _mock_cq(self):
+        return mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+    def _run_issue(self, mock_runner, met_batch, persist: bool, green_run=None):
+        """Run cmd_issue with the green-run / persistence mocks in place."""
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            return audit_runner.cmd_issue(
+                "TEST-1", persist=persist, force=True, runner=mock_runner,
+                green_run=green_run,
+            )
+
+    def test_mismatch_rejected_run_proceeds_without_attestation(self, capsys):
+        """AC3: a mismatched --green-run errors clearly and the run proceeds
+        WITHOUT the attestation (execution-dependent ACs stay partial)."""
+        mock_runner = self._make_cmd_issue_runner()
+        met_batch = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+            ]),
+        }
+        rc = self._run_issue(
+            mock_runner, met_batch, persist=False, green_run=_GREEN_RUN_OTHER,
+        )
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert _GREEN_RUN_OTHER in captured.err
+        assert _GREEN_RUN_HEAD in captured.err
+        assert "does not match" in captured.err
+        assert "GREEN-RUN ATTESTATION" not in captured.out
+        assert "Green run attestation" not in captured.out
+
+    def test_persisted_report_contains_attestation_line(self):
+        """AC4: with a valid attestation the persisted report (read back via
+        wl audit-show) contains 'Green run attestation: <sha>'."""
+        captured: dict = {}
+        mock_runner = self._make_cmd_issue_runner()
+        met_batch = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+            ]),
+        }
+
+        def _fake_persist(issue_id, report_text, worklog_dir=None):
+            captured["report"] = report_text
+            return 0
+
+        original_run_wl = audit_runner._run_wl
+
+        def _fake_run_wl(runner, cmd, worklog_dir=None):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return {
+                    "success": True,
+                    "audit": {
+                        "rawOutput": captured.get("report", ""),
+                        "auditedAt": "2026-01-01T00:00:00.000Z",
+                    },
+                }
+            return original_run_wl(runner, cmd, worklog_dir=worklog_dir)
+
+        with mock.patch.object(
+            audit_runner, "persist_audit", side_effect=_fake_persist
+        ), mock.patch.object(
+            audit_runner, "_run_wl", side_effect=_fake_run_wl
+        ), mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=True, force=True, runner=mock_runner,
+                green_run=_GREEN_RUN_HEAD,
+            )
+
+        assert rc == 0
+        assert "report" in captured, "persist_audit should have been invoked"
+        persisted = captured["report"]
+        assert f"Green run attestation: {_GREEN_RUN_HEAD}" in persisted
+        assert "TEST-1" in persisted  # content identity check passes
+
+    def test_persisted_report_without_attestation_has_no_line(self):
+        """Backward compatibility: no attestation line without --green-run."""
+        captured: dict = {}
+        mock_runner = self._make_cmd_issue_runner()
+        met_batch = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+            ]),
+        }
+
+        def _fake_persist(issue_id, report_text, worklog_dir=None):
+            captured["report"] = report_text
+            return 0
+
+        original_run_wl = audit_runner._run_wl
+
+        def _fake_run_wl(runner, cmd, worklog_dir=None):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return {
+                    "success": True,
+                    "audit": {
+                        "rawOutput": captured.get("report", ""),
+                        "auditedAt": "2026-01-01T00:00:00.000Z",
+                    },
+                }
+            return original_run_wl(runner, cmd, worklog_dir=worklog_dir)
+
+        with mock.patch.object(
+            audit_runner, "persist_audit", side_effect=_fake_persist
+        ), mock.patch.object(
+            audit_runner, "_run_wl", side_effect=_fake_run_wl
+        ), mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=True, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        assert "report" in captured
+        assert "Green run attestation" not in captured["report"]
