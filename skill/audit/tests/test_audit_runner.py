@@ -1630,6 +1630,55 @@ class TestPhase2RetryTuning:
         _args, kwargs = parent_calls[0]
         assert kwargs.get("max_retries") == 1
 
+    def test_child_provider_error_degrades_to_partial(self):
+        """AC2 (child path): a provider error in phase2_child degrades ACs.
+
+        Mirrors the parent phase2_deep path: on _provider_error the child's
+        ACs must be marked partial (not left at Phase 1 verdicts), and
+        phase2_completed must be False so the audit is not reported as fully
+        deep-verified.
+        """
+        issue = {"id": "TEST-1", "title": "Test"}
+        acs = [{"index": 0, "text": "AC", "verdict": "met", "evidence": ""}]
+        children = [{
+            "id": "CHILD-1",
+            "title": "Child",
+            "ac_results": [
+                {"index": 0, "text": "AC1", "verdict": "met",
+                 "evidence": "phase1"}
+            ],
+        }]
+
+        def _provider_error_call(issue_id, context, prompt, model="m",
+                                 pi_bin="pi", debug_log=None,
+                                 enable_tools=False, timeout=None,
+                                 max_retries=None):
+            if context.startswith("phase2_child"):
+                return {
+                    "verdict": "unmet",
+                    "evidence": "Pi provider error: finish_reason: error",
+                    "extracted_text": "",
+                    "_provider_error": True,
+                    "_provider_error_message": "finish_reason: error",
+                }
+            return {"extracted_text": "[]"}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            side_effect=_provider_error_call,
+        ):
+            _updated_acs, updated_children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(
+                    issue, acs, children, "test-model",
+                )
+            )
+
+        assert phase2_completed is False
+        child = updated_children[0]
+        assert child["id"] == "CHILD-1"
+        assert child["ac_results"][0]["verdict"] == "partial"
+        assert "provider error" in child["ac_results"][0]["evidence"].lower()
+
 
 # ===========================================================================
 # Verdict-driven status lifecycle tests (SA-0MSAWFTZX003T042)

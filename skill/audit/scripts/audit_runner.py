@@ -2528,6 +2528,29 @@ def _deep_analyze_child(
         updated["ac_results"] = timeout_acs
         return ci, updated, True
 
+    # Handle provider errors (e.g. finish_reason: error) before parsing.
+    # Mirror the parent phase2_deep path: the model never emitted its
+    # structured output, so degrade all child ACs to partial instead of
+    # silently keeping Phase 1 verdicts (met-only-when-confirmed invariant).
+    if child_result.get("_provider_error"):
+        provider_error = child_result.get("_provider_error_message", "unknown")
+        print(
+            f"Warning: Child deep analysis provider error for {child.get('id', '')}: "
+            f"{provider_error}",
+            file=sys.stderr,
+        )
+        error_acs = []
+        for ac in child_acs:
+            error_acs.append({
+                "text": ac.get("text", ""),
+                "verdict": VERDICT_PARTIAL,
+                "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+            })
+        updated = dict(child)
+        updated["ac_results"] = error_acs
+        # Same incomplete signal as timeout so phase2_completed=False propagates.
+        return ci, updated, True
+
     child_raw = (
         child_result.get("extracted_text", "")
         or child_result.get("evidence", "")
