@@ -69,6 +69,13 @@ MAX_WORK_ITEM_RESULTS: int = 3
 # matched. Ties are broken alphabetically for deterministic ordering.
 MAX_REPO_FILE_RESULTS: int = 3
 
+# Maximum number of matched keywords to list per repository file in the
+# automated report. Raw keyword word-lists are the dominant source of report
+# bloat (measured ~58% of the related-work section on SA-0MSF4AFX9007INSP),
+# inflating every prompt that carries the description. The full keyword list
+# is preserved in the persisted sidecar full report (see write_full_report).
+MAX_KEYWORDS_PER_FILE: int = 5
+
 
 # ---------------------------------------------------------------------------
 # CLI helpers
@@ -347,12 +354,35 @@ def search_repo(repo_path: str, keywords: list[str]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _format_keyword_list(
+    keywords: list[str],
+    max_keywords: int | None,
+) -> str:
+    """Render a compact keyword list, capping at *max_keywords* entries.
+
+    When *max_keywords* is ``None`` the full list is rendered. When the list
+    is truncated, a ``(+N more)`` marker shows how many keywords were omitted
+    so readers know the full data lives in the persisted sidecar full report.
+    """
+    if max_keywords is None or len(keywords) <= max_keywords:
+        return ", ".join(keywords)
+    shown = ", ".join(keywords[:max_keywords])
+    return f"{shown} (+{len(keywords) - max_keywords} more)"
+
+
 def format_report(
     work_item_id: str,
     related_items: list[dict[str, Any]],
     repo_matches: list[dict[str, Any]],
+    max_keywords_per_file: int | None = MAX_KEYWORDS_PER_FILE,
 ) -> str:
     """Generate a Markdown report with related work items and repo matches.
+
+    Keyword word-lists per repository file match are capped at
+    *max_keywords_per_file* entries (default ``MAX_KEYWORDS_PER_FILE``) with a
+    ``(+N more)`` marker, keeping the section compact in descriptions and any
+    prompt that carries them. Pass ``max_keywords_per_file=None`` for the full
+    untruncated report (used when persisting the complete data).
 
     Returns a string containing the full report section including heading.
     """
@@ -377,11 +407,43 @@ def format_report(
         for match in repo_matches:
             file_path = match.get("file", "?")
             matched_keywords = match.get("matches", [])
-            kw_str = ", ".join(matched_keywords)
+            kw_str = _format_keyword_list(
+                matched_keywords, max_keywords_per_file
+            )
             lines.append(f"- `{file_path}` — matched: {kw_str}")
 
     lines.append("")
     return "\n".join(lines)
+
+
+def write_full_report(
+    work_item_id: str,
+    related_items: list[dict[str, Any]],
+    repo_matches: list[dict[str, Any]],
+    repo_root: Path = REPO_ROOT,
+) -> Path | None:
+    """Persist the complete (untruncated) related-work report to a sidecar file.
+
+    The work-item description carries the compact summary (see
+    ``format_report``); this writes the full keyword lists to
+    ``.worklog/tmp/find-related-full-<id>.md`` so the full related-work data
+    remains available without bloating descriptions or prompts.
+
+    Returns the path written, or ``None`` if persistence failed (best-effort:
+    the description update must never fail because of this).
+    """
+    try:
+        out_dir = repo_root / ".worklog" / "tmp"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / f"find-related-full-{work_item_id}.md"
+        full_report = format_report(
+            work_item_id, related_items, repo_matches,
+            max_keywords_per_file=None,
+        )
+        target.write_text(full_report, encoding="utf-8")
+        return target
+    except Exception:  # noqa: BLE001 -- best-effort persistence
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +562,13 @@ def _main() -> None:
         # Generate report
         report_section = format_report(args.work_item_id, related_items, repo_matches)
 
+        # Persist the full (untruncated) report so no related-work data is lost
+        # when the description carries only the compact summary (P11 / AC2).
+        full_report_path = write_full_report(
+            args.work_item_id, related_items, repo_matches,
+            repo_root=Path(args.repo_path),
+        )
+
         # Update description
         original_desc = work_item.get("description", "")
         updated_desc = update_description(original_desc, report_section)
@@ -519,6 +588,7 @@ def _main() -> None:
             "keywords": keywords,
             "relatedItemCount": len(related_items),
             "repoMatchCount": len(repo_matches),
+            "fullReportPath": str(full_report_path) if full_report_path else None,
         }
 
         if args.json_output:
@@ -530,6 +600,8 @@ def _main() -> None:
             if added_ids:
                 print(f"Added IDs: {', '.join(added_ids)}")
             print(f"Report inserted: {update_success}")
+            if full_report_path:
+                print(f"Full report persisted: {full_report_path}")
 
         sys.exit(0)
 

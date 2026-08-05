@@ -3266,6 +3266,61 @@ class TestPhase1PromptFileScope:
         assert "scan.py" in prompt
         assert key_file in prompt  # child's Key Files manifest injected
 
+    def test_prompts_never_embed_related_work_report(self, capsys):
+        """P11: audit prompts never carry the auto-appended related-work report.
+
+        The find-related report bloats descriptions (~58% of chars measured on
+        SA-0MSF4AFX9007INSP). Even when a description contains a large
+        'Related work (automated report)' section with raw keyword word-lists,
+        no Phase 1 or Phase 2 prompt may embed it — only extracted ACs and the
+        file-scope manifest are injected (regression guard for prompt size).
+        """
+        blob_kw = "zzwordlistmarker42"
+        parent_desc = (
+            "# Parent\n\n"
+            "## Acceptance Criteria\n\n"
+            "- AC1: parent criterion\n"
+            "\n## Related work (automated report)\n"
+            "### Related work items\n"
+            "- **REL-001** – Some related item (open)\n"
+            "### Repository file matches\n"
+            f"- `skill/audit/scripts/audit_runner.py` — matched: "
+            f"{blob_kw}, kw2, kw3, kw4, kw5, kw6, kw7, kw8, kw9\n"
+        )
+        child = _phase1_child(1)
+        mock_runner, _audit_shows = _make_phase1_runner(
+            [child], parent_desc=parent_desc,
+        )
+        prompts: dict[str, str] = {}
+
+        def _capture(issue_id, context, prompt, **kwargs):
+            prompts[context] = prompt
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+            ])}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        # Both Phase 1 paths must have produced prompts
+        assert "parent" in prompts
+        assert "child:CHILD-1" in prompts
+        for context, prompt in prompts.items():
+            assert "Related work (automated report)" not in prompt, (
+                f"{context} prompt must not embed the related-work report heading"
+            )
+            assert blob_kw not in prompt, (
+                f"{context} prompt must not embed the related-work word-list blobs"
+            )
+
 
 class TestPhase1EnableTools:
     """AC2: Phase 1 parent and child AC review calls run with read-only tools

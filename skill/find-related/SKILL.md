@@ -42,6 +42,13 @@ Discover related work for a work item via Worklog search, file inspection, and o
 |----------|---------|-------------|
 | `MAX_WORK_ITEM_RESULTS` | 3 | Maximum related work items shown. Soft limit — may be replaced by minimum-relevance thresholds when semantic/embedding-based scoring is available. |
 | `MAX_REPO_FILE_RESULTS` | 3 | Maximum repo file matches shown. Same soft-limit semantics. |
+| `MAX_KEYWORDS_PER_FILE` | 5 | Maximum matched keywords listed per repo file match. Raw keyword word-lists are the dominant source of report bloat (measured ~58% of the related-work section), so lists are capped with a `(+N more)` marker to keep descriptions/prompts compact. |
+
+### Prompt-size management (P11)
+
+The related-work section is deliberately **compact**: keyword word-lists per repo file are capped at `MAX_KEYWORDS_PER_FILE` (default 5) with a `(+N more)` marker, so descriptions stay small and any prompt that carries the description stays within token limits.
+
+The **full** (untruncated) report — with every matched keyword — is persisted to `.worklog/tmp/find-related-full-<id>.md` on every run, so no related-work data is lost even though the description carries only the summary. The sidecar path is returned in JSON output as `fullReportPath`.
 
 ## Inputs / Outputs
 
@@ -93,8 +100,10 @@ Work item: <id> | Related: 3 | Repo matches: 2 | Added IDs: REL-001, REL-002
 ### Output (JSON)
 
 ```json
-{"workItemId": "<id>", "found": true, "addedIds": [...], "reportInserted": true, "keywords": [...], "relatedItemCount": 3, "repoMatchCount": 2}
+{"workItemId": "<id>", "found": true, "addedIds": [...], "reportInserted": true, "keywords": [...], "relatedItemCount": 3, "repoMatchCount": 2, "fullReportPath": ".worklog/tmp/find-related-full-<id>.md"}
 ```
+
+`fullReportPath` points at the persisted full (untruncated) report; it is `null` if sidecar persistence failed (best-effort).
 
 ### Exit codes
 

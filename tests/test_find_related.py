@@ -708,6 +708,123 @@ def test_format_report_empty_shows_no_results():
 
 
 # ---------------------------------------------------------------------------
+# P11: related-work report compaction (SA-0MSF4AFX9007INSP)
+# ---------------------------------------------------------------------------
+
+
+def test_format_report_caps_keyword_lists():
+    """P11: format_report caps raw keyword word-lists to MAX_KEYWORDS_PER_FILE.
+
+    Raw keyword word-lists are the dominant source of report bloat (measured
+    ~58% of the related-work section). Even when a file matches 20 keywords,
+    only MAX_KEYWORDS_PER_FILE may be rendered in the description report.
+    """
+    mod = _import_find_related()
+    repo_matches = [
+        {"file": "skill/audit/scripts/audit_runner.py",
+         "matches": [f"kw{i}" for i in range(20)]},
+    ]
+    report = mod.format_report("TEST-123", [], repo_matches)
+    line = next(l for l in report.splitlines() if "audit_runner.py" in l)
+    # Keywords beyond the cap must not appear in the rendered line
+    for i in range(mod.MAX_KEYWORDS_PER_FILE, 20):
+        assert f"kw{i}" not in line, f"Keyword kw{i} should be truncated"
+    # First keywords still present
+    assert "kw0" in line
+    # Truncation marker present so readers know data was omitted
+    assert "more" in line
+
+
+def test_format_report_truncation_marker_counts_omitted():
+    """P11: the (+N more) marker reflects exactly how many keywords were cut."""
+    mod = _import_find_related()
+    repo_matches = [{"file": "f.py", "matches": [f"k{i}" for i in range(8)]}]
+    report = mod.format_report("TEST-123", [], repo_matches)
+    assert f"(+{8 - mod.MAX_KEYWORDS_PER_FILE} more)" in report
+
+
+def test_format_report_no_marker_when_under_cap():
+    """P11: keyword lists at or under the cap render fully with no marker."""
+    mod = _import_find_related()
+    repo_matches = [{"file": "f.py", "matches": [f"k{i}" for i in range(3)]}]
+    report = mod.format_report("TEST-123", [], repo_matches)
+    assert "k0" in report and "k1" in report and "k2" in report
+    assert "more" not in report
+
+
+def test_format_report_full_keyword_list_when_unlimited():
+    """P11: max_keywords_per_file=None renders the full untruncated word list.
+
+    Used when persisting the full related-work report (sidecar), so no
+    related-work data is ever lost (AC2).
+    """
+    mod = _import_find_related()
+    repo_matches = [{"file": "f.py", "matches": [f"kw{i}" for i in range(12)]}]
+    report = mod.format_report("TEST-123", [], repo_matches,
+                               max_keywords_per_file=None)
+    for i in range(12):
+        assert f"kw{i}" in report
+    assert "more)" not in report
+
+
+def test_format_report_related_section_length_bound():
+    """AC1: the related-work section stays bounded with pathological word-lists.
+
+    Before P11, 3 files × 60 keywords rendered ~180 keywords (~3.6 KB). With
+    the per-file keyword cap the section must remain compact regardless of
+    upstream match-list size.
+    """
+    mod = _import_find_related()
+    repo_matches = [
+        {"file": f"src/file_{i}.py", "matches": [f"kw{j}" for j in range(60)]}
+        for i in range(3)
+    ]
+    items = [
+        {"id": f"REL-{i:03d}", "title": f"Item {i}", "status": "open"}
+        for i in range(3)
+    ]
+    report = mod.format_report("TEST-123", items, repo_matches)
+    assert len(report) <= 1200, (
+        f"Related-work section too large: {len(report)} chars"
+    )
+
+
+def test_write_full_report_persists_all_keywords(tmp_path):
+    """AC2: the full (untruncated) report is persisted to a sidecar file.
+
+    The description carries only the compact summary; the sidecar preserves
+    every keyword so the full related-work data remains available.
+    """
+    mod = _import_find_related()
+    items = [{"id": "REL-001", "title": "Item", "status": "open"}]
+    repo_matches = [{"file": "f.py", "matches": [f"kw{i}" for i in range(12)]}]
+    path = mod.write_full_report("TEST-123", items, repo_matches,
+                                 repo_root=tmp_path)
+    assert path is not None
+    assert path.exists()
+    content = path.read_text(encoding="utf-8")
+    assert mod.REPORT_HEADING in content
+    assert "REL-001" in content
+    for i in range(12):
+        assert f"kw{i}" in content  # every keyword preserved
+    # The sidecar lives under .worklog/tmp and is named after the work item
+    assert path.parent.name == "tmp"
+    assert "TEST-123" in path.name
+
+
+def test_write_full_report_returns_none_on_failure(tmp_path, monkeypatch):
+    """AC2: sidecar persistence is best-effort and never raises."""
+    mod = _import_find_related()
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "mkdir", _boom)
+    path = mod.write_full_report("TEST-123", [], [], repo_root=tmp_path)
+    assert path is None
+
+
+# ---------------------------------------------------------------------------
 # Idempotent description update tests
 # ---------------------------------------------------------------------------
 
