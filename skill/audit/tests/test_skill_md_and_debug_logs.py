@@ -65,6 +65,38 @@ class TestSkillMdScanningGuidance:
 # ===========================================================================
 
 
+class TestSkillMdDocumentsBatchAndConcurrencyFlags:
+    """SKILL.md documents the P6 batch mode and --max-concurrency flags.
+
+    Work item: SA-0MSG3M3NI004HQVO (parent SA-0MSADWWH3003N82D AC5).
+    """
+
+    def test_skill_md_documents_batch_phase2_flag(self) -> None:
+        """--batch-phase2 appears in SKILL.md."""
+        text = SKILL_MD.read_text()
+        assert "--batch-phase2" in text
+
+    def test_skill_md_documents_batch_env_var(self) -> None:
+        """AUDIT_PHASE2_BATCH appears in SKILL.md."""
+        text = SKILL_MD.read_text()
+        assert "AUDIT_PHASE2_BATCH" in text
+
+    def test_skill_md_documents_max_concurrency_flag(self) -> None:
+        """--max-concurrency appears in SKILL.md."""
+        text = SKILL_MD.read_text()
+        assert "--max-concurrency" in text
+
+    def test_skill_md_runner_usage_line_includes_flags(self) -> None:
+        """The Runner usage line lists --batch-phase2 and --max-concurrency."""
+        text = SKILL_MD.read_text()
+        usage_line = next(
+            line for line in text.splitlines()
+            if "audit_runner.py issue|project" in line
+        )
+        assert "--batch-phase2" in usage_line
+        assert "--max-concurrency" in usage_line
+
+
 class TestDebugLogLocation:
     def test_default_path_outside_worklog_and_repo(self) -> None:
         """_default_debug_log_path resolves outside .worklog/ and repo tree."""
