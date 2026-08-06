@@ -41,6 +41,14 @@ refactor/
   session changes.
 - Integrated into CI/CD pipelines for automated code quality gates.
 
+## Verification
+
+Refactoring changes must be verified against the full project test suite
+before completion. Run the suite via the
+[test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate →
+loop until green), following the quiet pytest contract, so refactor fixes do
+not silently break behavior.
+
 ## Status Management
 
 The refactor script manages work item status automatically via the shared
