@@ -16,10 +16,6 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 WIRED_FILES = {
     "AGENTS.md": _REPO_ROOT / "AGENTS.md",
     "skill/implement/SKILL.md": _REPO_ROOT / "skill" / "implement" / "SKILL.md",
-    "skill/implement-single/SKILL.md": _REPO_ROOT
-    / "skill"
-    / "implement-single"
-    / "SKILL.md",
     "skill/audit/SKILL.md": _REPO_ROOT / "skill" / "audit" / "SKILL.md",
     "skill/refactor/SKILL.md": _REPO_ROOT / "skill" / "refactor" / "SKILL.md",
     "skill/code-review/SKILL.md": _REPO_ROOT / "skill" / "code-review" / "SKILL.md",

@@ -37,7 +37,7 @@ All scripts below are internal implementation details — they are not exposed a
 |--------|---------|
 | `./scripts/run-release.js` | Release wrapper (includes gating, post-release dev sync) |
 | `./scripts/release/merge-dev-to-main.sh` | Canonical release merge script |
-| `./scripts/ship.js` | Push-to-dev helper (`pushToDev`, `pushToBranch`, `validatePushTarget`) — used by the implement/implement-single workflow |
+| `./scripts/ship.js` | Push-to-dev helper (`pushToDev`, `pushToBranch`, `validatePushTarget`) — used by the implement workflow |
 | `./scripts/git-helpers.js` | Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`) |
 | `./scripts/check-unmerged-branches.js` | Unmerged branch detection |
 | `./scripts/check-audit-gate.js` | Audit readiness and producer-review gating |
@@ -51,7 +51,7 @@ All scripts below are internal implementation details — they are not exposed a
 node ./scripts/run-release.js
 ```
 
-For programmatic access to internal helpers (used by the implement/implement-single workflow):
+For programmatic access to internal helpers (used by the implement workflow):
 
 ```javascript
 // Push completed work into dev (internal to implement workflow)
@@ -207,7 +207,7 @@ See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md) for local test c
 
 ## Integration with AGENTS.md
 
-The implement/implement-single workflow uses `pushToDev()` internally to push feature branches into `dev`. The ship skill's `release` action promotes `dev` to `main`. See [AGENTS.md](../../AGENTS.md) and [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full workflow.
+The implement workflow uses `pushToDev()` internally to push feature branches into `dev`. The ship skill's `release` action promotes `dev` to `main`. See [AGENTS.md](../../AGENTS.md) and [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full workflow.
 
 ## Outputs
 

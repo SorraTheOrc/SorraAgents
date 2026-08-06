@@ -162,8 +162,7 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 > progress the script refuses with "Project is in Code Freeze — implementation
 > blocked until the release completes", exits non-zero, and does **not** change
 > the work item status. There is no `--force` bypass. Fail-open: a missing or
-> corrupt marker never blocks implementation. `implement-single` inherits the
-> gate because it delegates to `implement.py`.
+> corrupt marker never blocks implementation.
 
 2. Safety gate: handle dirty working tree
 

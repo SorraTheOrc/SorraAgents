@@ -1,6 +1,6 @@
 Core principles for AI Agents working with work-items tracked in Worklog (wl) and the workflow to follow when completing tasks.
 
-- **NEVER write or edit code without an explicit instruction to use the implement skill** (`/skill:implement <id>` or `/skill:implement-single <id>`). Non-implement invocations (e.g. `/intake`, `/plan`, `/audit`) must complete their own workflow and STOP — they must not proceed to implementation. When implementation IS authorized, always follow the implement skill's instructions exactly: worktree lifecycle, build → test → commit order (never reverse), and the StatusLifecycle status transitions.
+- **NEVER write or edit code without an explicit instruction to use the implement skill** (`/skill:implement <id>`). Non-implement invocations (e.g. `/intake`, `/plan`, `/audit`) must complete their own workflow and STOP — they must not proceed to implementation. When implementation IS authorized, always follow the implement skill's instructions exactly: worktree lifecycle, build → test → commit order (never reverse), and the StatusLifecycle status transitions.
 - Tasks require a work-item id; if not provided, ask for one to be created or get permission to create one.
 - When asked to complete a task, follow the workflow below: claim, define, plan, decide, implement, update, repeat, end.
 - Do NOT ask unnecessary questions. Check existing information first before asking.
@@ -22,7 +22,7 @@ Follow the steps below when completing tasks. If you already have a current work
 3. **Plan the work** — Break into sub-tasks. Verify descriptions and ACs are clear, measurable, and testable. Create child work-items: `wl create -t "<title>" -d "<description>" --parent <id> --issue-type <type> --priority <level> --json`. Advance stage: `wl update <id> --stage plan_complete`. See [plan skill](/home/rgardler/.pi/agent/skills/plan/SKILL.md).
 4. **Decide what to work on next** — Use `wl next --json`. If the recommended item has children, claim it and recurse until reaching a leaf item. If no descendants remain, go to End session.
 
-> **NEVER write or edit code without an explicit instruction to use the implement skill** (`/skill:implement <id>` or `/skill:implement-single <id>`). Non-implement invocations (e.g. `/intake`, `/plan`, `/audit`) must complete their own workflow and STOP — they must not proceed to implementation. When implementation IS authorized, always follow the implement skill's instructions exactly: worktree lifecycle, build → test → commit order (never reverse), and the StatusLifecycle status transitions.
+> **NEVER write or edit code without an explicit instruction to use the implement skill** (`/skill:implement <id>`). Non-implement invocations (e.g. `/intake`, `/plan`, `/audit`) must complete their own workflow and STOP — they must not proceed to implementation. When implementation IS authorized, always follow the implement skill's instructions exactly: worktree lifecycle, build → test → commit order (never reverse), and the StatusLifecycle status transitions.
 
 5. **Implement the work-item** — Use the implement orchestration script to manage the deterministic lifecycle:
 
@@ -174,7 +174,7 @@ python3 /home/rgardler/.pi/agent/skills/triage/scripts/check_or_create.py '{"tes
 
 - Any incomplete work item tagged `test-failure` matching the test name is linked/updated.
 - If no match exists, a `critical` work item is created using the template at `/home/rgardler/.pi/agent/skills/triage/resources/test-failure-template.md`.
-- The child is then implemented via `implement-single`, fixed, committed, and tests re-run.
+- The child is then implemented, fixed, committed, and tests re-run.
 - **All tests must pass** before a work item reaches `in_review` — including pre-existing failures.
 
 ## Work-Item Management

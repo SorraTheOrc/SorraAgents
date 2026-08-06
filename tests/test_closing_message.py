@@ -18,7 +18,7 @@ _TARGET_FILES = [
     _REPO_ROOT / "AGENTS.md",
 ]
 _EXTRA_FILES = []
-for _path in [_PI_SKILLS_DIR / "implement" / "SKILL.md", _PI_SKILLS_DIR / "implement-single" / "SKILL.md"]:
+for _path in [_PI_SKILLS_DIR / "implement" / "SKILL.md"]:
     if _path.exists():
         _EXTRA_FILES.append(_path)
 _ALL_TARGET_FILES = _TARGET_FILES + _EXTRA_FILES

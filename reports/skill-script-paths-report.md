@@ -90,11 +90,6 @@
 - skill/implement/SKILL.md:163 — - Using the ship skill: `pushToDev()` from `skill/ship/scripts/ship.js` (preferred)
 - skill/implement/SKILL.md:173 — > See `skill/ship/SKILL.md` for the push-to-dev workflow and `scripts/release/merge-dev-to-main.sh` for the release process.
 
-## implement-single
-
-- path: skill/implement-single
-- status: PASS
-
 ## owner-inference
 
 - path: skill/owner-inference

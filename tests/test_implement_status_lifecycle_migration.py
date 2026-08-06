@@ -4,7 +4,6 @@ Verifies that:
 - skill/implement/scripts/implement.py uses StatusLifecycle context manager in phase_finish
 - All error paths in phase_finish properly reset status
 - skill/implement/SKILL.md references StatusLifecycle instead of ad-hoc wl update --status
-- skill/implement-single/SKILL.md references StatusLifecycle instead of ad-hoc wl update --status
 - skill/plan/SKILL.md references StatusLifecycle instead of ad-hoc wl update --status
 
 Related work item: SA-0MS69FE4Q008N8SZ
@@ -128,39 +127,6 @@ class TestImplementSkillDocReferencesStatusLifecycle:
                         f"Line {i+1}: ad-hoc 'wl update --status' command found "
                         f"in SKILL.md without StatusLifecycle reference: {line.strip()}"
                     )
-
-
-# ===========================================================================
-# Tests: implement-single SKILL.md references StatusLifecycle
-# ===========================================================================
-
-
-class TestImplementSingleSkillDocReferencesStatusLifecycle:
-    """Tests that skill/implement-single/SKILL.md references StatusLifecycle."""
-
-    SKILL_MD = REPO_ROOT / "skill" / "implement-single" / "SKILL.md"
-    CONTENT = SKILL_MD.read_text() if SKILL_MD.exists() else ""
-
-    def test_skill_md_exists(self):
-        """SKILL.md exists in the implement-single skill directory."""
-        assert self.SKILL_MD.exists(), f"SKILL.md not found at {self.SKILL_MD}"
-        assert self.CONTENT, "SKILL.md is empty"
-
-    def test_references_status_lifecycle(self):
-        """implement-single SKILL.md references StatusLifecycle for status management."""
-        assert "StatusLifecycle" in self.CONTENT, (
-            "implement-single SKILL.md should reference StatusLifecycle "
-            "for status management"
-        )
-
-    def test_uses_status_lifecycle_update_status_static(self):
-        """implement-single SKILL.md uses StatusLifecycle.update_status() or
-        StatusLifecycle context manager for transitions."""
-        has_reference = "StatusLifecycle" in self.CONTENT
-        assert has_reference, (
-            "implement-single SKILL.md should reference StatusLifecycle "
-            "instead of ad-hoc wl update --status commands"
-        )
 
 
 # ===========================================================================

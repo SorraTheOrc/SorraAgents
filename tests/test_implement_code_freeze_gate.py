@@ -7,8 +7,6 @@ Contract (per work item ACs):
   message, exits non-zero, and does NOT change the work item status.
 - AC: no `--force`-style bypass is supported.
 - AC: absence of a marker allows start (the gate is fail-open).
-- AC: `implement-single` inherits the gate because it delegates to
-  `implement.py` (documented orchestration path).
 """
 
 from __future__ import annotations

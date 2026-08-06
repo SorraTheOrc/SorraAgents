@@ -246,11 +246,6 @@
     ],
     "pass": false
   },
-  "implement-single": {
-    "path": "skill/implement-single",
-    "hits": [],
-    "pass": true
-  },
   "owner-inference": {
     "path": "skill/owner-inference",
     "hits": [

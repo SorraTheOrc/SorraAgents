@@ -35,7 +35,7 @@ refactor/
 
 ## When To Use
 
-- As a post-implementation quality check in the implement/implement-single
+- As a post-implementation quality check in the implement
   workflow.
 - Manually via `/refactor <work-item-id>` to run code smell analysis on
   session changes.
@@ -157,5 +157,4 @@ Comment delimiters vary by file type — `#` for Python, `//` for JS/TS, `<!-- -
 ## Related Skills
 
 - [Implement](../implement/SKILL.md) — Integrated refactor step
-- [Implement Single](../implement-single/SKILL.md) — Also includes refactor step
 - [Code Review](../code-review/SKILL.md) — Complementary code quality skill
