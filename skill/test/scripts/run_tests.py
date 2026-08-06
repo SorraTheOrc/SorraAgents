@@ -4,7 +4,6 @@
 Suites:
   - pytest:  pytest -q -r a --disable-warnings   (canonicalized via skill/test_runner.py)
   - node:    node --test "tests/<dir>/**/*.mjs"   (npm --silent test when a test script exists)
-  - bats:    bats tests/install-worklog-plugin.bats
 
 Results are cached per-repo (see skill/test_cache.py) by default so repeated
 verification at the same git state is served without re-executing the suite.
@@ -13,7 +12,7 @@ Emits structured per-failure records (test_name, stdout_excerpt, stack_trace)
 compatible with the triage skill's check_or_create.py input.
 
 Usage:
-  run_tests.py [--suite pytest|node|bats|all] [--json] [--parent-work-item-id ID] [--rerun-failures]
+  run_tests.py [--suite pytest|node|all] [--json] [--parent-work-item-id ID] [--rerun-failures]
   run_tests.py --summary [--summary-grep PATTERN]   (read cached summary lines, no execution)
   run_tests.py --force | --no-cache                (bypass the cache)
 
@@ -29,7 +28,6 @@ import argparse
 import json
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -55,12 +53,10 @@ CACHE_TTL_SECONDS = DEFAULT_TTL_SECONDS
 
 PYTEST_CMD = canonicalize_quiet_test_command("pytest")
 NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
-BATS_FILE = "tests/install-worklog-plugin.bats"
 
 _FAILED_RE = re.compile(r"^FAILED\s+(.+?)\s+-\s+(.*)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^_{5,}\s+(.+?)\s+_{5,}$", re.MULTILINE)
 _NODE_NOT_OK_RE = re.compile(r"^not ok\s+\d+\s*-\s*(.+)$", re.MULTILINE)
-_BATS_NOT_OK_RE = re.compile(r"^not ok\s+\d+\s+(.+?)(?:\s+in\s+[\d.]+m?s)?$", re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -101,11 +97,6 @@ def node_suite_commands() -> list[str]:
         else:
             cmds.append(f'node --test "{suite_dir}/**/*.mjs"')
     return cmds
-
-
-def bats_command() -> str:
-    """Return the bats invocation for the install-worklog-plugin suite."""
-    return f"bats {BATS_FILE}"
 
 
 # ---------------------------------------------------------------------------
@@ -214,21 +205,6 @@ def _extract_yaml_block(block: str, key: str) -> str:
     return "\n".join(collected).strip()
 
 
-def parse_bats_failures(output: str) -> list[dict[str, str]]:
-    """Parse bats TAP output into per-failure structured records."""
-    records: list[dict[str, str]] = []
-    for match in _BATS_NOT_OK_RE.finditer(output):
-        test_name = match.group(1).strip()
-        records.append(
-            {
-                "test_name": test_name,
-                "stdout_excerpt": test_name,
-                "stack_trace": test_name,
-            }
-        )
-    return records
-
-
 # ---------------------------------------------------------------------------
 # Suite execution
 # ---------------------------------------------------------------------------
@@ -283,24 +259,8 @@ def run_suite(
     elif name == "node":
         commands = node_suite_commands()
         command = " && ".join(commands)
-    elif name == "bats":
-        command = bats_command()
-        commands = [command]
     else:
         raise ValueError(f"unknown suite: {name}")
-
-    if (
-        name == "bats"
-        and shutil.which("bats") is None
-        and not use_cache
-    ):
-        return {
-            "success": False,
-            "returncode": None,
-            "command": command,
-            "failures": [],
-            "notice": "bats is not installed; skipping bats suite",
-        }
 
     all_failures: list[dict[str, str]] = []
     overall_returncode = 0
@@ -344,10 +304,8 @@ def run_suite(
         output = f"{proc.stdout}\n{proc.stderr}"
         if name == "pytest":
             failures = parse_pytest_failures(output)
-        elif name == "node":
-            failures = parse_node_failures(output)
         else:
-            failures = parse_bats_failures(output)
+            failures = parse_node_failures(output)
         all_failures.extend(failures)
         if proc.returncode != 0:
             overall_returncode = proc.returncode
@@ -363,7 +321,7 @@ def run_suite(
 
 
 def run_all(
-    suites: tuple[str, ...] = ("pytest", "node", "bats"),
+    suites: tuple[str, ...] = ("pytest", "node"),
     cwd: Path | None = None,
     timeout: int = 600,
     use_cache: bool = True,
@@ -412,8 +370,6 @@ def rerun_failures(
         suite = failure.get("suite", "pytest")
         if suite == "pytest" and test_name:
             cmd = canonicalize_quiet_test_command(f"pytest {test_name}")
-        elif suite == "bats" and test_name:
-            cmd = f"bats {BATS_FILE} --filter {test_name}"
         else:
             # Node tests are re-run per file — keep as stable without a rerun.
             stable.append(failure)
@@ -442,7 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--suite",
-        choices=("pytest", "node", "bats", "all"),
+        choices=("pytest", "node", "all"),
         default="all",
         help="Which suite(s) to run (default: all).",
     )
@@ -501,10 +457,8 @@ def run_summary(
     for name in suites:
         if name == "pytest":
             commands = [pytest_command()]
-        elif name == "node":
-            commands = node_suite_commands()
         else:
-            commands = [bats_command()]
+            commands = node_suite_commands()
         lines: list[str] = []
         for cmd in commands:
             entry = query_cached(cmd, cwd=str(cwd), ttl=CACHE_TTL_SECONDS)
@@ -519,7 +473,7 @@ def run_summary(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    suites = ("pytest", "node", "bats") if args.suite == "all" else (args.suite,)
+    suites = ("pytest", "node") if args.suite == "all" else (args.suite,)
 
     if args.summary:
         summary = run_summary(suites, pattern=args.summary_grep)

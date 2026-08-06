@@ -355,7 +355,7 @@ def test_query_mode_returns_summary_without_executing(git_repo: Path) -> None:
 
 def test_query_mode_reports_miss(git_repo: Path) -> None:
     """A query for an un-cached command returns None (clear miss)."""
-    assert query_cached("bats tests/install-worklog-plugin.bats", cwd=str(git_repo)) is None
+    assert query_cached("pytest tests/test_demo.py", cwd=str(git_repo)) is None
 
 
 # ---------------------------------------------------------------------------

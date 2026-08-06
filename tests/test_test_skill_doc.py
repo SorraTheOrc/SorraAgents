@@ -41,10 +41,14 @@ def test_test_skill_doc_documents_quiet_npm_contract() -> None:
     assert "npm --silent" in content
 
 
-def test_test_skill_doc_documents_bats_suite() -> None:
-    """SKILL.md must reference the bats suite."""
+def test_test_skill_doc_has_no_bats_suite_reference() -> None:
+    """SKILL.md must not reference the removed bats suite.
+
+    The only bats suite (tests/install-worklog-plugin.bats) was deleted and
+    the runner is pytest + Node only (SA-0MSHZ08O8002PYN5).
+    """
     content = _skill_content()
-    assert "bats" in content.lower()
+    assert "bats" not in content.lower()
 
 
 def test_test_skill_doc_has_no_dangling_any_asset_line() -> None:

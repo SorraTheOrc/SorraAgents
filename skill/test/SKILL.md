@@ -1,7 +1,7 @@
 ---
 name: test
 description: |
-  Run the full project test suite (pytest + Node + bats) in quiet mode, triage
+  Run the full project test suite (pytest + Node) in quiet mode, triage
   every failure into critical `test-failure` work items, evaluate whether each
   failing test is genuinely useful via code-path analysis, fix or remove
   useless tests, and loop until the suite is green. Trigger on user queries
@@ -59,7 +59,6 @@ The runner executes, in quiet mode:
   Glob patterns are required — on node v22.22.1 `node --test <dir>` treats a
   bare directory as a module entry point and fails with `MODULE_NOT_FOUND`
   (see SA-0MSF8KNE3003JDVD).
-- **bats**: `bats tests/install-worklog-plugin.bats`
 
 Output is a JSON document with per-suite results and a flat `failures` array;
 each failure record carries `test_name`, `stdout_excerpt` and `stack_trace`.
@@ -192,7 +191,7 @@ test-side change, stop and report to the operator with:
 Scripts
 -------
 
-- `./scripts/run_tests.py` — runs pytest / Node / bats suites in quiet mode
+- `./scripts/run_tests.py` — runs pytest / Node suites in quiet mode
   and parses failures into triage-compatible records.
 - `./scripts/evaluate_usefulness.py` — code-path usefulness analysis returning
   conservative verdicts (`keep` / `remove` / `report-to-user`).
