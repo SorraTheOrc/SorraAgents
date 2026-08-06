@@ -91,14 +91,14 @@ class FanoutSampler(threading.Thread):
     def __init__(self, stop_event: threading.Event, interval: float = 0.5,
                  batch_marker: str = "mockpi"):
         super().__init__(daemon=True)
-        self._stop = stop_event
+        self._stop_event = stop_event
         self._interval = interval
         self._batch_marker = batch_marker
         self.samples: list[dict] = []
         self.batch_pi_peak = 0
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             # Count batch pi first (cheap cmdline scan) so short-lived mock
             # pi processes are not missed while the heavier full snapshot runs.
             try:
@@ -109,7 +109,7 @@ class FanoutSampler(threading.Thread):
                 self.samples.append(collect())
             except Exception:  # noqa: BLE001, S110 -- sampler is best-effort; ignore on failure
                 pass
-            self._stop.wait(self._interval)
+            self._stop_event.wait(self._interval)
 
     def peak(self) -> dict:
         if not self.samples:
