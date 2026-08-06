@@ -7,7 +7,7 @@ simple internal event (written to an events log) so other processes can react.
 
 The implementation is intentionally small and dependency-free so it can be
 integrated into existing code paths quickly. The location for persisted
-artifacts is taken from the environment variable `AMPA_TOOL_OUTPUT_DIR`; if
+artifacts is taken from the environment variable `PI_TOOL_OUTPUT_DIR`; if
 unset a directory under the platform temporary directory is used.
 """
 
@@ -21,16 +21,11 @@ import time
 from datetime import datetime
 from typing import Any
 
-try:
-    from ampa import notifications as notifications_module
-except Exception:  # pragma: no cover - optional dependency  # noqa: BLE001
-    notifications_module = None
-
 LOG = logging.getLogger("session_block")
 
 
 def _tool_output_dir() -> str:
-    path = os.getenv("AMPA_TOOL_OUTPUT_DIR")
+    path = os.getenv("PI_TOOL_OUTPUT_DIR")
     if path:
         return path
     default = os.path.join(tempfile.gettempdir(), "pi_tool_output")
@@ -103,53 +98,6 @@ def set_session_state(session_id: str, state: str) -> str:
     return state_path
 
 
-def _waiting_actions_text() -> str:
-    return os.getenv(
-        "AMPA_WAITING_FOR_INPUT_ACTIONS",
-        "Auto-accept, auto-decline, or respond via the responder endpoint.",
-    )
-
-
-def _responder_endpoint_url() -> str:
-    return os.getenv("AMPA_RESPONDER_URL", "http://localhost:8081/respond")
-
-
-def _send_waiting_for_input_notification(metadata: dict[str, Any]) -> bool | None:
-    if notifications_module is None:
-        LOG.warning("ampa.notifications is unavailable; cannot send notification")
-        return None
-    actions = _waiting_actions_text()
-    summary = metadata.get("summary") or "(no summary)"
-    work_item = metadata.get("work_item") or "(none)"
-    session_id = metadata.get("session") or "(unknown)"
-    prompt_file = metadata.get("prompt_file") or "(unknown)"
-    pending_prompt_file = metadata.get("pending_prompt_file") or prompt_file
-    tool_dir = metadata.get("tool_output_dir") or _tool_output_dir()
-    responder_url = _responder_endpoint_url()
-    call_to_action = f"Respond now: {responder_url}"
-    body = (
-        "Session is waiting for input\n"
-        f"Session: {session_id}\n"
-        f"Work item: {work_item}\n"
-        f"Reason: {summary}\n"
-        f"Actions: {actions}\n"
-        f"Call to action: {call_to_action}\n"
-        f"Responder endpoint: {responder_url}\n"
-        f"Persisted prompt path: {pending_prompt_file}\n"
-        f"Pending prompt file: {pending_prompt_file}\n"
-        f"Tool output dir: {tool_dir}"
-    )
-    try:
-        return notifications_module.notify(
-            "Session Waiting For Input",
-            body,
-            message_type="waiting_for_input",
-        )
-    except Exception:
-        LOG.exception("Failed to send waiting_for_input notification")
-        return None
-
-
 def detect_and_surface_blocking_prompt(
     session_id: str,
     work_item_id: str | None,
@@ -209,6 +157,5 @@ def detect_and_surface_blocking_prompt(
     # set session state and emit event
     set_session_state(session_id, "waiting_for_input")
     emit_internal_event("waiting_for_input", metadata)
-    _send_waiting_for_input_notification(metadata)
 
     return metadata
