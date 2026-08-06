@@ -16,10 +16,12 @@ The module provides:
   - A high-level ``make_autoplan_decision()`` orchestrator
   - ``run_effort_and_risk()`` wrapper for the effort-and-risk skill
   - ``append_autoplan_decision_comment()`` for idempotent comment posting
+  - ``should_request_plan_approval()`` for the plan skill's step-4 approval gate
   - ``validate_key_files_format()`` for syntactic validation of ``**Key Files:**``
   - ``validate_key_files_in_description()`` for validating key files within
     a full work item description
-  - CLI entry points ``plan-if-needed`` and ``check-effort-risk``
+  - CLI entry points ``plan-if-needed``, ``check-effort-risk`` and
+    ``plan-approval-gate``
 """  # noqa: EXE001
 
 from __future__ import annotations
@@ -40,6 +42,14 @@ logger = logging.getLogger("plan_helpers")
 # skip /plan and proceed directly to implement.
 DEFAULT_AUTOPLAN_EFFORT_SKIP: frozenset[str] = frozenset({"Extra Small", "Small"})
 DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
+
+# Thresholds for the plan-approval gate (plan skill step 4)
+# If the work item's effort t-shirt size is in this set OR its risk level
+# is in the risk set, the plan skill asks the user to approve the proposed
+# feature plan (and explains why). Otherwise the plan proceeds straight to
+# the automated review stages without an approval pause.
+PLAN_APPROVAL_EFFORT: frozenset[str] = frozenset({"Medium", "Large", "Extra Large"})
+PLAN_APPROVAL_RISK: frozenset[str] = frozenset({"Medium", "High"})
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +324,50 @@ def resolve_complexity_tier(item: dict, config: dict) -> str:
         return "low"
 
     return "medium"
+
+
+# ---------------------------------------------------------------------------
+# Plan-approval gate (plan skill step 4)
+# ---------------------------------------------------------------------------
+
+
+def should_request_plan_approval(work_item: dict) -> tuple[bool, str]:
+    """Decide whether the plan skill should ask the user to approve a feature plan.
+
+    Returns ``(request_approval, reason)``:
+    - ``request_approval``: True when the work item's effort t-shirt size is
+      Medium/Large/Extra Large ("scale") OR its risk level is Medium/High.
+    - ``reason``: a human-readable clause explaining what triggered the gate,
+      used to tell the user why a human checkpoint is required. Empty string
+      when approval is not needed.
+
+    Missing effort and/or risk values default conservatively to requesting
+    approval (mirroring ``resolve_complexity_tier``'s Medium default), so a
+    human checkpoint is never silently skipped.
+
+    Arguments:
+        work_item: The work item dict (from ``wl show --json``) with
+            ``effort`` (t-shirt size) and ``risk`` (level) fields.
+    """
+    effort = (work_item.get("effort") or "").strip()
+    risk = (work_item.get("risk") or "").strip()
+
+    # Missing values default conservatively to requesting approval.
+    if not effort and not risk:
+        return True, "its effort and risk are not set (defaulting to requesting approval)"
+    if not effort:
+        return True, f"its effort is not set and its risk is {risk}"
+    if not risk:
+        return True, f"its effort is {effort} and its risk is not set"
+
+    reasons: list[str] = []
+    if effort in PLAN_APPROVAL_EFFORT:
+        reasons.append(f"its effort is {effort} scale")
+    if risk in PLAN_APPROVAL_RISK:
+        reasons.append(f"its risk is {risk}")
+    if reasons:
+        return True, " and ".join(reasons)
+    return False, ""
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +666,29 @@ def plan_if_needed(target_id: str) -> dict[str, Any]:
     }
 
 
+def plan_approval_gate(
+    target_id: str,
+    runner: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """CLI helper for the plan skill's step-4 approval gate.
+
+    Fetches the work item (via ``wl show`` or the provided runner) and
+    returns a JSON-serializable dict with keys:
+      - target_id
+      - request_approval (bool): whether the plan skill should ask the user
+        to approve the proposed feature plan
+      - reason (str): human-readable explanation of the gate decision
+        (empty when approval is not needed)
+    """
+    item = _wl_show(target_id, runner=runner)
+    request_approval, reason = should_request_plan_approval(item)
+    return {
+        "target_id": target_id,
+        "request_approval": request_approval,
+        "reason": reason,
+    }
+
+
 def check_effort_risk(target_id: str) -> dict[str, Any]:
     """CLI entry point for ``check-effort-risk``.
 
@@ -654,6 +731,13 @@ def main() -> None:
     )
     check_parser.add_argument("target_id", help="Work item ID to check")
 
+    # plan-approval-gate subcommand
+    gate_parser = subparsers.add_parser(
+        "plan-approval-gate",
+        help="Check whether the plan skill should ask the user to approve the feature plan",
+    )
+    gate_parser.add_argument("target_id", help="Work item ID to check")
+
     args = parser.parse_args()
 
     if args.command == "plan-if-needed":
@@ -661,6 +745,9 @@ def main() -> None:
         print(json.dumps(result, indent=2))
     elif args.command == "check-effort-risk":
         result = check_effort_risk(args.target_id)
+        print(json.dumps(result, indent=2))
+    elif args.command == "plan-approval-gate":
+        result = plan_approval_gate(args.target_id)
         print(json.dumps(result, indent=2))
 
 

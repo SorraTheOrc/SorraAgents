@@ -127,6 +127,38 @@ the autoplan decision logic).
    later, the pre-check will return `decision: "skip"` and the command will
    exit with the existing stage preserved (a warning comment is added).
 
+## Plan-approval gate (Process step 4)
+
+Before asking the user to approve a proposed feature plan (Process step 4),
+run the approval-gate check using the bundled `plan_helpers.py`:
+
+```bash
+python3 ./plan_helpers.py plan-approval-gate <work-item-id>
+```
+
+Parse the JSON result. Expected keys:
+
+- `request_approval` — `true` (ask the user to approve the plan) or `false`
+  (proceed without an approval pause)
+- `reason` — human-readable explanation of why approval is requested
+  (empty when approval is not needed)
+
+The gate requests approval when the work item's effort t-shirt size is
+Medium/Large/Extra Large (scale) **OR** its risk level is Medium/High, and
+**skips** approval when effort is Extra Small/Small **AND** risk is Low.
+When effort/risk values are absent from the work item, the gate defaults
+conservatively to requesting approval (mirroring `resolve_complexity_tier`'s
+Medium default), so a human checkpoint is never silently skipped.
+
+- **If `request_approval == true`**: present the plan and ask the user to
+  accept, edit, reorder, or split/merge — iterating until approved. When
+  asking, state the reason explicitly so the user understands why the
+  checkpoint is required, e.g. "This plan requires your confirmation because
+  its effort is Large scale and its risk is Medium."
+- **If `request_approval == false`**: do NOT ask the user to approve the
+  plan; proceed directly to Process step 5 (vertical slice verification)
+  and step 6 (automated review stages).
+
 ## Automated review on existing content (auto-complete path)
 
 When the pre-check returns `decision: "skip"`, the skill runs the six
@@ -241,8 +273,18 @@ instructions above).
    Each feature must describe how the user experience changes and what ACs validate it.
 
    - **Test-first ordering**: test/verification features before implementation features.
-   - Present as numbered list and ask user to accept, edit, reorder, or split/merge.
-   - Iterate until approved.
+   - **Approval gate**: before asking for approval, run the approval-gate check
+     (see **Plan-approval gate** below). Approval is requested only when the
+     work item's effort t-shirt size is Medium/Large/Extra Large (scale) OR its
+     risk level is Medium/High, or when effort/risk are absent (conservative
+     default). When approval IS requested, state the reason explicitly
+     (e.g. "This plan requires your confirmation because its effort is Large
+     scale and its risk is Medium."). Present as numbered list and ask user to
+     accept, edit, reorder, or split/merge. Iterate until approved.
+   - When the gate says approval is NOT warranted (effort Extra Small or Small
+     AND risk Low), do NOT ask the user to approve the plan — proceed directly
+     to step 5 (vertical slice verification) and step 6 (automated review
+     stages) without an approval pause.
 
 5. Verify vertical slice phasing (agent responsibility)
 
@@ -343,13 +385,15 @@ instructions above).
 
 - `plan_helpers.py` — Shared autoplan decision module. Provides the CLI
   entry points `plan-if-needed` and `check-effort-risk` used in the pre-check
-  above. Can also be imported as a Python module by other tools.
+  above, plus `plan-approval-gate` for the step-4 approval gate. Can also be
+  imported as a Python module by other tools.
 
   Usage:
 
   ```bash
   python3 ./plan_helpers.py plan-if-needed <work-item-id>
   python3 ./plan_helpers.py check-effort-risk <work-item-id>
+  python3 ./plan_helpers.py plan-approval-gate <work-item-id>
   ```
 
   Import:
@@ -358,6 +402,7 @@ instructions above).
   from skill.plan.plan_helpers import (
       make_autoplan_decision,
       resolve_complexity_tier,
+      should_request_plan_approval,
       is_effort_risk_computed,
       run_effort_and_risk,
       append_autoplan_decision_comment,
@@ -365,8 +410,11 @@ instructions above).
       validate_key_files_in_description,
       plan_if_needed,
       check_effort_risk,
+      plan_approval_gate,
       DEFAULT_AUTOPLAN_EFFORT_SKIP,
       DEFAULT_AUTOPLAN_RISK_SKIP,
+      PLAN_APPROVAL_EFFORT,
+      PLAN_APPROVAL_RISK,
   )
   ```
 
