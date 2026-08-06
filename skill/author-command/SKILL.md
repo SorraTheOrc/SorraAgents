@@ -21,6 +21,7 @@ User requests a new command ("Create a command to <do something>", "I need a com
 4. Review with user, revise until approved (do not proceed without approval)
 5. Place final command in `./command/` directory
 6. Document in README.md
+7. **Verify the new command against the full project test suite** via the [test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green) before declaring completion, so the authored command does not break existing behaviour.
 
 ## Framework placeholders
 
