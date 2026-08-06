@@ -517,6 +517,58 @@ def _get_repo_root(cwd: str | None = None) -> str | None:
     return None
 
 
+def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> bool:
+    """Auto-symlink the main checkout's node_modules into a worktree.
+
+    Git worktrees do not include gitignored directories, so tests that spawn
+    a real subprocess via an absolute worktree-relative path (e.g. CLI e2e
+    tests invoking ``<worktree>/node_modules/.bin/tsx``) fail with
+    MODULE_NOT_FOUND. Symlinking the main checkout's node_modules resolves
+    them without manual setup.
+
+    The symlink is created only when BOTH conditions hold:
+    - the worktree does not already have a node_modules entry (dir or
+      symlink), AND
+    - the main checkout has a node_modules directory.
+
+    Failures are logged, never fatal: the worktree remains usable and
+    dependencies can be installed inside it normally.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout, or None if unknown.
+
+    Returns:
+        True if the symlink was created, False otherwise (skipped/failed).
+    """
+    wt_nm = Path(worktree_path) / "node_modules"
+    if os.path.lexists(wt_nm):
+        LOG.info(
+            "Worktree already has node_modules (%s); skipping symlink.", wt_nm
+        )
+        return False
+    if not repo_root:
+        LOG.info("No repo root known; skipping node_modules symlink.")
+        return False
+    root_nm = Path(repo_root) / "node_modules"
+    if not root_nm.is_dir():
+        LOG.info(
+            "Main checkout has no node_modules (%s); skipping symlink.", root_nm
+        )
+        return False
+    try:
+        os.symlink(str(root_nm), str(wt_nm), target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        LOG.warning(
+            "Failed to symlink node_modules into worktree %s: %s",
+            worktree_path,
+            exc,
+        )
+        return False
+    LOG.info("Symlinked %s -> %s", wt_nm, root_nm)
+    return True
+
+
 def _remove_worktree(worktree_path: str) -> bool:
     """Remove a worktree directory gracefully.
 
@@ -1045,6 +1097,11 @@ def phase_start(
         return report
 
     abs_wt_path = str(Path(wt_path).resolve())
+
+    # Auto-symlink the main checkout's node_modules into the worktree so
+    # dist-spawning tests resolve dependencies without manual setup. Never
+    # fatal: skip when either side lacks node_modules (SA-0MSGS763C006SM1B).
+    _ensure_node_modules_symlink(abs_wt_path, _get_repo_root())
 
     # Update status with stage via shared helper
     try:

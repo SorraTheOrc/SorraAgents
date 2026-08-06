@@ -239,6 +239,13 @@ git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-
 cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 ```
 
+> **`node_modules` is auto-symlinked:** when using `implement.py start`, the
+> worktree gets `<worktree>/node_modules -> <repo-root>/node_modules`
+> automatically whenever the main checkout has a `node_modules` and the
+> worktree does not (SA-0MSGS763C006SM1B). This lets dist-spawning tests
+> resolve dependencies without manual `ln -s`. **Do NOT run `npm install` inside a worktree** — writes pass through the symlink into the main
+> checkout's `node_modules`, corrupting the shared dependency tree.
+
 See [AGENTS.md](../../AGENTS.md#implement-the-work-item) for the top-level policy.
 
 5. Implement
