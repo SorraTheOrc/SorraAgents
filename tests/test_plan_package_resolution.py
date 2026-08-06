@@ -25,8 +25,12 @@ import plan
 
 def test_plan_resolves_to_repo_root_not_skill_plan():
     """`plan` must be the root package, not skill/plan."""
-    assert plan.__file__ is None or "skill/plan" not in str(plan.__file__)
     root_plan = Path(plan.__path__[0]).resolve()
+    # Path-based check (not a substring scan): plan must resolve to the repo
+    # root plan/ package and NOT to skill/plan, regardless of the repo or
+    # worktree path (a worktree slug ending in "skill" would false-positive
+    # on a naive "skill/plan" substring check).
+    assert root_plan != (ROOT / "skill" / "plan").resolve()
     assert root_plan == (ROOT / "plan").resolve(), (
         f"plan resolved to {root_plan}, expected {ROOT / 'plan'}"
     )
