@@ -498,13 +498,21 @@ def git_get_commit_hash(cwd: str) -> str:
 
 
 def _get_repo_root(cwd: str | None = None) -> str | None:
-    """Get the absolute path to the git repository root.
+    """Get the absolute path to the MAIN git repository root.
+
+    ``git rev-parse --show-toplevel`` resolves to the root of the *current*
+    working tree. Inside a linked worktree (``.git`` is a file, not a
+    directory) that is the worktree root, not the main checkout. Callers
+    (the ``_remove_worktree`` safety gate, node_modules symlinking, repo
+    restore/push) need the main checkout root, so resolve it via
+    ``git rev-parse --git-common-dir`` (whose parent is the main working
+    tree root) when *cwd* is inside a linked worktree.
 
     Args:
         cwd: Optional working directory (defaults to current directory).
 
     Returns:
-        Absolute repo root path, or None if not in a git repo.
+        Absolute main repo root path, or None if not in a git repo.
     """
     result = run_cmd(
         ["git", "rev-parse", "--show-toplevel"],
@@ -512,9 +520,32 @@ def _get_repo_root(cwd: str | None = None) -> str | None:
         check=False,
         timeout=30,
     )
-    if result.returncode == 0 and result.stdout.strip():
-        return Path(result.stdout.strip()).resolve().as_posix()
-    return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    toplevel = Path(result.stdout.strip()).resolve()
+
+    # The main working tree has .git as a DIRECTORY; a linked worktree has
+    # it as a FILE pointing at the real git directory.
+    if (toplevel / ".git").is_dir():
+        return toplevel.as_posix()
+
+    # cwd is inside a linked worktree: derive the main repo root from the
+    # common git dir (its parent is the main working tree root).
+    common = run_cmd(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=cwd,
+        check=False,
+        timeout=30,
+    )
+    if common.returncode == 0 and common.stdout.strip():
+        common_dir = Path(common.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = toplevel / common_dir
+        main_root = common_dir.resolve().parent
+        git_marker = main_root / ".git"
+        if git_marker.is_dir() or git_marker.is_file():
+            return main_root.as_posix()
+    return toplevel.as_posix()
 
 
 def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> bool:
@@ -569,17 +600,24 @@ def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> b
     return True
 
 
-def _remove_worktree(worktree_path: str) -> bool:
+def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
     """Remove a worktree directory gracefully.
 
     Safety gates:
-    1. Validates the target path is not the repository root.
+    1. Validates the target path is not the repository root. The root is
+       taken from the *repo_root* argument when provided (``phase_finish``
+       passes the authoritative value from the implement state file);
+       otherwise it is derived from the current directory, resolving to the
+       MAIN checkout root even when the current directory is inside a linked
+       worktree (see ``_get_repo_root``).
     2. Before manual (shutil) removal, checks that the target does
        NOT contain a ``.git/`` directory (which would mean it's the
        main working tree).
 
     Args:
         worktree_path: Path to the worktree.
+        repo_root: Optional explicit main repo root (defaults to discovery
+            from the current directory).
 
     Returns:
         True if removal succeeded.
@@ -591,8 +629,8 @@ def _remove_worktree(worktree_path: str) -> bool:
     resolved_path = str(Path(worktree_path).resolve())
 
     # ── Safety gate 1: refuse if target is the repo root ──────────
-    repo_root = _get_repo_root()
-    if repo_root and Path(resolved_path).as_posix() == repo_root:
+    repo_root = repo_root or _get_repo_root()
+    if repo_root and Path(resolved_path) == Path(repo_root).resolve():
         msg = (
             f"REFUSE to remove the repository root: {resolved_path}. "
             f"This is the main working tree, not a worktree. "
@@ -600,6 +638,21 @@ def _remove_worktree(worktree_path: str) -> bool:
         )
         LOG.critical(msg)
         raise RuntimeError(msg)
+
+    # If the current directory is inside the worktree being removed, step
+    # out to the repo root first. A deleted cwd breaks os.getcwd() and
+    # subprocess spawning for every later step (StatusLifecycle.__exit__,
+    # phase_finish's completion comment, the signal handler).
+    try:
+        current_cwd = Path.cwd().resolve()
+    except OSError:
+        current_cwd = None
+    target = Path(resolved_path)
+    if (
+        current_cwd is not None
+        and (current_cwd == target or target in current_cwd.parents)
+    ):
+        os.chdir(repo_root or str(Path.home()))
 
     LOG.info("Removing worktree: %s", resolved_path)
     result = run_cmd(
@@ -633,8 +686,11 @@ def _remove_worktree(worktree_path: str) -> bool:
             LOG.warning("Manual worktree removal failed: %s", exc)
             return False
 
-    # Prune stale worktree references
-    run_cmd(["git", "worktree", "prune"], check=False)
+    # Prune stale worktree references. Run from an explicit, still-valid
+    # directory: the current directory may have been the worktree that was
+    # just removed (finish/abort can run from inside it), and a deleted cwd
+    # breaks both the log line and the subprocess spawn.
+    run_cmd(["git", "worktree", "prune"], cwd=repo_root, check=False)
     return True
 
 
@@ -1423,13 +1479,20 @@ def phase_finish(
             # ── Step 6: Remove worktree ────────────────────────────────────
             LOG.info("Removing worktree...")
             remove_state(worktree_path)
-            if not _remove_worktree(worktree_path):
+            if not _remove_worktree(
+                worktree_path,
+                repo_root=state.repo_root if state else None,
+            ):
                 msg = f"Failed to remove worktree at {worktree_path}"
                 LOG.warning(msg)
                 report["steps"]["worktree_removed"] = False
 
             # ── Step 7: Restore repo state ─────────────────────────────────
-            repo_root = state.repo_root if state else str(Path.cwd().resolve())
+            repo_root = (
+                state.repo_root
+                if state
+                else (_get_repo_root() or str(Path.cwd().resolve()))
+            )
             _restore_repo_state(repo_root)
 
             # ── Step 8: Push to dev ────────────────────────────────────────
