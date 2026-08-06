@@ -159,6 +159,13 @@ For repos where the automated merge is unsuitable, follow [`docs/dev/release-pro
 
 ### Cached test verification at release time
 
+Verifying the full project suite is green before promoting `dev` to `main` is
+an **optional pre-release verification step** driven by the
+[test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate →
+loop until green, quiet pytest contract). Release Managers may invoke it to
+confirm the suite is green before merging; the release itself does not
+depend on it unless the operator chooses to gate on it.
+
 Repeated full-suite verification at the same HEAD is expensive (minutes per
 run). Route release-time test checks through the **cached runner** so
 repeat verifications reuse the prior run instead of re-executing (see
@@ -180,7 +187,7 @@ python3 ../test/scripts/run_tests.py --force --json
 
 Cached results are valid for the same git state within the 2-hour TTL; a
 changed tree, expired TTL, or corrupt entry always triggers a fresh run.
-This complements the planned release test gate (SA-0MSBXQZCG0078SEW).
+This optional release test gate is wired via SA-0MSBXQZCG0078SEW.
 
 See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md) for local test commands.
 
