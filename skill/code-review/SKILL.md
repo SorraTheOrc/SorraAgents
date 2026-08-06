@@ -29,7 +29,7 @@ Evaluate changes against:
 - **Efficiency**: Any performance bottlenecks?
 - **Security**: Any vulnerabilities or insecure practices?
 - **Edge Cases & Error Handling**: Appropriate handling?
-- **Testability**: Adequately covered by tests?
+- **Testability**: Adequately covered by tests? If the reviewed changes are expected to keep the full suite green, verify via the [test skill](../test/SKILL.md) (`/skill:test`) — run → triage → evaluate → loop until green — rather than ad-hoc test commands.
 
 ### 4. Feedback
 
