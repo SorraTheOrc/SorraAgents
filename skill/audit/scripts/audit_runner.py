@@ -16,6 +16,13 @@ Verdicts:
   adjusted  – acceptance criterion adapted with acceptable variance
               (does not block ready-to-close, recorded in variance decisions)
 
+Execution-dependent criteria (e.g. 'full project test suite passes'):
+  the runner never executes the suite (read-only mandate). Evidence is
+  supplied either by the operator-attested ``--green-run`` path or,
+  automatically, by a green full-suite run found READ-ONLY in the per-repo
+  test cache (query_cached — see SA-0MSIU5HFI0024D7W). Both paths are
+  fail-closed: missing/mismatched evidence leaves such ACs partial.
+
 Persist + verify invariant:
   Unless ``--do-not-persist`` is given, the runner ALWAYS persists the
   audit report via ``persist_audit()`` and then performs a readback
@@ -72,6 +79,8 @@ from skill.shared.status_lifecycle import (
 from skill.shared.status_lifecycle import (
     resolve_worklog_flags as shared_resolve_worklog_flags,
 )
+from skill.test.scripts.run_tests import full_suite_commands
+from skill.test_cache import DEFAULT_TTL_SECONDS, query_cached
 
 # ---------------------------------------------------------------------------
 # Concurrency control (fan-out bounding, SA-0MSAEKOQE009TEB4)
@@ -162,6 +171,16 @@ AUDIT_GREEN_RUN_ENV = "AUDIT_GREEN_RUN"
 When set (and ``--green-run`` is not passed), this value (an exact commit
 sha or the alias ``HEAD``) is used as the green-run attestation. Precedence:
 ``--green-run`` flag > ``AUDIT_GREEN_RUN`` env var > unset (no attestation).
+"""
+
+AUTO_GREEN_RUN_BLOCK_HEADER = "AUTO-VERIFIED GREEN RUN"
+"""Header of the automatic full-suite verification block injected into prompts.
+
+The automatic path (SA-0MSIU5HFI0024D7W) consumes a green full-suite run
+from the per-repo test cache (``query_cached``) READ-ONLY — the runner never
+executes the suite. The block tells the model that execution-dependent
+criteria (e.g. 'full test suite passes') MAY be marked met based on that
+verified cached result, while the read-only mandate otherwise remains in force.
 """
 
 AUDIT_PARENT_TIMEOUT_ENV = "AUDIT_PARENT_TIMEOUT"
@@ -803,6 +822,63 @@ def _resolve_green_run_attestation(
         file=sys.stderr,
     )
     return None, None
+
+
+def _auto_green_run_prompt_block(sha: str) -> str:
+    """Build the AUTO-VERIFIED full-suite block injected into audit prompts.
+
+    The block tells the model that a full test-suite run at *sha* (the audited
+    HEAD) was verified green from the per-repo test cache via a READ-ONLY
+    query (``query_cached`` never executes anything), so execution-dependent
+    criteria (e.g. 'full test suite passes') MAY be marked met based on that
+    verified cached result — while the read-only mandate otherwise remains in
+    force and the suite must NOT be executed. Returns a string ending in a
+    blank line so callers can splice it between existing prompt sections.
+    """
+    return (
+        f"{AUTO_GREEN_RUN_BLOCK_HEADER} — A cached full test-suite run at "
+        f"commit {sha} (== current HEAD) was verified green from the per-repo "
+        "test cache (read-only query; the audit never executes the suite). "
+        "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
+        "marked met based on this verified cached result. Do NOT execute the "
+        "test suite or any other state-modifying command — the read-only "
+        "mandate otherwise remains in force.\n\n"
+    )
+
+
+def _resolve_auto_green_run(
+    runner: Runner,
+    cwd: str | Path | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve an automatically-verified green full-suite run, read-only.
+
+    Queries the per-repo test cache (``query_cached``) for each command in the
+    canonical full-suite set at *cwd* (default ``TARGET_PROJECT_ROOT``). The
+    query never executes anything, so the audit's read-only mandate is
+    preserved unconditionally (SA-0MSIU5HFI0024D7W).
+
+    Returns ``(prompt_block, head_sha)`` when EVERY suite command has a cached
+    entry at the audited git state within the cache TTL AND every entry's exit
+    code is 0. Returns ``(None, None)`` otherwise — fail-closed: a cache miss,
+    a non-zero (or timed-out) run, a partially cached suite set, an
+    unresolvable HEAD, or any cache/infra error yields NO evidence and never
+    crashes the audit (execution-dependent ACs stay partial).
+    """
+    try:
+        head_sha = _resolve_audited_head(runner)
+        if head_sha is None:
+            return None, None
+
+        project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
+        for command in full_suite_commands(project_root):
+            entry = query_cached(
+                command, cwd=str(project_root), ttl=DEFAULT_TTL_SECONDS,
+            )
+            if entry is None or int(entry.get("exit_code", -1)) != 0:
+                return None, None
+    except Exception:  # noqa: BLE001 -- fail-closed: never crash the audit
+        return None, None
+    return _auto_green_run_prompt_block(head_sha), head_sha
 
 
 def _audit_semaphore_max_workers(cli_value: int | None = None) -> int:
@@ -1657,7 +1733,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            model: str | None = _MISSING,
                            model_source: str | None = _MISSING,
                            phase2_completed: bool = False,
-                           green_run_sha: str | None = None) -> str:
+                           green_run_sha: str | None = None,
+                           auto_green_run_sha: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -1680,6 +1757,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       When provided, a ``Green run attestation: <sha>`` line is emitted near
       the ``Ready to close`` header so the report records the external
       evidence the execution-dependent ACs were marked met on.
+
+    *auto_green_run_sha* is the automatically-verified green-run commit sha
+      (when a green full-suite run was found read-only in the per-repo test
+      cache, SA-0MSIU5HFI0024D7W). When provided, an
+      ``Automatic green run evidence: <sha> (cached full-suite run)`` line is
+      emitted near the header so the report records the evidence source.
 
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
@@ -1759,6 +1842,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if green_run_sha:
             lines.append("")
             lines.append(f"Green run attestation: {green_run_sha}")
+        if auto_green_run_sha:
+            lines.append("")
+            lines.append(
+                f"Automatic green run evidence: {auto_green_run_sha} "
+                "(cached full-suite run)"
+            )
         lines.extend(["", "## Summary", ""])
     else:
         lines = [
@@ -1769,6 +1858,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if green_run_sha:
             lines.append("")
             lines.append(f"Green run attestation: {green_run_sha}")
+        if auto_green_run_sha:
+            lines.append("")
+            lines.append(
+                f"Automatic green run evidence: {auto_green_run_sha} "
+                "(cached full-suite run)"
+            )
         lines.extend(["", "## Summary", ""])
 
     # Count verdicts across all criteria (parent + children)
@@ -3498,6 +3593,15 @@ def cmd_issue(issue_id: str, persist: bool = True,
     error and the run proceeds WITHOUT the attestation (execution-dependent
     ACs stay partial) — never silently accepted.
 
+    When no operator attestation is present, the runner attempts the
+    automatic full-suite verification path (SA-0MSIU5HFI0024D7W): a green
+    full-suite run is looked up READ-ONLY in the per-repo test cache
+    (``query_cached`` — never executes) and, if found at the audited git
+    state within the cache TTL, an AUTO-VERIFIED block is injected and the
+    sha recorded as ``Automatic green run evidence``. Any miss, non-zero
+    run, or cache error yields no evidence (fail-closed); the operator path
+    takes precedence when both are available.
+
     For each active child (not completed/done), the child's persisted audit
     verdict is checked via ``wl audit-show``. If no audit exists or the audit
     is stale, an audit is auto-triggered for that child (via the same audit
@@ -3521,6 +3625,21 @@ def cmd_issue(issue_id: str, persist: bool = True,
     green_run_block, green_run_sha = _resolve_green_run_attestation(
         green_run, runner,
     )
+
+    # Automatic full-suite verification (SA-0MSIU5HFI0024D7W): when there is
+    # no operator attestation, consume a green full-suite run from the per-repo
+    # test cache READ-ONLY (query_cached never executes anything). Fail-closed:
+    # a cache miss, non-zero run, or cache error yields NO evidence and the run
+    # proceeds with execution-dependent ACs staying partial. The automatic path
+    # augments the operator path (AC7) — a valid --green-run takes precedence.
+    auto_green_run_sha = None
+    if green_run_sha is None:
+        auto_block, auto_sha = _resolve_auto_green_run(
+            runner, cwd=str(TARGET_PROJECT_ROOT),
+        )
+        if auto_sha is not None:
+            green_run_block = auto_block
+            auto_green_run_sha = auto_sha
 
     # ------------------------------------------------------------------
     # Freshness gate: skip if a recent audit already exists
@@ -4109,6 +4228,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 model_source=model_source,
                 phase2_completed=phase2_completed,
                 green_run_sha=green_run_sha,
+                auto_green_run_sha=auto_green_run_sha,
             )
             # Wrap report with failure notice if any subprocess calls failed
             if script_failure:

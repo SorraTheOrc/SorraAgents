@@ -7,11 +7,13 @@ check_or_create.py.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from skill.test.scripts.run_tests import (
+    full_suite_commands,
     node_suite_commands,
     parse_node_failures,
     parse_pytest_failures,
@@ -91,6 +93,45 @@ def test_node_suite_commands_cover_suite_dirs() -> None:
     for cmd in cmds:
         assert cmd.startswith("node --test ")
         assert "/**/*.mjs" in cmd, f"expected glob pattern in: {cmd}"
+
+
+def test_full_suite_commands_cover_pytest_and_node() -> None:
+    """The canonical full-suite command set = quiet pytest + each node suite dir.
+
+    Read-only consumers (e.g. the audit skill's automatic full-suite
+    verification) query the per-repo cache with exactly these commands so
+    cache entries written by run_tests.py are reused.
+    """
+    cmds = full_suite_commands()
+    assert cmds[0] == "pytest -q -r a --disable-warnings"
+    assert len(cmds) == 4  # 1 pytest + 3 node suite dirs
+    joined = " | ".join(cmds)
+    assert "tests/node" in joined
+    assert "tests/cli" in joined
+    assert "tests/unit" in joined
+
+
+def test_node_suite_commands_respect_custom_project_root(
+    tmp_path: Path,
+) -> None:
+    """node_suite_commands must read package.json from the given root.
+
+    A project with an npm test script uses `npm --silent test -- <dir>` per
+    suite directory; the framework repo (no npm test script) keeps the
+    `node --test "<dir>/**/*.mjs"` glob form.
+    """
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    (repo / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest"}})
+    )
+    cmds = node_suite_commands(repo)
+    assert len(cmds) == 3
+    assert all(c.startswith("npm --silent test -- ") for c in cmds)
+    assert all("/**/*.mjs" not in c for c in cmds)
+
+    framework_cmds = node_suite_commands()
+    assert all(c.startswith("node --test ") for c in framework_cmds)
 
 
 # ---------------------------------------------------------------------------

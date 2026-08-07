@@ -19,7 +19,8 @@ module adds a caching layer so repeated verification is cheap:
 - **Read-only query mode**: ``query_cached()`` + ``summary_lines()`` return
   summary lines from a cached run without executing anything (used by the
   ``run_tests.py --summary`` flag and available to read-only consumers such as
-  the audit skill, see SA-0MSGLAVCZ002LVZ4).
+  the audit skill — operator-attested path SA-0MSGLAVCZ002LVZ4 and the
+  automatic full-suite verification path SA-0MSIU5HFI0024D7W).
 
 Entry layout (stable, documented for read-only consumers)::
 

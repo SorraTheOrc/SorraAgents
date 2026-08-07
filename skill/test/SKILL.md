@@ -98,6 +98,12 @@ python3 ./scripts/run_tests.py --force
 Agents that only need summary information (e.g. release verification,
 read-only audits) should use `--summary` instead of re-running the suite.
 
+The **audit skill** consumes the cache directly (read-only, via
+`query_cached()`): when the full suite was run green at the audited git state
+within the TTL, the audit runner automatically verifies execution-dependent
+acceptance criteria (e.g. "full project test suite passes") without any
+operator attestation or re-execution (SA-0MSIU5HFI0024D7W).
+
 ### 2. Triage every failure
 
 For each failure record, invoke the triage helper to create or link a critical

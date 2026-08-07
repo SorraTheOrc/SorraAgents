@@ -4729,3 +4729,401 @@ class TestGreenRunCmdIssue:
         assert rc == 0
         assert "report" in captured
         assert "Green run attestation" not in captured["report"]
+
+# ===========================================================================
+# Automatic full-suite verification via the per-repo test cache
+# (SA-0MSIU5HFI0024D7W AC1-AC4)
+# ===========================================================================
+
+_AUTO_GREEN_ENTRY = {
+    "stdout": "5 passed in 0.03s",
+    "stderr": "",
+    "exit_code": 0,
+    "completed_at": 1000.0,
+    "command": "pytest -q -r a --disable-warnings",
+    "git_state": "fingerprint",
+    "cached": True,
+}
+"""A plausible green entry returned by ``query_cached``."""
+
+
+class TestAutoGreenRunResolution:
+    """Unit tests for the read-only automatic green-run resolution."""
+
+    def test_no_cached_run_no_evidence(self, tmp_path):
+        """AC1/AC2: a cache miss yields NO evidence (fail-closed)."""
+        with mock.patch.object(audit_runner, "query_cached", return_value=None):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+
+    def test_timed_out_run_leaves_no_evidence(self, tmp_path):
+        """AC2: a timed-out run never lands in the cache → no green verdict."""
+        with mock.patch.object(audit_runner, "query_cached", return_value=None):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+
+    def test_green_cached_run_yields_evidence(self, tmp_path):
+        """AC1: green cached full-suite entries yield a prompt block + sha."""
+        with mock.patch.object(audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert sha == _GREEN_RUN_HEAD
+        assert block is not None
+        assert "AUTO-VERIFIED GREEN RUN" in block
+        assert _GREEN_RUN_HEAD in block
+        assert "MAY be marked met" in block
+        assert "Do NOT execute the test suite" in block
+        assert "read-only mandate" in block
+
+    def test_failing_cached_run_no_evidence(self, tmp_path):
+        """AC2: a cached run with a non-zero exit never yields a green verdict."""
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "pytest" in command:
+                entry["exit_code"] = 1
+            return entry
+
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+
+    def test_partial_cache_no_evidence(self, tmp_path):
+        """AC2: only some suites cached → fail-closed (no evidence)."""
+        def _side_effect(command, **kwargs):
+            # pytest + two node dirs cached green; the tests/unit run is missing
+            return _AUTO_GREEN_ENTRY if "tests/unit" not in command else None
+
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+
+    def test_cache_error_fail_closed(self, tmp_path):
+        """AC2: a cache/infra error never crashes the audit, yields no evidence."""
+        with mock.patch.object(
+            audit_runner, "query_cached", side_effect=RuntimeError("cache corrupt")
+        ):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+
+    def test_git_unavailable_fail_closed(self, tmp_path):
+        """AC2: unresolvable HEAD → no evidence (mirrors the operator path)."""
+        with mock.patch.object(audit_runner, "query_cached") as mock_q:
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(head_sha=None), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+        mock_q.assert_not_called()
+
+    def test_query_cached_consumed_read_only(self, tmp_path):
+        """AC1: resolution consumes the cache (never executes) at the project cwd."""
+        with mock.patch.object(
+            audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
+        ) as mock_q:
+            audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert mock_q.call_count == 4  # pytest + 3 node suite commands
+        for call in mock_q.call_args_list:
+            assert call.kwargs["cwd"] == str(tmp_path.resolve())
+            assert call.kwargs["ttl"] == audit_runner.DEFAULT_TTL_SECONDS
+
+
+class TestAutoGreenRunReportLine:
+    """The persisted report records the automatic evidence (AC1)."""
+
+    def test_report_includes_auto_evidence_line(self):
+        """AC1: 'Automatic green run evidence: <sha>' appears near the header."""
+        issue = {"id": "TEST-1"}
+        acs = [{"text": "AC", "verdict": "met", "evidence": ""}]
+        report = audit_runner._assemble_issue_report(
+            issue, acs, [], model="m", model_source="local",
+            auto_green_run_sha=_GREEN_RUN_HEAD,
+        )
+        assert f"Automatic green run evidence: {_GREEN_RUN_HEAD}" in report
+        assert report.startswith("Ready to close:")
+
+    def test_report_without_auto_evidence_has_no_line(self):
+        """Backward compatibility: no auto line without evidence."""
+        issue = {"id": "TEST-1"}
+        acs = [{"text": "AC", "verdict": "met", "evidence": ""}]
+        report = audit_runner._assemble_issue_report(
+            issue, acs, [], model="m", model_source="local",
+        )
+        assert "Automatic green run evidence" not in report
+
+    def test_report_no_model_with_auto_evidence(self):
+        """The auto line also renders on the no-model header path."""
+        issue = {"id": "TEST-1"}
+        acs = [{"text": "AC", "verdict": "met", "evidence": ""}]
+        report = audit_runner._assemble_issue_report(
+            issue, acs, [], auto_green_run_sha=_GREEN_RUN_HEAD,
+        )
+        assert f"Automatic green run evidence: {_GREEN_RUN_HEAD}" in report
+
+
+class TestAutoGreenRunPromptInjection:
+    """Prompt-content assertions (AC1/AC3): the AUTO-VERIFIED block is present
+    in the Phase 1 parent prompt when the read-only cache holds a green
+    full-suite run, and absent otherwise."""
+
+    def _make_cmd_issue_runner(self, description: str = _GREEN_RUN_DESC,
+                               head_sha: str | None = _GREEN_RUN_HEAD):
+        """Build a mock runner handling all wl commands + git for cmd_issue."""
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if list(cmd[:2]) == ["git", "rev-parse"]:
+                if head_sha is None:
+                    return SimpleNamespace(returncode=128, stdout="", stderr="fatal")
+                return SimpleNamespace(returncode=0, stdout=head_sha + "\n", stderr="")
+            if "show" in cmd_str and "--children" not in cmd_str and "--json" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": "open"},
+                    }),
+                    stderr="",
+                )
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}),
+                    stderr="",
+                )
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": description,
+                            "status": "in_progress",
+                        },
+                        "children": [],
+                    }),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"success": True}),
+                stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def _mock_cq(self):
+        return mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+    def _capture_context_prompts(self, cache_result=_AUTO_GREEN_ENTRY, **cmd_kwargs):
+        """Run cmd_issue with query_cached mocked; return prompts by context."""
+        mock_runner = self._make_cmd_issue_runner()
+        prompts: dict[str, str] = {}
+
+        def _fake_call(*args, **kwargs):
+            prompts[args[1]] = args[2]
+            return {"extracted_text": "[]"}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=cache_result
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+                **cmd_kwargs,
+            )
+        return prompts
+
+    def test_green_cache_injects_auto_block(self):
+        """AC1: with a green cached full-suite run the Phase 1 parent prompt
+        carries the AUTO-VERIFIED block (no operator attestation needed)."""
+        prompts = self._capture_context_prompts()
+        assert "parent" in prompts
+        assert "AUTO-VERIFIED GREEN RUN" in prompts["parent"]
+        assert _GREEN_RUN_HEAD in prompts["parent"]
+        assert "GREEN-RUN ATTESTATION" not in prompts["parent"]
+
+    def test_cache_miss_no_auto_block_no_crash(self):
+        """AC2: a cache miss leaves the prompts unchanged and the audit completes."""
+        prompts = self._capture_context_prompts(cache_result=None)
+        assert "parent" in prompts
+        assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
+        assert "GREEN-RUN ATTESTATION" not in prompts["parent"]
+
+    def test_failing_cache_no_auto_block(self):
+        """AC2: a non-zero cached exit never injects the block."""
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "pytest" in command:
+                entry["exit_code"] = 1
+            return entry
+
+        prompts: dict[str, str] = {}
+        mock_runner = self._make_cmd_issue_runner()
+
+        def _fake_call(*args, **kwargs):
+            prompts[args[1]] = args[2]
+            return {"extracted_text": "[]"}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached", side_effect=_side_effect
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+        assert rc == 0
+        assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
+
+    def test_operator_attestation_precedes_auto_path(self):
+        """AC7: with a valid --green-run, the automatic path is not consulted."""
+        prompts = self._capture_context_prompts(green_run="HEAD")
+        assert "GREEN-RUN ATTESTATION" in prompts["parent"]
+        assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
+
+    def test_operator_attestation_skips_cache_query(self):
+        """AC7: a valid --green-run means query_cached is never called."""
+        mock_runner = self._make_cmd_issue_runner()
+
+        def _fake_call(*args, **kwargs):
+            return {"extracted_text": "[]"}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached"
+        ) as mock_q, mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+                green_run="HEAD",
+            )
+        mock_q.assert_not_called()
+
+
+class TestAutoGreenRunCmdIssue:
+    """End-to-end cmd_issue behavior (AC1, AC2)."""
+
+    def _make_cmd_issue_runner(self, description: str = _GREEN_RUN_DESC,
+                               head_sha: str | None = _GREEN_RUN_HEAD):
+        return TestAutoGreenRunPromptInjection()._make_cmd_issue_runner(
+            description=description, head_sha=head_sha,
+        )
+
+    def _mock_cq(self):
+        return mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+    def test_persisted_report_records_auto_evidence(self):
+        """AC1: with a green cached run the persisted report (read back via
+        wl audit-show) contains 'Automatic green run evidence: <sha>'."""
+        captured: dict = {}
+        mock_runner = self._make_cmd_issue_runner()
+        met_batch = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+            ]),
+        }
+
+        def _fake_persist(issue_id, report_text, worklog_dir=None):
+            captured["report"] = report_text
+            return 0
+
+        original_run_wl = audit_runner._run_wl
+
+        def _fake_run_wl(runner, cmd, worklog_dir=None):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return {
+                    "success": True,
+                    "audit": {
+                        "rawOutput": captured.get("report", ""),
+                        "auditedAt": "2026-01-01T00:00:00.000Z",
+                    },
+                }
+            return original_run_wl(runner, cmd, worklog_dir=worklog_dir)
+
+        with mock.patch.object(
+            audit_runner, "persist_audit", side_effect=_fake_persist
+        ), mock.patch.object(
+            audit_runner, "_run_wl", side_effect=_fake_run_wl
+        ), mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=met_batch
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=True, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        assert "report" in captured, "persist_audit should have been invoked"
+        persisted = captured["report"]
+        assert f"Automatic green run evidence: {_GREEN_RUN_HEAD}" in persisted
+        assert "TEST-1" in persisted  # content identity check passes
+
+    def test_cache_error_never_crashes_audit(self, capsys):
+        """AC2: an infra error in the cache query never crashes the audit."""
+        mock_runner = self._make_cmd_issue_runner()
+        met_batch = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:1"},
+            ]),
+        }
+
+        def _fake_call(*args, **kwargs):
+            return met_batch
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached",
+            side_effect=RuntimeError("cache corrupt"),
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "AUTO-VERIFIED GREEN RUN" not in out
+        assert "Automatic green run evidence" not in out

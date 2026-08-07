@@ -69,8 +69,12 @@ def pytest_command() -> str:
     return PYTEST_CMD
 
 
-def node_suite_commands() -> list[str]:
+def node_suite_commands(project_root: Path | None = None) -> list[str]:
     """Return one quiet node test command per Node suite directory.
+
+    *project_root* defaults to ``REPO_ROOT``; pass another root to build the
+    suite commands for a different project (e.g. a sibling repo targeted by
+    the audit skill's read-only full-suite verification).
 
     Prefers ``npm --silent test`` when the repo has an npm test script;
     otherwise falls back to ``node --test <glob>`` for each suite dir.
@@ -80,7 +84,8 @@ def node_suite_commands() -> list[str]:
     with ``MODULE_NOT_FOUND``; only glob patterns (e.g.
     ``node --test "tests/node/**/*.mjs"``) are scanned as test files.
     """
-    pkg_json = REPO_ROOT / "package.json"
+    root = Path(project_root or REPO_ROOT)
+    pkg_json = root / "package.json"
     has_npm_test_script = False
     if pkg_json.exists():
         try:
@@ -97,6 +102,19 @@ def node_suite_commands() -> list[str]:
         else:
             cmds.append(f'node --test "{suite_dir}/**/*.mjs"')
     return cmds
+
+
+def full_suite_commands(project_root: Path | None = None) -> list[str]:
+    """Return the canonical full-suite command set for *project_root*.
+
+    The set that constitutes "the full project test suite": the quiet
+    canonicalized pytest command plus one node command per suite directory.
+    Read-only consumers (e.g. the audit skill's automatic full-suite
+    verification, SA-0MSIU5HFI0024D7W) query the per-repo test cache with
+    exactly these commands so cache entries written by ``run_tests.py`` are
+    reused without executing anything.
+    """
+    return [pytest_command()] + node_suite_commands(project_root)
 
 
 # ---------------------------------------------------------------------------
