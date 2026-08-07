@@ -91,7 +91,15 @@ the autoplan decision logic).
 
    - `target_id` — the work item id
    - `decision` — `"skip"` (effort and risk below threshold, planning not
-     needed) or `"plan"` (effort or risk above threshold, planning required)
+     needed), `"plan"` (effort or risk above threshold, planning required),
+     or `"error"` (the work item could not be fetched — the helper makes
+     NO writes to the work item in this case)
+   - `effort` — the work item's effort t-shirt size (e.g. `"Small"`) when
+     determinable, otherwise empty
+   - `risk` — the work item's risk level (e.g. `"Low"`) when determinable,
+     otherwise empty
+   - `error` — present only when `decision` is `"error"`; a human-readable
+     explanation (no changes were made to the work item)
 
 3. Act on the decision:
 
@@ -115,6 +123,14 @@ the autoplan decision logic).
      ```bash
      wl comment add <work-item-id> --author "plan" --comment "Auto-plan completed with review: effort and risk below threshold. Review summary: [summarise what each stage checked and any changes made]" --json
      ```
+
+   - **If `decision == "error"`**: The work item could not be fetched
+     (invalid id, wrong cwd, or worklog unavailable). The helper made **no
+     writes** — the item's effort/risk fields and comments are untouched;
+     it never invokes the effort-and-risk orchestration with placeholder
+     values when it could not read the item first. Default to full planning
+     as a safety measure: proceed to the Process steps below and log a
+     warning.
 
    - **If `decision == "plan"`**: Proceed to the Process steps below. The
      work item is large or risky enough to warrant full decomposition.

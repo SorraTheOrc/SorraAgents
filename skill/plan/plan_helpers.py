@@ -31,9 +31,19 @@ import hashlib
 import json
 import logging
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+# Add repo root to sys.path for shared utility access (parity with
+# orchestrate_estimate.py). This lets the module run from any cwd — including
+# the installed skills dir (~/.pi/agent/skills is a symlink into the repo).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from skill.shared.status_lifecycle import resolve_worklog_flags
 
 logger = logging.getLogger("plan_helpers")
 
@@ -220,6 +230,7 @@ def _wl_comment_list(
 ) -> list[dict]:
     """Call ``wl comment list <id> --json`` and return the comment list."""
     cmd = ["wl", "comment", "list", work_item_id, "--json"]
+    cmd[1:1] = resolve_worklog_flags(cmd)
     proc = _execute_subprocess(cmd, runner=runner)
     if proc.returncode != 0:
         logger.warning("wl comment list failed target=%s stderr=%s", work_item_id, proc.stderr)
@@ -253,6 +264,7 @@ def _wl_comment_add(
         comment,
         "--json",
     ]
+    cmd[1:1] = resolve_worklog_flags(cmd)
     proc = _execute_subprocess(cmd, runner=runner)
     if proc.returncode != 0:
         logger.warning(
@@ -547,10 +559,17 @@ def make_autoplan_decision(
     - effort_risk: dict with "effort" (tshirt) and "risk" (level) keys,
         or None if effort/risk could not be determined
 
+    When the work item cannot be fetched (``wl show`` fails or the id is not
+    found), returns ``(True, "error", {"error": <message>})`` WITHOUT invoking
+    the effort-and-risk orchestration — the helper never writes to a work item
+    it could not read (a failed fetch must not overwrite genuine effort/risk
+    with the zeroed autoplan placeholder).
+
     When ``precomputed_item`` and ``precomputed_comments`` are provided, the
     function uses those instead of fetching the work item from the worklog.
     This allows callers to supply already-fetched data and avoid
-    redundant wl calls.
+    redundant wl calls. An empty ``precomputed_item`` (``{}``) is treated as a
+    failed fetch and returns the error result above.
 
     When ``runner`` is provided, uses it for all subprocess calls (enables
     test injection via FakeRunner). When ``runner`` is None, uses
@@ -567,6 +586,24 @@ def make_autoplan_decision(
     else:
         item = _wl_show(target_id, runner=runner)
         comments = _wl_comment_list(target_id, runner=runner)
+
+    # Fail fast when the work item could not be fetched: an empty item means
+    # ``wl show`` failed or the id was not found. Proceeding here would invoke
+    # run_effort_and_risk() with a zeroed placeholder payload that OVERWRITES
+    # the real item's effort/risk fields and posts a bogus comment (the item
+    # is found by prefix-resolved worklog in the orchestration, which succeeds
+    # even when this lookup failed). Never write to an item we could not read.
+    if not item:
+        logger.error(
+            "plan_helpers.fetch_failed target=%s — refusing to run effort-and-risk",
+            target_id,
+        )
+        return True, "error", {
+            "error": (
+                f"could not fetch work item {target_id}: "
+                "wl show failed or item not found; no changes were made"
+            ),
+        }
 
     # Idempotence check: skip re-computation if already computed
     if is_effort_risk_computed(item, comments):
@@ -625,9 +662,11 @@ def _wl_show(
 ) -> dict:
     """Call ``wl show <id> --json`` and return the workItem dict.
 
-    Returns an empty dict on failure.
+    Returns an empty dict on failure (callers must treat an empty result as
+    "could not read the item" and fail fast rather than write to it).
     """
     cmd = ["wl", "show", work_item_id, "--json"]
+    cmd[1:1] = resolve_worklog_flags(cmd)
     proc = _execute_subprocess(cmd, runner=runner)
     if proc.returncode != 0:
         logger.warning("wl show failed target=%s stderr=%s", work_item_id, proc.stderr)
@@ -648,21 +687,41 @@ def _wl_show(
 # ---------------------------------------------------------------------------
 
 
-def plan_if_needed(target_id: str) -> dict[str, Any]:
+def plan_if_needed(
+    target_id: str,
+    runner: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
     """CLI entry point for ``plan-if-needed``.
 
     Returns a JSON-serializable dict with keys:
       - target_id
-      - decision ("skip" | "plan")
-      - effort
-      - risk
+      - decision ("skip" | "plan" | "error")
+      - effort (t-shirt size, e.g. "Small"; empty when not determinable)
+      - risk (risk level, e.g. "Low"; empty when not determinable)
+      - error (present only when the work item could not be fetched)
+
+    ``effort``/``risk`` report the work item's actual values (never the stage
+    or the boolean decision). When the fetch fails, ``decision`` is
+    "error" and no write was made to the work item.
     """
-    do_plan, stage, _effort_risk = make_autoplan_decision(target_id, config={})
+    do_plan, stage, effort_risk = make_autoplan_decision(
+        target_id, config={}, runner=runner
+    )
+    if stage == "error" or (effort_risk and "error" in effort_risk):
+        return {
+            "target_id": target_id,
+            "decision": "error",
+            "effort": "",
+            "risk": "",
+            "error": (effort_risk or {}).get(
+                "error", f"could not fetch work item {target_id}"
+            ),
+        }
     return {
         "target_id": target_id,
         "decision": "plan" if do_plan else "skip",
-        "effort": stage,  # For backward compat: the stage indicates what happens
-        "risk": do_plan,
+        "effort": (effort_risk or {}).get("effort", ""),
+        "risk": (effort_risk or {}).get("risk", ""),
     }
 
 

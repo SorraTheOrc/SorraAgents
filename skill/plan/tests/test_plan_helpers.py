@@ -15,11 +15,14 @@ Related work item: SA-0MSHID94D009P0TL
 
 
 import json
+from unittest.mock import patch
 
 import pytest
 
 from skill.plan.plan_helpers import (
+    make_autoplan_decision,
     plan_approval_gate,
+    plan_if_needed,
     should_request_plan_approval,
 )
 
@@ -117,8 +120,10 @@ class _FakeWlShow:
         self._work_item = work_item
 
     def __call__(self, cmd):
-        assert cmd[:2] == ["wl", "show"]
+        assert cmd[0] == "wl"
+        assert "show" in cmd
         assert "--json" in cmd
+        # The command may carry resolved --worklog-dir flags after "wl"
         payload = json.dumps({"success": True, "workItem": self._work_item})
         return _FakeResult(payload)
 
@@ -157,11 +162,136 @@ class TestPlanApprovalGate:
 
     def test_failed_fetch_defaults_to_approval(self):
         """A failed ``wl show`` defaults conservatively to requesting approval."""
-
-        class _FailingRunner:
-            def __call__(self, cmd):
-                return _FakeResult("{}", returncode=1, stderr="boom")
-
         result = plan_approval_gate("X", runner=_FailingRunner())
         assert result["request_approval"] is True
         assert result["reason"]  # conservative default is explained
+
+
+# =========================================================================
+# 3. Fetch-failure safety (regression for SA-0MSIUJQAK008AQV8)
+#
+# The autoplan decision must NEVER invoke the effort-and-risk orchestration
+# (which WRITES effort/risk fields and posts a comment) when the work item
+# could not be read. Previously a failing ``wl show`` returned ``{}`` and
+# make_autoplan_decision proceeded with a zeroed placeholder payload,
+# overwriting genuine estimates.
+# =========================================================================
+
+
+class _FailingRunner:
+    """Runner that answers every wl command with a failure."""
+
+    def __call__(self, cmd):
+        return _FakeResult("{}", returncode=1, stderr="wl show failed")
+
+
+class TestMakeAutoplanDecisionFetchFailure:
+    """A failed work-item fetch must yield an explicit error and no writes."""
+
+    def test_fetch_failure_returns_explicit_error_and_skips_effort_and_risk(self):
+        """A failing ``wl show`` yields an explicit error result; the effort-and-risk
+        orchestration and comment posting are never invoked."""
+        runner = _FailingRunner()
+        with (
+            patch("skill.plan.plan_helpers.run_effort_and_risk") as mock_er,
+            patch("skill.plan.plan_helpers.append_autoplan_decision_comment") as mock_append,
+        ):
+            do_plan, stage, effort_risk = make_autoplan_decision(
+                "SA-TEST", config={}, runner=runner
+            )
+            mock_er.assert_not_called()
+            mock_append.assert_not_called()
+        assert stage == "error"
+        assert do_plan is True  # safety-first: default to planning
+        assert effort_risk is not None
+        assert "error" in effort_risk
+        assert "SA-TEST" in effort_risk["error"]
+
+    def test_plan_if_needed_fetch_failure_returns_error_decision(self):
+        """plan-if-needed with a failing ``wl show`` returns decision=error and
+        never invokes the effort-and-risk orchestration (no writes, no comments)."""
+        runner = _FailingRunner()
+        with (
+            patch("skill.plan.plan_helpers.run_effort_and_risk") as mock_er,
+            patch("skill.plan.plan_helpers.append_autoplan_decision_comment") as mock_append,
+        ):
+            result = plan_if_needed("SA-TEST", runner=runner)
+            mock_er.assert_not_called()
+            mock_append.assert_not_called()
+        assert result["target_id"] == "SA-TEST"
+        assert result["decision"] == "error"
+        assert "error" in result
+
+    def test_genuine_estimate_never_overwritten_by_placeholder(self):
+        """A work item with a genuine estimate (Small/Medium) is left untouched:
+        the zeroed autoplan placeholder orchestration is never run."""
+        runner = _FakeWlShow({"id": "SA-TEST", "effort": "Small", "risk": "Medium"})
+        with (
+            patch("skill.plan.plan_helpers.run_effort_and_risk") as mock_er,
+            patch("skill.plan.plan_helpers._wl_comment_list", return_value=[]),
+        ):
+            _do_plan, _stage, effort_risk = make_autoplan_decision(
+                "SA-TEST", config={}, runner=runner
+            )
+            mock_er.assert_not_called()
+        assert effort_risk == {"effort": "Small", "risk": "Medium"}
+
+
+class TestWlSubprocessWorklogFlags:
+    """wl subprocess calls must carry resolved --worklog-dir flags so they
+    succeed from any cwd (parity with orchestrate_estimate.py)."""
+
+    def test_wl_show_includes_resolved_worklog_flags(self):
+        """The wl show command includes the flags returned by resolve_worklog_flags."""
+        captured = []
+
+        class _RecordingRunner:
+            def __call__(self, cmd):
+                captured.append(list(cmd))
+                return _FakeResult(
+                    json.dumps({"success": True, "workItem": {"id": "SA-TEST"}})
+                )
+
+        with patch(
+            "skill.plan.plan_helpers.resolve_worklog_flags",
+            return_value=["--worklog-dir", "/some/wl"],
+        ) as mock_flags:
+            result = plan_approval_gate("SA-TEST", runner=_RecordingRunner())
+        assert result["target_id"] == "SA-TEST"
+        assert len(captured) == 1
+        show_cmd = captured[0]
+        assert show_cmd[0] == "wl"
+        assert show_cmd[1:3] == ["--worklog-dir", "/some/wl"]
+        assert "show" in show_cmd
+        assert "--json" in show_cmd
+        mock_flags.assert_called_once()
+
+    def test_plan_if_needed_cli_output_uses_real_effort_and_risk(self):
+        """plan-if-needed reports the work item's effort t-shirt and risk level
+        (not the stage mislabeled as effort, and not the boolean decision)."""
+        with patch(
+            "skill.plan.plan_helpers.make_autoplan_decision",
+            return_value=(
+                False,
+                "intake_complete",
+                {"effort": "Small", "risk": "Low"},
+            ),
+        ):
+            result = plan_if_needed("SA-TEST")
+        assert result["decision"] == "skip"
+        assert result["effort"] == "Small"
+        assert result["risk"] == "Low"
+
+    def test_plan_if_needed_error_result_maps_to_error_decision(self):
+        """An error tuple from make_autoplan_decision surfaces as decision=error."""
+        with patch(
+            "skill.plan.plan_helpers.make_autoplan_decision",
+            return_value=(
+                True,
+                "error",
+                {"error": "could not fetch work item SA-TEST"},
+            ),
+        ):
+            result = plan_if_needed("SA-TEST")
+        assert result["decision"] == "error"
+        assert "could not fetch" in result["error"]
