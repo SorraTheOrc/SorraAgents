@@ -22,8 +22,6 @@ Follow the steps below when completing tasks. If you already have a current work
 3. **Plan the work** — Break into sub-tasks. Verify descriptions and ACs are clear, measurable, and testable. Create child work-items: `wl create -t "<title>" -d "<description>" --parent <id> --issue-type <type> --priority <level> --json`. Advance stage: `wl update <id> --stage plan_complete`. See [plan skill](/home/rgardler/.pi/agent/skills/plan/SKILL.md).
 4. **Decide what to work on next** — Use `wl next --json`. If the recommended item has children, claim it and recurse until reaching a leaf item. If no descendants remain, go to End session.
 
-> **NEVER write or edit code without an explicit instruction to use the implement skill** (`/skill:implement <id>`). Non-implement invocations (e.g. `/intake`, `/plan`, `/audit`) must complete their own workflow and STOP — they must not proceed to implementation. When implementation IS authorized, always follow the implement skill's instructions exactly: worktree lifecycle, build → test → commit order (never reverse), and the StatusLifecycle status transitions.
-
 5. **Implement the work-item** — Use the implement orchestration script to manage the deterministic lifecycle:
 
    > **MANDATORY — worktree requirement:** All implementation work MUST be done in the git worktree created by `implement.py start`. `cd` into the worktree (`.worklog/worktrees/wl-<WIP-id>-<slug>`) and make ALL changes there — never edit, commit, or push directly from the main checkout. `implement.py finish` refuses to complete if it detects changes outside the worktree.
@@ -66,26 +64,20 @@ Follow the steps below when completing tasks. If you already have a current work
 
 ## work-item Tracking with Worklog (wl)
 
-IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use markdown TODOs, task lists, or other tracking methods.
-
 ## CRITICAL RULES
 
 - Use wl for ALL task tracking — never markdown TODOs, task lists, or other methods.
 - Never write directly to `.worklog/worklog-data.jsonl`. Use `wl` commands to interact with worklog data to ensure data integrity and consistency.
-- A child work-item may be closed independently; a parent work-item can only be closed once all children are closed, all blockers resolved, and a Producer has reviewed and approved.
+- A child work-item may be closed independently; a parent work-item can only be closed once all children are closed, all blockers resolved, all ACs are met, and a Producer has reviewed and approved.
 - Keep work-items up to date — update descriptions, ACs, stages, and comments throughout the lifecycle.
 - Every work-item must have a clear goal (preferably a user story) with measurable, testable ACs. Seek clarification if unclear.
 - When writing content for work-items, do not escape special characters EXCEPT backticks. Use markdown formatting as needed. Do not add unnecessary escaping.
 - Never commit changes without associating them with a work item.
 - Never commit without ensuring the build completes without errors and all tests pass.
 - Always follow build → test → commit order. Never reverse or skip steps.
-- ALL implementation work MUST be done in a git worktree created by the implement workflow (`implement.py start` → `cd .worklog/worktrees/wl-<WIP-id>-<slug>`). Never commit implementation changes directly from the main checkout — `implement.py finish` enforces this by refusing when changes exist outside the worktree.
-- Before reporting work as done, run the full test suite (pytest + Node + bats, quiet mode) and confirm the build succeeds and no tests fail. Use the [test skill](/home/rgardler/.pi/agent/skills/test/SKILL.md) (`/skill:test`) which runs the suite, triages every failure into critical `test-failure` work items, evaluates usefulness, and loops until green.
-- Always record the commit message and hash in a comment on the relevant work item(s).
-- When making comments, include the changes made, files affected, and the commit hash.
+- Always record the commit message and hash in a comment on the relevant work item(s), including the changes made and files affected.
 - If push fails, resolve and retry until it succeeds.
 - When using backticks in shell command arguments, ALWAYS escape them properly.
-- Never close a work item without ensuring all ACs are met, all children closed, all blockers resolved, and a Producer has reviewed/approved.
 - When displaying a work-item ID in any output, always include the item title alongside the ID using the format `Title Text (ID)` (e.g., `Per-project isolation for .env and scheduler_store.json with global installs (SA-0MLU57S7D1KX8CU7)`). This ensures every reference is self-describing.
 - **Session logging:** Whenever you start a new Pi session or create a new work item, add a comment to the relevant worklog item to enable session traceability. Use the format:
 
@@ -114,7 +106,6 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
   - If it must be completed before the current item, add as child (`wl create --parent <current-id>`)
   - If related but not blocking, add `discovered-from:<current-id>` in the description
 - Check `wl next` before asking "what should I work on?" and offer the result as a suggestion with explanation.
-- Run `wl --help` and `wl <cmd> --help` to discover available wl flags and capabilities.
 - Use work items for all significant work: bugs, features, tasks, epics, chores.
 - Use clear, concise titles and detailed descriptions.
 - Use parent/child relationships for dependencies and subtasks.
@@ -166,7 +157,6 @@ Track with `--issue-type`:
 
 Use parent/child relationships to track blocking dependencies.
 
-- Child items must be completed before the parent can be closed.
 - If an item blocks another, make it a child of the blocked item.
 - If an item blocks multiple items, create the parent/child relationships with the highest priority item as the parent unless one is in_progress (that item becomes the parent). If in doubt, raise for product manager review.
 
@@ -174,7 +164,7 @@ Other dependency types can be tracked in descriptions: `discovered-from:<id>`, `
 
 ## Workflow management
 
-- Use `--stage` to track workflow stages (e.g., idea, intake_complete, plan_complete, in_progress, done).
+- Use `--stage` to track workflow stages (e.g., idea, intake_complete, plan_complete, in_progress, in_review).
 - Use `--assignee` to assign items to agents.
 - Use `--tags` for filtering and organization (avoid over-tagging).
 - Use comments to document progress, decisions, and context.
@@ -182,7 +172,7 @@ Other dependency types can be tracked in descriptions: `discovered-from:<id>`, `
 
 ## Test-failure triage policy
 
-Before marking any work item `in_review`, run the full project test suite and triage every failure. The [test skill](/home/rgardler/.pi/agent/skills/test/SKILL.md) (`/skill:test`) orchestrates this discipline: run the suite in quiet mode → triage each failure into a critical `test-failure` work item → evaluate whether each failing test is genuinely useful via code-path analysis → fix or remove (respecting change authorization) → loop until green.
+Before marking any work item `in_review`, run the full project test suite (pytest + Node + bats, quiet mode) and triage every failure. The [test skill](/home/rgardler/.pi/agent/skills/test/SKILL.md) (`/skill:test`) orchestrates this discipline: run the suite in quiet mode → triage each failure into a critical `test-failure` work item → evaluate whether each failing test is genuinely useful via code-path analysis → fix or remove (respecting change authorization) → loop until green.
 
 When an agent discovers a failing test outside its ownership/scope, call the triage helper script:
 
