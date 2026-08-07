@@ -119,6 +119,105 @@ export function parsePRUrl(output) {
   return match ? match[0] : null;
 }
 
+// ── verifyReleaseMerge ───────────────────────────────────────────────────────
+
+/**
+ * Verify that a release actually landed on main before work items are closed.
+ *
+ * Defense-in-depth guard for the close-work-items step (SA-0MSJ2XMQL006CVQS):
+ * a dev→main merge must be verified before any "Shipped in v<version>" close
+ * may run. Without this, invoking the close step outside a real release (or
+ * after a failed merge) spuriously closes real work items.
+ *
+ * Both conditions must hold:
+ *   1. The version tag `v<version>` exists on origin (the release script
+ *      creates and pushes it on the merge commit).
+ *   2. The tag commit is an ancestor of `origin/main` — i.e. the release
+ *      merge actually landed on main.
+ *
+ * @param {string|null} version - The released semver version (e.g., "0.2.0").
+ * @param {object} [options] - Optional injection point (used by unit tests).
+ * @param {(cmd: string) => string} [options.run] - Command runner; defaults
+ *   to `execSync` returning trimmed stdout. Tests inject a fake runner to
+ *   simulate git state without touching a real repository.
+ * @returns {{ success: boolean, message: string }}
+ */
+export function verifyReleaseMerge(version, options = {}) {
+  const run = options.run || ((cmd) => execSync(cmd, {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    maxBuffer: 10 * 1024 * 1024,
+  }).toString().trim());
+
+  if (!version) {
+    return {
+      success: false,
+      message: 'No version provided; cannot verify the release merge.',
+    };
+  }
+
+  // Refresh remote refs so `origin/main` and the version tag reflect the
+  // just-completed release. A fetch failure means we cannot prove the merge
+  // landed — fail closed and refuse to close work items.
+  try {
+    run('git fetch origin --prune');
+  } catch {
+    return {
+      success: false,
+      message: 'Failed to fetch origin; cannot verify the release merge.',
+    };
+  }
+
+  // 1. The released version tag must exist on origin.
+  let lsRemote = '';
+  try {
+    lsRemote = run(`git ls-remote origin refs/tags/v${version}`);
+  } catch {
+    return {
+      success: false,
+      message: `Failed to query origin for tag v${version}; cannot verify the release merge.`,
+    };
+  }
+  if (!lsRemote.includes(`refs/tags/v${version}`)) {
+    return {
+      success: false,
+      message: `Release tag v${version} was not found on origin; refusing to close work items.`,
+    };
+  }
+
+  // 2. The tag commit must be an ancestor of origin/main — the dev→main
+  //    merge actually landed on main.
+  let tagCommit = '';
+  try {
+    tagCommit = run(`git rev-parse --verify v${version}^{commit}`);
+  } catch {
+    return {
+      success: false,
+      message: `Could not resolve tag v${version} to a commit; refusing to close work items.`,
+    };
+  }
+  if (!tagCommit) {
+    return {
+      success: false,
+      message: `Could not resolve tag v${version} to a commit; refusing to close work items.`,
+    };
+  }
+
+  try {
+    run(`git merge-base --is-ancestor ${tagCommit} origin/main`);
+  } catch {
+    return {
+      success: false,
+      message: `Release v${version} is not an ancestor of origin/main — the dev→main merge did not land; refusing to close work items.`,
+    };
+  }
+
+  return {
+    success: true,
+    message: `Release merge verified: v${version} is on origin/main.`,
+  };
+}
+
 // ── closeWorkItemsAfterRelease ──────────────────────────────────────────────
 
 /**
@@ -138,10 +237,30 @@ export function parsePRUrl(output) {
  * warnings and do not affect the return value. Empty candidate sets
  * are handled gracefully.
  *
+ * Test-isolation note (SA-0MSJ2XMQL006CVQS): callers MUST NOT invoke this
+ * function with the default worklog boundary unless a real, verified release
+ * is in progress — the release flow gates the call behind `verifyReleaseMerge()`
+ * (Step 8). Unit tests inject `getCandidateItemsFn`/`runCloseCommand` so the
+ * test suite never mutates the live worklog.
+ *
  * @param {string|null} version - The released semver version (e.g., "0.2.0").
+ * @param {object} [options] - Optional injection point (used by unit tests).
+ * @param {() => Array<{id: string, title: string, needsProducerReview: boolean|null}>} [options.getCandidateItemsFn] -
+ *   Candidate-item query; defaults to `getCandidateItems()` from
+ *   check-audit-gate.js (real `wl list`).
+ * @param {(itemId: string, reason: string) => void} [options.runCloseCommand] -
+ *   Close-command runner; defaults to `wl close <id> --force --reason <r>`.
  * @returns {{ success: boolean, message: string, closedCount: number, errorCount: number, skippedCount: number, skippedItems: Array<{id: string, title: string, reason: string}> }}
  */
-export function closeWorkItemsAfterRelease(version) {
+export function closeWorkItemsAfterRelease(version, options = {}) {
+  const {
+    getCandidateItemsFn = getCandidateItems,
+    runCloseCommand = (itemId, reason) => execSync(
+      `wl close ${itemId} --force --reason "${reason}" --json`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    ),
+  } = options;
+
   if (!version) {
     return {
       success: false,
@@ -155,7 +274,7 @@ export function closeWorkItemsAfterRelease(version) {
 
   console.log('\nClosing work items shipped in this release...');
 
-  const items = getCandidateItems();
+  const items = getCandidateItemsFn();
 
   if (items.length === 0) {
     const message = 'No work items to close — no in_review or completed items found.';
@@ -222,10 +341,7 @@ export function closeWorkItemsAfterRelease(version) {
       // non-terminal state (e.g. left at in_progress by a crashed audit) fails
       // to close recursively, leaving items dangling after the release
       // (SA-0MSAL2NQV0008HY5).
-      execSync(`wl close ${item.id} --force --reason "${reason}" --json`, {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
+      runCloseCommand(item.id, reason);
       console.log(`  ✓ ${item.title || item.id} — closed with reason: "${reason}"`);
       closedCount++;
     } catch (err) {
@@ -420,7 +536,8 @@ export function waitForPRMerge(prUrl, timeoutSeconds = 600) {
  * 5. Parse PR URL from release script output
  * 6. Wait for PR merge (if not already merged with --force)
  * 7. Sync dev with main
- * 8. Close work items shipped in this release (non-blocking)
+ * 8. Verify the release merge landed on main (gating, exit code 11)
+ * 9. Close work items shipped in this release (non-blocking)
  *
  * @param {string[]} [cliArgs=[]] - Command-line arguments.
  * @returns {number} Exit code (0 = success).
@@ -601,7 +718,13 @@ async function runReleaseImpl(cliArgs = []) {
     return 5;
   }
 
-  // ── Step 8: Close work items shipped in this release (non-blocking) ────
+  // ── Step 8: Verify the release merge landed on main (gating) ───────────
+  // Merge-verification guard (SA-0MSJ2XMQL006CVQS): only close work items
+  // after verifying the release actually landed on main — the version tag
+  // exists on origin AND the tag commit is an ancestor of origin/main.
+  // This prevents spurious "Shipped in v<version>" closes when the close
+  // step runs without a real dev→main merge.
+  //
   // Read the released version from the git tag created by the release script
   let version = null;
   try {
@@ -625,6 +748,14 @@ async function runReleaseImpl(cliArgs = []) {
   }
 
   if (version) {
+    const mergeVerification = verifyReleaseMerge(version);
+    if (!mergeVerification.success) {
+      console.error(`\n⚠️  ${mergeVerification.message}`);
+      console.error('Refusing to close work items (exit code 11).');
+      return 11;
+    }
+
+    // ── Step 9: Close work items shipped in this release (non-blocking) ──
     const closeResult = closeWorkItemsAfterRelease(version);
     if (!closeResult.success && closeResult.errorCount > 0) {
       console.warn(`\n⚠ Non-critical: ${closeResult.message}`);

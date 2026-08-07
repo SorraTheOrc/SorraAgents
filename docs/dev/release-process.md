@@ -212,27 +212,71 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
 
 1. Verify `main` is healthy — run the local test suite against the merge
    commit before deploying.
-2. **Work items are automatically closed** — After a successful release via
-   `run-release.js`, all work items that passed the audit readiness gate
-   (items in `in_review` stage or `completed` status, excluding `stage: done`)
-   are closed with the reason `"Shipped in v<version>"`. Only items with
-   `needsProducerReview = false` are closed — items with `needsProducerReview`
-   set to `true`, `null`, or `undefined` are skipped and logged as
-   "Skipped (needs producer review)". This is a non-blocking step — individual
-   close failures are logged as warnings but do not affect the release outcome.
-3. Version numbering, tagging, and tag pushing are **now automated** as part
+2. **Verify the release merge landed (gating)** — before any work item is
+   closed, the release pipeline verifies the dev→main merge actually happened:
+   the released version tag `v<version>` must exist on `origin` and the tag
+   commit must be an ancestor of `origin/main`. If verification fails, the
+   release aborts with exit code 11 and **no work items are closed**.
+3. **Work items are automatically closed** — After a successful, *verified*
+   release via `run-release.js`, all work items that passed the audit
+   readiness gate (items in `in_review` stage or `completed` status, excluding
+   `stage: done`) are closed with the reason `"Shipped in v<version>"`. Only
+   items with `needsProducerReview = false` are closed — items with
+   `needsProducerReview` set to `true`, `null`, or `undefined` are skipped and
+   logged as "Skipped (needs producer review)". This is a non-blocking step —
+   individual close failures are logged as warnings but do not affect the
+   release outcome.
+4. Version numbering, tagging, and tag pushing are **now automated** as part
    of the merge script (`merge-dev-to-main.sh`). Before merging, the script:
    - Increments the version in `package.json` (default: patch bump).
    - Commits the version change.
    - Creates an annotated git tag `v<new-version>` on the merge commit.
    - Pushes the tag to `origin`.
-4. Customize the bump type with the `--bump` flag:
+   - With `--force`, verifies after merging that the release branch is an
+     ancestor of `origin/main` (defense in depth, exit 1 otherwise).
+5. Customize the bump type with the `--bump` flag:
 
    ```bash
    bash scripts/release/merge-dev-to-main.sh --bump minor
    ```
 
-5. Update any downstream consumers or deployment targets.
+6. Update any downstream consumers or deployment targets.
+
+### Test-isolation failure (2026-08-07): root cause and remediation
+
+**Root cause.** `tests/unit/test-close-work-items-after-release.mjs` invoked the
+real `closeWorkItemsAfterRelease()` export against the live worklog with
+hardcoded versions (`'1.0.0'` and `'1.2.3'`). Every Node test-suite run therefore
+closed all real candidate work items with the spurious reason "Shipped in
+v1.0.0" / "Shipped in v1.2.3" — even though no dev→main merge occurred. 360
+items were affected between 2026-07-17 and 2026-08-07 (300 with v1.0.0, 36 with
+v1.2.3, 24 with both). Legitimate releases use real versions (e.g. "Shipped in
+v0.1.11"); v1.0.0/v1.2.3 never existed as release tags.
+
+**Fixes (SA-0MSJ2XMQL006CVQS).**
+
+1. **Test isolation** — the close function now accepts injectable
+   `getCandidateItemsFn`/`runCloseCommand` boundaries; the unit tests inject
+   fakes, so running the test suite has zero effect on the worklog.
+2. **Merge-verification guard** — `run-release.js` Step 8 calls
+   `verifyReleaseMerge(version)` (tag exists on origin + tag commit is an
+   ancestor of `origin/main`) before closing anything; failure aborts with exit
+   code 11 and closes nothing.
+3. **Defense in depth** — `merge-dev-to-main.sh` verifies post-merge (force
+   path) that the release branch is an ancestor of `origin/main`.
+4. **Remediation sweep** — an idempotent helper,
+   `skill/ship/scripts/remediate-spurious-closes.js`, deletes the spurious
+   close comments and restores each affected item to `status=completed,
+   stage=in_review` (the valid status/stage pair for a release-ready item;
+   the worklog rejects `open`/`in_review`). It matches strictly (author
+   `worklog`, content exactly `Closed with reason: Shipped in v1.0.0` /
+   `v1.2.3`) so legitimate close comments are never touched.
+
+**Re-run the sweep** (from the main checkout, safe to re-run):
+
+```bash
+node skill/ship/scripts/remediate-spurious-closes.js
+```
 
 > **Note:** If you need to see the current version, run:
 >

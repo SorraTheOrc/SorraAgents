@@ -43,6 +43,7 @@ All scripts below are internal implementation details — they are not exposed a
 | `./scripts/check-audit-gate.js` | Audit readiness and producer-review gating |
 | `./scripts/check-critical-items.js` | Critical-items gating |
 | `./scripts/check-worklog-refs.js` | Worklog refs gating |
+| `./scripts/remediate-spurious-closes.js` | Idempotent remediation sweep for test-suite-spuriously-closed work items (SA-0MSJ2XMQL006CVQS) |
 
 ## Usage
 
@@ -120,6 +121,7 @@ removed manually by deleting `.worklog/code-freeze.json`.
 | 8 | Worklog-ref gate failure (worklog refs present) |
 | 9 | Producer-review gate failure (items need producer review) |
 | 10 | Release script timed out (killed after `SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
+| 11 | Release merge verification failed (close-work-items step refused — no verified dev→main merge) |
 
 ## Release Process
 
@@ -138,9 +140,41 @@ Steps:
 7. **Audit logging** — records merge hash, PR URL in worklog.
 8. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push.
    > Release ops run from **main checkout**, not worktrees.
-9. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Logs warnings on individual close failures.
+9. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): the close step only runs after the release actually landed on main. Both conditions must hold:
+   - the released version tag `v<version>` exists on origin (`git ls-remote`), and
+   - the tag commit is an ancestor of `origin/main` (`git merge-base --is-ancestor`).
+   If verification fails, the release aborts with **exit code 11** and **no work items are closed** — a spurious "Shipped" record cannot be created without a real dev→main merge.
+10. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Logs warnings on individual close failures.
 
-### Fallback: Human Release Manager
+#### Test isolation (mandatory)
+
+The close-work-items unit tests must **never mutate the live worklog**. Root cause
+of SA-0MSJ2XMQL006CVQS: `tests/unit/test-close-work-items-after-release.mjs`
+called the real `closeWorkItemsAfterRelease('1.0.0'/'1.2.3')` export against the
+live worklog, spuriously closing ~360 real work items with "Shipped in v1.0.0"/
+"v1.2.3" reasons on every suite run. `closeWorkItemsAfterRelease` therefore
+accepts injectable `getCandidateItemsFn`/`runCloseCommand` boundaries; tests must
+inject fakes (or mock `wl` on PATH) and must never invoke the close function
+with the default worklog boundary outside a real, verified release flow.
+
+### Remediation sweep: test-spuriously-closed work items
+
+If the test-isolation bug ever recurs (work items closed with reason
+"Shipped in v1.0.0" or "Shipped in v1.2.3" that never shipped), run the
+idempotent sweep helper from the main checkout:
+
+```bash
+node ./scripts/remediate-spurious-closes.js
+```
+
+The sweep scans every work item, deletes close comments authored by `worklog`
+with content exactly `Closed with reason: Shipped in v1.0.0` / `v1.2.3`, and
+restores each affected item to `status=completed, stage=in_review` (the valid
+status/stage pair for a release-ready item — the worklog rejects
+`open`/`in_review`). Legitimate close comments (real versions such as v0.1.11)
+are never touched. Re-running after a successful sweep is a no-op.
+
+## Fallback: Human Release Manager
 
 For repos where the automated merge is unsuitable, follow [`docs/dev/release-process.md`](../docs/dev/release-process.md).
 

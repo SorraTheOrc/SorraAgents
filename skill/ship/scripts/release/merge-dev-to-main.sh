@@ -270,6 +270,21 @@ if [[ "$FORCE" == "true" ]]; then
     exit 1
   }
   echo "PR merged: $PR_URL"
+  # ── Post-merge verification (defense in depth, SA-0MSJ2XMQL006CVQS) ──
+  # Confirm the merge actually landed on origin/main before signalling
+  # success. Without this, a silently-skipped/failed merge could still let
+  # the run-release.js close step run and spuriously close work items with
+  # a "Shipped in v<version>" reason even though the release never landed.
+  git fetch origin main:refs/remotes/origin/main || {
+    echo "Failed to fetch origin/main after PR merge" >&2
+    exit 1
+  }
+  if git merge-base --is-ancestor "$BRANCH" origin/main 2>/dev/null; then
+    echo "Merge verified: release branch $BRANCH is an ancestor of origin/main"
+  else
+    echo "ERROR: release branch $BRANCH is NOT on origin/main after merge — the release did not land." >&2
+    exit 1
+  fi
 else
   echo "Release prepared. The PR $PR_URL should be merged once status checks pass (if any are configured) and reviewers approve."
 fi
