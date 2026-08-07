@@ -5127,3 +5127,192 @@ class TestAutoGreenRunCmdIssue:
         out = capsys.readouterr().out
         assert "AUTO-VERIFIED GREEN RUN" not in out
         assert "Automatic green run evidence" not in out
+
+
+# ===========================================================================
+# _extract_acs unit tests (SA-0MSJ0CFKJ005STB7)
+# ===========================================================================
+
+
+class TestExtractAcs:
+    """Direct unit tests for _extract_acs().
+
+    Locks the wrapped-bullet extraction behaviour required by
+    SA-0MSIDPN1N001BEQO: all wrapped-bullet ACs are extracted with their
+    indented continuation lines folded into the bullet and checkbox markers
+    stripped, with no regression to single-line / numbered / heading /
+    blank-line behaviour.
+    """
+
+    # OSL-0MSCCFH10001E59N-shaped fixture: 6 ``- [ ]`` bullets with indented
+    # continuation lines and no blank lines between bullets.
+    _OSL_SHAPED_AC_BLOCK = (
+        "## Acceptance Criteria\n\n"
+        "- [ ] Opening the podcast editor via the replacement workflow (ContextHub\n"
+        "      `worklog-selection-list` plugin pane, e.g. `herdr plugin pane open\n"
+        "      --plugin worklog-selection-list --entrypoint worklist --placement tab\n"
+        "      --focus`) creates a new tab whose label is exactly `Podcast Editing`\n"
+        "      (verified via `herdr tab list`).\n"
+        "- [ ] The open-and-rename behaviour is implemented in a repo-tracked shell script\n"
+        "      under `packages/ContextHub/packages/herdr/scripts/` (following the\n"
+        "      `open.sh` pattern) that parses the `tab_id` from `herdr plugin pane open`\n"
+        "      JSON output and calls `herdr tab rename <tab-id> \"Podcast Editing\"`.\n"
+        "- [ ] The script fails gracefully (clear error, non-zero exit) when the herdr CLI\n"
+        "      is unavailable or the `tab_id` cannot be parsed — a missing rename is never\n"
+        "      silently skipped.\n"
+        "- [ ] A shell unit test (mock herdr CLI, mirroring the ContextHub\n"
+        "      `scripts/tests/test_run_in_pane.sh` pattern) covers the parse-and-rename\n"
+        "      wiring and passes.\n"
+        "- [ ] The herdr config binding that opens the podcast editor (currently\n"
+        "      `prefix+l` → `worklog-selection-list.open-worklist`) is updated to invoke\n"
+        "      the new script (or a plugin action wrapping it), and the plugin README\n"
+        "      documents the keybinding and resulting tab name.\n"
+        "- [ ] All related documentation is updated to reflect the changes (README), and\n"
+        "      the full project test suite passes with the new changes.\n"
+    )
+
+    def test_osl_shaped_wrapped_bullets_all_extracted(self):
+        """All 6 OSL-shaped wrapped-bullet ACs are extracted in full."""
+        acs = audit_runner._extract_acs(self._OSL_SHAPED_AC_BLOCK)
+        assert len(acs) == 6
+        assert acs[0] == (
+            "Opening the podcast editor via the replacement workflow (ContextHub "
+            "`worklog-selection-list` plugin pane, e.g. `herdr plugin pane open "
+            "--plugin worklog-selection-list --entrypoint worklist --placement tab "
+            "--focus`) creates a new tab whose label is exactly `Podcast Editing` "
+            "(verified via `herdr tab list`)."
+        )
+        assert acs[1] == (
+            "The open-and-rename behaviour is implemented in a repo-tracked shell script "
+            "under `packages/ContextHub/packages/herdr/scripts/` (following the "
+            "`open.sh` pattern) that parses the `tab_id` from `herdr plugin pane open` "
+            "JSON output and calls `herdr tab rename <tab-id> \"Podcast Editing\"`."
+        )
+        assert acs[2] == (
+            "The script fails gracefully (clear error, non-zero exit) when the herdr CLI "
+            "is unavailable or the `tab_id` cannot be parsed — a missing rename is never "
+            "silently skipped."
+        )
+        assert acs[3] == (
+            "A shell unit test (mock herdr CLI, mirroring the ContextHub "
+            "`scripts/tests/test_run_in_pane.sh` pattern) covers the parse-and-rename "
+            "wiring and passes."
+        )
+        assert acs[4] == (
+            "The herdr config binding that opens the podcast editor (currently "
+            "`prefix+l` → `worklog-selection-list.open-worklist`) is updated to invoke "
+            "the new script (or a plugin action wrapping it), and the plugin README "
+            "documents the keybinding and resulting tab name."
+        )
+        assert acs[5] == (
+            "All related documentation is updated to reflect the changes (README), and "
+            "the full project test suite passes with the new changes."
+        )
+
+    def test_wrapped_bullet_continuation_folds_into_bullet(self):
+        """An indented continuation line is folded into the current bullet."""
+        desc = (
+            "## Acceptance Criteria\n"
+            "- Criterion one wraps onto\n"
+            "      a continuation line.\n"
+            "- Criterion two.\n"
+        )
+        assert audit_runner._extract_acs(desc) == [
+            "Criterion one wraps onto a continuation line.",
+            "Criterion two.",
+        ]
+
+    def test_checkbox_markers_stripped_from_bullets(self):
+        """Checkbox markers are stripped from extracted bullet ACs."""
+        desc = (
+            "## Acceptance Criteria\n"
+            "- [ ] Unchecked bullet\n"
+            "- [x] Lowercase checked\n"
+            "- [X] Uppercase checked\n"
+            "- [~] In-progress\n"
+            "- [-] Closed\n"
+            "- Plain bullet\n"
+        )
+        assert audit_runner._extract_acs(desc) == [
+            "Unchecked bullet",
+            "Lowercase checked",
+            "Uppercase checked",
+            "In-progress",
+            "Closed",
+            "Plain bullet",
+        ]
+
+    def test_single_line_bullets_unchanged(self):
+        """Single-line bullets still extract (no regression)."""
+        desc = (
+            "## Acceptance Criteria\n"
+            "- Criterion one\n"
+            "- Criterion two\n"
+        )
+        assert audit_runner._extract_acs(desc) == ["Criterion one", "Criterion two"]
+
+    def test_numbered_acs_untouched(self):
+        """Numbered ACs keep their text; checkbox stripping never applies."""
+        desc = (
+            "## Acceptance Criteria\n"
+            "1. Criterion one\n"
+            "2. Criterion two\n"
+        )
+        assert audit_runner._extract_acs(desc) == ["Criterion one", "Criterion two"]
+
+    def test_success_criteria_heading(self):
+        """Success Criteria headings are extracted exactly like Acceptance Criteria."""
+        desc = (
+            "## Success Criteria\n"
+            "- [ ] Must succeed\n"
+            "- [ ] And keep working\n"
+        )
+        assert audit_runner._extract_acs(desc) == [
+            "Must succeed",
+            "And keep working",
+        ]
+
+    def test_heading_terminates_extraction(self):
+        """A later heading terminates extraction (e.g. ## References)."""
+        desc = (
+            "## Acceptance Criteria\n"
+            "- Criterion one\n"
+            "- Criterion two\n"
+            "\n"
+            "## References\n"
+            "- something else\n"
+        )
+        assert audit_runner._extract_acs(desc) == ["Criterion one", "Criterion two"]
+
+    def test_blank_lines_between_bullets_skipped(self):
+        """Blank lines between bullets are skipped, not treated as terminators."""
+        desc = (
+            "## Acceptance Criteria\n"
+            "- Criterion one\n"
+            "\n"
+            "- Criterion two\n"
+            "\n"
+            "- Criterion three\n"
+        )
+        assert audit_runner._extract_acs(desc) == [
+            "Criterion one",
+            "Criterion two",
+            "Criterion three",
+        ]
+
+    def test_non_indented_prose_terminates_extraction(self):
+        """Trailing non-indented prose after the list is not folded in."""
+        desc = (
+            "## Acceptance Criteria\n"
+            "- Criterion one\n"
+            "- Criterion two\n"
+            "These notes are not part of the criteria list.\n"
+        )
+        assert audit_runner._extract_acs(desc) == ["Criterion one", "Criterion two"]
+
+    def test_no_acceptance_criteria_fallback(self):
+        """Missing criteria section yields the documented fallback string."""
+        assert audit_runner._extract_acs(
+            "## Summary\nJust prose.\n"
+        ) == ["No acceptance criteria defined."]
+        assert audit_runner._extract_acs("") == ["No acceptance criteria defined."]
