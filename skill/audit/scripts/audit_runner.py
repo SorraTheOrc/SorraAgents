@@ -1508,6 +1508,19 @@ def _extract_json_array(text: str) -> list | None:
     return None
 
 
+_CHECKBOX_MARKER_RE = re.compile(r"^\[[ xX~-]\]\s*")
+"""Checkbox marker prefix stripped from bullet acceptance criteria.
+
+Matches ``[ ]``, ``[x]``, ``[X]``, ``[~]`` and ``[-]`` markers. Numbered ACs
+are left untouched (see _extract_acs).
+"""
+
+
+def _strip_checkbox(text: str) -> str:
+    """Strip a leading markdown checkbox marker from *text* (bullets only)."""
+    return _CHECKBOX_MARKER_RE.sub("", text, count=1)
+
+
 def _extract_acs(description: str) -> list[str]:
     """Extract acceptance criteria lines from a markdown description."""
     pattern = re.compile(
@@ -1531,9 +1544,13 @@ def _extract_acs(description: str) -> list[str]:
             continue
         bulleted = re.match(r"^[-*]\s+(.*)", stripped)
         if bulleted:
-            acs.append(bulleted.group(1))
+            acs.append(_strip_checkbox(bulleted.group(1)))
             continue
         if acs and stripped:
+            if line[:1].isspace():
+                # Indented continuation line: fold into the current bullet.
+                acs[-1] = f"{acs[-1]} {stripped}"
+                continue
             break
 
     if not acs:
