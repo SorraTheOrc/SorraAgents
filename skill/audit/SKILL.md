@@ -271,6 +271,8 @@ Semantics:
 
 **Provider-error retry:** Pi calls that end in a provider error (`stopReason: "error"` / `errorMessage` on the last assistant message of `agent_end`, e.g. Local Proxy `finish_reason: error`) are retried automatically up to `_PI_MAX_RETRIES` (2) times with linear backoff (`_PI_RETRY_BACKOFF_SECONDS`). Timeouts and unparseable-but-otherwise-healthy responses are NOT retried. If a provider error persists after retries, ACs fall back to `partial` with evidence like "Pi provider error: <errorMessage> — criterion could not be evaluated." rather than the misleading "Pi model output could not be parsed" message, so operators can distinguish a transient model outage from a genuine parse failure.
 
+**Context reduction:** every Pi call (`_call_pi`) runs with `--no-context-files --no-skills`, in both tool-enabled and tool-less modes. Audit prompts are fully self-contained — they carry the read-only mandate, JSON output format, FILE SCOPE manifest, SCANNING block, and criteria — so the global+project AGENTS.md load (~40KB, byte-identical duplication) and the skills section (~7KB) are dropped from each session's static context, cutting per-call startup from ~49KB (~12.3K tokens) to ~2KB. Prompts must never depend on AGENTS.md or skill descriptions: that is an invariant of this skill (context-reduction item SA-0MSISKM8F004NW1U).
+
 **Per-call timing instrumentation:** Every Pi call (`_call_pi`) records its wall-clock duration via `time.monotonic` and attaches `elapsed_seconds` to the returned result dict (all return paths, including timeouts and provider errors). `_call_pi_and_maybe_log` emits a per-call timing line to stderr in the form:
 
 ```text

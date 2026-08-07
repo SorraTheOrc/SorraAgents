@@ -1052,6 +1052,14 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         enable_tools: If True, adds ``--tools read,bash,grep,find,ls
                        --exclude-tools ask_question`` to enable file-reading
                        capabilities in the Pi agent session.
+
+        # Context reduction: every call adds ``--no-context-files --no-skills``
+        so each pi session starts with minimal static context (~2KB instead of
+        ~49KB of duplicated global+project AGENTS.md plus the skills section).
+        Audit prompts are fully self-contained (read-only mandate, JSON
+        format, FILE SCOPE manifest, criteria) and must never depend on
+        AGENTS.md or skill descriptions.
+
         max_retries: Maximum number of extra attempts after a provider error.
             When None, falls back to ``_PI_MAX_RETRIES`` (2). Long
             agent-mode Phase 2 calls pass 1 so a provider error does not
@@ -1072,6 +1080,12 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             "--tools", "read,bash,grep,find,ls",
             "--exclude-tools", "ask_question",
         ])
+    # Context reduction (SA-0MSISKM8F004NW1U): audit prompts are fully
+    # self-contained, so drop the duplicated global+project AGENTS.md load
+    # (~40KB) and the skills section (~7KB) from every pi call in both tool
+    # modes. Both flags are loader toggles compatible with --mode json and
+    # --tools; prompts must never rely on AGENTS.md or skill descriptions.
+    cmd.extend(["--no-context-files", "--no-skills"])
 
     effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
     effective_max_retries = _PI_MAX_RETRIES if max_retries is None else max_retries
@@ -2163,6 +2177,10 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             _call_pi(). Phase 2 deep analysis passes 1 (see
             ``_PHASE2_MAX_RETRIES``) so long agent-mode calls are not
             restarted multiple times on a provider error.
+
+        # Context reduction: every forwarded pi call runs with
+        ``--no-context-files --no-skills`` (see _call_pi) so audit sessions
+        start with minimal static context; prompts are self-contained.
 
     If *debug_log* is provided the entry reason will be "debug_log" and the
     provided path will be used. If *debug_log* is not provided but the pi

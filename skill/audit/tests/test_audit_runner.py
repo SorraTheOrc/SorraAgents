@@ -296,7 +296,8 @@ class TestCallPiEnableTools:
         """AC1: _call_pi() adds --tools flags when enable_tools=True.
 
         Mocks ``subprocess.Popen`` and asserts the constructed command
-        includes ``--tools read,bash,grep,find,ls --exclude-tools ask_question``.
+        includes ``--tools read,bash,grep,find,ls --exclude-tools ask_question``
+        plus the context-reduction flags ``--no-context-files --no-skills``.
         """
         mock_process = self._make_mock_popen()
 
@@ -311,6 +312,9 @@ class TestCallPiEnableTools:
         assert "--exclude-tools" in args
         exclude_idx = args.index("--exclude-tools")
         assert args[exclude_idx + 1] == "ask_question"
+        # Context reduction flags are present in the tool-enabled path
+        assert "--no-context-files" in args
+        assert "--no-skills" in args
 
     def test_command_unchanged_when_enable_tools_false(self):
         """AC2: _call_pi() does NOT add --tools when enable_tools=False (default)."""
@@ -328,6 +332,9 @@ class TestCallPiEnableTools:
         assert args[1] == "-p"
         assert args[2] == "--mode"
         assert args[3] == "json"
+        # Context reduction flags are present in the no-tools path
+        assert "--no-context-files" in args
+        assert "--no-skills" in args
 
     def test_default_enable_tools_is_false(self):
         """AC3: Default value of enable_tools is False (backward compatible)."""
@@ -343,7 +350,8 @@ class TestCallPiEnableTools:
     def test_existing_callers_unchanged(self):
         """AC4: Existing callers work without modification (default enable_tools=False).
 
-        Verifies the default command structure matches current behavior.
+        Verifies the default command structure matches current behavior,
+        including the context-reduction flags every call now carries.
         """
         mock_process = self._make_mock_popen()
 
@@ -353,7 +361,34 @@ class TestCallPiEnableTools:
 
         mock_popen.assert_called_once()
         args = mock_popen.call_args[0][0]
-        assert args == ["pi", "-p", "--mode", "json", "--model", "test-model", "test prompt"]
+        assert args == [
+            "pi", "-p", "--mode", "json", "--model", "test-model",
+            "test prompt", "--no-context-files", "--no-skills",
+        ]
+
+    def test_context_reduction_flags_present_in_both_tool_modes(self):
+        """SA-0MSISKM8F004NW1U AC1: --no-context-files --no-skills in both modes.
+
+        Asserts the context-reduction flags are part of the constructed pi
+        command for both enable_tools=True and enable_tools=False paths.
+        """
+        mock_process = self._make_mock_popen()
+
+        for enable_tools in (False, True):
+            with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process) as mock_popen:
+                audit_runner._call_pi(
+                    "test prompt", model="test-model", enable_tools=enable_tools
+                )
+            mock_popen.assert_called_once()
+            args = mock_popen.call_args[0][0]
+            assert "--no-context-files" in args
+            assert "--no-skills" in args
+            # Flags come after the prompt, before/around the tools block
+            assert args.index("--no-context-files") < args.index("--no-skills")
+            if enable_tools:
+                assert "--tools" in args
+            else:
+                assert "--tools" not in args
 
     def test_timeout_handling_unchanged(self):
         """AC5: Timeout handling remains unchanged when enable_tools=True."""
