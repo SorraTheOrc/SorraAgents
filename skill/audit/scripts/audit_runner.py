@@ -257,6 +257,20 @@ When the audit's ``auditedAt`` timestamp is more recent than the work item's
 the runner skips the full audit pipeline.
 """
 
+AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS = 30
+"""Tolerance (seconds) for treating an audit as fresh despite a stale check.
+
+Persisting an audit bumps the work item's ``updatedAt`` (``wl audit-set`` +
+``wl update --audit-text`` + the verdict-driven status transition), so
+``auditedAt`` is always a fraction of a second to a few seconds BEFORE the
+final ``updatedAt``. The plain freshness gate (``auditedAt > updatedAt +
+buffer``) can therefore never hold for a just-persisted audit, which made the
+parent runner re-trigger child audits forever. When the child's ``updatedAt``
+is at-or-slightly-after the audit's ``auditedAt`` within this tolerance, the
+update is the audit's own persistence write and the audit is trusted instead
+of being flagged stale (SA-0MSI3XH34001LLU4).
+"""
+
 # Verdict constants
 VERDICT_MET = "met"
 VERDICT_UNMET = "unmet"
@@ -2235,7 +2249,11 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
         (None, "error")      — wl audit-show command failed
 
     Freshness is determined by comparing the audit's auditedAt timestamp against
-    the child's updatedAt timestamp plus AUDIT_FRESHNESS_BUFFER_SECONDS.
+    the child's updatedAt timestamp plus AUDIT_FRESHNESS_BUFFER_SECONDS. An
+    audit whose auditedAt coincides with the child's updatedAt within
+    AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS (i.e. the updatedAt bump was the
+    audit's own persistence write) is treated as fresh rather than stale so the
+    parent runner does not re-trigger child audits forever.
     """
     from datetime import datetime, timedelta, timezone
 
@@ -2282,7 +2300,16 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
                     update_time = update_time.replace(tzinfo=timezone.utc)
                 freshness_threshold = update_time + timedelta(seconds=AUDIT_FRESHNESS_BUFFER_SECONDS)
                 if not (audit_time > freshness_threshold):
-                    return None, "stale"
+                    # The child's own persistence write bumps its updatedAt to
+                    # ~the audit's auditedAt. When the two timestamps coincide
+                    # within the persistence tolerance, the bump is the audit's
+                    # own write, so the audit reflects current state and is
+                    # trusted (prevents the parent runner from re-triggering
+                    # child audits forever — SA-0MSI3XH34001LLU4).
+                    write_delta = update_time - audit_time
+                    if not (timedelta(0) <= write_delta
+                            <= timedelta(seconds=AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS)):
+                        return None, "stale"
             except (ValueError, TypeError):
                 pass  # Can't parse timestamps; treat as fresh since we have an audit
 
