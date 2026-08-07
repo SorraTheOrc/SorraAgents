@@ -12,7 +12,7 @@
  *  1. Full pytest suite collects and at least a subset passes
  *  2. All skill SKILL.md files are present and parseable
  *  3. Worklog data file integrity
- *  4. Agent guidance files (AGENTS.md, Workflow.md) are consistent
+ *  4. Agent guidance files (AGENTS_GLOBAL.md, Workflow.md) are consistent
  *  5. CI workflow YAML files are valid
  */
 import { test } from 'node:test';
@@ -115,61 +115,61 @@ test('critical: all skills have valid SKILL.md files', () => {
 // ---------------------------------------------------------------------------
 // 4. Agent guidance files consistency
 // ---------------------------------------------------------------------------
-test('critical: AGENTS.md and Workflow.md reference consistent terminology', () => {
-  const agentsMd = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf-8');
+test('critical: AGENTS_GLOBAL.md and Workflow.md reference consistent terminology', () => {
+  const agentsMd = readFileSync(join(REPO_ROOT, 'AGENTS_GLOBAL.md'), 'utf-8');
   const workflowMd = readFileSync(join(REPO_ROOT, 'Workflow.md'), 'utf-8');
 
   // Both files should reference worklog/wl consistently
   const hasWlReference = (content) =>
     content.includes('wl ') || content.includes('Worklog') || content.includes('work-item');
 
-  assert.ok(hasWlReference(agentsMd), 'AGENTS.md should reference worklog/wl');
+  assert.ok(hasWlReference(agentsMd), 'AGENTS_GLOBAL.md should reference worklog/wl');
   assert.ok(hasWlReference(workflowMd), 'Workflow.md should reference worklog/wl');
 
   // Both should mention the core workflow stages
   for (const stage of ['in_progress', 'in_review']) {
     assert.ok(
       agentsMd.includes(stage),
-      `AGENTS.md should reference stage "${stage}"`,
+      `AGENTS_GLOBAL.md should reference stage "${stage}"`,
     );
   }
 });
 
 // ---------------------------------------------------------------------------
-// 5. AGENTS.md workflow: agents push to dev, ship handles release to main
+// 5. AGENTS_GLOBAL.md workflow: agents push to dev, ship handles release to main
 // ---------------------------------------------------------------------------
-test('critical: AGENTS.md workflow pushes to dev; ship handles release to main', () => {
-  const agentsMd = readFileSync(join(REPO_ROOT, 'AGENTS.md'), 'utf-8');
+test('critical: AGENTS_GLOBAL.md workflow pushes to dev; ship handles release to main', () => {
+  const agentsMd = readFileSync(join(REPO_ROOT, 'AGENTS_GLOBAL.md'), 'utf-8');
 
   // Push policy should describe pushing into dev as the integration step
   assert.ok(
     agentsMd.includes('Push only to') && agentsMd.includes('dev'),
-    'AGENTS.md push policy should describe pushing into dev',
+    'AGENTS_GLOBAL.md push policy should describe pushing into dev',
   );
 
   // Should state that regular agents do NOT merge to main
   assert.ok(
     agentsMd.includes('never to') && agentsMd.includes('main') ||
     agentsMd.includes('do NOT merge') || agentsMd.includes('not merge to main'),
-    'AGENTS.md should state regular agents do not merge to main',
+    'AGENTS_GLOBAL.md should state regular agents do not merge to main',
   );
 
   // Should reference the ship skill for the dev→main release process
   assert.ok(
     agentsMd.includes('ship skill') || agentsMd.includes('ship/SKILL.md'),
-    'AGENTS.md should reference the ship skill',
+    'AGENTS_GLOBAL.md should reference the ship skill',
   );
 
   // Should reference the release merge script for dev→main
   assert.ok(
     agentsMd.includes('merge-dev-to-main.sh') || agentsMd.includes('scripts/release'),
-    'AGENTS.md should reference the release merge script',
+    'AGENTS_GLOBAL.md should reference the release merge script',
   );
 
   // Step 5 implementation should confirm work is committed to dev
   assert.ok(
     agentsMd.includes('Work committed to dev'),
-    'AGENTS.md step 5 should confirm work committed to dev',
+    'AGENTS_GLOBAL.md step 5 should confirm work committed to dev',
   );
 });
 

@@ -51,6 +51,7 @@ function run(cmd, opts = {}) {
 test('repository structure: key files and directories exist', () => {
   const required = [
     'AGENTS.md',
+    'AGENTS_GLOBAL.md',
     'README.md',
     'Workflow.md',
     'skill/audit/SKILL.md',

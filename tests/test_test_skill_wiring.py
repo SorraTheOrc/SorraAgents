@@ -1,8 +1,11 @@
 """Doc hygiene tests for test-skill wiring into code-touching skills.
 
-Verifies that the master AGENTS.md and every code-touching skill reference
-the test skill (skill/test or /skill:test), so agents consistently apply the
-run → triage → evaluate → loop discipline before marking work items in_review.
+Verifies that the global AGENTS_GLOBAL.md and every code-touching skill
+reference the test skill (skill/test or /skill:test), so agents consistently
+apply the run → triage → evaluate → loop discipline before marking work items
+in_review. The generic workflow guidance lives in AGENTS_GLOBAL.md (installed
+to ~/.pi/agent/AGENTS.md); the project-local AGENTS.md holds only
+project-specific content.
 """
 
 from __future__ import annotations
@@ -11,10 +14,10 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Master AGENTS.md plus the code-touching skills that must reference the
-# test skill in their workflows (wired via SA-0MSAC1IAS007I3K8).
+# Global AGENTS_GLOBAL.md plus the code-touching skills that must reference
+# the test skill in their workflows (wired via SA-0MSAC1IAS007I3K8).
 WIRED_FILES = {
-    "AGENTS.md": _REPO_ROOT / "AGENTS.md",
+    "AGENTS_GLOBAL.md": _REPO_ROOT / "AGENTS_GLOBAL.md",
     "skill/implement/SKILL.md": _REPO_ROOT / "skill" / "implement" / "SKILL.md",
     "skill/audit/SKILL.md": _REPO_ROOT / "skill" / "audit" / "SKILL.md",
     "skill/refactor/SKILL.md": _REPO_ROOT / "skill" / "refactor" / "SKILL.md",
@@ -57,9 +60,9 @@ def test_all_wired_files_reference_test_skill() -> None:
 
 
 def test_references_appear_before_in_review_requirement() -> None:
-    """AGENTS.md must mention the test skill where tests are required
+    """AGENTS_GLOBAL.md must mention the test skill where tests are required
     before marking a work item in_review."""
-    content = _content(WIRED_FILES["AGENTS.md"])
+    content = _content(WIRED_FILES["AGENTS_GLOBAL.md"])
     assert "in_review" in content
     # The test-skill reference and the in_review requirement must co-occur
     # within the same document (at least one reference sits in a sentence
@@ -67,7 +70,7 @@ def test_references_appear_before_in_review_requirement() -> None:
     for marker in REFERENCE_MARKERS:
         if marker in content:
             assert "in_review" in content, (
-                "AGENTS.md references the test skill but never ties it to "
-                "the in_review gate"
+                "AGENTS_GLOBAL.md references the test skill but never ties it "
+                "to the in_review gate"
             )
             break
