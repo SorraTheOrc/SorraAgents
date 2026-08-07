@@ -87,6 +87,24 @@ IMPORTANT: This project uses Worklog (wl) for ALL work-item tracking. Do NOT use
 - When using backticks in shell command arguments, ALWAYS escape them properly.
 - Never close a work item without ensuring all ACs are met, all children closed, all blockers resolved, and a Producer has reviewed/approved.
 - When displaying a work-item ID in any output, always include the item title alongside the ID using the format `Title Text (ID)` (e.g., `Per-project isolation for .env and scheduler_store.json with global installs (SA-0MLU57S7D1KX8CU7)`). This ensures every reference is self-describing.
+- **Session logging:** Whenever you start a new Pi session or create a new work item, add a comment to the relevant worklog item to enable session traceability. Use the format:
+
+  ```
+  <agent_action> - Session ID: <pi_session_id> - <path_to_sessions_log>
+  ```
+
+  Where:
+  - `<agent_action>` is a short description of the action (e.g., `/plan`, `/implement`, `creating work item`)
+  - `<pi_session_id>` is available via the `PI_SESSION_ID` environment variable
+  - `<path_to_sessions_log>` is available via the `PI_SESSION_FILE` environment variable (the `.jsonl` session log for the current Pi session)
+
+  Example:
+
+  ```
+  /plan SA-0MSI51QTA009WDFO - Session ID: 019fd9b7-... - /home/<user>/.pi/agent/sessions/.../2026-08-07T00-55-03-067Z_019fd9b7-....jsonl
+  ```
+
+  Use `wl comment add <id> --comment "<comment>" --author "<agent_name>" --json` to post the comment.
 
 ## Important Rules
 
