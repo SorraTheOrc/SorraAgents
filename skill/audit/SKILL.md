@@ -212,7 +212,7 @@ Synonym for "Acceptance Criteria". Use **Acceptance Criteria** as canonical head
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--max-concurrency N] [--green-run SHA|HEAD] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR]`
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--max-concurrency N] [--green-run SHA|HEAD] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
 **Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
@@ -248,6 +248,16 @@ Failure diagnostics surface the real `wl` error (stdout JSON error field first,
 then stdout text, then stderr) instead of empty stderr.
 
 **Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard skips remaining child audits to prevent silent kill; the default scales with the number of active children (`110s` base + `600s` per child — e.g. ~710s for a single child, ~6,110s for a 10-child parent), so multi-child audits with default settings attempt child auto-audits instead of silently degrading to parent-only. Override with an exact value via `--parent-timeout SECONDS` or the `AUDIT_PARENT_TIMEOUT` env var (e.g. `AUDIT_PARENT_TIMEOUT=3600`) to audit items with many children in one pass on harnesses whose bash tool allows longer runs. Precedence: `--parent-timeout` flag > `AUDIT_PARENT_TIMEOUT` env var > child-count-scaled default. When the guard does trip, the skip diagnostic names the computed budget and the `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` override. On timeout, returns `unmet` with evidence "Pi model call timed out."
+
+**Child audit cascade (opt-in):** the recursive child-audit cascade — where a parent with unaudited children spawns a full child audit per child — is **OFF by default** (SA-0MSKB6V5Q007YDHE). A parent with children that lack fresh audits no longer implicitly spawns a cascade that can take hours. Enable it explicitly:
+
+```bash
+python3 ./scripts/audit_runner.py issue SA-123 --audit-children
+```
+
+- `--audit-children` enables the cascade (default: no cascade — children without fresh audits stay not-ready and block the parent, verdict semantics unchanged).
+- `--max-child-audits N` (env `AUDIT_MAX_CHILD_AUDITS`) bounds the number of child audits a single run may auto-trigger (default: `5`).
+- Children with unchanged content are skipped via the content-based freshness gate — their stored verdict is reused instead of re-auditing.
 
 **Operator-attested green test run (`--green-run` / `AUDIT_GREEN_RUN`):** Some acceptance criteria are inherently execution-dependent — e.g. "Full project test suite passes with the new changes" — and the audit's read-only mandate forbids the runner (and its Phase 1/2 models) from executing the suite. Without external evidence such criteria can NEVER be verified inside the audit, so they always return `partial`. Operators should run the full suite via the [test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green) so the run is quiet-mode, triaged, and genuinely green. An operator who has verifiably run the full suite at the audited commit can then attest that fact and unblock those criteria:
 

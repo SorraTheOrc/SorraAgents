@@ -194,6 +194,24 @@ release operators extend the overall audit run budget (e.g.
 ``AUDIT_PARENT_TIMEOUT=3600``) without changing defaults.
 """
 
+AUDIT_MAX_CHILD_AUDITS_ENV = "AUDIT_MAX_CHILD_AUDITS"
+"""Environment variable bounding the per-run recursive child-audit cascade.
+
+When set (a positive integer) and ``--max-child-audits`` is not passed, this
+is the maximum number of child audits that a single parent ``cmd_issue`` run
+may auto-trigger (SA-0MSKB6V5Q007YDHE). An invalid value is ignored with a
+warning and the default cap is used.
+"""
+
+_DEFAULT_MAX_CHILD_AUDITS = 5
+"""Default per-run cap on auto-triggered recursive child audits.
+
+Bounds the wall-clock of the child cascade even when the operator explicitly
+opts in with ``--audit-children``: a parent with many unaudited children can
+no longer silently spawn an unbounded number of child audit subprocesses
+(SA-0MSKB6V5Q007YDHE).
+"""
+
 _PI_MAX_RETRIES = 2
 """Number of retries for transient provider errors in ``_call_pi``.
 
@@ -778,6 +796,43 @@ def _default_parent_timeout(n_children: int) -> int:
     / ``AUDIT_PARENT_TIMEOUT`` overrides replace this computed value entirely.
     """
     return PARENT_TIMEOUT_DEFAULT + n_children * PARENT_TIMEOUT_PER_CHILD
+
+
+def _resolve_max_child_audits(cli_value: int | None = None) -> int:
+    """Resolve the per-run cap on auto-triggered recursive child audits.
+
+    Precedence:
+      1. ``--max-child-audits`` CLI flag (explicit override)
+      2. ``AUDIT_MAX_CHILD_AUDITS`` environment variable (positive integer)
+      3. ``_DEFAULT_MAX_CHILD_AUDITS``
+
+    An invalid env value (non-positive integer) is ignored with a warning so
+    a misconfigured environment cannot break the audit run.
+    """
+    if cli_value is not None:
+        if cli_value < 1:
+            print(
+                f"Warning: invalid --max-child-audits value {cli_value}; "
+                f"using the default cap ({_DEFAULT_MAX_CHILD_AUDITS})",
+                file=sys.stderr,
+            )
+            return _DEFAULT_MAX_CHILD_AUDITS
+        return cli_value
+    env_value = os.environ.get(AUDIT_MAX_CHILD_AUDITS_ENV)
+    if env_value:
+        try:
+            parsed = int(env_value)
+            if parsed < 1:
+                raise ValueError
+            return parsed
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_MAX_CHILD_AUDITS_ENV} value "
+                f"{env_value!r}; using the default cap "
+                f"({_DEFAULT_MAX_CHILD_AUDITS})",
+                file=sys.stderr,
+            )
+    return _DEFAULT_MAX_CHILD_AUDITS
 
 
 def _resolve_parent_timeout(cli_value: int | None) -> int | None:
@@ -3701,7 +3756,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
               force: bool = False,
               worklog_dir: str | None = None,
               batch_phase2: bool = False,
-              green_run: str | None = None) -> int:
+              green_run: str | None = None,
+              audit_children: bool = False,
+              max_child_audits: int | None = None) -> int:
     """Audit a single work item.
 
     The resolved model name and source are included as a metadata line
@@ -3714,6 +3771,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
     When *force* is ``True``, the freshness gate is bypassed and a full
     audit pipeline is always run, even if a recent audit already exists.
+
+    *audit_children* enables the recursive child-audit cascade: when a child
+    has no fresh audit, the runner auto-triggers a full child audit instead
+    of leaving the child not-ready (SA-0MSKB6V5Q007YDHE). The cascade is
+    OPT-IN — the default is no cascade. Children with unchanged content are
+    skipped via the Feature 1 content-based freshness gate rather than
+    re-audited.
+
+    *max_child_audits* bounds the number of child audits a single run may
+    auto-trigger (default: ``AUDIT_MAX_CHILD_AUDITS`` env or
+    ``_DEFAULT_MAX_CHILD_AUDITS``).
 
     *worklog_dir* is an explicit ``--worklog-dir`` value that overrides
     auto-resolution for every wl call made by this run (see
@@ -4191,10 +4259,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # ------------------------------------------------------------------
         # Check each active child's persisted audit verdict.
         # For children without audits or with stale audits, auto-trigger
-        # a fresh audit (if persist is True) and re-evaluate.
-        # Children with completed/done status+stage are exempt (AC5).
+        # a fresh audit (if persist is True AND --audit-children is set) and
+        # re-evaluate. The recursive cascade is OPT-IN (SA-0MSKB6V5Q007YDHE):
+        # by default no child audits are auto-triggered, so a parent with many
+        # unaudited children no longer spawns an unbounded cascade. Children
+        # with unchanged content are skipped via the Feature 1 content-based
+        # freshness gate. Children with completed/done status+stage are
+        # exempt (AC5).
         # ------------------------------------------------------------------
         _audit_runner_path = Path(__file__).resolve()
+        max_child_audits = _resolve_max_child_audits(max_child_audits)
+        child_audits_triggered = 0
 
         for child in child_results:
             # Skip completed/done children (exempt per AC5)
@@ -4208,55 +4283,93 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
             if verdict is None and persist:
                 if _elapsed() < elapsed_guard:
-                    print(
-                        f"Auto-triggering audit for child {child['id']} "
-                        f"({child['title']}) — reason: {reason}",
-                        file=sys.stderr,
+                    # Content-based freshness skip (AC4): a child whose content
+                    # fingerprint is unchanged has a still-valid audit — do not
+                    # re-trigger it; re-evaluate the verdict from the stored
+                    # report instead.
+                    fresh_report = _check_audit_freshness(
+                        runner, child["id"], worklog_dir=worklog_dir,
                     )
-                    try:
-                        audit_cmd = [
-                            sys.executable or "python3",
-                            str(_audit_runner_path),
-                            "issue",
-                            child["id"],
-                            "--pi-bin", pi_bin,
-                            "--model", resolved_model,
-                            "--model-source", model_source,
-                            "--force",  # Bypass freshness gate
-                        ]
-                        if timeout is not None:
-                            audit_cmd.extend(["--timeout", str(timeout)])
-                        if parent_timeout is not None:
-                            audit_cmd.extend(["--parent-timeout", str(parent_timeout)])
-                        # Thread the resolved worklog flags through to the child
-                        # runner process so it targets the same worklog store.
-                        child_flags = _resolve_worklog_flags(
-                            ["wl", "show", child["id"], "--json"],
-                            explicit_dir=worklog_dir,
-                        )
-                        if child_flags:
-                            audit_cmd.extend(child_flags)
-                        effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
-                        subprocess.run(
-                            audit_cmd,
-                            check=False,
-                            capture_output=True,
-                            text=True,
-                            timeout=effective_timeout,
-                        )
-                        # Re-check verdict after triggered audit
-                        verdict, reason = _get_child_audit_verdict(runner, child["id"],
-                                                                   worklog_dir=worklog_dir)
-                    except subprocess.TimeoutExpired:
+                    if fresh_report is not None:
+                        fresh_ready = _parse_ready_to_close(fresh_report)
+                        verdict = fresh_ready == "yes"
+                        reason = "ready" if fresh_ready == "yes" else "not_ready"
                         print(
-                            f"Warning: Auto-triggered audit for child {child['id']} "
-                            f"timed out.", file=sys.stderr,
+                            f"Reusing fresh audit for child {child['id']} "
+                            f"({child['title']}) — content unchanged",
+                            file=sys.stderr,
                         )
-                    except Exception as exc:  # noqa: BLE001 -- audit failure warning
+                    elif not audit_children:
+                        # AC1: no cascade without explicit opt-in. The child
+                        # stays not-ready (a not-ready child still blocks the
+                        # parent — verdict semantics unchanged).
                         print(
-                            f"Warning: Auto-triggered audit for child {child['id']} "
-                            f"failed: {exc}", file=sys.stderr,
+                            f"Child {child['id']} ({child['title']}) has no "
+                            f"fresh audit; not auto-triggering a child audit. "
+                            f"Use --audit-children to enable the recursive "
+                            f"cascade (or audit the child directly).",
+                            file=sys.stderr,
                         )
+                    elif child_audits_triggered >= max_child_audits:
+                        # AC3: per-run cap reached — stop the cascade.
+                        print(
+                            f"Warning: child audit cap ({max_child_audits}) "
+                            f"reached; not auto-auditing child {child['id']} "
+                            f"({child['title']}). Raise via --max-child-audits "
+                            f"or {AUDIT_MAX_CHILD_AUDITS_ENV}.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        child_audits_triggered += 1
+                        print(
+                            f"Auto-triggering audit for child {child['id']} "
+                            f"({child['title']}) — reason: {reason}",
+                            file=sys.stderr,
+                        )
+                        try:
+                            audit_cmd = [
+                                sys.executable or "python3",
+                                str(_audit_runner_path),
+                                "issue",
+                                child["id"],
+                                "--pi-bin", pi_bin,
+                                "--model", resolved_model,
+                                "--model-source", model_source,
+                                "--force",  # Bypass freshness gate
+                            ]
+                            if timeout is not None:
+                                audit_cmd.extend(["--timeout", str(timeout)])
+                            if parent_timeout is not None:
+                                audit_cmd.extend(["--parent-timeout", str(parent_timeout)])
+                            # Thread the resolved worklog flags through to the child
+                            # runner process so it targets the same worklog store.
+                            child_flags = _resolve_worklog_flags(
+                                ["wl", "show", child["id"], "--json"],
+                                explicit_dir=worklog_dir,
+                            )
+                            if child_flags:
+                                audit_cmd.extend(child_flags)
+                            effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
+                            subprocess.run(
+                                audit_cmd,
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                                timeout=effective_timeout,
+                            )
+                            # Re-check verdict after triggered audit
+                            verdict, reason = _get_child_audit_verdict(runner, child["id"],
+                                                                       worklog_dir=worklog_dir)
+                        except subprocess.TimeoutExpired:
+                            print(
+                                f"Warning: Auto-triggered audit for child {child['id']} "
+                                f"timed out.", file=sys.stderr,
+                            )
+                        except Exception as exc:  # noqa: BLE001 -- audit failure warning
+                            print(
+                                f"Warning: Auto-triggered audit for child {child['id']} "
+                                f"failed: {exc}", file=sys.stderr,
+                            )
                 else:
                     print(
                         f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
@@ -4810,6 +4923,19 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Append Pi debug output to this file (JSONL)")
     p_issue.add_argument("--force", action="store_true",
                          help="Bypass the freshness gate and force a full audit")
+    p_issue.add_argument("--audit-children", action="store_true",
+                         help=(
+                             "Opt-in: auto-trigger a full audit for each active child "
+                             "that has no fresh audit (recursive cascade). Default is "
+                             "NO cascade — children without fresh audits stay not-ready "
+                             "and block the parent (SA-0MSKB6V5Q007YDHE)"
+                         ))
+    p_issue.add_argument("--max-child-audits", type=int, default=None,
+                         help=(
+                             "Per-run cap on auto-triggered recursive child audits "
+                             f"(default: {AUDIT_MAX_CHILD_AUDITS_ENV} env or "
+                             f"{_DEFAULT_MAX_CHILD_AUDITS})"
+                         ))
     p_issue.add_argument("--worklog-dir", default=None,
                          help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_issue.add_argument("--max-concurrency", type=int, default=None,
@@ -4870,7 +4996,11 @@ def main(argv: list[str] | None = None) -> int:
                          force=args.force,
                          worklog_dir=args.worklog_dir,
                          batch_phase2=_phase2_batch_enabled(args.batch_phase2),
-                         green_run=args.green_run)
+                         green_run=args.green_run,
+                         audit_children=args.audit_children,
+                         max_child_audits=_resolve_max_child_audits(
+                             args.max_child_audits
+                         ))
     elif args.command == "project":
         return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
                            pi_bin=args.pi_bin, model=args.model,

@@ -2003,7 +2003,9 @@ class TestCmdIssueChildAuditAutoTrigger:
     """Integration tests for child audit auto-trigger in cmd_issue."""
 
     def test_child_with_no_audit_triggers_audit(self, monkeypatch, capsys):
-        """When a child has no persisted audit, an audit is auto-triggered."""
+        """When a child has no persisted audit, an audit is auto-triggered
+        when the cascade is explicitly opted into (--audit-children,
+        SA-0MSKB6V5Q007YDHE)."""
         pi_calls = []
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
@@ -2083,7 +2085,8 @@ class TestCmdIssueChildAuditAutoTrigger:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        cmd_issue("SA-PARENT", runner=fake_runner, persist=True)
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=True,
+                  audit_children=True)  # cascade is opt-in (SA-0MSKB6V5Q007YDHE)
         # Should have triggered an audit for the active child
         assert "SA-ACTIVE" in triggered_children
 

@@ -2531,6 +2531,92 @@ class TestParentTimeoutResolution:
             assert kwargs["parent_timeout"] == 900
 
 
+class TestMaxChildAuditsResolution:
+    """Tests for the per-run child-audit cap resolution (AC3).
+
+    The recursive child-audit cascade is bounded by a per-run cap resolved as
+    ``--max-child-audits`` CLI flag > ``AUDIT_MAX_CHILD_AUDITS`` env > default
+    (SA-0MSKB6V5Q007YDHE).
+    """
+
+    def test_env_constant_defined(self):
+        """AC3: The AUDIT_MAX_CHILD_AUDITS env var constant is defined."""
+        assert audit_runner.AUDIT_MAX_CHILD_AUDITS_ENV == "AUDIT_MAX_CHILD_AUDITS"
+
+    def test_default_cap(self):
+        """AC3: The default cap is used when no flag/env is set."""
+        with mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            assert audit_runner._resolve_max_child_audits(None) == (
+                audit_runner._DEFAULT_MAX_CHILD_AUDITS
+            )
+
+    def test_cli_flag_wins_over_env(self):
+        """AC3: The --max-child-audits CLI flag takes precedence over env."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_MAX_CHILD_AUDITS_ENV: "7"},
+            clear=False,
+        ):
+            assert audit_runner._resolve_max_child_audits(2) == 2
+
+    def test_env_var_used_when_no_flag(self):
+        """AC3: AUDIT_MAX_CHILD_AUDITS is honored when no flag is passed."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_MAX_CHILD_AUDITS_ENV: "7"},
+            clear=False,
+        ):
+            assert audit_runner._resolve_max_child_audits(None) == 7
+
+    def test_invalid_env_falls_back_to_default(self):
+        """AC3: An invalid env value falls back to the default cap with a warning."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_MAX_CHILD_AUDITS_ENV: "bogus"},
+            clear=False,
+        ):
+            assert audit_runner._resolve_max_child_audits(None) == (
+                audit_runner._DEFAULT_MAX_CHILD_AUDITS
+            )
+
+    def test_invalid_cli_falls_back_to_default(self):
+        """AC3: A non-positive --max-child-audits falls back to the default."""
+        assert audit_runner._resolve_max_child_audits(0) == (
+            audit_runner._DEFAULT_MAX_CHILD_AUDITS
+        )
+
+    def test_main_resolves_env_var_max_child_audits(self):
+        """AC3: main() resolves the cap from env var and passes it through."""
+        with (
+            mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
+            mock.patch.dict(
+                audit_runner.os.environ,
+                {audit_runner.AUDIT_MAX_CHILD_AUDITS_ENV: "4"},
+                clear=False,
+            ),
+        ):
+            rc = audit_runner.main(["issue", "SA-123", "--do-not-persist"])
+            assert rc == mock_cmd.return_value
+            _args, kwargs = mock_cmd.call_args
+            assert kwargs["max_child_audits"] == 4
+
+    def test_main_resolves_audit_children_flag(self):
+        """AC2: main() passes the --audit-children flag through to cmd_issue."""
+        with mock.patch.object(audit_runner, "cmd_issue") as mock_cmd:
+            audit_runner.main(
+                ["issue", "SA-123", "--do-not-persist", "--audit-children"]
+            )
+            _args, kwargs = mock_cmd.call_args
+            assert kwargs["audit_children"] is True
+
+    def test_main_defaults_audit_children_off(self):
+        """AC1: main() defaults --audit-children to off (no cascade)."""
+        with mock.patch.object(audit_runner, "cmd_issue") as mock_cmd:
+            audit_runner.main(["issue", "SA-123", "--do-not-persist"])
+            _args, kwargs = mock_cmd.call_args
+            assert kwargs["audit_children"] is False
+
+
 class TestParentTimeoutGuardBehavior:
     """AC3: The elapsed-time guard skips children only in pathological runs;
     the scaled default gives multi-child parents a realistic budget and an
@@ -2688,9 +2774,10 @@ class TestParentTimeoutGuardBehavior:
         assert ac["text"] == "CAC1: child criterion"
 
     def test_default_guard_attempts_child_auto_audit(self, capsys):
-        """AC2: With defaults (no override), a run that finishes the parent
-        Phase 1 call in a normal time no longer trips the guard — the child
-        auto-audit is attempted instead of being skipped."""
+        """AC2 (SA-0MSKB6V5Q007YDHE): With defaults (no override), a run that
+        finishes the parent Phase 1 call in a normal time no longer trips the
+        guard — with --audit-children the child auto-audit is attempted instead
+        of being skipped."""
         clock = {"n": 0, "t0": 1000.0}
 
         def _fake_monotonic():
@@ -2739,6 +2826,7 @@ class TestParentTimeoutGuardBehavior:
                 runner=self._make_runner(parent_audit_show=True),
                 json_mode=True,
                 parent_timeout=None,
+                audit_children=True,
             )
 
         err = capsys.readouterr().err
@@ -2747,8 +2835,320 @@ class TestParentTimeoutGuardBehavior:
             "the scaled default guard must not trip right after the parent Phase 1 call"
         )
         assert any("CHILD-1" in c for c in triggered), (
-            "the child auto-audit should be attempted under the default guard"
+            "the child auto-audit should be attempted under the default guard "
+            "when --audit-children is set"
         )
+
+    def test_default_no_cascade_without_audit_children(self, capsys):
+        """AC1 (SA-0MSKB6V5Q007YDHE): without --audit-children, a child with
+        no fresh audit is NOT auto-triggered — the cascade is opt-in."""
+        clock = {"n": 0, "t0": 1000.0}
+
+        def _fake_monotonic():
+            clock["n"] += 1
+            if clock["n"] == 1:
+                return clock["t0"]
+            return clock["t0"] + 30.0
+
+        pi_result = {
+            "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "mocked"}]',
+        }
+
+        def _passthrough_phase2(work_item, ac_results, child_results, **kwargs):
+            return (ac_results, child_results, True)
+
+        triggered: list[str] = []
+
+        def _fake_subprocess_run(cmd, **kwargs):
+            cmd_str = " ".join(cmd)
+            if "audit_runner.py" in cmd_str and "issue" in cmd_str:
+                triggered.append(cmd_str)
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        with (
+            mock.patch.object(
+                audit_runner.time, "monotonic", side_effect=_fake_monotonic
+            ),
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+            mock.patch.object(
+                audit_runner, "_run_phase2_deep_analysis",
+                side_effect=_passthrough_phase2,
+            ),
+            mock.patch.object(
+                audit_runner.subprocess, "run", side_effect=_fake_subprocess_run
+            ),
+            mock.patch.object(audit_runner, "persist_audit", return_value=0),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=True, force=True,
+                runner=self._make_runner(parent_audit_show=True),
+                json_mode=True,
+                parent_timeout=None,
+                # audit_children defaults to False — no cascade
+            )
+
+        err = capsys.readouterr().err
+        assert rc == 0
+        assert any("CHILD-1" in c for c in triggered) is False, (
+            "without --audit-children no child audit subprocess is spawned"
+        )
+        assert "not auto-triggering a child audit" in err
+
+
+# ===========================================================================
+# Opt-in child audit cascade (SA-0MSKB6V5Q007YDHE)
+# ===========================================================================
+
+
+class TestOptInChildAuditCascade:
+    """Tests for the opt-in recursive child-audit cascade (AC1-AC6).
+
+    The cascade is OFF by default (AC1): a parent with unaudited children no
+    longer implicitly spawns a full child audit per child. ``--audit-children``
+    opts in (AC2); a per-run cap bounds the number of auto-triggered child
+    audits (AC3); children with unchanged content are skipped via the Feature 1
+    content-based freshness gate (AC4); and a not-ready child still blocks the
+    parent (AC5 — verdict semantics unchanged).
+    """
+
+    def _make_runner(self, child_stage="plan_complete", parent_audit_show=True,
+                     n_children=1, child_audit_raw=None, child_updated_at=None):
+        """Build a mock runner returning a parent with *n_children* children.
+
+        *child_audit_raw* maps child id -> rawOutput returned by
+        ``wl audit-show`` for that child (None = no prior audit).
+        *child_updated_at* sets the child's ``updatedAt`` (default: recent —
+        see individual tests).
+        """
+        mock_runner = mock.MagicMock()
+        child_audit_raw = child_audit_raw or {}
+        child_updated_at = child_updated_at or "2026-08-05T00:00:00.000Z"
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+
+            # Parent readback verification (persist=True): stored audit.
+            if "audit-show" in cmd_str and parent_audit_show and "TEST-1" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "audit": {
+                            "rawOutput": "TEST-1 audit report",
+                            "auditedAt": "2026-01-01T00:00:00.000Z",
+                        },
+                    }),
+                    stderr="",
+                )
+
+            # Child audit-show lookups.
+            if "audit-show" in cmd_str:
+                child_id = cmd_str.split("audit-show", 1)[1].strip().split()[0]
+                raw = child_audit_raw.get(child_id)
+                if raw is None:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"success": True, "audit": None}),
+                        stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "audit": {
+                            "rawOutput": raw,
+                            "auditedAt": "2026-08-01T00:00:00.000Z",
+                        },
+                    }),
+                    stderr="",
+                )
+
+            # StatusLifecycle.show -> wl show <id> --json (parent TEST-1)
+            if "show" in cmd_str and "--children" not in cmd_str and "TEST-1" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": "open",
+                                     "stage": "plan_complete"},
+                    }),
+                    stderr="",
+                )
+
+            # Child work-item lookup (freshness pre-pass / content gate):
+            # return the child with its updatedAt so the time gate reports
+            # stale when the stored audit is older than the child update.
+            if "show" in cmd_str and "--children" not in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": cmd_str.split("show", 1)[1].strip().split()[0],
+                            "description": "## Acceptance Criteria\n- CAC1: child criterion",
+                            "updatedAt": child_updated_at,
+                        },
+                    }),
+                    stderr="",
+                )
+
+            # _run_wl -> wl show <id> --children --json
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": (
+                                "## Acceptance Criteria\n- AC1: parent criterion"
+                            ),
+                            "status": "in_progress",
+                        },
+                        "children": [{
+                            "id": f"CHILD-{i}",
+                            "title": f"Child Issue {i}",
+                            "status": "open",
+                            "stage": child_stage,
+                            "updatedAt": child_updated_at,
+                            "description": "## Acceptance Criteria\n- CAC1: child criterion",
+                        } for i in range(1, n_children + 1)],
+                    }),
+                    stderr="",
+                )
+
+            # StatusLifecycle.update_status -> wl update <id> --status ...
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}),
+                    stderr="",
+                )
+
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def _run(self, triggered, **cmd_kwargs):
+        """Run cmd_issue with a mocked pipeline, recording child subprocess
+        spawns in *triggered*."""
+        pi_result = {
+            "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "mocked"}]',
+        }
+
+        def _passthrough_phase2(work_item, ac_results, child_results, **kwargs):
+            return (ac_results, child_results, True)
+
+        def _fake_subprocess_run(cmd, **kwargs):
+            cmd_str = " ".join(cmd)
+            if "audit_runner.py" in cmd_str and "issue" in cmd_str:
+                triggered.append(cmd_str)
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        runner_kwargs = cmd_kwargs.pop("runner_kwargs", {})
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+            mock.patch.object(
+                audit_runner, "_run_phase2_deep_analysis",
+                side_effect=_passthrough_phase2,
+            ),
+            mock.patch.object(
+                audit_runner.subprocess, "run", side_effect=_fake_subprocess_run
+            ),
+            mock.patch.object(audit_runner, "persist_audit", return_value=0),
+        ):
+            return audit_runner.cmd_issue(
+                "TEST-1", persist=True, force=True,
+                runner=self._make_runner(**runner_kwargs),
+                json_mode=True,
+                parent_timeout=None,
+                **cmd_kwargs,
+            )
+
+    def test_default_no_cascade_marks_children_not_ready(self):
+        """AC1: without --audit-children, children without fresh audits are
+        not auto-audited — no subprocess spawn."""
+        triggered: list[str] = []
+        rc = self._run(triggered, runner_kwargs={"n_children": 2})
+        assert rc == 0
+        assert triggered == []
+
+    def test_audit_children_enables_cascade(self):
+        """AC2: --audit-children triggers a full audit per unaudited child."""
+        triggered: list[str] = []
+        rc = self._run(triggered, runner_kwargs={"n_children": 2},
+                       audit_children=True)
+        assert rc == 0
+        assert len(triggered) == 2
+        assert all("CHILD-" in c for c in triggered)
+
+    def test_cap_bounds_triggered_child_audits(self):
+        """AC3: the per-run cap bounds the number of auto-triggered child
+        audits even when --audit-children is set."""
+        triggered: list[str] = []
+        rc = self._run(triggered, runner_kwargs={"n_children": 4},
+                       audit_children=True, max_child_audits=2)
+        assert rc == 0
+        assert len(triggered) == 2
+
+    def test_unchanged_child_skipped_via_content_gate(self, capsys):
+        """AC4: a child whose audit is stale by the TIME gate but content-
+        unchanged (fingerprint matches) is not re-audited even with
+        --audit-children — its stored verdict is reused via the content gate."""
+        from skill.audit.scripts import audit_runner as ar
+        head = "a" * 40
+        child_desc = "## Acceptance Criteria\n- CAC1: child criterion"
+        with mock.patch.object(ar, "_resolve_audited_head", return_value=head):
+            fp = ar._compute_content_fingerprint(
+                mock.MagicMock(), "CHILD-1", work_item={"description": child_desc},
+            )
+        stored = (
+            f"Ready to close: Yes\n\nAudit report for work item CHILD-1\n\n"
+            f"{ar.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fp}\n\n## Summary\nok"
+        )
+
+        triggered: list[str] = []
+        # The stored audit is OLD (auditedAt 2026-08-01) while the child was
+        # updated LATER (updatedAt 2026-08-05) → stale by the time gate, but
+        # the content fingerprint still matches → content gate reuses it.
+        with mock.patch.object(ar, "_resolve_audited_head", return_value=head):
+            rc = self._run(
+                triggered,
+                runner_kwargs={
+                    "n_children": 1,
+                    "child_audit_raw": {"CHILD-1": stored},
+                    "child_updated_at": "2026-08-05T00:00:00.000Z",
+                },
+                audit_children=True,
+            )
+        assert rc == 0
+        assert triggered == [], (
+            "content-unchanged child must not be re-audited"
+        )
+        assert "Reusing fresh audit" in capsys.readouterr().err
+
+    def test_not_ready_child_still_blocks_parent(self):
+        """AC5: a child without a fresh audit (no --audit-children) stays
+        not-ready and blocks the parent — verdict semantics unchanged."""
+        triggered: list[str] = []
+        rc = self._run(triggered, runner_kwargs={"n_children": 1})
+        assert rc == 0
+        assert triggered == []
 
 
 # ===========================================================================

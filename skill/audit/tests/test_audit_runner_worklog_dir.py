@@ -233,6 +233,7 @@ class TestChildAuditWorklogDirThreading:
                 force=True,
                 runner=fake_runner,
                 timeout=30,
+                audit_children=True,  # Cascade is opt-in (SA-0MSKB6V5Q007YDHE)
             )
 
         # The child-audit spawn is the audit_runner.py invocation (not the
