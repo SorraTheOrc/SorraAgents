@@ -391,12 +391,14 @@ See `docs/dev/audit-phase1-performance-evaluation.md`
 
 ### Code Quality Integration
 
-Runner performs code quality checks before AC verification (invokes `../code-review/scripts/code_quality.py`):
+Runner performs code quality checks before AC verification (invokes `../code_review/scripts/code_quality.py`):
 
 1. Language detection → linter probing (ruff, eslint, markdownlint, shellcheck) → findings classified by severity
-2. Critical/high findings → "Ready to close: No"; medium/low are warnings
-3. Quality epics ("Quality Improvement - Refactoring") created/reused for findings
-4. If `code_quality` module unavailable, continues with warning
+2. **Scoped to the git changed-file list** (SA-0MSKB6VWU000RT58): the scan lints only the changed files (the same file-scope manifest used for Phase 1/2) instead of the whole repo, bounding the dominant full-repo lint cost.
+3. **Read-only (never auto-fixes)**: audits call with `fix=False` — linters may not mutate files during an audit. Findings that were previously auto-fixed now surface as findings (severity classification unchanged).
+4. Critical/high findings → "Ready to close: No"; medium/low are warnings
+5. Quality epics ("Quality Improvement - Refactoring") created/reused for findings
+6. If `code_quality` module unavailable, continues with warning
 
 - Persist from stdin: `cat report.md | python3 ./scripts/persist_audit.py --issue-id SA-123`
 - Persist from a file: `python3 ./scripts/persist_audit.py --issue-id SA-123 --file report.md`

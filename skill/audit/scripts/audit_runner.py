@@ -4092,7 +4092,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
         cq_skipped_reason: str | None = None
         try:
             from skill.code_review.scripts.code_quality import run_code_quality
-            cq_result = run_code_quality(project_root=TARGET_PROJECT_ROOT, runner=runner, fix=True)
+            # Scoped, read-only code-quality scan (SA-0MSKB6VWU000RT58): the
+            # audit lints only the git changed-file list (already computed for
+            # the Phase 1/2 file-scope manifest) instead of the whole repo, and
+            # never mutates files (fix=False — audits are read-only). The
+            # changed-file list doubles as the scoping manifest, so no extra
+            # git scan is issued here.
+            cq_scope_files = _git_changed_files(runner)
+            cq_result = run_code_quality(
+                project_root=TARGET_PROJECT_ROOT, runner=runner, fix=False,
+                files=cq_scope_files or None,
+            )
             if cq_result.get("success", False):
                 cq_findings = cq_result.get("findings", [])
                 cq_fixes_applied = cq_result.get("fixes_applied", 0)
