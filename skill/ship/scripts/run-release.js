@@ -104,6 +104,27 @@ export function clearCodeFreezeMarker(projectRoot = resolveProjectRoot()) {
   }
 }
 
+// ── releaseScriptForwardArgs ─────────────────────────────────────────────────
+
+// Flags consumed by run-release.js itself (e.g. gate bypass) and therefore
+// NEVER forwarded to the canonical merge script, which rejects unknown flags
+// with exit 2 ("Unknown arg: ..."). See SA-0MSKYGAWJ0009M3P.
+const WRAPPER_ONLY_FLAGS = new Set(['--skip-checks']);
+
+/**
+ * Compute the argument list to forward to the canonical merge script.
+ *
+ * Strips wrapper-only flags (currently just `--skip-checks`) so the merge
+ * script never sees arguments it does not understand. All other flags
+ * (`--dry-run`, `--force`, `--work-item-id`, `--bump`) pass through unchanged.
+ *
+ * @param {string[]} [cliArgs] - Full CLI arguments given to run-release.js.
+ * @returns {string[]} Arguments safe to forward to the merge script.
+ */
+export function releaseScriptForwardArgs(cliArgs) {
+  return (cliArgs || []).filter((arg) => !WRAPPER_ONLY_FLAGS.has(arg));
+}
+
 // ── parsePRUrl ───────────────────────────────────────────────────────────────
 
 /**
@@ -660,7 +681,10 @@ async function runReleaseImpl(cliArgs = []) {
   // ── Step 5: Execute the release script ─────────────────────────────────
   console.log('Executing release script...\n');
 
-  const child = spawnSync('bash', [selectedScript, ...args], {
+  // Wrapper-only flags (e.g. --skip-checks) must not reach the merge script,
+  // which rejects unknown arguments (SA-0MSKYGAWJ0009M3P).
+  const forwardedArgs = releaseScriptForwardArgs(args);
+  const child = spawnSync('bash', [selectedScript, ...forwardedArgs], {
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
     timeout: RELEASE_SCRIPT_TIMEOUT_MS,
