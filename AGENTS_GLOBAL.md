@@ -126,8 +126,9 @@ Work items have two lifecycle axes that agents must manage independently:
 Track with `--issue-type`:
 
 - bug — Something broken
+- docs — Documentation (guides, README, API docs, podcast scripts)
 - feature — New functionality
-- task — Work item (tests, docs, refactoring)
+- task — Work item (tests, refactoring)
 - epic — Large feature with subtasks
 - chore — Maintenance (dependencies, tooling)
 
