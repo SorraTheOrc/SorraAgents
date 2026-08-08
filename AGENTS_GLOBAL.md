@@ -224,21 +224,15 @@ wl in_progress --assignee "<agent>" --json
 wl recent --json
 wl recent --number 10 --children --json
 
-# List items — ALWAYS use a search term or a filter flag (--status/--priority/--tags/--assignee/--stage)
-# NEVER run bare `wl list --json`: it dumps the ENTIRE worklog (all items + full descriptions, potentially MBs)
-# into context, and the whole dump is re-transmitted on every subsequent request.
-wl list --status open --json
-wl list --priority high --json
-wl list --tags "frontend,bug" --json
-wl list --assignee "<name>" --json
-wl list --stage review --json
-
-# Search — two approaches, use the right one:
+# List/Search — NEVER run `wl list` without a search term.
+# Bare `wl list --json` or filter-only variants (e.g. `wl list --status open`, `wl list --priority high`)
+# dump the ENTIRE worklog (all items + full descriptions, potentially MBs) into context, and the whole
+# dump is re-transmitted on every subsequent request. Two search approaches, use the right one:
 #
-# 1) wl list <term>  — substring/LIKE match over title AND description. Returns full records of
+# 1) wl list <term> — substring/LIKE match over title AND description. Returns full records of
 #    matching items only. USE WHEN: you need an exact filename, path, or partial string that may
 #    contain punctuation (e.g. `wl list podcast_6`, `wl list github.ts`). This is the ONLY tool
-#    that matches punctuation-bearing strings.
+#    that matches punctuation-bearing strings. Filters may be combined with the term.
 wl list <search-term> --json
 wl list <search-term> --status open --json
 #
