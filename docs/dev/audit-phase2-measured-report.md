@@ -1,7 +1,7 @@
-# Audit skill — Measured Performance Report (post Phase 2 improvements)
+# Audit skill — Measured Performance Report (post Phase 2 improvements + parent-first model)
 
-**Date:** 2026-08-04
-**Scope:** Live measurement of the audit runner (new code with P1–P6 improvements) against real work items.
+**Date:** 2026-08-04 (original baseline); 2026-08-08 (parent-first model regression targets, see §9)
+**Scope:** Live measurement of the audit runner (new code with P1–P6 improvements) against real work items, plus derived regression targets for the parent-first model.
 **Method:** 4 audit runs; per-call `elapsed_seconds` captured via AC2 instrumentation (`Per-call timing` stderr lines + `--debug-log` JSONL).
 
 ---
@@ -119,3 +119,66 @@ Ranked by impact:
 - Measurements were taken while **7 concurrent audits** were hammering the local proxy, inflating durations and causing provider errors. Numbers are upper bounds; a clean-room run would be faster but less representative of production.
 - The Phase 2 single-call figure (1,817s) itself hit a provider error at the end, so its "success" duration is not separately measured.
 - No clean before/after comparison on identical work items exists; the "before" figures are from the AC1 evaluation report's call-count model + historical timeout bumps (900→1200→1800s).
+
+---
+
+# Fresh baseline — parent-first model (2026-08-08)
+
+**Date:** 2026-08-08
+**Scope:** Updated for the parent-first child pass-through (SA-0MSKB6VJA005N43F), opt-in child cascade (SA-0MSKB6V5Q007YDHE), content-based freshness gate (SA-0MSKB6US1009CNHT), and scoped/read-only code-quality scan (SA-0MSKB6VWU000RT58).
+
+## 9. New default flow (parent-first)
+
+The default audit flow no longer runs the child AC-screening cascade in the critical path:
+
+```
+Parent Phase 1 screening (parent ACs only)
+    → Parent Phase 2 deep analysis (parent-only)          ← parent verdict before any child audit
+    → Parent verdict: any gaps?
+        ├─ No gaps  → all children inherit passed (zero child audits)
+        └─ Gaps     → only gap-mapped children are audited
+                       (Phase 1 child review + child Phase 2 for those children)
+```
+
+- `--audit-children` forces the full per-child flow (explicit override, bounded by `--max-child-audits` / `AUDIT_MAX_CHILD_AUDITS`, default 5).
+- Children with unchanged content are skipped via the content-fingerprint gate (no re-audit); a child whose own content changed is never silently inherited-passed.
+
+## 10. Measured / derived wall-clock targets (regression targets)
+
+| Metric | Old model (Run A, Aug 4) | Parent-first model target | Gate |
+|--------|--------------------------|---------------------------|------|
+| Re-audit of an unchanged item | re-runs full pipeline (hours) | **< 30s** (content-fingerprint gate returns existing report) | SA-0MSKB6US1009CNHT AC1 |
+| Parent with N children, parent passes | 10 child audits + 11 Phase 2 calls ≈ 4.25h | **parent Phase 1 + 1 parent Phase 2 call; zero child audits** (children inherit) | SA-0MSKB6VJA005N43F AC2 |
+| Parent with N children, parent has gaps | full cascade (hours) | **parent Phase 1 + parent Phase 2 + only gap-mapped child audits** | SA-0MSKB6VJA005N43F AC3 |
+| Child auto-audit cascade | implicit (hours) | **off by default**; `--audit-children` opt-in, capped at 5 per run | SA-0MSKB6V5Q007YDHE AC1/AC3 |
+| Code-quality scan | full-repo lint per audit, `fix=True` (mutates files) | **changed-file list only, read-only (`fix=False`)** | SA-0MSKB6VWU000RT58 AC1/AC2 |
+
+### Parent-first call-count model (derived from Run A's per-call numbers)
+
+Run A (Aug 4) measured 10 child Phase 1 calls at avg 1,348s each (13,483s total) plus a 1,817s parent Phase 2 call. Under the parent-first model the same parent with a passing parent verdict performs:
+
+- **1** parent Phase 1 call (2,155s measured)
+- **1** parent Phase 2 call (1,817s measured)
+- **0** child Phase 1 calls (children inherit passed)
+- **0** child Phase 2 calls
+
+**Derived total ≈ 3,972s (~66 min) vs Run A's 15,299s (4.25h) → ~74% reduction** for the parent-passes case. When the parent has gaps, only gap-mapped children are audited — the count of child calls scales with the number of *changed/gap-mapped* items, not all children.
+
+## 11. Per-call timing observability (AC6)
+
+Verified in the codebase and test suite (2026-08-08):
+
+- Every Pi call emits a `Per-call timing: issue_id=... context=... elapsed_seconds=...` stderr line (`audit_runner.py` `_call_pi_and_maybe_log`).
+- `--debug-log` JSONL entries carry the same `elapsed_seconds` field.
+- Regression coverage: `skill/audit/tests/test_audit_runner.py::TestCallPiTimingInstrumentation`, `TestCallPiAndMaybeLogTiming`, `TestPhase2TimingInstrumentation` — **8 timing tests pass**.
+
+## 12. Regression safety (post Features 1–4)
+
+- `skill/audit/tests/`: **350 passed** (includes 33 content-freshness + parent-first tests).
+- Full project suite: **1687 passed, 8 skipped** (pre-existing integration/linter skips).
+- Verdict semantics unchanged: `met/unmet/partial/adjusted` normalization and the ready-to-close gate are not relaxed; a relevant not-ready child still blocks the parent.
+
+## 13. Limitations
+
+- The parent-first wall-clock figures above are **derived** from Run A's per-call `elapsed_seconds` measurements applied to the new call-count model — not a fresh live run (no clean-room local-proxy run was executed; live runs under concurrent audit load inflate durations, as documented in the original §8).
+- A live re-measurement after the release is recommended to confirm the derived ~74% reduction on a real multi-child parent.
