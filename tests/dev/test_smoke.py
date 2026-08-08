@@ -33,7 +33,7 @@ def test_smoke_no_ci_workflows():
     """No GitHub CI workflow files remain (project operates fully locally)."""
     assert not (_GITHUB_DIR / "workflows").exists(), \
         "CI workflows directory should have been removed"
-    assert not (_GITHUB_DIR / "ampa-dev-baseline-size").exists(), \
+    assert not (_GITHUB_DIR / "dev-baseline-size").exists(), \
         "CI baseline size file should have been removed"
 
 

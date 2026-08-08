@@ -124,7 +124,7 @@ def test_match_heuristic_2_token_overlap(monkeypatch):
                     {
                         "id": "SA-H2",
                         "title": "[test-failure] scheduler heartbeat failing",
-                        "description": 'File "ampa/scheduler.py", line 42\nHeartbeatError',
+                        "description": 'File "scheduler.py", line 42\nHeartbeatError',
                         "status": "open",
                         "updatedAt": "2026-02-20T00:00:00Z",
                     }
@@ -140,7 +140,7 @@ def test_match_heuristic_2_token_overlap(monkeypatch):
         {
             "test_name": "test_scheduler_heartbeat",
             "stdout_excerpt": "fail",
-            "stack_trace": 'File "ampa/scheduler.py", line 42\nHeartbeatError',
+            "stack_trace": 'File "scheduler.py", line 42\nHeartbeatError',
         }
     )
     assert result["created"] is False
