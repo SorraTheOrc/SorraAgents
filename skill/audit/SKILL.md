@@ -71,10 +71,11 @@ Short-circuits item-level audits when a recent, valid audit exists to avoid unne
 
 ### Behavior
 
-1. Fetch latest audit via ``wl audit-show <id> --json``; compare ``auditedAt`` against ``updatedAt + 60s``.
-2. If fresh: prints ``Skipping: audit still fresh`` + existing report, exits code 0 **without** status lifecycle.
-3. If stale or error: falls through to normal full audit.
-4. ``--force`` bypasses the gate. Applies only to item-level audits (``cmd_issue``).
+1. **Content-based gate (primary):** each audit captures a content fingerprint — git HEAD sha + work-item description hash + Key Files list — and embeds it in the persisted report (`Audit content fingerprint: <sha256hex>`). Re-auditing an item whose fingerprint is unchanged returns the existing report in seconds instead of re-running the pipeline (SA-0MSKB6US1009CNHT). A change in ANY fingerprint component (new commit, edited description/ACs, changed Key Files) invalidates freshness and re-runs the full audit.
+2. **Time gate (floor):** audits persisted without a fingerprint (legacy reports) fall back to the 60s timestamp gate — compare ``auditedAt`` against ``updatedAt + 60s``.
+3. If fresh: prints ``Skipping: audit still fresh`` + existing report, exits code 0 **without** status lifecycle.
+4. If stale or error: falls through to normal full audit.
+5. ``--force`` bypasses the gate. Applies only to item-level audits (``cmd_issue``).
 
 Configuration: ``AUDIT_FRESHNESS_BUFFER_SECONDS = 60`` (in ``./scripts/audit_runner.py``).
 
@@ -83,7 +84,7 @@ Skipping: audit still fresh
 <existing rawOutput>
 ```
 
-No status lifecycle transitions occur, and no persistence is performed.
+No status lifecycle transitions occur, and no persistence is performed. An explicit ``Ready to close: No`` verdict in the stored report is returned verbatim — it is never masked by a freshness skip.
 
 ## Safety and prompt design
 

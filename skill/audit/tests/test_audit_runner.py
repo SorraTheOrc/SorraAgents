@@ -5316,3 +5316,376 @@ class TestExtractAcs:
             "## Summary\nJust prose.\n"
         ) == ["No acceptance criteria defined."]
         assert audit_runner._extract_acs("") == ["No acceptance criteria defined."]
+
+# ===========================================================================
+# Content-based freshness gate (SA-0MSKB6US1009CNHT)
+# ===========================================================================
+
+
+class TestContentFreshnessGate:
+    """Tests for the content-based freshness gate (AC1-AC6).
+
+    The gate captures a content fingerprint (git HEAD sha + work-item
+    description hash + Key Files list) at audit time and stores it in the
+    persisted report. Re-auditing an item whose fingerprint is unchanged
+    returns the existing report in seconds instead of re-running the
+    pipeline. A change in ANY fingerprint component invalidates freshness.
+    Legacy audits without a fingerprint fall back to the 60s time floor.
+    """
+
+    _HEAD = "a" * 40
+    _DESC = "## Acceptance Criteria\n- AC1: do the thing\n\n## Key Files\n- `src/a.py`"
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _make_run_wl(self, audit_raw=None, audit_audited_at="2026-08-01T00:00:00.000Z",
+                     work_item_desc=_DESC, work_item_updated_at="2026-07-01T00:00:00.000Z"):
+        """Build a ``_run_wl`` fake returning a stored audit + work item."""
+        def _fake(runner, cmd, worklog_dir=None):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return {
+                    "success": True,
+                    "audit": {
+                        "auditedAt": audit_audited_at,
+                        "rawOutput": audit_raw or "",
+                    },
+                }
+            if "show" in cmd_str and "--children" not in cmd_str:
+                return {
+                    "success": True,
+                    "workItem": {
+                        "id": "TEST-1",
+                        "description": work_item_desc,
+                        "updatedAt": work_item_updated_at,
+                    },
+                }
+            raise AssertionError(f"unexpected wl command: {cmd_str}")
+        return _fake
+
+    def _report_with_fingerprint(self, fingerprint, verdict="Yes"):
+        """Assemble a report body carrying a fingerprint line."""
+        return (
+            f"Ready to close: {verdict}\n\n"
+            f"Audit report for work item TEST-1\n\n"
+            f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fingerprint}\n\n"
+            "## Summary\nAll criteria acceptable."
+        )
+
+    def _check(self, run_wl_fake, head=_HEAD):
+        """Run _check_audit_freshness with mocked wl + git HEAD."""
+        with (
+            mock.patch.object(audit_runner, "_run_wl", side_effect=run_wl_fake),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head", return_value=head,
+            ),
+        ):
+            return audit_runner._check_audit_freshness(mock.MagicMock(), "TEST-1")
+
+    # ------------------------------------------------------------------
+    # Fingerprint computation (AC2)
+    # ------------------------------------------------------------------
+
+    def test_fingerprint_changes_with_head_sha(self):
+        """AC2/AC3: a different HEAD sha yields a different fingerprint."""
+        with mock.patch.object(audit_runner, "_resolve_audited_head") as mock_head:
+            mock_head.side_effect = ["h" * 40, "g" * 40]
+            f1 = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+            f2 = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+        assert f1 != f2
+        assert len(f1) == 64  # sha256 hex
+
+    def test_fingerprint_changes_with_description(self):
+        """AC3: a different description (ACs) yields a different fingerprint."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            f1 = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+            f2 = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1",
+                work_item={"description": self._DESC + "\n- AC2: more"},
+            )
+        assert f1 != f2
+
+    def test_fingerprint_changes_with_key_files(self):
+        """AC3: a different Key Files list yields a different fingerprint."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            f1 = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+            f2 = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1",
+                work_item={"description": self._DESC + "\n- `src/b.py`"},
+            )
+        assert f1 != f2
+
+    def test_fingerprint_none_when_git_unavailable(self):
+        """AC2 (fail-open): no HEAD sha → no fingerprint (pipeline re-runs)."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=None,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+        assert fp is None
+
+    def test_extract_fingerprint_roundtrip(self):
+        """AC2: the fingerprint line is extracted back from a stored report."""
+        fp = "f" * 64
+        report = self._report_with_fingerprint(fp)
+        assert audit_runner._extract_content_fingerprint(report) == fp
+
+    def test_extract_fingerprint_none_for_legacy_report(self):
+        """Legacy reports without the line yield None (time floor applies)."""
+        assert audit_runner._extract_content_fingerprint(
+            "Ready to close: Yes\n\n## Summary\nok"
+        ) is None
+
+    # ------------------------------------------------------------------
+    # Freshness gate decisions (AC1, AC3)
+    # ------------------------------------------------------------------
+
+    def test_unchanged_fingerprint_skips(self):
+        """AC1: unchanged fingerprint → existing report returned (skip)."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+        report = self._report_with_fingerprint(fp)
+        run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
+        result = self._check(run_wl)
+        assert result == report
+
+    def test_head_sha_changed_reauths(self):
+        """AC3: changed HEAD sha → fingerprint mismatch → re-audit (None)."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+        report = self._report_with_fingerprint(fp)
+        run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
+        # Now the repository moved to a different HEAD
+        result = self._check(run_wl, head="b" * 40)
+        assert result is None
+
+    def test_description_changed_reauths(self):
+        """AC3: changed description → fingerprint mismatch → re-audit."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+        report = self._report_with_fingerprint(fp)
+        changed_desc = self._DESC + "\n- AC2: added later"
+        run_wl = self._make_run_wl(audit_raw=report, work_item_desc=changed_desc)
+        result = self._check(run_wl)
+        assert result is None
+
+    def test_key_files_changed_reauths(self):
+        """AC3: changed Key Files → fingerprint mismatch → re-audit."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+        report = self._report_with_fingerprint(fp)
+        changed_desc = self._DESC + "\n- `src/other.py`"
+        run_wl = self._make_run_wl(audit_raw=report, work_item_desc=changed_desc)
+        result = self._check(run_wl)
+        assert result is None
+
+    def test_ready_no_verdict_not_masked_by_skip(self):
+        """AC5: a stored 'Ready to close: No' verdict is returned verbatim,
+        never masked by a freshness skip."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+        report = self._report_with_fingerprint(fp, verdict="No")
+        run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
+        result = self._check(run_wl)
+        assert result == report
+        assert "Ready to close: No" in result
+
+    # ------------------------------------------------------------------
+    # 60s time floor interaction (AC1, AC4)
+    # ------------------------------------------------------------------
+
+    def test_legacy_audit_without_fingerprint_uses_time_floor(self):
+        """AC1/AC4: audits without a fingerprint fall back to the 60s time
+        gate — fresh when auditedAt > updatedAt + 60s, stale otherwise."""
+        legacy_report = "Ready to close: Yes\n\n## Summary\nlegacy audit"
+        # Audit 1 day after the last update → fresh by time gate
+        run_wl = self._make_run_wl(
+            audit_raw=legacy_report,
+            audit_audited_at="2026-08-02T00:00:00.000Z",
+            work_item_updated_at="2026-08-01T00:00:00.000Z",
+        )
+        assert self._check(run_wl) == legacy_report
+
+        # Audit BEFORE the last update → stale by time gate
+        run_wl = self._make_run_wl(
+            audit_raw=legacy_report,
+            audit_audited_at="2026-08-01T00:00:00.000Z",
+            work_item_updated_at="2026-08-02T00:00:00.000Z",
+        )
+        assert self._check(run_wl) is None
+
+    def test_fingerprint_gate_not_blocked_by_recent_update(self):
+        """AC1: the content gate skips even when updatedAt moved after the
+        audit (e.g. a comment added) — the 60s floor only applies to legacy
+        audits without a fingerprint."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+        report = self._report_with_fingerprint(fp)
+        # Item was updated AFTER the audit (updatedAt > auditedAt)
+        run_wl = self._make_run_wl(
+            audit_raw=report,
+            audit_audited_at="2026-08-01T00:00:00.000Z",
+            work_item_updated_at="2026-08-05T00:00:00.000Z",
+        )
+        result = self._check(run_wl)
+        assert result == report
+
+    def test_fingerprint_unavailable_reauths_fail_open(self):
+        """AC1 (fail-open): when the stored audit has a fingerprint but the
+        current fingerprint cannot be computed (git unavailable), the gate
+        re-runs the pipeline instead of guessing."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+        report = self._report_with_fingerprint(fp)
+        run_wl = self._make_run_wl(audit_raw=report, work_item_desc=self._DESC)
+        # Git unavailable now → fingerprint computation returns None
+        result = self._check(run_wl, head=None)
+        assert result is None
+
+    # ------------------------------------------------------------------
+    # Report embedding (AC2)
+    # ------------------------------------------------------------------
+
+    def test_report_embeds_fingerprint_line(self):
+        """AC2: the assembled report embeds the fingerprint metadata line so
+        the persisted audit carries the freshness gate data."""
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, [], [],
+            model="Local Proxy/plan", model_source="local",
+            content_fingerprint="f" * 64,
+        )
+        assert f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}{'f' * 64}" in report
+
+    def test_report_without_fingerprint_has_no_line(self):
+        """Backward compatibility: no fingerprint → no metadata line."""
+        report = audit_runner._assemble_issue_report(
+            {"id": "TEST-1"}, [], [],
+            model="Local Proxy/plan", model_source="local",
+        )
+        assert "Audit content fingerprint" not in report
+
+    # ------------------------------------------------------------------
+    # cmd_issue integration (AC4: --force bypass)
+    # ------------------------------------------------------------------
+
+    def test_force_bypasses_content_gate(self):
+        """AC4: --force bypasses the content gate (fresh audit still
+        re-runs the pipeline)."""
+        updates = []
+
+        def _make_runner():
+            mock_runner = mock.MagicMock()
+
+            def _side_effect(cmd):
+                cmd_str = " ".join(cmd)
+                if "audit-show" in cmd_str:
+                    # Stored audit WITH a matching fingerprint
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "audit": {
+                                "auditedAt": "2026-08-01T00:00:00.000Z",
+                                "rawOutput": self._report_with_fingerprint("f" * 64),
+                            },
+                        }),
+                        stderr="",
+                    )
+                if "update" in cmd_str:
+                    updates.append(list(cmd))
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"success": True}), stderr="",
+                    )
+                if "show" in cmd_str and "--children" not in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "workItem": {
+                                "id": "TEST-1", "status": "open",
+                                "stage": "plan_complete",
+                            },
+                        }),
+                        stderr="",
+                    )
+                if "--children" in cmd_str:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "workItem": {
+                                "id": "TEST-1", "status": "open",
+                                "stage": "plan_complete",
+                                "description": self._DESC,
+                            },
+                            "children": [],
+                        }),
+                        stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+            mock_runner.side_effect = _side_effect
+            return mock_runner
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log",
+                return_value={"extracted_text": "[]"},
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=_make_runner(),
+            )
+        assert rc == 0

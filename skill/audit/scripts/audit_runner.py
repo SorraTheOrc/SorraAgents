@@ -39,6 +39,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -273,7 +274,20 @@ AUDIT_FRESHNESS_BUFFER_SECONDS = 60
 
 When the audit's ``auditedAt`` timestamp is more recent than the work item's
 ``updatedAt`` timestamp plus this buffer, the audit is considered fresh and
-the runner skips the full audit pipeline.
+the runner skips the full audit pipeline. This time gate remains as a floor
+for audits that carry no content fingerprint (SA-0MSKB6US1009CNHT); audits
+with a fingerprint are gated on content match instead (see
+``_check_audit_freshness``).
+"""
+
+AUDIT_CONTENT_FINGERPRINT_PREFIX = "Audit content fingerprint: "
+"""Prefix of the content-fingerprint metadata line embedded in audit reports.
+
+The content fingerprint (git HEAD sha + work-item description hash + Key Files
+list, captured at audit time) is embedded in the persisted report so a re-audit
+of an unchanged item can skip the pipeline in seconds instead of re-running it
+(SA-0MSKB6US1009CNHT). The line is parsed back out by
+``_extract_content_fingerprint``.
 """
 
 AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS = 30
@@ -544,9 +558,21 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
                            worklog_dir: str | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
 
-    Fetches the latest audit via ``wl audit-show <id> --json`` and compares
-    the audit's ``auditedAt`` timestamp against the work item's ``updatedAt``
-    timestamp plus ``AUDIT_FRESHNESS_BUFFER_SECONDS``.
+    Two-stage freshness gate:
+
+    1. **Content-based gate (primary, SA-0MSKB6US1009CNHT):** when the
+       stored audit report carries a content fingerprint (git HEAD sha +
+       work-item description hash + Key Files list captured at audit time),
+       the audit is fresh iff the fingerprint is unchanged. This makes
+       re-audits of unchanged items return the existing report in seconds
+       instead of re-running the pipeline, even when ``updatedAt`` moved for
+       non-content reasons (e.g. a comment was added). A change in ANY
+       fingerprint component invalidates freshness and re-runs the pipeline.
+    2. **Time gate (floor):** when the stored report carries no fingerprint
+       (e.g. legacy audits persisted before the fingerprint feature), the
+       existing 60s time gate is retained as the freshness floor: compare
+       the audit's ``auditedAt`` against the work item's ``updatedAt`` plus
+       ``AUDIT_FRESHNESS_BUFFER_SECONDS``.
 
     Returns the ``rawOutput`` of the existing audit if still fresh, ``None``
     otherwise (no prior audit, stale audit, or command failure).
@@ -575,6 +601,26 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     if not audited_at or not raw_output:
         return None
 
+    # ── Content-based freshness gate (SA-0MSKB6US1009CNHT) ─────────────
+    # When the stored audit carries a content fingerprint, freshness is
+    # decided by content match: re-auditing an item whose git HEAD sha,
+    # description hash, and Key Files are unchanged returns the existing
+    # report in seconds instead of re-running the pipeline.
+    stored_fingerprint = _extract_content_fingerprint(raw_output)
+    if stored_fingerprint is not None:
+        current_fingerprint = _compute_content_fingerprint(
+            runner, issue_id, worklog_dir=worklog_dir,
+        )
+        if current_fingerprint is None:
+            # Fingerprint cannot be computed now (e.g. git unavailable) —
+            # fail open and let the pipeline re-run.
+            return None
+        if current_fingerprint == stored_fingerprint:
+            return raw_output
+        # Content changed → stale → re-run the pipeline.
+        return None
+
+    # ── Time gate (floor): legacy audits without a fingerprint ──────────
     # Get the work item's updatedAt
     try:
         wi_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
@@ -610,6 +656,63 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
         return None
 
     return None
+
+
+def _extract_content_fingerprint(report_text: str) -> str | None:
+    """Extract the content fingerprint from a persisted audit report.
+
+    The fingerprint is stored as a metadata line in the report:
+    ``Audit content fingerprint: <sha256-hex>``. Returns the fingerprint
+    value, or ``None`` when the report carries no fingerprint (e.g. legacy
+    audits persisted before SA-0MSKB6US1009CNHT, or manual reports).
+    """
+    if not report_text:
+        return None
+    for line in report_text.splitlines():
+        if line.startswith(AUDIT_CONTENT_FINGERPRINT_PREFIX):
+            value = line[len(AUDIT_CONTENT_FINGERPRINT_PREFIX):].strip()
+            return value or None
+    return None
+
+
+def _compute_content_fingerprint(runner: Runner, issue_id: str,
+                                 worklog_dir: str | None = None,
+                                 work_item: dict | None = None) -> str | None:
+    """Compute the content fingerprint for a work item at the current state.
+
+    The fingerprint combines three components so that a change in ANY of them
+    invalidates freshness (SA-0MSKB6US1009CNHT):
+
+    1. **git HEAD sha** — the repository state being audited.
+    2. **work-item description hash** — the audited acceptance criteria text.
+    3. **Key Files list** — the file-scope manifest of the audited item.
+
+    *work_item* may be passed in to avoid a redundant ``wl show`` call when
+    the caller already fetched the work item (e.g. ``cmd_issue``). When
+    omitted, the work item is fetched via ``wl show``.
+
+    Returns a sha256 hex digest of the canonical JSON payload, or ``None``
+    when the fingerprint cannot be determined (git unavailable, wl show
+    failure, or missing data) so callers fail open and re-run the pipeline.
+    """
+    head_sha = _resolve_audited_head(runner)
+    if head_sha is None:
+        return None
+    if work_item is None:
+        try:
+            data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                           worklog_dir=worklog_dir)
+        except RuntimeError:
+            return None
+        work_item = data.get("workItem", {}) if isinstance(data, dict) else {}
+    description = work_item.get("description", "") or ""
+    key_files = _extract_key_files(description)
+    payload = json.dumps({
+        "head_sha": head_sha,
+        "description_hash": hashlib.sha256(description.encode("utf-8")).hexdigest(),
+        "key_files": key_files,
+    }, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -1751,7 +1854,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            model_source: str | None = _MISSING,
                            phase2_completed: bool = False,
                            green_run_sha: str | None = None,
-                           auto_green_run_sha: str | None = None) -> str:
+                           auto_green_run_sha: str | None = None,
+                           content_fingerprint: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -1780,6 +1884,14 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       cache, SA-0MSIU5HFI0024D7W). When provided, an
       ``Automatic green run evidence: <sha> (cached full-suite run)`` line is
       emitted near the header so the report records the evidence source.
+
+    *content_fingerprint* is the content fingerprint (git HEAD sha +
+      description hash + Key Files, see ``_compute_content_fingerprint``)
+      captured at audit time. When provided, an
+      ``Audit content fingerprint: <hex>`` line is emitted near the header so
+      the persisted report carries the freshness gate data
+      (SA-0MSKB6US1009CNHT). The line is parsed back by
+      ``_extract_content_fingerprint``.
 
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
@@ -1865,6 +1977,9 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 f"Automatic green run evidence: {auto_green_run_sha} "
                 "(cached full-suite run)"
             )
+        if content_fingerprint:
+            lines.append("")
+            lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
         lines.extend(["", "## Summary", ""])
     else:
         lines = [
@@ -1881,6 +1996,9 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 f"Automatic green run evidence: {auto_green_run_sha} "
                 "(cached full-suite run)"
             )
+        if content_fingerprint:
+            lines.append("")
+            lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
         lines.extend(["", "## Summary", ""])
 
     # Count verdicts across all criteria (parent + children)
@@ -3770,6 +3888,16 @@ def cmd_issue(issue_id: str, persist: bool = True,
         children = data.get("children", [])
         description = work_item.get("description", "")
 
+        # Capture the content fingerprint at audit time (SA-0MSKB6US1009CNHT):
+        # git HEAD sha + work-item description hash + Key Files list. The
+        # fingerprint is embedded in the persisted report so a re-audit of an
+        # unchanged item skips the pipeline (content-based freshness gate).
+        # Fail-open: if the fingerprint cannot be computed (git unavailable,
+        # wl failure), the audit proceeds and simply stores no fingerprint.
+        content_fingerprint = _compute_content_fingerprint(
+            runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
+        )
+
         # ------------------------------------------------------------------
         # Code quality check (before AC verification)
         # ------------------------------------------------------------------
@@ -4246,6 +4374,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 phase2_completed=phase2_completed,
                 green_run_sha=green_run_sha,
                 auto_green_run_sha=auto_green_run_sha,
+                content_fingerprint=content_fingerprint,
             )
             # Wrap report with failure notice if any subprocess calls failed
             if script_failure:
