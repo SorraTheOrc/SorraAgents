@@ -249,13 +249,22 @@ then stdout text, then stderr) instead of empty stderr.
 
 **Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard skips remaining child audits to prevent silent kill; the default scales with the number of active children (`110s` base + `600s` per child — e.g. ~710s for a single child, ~6,110s for a 10-child parent), so multi-child audits with default settings attempt child auto-audits instead of silently degrading to parent-only. Override with an exact value via `--parent-timeout SECONDS` or the `AUDIT_PARENT_TIMEOUT` env var (e.g. `AUDIT_PARENT_TIMEOUT=3600`) to audit items with many children in one pass on harnesses whose bash tool allows longer runs. Precedence: `--parent-timeout` flag > `AUDIT_PARENT_TIMEOUT` env var > child-count-scaled default. When the guard does trip, the skip diagnostic names the computed budget and the `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` override. On timeout, returns `unmet` with evidence "Pi model call timed out."
 
-**Child audit cascade (opt-in):** the recursive child-audit cascade — where a parent with unaudited children spawns a full child audit per child — is **OFF by default** (SA-0MSKB6V5Q007YDHE). A parent with children that lack fresh audits no longer implicitly spawns a cascade that can take hours. Enable it explicitly:
+**Parent-first child pass-through (default):** item audits run a **full parent-only audit first** — Phase 1 screens parent ACs only (no child AC screening) and Phase 2 parent deep analysis completes before any child audit is considered (SA-0MSKB6VJA005N43F). The parent verdict then drives the child pass-through:
+
+- **Parent passes with no gaps** (all ACs `met`/`adjusted`, no blocking CQ findings) → all children **inherit passed** by virtue of the parent — zero child audits. Children whose own content changed (content-fingerprint mismatch, Feature 1) are never silently inherited-passed: they are audited.
+- **Parent has gaps** (`unmet`/`partial` ACs or blocking CQ findings) → only the child(ren) mapped to the gap files (via the Phase 1/2 file-scope manifest and child Key Files) receive full audits; unrelated children are not audited.
+- Inherited/not-audited children are marked **explicitly** in the report (`Inherited from parent pass` / `Not audited (unrelated to parent gaps)`) — never silent.
+- Verdict semantics are unchanged: a relevant not-ready child still blocks the parent (`Ready to close: No`).
+
+`--audit-children` is the **explicit override** that forces the full per-child flow below regardless of the parent result.
+
+**Child audit cascade (opt-in via `--audit-children`):** the recursive child-audit cascade — where a parent with unaudited children spawns a full child audit per child — is **OFF by default** (SA-0MSKB6V5Q007YDHE). A parent with children that lack fresh audits no longer implicitly spawns a cascade that can take hours. Enable it explicitly:
 
 ```bash
 python3 ./scripts/audit_runner.py issue SA-123 --audit-children
 ```
 
-- `--audit-children` enables the cascade (default: no cascade — children without fresh audits stay not-ready and block the parent, verdict semantics unchanged).
+- `--audit-children` forces the full per-child flow (override of the default parent-first pass-through): each child without a fresh audit is independently reviewed; children without fresh audits that stay not-ready block the parent, verdict semantics unchanged.
 - `--max-child-audits N` (env `AUDIT_MAX_CHILD_AUDITS`) bounds the number of child audits a single run may auto-trigger (default: `5`).
 - Children with unchanged content are skipped via the content-based freshness gate — their stored verdict is reused instead of re-auditing.
 

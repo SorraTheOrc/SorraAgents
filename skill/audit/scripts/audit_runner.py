@@ -1966,10 +1966,13 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         r["verdict"] in _ACCEPTABLE_VERDICTS
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
-    # Check that all active children are in in_review or done stage
+    # Check that all active children are in in_review or done stage.
+    # Children that inherited the parent's pass (parent-first pass-through,
+    # SA-0MSKB6VJA005N43F) count as reviewed by virtue of the parent — they
+    # are not independently audited but the parent verdict covers them.
     active_children = [c for c in child_results if c.get("stage") not in ("", None)]
     all_children_reviewed = all(
-        c.get("stage") in ("in_review", "done")
+        c.get("stage") in ("in_review", "done") or c.get("inherited_pass")
         for c in active_children
     )
 
@@ -2180,6 +2183,21 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 f"{child['status']}/{child['stage']}"
             )
             lines.append("")
+            if child.get("inherited_pass"):
+                # Parent-first pass-through (SA-0MSKB6VJA005N43F): the child
+                # inherited the parent's pass — explicit, never silent.
+                lines.append(
+                    "**Inherited from parent pass** — the parent audit found no "
+                    "gaps, so this child was not independently audited."
+                )
+                lines.append("")
+            elif child.get("pass_through") == "unrelated_to_gaps":
+                lines.append(
+                    "**Not audited (unrelated to parent gaps)** — the parent "
+                    "audit has gaps in other areas; this child is not mapped to "
+                    "any gap and was not audited."
+                )
+                lines.append("")
             if child.get("ac_results"):
                 lines.append("| # | Criterion | Verdict | Evidence |")
                 lines.append("|---|-----------|---------|----------|")
@@ -2853,6 +2871,79 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
     return ci, child_ac_results
 
 
+def _parent_has_gaps(ac_results: list[dict]) -> bool:
+    """Return True when the parent audit has any gap (unmet/partial AC).
+
+    ``adjusted`` verdicts are acceptable variance and do NOT count as gaps
+    (consistent with ``_ACCEPTABLE_VERDICTS``). The parent-first child
+    pass-through (SA-0MSKB6VJA005N43F) uses this to decide whether children
+    inherit the parent's pass or are audited: parent passes with no gaps →
+    all children inherit passed; parent has gaps → only gap-mapped children
+    are audited.
+    """
+    return any(r.get("verdict") not in _ACCEPTABLE_VERDICTS for r in ac_results)
+
+
+def _child_content_changed(runner: Runner, child_id: str,
+                           worklog_dir: str | None = None) -> bool:
+    """Return True when a child's own content changed since its last audit.
+
+    Uses the Feature 1 content-based freshness gate (SA-0MSKB6US1009CNHT): a
+    stored audit whose content fingerprint no longer matches means the
+    child's content changed, so the child must NOT silently inherit the
+    parent's pass (SA-0MSKB6VJA005N43F AC6). Children with no stored audit
+    (never audited) return False — nothing to compare, so inheritance is
+    safe. A child with a content-fresh audit returns False too.
+    """
+    fresh_report = _check_audit_freshness(
+        runner, child_id, worklog_dir=worklog_dir,
+    )
+    if fresh_report is not None:
+        return False  # content-fresh audit exists → unchanged
+    # No content-fresh audit: distinguish "never audited" from "content
+    # changed" by checking whether an audit record exists at all.
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"],
+                       worklog_dir=worklog_dir)
+    except RuntimeError:
+        return False  # cannot determine → treat as unchanged (fail-open)
+    audit = data.get("audit") if isinstance(data, dict) else None
+    return audit is not None  # audit exists but content-fresh gate failed → changed
+
+
+def _map_gaps_to_children(ac_results: list[dict],
+                          child_results: list[dict]) -> list[str]:
+    """Map parent gap ACs to the child work items that own the affected files.
+
+    For each gap AC (unmet/partial), extract file references from its
+    evidence (``path/file.ext:line``) and from the parent's Key Files, then
+    return the child ids whose own description Key Files intersect those
+    references. When no mapping can be determined (no file refs, no child Key
+    Files), ALL children are returned so nothing is silently skipped
+    (conservative — a not-ready child still blocks the parent).
+    """
+    gap_refs: set[str] = set()
+    for r in ac_results:
+        if r.get("verdict") in _ACCEPTABLE_VERDICTS:
+            continue
+        evidence = r.get("evidence", "") or ""
+        for m in re.finditer(r"([\w./-]+\.\w+)(?::\d+)?", evidence):
+            gap_refs.add(m.group(1))
+    if not gap_refs:
+        # No evidence file refs to map from — conservative: audit all children.
+        return [c.get("id", "") for c in child_results if c.get("id")]
+
+    mapped: list[str] = []
+    for child in child_results:
+        child_key_files = _extract_key_files(child.get("description", "") or "")
+        if any(kf in gap_refs for kf in child_key_files):
+            mapped.append(child.get("id", ""))
+    if not mapped:
+        # No child Key Files intersect the gap refs — conservative: audit all.
+        return [c.get("id", "") for c in child_results if c.get("id")]
+    return mapped
+
+
 def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict]) -> tuple[bool, str]:
     """Check whether Phase 1 automated screening has blocking issues.
 
@@ -2872,10 +2963,13 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
         if f.get("severity") in ("critical", "high"):
             return True, f"Critical/high code quality finding: {f.get('file', '?')}:{f.get('line', 0)} — {f.get('message', '')}"
 
-    # Check children stages — skip deleted children
+    # Check children stages — skip deleted children and inherited-pass
+    # children (parent-first pass-through, SA-0MSKB6VJA005N43F: an inherited
+    # child is reviewed by virtue of the parent's pass).
     active_children = [
         c for c in child_results
         if c.get("stage") not in ("", None) and c.get("status") != "deleted"
+        and not c.get("inherited_pass")
     ]
     blocked_children = [
         c for c in active_children
@@ -2922,10 +3016,12 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
         r["verdict"] in _ACCEPTABLE_VERDICTS
         for r in ac_results + [c for cr in child_results for c in cr.get("ac_results", [])]
     )
-    # Check that all active children are in in_review or done stage
+    # Check that all active children are in in_review or done stage.
+    # Children that inherited the parent's pass (parent-first pass-through,
+    # SA-0MSKB6VJA005N43F) count as reviewed by virtue of the parent.
     active_children = [c for c in child_results if c.get("stage") not in ("", None)]
     all_children_reviewed = all(
-        c.get("stage") in ("in_review", "done")
+        c.get("stage") in ("in_review", "done") or c.get("inherited_pass")
         for c in active_children
     )
 
@@ -3360,6 +3456,7 @@ def _run_phase2_deep_analysis(
     worklog_dir: str | None = None,
     ac_fallback_used: threading.Event | None = None,
     green_run_block: str | None = None,
+    skip_parent_deep: bool = False,
 ) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
@@ -3377,6 +3474,12 @@ def _run_phase2_deep_analysis(
     child (``phase2_child``) and batch (``phase2_batch``) prompts so the
     model may mark execution-dependent criteria met based on the operator
     attestation.
+
+    *skip_parent_deep* (SA-0MSKB6VJA005N43F) skips the parent deep call and
+    only runs child deep analysis. The parent-first flow runs parent Phase 2
+    FIRST (parent-only), then passes the already-deep-verified parent
+    ``ac_results`` back in with the gap-mapped children so the parent call is
+    not duplicated.
 
     Returns (updated_ac_results, updated_child_results, phase2_completed).
     The ``phase2_completed`` flag is ``False`` when the Pi call times out,
@@ -3420,7 +3523,10 @@ def _run_phase2_deep_analysis(
 
     # Batch mode (P6): fold parent + pending child ACs into one indexed
     # call. On any failure fall back to the per-child path below.
-    if batch_phase2 and pending:
+    # When *skip_parent_deep* is set the parent was already deep-verified
+    # in a prior parent-only call (SA-0MSKB6VJA005N43F); the batch path
+    # re-analyzes the parent ACs, so skip it and use the per-child path.
+    if batch_phase2 and pending and not skip_parent_deep:
         batch_outcome = _run_batch_phase2(
             issue, ac_results, pending, updated_children,
             resolved_model, pi_bin, debug_log, timeout, runner,
@@ -3430,183 +3536,188 @@ def _run_phase2_deep_analysis(
         if batch_outcome is not None:
             return batch_outcome
 
-    file_scope = _build_file_scope_manifest(issue, ac_results, runner=runner)
+    if not skip_parent_deep:
+        file_scope = _build_file_scope_manifest(issue, ac_results, runner=runner)
 
-    # Build a detailed prompt for deep analysis
-    ac_list_json = json.dumps([
-        {"index": i, "text": r["text"], "initial_verdict": r["verdict"]}
-        for i, r in enumerate(ac_results)
-    ])
+        # Build a detailed prompt for deep analysis
+        ac_list_json = json.dumps([
+            {"index": i, "text": r["text"], "initial_verdict": r["verdict"]}
+            for i, r in enumerate(ac_results)
+        ])
 
-    prompt = (
-        "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS] "
-        "You are performing a deep code analysis. "
-        "Do NOT close, modify, create, or delete any work items. "
-        "Do NOT execute any wl, git, or other state-modifying commands. "
-        "Return ONLY a structured JSON array.\n\n"
-        "Phase 1 automated screening has PASSED. You must now perform deep code analysis.\n\n"
-        "FILE SCOPE — Read ONLY the files listed in the manifest below. "
-        "Do not explore the whole repository (no unbounded `find`, `grep -r`, "
-        "or `ls -R` across the repo). If a criterion requires a file not listed "
-        "here, state that in the evidence instead of searching for it.\n\n"
-        f"{file_scope}\n\n"
-        "SCANNING — When you need to look something up, use the bounded helpers:\n"
-        "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
-        "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
-        "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
-        "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n"
-        "- Single-file greps of `.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).\n\n"
-        f"{green_run_block or ''}"
-        "For each acceptance criterion:\n"
-        "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
-        "2. **Verify the code actually does what the criterion claims.**\n"
-        "3. **Check for gaps between documented behavior and actual behavior.**\n"
-        "4. **Provide a specific file:line reference** as evidence.\n\n"
-        "Instructions:\n"
-        "- Use 'met' ONLY if the code genuinely satisfies the criterion.\n"
-        "- Use 'unmet' if the criterion is not satisfied at all.\n"
-        "- Use 'partial' if the criterion is partially satisfied (e.g., documented but not implemented, or implemented with gaps).\n"
-        "- Use 'adjusted' if the implementation differs from the original specification but the user story intent is preserved.\n"
-        "- Evidence MUST include a file path and line number. If no line number is available, state why.\n"
-        "- If a criterion says 'X is implemented' but the code only has scaffolding/stubs, use 'partial' not 'met'.\n\n"
-        f"Criteria: {ac_list_json}"
-    )
-
-    try:
-        issue_id = issue.get("id", "")
-        result = _call_pi_and_maybe_log(
-            issue_id, "phase2_deep", prompt,
-            model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
-            enable_tools=True, timeout=timeout,
-            max_retries=_PHASE2_MAX_RETRIES,
-            ac_fallback_used=ac_fallback_used,
+        prompt = (
+            "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS] "
+            "You are performing a deep code analysis. "
+            "Do NOT close, modify, create, or delete any work items. "
+            "Do NOT execute any wl, git, or other state-modifying commands. "
+            "Return ONLY a structured JSON array.\n\n"
+            "Phase 1 automated screening has PASSED. You must now perform deep code analysis.\n\n"
+            "FILE SCOPE — Read ONLY the files listed in the manifest below. "
+            "Do not explore the whole repository (no unbounded `find`, `grep -r`, "
+            "or `ls -R` across the repo). If a criterion requires a file not listed "
+            "here, state that in the evidence instead of searching for it.\n\n"
+            f"{file_scope}\n\n"
+            "SCANNING — When you need to look something up, use the bounded helpers:\n"
+            "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
+            "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
+            "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
+            "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n"
+            "- Single-file greps of `.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).\n\n"
+            f"{green_run_block or ''}"
+            "For each acceptance criterion:\n"
+            "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
+            "2. **Verify the code actually does what the criterion claims.**\n"
+            "3. **Check for gaps between documented behavior and actual behavior.**\n"
+            "4. **Provide a specific file:line reference** as evidence.\n\n"
+            "Instructions:\n"
+            "- Use 'met' ONLY if the code genuinely satisfies the criterion.\n"
+            "- Use 'unmet' if the criterion is not satisfied at all.\n"
+            "- Use 'partial' if the criterion is partially satisfied (e.g., documented but not implemented, or implemented with gaps).\n"
+            "- Use 'adjusted' if the implementation differs from the original specification but the user story intent is preserved.\n"
+            "- Evidence MUST include a file path and line number. If no line number is available, state why.\n"
+            "- If a criterion says 'X is implemented' but the code only has scaffolding/stubs, use 'partial' not 'met'.\n\n"
+            f"Criteria: {ac_list_json}"
         )
-    except RuntimeError as exc:
-        # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
-        print(f"Warning: Phase 2 deep analysis failed: {exc}", file=sys.stderr)
-        if script_failure_callback:
-            script_failure_callback("pi (Phase 2 deep analysis)", exc)
-        return ac_results, child_results, False
 
-    # Check for timeout before attempting to parse results
-    if result.get("_timeout"):
-        if ac_fallback_used is not None:
-            ac_fallback_used.set()
-        evidence = result.get("evidence", "Deep analysis timed out.")
-        print(f"Warning: Phase 2 deep analysis timed out: {evidence}", file=sys.stderr)
-        if script_failure_callback:
-            script_failure_callback(
-                "pi (Phase 2 deep analysis)",
-                RuntimeError(f"Phase 2 deep analysis timed out after {CALL_PI_TIMEOUT}s"),
+        try:
+            issue_id = issue.get("id", "")
+            result = _call_pi_and_maybe_log(
+                issue_id, "phase2_deep", prompt,
+                model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
+                enable_tools=True, timeout=timeout,
+                max_retries=_PHASE2_MAX_RETRIES,
+                ac_fallback_used=ac_fallback_used,
             )
-        # Mark all ACs as partial with timeout evidence
-        timeout_acs = []
-        for ac in ac_results:
-            timeout_acs.append({
-                "text": ac.get("text", ""),
-                "verdict": VERDICT_PARTIAL,
-                "evidence": "Deep analysis timed out \u2014 manual review required.",
-            })
-        # Also mark all child ACs as partial
-        timeout_children = []
-        for child in child_results:
-            child_acs = child.get("ac_results", [])
-            updated_child_acs = []
-            for ac in child_acs:
-                updated_child_acs.append({
+        except RuntimeError as exc:
+            # Phase 2 failure is non-fatal; log and fall back to Phase 1 results
+            print(f"Warning: Phase 2 deep analysis failed: {exc}", file=sys.stderr)
+            if script_failure_callback:
+                script_failure_callback("pi (Phase 2 deep analysis)", exc)
+            return ac_results, child_results, False
+
+        # Check for timeout before attempting to parse results
+        if result.get("_timeout"):
+            if ac_fallback_used is not None:
+                ac_fallback_used.set()
+            evidence = result.get("evidence", "Deep analysis timed out.")
+            print(f"Warning: Phase 2 deep analysis timed out: {evidence}", file=sys.stderr)
+            if script_failure_callback:
+                script_failure_callback(
+                    "pi (Phase 2 deep analysis)",
+                    RuntimeError(f"Phase 2 deep analysis timed out after {CALL_PI_TIMEOUT}s"),
+                )
+            # Mark all ACs as partial with timeout evidence
+            timeout_acs = []
+            for ac in ac_results:
+                timeout_acs.append({
                     "text": ac.get("text", ""),
                     "verdict": VERDICT_PARTIAL,
                     "evidence": "Deep analysis timed out \u2014 manual review required.",
                 })
-            timeout_children.append(dict(child))
-            timeout_children[-1]["ac_results"] = updated_child_acs
-        return timeout_acs, timeout_children, False
+            # Also mark all child ACs as partial
+            timeout_children = []
+            for child in child_results:
+                child_acs = child.get("ac_results", [])
+                updated_child_acs = []
+                for ac in child_acs:
+                    updated_child_acs.append({
+                        "text": ac.get("text", ""),
+                        "verdict": VERDICT_PARTIAL,
+                        "evidence": "Deep analysis timed out \u2014 manual review required.",
+                    })
+                timeout_children.append(dict(child))
+                timeout_children[-1]["ac_results"] = updated_child_acs
+            return timeout_acs, timeout_children, False
 
-    # Check for provider errors (e.g. finish_reason: error) before parsing.
-    # The model never emitted its structured output, so treat all ACs as
-    # partial with a provider-error diagnostic (distinct from a parse failure).
-    if result.get("_provider_error"):
-        if ac_fallback_used is not None:
-            ac_fallback_used.set()
-        provider_error = result.get("_provider_error_message", "unknown")
-        print(
-            f"Warning: Phase 2 deep analysis provider error: {provider_error}",
-            file=sys.stderr,
-        )
-        if script_failure_callback:
-            script_failure_callback(
-                "pi (Phase 2 deep analysis)",
-                RuntimeError(f"Pi provider error: {provider_error}"),
+        # Check for provider errors (e.g. finish_reason: error) before parsing.
+        # The model never emitted its structured output, so treat all ACs as
+        # partial with a provider-error diagnostic (distinct from a parse failure).
+        if result.get("_provider_error"):
+            if ac_fallback_used is not None:
+                ac_fallback_used.set()
+            provider_error = result.get("_provider_error_message", "unknown")
+            print(
+                f"Warning: Phase 2 deep analysis provider error: {provider_error}",
+                file=sys.stderr,
             )
-        error_acs = []
-        for ac in ac_results:
-            error_acs.append({
-                "text": ac.get("text", ""),
-                "verdict": VERDICT_PARTIAL,
-                "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
-            })
-        error_children = []
-        for child in child_results:
-            child_acs = child.get("ac_results", [])
-            updated_child_acs = []
-            for ac in child_acs:
-                updated_child_acs.append({
+            if script_failure_callback:
+                script_failure_callback(
+                    "pi (Phase 2 deep analysis)",
+                    RuntimeError(f"Pi provider error: {provider_error}"),
+                )
+            error_acs = []
+            for ac in ac_results:
+                error_acs.append({
                     "text": ac.get("text", ""),
                     "verdict": VERDICT_PARTIAL,
                     "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
                 })
-            error_children.append(dict(child))
-            error_children[-1]["ac_results"] = updated_child_acs
-        return error_acs, error_children, False
+            error_children = []
+            for child in child_results:
+                child_acs = child.get("ac_results", [])
+                updated_child_acs = []
+                for ac in child_acs:
+                    updated_child_acs.append({
+                        "text": ac.get("text", ""),
+                        "verdict": VERDICT_PARTIAL,
+                        "evidence": f"Pi provider error: {provider_error} \u2014 manual review required.",
+                    })
+                error_children.append(dict(child))
+                error_children[-1]["ac_results"] = updated_child_acs
+            return error_acs, error_children, False
 
-    # Parse the batched result
-    raw_text = (
-        result.get("extracted_text", "")
-        or result.get("evidence", "")
-        or result.get("text", "")
-    )
-    batch = _extract_json_array(raw_text)
-    if batch is None:
-        try:
-            batch = json.loads(raw_text)
-        except json.JSONDecodeError:
-            batch = []
+        # Parse the batched result
+        raw_text = (
+            result.get("extracted_text", "")
+            or result.get("evidence", "")
+            or result.get("text", "")
+        )
+        batch = _extract_json_array(raw_text)
+        if batch is None:
+            try:
+                batch = json.loads(raw_text)
+            except json.JSONDecodeError:
+                batch = []
 
-    updated_ac = list(ac_results)
-    if isinstance(batch, list):
-        reviewed = {
-            item["index"]: item
-            for item in batch
-            if isinstance(item, dict) and "index" in item
-        }
-        for i in range(len(updated_ac)):
-            item = reviewed.get(i, {})
-            deep_verdict = _normalize_verdict(item.get("verdict", ""))
-            deep_evidence = item.get("evidence", "")
-            if deep_verdict:
-                # Final verdict = Phase 1 passes AND Phase 2 confirms
-                initial = updated_ac[i]["verdict"]
-                if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
-                    updated_ac[i] = {
-                        "text": updated_ac[i]["text"],
-                        "verdict": VERDICT_MET,
-                        "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
-                    }
-                elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
-                    # Phase 1 said met, Phase 2 disagrees → downgrade
-                    updated_ac[i] = {
-                        "text": updated_ac[i]["text"],
-                        "verdict": deep_verdict,
-                        "evidence": f"Phase 1: {updated_ac[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
-                    }
-                else:
-                    # Use Phase 2 verdict (deep override for initial non-met)
-                    updated_ac[i] = {
-                        "text": updated_ac[i]["text"],
-                        "verdict": deep_verdict,
-                        "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
-                    }
+        updated_ac = list(ac_results)
+        if isinstance(batch, list):
+            reviewed = {
+                item["index"]: item
+                for item in batch
+                if isinstance(item, dict) and "index" in item
+            }
+            for i in range(len(updated_ac)):
+                item = reviewed.get(i, {})
+                deep_verdict = _normalize_verdict(item.get("verdict", ""))
+                deep_evidence = item.get("evidence", "")
+                if deep_verdict:
+                    # Final verdict = Phase 1 passes AND Phase 2 confirms
+                    initial = updated_ac[i]["verdict"]
+                    if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
+                        updated_ac[i] = {
+                            "text": updated_ac[i]["text"],
+                            "verdict": VERDICT_MET,
+                            "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
+                        }
+                    elif initial == VERDICT_MET and deep_verdict != VERDICT_MET:
+                        # Phase 1 said met, Phase 2 disagrees → downgrade
+                        updated_ac[i] = {
+                            "text": updated_ac[i]["text"],
+                            "verdict": deep_verdict,
+                            "evidence": f"Phase 1: {updated_ac[i].get('evidence', '')}; Phase 2 deep analysis: {deep_evidence}",
+                        }
+                    else:
+                        # Use Phase 2 verdict (deep override for initial non-met)
+                        updated_ac[i] = {
+                            "text": updated_ac[i]["text"],
+                            "verdict": deep_verdict,
+                            "evidence": deep_evidence or updated_ac[i].get("evidence", ""),
+                        }
 
+    else:
+        # Parent Phase 2 already completed in a prior parent-only call
+        # (SA-0MSKB6VJA005N43F). Only the child deep calls below run.
+        updated_ac = list(ac_results)
     # Also run deep analysis on active children
     child_timeout_occurred = False
 
@@ -3812,6 +3923,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
     audit says "Ready to close: No" prevents the parent from being ready to
     close. This check is performed before Phase 1 screening so that Phase 1
     can block on children not individually ready.
+
+    Default orchestration is parent-first (SA-0MSKB6VJA005N43F): the parent
+    is fully audited first (Phase 1 parent ACs + Phase 2 deep analysis) with
+    no child screening; then the parent verdict drives the child pass-through
+    (all children inherit passed when the parent has no gaps; only gap-mapped
+    children are audited when it does). ``--audit-children`` forces the full
+    per-child flow described above (explicit override).
     """
     # Resolve the effective model from config + CLI
     config = _load_config()
@@ -4155,309 +4273,509 @@ def cmd_issue(issue_id: str, persist: bool = True,
             parent_timeout if parent_timeout is not None
             else _default_parent_timeout(len(active_children))
         )
-        pending_children: list[tuple[int, dict]] = []
-        pre_verdicts: dict[str, tuple[bool | None, str]] = {}
-        for child in active_children:
-            cr = {
-                "title": child.get("title", ""),
-                "id": child.get("id", ""),
-                "status": child.get("status", ""),
-                "stage": child.get("stage", ""),
-            }
-            # Skip remaining children if we're too close to the parent
-            # timeout (elapsed_guard). This prevents a silent external kill
-            # and instead produces a clear diagnostic for skipped audits.
-            if _elapsed() >= elapsed_guard:
-                print(
-                    f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
-                    f"Skipping child {child.get('id', '')} ({child.get('title', '')}). "
-                    "Manual audit required for this child. Raise the budget via "
-                    "--parent-timeout or AUDIT_PARENT_TIMEOUT.",
-                    file=sys.stderr,
+
+        if audit_children:
+            pending_children: list[tuple[int, dict]] = []
+            pre_verdicts: dict[str, tuple[bool | None, str]] = {}
+            for child in active_children:
+                cr = {
+                    "title": child.get("title", ""),
+                    "id": child.get("id", ""),
+                    "status": child.get("status", ""),
+                    "stage": child.get("stage", ""),
+                }
+                # Skip remaining children if we're too close to the parent
+                # timeout (elapsed_guard). This prevents a silent external kill
+                # and instead produces a clear diagnostic for skipped audits.
+                if _elapsed() >= elapsed_guard:
+                    print(
+                        f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
+                        f"Skipping child {child.get('id', '')} ({child.get('title', '')}). "
+                        "Manual audit required for this child. Raise the budget via "
+                        "--parent-timeout or AUDIT_PARENT_TIMEOUT.",
+                        file=sys.stderr,
+                    )
+                    cr["ac_results"] = [{
+                        "text": "Skipped due to audit timeout. Manual audit required.",
+                        "verdict": "unmet",
+                        "evidence": (
+                            f"Audit runner skipped this child after "
+                            f"{_elapsed():.0f}s total elapsed time to avoid "
+                            f"the parent process timeout ({elapsed_guard}s "
+                            f"budget; raise via --parent-timeout or "
+                            f"AUDIT_PARENT_TIMEOUT). Manual audit required."
+                        ),
+                    }]
+                    cr["child_audit_ready"] = False
+                    child_results.append(cr)
+                    continue
+
+                # Completed/done children are exempt (AC5): their audits are not
+                # re-checked and the Phase 1 child AC review is skipped; AC results
+                # are sourced from their own persisted audit (fallback to met).
+                if child.get("status") == "completed" and child.get("stage") == "done":
+                    cr["child_audit_ready"] = True
+                    cr["ac_results"] = _child_acs_from_own_audit(
+                        child, runner, worklog_dir=worklog_dir,
+                    )
+                    child_results.append(cr)
+                    continue
+
+                verdict, reason = _get_child_audit_verdict(
+                    runner, child["id"], worklog_dir=worklog_dir,
                 )
-                cr["ac_results"] = [{
-                    "text": "Skipped due to audit timeout. Manual audit required.",
-                    "verdict": "unmet",
-                    "evidence": (
-                        f"Audit runner skipped this child after "
-                        f"{_elapsed():.0f}s total elapsed time to avoid "
-                        f"the parent process timeout ({elapsed_guard}s "
-                        f"budget; raise via --parent-timeout or "
-                        f"AUDIT_PARENT_TIMEOUT). Manual audit required."
-                    ),
-                }]
-                cr["child_audit_ready"] = False
+                pre_verdicts[child["id"]] = (verdict, reason)
+                if verdict is True:
+                    # Fresh ready audit: skip the Phase 1 child AC review and reuse
+                    # the AC verdicts persisted in the child's own audit report
+                    # (fallback to met when the table cannot be parsed).
+                    cr["child_audit_ready"] = True
+                    cr["ac_results"] = _child_acs_from_own_audit(
+                        child, runner, worklog_dir=worklog_dir,
+                    )
+                else:
+                    cr["child_audit_ready"] = False
+                    # P12: record whether the child's own fresh audit produced an
+                    # explicit 'not ready to close' verdict. Such children have
+                    # already had their ACs deep-analyzed by their own audit
+                    # pipeline, so the parent's Phase 2 can skip the duplicated
+                    # phase2_child call (see _run_phase2_deep_analysis).
+                    cr["child_audit_not_ready"] = verdict is False
+                    cr["ac_results"] = []
+                    pending_children.append((len(child_results), child))
                 child_results.append(cr)
-                continue
 
-            # Completed/done children are exempt (AC5): their audits are not
-            # re-checked and the Phase 1 child AC review is skipped; AC results
-            # are sourced from their own persisted audit (fallback to met).
-            if child.get("status") == "completed" and child.get("stage") == "done":
-                cr["child_audit_ready"] = True
-                cr["ac_results"] = _child_acs_from_own_audit(
-                    child, runner, worklog_dir=worklog_dir,
-                )
-                child_results.append(cr)
-                continue
-
-            verdict, reason = _get_child_audit_verdict(
-                runner, child["id"], worklog_dir=worklog_dir,
-            )
-            pre_verdicts[child["id"]] = (verdict, reason)
-            if verdict is True:
-                # Fresh ready audit: skip the Phase 1 child AC review and reuse
-                # the AC verdicts persisted in the child's own audit report
-                # (fallback to met when the table cannot be parsed).
-                cr["child_audit_ready"] = True
-                cr["ac_results"] = _child_acs_from_own_audit(
-                    child, runner, worklog_dir=worklog_dir,
-                )
-            else:
-                cr["child_audit_ready"] = False
-                # P12: record whether the child's own fresh audit produced an
-                # explicit 'not ready to close' verdict. Such children have
-                # already had their ACs deep-analyzed by their own audit
-                # pipeline, so the parent's Phase 2 can skip the duplicated
-                # phase2_child call (see _run_phase2_deep_analysis).
-                cr["child_audit_not_ready"] = verdict is False
-                cr["ac_results"] = []
-                pending_children.append((len(child_results), child))
-            child_results.append(cr)
-
-        # Review pending (no-audit / not-ready / not_ready) children with
-        # bounded parallelism; fall back to a sequential loop for a single
-        # pending child or parallelism=1 (mirrors the Phase 2 parallel pattern).
-        if pending_children:
-            parallelism = _resolve_phase2_parallelism()
-            if parallelism > 1 and len(pending_children) > 1:
-                with ThreadPoolExecutor(max_workers=parallelism) as executor:
-                    futures = [
-                        executor.submit(
-                            _phase1_review_child_acs,
+            # Review pending (no-audit / not-ready / not_ready) children with
+            # bounded parallelism; fall back to a sequential loop for a single
+            # pending child or parallelism=1 (mirrors the Phase 2 parallel pattern).
+            if pending_children:
+                parallelism = _resolve_phase2_parallelism()
+                if parallelism > 1 and len(pending_children) > 1:
+                    with ThreadPoolExecutor(max_workers=parallelism) as executor:
+                        futures = [
+                            executor.submit(
+                                _phase1_review_child_acs,
+                                ci, child,
+                                resolved_model, pi_bin, debug_log, timeout,
+                                runner, _record_script_failure,
+                                ac_fallback_used=ac_fallback_used,
+                            )
+                            for ci, child in pending_children
+                        ]
+                        for future in futures:
+                            ci, acs = future.result()
+                            child_results[ci]["ac_results"] = acs
+                else:
+                    for ci, child in pending_children:
+                        _ci, acs = _phase1_review_child_acs(
                             ci, child,
                             resolved_model, pi_bin, debug_log, timeout,
                             runner, _record_script_failure,
                             ac_fallback_used=ac_fallback_used,
                         )
-                        for ci, child in pending_children
-                    ]
-                    for future in futures:
-                        ci, acs = future.result()
                         child_results[ci]["ac_results"] = acs
-            else:
-                for ci, child in pending_children:
-                    _ci, acs = _phase1_review_child_acs(
-                        ci, child,
-                        resolved_model, pi_bin, debug_log, timeout,
-                        runner, _record_script_failure,
-                        ac_fallback_used=ac_fallback_used,
-                    )
-                    child_results[ci]["ac_results"] = acs
 
 
-        # ------------------------------------------------------------------
-        # Check each active child's persisted audit verdict.
-        # For children without audits or with stale audits, auto-trigger
-        # a fresh audit (if persist is True AND --audit-children is set) and
-        # re-evaluate. The recursive cascade is OPT-IN (SA-0MSKB6V5Q007YDHE):
-        # by default no child audits are auto-triggered, so a parent with many
-        # unaudited children no longer spawns an unbounded cascade. Children
-        # with unchanged content are skipped via the Feature 1 content-based
-        # freshness gate. Children with completed/done status+stage are
-        # exempt (AC5).
-        # ------------------------------------------------------------------
-        _audit_runner_path = Path(__file__).resolve()
-        max_child_audits = _resolve_max_child_audits(max_child_audits)
-        child_audits_triggered = 0
+            # ------------------------------------------------------------------
+            # Check each active child's persisted audit verdict.
+            # For children without audits or with stale audits, auto-trigger
+            # a fresh audit (if persist is True AND --audit-children is set) and
+            # re-evaluate. The recursive cascade is OPT-IN (SA-0MSKB6V5Q007YDHE):
+            # by default no child audits are auto-triggered, so a parent with many
+            # unaudited children no longer spawns an unbounded cascade. Children
+            # with unchanged content are skipped via the Feature 1 content-based
+            # freshness gate. Children with completed/done status+stage are
+            # exempt (AC5).
+            # ------------------------------------------------------------------
+            _audit_runner_path = Path(__file__).resolve()
+            max_child_audits = _resolve_max_child_audits(max_child_audits)
+            child_audits_triggered = 0
 
-        for child in child_results:
-            # Skip completed/done children (exempt per AC5)
-            if child.get("status") == "completed" and child.get("stage") == "done":
-                child["child_audit_ready"] = True  # Exempt - treat as ready
-                continue
-
-            # Reuse the pre-computed verdict from the Phase 1 pre-pass (P7) to
-            # avoid a second wl audit-show lookup per child.
-            verdict, reason = pre_verdicts.get(child["id"], (None, "unknown"))
-
-            if verdict is None and persist:
-                if _elapsed() < elapsed_guard:
-                    # Content-based freshness skip (AC4): a child whose content
-                    # fingerprint is unchanged has a still-valid audit — do not
-                    # re-trigger it; re-evaluate the verdict from the stored
-                    # report instead.
-                    fresh_report = _check_audit_freshness(
-                        runner, child["id"], worklog_dir=worklog_dir,
-                    )
-                    if fresh_report is not None:
-                        fresh_ready = _parse_ready_to_close(fresh_report)
-                        verdict = fresh_ready == "yes"
-                        reason = "ready" if fresh_ready == "yes" else "not_ready"
-                        print(
-                            f"Reusing fresh audit for child {child['id']} "
-                            f"({child['title']}) — content unchanged",
-                            file=sys.stderr,
-                        )
-                    elif not audit_children:
-                        # AC1: no cascade without explicit opt-in. The child
-                        # stays not-ready (a not-ready child still blocks the
-                        # parent — verdict semantics unchanged).
-                        print(
-                            f"Child {child['id']} ({child['title']}) has no "
-                            f"fresh audit; not auto-triggering a child audit. "
-                            f"Use --audit-children to enable the recursive "
-                            f"cascade (or audit the child directly).",
-                            file=sys.stderr,
-                        )
-                    elif child_audits_triggered >= max_child_audits:
-                        # AC3: per-run cap reached — stop the cascade.
-                        print(
-                            f"Warning: child audit cap ({max_child_audits}) "
-                            f"reached; not auto-auditing child {child['id']} "
-                            f"({child['title']}). Raise via --max-child-audits "
-                            f"or {AUDIT_MAX_CHILD_AUDITS_ENV}.",
-                            file=sys.stderr,
-                        )
-                    else:
-                        child_audits_triggered += 1
-                        print(
-                            f"Auto-triggering audit for child {child['id']} "
-                            f"({child['title']}) — reason: {reason}",
-                            file=sys.stderr,
-                        )
-                        try:
-                            audit_cmd = [
-                                sys.executable or "python3",
-                                str(_audit_runner_path),
-                                "issue",
-                                child["id"],
-                                "--pi-bin", pi_bin,
-                                "--model", resolved_model,
-                                "--model-source", model_source,
-                                "--force",  # Bypass freshness gate
-                            ]
-                            if timeout is not None:
-                                audit_cmd.extend(["--timeout", str(timeout)])
-                            if parent_timeout is not None:
-                                audit_cmd.extend(["--parent-timeout", str(parent_timeout)])
-                            # Thread the resolved worklog flags through to the child
-                            # runner process so it targets the same worklog store.
-                            child_flags = _resolve_worklog_flags(
-                                ["wl", "show", child["id"], "--json"],
-                                explicit_dir=worklog_dir,
-                            )
-                            if child_flags:
-                                audit_cmd.extend(child_flags)
-                            effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
-                            subprocess.run(
-                                audit_cmd,
-                                check=False,
-                                capture_output=True,
-                                text=True,
-                                timeout=effective_timeout,
-                            )
-                            # Re-check verdict after triggered audit
-                            verdict, reason = _get_child_audit_verdict(runner, child["id"],
-                                                                       worklog_dir=worklog_dir)
-                        except subprocess.TimeoutExpired:
-                            print(
-                                f"Warning: Auto-triggered audit for child {child['id']} "
-                                f"timed out.", file=sys.stderr,
-                            )
-                        except Exception as exc:  # noqa: BLE001 -- audit failure warning
-                            print(
-                                f"Warning: Auto-triggered audit for child {child['id']} "
-                                f"failed: {exc}", file=sys.stderr,
-                            )
-                else:
-                    print(
-                        f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
-                        f"Cannot auto-trigger audit for child {child['id']} "
-                        f"({child['title']}). Manual audit required. Raise the "
-                        f"budget via --parent-timeout or AUDIT_PARENT_TIMEOUT.",
-                        file=sys.stderr,
-                    )
-
-            # Set child_audit_ready: True/False if verdict is known, False otherwise
-            child["child_audit_ready"] = verdict if verdict is not None else False
-            # P12: record whether the child's own audit produced an explicit
-            # 'not ready to close' verdict (e.g. after the auto-triggered
-            # child audit above). The parent Phase 2 then skips the duplicated
-            # deep-analysis call and reuses the child's own persisted findings.
-            child["child_audit_not_ready"] = verdict is False
-
-        # Initialize child_persist_results for reporting
-        child_persist_results = []
-
-        # Persist child audits to individual child work items (if persist is True)
-        if persist:
             for child in child_results:
-                child_success, _child_report = _persist_child_audit(
-                    child_id=child["id"],
-                    child_title=child["title"],
-                    child_status=child["status"],
-                    child_stage=child["stage"],
-                    ac_results=child["ac_results"],
-                    pi_bin=pi_bin,
-                    model=resolved_model,
-                    model_source=model_source,
-                    worklog_dir=worklog_dir,
-                )
-                child_persist_results.append({
-                    "id": child["id"],
-                    "title": child["title"],
-                    "success": child_success,
-                })
-                if not child_success:
-                    print(
-                        f"Warning: Failed to persist audit for child {child['id']} "
-                        f"({child['title']}): wl returned exit code {1}",
-                        file=sys.stderr,
+                # Skip completed/done children (exempt per AC5)
+                if child.get("status") == "completed" and child.get("stage") == "done":
+                    child["child_audit_ready"] = True  # Exempt - treat as ready
+                    continue
+
+                # Reuse the pre-computed verdict from the Phase 1 pre-pass (P7) to
+                # avoid a second wl audit-show lookup per child.
+                verdict, reason = pre_verdicts.get(child["id"], (None, "unknown"))
+
+                if verdict is None and persist:
+                    if _elapsed() < elapsed_guard:
+                        # Content-based freshness skip (AC4): a child whose content
+                        # fingerprint is unchanged has a still-valid audit — do not
+                        # re-trigger it; re-evaluate the verdict from the stored
+                        # report instead.
+                        fresh_report = _check_audit_freshness(
+                            runner, child["id"], worklog_dir=worklog_dir,
+                        )
+                        if fresh_report is not None:
+                            fresh_ready = _parse_ready_to_close(fresh_report)
+                            verdict = fresh_ready == "yes"
+                            reason = "ready" if fresh_ready == "yes" else "not_ready"
+                            print(
+                                f"Reusing fresh audit for child {child['id']} "
+                                f"({child['title']}) — content unchanged",
+                                file=sys.stderr,
+                            )
+                        elif not audit_children:
+                            # AC1: no cascade without explicit opt-in. The child
+                            # stays not-ready (a not-ready child still blocks the
+                            # parent — verdict semantics unchanged).
+                            print(
+                                f"Child {child['id']} ({child['title']}) has no "
+                                f"fresh audit; not auto-triggering a child audit. "
+                                f"Use --audit-children to enable the recursive "
+                                f"cascade (or audit the child directly).",
+                                file=sys.stderr,
+                            )
+                        elif child_audits_triggered >= max_child_audits:
+                            # AC3: per-run cap reached — stop the cascade.
+                            print(
+                                f"Warning: child audit cap ({max_child_audits}) "
+                                f"reached; not auto-auditing child {child['id']} "
+                                f"({child['title']}). Raise via --max-child-audits "
+                                f"or {AUDIT_MAX_CHILD_AUDITS_ENV}.",
+                                file=sys.stderr,
+                            )
+                        else:
+                            child_audits_triggered += 1
+                            print(
+                                f"Auto-triggering audit for child {child['id']} "
+                                f"({child['title']}) — reason: {reason}",
+                                file=sys.stderr,
+                            )
+                            try:
+                                audit_cmd = [
+                                    sys.executable or "python3",
+                                    str(_audit_runner_path),
+                                    "issue",
+                                    child["id"],
+                                    "--pi-bin", pi_bin,
+                                    "--model", resolved_model,
+                                    "--model-source", model_source,
+                                    "--force",  # Bypass freshness gate
+                                ]
+                                if timeout is not None:
+                                    audit_cmd.extend(["--timeout", str(timeout)])
+                                if parent_timeout is not None:
+                                    audit_cmd.extend(["--parent-timeout", str(parent_timeout)])
+                                # Thread the resolved worklog flags through to the child
+                                # runner process so it targets the same worklog store.
+                                child_flags = _resolve_worklog_flags(
+                                    ["wl", "show", child["id"], "--json"],
+                                    explicit_dir=worklog_dir,
+                                )
+                                if child_flags:
+                                    audit_cmd.extend(child_flags)
+                                effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
+                                subprocess.run(
+                                    audit_cmd,
+                                    check=False,
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=effective_timeout,
+                                )
+                                # Re-check verdict after triggered audit
+                                verdict, reason = _get_child_audit_verdict(runner, child["id"],
+                                                                           worklog_dir=worklog_dir)
+                            except subprocess.TimeoutExpired:
+                                print(
+                                    f"Warning: Auto-triggered audit for child {child['id']} "
+                                    f"timed out.", file=sys.stderr,
+                                )
+                            except Exception as exc:  # noqa: BLE001 -- audit failure warning
+                                print(
+                                    f"Warning: Auto-triggered audit for child {child['id']} "
+                                    f"failed: {exc}", file=sys.stderr,
+                                )
+                    else:
+                        print(
+                            f"Warning: Approaching parent timeout ({_elapsed():.0f}s elapsed). "
+                            f"Cannot auto-trigger audit for child {child['id']} "
+                            f"({child['title']}). Manual audit required. Raise the "
+                            f"budget via --parent-timeout or AUDIT_PARENT_TIMEOUT.",
+                            file=sys.stderr,
+                        )
+
+                # Set child_audit_ready: True/False if verdict is known, False otherwise
+                child["child_audit_ready"] = verdict if verdict is not None else False
+                # P12: record whether the child's own audit produced an explicit
+                # 'not ready to close' verdict (e.g. after the auto-triggered
+                # child audit above). The parent Phase 2 then skips the duplicated
+                # deep-analysis call and reuses the child's own persisted findings.
+                child["child_audit_not_ready"] = verdict is False
+
+            # Initialize child_persist_results for reporting
+            child_persist_results = []
+
+            # Persist child audits to individual child work items (if persist is True)
+            if persist:
+                for child in child_results:
+                    child_success, _child_report = _persist_child_audit(
+                        child_id=child["id"],
+                        child_title=child["title"],
+                        child_status=child["status"],
+                        child_stage=child["stage"],
+                        ac_results=child["ac_results"],
+                        pi_bin=pi_bin,
+                        model=resolved_model,
+                        model_source=model_source,
+                        worklog_dir=worklog_dir,
                     )
+                    child_persist_results.append({
+                        "id": child["id"],
+                        "title": child["title"],
+                        "success": child_success,
+                    })
+                    if not child_success:
+                        print(
+                            f"Warning: Failed to persist audit for child {child['id']} "
+                            f"({child['title']}): wl returned exit code {1}",
+                            file=sys.stderr,
+                        )
 
-        # ------------------------------------------------------------------
-        # Phase 2 gate: check if Phase 1 automated screening has blocking issues
-        # ------------------------------------------------------------------
-        phase1_blocked, phase1_reason = _has_phase1_blocking_issues(
-            cq_findings, child_results
-        )
-        phase2_completed = False
+            # ------------------------------------------------------------------
+            # Phase 2 gate: check if Phase 1 automated screening has blocking issues
+            # ------------------------------------------------------------------
+            phase1_blocked, phase1_reason = _has_phase1_blocking_issues(
+                cq_findings, child_results
+            )
+            phase2_completed = False
 
-        if phase1_blocked:
-            # Phase 1 blocked → demote all "met" verdicts to "partial"
-            ac_results = _demote_met_to_partial(ac_results)
-            for ci, child in enumerate(child_results):
-                child_results[ci]["ac_results"] = _demote_met_to_partial(
-                    child.get("ac_results", [])
+            if phase1_blocked:
+                # Phase 1 blocked → demote all "met" verdicts to "partial"
+                ac_results = _demote_met_to_partial(ac_results)
+                for ci, child in enumerate(child_results):
+                    child_results[ci]["ac_results"] = _demote_met_to_partial(
+                        child.get("ac_results", [])
+                    )
+                print(
+                    f"Phase 1 blocked ({phase1_reason}): demoting 'met' verdicts to 'partial', "
+                    "skipping Phase 2 deep analysis.",
+                    file=sys.stderr,
                 )
-            print(
-                f"Phase 1 blocked ({phase1_reason}): demoting 'met' verdicts to 'partial', "
-                "skipping Phase 2 deep analysis.",
-                file=sys.stderr,
-            )
-        elif not acs or acs[0] == "No acceptance criteria defined.":
-            # No ACs defined — nothing to deep-analyze; skip Phase 2
-            print(
-                "No acceptance criteria defined: skipping Phase 2 deep analysis.",
-                file=sys.stderr,
-            )
+            elif not acs or acs[0] == "No acceptance criteria defined.":
+                # No ACs defined — nothing to deep-analyze; skip Phase 2
+                print(
+                    "No acceptance criteria defined: skipping Phase 2 deep analysis.",
+                    file=sys.stderr,
+                )
+            else:
+                # Phase 1 passed → run Phase 2 deep code analysis
+                print("Phase 1 passed: running Phase 2 deep code analysis...", file=sys.stderr)
+                ac_results, child_results, phase2_completed = _run_phase2_deep_analysis(
+                    work_item, ac_results, child_results,
+                    resolved_model=resolved_model,
+                    pi_bin=pi_bin,
+                    debug_log=debug_log,
+                    script_failure_callback=_record_script_failure,
+                    timeout=timeout,
+                    runner=runner,
+                    batch_phase2=batch_phase2,
+                    worklog_dir=worklog_dir,
+                    ac_fallback_used=ac_fallback_used,
+                    green_run_block=green_run_block,
+                )
         else:
-            # Phase 1 passed → run Phase 2 deep code analysis
-            print("Phase 1 passed: running Phase 2 deep code analysis...", file=sys.stderr)
-            ac_results, child_results, phase2_completed = _run_phase2_deep_analysis(
-                work_item, ac_results, child_results,
-                resolved_model=resolved_model,
-                pi_bin=pi_bin,
-                debug_log=debug_log,
-                script_failure_callback=_record_script_failure,
-                timeout=timeout,
-                runner=runner,
-                batch_phase2=batch_phase2,
-                worklog_dir=worklog_dir,
-                ac_fallback_used=ac_fallback_used,
-                green_run_block=green_run_block,
+            # ── PARENT-FIRST flow (default, SA-0MSKB6VJA005N43F) ──
+            # Phase 1 screens parent ACs only (no child AC screening) and
+            # Phase 2 parent deep analysis completes BEFORE any child audit is
+            # considered. Then the parent verdict drives the child pass-through:
+            #   - parent passes with no gaps → all children inherit passed
+            #     (zero child audits), unless a child's own content changed
+            #   - parent has gaps → only gap-mapped children are audited;
+            #     unrelated children are not audited
+            # --audit-children (Feature 2) forces the full per-child flow.
+            phase2_completed = False
+            has_blocking_cq = any(
+                f.get("severity") in ("critical", "high") for f in cq_findings
             )
+            # 1. Parent Phase 2 deep analysis FIRST (parent-only).
+            if has_blocking_cq:
+                # Blocking CQ findings → demote met verdicts to partial and
+                # skip Phase 2 (mirrors the full-flow gate: the verdict is
+                # already "Ready to close: No" via the CQ findings, so the
+                # parent deep call would only burn model latency).
+                ac_results = _demote_met_to_partial(ac_results)
+            elif acs and acs[0] != "No acceptance criteria defined.":
+                print(
+                    "Phase 1 passed: running Phase 2 deep code analysis "
+                    "(parent-first)...",
+                    file=sys.stderr,
+                )
+                ac_results, _, phase2_completed = _run_phase2_deep_analysis(
+                    work_item, ac_results, [],  # parent-only
+                    resolved_model=resolved_model,
+                    pi_bin=pi_bin,
+                    debug_log=debug_log,
+                    script_failure_callback=_record_script_failure,
+                    timeout=timeout,
+                    runner=runner,
+                    batch_phase2=batch_phase2,
+                    worklog_dir=worklog_dir,
+                    ac_fallback_used=ac_fallback_used,
+                    green_run_block=green_run_block,
+                )
+
+            # 2. Parent verdict: any gaps? (unmet/partial ACs or blocking CQ).
+            parent_gaps = _parent_has_gaps(ac_results) or has_blocking_cq
+            gap_child_ids = set(
+                _map_gaps_to_children(ac_results, active_children)
+            ) if parent_gaps else set()
+
+            # 3. Child pass-through decision.
+            pending_children: list[tuple[int, dict]] = []
+            for child in active_children:
+                cr = {
+                    "title": child.get("title", ""),
+                    "id": child.get("id", ""),
+                    "status": child.get("status", ""),
+                    "stage": child.get("stage", ""),
+                }
+                if _elapsed() >= elapsed_guard:
+                    cr["ac_results"] = [{
+                        "text": "Skipped due to audit timeout. Manual audit required.",
+                        "verdict": "unmet",
+                        "evidence": (
+                            f"Audit runner skipped this child after "
+                            f"{_elapsed():.0f}s total elapsed time to avoid "
+                            f"the parent process timeout ({elapsed_guard}s "
+                            f"budget; raise via --parent-timeout or "
+                            f"AUDIT_PARENT_TIMEOUT). Manual audit required."
+                        ),
+                    }]
+                    cr["child_audit_ready"] = False
+                    child_results.append(cr)
+                    continue
+
+                if child.get("status") == "completed" and child.get("stage") == "done":
+                    cr["child_audit_ready"] = True
+                    cr["ac_results"] = _child_acs_from_own_audit(
+                        child, runner, worklog_dir=worklog_dir,
+                    )
+                    child_results.append(cr)
+                    continue
+
+                if not parent_gaps:
+                    # Parent passed with no gaps → child inherits passed
+                    # (AC2), unless the child's own content changed (AC6 —
+                    # changed children are never silently inherited-passed).
+                    if _child_content_changed(
+                        runner, child["id"], worklog_dir=worklog_dir,
+                    ):
+                        cr["child_audit_ready"] = False
+                        pending_children.append((len(child_results), child))
+                    else:
+                        cr["inherited_pass"] = True
+                        cr["child_audit_ready"] = True
+                        cr["ac_results"] = [{
+                            "text": "Inherited from parent pass",
+                            "verdict": "met",
+                            "evidence": (
+                                "Parent audit passed with no gaps; child "
+                                "inherits passed (SA-0MSKB6VJA005N43F)."
+                            ),
+                        }]
+                elif child["id"] in gap_child_ids:
+                    # Parent has gaps and this child owns the affected files
+                    # → full audit (AC3).
+                    cr["child_audit_ready"] = False
+                    pending_children.append((len(child_results), child))
+                else:
+                    # Unrelated child → not audited (AC3), does not block.
+                    cr["pass_through"] = "unrelated_to_gaps"
+                    cr["child_audit_ready"] = True
+                    cr["ac_results"] = [{
+                        "text": "Not audited (unrelated to parent gaps)",
+                        "verdict": "partial",
+                        "evidence": (
+                            "Parent audit has gaps; this child is unrelated to "
+                            "the gap files and was not audited "
+                            "(SA-0MSKB6VJA005N43F)."
+                        ),
+                    }]
+                child_results.append(cr)
+
+            # 4. Phase 1 child AC review for pending (gap-mapped / changed)
+            # children only — the parent's critical path is unaffected.
+            if pending_children:
+                parallelism = _resolve_phase2_parallelism()
+                if parallelism > 1 and len(pending_children) > 1:
+                    with ThreadPoolExecutor(max_workers=parallelism) as executor:
+                        futures = [
+                            executor.submit(
+                                _phase1_review_child_acs,
+                                ci, child,
+                                resolved_model, pi_bin, debug_log, timeout,
+                                runner, _record_script_failure,
+                                ac_fallback_used=ac_fallback_used,
+                            )
+                            for ci, child in pending_children
+                        ]
+                        for future in futures:
+                            ci, acs = future.result()
+                            child_results[ci]["ac_results"] = acs
+                else:
+                    for ci, child in pending_children:
+                        _ci, acs = _phase1_review_child_acs(
+                            ci, child,
+                            resolved_model, pi_bin, debug_log, timeout,
+                            runner, _record_script_failure,
+                            ac_fallback_used=ac_fallback_used,
+                        )
+                        child_results[ci]["ac_results"] = acs
+
+            # 5. Child Phase 2 deep analysis for pending children only
+            # (parent already deep-verified — skip_parent_deep=True).
+            if pending_children and not has_blocking_cq:
+                ac_results, child_results, phase2_completed = _run_phase2_deep_analysis(
+                    work_item, ac_results, child_results,
+                    resolved_model=resolved_model,
+                    pi_bin=pi_bin,
+                    debug_log=debug_log,
+                    script_failure_callback=_record_script_failure,
+                    timeout=timeout,
+                    runner=runner,
+                    batch_phase2=batch_phase2,
+                    worklog_dir=worklog_dir,
+                    ac_fallback_used=ac_fallback_used,
+                    green_run_block=green_run_block,
+                    skip_parent_deep=True,
+                )
+
+            # 6. Persist child audits (inherited children are explicit in the
+            # parent report; only audited children get persisted audits).
+            child_persist_results = []
+            if persist:
+                for child in child_results:
+                    if child.get("inherited_pass") or child.get("pass_through"):
+                        continue  # no per-child audit was run
+                    child_success, _child_report = _persist_child_audit(
+                        child_id=child["id"],
+                        child_title=child["title"],
+                        child_status=child["status"],
+                        child_stage=child["stage"],
+                        ac_results=child["ac_results"],
+                        pi_bin=pi_bin,
+                        model=resolved_model,
+                        model_source=model_source,
+                        worklog_dir=worklog_dir,
+                    )
+                    child_persist_results.append({
+                        "id": child["id"],
+                        "title": child["title"],
+                        "success": child_success,
+                    })
+                    if not child_success:
+                        print(
+                            f"Warning: Failed to persist audit for child {child['id']} "
+                            f"({child['title']}): wl returned exit code {1}",
+                            file=sys.stderr,
+                        )
+
+
 
         # ------------------------------------------------------------------
         # Create quality epics for findings (before report assembly)

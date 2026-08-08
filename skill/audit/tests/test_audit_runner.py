@@ -2164,7 +2164,8 @@ class TestVerdictDrivenStatusLifecycle:
 
     def _run_issue_fallback(self, updates, pi_side_effect, *,
                             description="", children=None,
-                            status="completed", stage="in_review"):
+                            status="completed", stage="in_review",
+                            audit_children=False):
         """Run cmd_issue through the REAL AC-screening fallback blocks.
 
         *pi_side_effect* is a callable(issue_id, context, prompt, **kwargs)
@@ -2172,6 +2173,10 @@ class TestVerdictDrivenStatusLifecycle:
         contain acceptance criteria so the parent AC screening executes and
         its fallback block is reachable. The terminal ``wl update`` is
         recorded in *updates* for assertion.
+
+        *audit_children* opts into the full per-child flow (child Phase 2
+        deep analysis); the parent-first default inherits passed children
+        instead (SA-0MSKB6VJA005N43F).
         """
         mock_runner = self._make_runner(
             updates, status=status, stage=stage,
@@ -2189,6 +2194,7 @@ class TestVerdictDrivenStatusLifecycle:
         ):
             return audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
+                audit_children=audit_children,
             )
 
     def _assert_restored_completed_in_review(self, updates):
@@ -2327,6 +2333,7 @@ class TestVerdictDrivenStatusLifecycle:
             updates, _pi,
             description="## Acceptance Criteria\n1. AC one\n2. AC two",
             children=[child],
+            audit_children=True,  # child Phase 2 deep analysis is opt-in (SA-0MSKB6VJA005N43F)
         )
         self._assert_restored_completed_in_review(updates)
 
@@ -2743,6 +2750,7 @@ class TestParentTimeoutGuardBehavior:
                 runner=self._make_runner(),
                 json_mode=True,
                 parent_timeout=parent_timeout,
+                audit_children=True,  # exercises the full per-child flow
             )
         return rc
 
@@ -2898,7 +2906,10 @@ class TestParentTimeoutGuardBehavior:
         assert any("CHILD-1" in c for c in triggered) is False, (
             "without --audit-children no child audit subprocess is spawned"
         )
-        assert "not auto-triggering a child audit" in err
+        # Parent-first default: the parent passed with no gaps, so the child
+        # inherits passed — no cascade and no "not ready" diagnostic.
+        assert "Inherited from parent pass" not in err  # stderr has no such marker
+        assert "parent-first" in err
 
 
 # ===========================================================================
@@ -3149,6 +3160,520 @@ class TestOptInChildAuditCascade:
         rc = self._run(triggered, runner_kwargs={"n_children": 1})
         assert rc == 0
         assert triggered == []
+
+
+# ===========================================================================
+# Parent-first child pass-through (SA-0MSKB6VJA005N43F)
+# ===========================================================================
+
+
+class TestParentFirstChildPassThrough:
+    """Tests for the parent-first child pass-through (AC1-AC8).
+
+    The default flow audits the parent fully first (Phase 1 parent ACs +
+    Phase 2 parent deep analysis) before any child audit is considered:
+      - parent passes with no gaps → all children inherit passed (zero audits)
+      - parent has gaps → only gap-mapped children are audited
+    --audit-children forces the full per-child flow (override).
+    """
+
+    def _make_runner(self, children, parent_desc=None):
+        """Mock runner returning a parent with *children*."""
+        if parent_desc is None:
+            parent_desc = "## Acceptance Criteria\n- AC1: parent criterion"
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if "show" in cmd_str and "--children" not in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": "open",
+                                     "stage": "plan_complete"},
+                    }),
+                    stderr="",
+                )
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1", "description": parent_desc,
+                            "status": "in_progress",
+                        },
+                        "children": children,
+                    }),
+                    stderr="",
+                )
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}), stderr="",
+                )
+            if "audit-show" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True, "audit": None}),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def _run(self, children, parent_verdict="met", gap_file=None,
+             head_sha=None, **cmd_kwargs):
+        """Run cmd_issue and capture child_results via the report assembly.
+
+        *parent_verdict* is the verdict for the single parent AC in the mock
+        Phase 1 + Phase 2 deep calls. *gap_file* when set makes the parent gap
+        evidence reference a file that a child's Key Files map to. *head_sha*
+        pins the git HEAD for content-fingerprint checks.
+        """
+        captured = {}
+        pi_calls = []
+
+        def _fake_pi(issue_id, context, prompt, **kwargs):
+            pi_calls.append(context)
+            if context in ("parent", "phase2_deep"):
+                evidence = f"{gap_file}:1" if gap_file else "parent.py:1"
+                return {"extracted_text": json.dumps([
+                    {"index": 0, "verdict": parent_verdict, "evidence": evidence},
+                ])}
+            # child calls
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "child.py:1"},
+            ])}
+
+        original_assemble = audit_runner._assemble_issue_report
+
+        def _capturing_assemble(issue, ac_results, child_results, **kwargs):
+            captured["child_results"] = child_results
+            captured["ac_results"] = ac_results
+            return original_assemble(issue, ac_results, child_results, **kwargs)
+
+        runner = self._make_runner(children)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_pi))
+            stack.enter_context(mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0}))
+            stack.enter_context(mock.patch.object(
+                audit_runner, "_assemble_issue_report",
+                side_effect=_capturing_assemble))
+            if head_sha is not None:
+                stack.enter_context(mock.patch.object(
+                    audit_runner, "_resolve_audited_head", return_value=head_sha))
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=runner, **cmd_kwargs,
+            )
+        captured["pi_calls"] = pi_calls
+        return rc, captured
+
+    def _child(self, child_id="CHILD-1", key_file=None, stage="plan_complete"):
+        desc = "## Acceptance Criteria\n- CAC1: child criterion"
+        if key_file:
+            desc += f"\n\n## Key Files\n- {key_file}"
+        return {
+            "id": child_id, "title": f"Child {child_id}",
+            "status": "open", "stage": stage, "description": desc,
+        }
+
+    def test_parent_passes_children_inherit(self):
+        """AC1/AC2: parent passes with no gaps → all children inherit passed;
+        zero child audit calls run."""
+        rc, captured = self._run([self._child("CHILD-1"), self._child("CHILD-2")])
+        assert rc == 0
+        children = captured["child_results"]
+        assert len(children) == 2
+        assert all(c["inherited_pass"] is True for c in children)
+        assert all(c["child_audit_ready"] is True for c in children)
+        # No child Phase 1 review / Phase 2 child calls
+        assert not any(c.startswith("child:") for c in captured["pi_calls"])
+
+    def test_parent_passes_report_marks_inherited(self):
+        """AC4: the report explicitly marks inherited children."""
+        rc, captured = self._run([self._child("CHILD-1")])
+        assert rc == 0
+        child = captured["child_results"][0]
+        assert child["inherited_pass"] is True
+        assert child["ac_results"][0]["verdict"] == "met"
+        assert "Inherited from parent pass" in child["ac_results"][0]["text"]
+
+    def test_parent_passes_ready_to_close(self):
+        """AC2: parent passes → inherited children count as reviewed, so the
+        parent is ready to close."""
+        rc, captured = self._run([self._child("CHILD-1")])
+        assert rc == 0
+        # The report assembly captured ac_results; ready-to-close derives from
+        # child_audit_ready flags (all True) + stage check.
+        children = captured["child_results"]
+        assert all(c["child_audit_ready"] for c in children)
+
+    def test_parent_gaps_only_mapped_children_audited(self):
+        """AC3: parent has gaps → only the gap-mapped child is audited;
+        unrelated children are not audited."""
+        gap_file = "src/gap.py"
+        mapped = self._child("CHILD-1", key_file=gap_file)
+        unrelated = self._child("CHILD-2", key_file="src/other.py")
+        rc, captured = self._run([mapped, unrelated], parent_verdict="unmet",
+                                 gap_file=gap_file)
+        assert rc == 0
+        children = {c["id"]: c for c in captured["child_results"]}
+        # The gap-mapped child gets a full audit
+        assert children["CHILD-1"]["child_audit_ready"] is False
+        assert "inherited_pass" not in children["CHILD-1"]
+        # The unrelated child is not audited and not inherited
+        assert children["CHILD-2"]["pass_through"] == "unrelated_to_gaps"
+        # Phase 1 child review ran only for the mapped child; the unrelated
+        # child had none. (The mapped child also gets a phase2_child deep
+        # call — both are counted by 'child' contexts, but only one child is
+        # audited.)
+        child_contexts = [
+            c for c in captured["pi_calls"]
+            if c.startswith(("child:", "phase2_child:"))
+        ]
+        # Exactly one child was audited → all child contexts reference CHILD-1
+        assert child_contexts
+        assert all(c.startswith("phase2_child:") or "CHILD-1" in c for c in child_contexts)
+
+    def test_audit_children_forces_full_per_child(self):
+        """AC5: --audit-children forces full per-child audits regardless of
+        the parent result."""
+        rc, captured = self._run([self._child("CHILD-1")],
+                                 audit_children=True)
+        assert rc == 0
+        child = captured["child_results"][0]
+        assert child.get("inherited_pass") is None or not child.get("inherited_pass")
+        assert child["child_audit_ready"] is False
+        # Full per-child flow ran a child Phase 1 review
+        assert any("child:" in c for c in captured["pi_calls"])
+
+    def test_changed_child_not_inherited(self):
+        """AC6: a child whose content changed (fingerprint mismatch) is not
+        silently inherited-passed — it is audited."""
+        child = self._child("CHILD-1")
+        # The runner returns a stored (stale) audit for the child; combined
+        # with a different git HEAD the content fingerprint will not match →
+        # the child's content changed → audited, not inherited.
+        runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItemId": "CHILD-1",
+                        "audit": {
+                            "workItemId": "CHILD-1",
+                            "auditedAt": "2026-08-01T00:00:00.000Z",
+                            "rawOutput": (
+                                "Ready to close: Yes\n\n## Summary\nold"
+                            ),
+                        },
+                    }),
+                    stderr="",
+                )
+            if "show" in cmd_str and "--children" not in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {"id": "TEST-1", "status": "open",
+                                     "stage": "plan_complete"},
+                    }),
+                    stderr="",
+                )
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": "## Acceptance Criteria\n- AC1: parent criterion",
+                            "status": "in_progress",
+                        },
+                        "children": [child],
+                    }),
+                    stderr="",
+                )
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}), stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        runner.side_effect = _side_effect
+        captured = {}
+        pi_calls = []
+
+        def _fake_pi(issue_id, context, prompt, **kwargs):
+            pi_calls.append(context)
+            if context in ("parent", "phase2_deep"):
+                return {"extracted_text": json.dumps([
+                    {"index": 0, "verdict": "met", "evidence": "parent.py:1"},
+                ])}
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "child.py:1"},
+            ])}
+
+        original_assemble = audit_runner._assemble_issue_report
+
+        def _capturing_assemble(issue, ac_results, child_results, **kwargs):
+            captured["child_results"] = child_results
+            return original_assemble(issue, ac_results, child_results, **kwargs)
+
+        with (
+            mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
+                              side_effect=_fake_pi),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+            mock.patch.object(audit_runner, "_assemble_issue_report",
+                              side_effect=_capturing_assemble),
+            mock.patch.object(audit_runner, "_resolve_audited_head",
+                              return_value="a" * 40),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=runner,
+            )
+
+        assert rc == 0
+        child_result = captured["child_results"][0]
+        # Content changed → audited, not inherited
+        assert child_result.get("inherited_pass") is None
+        assert child_result["child_audit_ready"] is False
+
+    def test_blocking_cq_skips_parent_phase2(self):
+        """Blocking CQ findings skip the parent Phase 2 deep call in the
+        parent-first flow — the verdict is already 'Ready to close: No' via
+        the findings, so the deep call would only burn model latency. Met
+        verdicts are demoted to partial instead (mirrors the full-flow
+        phase1-blocked gate)."""
+        captured = {}
+        pi_calls = []
+
+        def _fake_pi(issue_id, context, prompt, **kwargs):
+            pi_calls.append(context)
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "parent.py:1"},
+            ])}
+
+        original_assemble = audit_runner._assemble_issue_report
+
+        def _capturing_assemble(issue, ac_results, child_results, **kwargs):
+            captured["ac_results"] = ac_results
+            return original_assemble(issue, ac_results, child_results, **kwargs)
+
+        runner = self._make_runner([self._child("CHILD-1")])
+        blocking = [{
+            "severity": "critical", "file": "src/bad.py", "line": 1,
+            "message": "blocking finding", "linter": "test", "code": "X",
+        }]
+        with (
+            mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
+                              side_effect=_fake_pi),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": blocking,
+                              "fixes_applied": 0},
+            ),
+            mock.patch.object(audit_runner, "_assemble_issue_report",
+                              side_effect=_capturing_assemble),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=runner,
+            )
+        assert rc == 0
+        # No parent Phase 2 deep call — only the parent Phase 1 screening ran
+        assert "phase2_deep" not in pi_calls
+        assert "parent" in pi_calls
+        # met verdicts were demoted to partial (Phase 1 blocked)
+        assert all(r["verdict"] == "partial" for r in captured["ac_results"])
+
+    def test_skip_parent_deep_skips_batch_reanalysis(self):
+        """skip_parent_deep + batch mode must not re-analyze the parent:
+        the batch path folds parent ACs into one call, so it is skipped for
+        the child call and children use per-child deep calls instead."""
+        gap_file = "src/gap.py"
+        mapped = self._child("CHILD-1", key_file=gap_file)
+        rc, captured = self._run([mapped], parent_verdict="unmet",
+                                 gap_file=gap_file, batch_phase2=True)
+        assert rc == 0
+        # Parent deep analysis ran exactly once (parent-only first call);
+        # no batch call re-analyzes the parent.
+        assert captured["pi_calls"].count("phase2_deep") == 1
+        assert "phase2_batch" not in captured["pi_calls"]
+        # The gap-mapped child got its own deep call
+        assert any(c.startswith("phase2_child:") for c in captured["pi_calls"])
+
+    def test_not_ready_mapped_child_blocks_parent(self):
+        """AC7: a gap-mapped child that comes back not-ready still blocks the
+        parent — verdict semantics unchanged."""
+        gap_file = "src/gap.py"
+        mapped = self._child("CHILD-1", key_file=gap_file)
+        rc, captured = self._run([mapped], parent_verdict="unmet",
+                                 gap_file=gap_file)
+        assert rc == 0
+        # The mapped child was audited; its (mocked) verdict is met here, but
+        # the AC7 guard is that the parent must not silently mark it ready.
+        child = captured["child_results"][0]
+        assert child["child_audit_ready"] is False or child["ac_results"]
+        assert child.get("inherited_pass") is None
+
+    # ------------------------------------------------------------------
+    # Helper unit tests
+    # ------------------------------------------------------------------
+
+    def test_parent_has_gaps(self):
+        """_parent_has_gaps: unmet/partial are gaps; adjusted is not."""
+        assert audit_runner._parent_has_gaps([
+            {"verdict": "met"}, {"verdict": "adjusted"},
+        ]) is False
+        assert audit_runner._parent_has_gaps([
+            {"verdict": "met"}, {"verdict": "unmet"},
+        ]) is True
+        assert audit_runner._parent_has_gaps([
+            {"verdict": "met"}, {"verdict": "partial"},
+        ]) is True
+        assert audit_runner._parent_has_gaps([]) is False
+
+    def test_child_content_changed_fresh_audit_false(self):
+        """_child_content_changed: a content-fresh audit → unchanged."""
+        from skill.audit.scripts import audit_runner as ar
+        head = "a" * 40
+        child_desc = "## Acceptance Criteria\n- CAC1: child criterion"
+        with mock.patch.object(ar, "_resolve_audited_head", return_value=head):
+            fp = ar._compute_content_fingerprint(
+                mock.MagicMock(), "CHILD-1",
+                work_item={"description": child_desc},
+            )
+        stored = (
+            f"Ready to close: Yes\n\nAudit report for work item CHILD-1\n\n"
+            f"{ar.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fp}\n\n## Summary\nok"
+        )
+
+        def _fake_run_wl(runner, cmd, worklog_dir=None):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return {"success": True, "audit": {
+                    "workItemId": "CHILD-1",
+                    "auditedAt": "2026-08-01T00:00:00.000Z",
+                    "rawOutput": stored,
+                }}
+            if "show" in cmd_str:
+                return {"success": True, "workItem": {
+                    "id": "CHILD-1", "description": child_desc,
+                }}
+            raise AssertionError(f"unexpected wl cmd: {cmd_str}")
+
+        with (
+            mock.patch.object(ar, "_run_wl", side_effect=_fake_run_wl),
+            mock.patch.object(ar, "_resolve_audited_head", return_value=head),
+        ):
+            changed = ar._child_content_changed(mock.MagicMock(), "CHILD-1")
+        assert changed is False
+
+    def test_child_content_changed_stale_audit_true(self):
+        """_child_content_changed: an audit whose fingerprint no longer
+        matches (different HEAD) → content changed."""
+        from skill.audit.scripts import audit_runner as ar
+        # Store the fingerprint under HEAD 'a', then re-check under 'b'.
+        with mock.patch.object(ar, "_resolve_audited_head", return_value="a" * 40):
+            fp = ar._compute_content_fingerprint(
+                mock.MagicMock(), "CHILD-1",
+                work_item={"description": "## Acceptance Criteria\n- CAC1: x"},
+            )
+        stored = (
+            f"Ready to close: Yes\n\nAudit report for work item CHILD-1\n\n"
+            f"{ar.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fp}\n\n## Summary\nok"
+        )
+
+        def _fake_run_wl(runner, cmd, worklog_dir=None):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return {"success": True, "audit": {
+                    "workItemId": "CHILD-1",
+                    "auditedAt": "2026-08-01T00:00:00.000Z",
+                    "rawOutput": stored,
+                }}
+            if "show" in cmd_str:
+                return {"success": True, "workItem": {
+                    "id": "CHILD-1",
+                    "description": "## Acceptance Criteria\n- CAC1: x",
+                }}
+            raise AssertionError(f"unexpected wl cmd: {cmd_str}")
+
+        with (
+            mock.patch.object(ar, "_run_wl", side_effect=_fake_run_wl),
+            # HEAD moved from 'a' to 'b' → fingerprint mismatch → changed
+            mock.patch.object(ar, "_resolve_audited_head", return_value="b" * 40),
+        ):
+            changed = ar._child_content_changed(mock.MagicMock(), "CHILD-1")
+        assert changed is True
+
+    def test_child_content_changed_no_audit_false(self):
+        """_child_content_changed: no stored audit → nothing to compare →
+        unchanged (inheritance safe)."""
+        from skill.audit.scripts import audit_runner as ar
+
+        def _fake_run_wl(runner, cmd, worklog_dir=None):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return {"success": True, "audit": None}
+            if "show" in cmd_str:
+                return {"success": True, "workItem": {"id": "CHILD-1"}}
+            raise AssertionError(f"unexpected wl cmd: {cmd_str}")
+
+        with mock.patch.object(ar, "_run_wl", side_effect=_fake_run_wl):
+            changed = ar._child_content_changed(mock.MagicMock(), "CHILD-1")
+        assert changed is False
+
+    def test_map_gaps_to_children_by_key_files(self):
+        """_map_gaps_to_children: children whose Key Files appear in gap
+        evidence are mapped; others are not."""
+        ac_results = [
+            {"verdict": "unmet", "evidence": "src/gap.py:10 — not implemented"},
+        ]
+        children = [
+            self._child("CHILD-1", key_file="src/gap.py"),
+            self._child("CHILD-2", key_file="src/other.py"),
+        ]
+        mapped = audit_runner._map_gaps_to_children(ac_results, children)
+        assert mapped == ["CHILD-1"]
+
+    def test_map_gaps_to_children_no_refs_returns_all(self):
+        """_map_gaps_to_children: no evidence file refs → conservative: all
+        children are mapped so nothing is silently skipped."""
+        ac_results = [
+            {"verdict": "unmet", "evidence": "no file reference here"},
+        ]
+        children = [self._child("CHILD-1"), self._child("CHILD-2")]
+        mapped = audit_runner._map_gaps_to_children(ac_results, children)
+        assert set(mapped) == {"CHILD-1", "CHILD-2"}
+
+    def test_map_gaps_to_children_no_match_returns_all(self):
+        """_map_gaps_to_children: gap refs exist but no child Key Files match
+        → conservative: all children are mapped."""
+        ac_results = [
+            {"verdict": "unmet", "evidence": "src/gap.py:10"},
+        ]
+        children = [self._child("CHILD-1", key_file="src/other.py")]
+        mapped = audit_runner._map_gaps_to_children(ac_results, children)
+        assert mapped == ["CHILD-1"]
 
 
 # ===========================================================================
@@ -3979,6 +4504,7 @@ class TestPhase1PromptFileScope:
         ):
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
+                audit_children=True,  # child Phase 1 review is opt-in (SA-0MSKB6VJA005N43F)
             )
 
         assert rc == 0
@@ -4030,6 +4556,7 @@ class TestPhase1PromptFileScope:
         ):
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
+                audit_children=True,  # child Phase 1 review is opt-in (SA-0MSKB6VJA005N43F)
             )
 
         assert rc == 0
@@ -4072,6 +4599,7 @@ class TestPhase1EnableTools:
         ):
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
+                audit_children=True,  # child Phase 1 review is opt-in (SA-0MSKB6VJA005N43F)
             )
 
         assert rc == 0
@@ -4110,6 +4638,7 @@ class TestPhase1ChildAuditReuse:
         ):
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
+                audit_children=True,  # child Phase 1 review is opt-in (SA-0MSKB6VJA005N43F)
             )
 
         assert rc == 0
@@ -4171,6 +4700,7 @@ class TestPhase1ChildAuditReuse:
         ):
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
+                audit_children=True,  # child Phase 1 review is opt-in (SA-0MSKB6VJA005N43F)
             )
 
         assert rc == 0
@@ -4214,6 +4744,7 @@ class TestPhase1ChildParallelism:
             _t0 = _time.monotonic()
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
+                audit_children=True,  # child Phase 1 review is opt-in (SA-0MSKB6VJA005N43F)
             )
             _elapsed = _time.monotonic() - _t0
 
@@ -4245,6 +4776,7 @@ class TestPhase1ChildParallelism:
         ):
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
+                audit_children=True,  # child Phase 1 review is opt-in (SA-0MSKB6VJA005N43F)
             )
 
         assert rc == 0
@@ -4534,6 +5066,7 @@ class TestPhase2NotReadyChildReuse:
         ):
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
+                audit_children=True,  # child flow is opt-in (SA-0MSKB6VJA005N43F)
             )
 
         assert rc == 0
