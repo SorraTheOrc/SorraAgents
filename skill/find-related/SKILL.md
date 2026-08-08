@@ -108,7 +108,7 @@ python3 ./scripts/find_related.py --work-item-id <id> [--json] [--verbose] [--re
 | `--work-item-id` | Yes | — | Work item to search |
 | `--verbose` | No | false | Debug output to stderr |
 | `--json` | No | false | JSON output |
-| `--repo-path` | No | auto | Repository root |
+| `--repo-path` | No | auto | Repository root. Defaults to the analyzed work item's own project (parent of its resolved `.worklog` store, prefix-to-sibling scan); falls back to the framework repo when no store resolves. An explicit path always overrides the default. |
 
 ### Output (default)
 
@@ -133,7 +133,9 @@ Work item: <id> | Related: 3 | Repo matches: 2 | Added IDs: REL-001, REL-002
 
 ### Idempotency
 
-Safe to re-run: existing automated report is replaced, not duplicated. Manual "Related work" sections preserved.
+Safe to re-run: ALL prior automated report sections are removed before the
+new one is inserted (duplicates from earlier runs never accumulate). Manual
+"Related work" sections (without the automated marker) are preserved.
 
 ### Design
 

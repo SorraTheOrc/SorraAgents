@@ -26,7 +26,11 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from skill.scripts.failure_notice import FailureNotice
-from skill.shared.status_lifecycle import StatusLifecycle, resolve_worklog_flags
+from skill.shared.status_lifecycle import (
+    StatusLifecycle,
+    resolve_worklog_dir,
+    resolve_worklog_flags,
+)
 
 # ---------------------------------------------------------------------------
 # Stop words
@@ -82,6 +86,27 @@ MAX_KEYWORDS_PER_FILE: int = 5
 # ---------------------------------------------------------------------------
 
 
+def _default_repo_path(work_item_id: str) -> Path:
+    """Resolve the target project's repository root for *work_item_id*.
+
+    The work item's own worklog store is resolved via the shared
+    prefix-to-sibling scan (:func:`resolve_worklog_dir`); the parent of the
+    ``.worklog`` directory is the target project root. Deriving the default
+    from the work item (rather than this script's own location) keeps repo
+    scans on the analyzed project even when the script runs from the
+    framework install dir (``~/.pi/agent/skills/find-related`` is a symlink
+    into SorraAgents).
+
+    Falls back to the framework ``REPO_ROOT`` when no store resolves
+    (e.g. an unknown prefix with an empty cwd chain) — the pre-fix
+    behavior.
+    """
+    wl_dir = resolve_worklog_dir(work_item_id)
+    if wl_dir is not None:
+        return wl_dir.parent
+    return REPO_ROOT
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -105,8 +130,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--repo-path",
-        default=str(REPO_ROOT),
-        help="Path to the repository root (default: auto-detected).",
+        default=None,
+        help="Path to the repository root (default: auto-detected from the "
+             "work item's worklog store; falls back to the framework repo).",
     )
     return parser.parse_args(argv)
 
@@ -496,28 +522,43 @@ def write_full_report(
 def update_description(original_desc: str, report_section: str) -> str:
     """Append or replace the automated report section in a work-item description.
 
-    If the description already contains a 'Related work (automated report)'
-    section, it is replaced. Otherwise the report is appended.
+    ALL existing 'Related work (automated report)' sections are removed
+    before the new report is inserted — earlier runs may have appended
+    duplicates (e.g. when a wrong-store run was followed by a correct
+    one). The new report is inserted at the position of the first removed
+    section (in-place replacement, preserving surrounding sections), or
+    appended when no section existed. Manual "Related work" sections
+    (without the automated marker) are preserved.
 
     Returns the updated description string.
     """
     heading_pattern = f"## {REPORT_HEADING}"
-    heading_idx = original_desc.find(heading_pattern)
+    remaining = original_desc
+    insertion_idx: int | None = None
 
-    if heading_idx == -1:
+    # Remove every automated report section: each spans from its heading to
+    # the next section heading (\n##) or the end of the description.
+    while True:
+        heading_idx = remaining.find(heading_pattern)
+        if heading_idx == -1:
+            break
+        if insertion_idx is None:
+            insertion_idx = heading_idx
+        next_section_idx = len(remaining)
+        for i in range(heading_idx + len(heading_pattern), len(remaining)):
+            if remaining[i : i + 3] == "\n##":
+                next_section_idx = i
+                break
+        remaining = remaining[:heading_idx] + remaining[next_section_idx:]
+
+    if insertion_idx is None:
         # No existing report section — append
         return original_desc.rstrip() + report_section
 
-    # Find the start of the next section after the report heading
-    next_section_idx = len(original_desc)
-    for i in range(heading_idx + len(heading_pattern), len(original_desc)):
-        if original_desc[i : i + 3] == "\n##":
-            next_section_idx = i
-            break
-
-    # Replace the old report section with the new one
-    before = original_desc[:heading_idx].rstrip()
-    after = original_desc[next_section_idx:]
+    # Replace the (first) report section position with the new report;
+    # everything after the last removed section follows unchanged.
+    before = remaining[:insertion_idx].rstrip()
+    after = remaining[insertion_idx:]
     return before + report_section + after
 
 
@@ -544,6 +585,13 @@ def main() -> None:
 
 def _main() -> None:
     args = parse_args()
+
+    # Resolve the default --repo-path from the work item's own worklog
+    # store (parent of .worklog) so repo scans target the analyzed project
+    # even when invoked from the framework install dir. An explicit
+    # --repo-path continues to override the default.
+    if args.repo_path is None:
+        args.repo_path = str(_default_repo_path(args.work_item_id))
 
     # StatusLifecycle manages work-item status transitions:
     #   - On entry: sets status to in_progress (captures original)
