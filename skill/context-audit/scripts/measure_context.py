@@ -75,7 +75,7 @@ def parse_description(frontmatter: str) -> str:
             block_lines: list[str] = []
             for sub in lines[index + 1:]:
                 if sub == "" or sub.startswith(("  ", "\t")):
-                    block_lines.append(sub[2:] if sub.startswith("  ") else sub)
+                    block_lines.append(sub.removeprefix("  ") if sub.startswith("  ") else sub)
                 else:
                     break
             return "\n".join(block_lines).strip()
@@ -83,7 +83,7 @@ def parse_description(frontmatter: str) -> str:
             block_lines: list[str] = []
             for sub in lines[index + 1:]:
                 if sub == "" or sub.startswith(("  ", "\t")):
-                    block_lines.append(sub[2:] if sub.startswith("  ") else sub)
+                    block_lines.append(sub.removeprefix("  ") if sub.startswith("  ") else sub)
                 else:
                     break
             return "\n".join(block_lines).strip()
