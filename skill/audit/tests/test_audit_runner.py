@@ -6063,6 +6063,349 @@ class TestAutoGreenRunCmdIssue:
 
 
 # ===========================================================================
+# --run-tests test-skill invocation (SA-0MSJELSWS002UF60)
+# ===========================================================================
+
+
+class TestRunTestsViaTestSkill:
+    """Unit tests for the --run-tests test-skill invocation.
+
+    Covers: green executed run (AC1), failures triaged per the test skill
+    (AC4), fail-closed notices, and triage-error resilience.
+    """
+
+    def _green_run(self, command, **kwargs):
+        return {
+            "stdout": "5 passed in 0.03s",
+            "stderr": "",
+            "exit_code": 0,
+            "completed_at": 1000.0,
+            "command": command,
+            "git_state": "fingerprint",
+            "cached": False,
+        }
+
+    def test_green_run_success_refreshes_cache(self, tmp_path, capsys):
+        """AC1: a green executed suite yields success and refreshes the cache."""
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=self._green_run
+        ) as mock_run:
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is True
+        assert result["failures"] == []
+        assert result["triaged"] == []
+        assert result["notice"] == ""
+        # force=True executes fresh and stores, so the cache is refreshed.
+        assert mock_run.call_count == 4  # pytest + 3 node suite commands
+        for call in mock_run.call_args_list:
+            assert call.kwargs["cwd"] == str(tmp_path.resolve())
+            assert call.kwargs["force"] is True
+            assert call.kwargs["ttl"] == audit_runner.DEFAULT_TTL_SECONDS
+        err = capsys.readouterr().err
+        assert "Invoking test skill (run_tests.py)" in err
+        assert "Test skill run completed: success=True" in err
+
+    def test_failing_run_triages_failures(self, tmp_path, capsys):
+        """AC4: failures are triaged per the test skill, never silently ignored."""
+        def _side_effect(command, **kwargs):
+            if "pytest" in command:
+                return {
+                    "stdout": (
+                        "FAILED tests/test_x.py::test_boom - "
+                        "AssertionError: boom"
+                    ),
+                    "stderr": "",
+                    "exit_code": 1,
+                    "completed_at": 1000.0,
+                    "command": command,
+                    "git_state": "fingerprint",
+                    "cached": False,
+                }
+            return self._green_run(command, **kwargs)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ), mock.patch(
+            "skill.triage.scripts.check_or_create.check_or_create",
+            return_value={"issueId": "SA-TRIAGE-1", "created": True},
+        ) as mock_triage:
+            result = audit_runner._run_tests_via_test_skill(
+                cwd=tmp_path, parent_work_item_id="TEST-1", head_sha="abc123",
+            )
+        assert result["success"] is False
+        assert len(result["failures"]) == 1
+        assert result["failures"][0]["test_name"] == "tests/test_x.py::test_boom"
+        assert mock_triage.call_count == 1
+        payload = mock_triage.call_args.args[0]
+        assert payload["test_name"] == "tests/test_x.py::test_boom"
+        assert payload["parent_work_item_id"] == "TEST-1"
+        assert payload["commit_hash"] == "abc123"
+        assert payload["repo_path"] == str(tmp_path.resolve())
+        err = capsys.readouterr().err
+        assert "Test skill run completed: success=False" in err
+        assert "failures=1 triaged=1" in err
+
+    def test_nonzero_exit_without_parseable_failures(self, tmp_path):
+        """A non-zero exit with no FAILED lines is recorded, never silently green."""
+        def _side_effect(command, **kwargs):
+            if "pytest" in command:
+                return {
+                    "stdout": "crash before any test ran",
+                    "stderr": "",
+                    "exit_code": 1,
+                    "completed_at": 1000.0,
+                    "command": command,
+                    "git_state": "fingerprint",
+                    "cached": False,
+                }
+            return self._green_run(command, **kwargs)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ), mock.patch(
+            "skill.triage.scripts.check_or_create.check_or_create",
+            return_value={"issueId": "SA-TRIAGE-1", "created": True},
+        ) as mock_triage:
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is False
+        assert len(result["failures"]) == 1
+        assert "<suite exited 1>" in result["failures"][0]["test_name"]
+        assert mock_triage.call_count == 1
+
+    def test_timeout_notice_fail_closed(self, tmp_path):
+        """A suite timeout yields a notice, no evidence, no crash."""
+        def _side_effect(command, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=command, timeout=600)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ):
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is False
+        assert "timed out" in result["notice"]
+        assert result["failures"] == []
+
+    def test_command_not_found_notice_fail_closed(self, tmp_path):
+        """A missing suite binary yields a notice, no evidence, no crash."""
+        def _side_effect(command, **kwargs):
+            raise FileNotFoundError("pytest")
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ):
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is False
+        assert "command not found" in result["notice"]
+        assert result["failures"] == []
+
+    def test_triage_error_never_crashes_run(self, tmp_path):
+        """AC4: a triage helper failure is recorded, never crashes the run."""
+        def _side_effect(command, **kwargs):
+            if "pytest" in command:
+                return {
+                    "stdout": (
+                        "FAILED tests/test_x.py::test_boom - "
+                        "AssertionError: boom"
+                    ),
+                    "stderr": "",
+                    "exit_code": 1,
+                    "completed_at": 1000.0,
+                    "command": command,
+                    "git_state": "fingerprint",
+                    "cached": False,
+                }
+            return self._green_run(command, **kwargs)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ), mock.patch(
+            "skill.triage.scripts.check_or_create.check_or_create",
+            side_effect=RuntimeError("triage boom"),
+        ):
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is False
+        assert result["triaged"][0]["error"] == "triage boom"
+
+
+class TestRunTestsPromptInjection:
+    """Prompt-content assertions for the --run-tests path (SA-0MSJELSWS002UF60)."""
+
+    def _make_cmd_issue_runner(self, description: str = _GREEN_RUN_DESC,
+                               head_sha: str | None = _GREEN_RUN_HEAD):
+        return TestAutoGreenRunPromptInjection()._make_cmd_issue_runner(
+            description=description, head_sha=head_sha,
+        )
+
+    def _mock_cq(self):
+        return mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+    def _capture_context_prompts(self, cache_result=None, test_run=None,
+                                 **cmd_kwargs):
+        """Run cmd_issue with query_cached + _run_tests_via_test_skill mocked.
+
+        Returns (prompts, mock_run_tests) so tests can assert both the prompt
+        content and whether the test-skill invocation was (not) called.
+        """
+        mock_runner = self._make_cmd_issue_runner()
+        prompts: dict[str, str] = {}
+        effective_test_run = test_run or {
+            "success": True, "results": [], "failures": [],
+            "triaged": [], "notice": "",
+        }
+
+        def _fake_call(*args, **kwargs):
+            prompts[args[1]] = args[2]
+            return {"extracted_text": "[]"}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=cache_result
+        ), mock.patch.object(
+            audit_runner, "_run_tests_via_test_skill",
+            return_value=effective_test_run,
+        ) as mock_run_tests, mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+                **cmd_kwargs,
+            )
+        return prompts, mock_run_tests
+
+    def test_run_tests_with_empty_cache_invokes_test_skill(self):
+        """AC1: cache miss + --run-tests → the test skill is invoked and a green
+        executed run injects the TEST-SKILL RUN block (no operator round-trip)."""
+        prompts, mock_run_tests = self._capture_context_prompts(
+            cache_result=None, run_tests=True,
+        )
+        assert "parent" in prompts
+        assert mock_run_tests.call_count == 1
+        assert mock_run_tests.call_args.kwargs["parent_work_item_id"] == "TEST-1"
+        assert "TEST-SKILL GREEN RUN" in prompts["parent"]
+        assert _GREEN_RUN_HEAD in prompts["parent"]
+        assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
+
+    def test_without_run_tests_never_invokes_test_skill(self):
+        """AC2: without --run-tests the behavior is unchanged — the test skill is
+        never invoked on a cache miss and no block is injected."""
+        prompts, mock_run_tests = self._capture_context_prompts(
+            cache_result=None,
+        )
+        assert "parent" in prompts
+        mock_run_tests.assert_not_called()
+        assert "TEST-SKILL GREEN RUN" not in prompts["parent"]
+        assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
+
+    def test_green_cache_skips_test_skill_invocation(self):
+        """AC1: a green cached run short-circuits the invocation entirely."""
+        prompts, mock_run_tests = self._capture_context_prompts(
+            cache_result=_AUTO_GREEN_ENTRY, run_tests=True,
+        )
+        assert "AUTO-VERIFIED GREEN RUN" in prompts["parent"]
+        mock_run_tests.assert_not_called()
+
+    def test_failing_test_run_injects_no_block(self):
+        """AC1/AC4: a non-green executed run yields no evidence (fail-closed)."""
+        prompts, mock_run_tests = self._capture_context_prompts(
+            cache_result=None, run_tests=True,
+            test_run={
+                "success": False, "results": [],
+                "failures": [{"test_name": "tests/test_x.py::test_boom"}],
+                "triaged": [{"issueId": "SA-TRIAGE-1"}], "notice": "",
+            },
+        )
+        assert "parent" in prompts
+        assert mock_run_tests.call_count == 1
+        assert "TEST-SKILL GREEN RUN" not in prompts["parent"]
+        assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
+
+    def test_log_lines_show_invocation_and_result(self, capsys):
+        """AC3: clear log lines show when the test skill is invoked and its result.
+
+        The real ``_run_tests_via_test_skill`` runs here (with ``run_cached``
+        mocked green) so the invocation log lines are actually emitted.
+        """
+        mock_runner = self._make_cmd_issue_runner()
+
+        def _fake_call(*args, **kwargs):
+            return {"extracted_text": "[]"}
+
+        def _green_run(command, **kwargs):
+            return {
+                "stdout": "5 passed in 0.03s",
+                "stderr": "",
+                "exit_code": 0,
+                "completed_at": 1000.0,
+                "command": command,
+                "git_state": "fingerprint",
+                "cached": False,
+            }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=None
+        ), mock.patch.object(
+            audit_runner, "run_cached", side_effect=_green_run
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+                run_tests=True,
+            )
+        err = capsys.readouterr().err
+        assert "Invoking test skill (run_tests.py)" in err
+        assert "Test skill run completed: success=True" in err
+
+
+class TestRunTestsReportLine:
+    """The persisted report records the executed-run evidence (AC1/AC3)."""
+
+    def test_report_includes_test_skill_run_line(self):
+        """AC1: 'Test skill run evidence: <sha>' appears near the header."""
+        issue = {"id": "TEST-1"}
+        acs = [{"text": "AC", "verdict": "met", "evidence": ""}]
+        report = audit_runner._assemble_issue_report(
+            issue, acs, [], model="m", model_source="local",
+            test_skill_run_sha=_GREEN_RUN_HEAD,
+        )
+        assert f"Test skill run evidence: {_GREEN_RUN_HEAD}" in report
+        assert "executed full-suite run, --run-tests" in report
+        assert "Automatic green run evidence" not in report
+
+    def test_report_without_test_skill_run_has_no_line(self):
+        """Backward compatibility: no executed-run line without evidence."""
+        issue = {"id": "TEST-1"}
+        acs = [{"text": "AC", "verdict": "met", "evidence": ""}]
+        report = audit_runner._assemble_issue_report(
+            issue, acs, [], model="m", model_source="local",
+        )
+        assert "Test skill run evidence" not in report
+
+
+class TestRunTestsCliFlag:
+    """The --run-tests flag parses and defaults off (AC2)."""
+
+    def test_flag_defaults_off(self):
+        """AC2: without the flag the audit stays strictly read-only."""
+        args = audit_runner.build_parser().parse_args(["issue", "TEST-1"])
+        assert args.run_tests is False
+
+    def test_flag_enables(self):
+        """The flag enables the test-skill invocation path."""
+        args = audit_runner.build_parser().parse_args(
+            ["issue", "TEST-1", "--run-tests"]
+        )
+        assert args.run_tests is True
+
+
+# ===========================================================================
 # _extract_acs unit tests (SA-0MSJ0CFKJ005STB7)
 # ===========================================================================
 

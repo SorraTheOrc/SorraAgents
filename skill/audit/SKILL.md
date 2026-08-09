@@ -331,7 +331,7 @@ Synonym for "Acceptance Criteria". Use **Acceptance Criteria** as canonical head
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--max-concurrency N] [--green-run SHA|HEAD] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR]`
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR]`
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
 **Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
@@ -414,6 +414,19 @@ Semantics:
 - **Fail-closed:** a cache miss, a non-zero (or timed-out) cached run, a partially cached suite set (e.g. pytest but not node), an unresolvable HEAD, or any cache/infra error yields NO evidence — execution-dependent ACs stay `partial` and the audit completes normally (never crashes, never fabricates a green verdict).
 - **Read-only by construction:** `query_cached()` executes nothing, so the audit's read-only mandate is preserved unconditionally — the suite is never executed inside the audit. The cached run must match the audited git state exactly (HEAD sha + working-tree fingerprint) and be within the 2h TTL, so the evidence is a genuine full-suite result at the audited commit.
 - **Workflow:** run the full suite once via the [test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green; this populates the cache), then audits at the same git state within the TTL automatically verify execution-dependent ACs. This removes the manual attestation step for automated/read-only pipelines (e.g. the herdr downtime worker's auto-audit dispatches).
+
+**Auto-invoked test skill (`--run-tests`, SA-0MSJELSWS002UF60):** For environments that authorize test execution during audits (e.g. the herdr downtime worker's auto-audit dispatches, where the manual `/skill:test` round-trip stalls the pipeline), the `--run-tests` flag removes the operator round-trip entirely:
+
+```bash
+python3 ./scripts/audit_runner.py issue SA-123 --run-tests
+```
+
+- When no `--green-run`/`AUDIT_GREEN_RUN` attestation is present AND the read-only cache holds no green full-suite run at the audited git state, the runner **invokes the test skill** (the `run_tests.py` machinery) to execute the full project test suite in quiet mode, triage any failures per the test skill, and refresh the per-repo cache. When the executed run is green, a **TEST-SKILL GREEN RUN** block is injected into the Phase 1 parent prompt and ALL Phase 2 prompts, the sha is recorded in the persisted report as `Test skill run evidence: <sha> (executed full-suite run, --run-tests)`, and execution-dependent ACs MAY be marked met — no operator round-trip needed.
+- **OFF by default (AC2):** without the flag the audit stays strictly read-only and never executes the suite — environments that forbid test execution during audits are unaffected (execution-dependent ACs stay `partial` with the operator instruction). The flag is an explicit, operator-authorized deviation from the read-only mandate, consistent with the implement skill's "run the full suite via the test skill before `in_review`" discipline.
+- **Clear log lines (AC3):** the runner prints when the test skill is invoked (`Invoking test skill (run_tests.py) — --run-tests enabled: executing the full project test suite at <cwd> in quiet mode...`) and what it returned (`Test skill run completed: success=... commands=... failures=... triaged=... notice=...`).
+- **Failures are triaged, never silently ignored (AC4):** each structured failure record from the executed run is passed to the triage helper (`check_or_create.py`), which links/creates a critical `test-failure` work item for the failing test — exactly the test skill's run → triage discipline. The audit then completes fail-closed with no green evidence.
+- **Fail-closed:** a non-green executed run (failures, non-zero exit, timeout, missing binary) yields NO evidence — execution-dependent ACs stay `partial` and the audit completes normally (never crashes, never fabricates a green verdict).
+- A green cache hit at the audited state short-circuits the invocation entirely (the suite is only executed when the cache cannot satisfy the evidence).
 
 **Concurrency:** `--max-concurrency N` bounds the number of concurrent pi/audit subprocesses host-wide (default: `AUDIT_MAX_CONCURRENCY` env var or 2). Each pi launch holds one audit slot; when the ceiling is saturated the call **fails fast by default** (no wait) and returns `unmet` with evidence "Audit concurrency limit reached" immediately, so the audit completes gracefully and the operator can retry later. To opt into a bounded wait instead, set the `AUDIT_LOCK_TIMEOUT` env var (seconds), e.g. `AUDIT_LOCK_TIMEOUT=30` waits up to 30s for a free slot before returning the `unmet` verdict. Precedence: `--max-concurrency` flag > `AUDIT_MAX_CONCURRENCY` env var > 2 default.
 

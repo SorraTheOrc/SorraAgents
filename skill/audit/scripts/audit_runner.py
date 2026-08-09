@@ -6,7 +6,7 @@ Provides two subcommands:
   project      – audit the overall project
 
 Usage:
-  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>]
+  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--run-tests]
   audit_runner.py project [--pi-bin pi] [--model <name>]
 
 Verdicts:
@@ -17,11 +17,14 @@ Verdicts:
               (does not block ready-to-close, recorded in variance decisions)
 
 Execution-dependent criteria (e.g. 'full project test suite passes'):
-  the runner never executes the suite (read-only mandate). Evidence is
-  supplied either by the operator-attested ``--green-run`` path or,
-  automatically, by a green full-suite run found READ-ONLY in the per-repo
-  test cache (query_cached — see SA-0MSIU5HFI0024D7W). Both paths are
-  fail-closed: missing/mismatched evidence leaves such ACs partial.
+  by default the runner never executes the suite (read-only mandate).
+  Evidence is supplied either by the operator-attested ``--green-run`` path
+  or, automatically, by a green full-suite run found READ-ONLY in the
+  per-repo test cache (query_cached — see SA-0MSIU5HFI0024D7W). With the
+  explicit ``--run-tests`` flag (SA-0MSJELSWS002UF60) the runner instead
+  invokes the test skill (run_tests.py) to execute the full suite when the
+  cache is missing/stale, triaging failures per the test skill. All paths
+  are fail-closed: missing/mismatched evidence leaves such ACs partial.
 
 Persist + verify invariant:
   Unless ``--do-not-persist`` is given, the runner ALWAYS persists the
@@ -80,8 +83,12 @@ from skill.shared.status_lifecycle import (
 from skill.shared.status_lifecycle import (
     resolve_worklog_flags as shared_resolve_worklog_flags,
 )
-from skill.test.scripts.run_tests import full_suite_commands
-from skill.test_cache import DEFAULT_TTL_SECONDS, query_cached
+from skill.test.scripts.run_tests import (
+    full_suite_commands,
+    parse_node_failures,
+    parse_pytest_failures,
+)
+from skill.test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
 
 # ---------------------------------------------------------------------------
 # Concurrency control (fan-out bounding, SA-0MSAEKOQE009TEB4)
@@ -182,6 +189,28 @@ from the per-repo test cache (``query_cached``) READ-ONLY — the runner never
 executes the suite. The block tells the model that execution-dependent
 criteria (e.g. 'full test suite passes') MAY be marked met based on that
 verified cached result, while the read-only mandate otherwise remains in force.
+"""
+
+TEST_SKILL_RUN_BLOCK_HEADER = "TEST-SKILL GREEN RUN"
+"""Header of the executed full-suite verification block injected into prompts.
+
+The ``--run-tests`` path (SA-0MSJELSWS002UF60) executes the full project
+test suite via the test skill's runner (``run_tests.py``) as an explicit,
+operator-authorized deviation from the audit's read-only mandate, then
+injects this block so the model MAY mark execution-dependent criteria met
+based on the executed green run. Distinct from ``AUTO_GREEN_RUN_BLOCK_HEADER``
+(read-only cache consumption) and ``GREEN-RUN ATTESTATION`` (operator
+attestation).
+"""
+
+AUDIT_TEST_SKILL_RUN_TIMEOUT = 600
+"""Per-command timeout (seconds) for the test-skill invocation (``--run-tests``).
+
+The audit runner delegates full-suite execution to the test skill's runner
+machinery (``skill/test/scripts/run_tests.py``) when the operator passes
+``--run-tests`` and no cached green evidence exists. Each suite command
+(pytest + node suite dirs) is executed with this timeout, matching the
+default used by ``run_tests.py`` itself.
 """
 
 AUDIT_PARENT_TIMEOUT_ENV = "AUDIT_PARENT_TIMEOUT"
@@ -1037,6 +1066,153 @@ def _resolve_auto_green_run(
     except Exception:  # noqa: BLE001 -- fail-closed: never crash the audit
         return None, None
     return _auto_green_run_prompt_block(head_sha), head_sha
+
+
+def _test_skill_run_prompt_block(sha: str) -> str:
+    """Build the TEST-SKILL RUN block injected into audit prompts.
+
+    The block tells the model that the full project test suite was EXECUTED
+    via the test skill (``run_tests.py``) at *sha* (== the audited HEAD) and
+    passed (``--run-tests`` path, SA-0MSJELSWS002UF60), so execution-
+    dependent criteria (e.g. 'full test suite passes') MAY be marked met
+    based on that executed green run — while the read-only mandate otherwise
+    remains in force and the suite must NOT be executed again. Returns a
+    string ending in a blank line so callers can splice it between existing
+    prompt sections.
+    """
+    return (
+        f"{TEST_SKILL_RUN_BLOCK_HEADER} — The full project test suite was "
+        f"executed via the test skill (/skill:test / run_tests.py) at commit "
+        f"{sha} (== current HEAD) and passed (--run-tests). "
+        "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
+        "marked met based on this executed green run. Do NOT execute the test "
+        "suite again or any other state-modifying command — the read-only "
+        "mandate otherwise remains in force.\n\n"
+    )
+
+
+def _run_tests_via_test_skill(
+    cwd: str | Path,
+    timeout: int = AUDIT_TEST_SKILL_RUN_TIMEOUT,
+    parent_work_item_id: str | None = None,
+    head_sha: str | None = None,
+) -> dict:
+    """Execute the full project test suite via the test skill's runner.
+
+    The ``--run-tests`` path (SA-0MSJELSWS002UF60): an explicit,
+    operator-authorized deviation from the audit's read-only mandate. The
+    runner delegates to the test skill's machinery (``run_tests.py``) —
+    executing each command in ``full_suite_commands()`` at *cwd* in quiet
+    mode through the per-repo test cache with ``force=True`` (execute fresh,
+    refresh the stored entries so subsequent audits auto-verify).
+
+    Failures are triaged per the test skill, never silently ignored: each
+    structured failure record is passed to the triage helper
+    (``check_or_create``), which links/creates a critical ``test-failure``
+    work item for the failing test (as a child of *parent_work_item_id* when
+    provided). A triage helper failure is recorded but never crashes the run.
+
+    Returns a dict:
+      success   — True iff every suite command was executed and exited 0
+                  with no parsed failures
+      results   — per-command execution results (``run_cached`` dicts)
+      failures  — structured failure records (test_name, stdout_excerpt,
+                  stack_trace, suite_command)
+      triaged   — triage helper results per failure
+      notice    — error string when the suite could not be executed at all
+    """
+    project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
+    print(
+        f"Invoking test skill (run_tests.py) — --run-tests enabled: executing "
+        f"the full project test suite at {project_root} in quiet mode "
+        f"(cache refresh, per-command timeout {timeout}s)...",
+        file=sys.stderr,
+    )
+    results: list[dict] = []
+    failures: list[dict] = []
+    triaged: list[dict] = []
+    notice = ""
+    for command in full_suite_commands(project_root):
+        try:
+            run = run_cached(
+                command,
+                cwd=str(project_root),
+                force=True,  # execute fresh; refresh the cache entry
+                ttl=DEFAULT_TTL_SECONDS,
+                timeout=timeout,
+            )
+        except FileNotFoundError as exc:
+            notice = f"command not found: {exc.filename}"
+            break
+        except subprocess.TimeoutExpired:
+            notice = f"suite command timed out after {timeout}s: {command}"
+            break
+        except Exception as exc:  # noqa: BLE001 -- fail-closed: never crash the audit
+            notice = f"suite execution error: {exc}"
+            break
+        results.append(run)
+        output = f"{run.get('stdout', '')}\n{run.get('stderr', '')}"
+        if "pytest" in command:
+            cmd_failures = parse_pytest_failures(output)
+        else:
+            cmd_failures = parse_node_failures(output)
+        for failure in cmd_failures:
+            failure["suite_command"] = command
+        failures.extend(cmd_failures)
+        if int(run.get("exit_code", -1)) != 0 and not cmd_failures:
+            # Non-zero exit with no parseable failure records (e.g. the suite
+            # crashed before any test ran): record an entry-level failure so
+            # the run is genuinely red, never silently green.
+            failures.append({
+                "test_name": f"<suite exited {run.get('exit_code')}>: {command}",
+                "stdout_excerpt": output[:1000],
+                "stack_trace": output[:1000],
+                "suite_command": command,
+            })
+
+    success = bool(results) and not notice and not failures
+
+    # Triage failures per the test skill (AC4) — never silently ignored.
+    if failures:
+        try:
+            from skill.triage.scripts.check_or_create import check_or_create
+        except ImportError:
+            check_or_create = None
+        for failure in failures:
+            if check_or_create is None:
+                triaged.append({
+                    "test_name": failure.get("test_name", ""),
+                    "error": "triage helper unavailable",
+                })
+                continue
+            try:
+                triaged.append(check_or_create({
+                    "test_name": failure.get("test_name", ""),
+                    "stdout_excerpt": failure.get("stdout_excerpt", ""),
+                    "stack_trace": failure.get("stack_trace", ""),
+                    "repo_path": str(project_root),
+                    "parent_work_item_id": parent_work_item_id,
+                    "commit_hash": head_sha,
+                }))
+            except Exception as exc:  # noqa: BLE001 -- triage must never crash the audit
+                triaged.append({
+                    "test_name": failure.get("test_name", ""),
+                    "error": str(exc),
+                })
+
+    print(
+        f"Test skill run completed: success={success} commands={len(results)} "
+        f"failures={len(failures)} triaged={len(triaged)} "
+        f"notice={notice or 'none'}",
+        file=sys.stderr,
+    )
+    return {
+        "success": success,
+        "results": results,
+        "failures": failures,
+        "triaged": triaged,
+        "notice": notice,
+    }
 
 
 def _audit_semaphore_max_workers(cli_value: int | None = None) -> int:
@@ -2019,6 +2195,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            phase2_completed: bool = False,
                            green_run_sha: str | None = None,
                            auto_green_run_sha: str | None = None,
+                           test_skill_run_sha: str | None = None,
                            content_fingerprint: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
@@ -2048,6 +2225,13 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       cache, SA-0MSIU5HFI0024D7W). When provided, an
       ``Automatic green run evidence: <sha> (cached full-suite run)`` line is
       emitted near the header so the report records the evidence source.
+
+    *test_skill_run_sha* is the executed full-suite commit sha (when the
+      ``--run-tests`` path executed the suite via the test skill and it
+      passed, SA-0MSJELSWS002UF60). When provided, a
+      ``Test skill run evidence: <sha> (executed full-suite run, --run-tests)``
+      line is emitted near the header so the report records the evidence
+      source distinctly from the cache-consumption path.
 
     *content_fingerprint* is the content fingerprint (git HEAD sha +
       description hash + Key Files, see ``_compute_content_fingerprint``)
@@ -2144,6 +2328,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 f"Automatic green run evidence: {auto_green_run_sha} "
                 "(cached full-suite run)"
             )
+        if test_skill_run_sha:
+            lines.append("")
+            lines.append(
+                f"Test skill run evidence: {test_skill_run_sha} "
+                "(executed full-suite run, --run-tests)"
+            )
         if content_fingerprint:
             lines.append("")
             lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
@@ -2162,6 +2352,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(
                 f"Automatic green run evidence: {auto_green_run_sha} "
                 "(cached full-suite run)"
+            )
+        if test_skill_run_sha:
+            lines.append("")
+            lines.append(
+                f"Test skill run evidence: {test_skill_run_sha} "
+                "(executed full-suite run, --run-tests)"
             )
         if content_fingerprint:
             lines.append("")
@@ -3978,7 +4174,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
               batch_phase2: bool = False,
               green_run: str | None = None,
               audit_children: bool = False,
-              max_child_audits: int | None = None) -> int:
+              max_child_audits: int | None = None,
+              run_tests: bool = False) -> int:
     """Audit a single work item.
 
     The resolved model name and source are included as a metadata line
@@ -4025,6 +4222,20 @@ def cmd_issue(issue_id: str, persist: bool = True,
     run, or cache error yields no evidence (fail-closed); the operator path
     takes precedence when both are available.
 
+    *run_tests* (``--run-tests``, OFF by default) extends the automatic path
+    (SA-0MSJELSWS002UF60): when no operator attestation exists AND the
+    read-only cache holds no green full-suite run at the audited state, the
+    runner invokes the test skill (``run_tests.py`` machinery) to EXECUTE
+    the full project test suite in quiet mode, triage failures per the test
+    skill, and refresh the per-repo cache. When the executed run is green, a
+    TEST-SKILL RUN block is injected (the model MAY mark execution-dependent
+    criteria met) and the sha recorded as ``Test skill run evidence``. This
+    is an explicit, operator-authorized deviation from the audit's read-only
+    mandate — environments that forbid test execution during audits simply
+    omit the flag and behavior is unchanged (execution-dependent ACs stay
+    partial with the operator instruction). A non-green executed run yields
+    no evidence (fail-closed).
+
     For each active child (not completed/done), the child's persisted audit
     verdict is checked via ``wl audit-show``. If no audit exists or the audit
     is stale, an audit is auto-triggered for that child (via the same audit
@@ -4063,6 +4274,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
     # proceeds with execution-dependent ACs staying partial. The automatic path
     # augments the operator path (AC7) — a valid --green-run takes precedence.
     auto_green_run_sha = None
+    test_skill_run_sha = None
     if green_run_sha is None:
         auto_block, auto_sha = _resolve_auto_green_run(
             runner, cwd=str(TARGET_PROJECT_ROOT),
@@ -4070,6 +4282,23 @@ def cmd_issue(issue_id: str, persist: bool = True,
         if auto_sha is not None:
             green_run_block = auto_block
             auto_green_run_sha = auto_sha
+        elif run_tests:
+            # --run-tests path (SA-0MSJELSWS002UF60): no operator attestation
+            # and no cached green evidence. Invoke the test skill (run_tests.py)
+            # to execute the full project test suite in quiet mode, triage any
+            # failures per the test skill, and refresh the per-repo cache so
+            # subsequent audits auto-verify. This is an explicit,
+            # operator-authorized deviation from the audit's read-only mandate;
+            # the default (no --run-tests) stays strictly read-only.
+            head_sha = _resolve_audited_head(runner)
+            test_run = _run_tests_via_test_skill(
+                cwd=TARGET_PROJECT_ROOT,
+                parent_work_item_id=issue_id,
+                head_sha=head_sha,
+            )
+            if test_run["success"] and head_sha is not None:
+                green_run_block = _test_skill_run_prompt_block(head_sha)
+                test_skill_run_sha = head_sha
 
     # ------------------------------------------------------------------
     # Freshness gate: skip if a recent audit already exists
@@ -4580,6 +4809,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
                                     audit_cmd.extend(["--timeout", str(timeout)])
                                 if parent_timeout is not None:
                                     audit_cmd.extend(["--parent-timeout", str(parent_timeout)])
+                                if run_tests:
+                                    # Thread the operator's --run-tests authorization
+                                    # into child audits so execution-dependent ACs
+                                    # auto-verify there too (SA-0MSJELSWS002UF60). In
+                                    # practice the parent's suite run already refreshed
+                                    # the cache, so children hit it read-only.
+                                    audit_cmd.append("--run-tests")
                                 # Thread the resolved worklog flags through to the child
                                 # runner process so it targets the same worklog store.
                                 child_flags = _resolve_worklog_flags(
@@ -4924,6 +5160,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 phase2_completed=phase2_completed,
                 green_run_sha=green_run_sha,
                 auto_green_run_sha=auto_green_run_sha,
+                test_skill_run_sha=test_skill_run_sha,
                 content_fingerprint=content_fingerprint,
             )
             # Wrap report with failure notice if any subprocess calls failed
@@ -5432,6 +5669,18 @@ def build_parser() -> argparse.ArgumentParser:
                              "based on the attestation; the runner never executes the "
                              "suite (env: AUDIT_GREEN_RUN; flag wins)"
                          ))
+    p_issue.add_argument("--run-tests", action="store_true",
+                         help=(
+                             "Execute the full project test suite via the test skill "
+                             "(/skill:test / run_tests.py) when execution-dependent "
+                             "acceptance criteria are present and no cached green "
+                             "full-suite run exists, then auto-verify those criteria "
+                             "from the executed green run. OFF by default: the audit "
+                             "is otherwise strictly read-only and never executes the "
+                             "suite (environments that forbid test execution during "
+                             "audits are unaffected). Failures are triaged per the "
+                             "test skill (critical test-failure work items)."
+                         ))
 
     p_project = sub.add_parser("project", help="Audit the overall project")
     p_project.add_argument("--timeout", type=int, default=None,
@@ -5482,7 +5731,8 @@ def main(argv: list[str] | None = None) -> int:
                          audit_children=args.audit_children,
                          max_child_audits=_resolve_max_child_audits(
                              args.max_child_audits
-                         ))
+                         ),
+                         run_tests=args.run_tests)
     elif args.command == "project":
         return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
                            pi_bin=args.pi_bin, model=args.model,
