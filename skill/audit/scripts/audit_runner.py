@@ -1674,6 +1674,115 @@ are left untouched (see _extract_acs).
 """
 
 
+def _extract_json_object(text: str, required_keys: Sequence[str] = ()) -> dict | None:
+    """Extract a JSON object from text that may contain analysis before it.
+
+    Mirrors ``_extract_json_array`` for object-shaped responses (e.g. the
+    project-level summary/recommendation). Pi often returns analysis text
+    followed by a JSON object at the end; this scans candidates from the last
+    ``{`` backwards so the trailing object wins.
+
+    When *required_keys* is non-empty, a candidate is returned only if it
+    contains every required key with a non-empty string value; otherwise the
+    scan continues so a nested fragment never shadows the real response (e.g.
+    ``{"summary": "...", "meta": {...}, "recommendation": "..."}`` resolves
+    to the outer object). If no candidate satisfies the required keys, the
+    last parsed object is returned as a fallback.
+
+    Returns the best parsed dict, otherwise None.
+    """
+    if not text:
+        return None
+
+    # Find positions of `{` that could start a JSON object, skipping `{`
+    # characters that are inside JSON strings.
+    possible_starts = []
+    in_string = False
+    escape_next = False
+
+    for i, char in enumerate(text):
+        if escape_next:
+            escape_next = False
+            continue
+        if char == '\\' and in_string:
+            escape_next = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == '{':
+            possible_starts.append(i)
+
+    fallback: dict | None = None
+    # Try each possible start position from last to first
+    for start in reversed(possible_starts):
+        candidate = text[start:].strip()
+        parsed = _parse_json_object_prefix(candidate)
+        if parsed is None:
+            continue
+        if fallback is None:
+            fallback = parsed
+        if required_keys:
+            if all(
+                isinstance(parsed.get(key), str) and parsed.get(key).strip()
+                for key in required_keys
+            ):
+                return parsed
+        else:
+            return parsed
+
+    return fallback
+
+
+def _parse_json_object_prefix(text: str) -> dict | None:
+    """Parse *text* as a JSON object, tolerating trailing content.
+
+    First tries the full *text*; if that fails, finds the end of the
+    outermost JSON object and parses just that prefix (this tolerates
+    markdown fences or trailing prose after the object). Returns the dict or
+    None.
+    """
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # Find where the JSON object ends, skipping nested braces and strings.
+    depth = 0
+    in_str = False
+    esc = False
+    for end_search, char in enumerate(text):
+        if esc:
+            esc = False
+            continue
+        if char == '\\' and in_str:
+            esc = True
+            continue
+        if char == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    result = json.loads(text[:end_search + 1])
+                    if isinstance(result, dict):
+                        return result
+                except json.JSONDecodeError:
+                    pass
+                break
+
+    return None
+
+
 def _strip_checkbox(text: str) -> str:
     """Strip a leading markdown checkbox marker from *text* (bullets only)."""
     return _CHECKBOX_MARKER_RE.sub("", text, count=1)
@@ -5170,7 +5279,10 @@ def cmd_project(timeout: int | None = None,
     else:
         recommendation = "No specific recommendations at this time."
 
-    # Optional: call Pi for project-level summary
+    # Call Pi for project-level summary. Use the model output when it is
+    # parseable, otherwise fall back to the locally computed values so the
+    # report is never degraded by an unparseable or failed model call
+    # (SA-0MSL1YWOG005QAH8).
     prompt = (
         f"[READ-ONLY AUDIT] You are performing a read-only audit. "
         f"Do NOT close, modify, create, or delete any work items. "
@@ -5182,9 +5294,28 @@ def cmd_project(timeout: int | None = None,
     )
     try:
         pi_result = _call_pi_and_maybe_log("project", "project", prompt, model=resolved_model, pi_bin=pi_bin, debug_log=debug_log, timeout=timeout)
-        if pi_result.get("verdict") == "met" and pi_result.get("evidence"):
-            # Use Pi's response if parseable
-            pass  # Could enhance this in future
+        raw_text = (
+            pi_result.get("extracted_text", "")
+            or pi_result.get("evidence", "")
+            or pi_result.get("text", "")
+        )
+        parsed = _extract_json_object(
+            raw_text, required_keys=("summary", "recommendation")
+        )
+        parsed_summary = parsed.get("summary") if isinstance(parsed, dict) else None
+        parsed_recommendation = parsed.get("recommendation") if isinstance(parsed, dict) else None
+        if (
+            isinstance(parsed_summary, str) and parsed_summary.strip()
+            and isinstance(parsed_recommendation, str) and parsed_recommendation.strip()
+        ):
+            summary = parsed_summary.strip()
+            recommendation = parsed_recommendation.strip()
+        elif raw_text:
+            print(
+                "Warning: Unparseable Pi output for project summary — "
+                "using locally computed summary/recommendation.",
+                file=sys.stderr,
+            )
     except RuntimeError as exc:
         _record_script_failure("pi (project-level summary)", exc)
         print(f"Warning: Pi call failed for project summary: {exc}", file=sys.stderr)

@@ -6622,3 +6622,188 @@ class TestContentFreshnessGate:
                 "TEST-1", persist=False, force=True, runner=_make_runner(),
             )
         assert rc == 0
+
+# ===========================================================================
+# _extract_json_object unit tests (SA-0MSL1YWOG005QAH8)
+# ===========================================================================
+
+
+class TestExtractJsonObject:
+    """Tests for _extract_json_object() used by the project-level audit.
+
+    Covers the parsing helper that wires Pi's summary/recommendation JSON
+    object into cmd_project (SA-0MSL1YWOG005QAH8).
+    """
+
+    def test_parses_bare_json_object(self):
+        """A standalone JSON object is parsed and returned."""
+        result = audit_runner._extract_json_object('{"summary": "s", "recommendation": "r"}')
+        assert result == {"summary": "s", "recommendation": "r"}
+
+    def test_parses_object_after_analysis_text(self):
+        """Analysis text before the JSON object does not block parsing."""
+        text = (
+            "Here is my analysis of the project state.\n"
+            '{"summary": "Model summary", "recommendation": "Model rec"}'
+        )
+        result = audit_runner._extract_json_object(text)
+        assert result == {"summary": "Model summary", "recommendation": "Model rec"}
+
+    def test_parses_object_with_markdown_fence(self):
+        """A ```json ... ``` fenced object is parsed (trailing fence ignored)."""
+        text = '```json\n{"summary": "s", "recommendation": "r"}\n```'
+        result = audit_runner._extract_json_object(text)
+        assert result == {"summary": "s", "recommendation": "r"}
+
+    def test_parses_nested_object_with_required_keys(self):
+        """With required keys, the outer object wins over nested fragments."""
+        text = '{"summary": "s", "meta": {"nested": true}, "recommendation": "r"}'
+        result = audit_runner._extract_json_object(
+            text, required_keys=("summary", "recommendation")
+        )
+        assert result["recommendation"] == "r"
+        assert result["meta"] == {"nested": True}
+
+    def test_required_keys_skip_incidental_fragment(self):
+        """A fragment object before the real response is skipped when keys
+        are required (the real object appears later / last)."""
+        text = (
+            '{"fragment": true} then the response '
+            '{"summary": "s", "recommendation": "r"}'
+        )
+        result = audit_runner._extract_json_object(
+            text, required_keys=("summary", "recommendation")
+        )
+        assert result == {"summary": "s", "recommendation": "r"}
+
+    def test_empty_and_none_return_none(self):
+        """Empty or None input yields None (no crash)."""
+        assert audit_runner._extract_json_object("") is None
+        assert audit_runner._extract_json_object(None) is None
+
+    def test_non_json_text_returns_none(self):
+        """Free-form text without a JSON object yields None."""
+        assert audit_runner._extract_json_object("no json here at all") is None
+
+    def test_array_without_object_returns_none(self):
+        """A JSON array without an object inside yields None."""
+        assert audit_runner._extract_json_object("[1, 2, 3]") is None
+        assert audit_runner._extract_json_object('"just a string"') is None
+
+
+class TestCmdProjectPiOutputWiring:
+    """cmd_project uses Pi output when parseable and falls back to local values.
+
+    Acceptance criteria (SA-0MSL1YWOG005QAH8):
+    1. No Pi model call is made whose output is discarded.
+    2. Existing project-audit output format is preserved when the model path
+       is unavailable/fails.
+    3. Unit tests cover both the wired path and the fallback path.
+    """
+
+    _WORK_ITEMS = [
+        {"id": "SA-1", "status": "in_progress"},
+        {"id": "SA-2", "status": "blocked"},
+        {"id": "SA-3", "status": "completed"},
+    ]
+
+    _LOCAL_SUMMARY = (
+        "Project-level audit: 1 items in progress, 1 blocked, 1 completed."
+    )
+    _LOCAL_RECOMMENDATION = "Review blocked items SA-2 to unblock progress."
+
+    def _run_project_capture(self, pi_result, json_mode=True, capsys=None):
+        with (
+            mock.patch.object(audit_runner, "_load_config", return_value={}),
+            mock.patch.object(
+                audit_runner, "_resolve_model_for_phase", return_value="test-model"
+            ),
+            mock.patch.object(
+                audit_runner,
+                "_run_wl",
+                return_value={"success": True, "workItems": self._WORK_ITEMS},
+            ),
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
+            ),
+        ):
+            rc = audit_runner.cmd_project(
+                model="test-model", runner=mock.MagicMock(), json_mode=json_mode
+            )
+        assert rc == 0
+        return capsys.readouterr().out
+
+    def test_wired_path_uses_model_summary_and_recommendation(self, capsys):
+        """A parseable Pi JSON object drives the project report (wired path)."""
+        pi_result = {
+            "verdict": "met",
+            "evidence": '{"summary": "Model summary", "recommendation": "Model rec"}',
+            "extracted_text": '{"summary": "Model summary", "recommendation": "Model rec"}',
+        }
+        out = self._run_project_capture(pi_result, json_mode=True, capsys=capsys)
+        payload = json.loads(out)
+        assert payload["summary"] == "Model summary"
+        assert payload["recommendation"] == "Model rec"
+        assert payload["ready_to_close"] is False
+
+    def test_wired_path_text_report_contains_model_output(self, capsys):
+        """Text-mode report embeds the model summary and recommendation."""
+        pi_result = {
+            "extracted_text": (
+                '{"summary": "Model summary", "recommendation": "Model rec"}'
+            ),
+        }
+        out = self._run_project_capture(pi_result, json_mode=False, capsys=capsys)
+        assert "Model summary" in out
+        assert "Model rec" in out
+        assert "Ready to close: No" in out
+
+    def test_fallback_on_pi_runtime_error(self, capsys):
+        """Pi failure (RuntimeError) preserves locally computed values."""
+        with (
+            mock.patch.object(audit_runner, "_load_config", return_value={}),
+            mock.patch.object(
+                audit_runner, "_resolve_model_for_phase", return_value="test-model"
+            ),
+            mock.patch.object(
+                audit_runner,
+                "_run_wl",
+                return_value={"success": True, "workItems": self._WORK_ITEMS},
+            ),
+            mock.patch.object(
+                audit_runner,
+                "_call_pi_and_maybe_log",
+                side_effect=RuntimeError("pi binary not found"),
+            ),
+        ):
+            rc = audit_runner.cmd_project(
+                model="test-model", runner=mock.MagicMock(), json_mode=True
+            )
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["summary"] == self._LOCAL_SUMMARY
+        assert payload["recommendation"] == self._LOCAL_RECOMMENDATION
+
+    def test_fallback_on_unparseable_pi_output(self, capsys):
+        """Unparseable model output preserves locally computed values."""
+        pi_result = {"extracted_text": "This is not JSON at all."}
+        out = self._run_project_capture(pi_result, json_mode=True, capsys=capsys)
+        payload = json.loads(out)
+        assert payload["summary"] == self._LOCAL_SUMMARY
+        assert payload["recommendation"] == self._LOCAL_RECOMMENDATION
+
+    def test_fallback_on_empty_pi_output(self, capsys):
+        """Empty model output (timeout/provider error) preserves local values."""
+        pi_result = {"verdict": "unmet", "evidence": "", "extracted_text": ""}
+        out = self._run_project_capture(pi_result, json_mode=True, capsys=capsys)
+        payload = json.loads(out)
+        assert payload["summary"] == self._LOCAL_SUMMARY
+        assert payload["recommendation"] == self._LOCAL_RECOMMENDATION
+
+    def test_fallback_on_missing_json_keys(self, capsys):
+        """Model JSON missing required keys preserves local values."""
+        pi_result = {"extracted_text": '{"summary": "Only a summary here"}'}
+        out = self._run_project_capture(pi_result, json_mode=True, capsys=capsys)
+        payload = json.loads(out)
+        assert payload["summary"] == self._LOCAL_SUMMARY
+        assert payload["recommendation"] == self._LOCAL_RECOMMENDATION
