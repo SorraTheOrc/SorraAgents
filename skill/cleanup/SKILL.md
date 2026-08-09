@@ -1,6 +1,6 @@
 ---
 name: cleanup
-description: "Clean up completed work: inspect branches, update main, remove merged branches (local and optionally remote), and produce a concise report. Trigger on queries like: 'clean up', 'tidy up', 'prune branches', 'housekeeping'."
+description: "Clean up completed work: prune merged branches and report. Use when asked: 'clean up', 'prune branches'."
 ---
 
 # Cleanup Skill

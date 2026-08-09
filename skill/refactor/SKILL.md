@@ -1,6 +1,6 @@
 ---
 name: refactor
-description: "Automated code smell detection and remediation. Detects code smells using a hybrid approach (linters + LLM), fixes session-introduced smells immediately, and creates Worklog work items for pre-existing smells with structured REFACTOR comments to prevent duplicates."
+description: "Detect and fix code smells (linters + LLM); file work items for pre-existing smells. Use when asked to refactor."
 ---
 
 # Refactor

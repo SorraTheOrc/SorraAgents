@@ -1,11 +1,6 @@
 ---
 name: test
-description: |
-  Run the full project test suite (pytest + Node) in quiet mode, triage
-  every failure into critical `test-failure` work items, evaluate whether each
-  failing test is genuinely useful via code-path analysis, fix or remove
-  useless tests, and loop until the suite is green. Trigger on user queries
-  such as: 'run all tests', 'test suite', 'make tests pass', 'run tests'.
+description: "Run the full test suite in quiet mode; triage failures into critical work items. Use when: 'run all tests'."
 ---
 
 Purpose

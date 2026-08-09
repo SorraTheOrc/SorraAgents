@@ -1,6 +1,6 @@
 ---
 name: git-management
-description: "Unified git management skill that orchestrates the full feature-branch lifecycle — create, commit, push, PR, merge, cleanup — for both AI agents and human operators."
+description: "Manage the feature-branch lifecycle: create, commit, push, PR, merge, cleanup. Use when asked to manage git branches."
 ---
 
 # Git Management Skill

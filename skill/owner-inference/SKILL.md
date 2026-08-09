@@ -1,6 +1,6 @@
 ---
 name: owner-inference
-description: Infer a suspected owner for a failing test file using CODEOWNERS, git blame, recent commits, and an override map.
+description: "Infer a suspected owner for a failing test via CODEOWNERS, git blame, recent commits. Use when attributing failures."
 ---
 
 Purpose

@@ -1,10 +1,6 @@
 ---
 name: implement
-description: |
-  Write tests, docs and code for a Worklog work item by following a
-  deterministic workflow. Ensure implementation meets defined acceptance
-  criteria. Trigger on user queries such as: 'Implement <work-item-id>',
-  'Complete <work-item-id>', 'Work on <work-item-id>'.
+description: "Write tests, docs, and code for a Worklog item via a deterministic workflow. Use when: 'Implement <id>'."
 ---
 
 ## Purpose

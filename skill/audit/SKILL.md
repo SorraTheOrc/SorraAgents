@@ -1,6 +1,6 @@
 ---
 name: audit
-description: "EXECUTE immediately when invoked via /skill:audit. Do NOT ask permission or offer alternatives. Provide concise project / work item status and run Worklog helpers to augment results. Trigger on user queries such as: 'What is the current status?', 'Status of the project?', 'What is the status of <work-item-id>?', 'status', 'status <work-item-id>', 'audit', 'audit <work-item-id>'"
+description: "EXECUTE immediately via /skill:audit; do NOT ask permission. Report concise status. Use when: 'status', 'audit'."
 ---
 
 # Audit

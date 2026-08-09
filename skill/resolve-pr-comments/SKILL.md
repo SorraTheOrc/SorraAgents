@@ -1,6 +1,6 @@
 ---
 name: resolve-pr-comments
-description: Fetch GitHub PR review comments, propose fixes with a plan, and resolve threads after approval
+description: "Fetch GitHub PR review comments, propose fixes, resolve threads after approval. Use when handling PR comments."
 license: MIT
 compatibility: pi
 metadata:

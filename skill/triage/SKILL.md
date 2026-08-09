@@ -1,6 +1,6 @@
 ---
 name: triage
-description: Triage workflows and helpers for test-failure detection and critical issue creation. Provides a skill to search for or create critical `test-failure` work items and related resources.
+description: "Triage test failures: search or create critical test-failure work items. Use when triaging failing tests."
 ---
 
 Purpose

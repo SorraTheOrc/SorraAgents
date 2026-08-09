@@ -1,6 +1,6 @@
 ---
 name: intake
-description: Create an intake brief (Workflow step 1). Interview-driven requirements gathering, drafting, and work-item preparation.
+description: "Create an intake brief via interview-driven requirements gathering. Use when preparing a work item (Workflow step 1)."
 agent: build
 ---
 

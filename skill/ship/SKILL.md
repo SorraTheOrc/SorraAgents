@@ -1,6 +1,6 @@
 ---
 name: ship
-description: "Canonical dev-to-main release workflow. Provides the release process (dev → main merge) with automated gating for unmerged branches, audit readiness, critical items, worklog refs, and producer review. Trigger with: /skill:ship release"
+description: "Canonical dev-to-main release workflow with automated gating. Use when: '/skill:ship release'."
 ---
 
 # Ship Skill

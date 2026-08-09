@@ -1,6 +1,6 @@
 ---
 name: plan
-description: Decompose a Worklog work item into features and implementation tasks. Includes automated effort/risk pre-check to skip planning for small items. Use when a work item needs to be broken down into actionable sub-tasks.
+description: "Decompose a work item into features and implementation tasks; auto-skip small items. Use when planning work."
 ---
 
 # Plan Skill

@@ -1,8 +1,6 @@
 ---
 name: code-review
-description:
-  Use this skill to review local code. It focuses on correctness, maintainability,
-  and adherence to project standards.
+description: "Review local code for correctness, maintainability, and standards. Use when reviewing code."
 ---
 
 # Code Reviewer
