@@ -16,7 +16,7 @@ import pytest
 _SCRIPT_DIR = Path(__file__).resolve().parent.parent / "skill" / "context-audit" / "scripts"
 sys.path.insert(0, str(_SCRIPT_DIR))
 
-import measure_context as mc  # noqa: E402
+import measure_context as mc
 
 GLOBAL_MD = "AGENTS_GLOBAL.md"
 PROJECT_MD = "AGENTS.md"
