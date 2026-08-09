@@ -303,12 +303,6 @@
     ],
     "pass": false
   },
-  "implement-single": {
-    "path": "skill/implement-single",
-    "needs": [],
-    "safe": [],
-    "pass": true
-  },
   "owner-inference": {
     "path": "skill/owner-inference",
     "needs": [

@@ -85,11 +85,6 @@
 - skill/implement/SKILL.md:139 — - Example: `python3 skill/triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"..."}'`
 - skill/implement/SKILL.md:163 — - Using the ship skill: `pushToDev()` from `skill/ship/scripts/ship.js` (preferred)
 
-## implement-single
-
-- path: skill/implement-single
-- status: PASS
-
 ## owner-inference
 
 - path: skill/owner-inference

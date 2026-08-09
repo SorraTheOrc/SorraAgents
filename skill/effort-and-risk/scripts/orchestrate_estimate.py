@@ -38,7 +38,7 @@ from _shared import (
 )
 
 from skill.scripts.failure_notice import FailureNotice
-from skill.shared.status_lifecycle import worklog_dir_flag
+from skill.shared.status_lifecycle import resolve_worklog_flags
 
 # ---------------------------------------------------------------------------
 # Extracted helper functions
@@ -80,7 +80,7 @@ def _fetch_issue_stage(issue_id: str) -> str:
         import subprocess
 
         show_cmd = ["wl", "show", issue_id, "--json"]
-        show_cmd[1:1] = worklog_dir_flag()
+        show_cmd[1:1] = resolve_worklog_flags(show_cmd)
         show_proc = subprocess.run(  # noqa: PLW1510
             show_cmd, capture_output=True, text=True
         )
@@ -191,7 +191,7 @@ def _update_work_item(issue_id: str, wl_effort: str, wl_risk: str) -> dict:
             str(wl_risk),
             "--json",
         ]
-        update_cmd[1:1] = worklog_dir_flag()
+        update_cmd[1:1] = resolve_worklog_flags(update_cmd)
         update_proc = subprocess.run(update_cmd, capture_output=True, text=True)  # noqa: PLW1510
         return {
             "success": update_proc.returncode == 0,
@@ -278,7 +278,7 @@ def _post_comment(issue_id: str, combined_text: str) -> dict:
             combined_text,
             "--json",
         ]
-        comment_cmd[1:1] = worklog_dir_flag()
+        comment_cmd[1:1] = resolve_worklog_flags(comment_cmd)
         comment_proc = subprocess.run(comment_cmd, capture_output=True, text=True)  # noqa: PLW1510
         return {
             "returncode": comment_proc.returncode,

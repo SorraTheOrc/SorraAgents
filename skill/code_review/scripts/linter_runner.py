@@ -73,6 +73,7 @@ _RUFF_SEVERITY_MAP: dict[str, str] = {
     "RUF": "medium",      # Ruff-specific rules
     # Low: complexity, style
     "C": "low",
+    "EXE": "low",        # executable-bit conventions (shebang without +x)
     "ISC": "low",         # implicit-string-concatenation
     "PIE": "low",         # flake8-pie
     "COM": "low",         # flake8-commas
@@ -183,6 +184,7 @@ def _run_eslint_findings(
 def _run_eslint_findings_check(
     root: Path,
     runner: Callable,
+    files: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Run eslint check (without fix) and return structured findings.
 
@@ -193,7 +195,10 @@ def _run_eslint_findings_check(
     Returns:
         A list of finding dicts.
     """
-    cmd = ["eslint", str(root), "-f", "json", "--quiet"]
+    if files:
+        cmd = ["eslint", *[str(f) for f in files], "-f", "json", "--quiet"]
+    else:
+        cmd = ["eslint", str(root), "-f", "json", "--quiet"]
     result = runner(cmd)
 
     if result.returncode not in (0, 1):
@@ -205,6 +210,7 @@ def _run_eslint_findings_check(
 def _run_ruff_check(
     root: Path,
     runner: Callable,
+    files: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Run ruff check (without fix) and return structured findings.
 
@@ -217,7 +223,11 @@ def _run_ruff_check(
     """
     findings: list[dict[str, Any]] = []
 
-    cmd = ["ruff", "check", str(root), "--output-format", "json", "--quiet"]
+    if files:
+        cmd = ["ruff", "check", *[str(f) for f in files],
+               "--output-format", "json", "--quiet"]
+    else:
+        cmd = ["ruff", "check", str(root), "--output-format", "json", "--quiet"]
     result = runner(cmd)
 
     if result.returncode not in (0, 1):
@@ -446,12 +456,19 @@ def _run_linter_fix_mode(
 def _run_ruff_fix_mode(
     root: Path,
     runner: Callable,
+    files: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Run ruff check --fix and return remaining findings."""
     def fix_cmd(root: Path) -> list[str]:
+        if files:
+            return ["ruff", "check", *[str(f) for f in files], "--fix",
+                    "--output-format", "json", "--quiet"]
         return ["ruff", "check", str(root), "--fix", "--output-format", "json", "--quiet"]
 
     def rescan_cmd(root: Path) -> list[str]:
+        if files:
+            return ["ruff", "check", *[str(f) for f in files],
+                    "--output-format", "json", "--quiet"]
         return ["ruff", "check", str(root), "--output-format", "json", "--quiet"]
 
     def fixes_detected(result: Any, output: str) -> bool:
@@ -507,12 +524,17 @@ def _run_ruff_fix_mode(
 def _run_eslint_fix_mode(
     root: Path,
     runner: Callable,
+    files: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Run eslint --fix and return remaining findings."""
     def fix_cmd(root: Path) -> list[str]:
+        if files:
+            return ["eslint", *[str(f) for f in files], "-f", "json", "--fix", "--quiet"]
         return ["eslint", str(root), "-f", "json", "--fix", "--quiet"]
 
     def rescan_cmd(root: Path) -> list[str]:
+        if files:
+            return ["eslint", *[str(f) for f in files], "-f", "json", "--quiet"]
         return ["eslint", str(root), "-f", "json", "--quiet"]
 
     def fixes_detected(result: Any, output: str) -> bool:
@@ -548,6 +570,7 @@ def run_ruff(
     project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
     fix: bool = False,
+    files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run ruff check on the given project root and return structured findings.
 
@@ -582,9 +605,9 @@ def run_ruff(
         runner = _run_subprocess
 
     if fix:
-        findings, fixes_applied = _run_ruff_fix_mode(root, runner)
+        findings, fixes_applied = _run_ruff_fix_mode(root, runner, files=files)
     else:
-        findings = _run_ruff_check(root, runner)
+        findings = _run_ruff_check(root, runner, files=files)
         fixes_applied = False
 
     return {"findings": findings, "fixes_applied": fixes_applied}
@@ -594,6 +617,7 @@ def run_eslint(
     project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
     fix: bool = False,
+    files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run eslint on the given project root and return structured findings.
 
@@ -641,6 +665,7 @@ def run_markdownlint(
     project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
     fix: bool = False,
+    files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run markdownlint on the given project root and return structured findings.
 
@@ -674,7 +699,10 @@ def run_markdownlint(
 
     if fix:
         # Run markdownlint with --fix to auto-fix issues
-        cmd = ["markdownlint", "--fix", "--json", str(root)]
+        if files:
+            cmd = ["markdownlint", "--fix", "--json", *[str(f) for f in files]]
+        else:
+            cmd = ["markdownlint", "--fix", "--json", str(root)]
         result = runner(cmd)
 
         # markdownlint may exit 0 or 1; check if fixes were applied by
@@ -683,11 +711,17 @@ def run_markdownlint(
         fixes_applied = True
 
         # Re-scan to get remaining issues
-        cmd = ["markdownlint", "--json", str(root)]
+        if files:
+            cmd = ["markdownlint", "--json", *[str(f) for f in files]]
+        else:
+            cmd = ["markdownlint", "--json", str(root)]
         result = runner(cmd)
     else:
         # Normal check mode
-        cmd = ["markdownlint", "--json", str(root)]
+        if files:
+            cmd = ["markdownlint", "--json", *[str(f) for f in files]]
+        else:
+            cmd = ["markdownlint", "--json", str(root)]
         result = runner(cmd)
 
     findings: list[dict[str, Any]] = []
@@ -725,6 +759,7 @@ def run_markdownlint(
 def run_shellcheck(
     project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
+    files: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Run shellcheck on the given project root and return structured findings.
 
@@ -765,6 +800,13 @@ def run_shellcheck(
     if not shell_files:
         return []
 
+    # Scope to the provided file list when given (SA-0MSKB6VWU000RT58).
+    if files:
+        scoped = {str(Path(f).resolve()) for f in files}
+        shell_files = [p for p in shell_files if str(p.resolve()) in scoped]
+        if not shell_files:
+            return []
+
     for shell_file in shell_files:
         cmd = ["shellcheck", "-f", "json", str(shell_file)]
         result = runner(cmd)
@@ -803,6 +845,7 @@ def run_dotnet_format(
     project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
     fix: bool = False,
+    files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run dotnet-format on the given project root and return structured findings.
 
@@ -862,9 +905,14 @@ def run_dotnet_format(
         return {"findings": findings, "fixes_applied": fixes_applied}
 
     # dotnet format outputs file paths for violations
+    scoped = None
+    if files:
+        scoped = {str(Path(f).resolve()) for f in files}
     for line in output.splitlines():
         line = line.strip()
         if line and (line.endswith(".cs") or line.endswith(".csproj")):  # noqa: PIE810
+            if scoped is not None and str(Path(line).resolve()) not in scoped:
+                continue
             findings.append({
                 "file": line,
                 "line": 0,
@@ -886,6 +934,7 @@ def run_linters_for_project(
     project_root: str | os.PathLike[str] | None = None,
     runner: Any = None,
     fix: bool = False,
+    files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Detect languages, probe linters, and run all available linters.
 
@@ -893,6 +942,10 @@ def run_linters_for_project(
         project_root: Path to the project root (default: cwd).
         runner: Optional injectable runner for testing.
         fix: If True, run all linters with auto-fix mode enabled.
+        files: Optional list of file paths (absolute or relative to
+               project_root) to scope the scan to. When provided, only these
+               files are linted instead of the whole project
+               (SA-0MSKB6VWU000RT58). Passed through to every linter.
 
     Returns:
         A dict with keys:
@@ -924,25 +977,25 @@ def run_linters_for_project(
             continue
         linter_name = linter_info["name"]
         if linter_name == "ruff":
-            result = run_ruff(root, runner=runner, fix=fix)
+            result = run_ruff(root, runner=runner, fix=fix, files=files)
             all_findings.extend(result.get("findings", []))
             if result.get("fixes_applied"):
                 fixes_applied += 1
         elif linter_name == "eslint":
-            result = run_eslint(root, runner=runner, fix=fix)
+            result = run_eslint(root, runner=runner, fix=fix, files=files)
             all_findings.extend(result.get("findings", []))
             if result.get("fixes_applied"):
                 fixes_applied += 1
         elif linter_name == "markdownlint":
-            result = run_markdownlint(root, runner=runner, fix=fix)
+            result = run_markdownlint(root, runner=runner, fix=fix, files=files)
             all_findings.extend(result.get("findings", []))
             if result.get("fixes_applied"):
                 fixes_applied += 1
         elif linter_name == "shellcheck":
-            result = run_shellcheck(root, runner=runner)
+            result = run_shellcheck(root, runner=runner, files=files)
             all_findings.extend(result)
         elif linter_name == "dotnet-format":
-            result = run_dotnet_format(root, runner=runner, fix=fix)
+            result = run_dotnet_format(root, runner=runner, fix=fix, files=files)
             all_findings.extend(result.get("findings", []))
             if result.get("fixes_applied"):
                 fixes_applied += 1

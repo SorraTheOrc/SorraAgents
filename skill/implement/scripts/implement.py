@@ -41,12 +41,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from skill.shared.status_lifecycle import StatusLifecycle
+# Ensure the repository root is on sys.path so skill package imports work
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-# Ensure skill package root is on sys.path for shared imports
-_SKILLS_ROOT = Path(__file__).resolve().parents[3]  # .../.pi/agent/skills/
-if str(_SKILLS_ROOT.parent / "skill") not in sys.path:
-    sys.path.insert(0, str(_SKILLS_ROOT.parent / "skill"))
+from skill.shared.code_freeze import is_code_freeze_active
+from skill.shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
+from skill.test_cache import run_cached
 
 LOG = logging.getLogger("implement.scripts.implement")
 
@@ -278,10 +280,9 @@ def wl_show(work_item_id: str) -> dict[str, Any]:
     Returns:
         Parsed JSON dict from ``wl show``.
     """
-    result = run_cmd(
-        ["wl", "show", work_item_id, "--json"],
-        check=False,
-    )
+    cmd = ["wl", "show", work_item_id, "--json"]
+    cmd[1:1] = worklog_dir_flag()
+    result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.error("Failed to fetch work item %s: %s", work_item_id, result.stderr.strip())
         return {}
@@ -305,10 +306,12 @@ def wl_add_comment(work_item_id: str, comment: str) -> bool:
     Returns:
         True if the comment was added.
     """
-    result = run_cmd(
-        ["wl", "comment", "add", work_item_id, "--comment", comment, "--author", "implement"],
-        check=False,
-    )
+    cmd = [
+        "wl", "comment", "add", work_item_id,
+        "--comment", comment, "--author", "implement",
+    ]
+    cmd[1:1] = worklog_dir_flag()
+    result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         LOG.warning("Failed to add comment to %s: %s", work_item_id, result.stderr.strip())
         return False
@@ -354,10 +357,18 @@ def git_rev_parse_is_inside_work_tree() -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
-def git_status() -> str:
-    """Get the current git status (porcelain v1)."""
+def git_status(cwd: str | None = None) -> str:
+    """Get the current git status (porcelain v1).
+
+    Args:
+        cwd: Working directory to check (defaults to current directory).
+
+    Returns:
+        Porcelain status output, or empty string on error.
+    """
     result = run_cmd(
         ["git", "status", "--porcelain=v1", "-b"],
+        cwd=cwd,
         capture=True,
         check=False,
     )
@@ -487,13 +498,21 @@ def git_get_commit_hash(cwd: str) -> str:
 
 
 def _get_repo_root(cwd: str | None = None) -> str | None:
-    """Get the absolute path to the git repository root.
+    """Get the absolute path to the MAIN git repository root.
+
+    ``git rev-parse --show-toplevel`` resolves to the root of the *current*
+    working tree. Inside a linked worktree (``.git`` is a file, not a
+    directory) that is the worktree root, not the main checkout. Callers
+    (the ``_remove_worktree`` safety gate, node_modules symlinking, repo
+    restore/push) need the main checkout root, so resolve it via
+    ``git rev-parse --git-common-dir`` (whose parent is the main working
+    tree root) when *cwd* is inside a linked worktree.
 
     Args:
         cwd: Optional working directory (defaults to current directory).
 
     Returns:
-        Absolute repo root path, or None if not in a git repo.
+        Absolute main repo root path, or None if not in a git repo.
     """
     result = run_cmd(
         ["git", "rev-parse", "--show-toplevel"],
@@ -501,22 +520,104 @@ def _get_repo_root(cwd: str | None = None) -> str | None:
         check=False,
         timeout=30,
     )
-    if result.returncode == 0 and result.stdout.strip():
-        return Path(result.stdout.strip()).resolve().as_posix()
-    return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    toplevel = Path(result.stdout.strip()).resolve()
+
+    # The main working tree has .git as a DIRECTORY; a linked worktree has
+    # it as a FILE pointing at the real git directory.
+    if (toplevel / ".git").is_dir():
+        return toplevel.as_posix()
+
+    # cwd is inside a linked worktree: derive the main repo root from the
+    # common git dir (its parent is the main working tree root).
+    common = run_cmd(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=cwd,
+        check=False,
+        timeout=30,
+    )
+    if common.returncode == 0 and common.stdout.strip():
+        common_dir = Path(common.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = toplevel / common_dir
+        main_root = common_dir.resolve().parent
+        git_marker = main_root / ".git"
+        if git_marker.is_dir() or git_marker.is_file():
+            return main_root.as_posix()
+    return toplevel.as_posix()
 
 
-def _remove_worktree(worktree_path: str) -> bool:
+def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> bool:
+    """Auto-symlink the main checkout's node_modules into a worktree.
+
+    Git worktrees do not include gitignored directories, so tests that spawn
+    a real subprocess via an absolute worktree-relative path (e.g. CLI e2e
+    tests invoking ``<worktree>/node_modules/.bin/tsx``) fail with
+    MODULE_NOT_FOUND. Symlinking the main checkout's node_modules resolves
+    them without manual setup.
+
+    The symlink is created only when BOTH conditions hold:
+    - the worktree does not already have a node_modules entry (dir or
+      symlink), AND
+    - the main checkout has a node_modules directory.
+
+    Failures are logged, never fatal: the worktree remains usable and
+    dependencies can be installed inside it normally.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout, or None if unknown.
+
+    Returns:
+        True if the symlink was created, False otherwise (skipped/failed).
+    """
+    wt_nm = Path(worktree_path) / "node_modules"
+    if os.path.lexists(wt_nm):
+        LOG.info(
+            "Worktree already has node_modules (%s); skipping symlink.", wt_nm
+        )
+        return False
+    if not repo_root:
+        LOG.info("No repo root known; skipping node_modules symlink.")
+        return False
+    root_nm = Path(repo_root) / "node_modules"
+    if not root_nm.is_dir():
+        LOG.info(
+            "Main checkout has no node_modules (%s); skipping symlink.", root_nm
+        )
+        return False
+    try:
+        os.symlink(str(root_nm), str(wt_nm), target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        LOG.warning(
+            "Failed to symlink node_modules into worktree %s: %s",
+            worktree_path,
+            exc,
+        )
+        return False
+    LOG.info("Symlinked %s -> %s", wt_nm, root_nm)
+    return True
+
+
+def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
     """Remove a worktree directory gracefully.
 
     Safety gates:
-    1. Validates the target path is not the repository root.
+    1. Validates the target path is not the repository root. The root is
+       taken from the *repo_root* argument when provided (``phase_finish``
+       passes the authoritative value from the implement state file);
+       otherwise it is derived from the current directory, resolving to the
+       MAIN checkout root even when the current directory is inside a linked
+       worktree (see ``_get_repo_root``).
     2. Before manual (shutil) removal, checks that the target does
        NOT contain a ``.git/`` directory (which would mean it's the
        main working tree).
 
     Args:
         worktree_path: Path to the worktree.
+        repo_root: Optional explicit main repo root (defaults to discovery
+            from the current directory).
 
     Returns:
         True if removal succeeded.
@@ -528,8 +629,8 @@ def _remove_worktree(worktree_path: str) -> bool:
     resolved_path = str(Path(worktree_path).resolve())
 
     # ── Safety gate 1: refuse if target is the repo root ──────────
-    repo_root = _get_repo_root()
-    if repo_root and Path(resolved_path).as_posix() == repo_root:
+    repo_root = repo_root or _get_repo_root()
+    if repo_root and Path(resolved_path) == Path(repo_root).resolve():
         msg = (
             f"REFUSE to remove the repository root: {resolved_path}. "
             f"This is the main working tree, not a worktree. "
@@ -537,6 +638,21 @@ def _remove_worktree(worktree_path: str) -> bool:
         )
         LOG.critical(msg)
         raise RuntimeError(msg)
+
+    # If the current directory is inside the worktree being removed, step
+    # out to the repo root first. A deleted cwd breaks os.getcwd() and
+    # subprocess spawning for every later step (StatusLifecycle.__exit__,
+    # phase_finish's completion comment, the signal handler).
+    try:
+        current_cwd = Path.cwd().resolve()
+    except OSError:
+        current_cwd = None
+    target = Path(resolved_path)
+    if (
+        current_cwd is not None
+        and (current_cwd == target or target in current_cwd.parents)
+    ):
+        os.chdir(repo_root or str(Path.home()))
 
     LOG.info("Removing worktree: %s", resolved_path)
     result = run_cmd(
@@ -570,8 +686,11 @@ def _remove_worktree(worktree_path: str) -> bool:
             LOG.warning("Manual worktree removal failed: %s", exc)
             return False
 
-    # Prune stale worktree references
-    run_cmd(["git", "worktree", "prune"], check=False)
+    # Prune stale worktree references. Run from an explicit, still-valid
+    # directory: the current directory may have been the worktree that was
+    # just removed (finish/abort can run from inside it), and a deleted cwd
+    # breaks both the log line and the subprocess spawn.
+    run_cmd(["git", "worktree", "prune"], cwd=repo_root, check=False)
     return True
 
 
@@ -717,56 +836,68 @@ def run_build(cwd: str) -> dict[str, Any]:
 
 
 def run_tests(cwd: str) -> dict[str, Any]:
-    """Run the full test suite.
+    """Run the full test suite, routed through the per-repo run cache.
+
+    The pytest (and, on failure, npm test) command runs through
+    ``skill.test_cache.run_cached``: a valid cached result for the same
+    worktree git state within the TTL is reused without re-executing the
+    suite (see SA-0MSGN5OJ4002OZKY). Caching is worktree-aware — the
+    fingerprint reflects *cwd*'s HEAD + working-tree changes, so edits in the
+    worktree invalidate stale entries automatically.
 
     Args:
         cwd: Working directory (worktree root).
 
     Returns:
         A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
-        ``exit_code`` (int), ``failures`` (list[str]).
+        ``exit_code`` (int), ``failures`` (list[str]) — semantics unchanged
+        from the raw-execution version.
     """
-    # Try pytest first, then npm test
-    result = run_cmd(
-        ["python3", "-m", "pytest", "-x", "--tb=short", "-q"],
+    # Route through the cache so repeated verification at the same git state
+    # reuses the prior run instead of re-executing a multi-minute suite.
+    pytest_run = run_cached(
+        "python3 -m pytest -x --tb=short -q",
         cwd=cwd,
-        check=False,
         timeout=600,
-        capture=True,
+        runner=lambda command, cwd_, timeout_: run_cmd(
+            command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+        ),
     )
 
-    if result.returncode != 0:
-        # Try npm test as fallback
-        npm_result = run_cmd(
-            ["npm", "test"],
+    result = pytest_run
+    if result["exit_code"] != 0:
+        # Try npm test as fallback (also cached)
+        npm_run = run_cached(
+            "npm test",
             cwd=cwd,
-            check=False,
             timeout=600,
-            capture=True,
+            runner=lambda command, cwd_, timeout_: run_cmd(
+                command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+            ),
         )
-        if npm_result.returncode == 0:
+        if npm_run["exit_code"] == 0:
             return {
                 "success": True,
-                "stdout": npm_result.stdout.strip(),
-                "stderr": npm_result.stderr.strip(),
+                "stdout": npm_run["stdout"].strip(),
+                "stderr": npm_run["stderr"].strip(),
                 "exit_code": 0,
                 "failures": [],
             }
         # Use the npm result if pytest also failed
-        result = npm_result
+        result = npm_run
 
     # Parse failures from output
     failures: list[str] = []
-    combined = f"{result.stdout}\n{result.stderr}"
+    combined = f"{result['stdout']}\n{result['stderr']}"
     for line in combined.splitlines():
         if "FAILED" in line or "failed" in line.lower():
             failures.append(line.strip())
 
     return {
-        "success": result.returncode == 0,
-        "stdout": result.stdout.strip(),
-        "stderr": result.stderr.strip(),
-        "exit_code": result.returncode,
+        "success": result["exit_code"] == 0,
+        "stdout": result["stdout"].strip(),
+        "stderr": result["stderr"].strip(),
+        "exit_code": result["exit_code"],
         "failures": failures,
     }
 
@@ -879,12 +1010,13 @@ def phase_start(
 
     Steps:
     1. Validate the work item ID
-    2. Claim the work item (status → in_progress)
-    3. Safety gate: check for dirty working tree
-    4. Fetch work item details (audit)
-    5. Create a worktree from the parent branch
-    6. Register signal handlers
-    7. Write persistent state
+    2. Code Freeze gate: refuse when a release is in progress
+    3. Claim the work item (status → in_progress)
+    4. Safety gate: check for dirty working tree
+    5. Fetch work item details (audit)
+    6. Create a worktree from the parent branch
+    7. Register signal handlers
+    8. Write persistent state
 
     Args:
         work_item_id: The work item ID.
@@ -918,7 +1050,23 @@ def phase_start(
             LOG.error(msg)
         return report
 
-    # ── Step 2: Claim the work item via shared helper ─────────────
+    # ── Step 2: Code Freeze gate (before claiming) ────────────────
+    if is_code_freeze_active():
+        msg = (
+            "Project is in Code Freeze — implementation blocked until the "
+            "release completes."
+        )
+        LOG.error(msg)
+        report["success"] = False
+        report["message"] = msg
+        report["code_freeze"] = True
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {msg}\n")
+        return report
+
+    # ── Step 3: Claim the work item via shared helper ─────────────
     LOG.info("Claiming work item %s...", work_item_id)
     try:
         StatusLifecycle.update_status(work_item_id, "in_progress")
@@ -932,7 +1080,7 @@ def phase_start(
             LOG.error(msg)
         return report
 
-    # ── Step 3: Safety gate (dirty working tree) ───────────────────
+    # ── Step 4: Safety gate (dirty working tree) ───────────────────
     LOG.info("Checking git working tree...")
     status_output = git_status()
     is_dirty = git_has_dirty_files(status_output)
@@ -940,7 +1088,9 @@ def phase_start(
     if is_dirty:
         msg = (
             f"Dirty working tree detected. Uncommitted changes exist outside .worklog/.\n"
-            f"Please stash, commit, or revert changes before proceeding.\n"
+            f"Do NOT stash, commit, or revert the user's uncommitted changes.\n"
+            f"STOP and ask the operator how to proceed (commit, stash, revert, or abort)\n"
+            f"— never touch the user's working tree without explicit permission.\n"
             f"\nTo abort and release the work item, run:\n"
             f"  python3 {Path(__file__).resolve()} abort {work_item_id}\n"
             f"\nGit status:\n{status_output}"
@@ -951,7 +1101,7 @@ def phase_start(
             print("=" * 60)
             print(status_output)
             print("=" * 60)
-            print("Please resolve before proceeding.\n")
+            print("Ask the operator how to proceed — do not stash, commit, or revert user changes without permission.\n")
         report["success"] = False
         report["message"] = msg
         report["dirty_worktree"] = True
@@ -964,7 +1114,7 @@ def phase_start(
             print(format_json_output(report))
         return report
 
-    # ── Step 4: Fetch work item details ────────────────────────────
+    # ── Step 5: Fetch work item details ────────────────────────────
     LOG.info("Fetching work item %s...", work_item_id)
     work_item = wl_show(work_item_id)
     if not work_item:
@@ -984,7 +1134,7 @@ def phase_start(
     title = work_item.get("title", work_item_id)
     slug = slug_from_title(title)
 
-    # ── Step 5: Create worktree ────────────────────────────────────
+    # ── Step 6: Create worktree ────────────────────────────────────
     wt_path = worktree_path_override or worktree_path_for(work_item_id, slug)
     branch = branch_name_for(work_item_id, slug)
 
@@ -1004,6 +1154,11 @@ def phase_start(
 
     abs_wt_path = str(Path(wt_path).resolve())
 
+    # Auto-symlink the main checkout's node_modules into the worktree so
+    # dist-spawning tests resolve dependencies without manual setup. Never
+    # fatal: skip when either side lacks node_modules (SA-0MSGS763C006SM1B).
+    _ensure_node_modules_symlink(abs_wt_path, _get_repo_root())
+
     # Update status with stage via shared helper
     try:
         StatusLifecycle.update_status(work_item_id, "in_progress", stage="in_progress")
@@ -1014,12 +1169,12 @@ def phase_start(
         f"Implementation started\n- Worktree: {abs_wt_path}\n- Branch: {branch}",
     )
 
-    # ── Step 6: Register signal handlers ───────────────────────────
+    # ── Step 7: Register signal handlers ───────────────────────────
     repo_root = str(Path.cwd().resolve())
     _store_signal_globals(abs_wt_path, work_item_id, repo_root)
     _register_signal_handlers()
 
-    # ── Step 7: Write state ────────────────────────────────────────
+    # ── Step 8: Write state ────────────────────────────────────────
     state = ImplementState(
         work_item_id=work_item_id,
         worktree_path=abs_wt_path,
@@ -1068,6 +1223,7 @@ def phase_finish(
     """Phase 2: Complete the implementation.
 
     Steps:
+    0. Worktree placement gate (refuse if changes were made outside the worktree)
     1. Read state to find worktree
     2. Refactor step (unless --no-refactor)
     3. Build
@@ -1078,6 +1234,10 @@ def phase_finish(
     8. Push to dev
     9. Restore repo state
     10. Mark in_review
+
+    All implementation work MUST be done inside the worktree created by
+    ``phase_start``. If the current directory is outside the worktree and the
+    main checkout holds uncommitted changes, finish refuses (step 0).
 
     Args:
         work_item_id: The work item ID.
@@ -1129,6 +1289,36 @@ def phase_finish(
             print(format_json_output(report))
         else:
             LOG.error(msg)
+        return report
+
+    # ── Step 0.5: Worktree placement gate ──────────────────────────
+    # All implementation work must happen inside the worktree created by
+    # `implement.py start`. If changes were made in the main checkout
+    # instead, refuse rather than silently build/test/commit an empty
+    # worktree and mark the item in_review.
+    violation = _worktree_placement_violation(
+        worktree_path,
+        parent_branch=state.parent_branch if state else DEFAULT_PARENT_BRANCH,
+    )
+    if violation:
+        msg = violation
+        LOG.error(msg)
+        report["success"] = False
+        report["message"] = msg
+        report["worktree_enforcement"] = True
+        wl_add_comment(
+            work_item_id,
+            "Finish phase refused: implementation changes found outside the "
+            f"worktree.\n```\n{msg}\n```",
+        )
+        try:
+            StatusLifecycle.update_status(work_item_id, "open")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {msg}\n")
         return report
 
     # ── Step 1: Refactor step ──────────────────────────────────────
@@ -1289,13 +1479,20 @@ def phase_finish(
             # ── Step 6: Remove worktree ────────────────────────────────────
             LOG.info("Removing worktree...")
             remove_state(worktree_path)
-            if not _remove_worktree(worktree_path):
+            if not _remove_worktree(
+                worktree_path,
+                repo_root=state.repo_root if state else None,
+            ):
                 msg = f"Failed to remove worktree at {worktree_path}"
                 LOG.warning(msg)
                 report["steps"]["worktree_removed"] = False
 
             # ── Step 7: Restore repo state ─────────────────────────────────
-            repo_root = state.repo_root if state else str(Path.cwd().resolve())
+            repo_root = (
+                state.repo_root
+                if state
+                else (_get_repo_root() or str(Path.cwd().resolve()))
+            )
             _restore_repo_state(repo_root)
 
             # ── Step 8: Push to dev ────────────────────────────────────────
@@ -1432,6 +1629,84 @@ def _is_worktree(path: Path) -> bool:
     """
     git_path = path / ".git"
     return git_path.is_file()
+
+
+def _worktree_placement_violation(
+    worktree_path: str,
+    cwd: str | None = None,
+    repo_root: str | None = None,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> str | None:
+    """Return an error message when implementation work landed outside the worktree.
+
+    All implementation work must happen inside the worktree created by
+    ``implement.py start``. A violation exists only when ALL of:
+
+    1. the current directory is not the worktree (or a subdirectory of it),
+    2. the main checkout holds uncommitted changes outside ``.worklog/``, and
+    3. the worktree itself holds NO changes (clean and at the parent branch
+       HEAD) — i.e. the work was done in the main checkout, not the worktree.
+
+    Condition 3 keeps the gate precise: pre-existing/unrelated dirt in the
+    main checkout does not block a legitimate finish when the work actually
+    lives in the worktree.
+
+    Args:
+        worktree_path: Absolute path to the worktree.
+        cwd: Directory to treat as the current directory (defaults to
+            ``os.getcwd()``).
+        repo_root: Main repo root (defaults to discovery from *cwd*).
+        parent_branch: Branch the worktree forked from (default: ``dev``).
+
+    Returns:
+        An actionable error message string if placement is violated,
+        otherwise ``None``.
+    """
+    wt = Path(worktree_path).resolve()
+    cur = Path(cwd or os.getcwd()).resolve()
+    if cur == wt or wt in cur.parents:
+        return None  # already inside the worktree
+
+    root = Path(repo_root or _get_repo_root(cur) or cur).resolve()
+    if not git_has_dirty_files(git_status(cwd=str(root))):
+        return None  # main checkout clean; work must be in the worktree
+
+    if _git_path_has_changes(wt, parent_branch):
+        return None  # work lives in the worktree; main-checkout dirt is unrelated
+
+    return (
+        f"Work done outside the worktree: uncommitted changes were found in "
+        f"the main checkout at {root} while the worktree {wt} contains no "
+        f"changes. All implementation work MUST be done in the worktree "
+        f"created by `implement.py start`. Move your changes into the "
+        f"worktree and re-run `implement.py finish`."
+    )
+
+
+def _git_path_has_changes(path: Path, parent_branch: str) -> bool:
+    """True when the git directory at *path* contains implementation changes.
+
+    Detects both uncommitted changes and commits ahead of *parent_branch*.
+
+    Args:
+        path: Directory to check (e.g. the worktree root).
+        parent_branch: Branch the directory forked from (e.g. ``dev``).
+
+    Returns:
+        True if the directory is dirty or its HEAD differs from the parent
+        branch; False only when it is clean AND at the parent branch HEAD.
+    """
+    if git_has_dirty_files(git_status(cwd=str(path))):
+        return True
+    head = run_cmd(
+        ["git", "rev-parse", "HEAD"], cwd=str(path), check=False, capture=True
+    )
+    parent = run_cmd(
+        ["git", "rev-parse", parent_branch], cwd=str(path), check=False, capture=True
+    )
+    if head.returncode == 0 and parent.returncode == 0:
+        return head.stdout.strip() != parent.stdout.strip()
+    return True  # cannot compare; fail open
 
 
 def _discover_worktree(work_item_id: str) -> str | None:

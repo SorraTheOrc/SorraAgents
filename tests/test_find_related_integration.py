@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 
 def _write_wl_state(path, state):
@@ -36,6 +37,12 @@ args = sys.argv[1:]
 if not args:
     print('{{}}')
     sys.exit(0)
+
+# Real wl accepts a leading `--worklog-dir <path>` pair (injected by the
+# shared worklog-dir resolution); normalize it away so the fake behaves
+# like real wl regardless of the caller's cwd.
+if len(args) >= 2 and args[0] == '--worklog-dir':
+    args = args[2:]
 
 cmd = args[0]
 
@@ -153,6 +160,8 @@ def test_find_related_integration(tmp_path, monkeypatch):
             "--work-item-id",
             "TEST-001",
             "--json",
+            "--repo-path",
+            str(tmp_path),
         ],
         env=env,
         capture_output=True,
@@ -172,6 +181,14 @@ def test_find_related_integration(tmp_path, monkeypatch):
     assert out["relatedItemCount"] == 2
     assert out["repoMatchCount"] >= 0
 
+    # P11/AC2: the full (untruncated) report is persisted to a sidecar file
+    # even though the description carries the compact summary.
+    assert out["fullReportPath"] is not None
+    full_report = Path(out["fullReportPath"])
+    assert full_report.exists()
+    assert "Previous automation work" in full_report.read_text(encoding="utf-8")
+    assert "REL-002" in full_report.read_text(encoding="utf-8")
+
     # Verify the description was updated
     with open(state_file, "r") as fh:
         updated_state = json.load(fh)
@@ -189,6 +206,8 @@ def test_find_related_integration(tmp_path, monkeypatch):
             "--work-item-id",
             "TEST-001",
             "--json",
+            "--repo-path",
+            str(tmp_path),
         ],
         env=env,
         capture_output=True,
@@ -249,6 +268,8 @@ def test_find_related_integration_no_results(tmp_path):
             "--work-item-id",
             "TEST-002",
             "--json",
+            "--repo-path",
+            str(tmp_path),
         ],
         env=env,
         capture_output=True,

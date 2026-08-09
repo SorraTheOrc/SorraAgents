@@ -81,6 +81,7 @@ def run_code_quality(
     languages: list[str] | None = None,
     runner: Any = None,
     fix: bool = False,
+    files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run the full code quality pipeline and return structured results.
 
@@ -90,6 +91,11 @@ def run_code_quality(
                    If None, all detected languages are processed.
         runner: Optional injectable subprocess runner for testing.
         fix: If True, run all linters with auto-fix mode enabled.
+        files: Optional list of file paths (absolute or relative to
+               project_root) to scope the scan to. When provided, only these
+               files are linted instead of the whole project — this bounds the
+               audit's code-quality check to the git changed-file list
+               (SA-0MSKB6VWU000RT58). Passed through to every linter.
 
     Returns:
         A dict with keys:
@@ -125,7 +131,8 @@ def run_code_quality(
                     linters.append(probe_linter(linter_name))
 
         # 4. Run linters
-        result = run_linters_for_project(project_root, runner=runner, fix=fix)
+        result = run_linters_for_project(project_root, runner=runner, fix=fix,
+                                         files=files)
 
         # 5. Build result ensuring detected/filtered languages are reflected
         return {

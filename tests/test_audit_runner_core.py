@@ -49,6 +49,24 @@ def _fake_proc(returncode: int = 0, stdout: str = "", stderr: str = ""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _strip_worklog_dir(cmd: list[str]) -> list[str]:
+    """Remove an injected ``--worklog-dir <path>`` flag pair from a wl argv.
+
+    The audit runner injects ``--worklog-dir`` into every wl command to make
+    wl invocation cwd-independent. Tests that pin the exact wl argv should
+    strip the injected pair so assertions remain stable across environments.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(cmd):
+        if cmd[i] == "--worklog-dir" and i + 1 < len(cmd):
+            i += 2
+            continue
+        out.append(cmd[i])
+        i += 1
+    return out
+
+
 # ---------------------------------------------------------------------------
 # CLI parsing tests
 # ---------------------------------------------------------------------------
@@ -221,7 +239,7 @@ class TestRunWl:
 
         result = _run_wl(fake_runner, ["wl", "show", "SA-123", "--children", "--json"])
         assert result == {"success": True}
-        assert calls == [["wl", "show", "SA-123", "--children", "--json"]]
+        assert _strip_worklog_dir(calls[0]) == ["wl", "show", "SA-123", "--children", "--json"]
 
     def test_run_wl_nonzero_exit_raises(self):
         def fake_runner(cmd, **kwargs):
@@ -246,7 +264,7 @@ class TestRunWl:
 
         result = _run_wl(fake_runner, ["wl", "dep", "list", "SA-123", "--json"])
         assert result == []
-        assert calls == [["wl", "dep", "list", "SA-123", "--json"]]
+        assert _strip_worklog_dir(calls[0]) == ["wl", "dep", "list", "SA-123", "--json"]
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +418,30 @@ class TestExtractACs:
         acs = _extract_acs(desc)
         assert acs == ["Must be fast"]
 
+    def test_heading_with_trailing_colon(self):
+        """Headers like 'Acceptance Criteria:' (canonical AGENTS.md format)
+        must be recognized — the colon is optional."""
+        desc = (
+            "Acceptance Criteria:\n"
+            "- [ ] runWl-init-detection.test.ts passes reliably (25/25)\n"
+            "- [ ] mock-timeout.test.ts passes (8/8)\n"
+            "- [ ] Full suite green\n"
+        )
+        acs = _extract_acs(desc)
+        assert len(acs) == 3
+        assert "runWl-init-detection.test.ts passes reliably (25/25)" in acs[0]
+        assert "mock-timeout.test.ts passes (8/8)" in acs[1]
+        assert "Full suite green" in acs[2]
+
+    def test_h2_heading_with_trailing_colon(self):
+        desc = (
+            "## Acceptance Criteria:\n"
+            "1. Must do X\n"
+            "2. Must do Y\n\n## Notes\n"
+        )
+        acs = _extract_acs(desc)
+        assert acs == ["Must do X", "Must do Y"]
+
 
 # ---------------------------------------------------------------------------
 # Persistence delegation tests
@@ -433,7 +475,7 @@ class TestPersistenceDelegation:
                     "success": True,
                     "audit": {
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: No\n\n## Summary\nTest.",
+                        "rawOutput": "Audit report for work item SA-TEST-001\nReady to close: No\n\n## Summary\nTest.",
                     },
                 }))
             return _fake_proc(
@@ -931,7 +973,7 @@ class TestStatusLifecycle:
 
         def fake_runner(cmd, **kwargs):
             nonlocal _show_called
-            cmd_list = list(cmd)
+            cmd_list = _strip_worklog_dir(list(cmd))
             calls.append(cmd_list)
             # If fail_show is True and this is a "wl show" call, return failure
             if fail_show and "show" in cmd_list:
@@ -970,7 +1012,7 @@ class TestStatusLifecycle:
 
         def fake_runner(cmd, **kwargs):
             nonlocal _show_called
-            cmd_list = list(cmd)
+            cmd_list = _strip_worklog_dir(list(cmd))
             calls.append(cmd_list)
             # The original-status capture uses "wl show <id> --json" (no --children).
             # Match commands where "show" is present but "--children" is absent.
@@ -1032,8 +1074,9 @@ class TestStatusLifecycle:
             f"in_progress update must include --json, got: {in_progress_updates[0]}"
         )
 
-    def test_restores_open_on_success_no_status_in_response(self, monkeypatch):
-        """On successful audit, status is restored to 'open' (default) when no original status was captured."""
+    def test_advances_to_completed_in_review_on_success(self, monkeypatch):
+        """On a successful audit with a 'yes' verdict, the item advances to
+        completed/in_review even when no original status was captured."""
         calls = []
 
         monkeypatch.setattr(
@@ -1048,9 +1091,12 @@ class TestStatusLifecycle:
         cmd_issue("SA-LIFECYCLE", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-LIFECYCLE"]]
-        open_restore_updates = [c for c in wl_updates if c[3:5] == ["--status", "open"]]
-        assert len(open_restore_updates) >= 1, (
-            f"Expected at least one 'open' status restore, got: {wl_updates}"
+        final_update = wl_updates[-1]
+        assert final_update[3:5] == ["--status", "completed"], (
+            f"Expected 'completed' terminal transition on yes verdict, got: {wl_updates}"
+        )
+        assert final_update[5:7] == ["--stage", "in_review"], (
+            f"Expected stage in_review, got: {final_update}"
         )
 
     def test_final_restore_update_includes_json_flag(self, monkeypatch):
@@ -1116,8 +1162,9 @@ class TestStatusLifecycle:
         )
 
     def test_handled_exception_sets_open_status(self, monkeypatch):
-        """When a pi RuntimeError is caught by the body, audit cannot verify ACs
-        so ``Ready to close: No`` → status becomes ``open``."""
+        """When a pi RuntimeError is caught by the body, the audit is a failure:
+        the item is never left in_progress — it is restored to a safe state
+        ('open') with the assignee cleared."""
         calls = []
 
         def fake_call_pi(prompt, model="x", pi_bin="x", **kwargs):
@@ -1163,7 +1210,8 @@ class TestStatusLifecycle:
         )
 
     def test_restores_original_status_with_json_flag_when_audit_passes(self, monkeypatch):
-        """When audit passes, original status is restored and the update includes --json flag."""
+        """A yes verdict on an originally in_progress item advances it to
+        completed/in_review (never back to in_progress); --json is included."""
         calls = []
 
         monkeypatch.setattr(
@@ -1178,15 +1226,155 @@ class TestStatusLifecycle:
         cmd_issue("SA-ORIGSTAT2", runner=self._fake_runner_with_status(calls, status="in_progress"), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-ORIGSTAT2"]]
-        # The restore should set the original status (in_progress)
-        restore_updates = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]]
-        assert len(restore_updates) >= 1, (
-            f"Expected status restore to 'in_progress' (original status), got: {wl_updates}"
+        # The only in_progress update is the entry claim — the item must NOT be
+        # restored to in_progress after a yes verdict.
+        in_progress_updates = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]]
+        assert len(in_progress_updates) == 1, (
+            f"Expected exactly one in_progress update (the entry claim), got: {wl_updates}"
         )
-        # The restore update should include --json (the last in_progress update is the restore)
-        last_restore = [c for c in wl_updates if c[3:5] == ["--status", "in_progress"]][-1]
-        assert "--json" in last_restore, (
-            f"Status restore must include --json, got: {last_restore}"
+        # The terminal transition advances the item to completed/in_review.
+        final_update = wl_updates[-1]
+        assert final_update[3:7] == ["--status", "completed", "--stage", "in_review"], (
+            f"Expected completed/in_review terminal transition, got: {final_update}"
+        )
+        assert "--json" in final_update, (
+            f"Status transition must include --json, got: {final_update}"
+        )
+
+
+    def _fake_runner_with_restore_failure(self, calls, fail_restore_count):
+        """Fake runner that fails the terminal status-restore ``wl update``
+        the first ``fail_restore_count`` times, then succeeds.
+
+        The entry ``in_progress`` claim is never failed — only the final
+        verdict-driven restore update (any status other than in_progress).
+        """
+        _show_called = False
+        restore_failures = {"remaining": fail_restore_count}
+
+        def fake_runner(cmd, **kwargs):
+            nonlocal _show_called
+            cmd_list = _strip_worklog_dir(list(cmd))
+            calls.append(cmd_list)
+            if (
+                cmd_list[:3] == ["wl", "update", cmd_list[2]]
+                and "--status" in cmd_list
+                and "in_progress" not in cmd_list
+                and restore_failures["remaining"] > 0
+            ):
+                restore_failures["remaining"] -= 1
+                return _fake_proc(returncode=1, stderr="wl: transient error")
+            if "show" in cmd_list and "--children" in cmd_list and not _show_called:
+                _show_called = True
+                return _fake_proc(stdout=json.dumps({
+                    "success": True,
+                    "workItem": {
+                        "id": cmd_list[2],
+                        "title": "Test Item",
+                        "description": (
+                            "## Acceptance Criteria\n"
+                            "1. The system passes the test\n"
+                        ),
+                    },
+                    "children": [],
+                }))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+        return fake_runner
+
+    def test_restore_failure_retries_then_succeeds(self, monkeypatch, capsys):
+        """A transient failure on the terminal status restore is retried, so
+        the item is not left in_progress; no warning is printed when the
+        retry succeeds."""
+        calls = []
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
+        )
+
+        rc = cmd_issue(
+            "SA-RETRY",
+            runner=self._fake_runner_with_restore_failure(calls, fail_restore_count=1),
+            persist=False,
+        )
+        assert rc == 0, f"Expected exit 0 on successful audit, got {rc}"
+
+        # The restore update was attempted twice: first attempt failed, retry succeeded.
+        restore_updates = [
+            c for c in calls
+            if c[:3] == ["wl", "update", "SA-RETRY"]
+            and "--status" in c
+            and "in_progress" not in c
+        ]
+        assert len(restore_updates) >= 2, (
+            f"Expected the restore update to be retried after a transient failure, got: {calls}"
+        )
+        err = capsys.readouterr().err
+        assert "Failed to restore" not in err, (
+            f"No warning expected when the retry succeeds, got: {err}"
+        )
+
+    def test_restore_failure_prints_visible_warning(self, monkeypatch, capsys):
+        """AC2: when the terminal status restore ultimately fails, a visible
+        warning is printed to stderr (not silently swallowed) naming the work
+        item, so the operator can recover an item left in_progress."""
+        calls = []
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
+        )
+
+        rc = cmd_issue(
+            "SA-RESTOREFAIL",
+            runner=self._fake_runner_with_restore_failure(calls, fail_restore_count=999),
+            persist=False,
+        )
+        assert rc == 0, "Audit result must not be masked by status-restore failure"
+
+        err = capsys.readouterr().err
+        assert "Failed to restore" in err, (
+            f"Expected a visible restore-failure warning on stderr, got: {err}"
+        )
+        assert "SA-RESTOREFAIL" in err, (
+            f"Warning should name the affected work item, got: {err}"
+        )
+
+    def test_restore_failure_preserves_audit_exit_code(self, monkeypatch, capsys):
+        """A status-restore failure must not mask the main audit result: the
+        exit code still reflects the audit outcome (0 = success)."""
+        calls = []
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._STATUS_RESTORE_RETRY_DELAY_S", 0,
+        )
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            lambda prompt, model="x", pi_bin="x", **kwargs: {
+                "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}]',
+                "verdict": "met",
+                "evidence": "ok",
+            },
+        )
+
+        rc = cmd_issue(
+            "SA-EXITCODE",
+            runner=self._fake_runner_with_restore_failure(calls, fail_restore_count=999),
+            persist=False,
+        )
+        assert rc == 0, (
+            f"Status-restore failure must not mask the audit result (expected 0), got {rc}"
         )
 
 
@@ -1195,7 +1383,7 @@ class TestStatusLifecycle:
     # ------------------------------------------------------------------
 
     def test_status_restore_does_not_include_producer_review_flags(self, monkeypatch):
-        """Status restore does not include --needs-producer-review or --stage flags."""
+        """The verdict-driven transition does not include --needs-producer-review."""
         calls = []
 
         monkeypatch.setattr(
@@ -1210,13 +1398,15 @@ class TestStatusLifecycle:
         cmd_issue("SA-NPR1", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR1"]]
-        # The status restore (final update) should NOT include --needs-producer-review or --stage
+        # The verdict-driven transition (final update) should NOT include
+        # --needs-producer-review. It DOES set a compatible stage
+        # (in_review for a yes verdict).
         final_update = wl_updates[-1] if wl_updates else []
         assert "--needs-producer-review" not in final_update, (
-            f"Status restore must NOT include --needs-producer-review, got: {final_update}"
+            f"Status transition must NOT include --needs-producer-review, got: {final_update}"
         )
-        assert "--stage" not in final_update, (
-            f"Status restore must NOT include --stage, got: {final_update}"
+        assert final_update[3:7] == ["--status", "completed", "--stage", "in_review"], (
+            f"Expected completed/in_review transition on yes verdict, got: {final_update}"
         )
 
     def test_no_needs_producer_review_when_not_ready_to_close(self, monkeypatch):
@@ -1665,6 +1855,118 @@ class TestGetChildAuditVerdict:
         assert verdict is True
         assert reason == "ready"
 
+    def test_just_persisted_audit_returns_ready_not_stale(self):
+        """AC1/AC3: an audit just persisted is trusted, not flagged stale.
+
+        Persisting an audit bumps the child's updatedAt to ~its auditedAt
+        (wl audit-set + wl update --audit-text + status transition), so
+        auditedAt is a fraction of a second before updatedAt. The plain
+        freshness gate (auditedAt > updatedAt + buffer) can never hold in that
+        case, which made the parent runner re-trigger child audits forever. A
+        child audited moments ago and reporting "Ready to close: Yes" must be
+        treated as fresh instead of stale.
+        """
+        def runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                # auditedAt recorded at wl audit-set; updatedAt bumped slightly
+                # later by the wl update --audit-text + status writes.
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": {
+                        "workItemId": "SA-CHILD",
+                        "auditedAt": "2026-07-15T10:00:00.200Z",
+                        "rawOutput": "Ready to close: Yes\n\nAll good.",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            if "show" in cmd_list and "--children" not in cmd_list:
+                wi_data = {
+                    "success": True,
+                    "workItem": {
+                        "id": "SA-CHILD",
+                        "updatedAt": "2026-07-15T10:00:00.400Z",  # 200ms after auditedAt
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(wi_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        assert verdict is True
+        assert reason == "ready"
+
+    def test_just_persisted_not_ready_audit_blocks_closure(self):
+        """AC2: a just-persisted "Ready to close: No" audit still blocks.
+
+        The audit-persistence freshness exemption must only make the audit
+        usable; a "No" verdict must still be returned so it blocks parent
+        closure (verdict semantics unchanged).
+        """
+        def runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": {
+                        "workItemId": "SA-CHILD",
+                        "auditedAt": "2026-07-15T10:00:00.200Z",
+                        "rawOutput": "Ready to close: No\n\nIssues remain.",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            if "show" in cmd_list and "--children" not in cmd_list:
+                wi_data = {
+                    "success": True,
+                    "workItem": {
+                        "id": "SA-CHILD",
+                        "updatedAt": "2026-07-15T10:00:00.400Z",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(wi_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        assert verdict is False
+        assert reason == "not_ready"
+
+    def test_audit_older_than_child_update_stays_stale(self):
+        """A genuinely stale audit still returns stale.
+
+        When the child was updated well AFTER the audit (not just the audit's
+        own persistence write, which is within a few seconds), the audit must
+        still be flagged stale so a re-audit is triggered.
+        """
+        def runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "audit-show" in cmd_list:
+                audit_data = {
+                    "success": True,
+                    "workItemId": "SA-CHILD",
+                    "audit": {
+                        "workItemId": "SA-CHILD",
+                        "auditedAt": "2026-07-15T10:00:00.000Z",
+                        "rawOutput": "Ready to close: Yes\n\nAll good.",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(audit_data))
+            if "show" in cmd_list and "--children" not in cmd_list:
+                wi_data = {
+                    "success": True,
+                    "workItem": {
+                        "id": "SA-CHILD",
+                        # Child updated 10 minutes after the audit → stale
+                        "updatedAt": "2026-07-15T10:10:00.000Z",
+                    },
+                }
+                return _fake_proc(stdout=json.dumps(wi_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        assert verdict is None
+        assert reason == "stale"
+
     def test_audit_show_failure_returns_error(self):
         """Returns (None, "error") when wl audit-show fails."""
         def runner(cmd, **kwargs):
@@ -1701,7 +2003,9 @@ class TestCmdIssueChildAuditAutoTrigger:
     """Integration tests for child audit auto-trigger in cmd_issue."""
 
     def test_child_with_no_audit_triggers_audit(self, monkeypatch, capsys):
-        """When a child has no persisted audit, an audit is auto-triggered."""
+        """When a child has no persisted audit, an audit is auto-triggered
+        when the cascade is explicitly opted into (--audit-children,
+        SA-0MSKB6V5Q007YDHE)."""
         pi_calls = []
 
         def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
@@ -1781,9 +2085,172 @@ class TestCmdIssueChildAuditAutoTrigger:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        cmd_issue("SA-PARENT", runner=fake_runner, persist=True)
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=True,
+                  audit_children=True)  # cascade is opt-in (SA-0MSKB6V5Q007YDHE)
         # Should have triggered an audit for the active child
         assert "SA-ACTIVE" in triggered_children
+
+    def test_child_with_just_persisted_audit_is_not_retriggered(self, monkeypatch, capsys):
+        """AC1: a child audited moments ago is not re-audited by the parent run.
+
+        A child whose own audit reports "Ready to close: Yes" and whose
+        updatedAt was bumped by the audit's own persistence write (auditedAt ~
+        updatedAt) must be treated as fresh and must not trigger a redundant
+        auto-audit. Before SA-0MSI3XH34001LLU4 this child was flagged stale and
+        the parent run re-triggered audits in an endless loop.
+        """
+        triggered_children = []
+        pi_calls = []
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            pi_calls.append(prompt)
+            return {"verdict": "met", "evidence": "x:1 — ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_subprocess_run(cmd, **kwargs):
+            # Must never be called: a fresh child audit should not be re-triggered
+            if "issue" in cmd:
+                for i, arg in enumerate(cmd):
+                    if arg == "issue" and i + 1 < len(cmd):
+                        triggered_children.append(cmd[i + 1])
+                        break
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.subprocess.run",
+            fake_subprocess_run,
+        )
+
+        child_wi = _load_fixture("wi_with_numbered_ac.json")
+        child_wi["workItem"]["id"] = "SA-FRESH"
+        child_wi["workItem"]["title"] = "Fresh Child"
+        child_wi["workItem"]["status"] = "in_progress"
+        child_wi["workItem"]["stage"] = "in_review"
+        child_wi["workItem"]["updatedAt"] = "2026-07-16T12:00:00.400Z"
+
+        parent_wi = _load_fixture("wi_with_numbered_ac.json")
+        parent_wi["children"] = [
+            {
+                "id": "SA-FRESH",
+                "title": "Fresh Child",
+                "status": "in_progress",
+                "stage": "in_review",
+                "description": child_wi["workItem"]["description"],
+            },
+        ]
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi))
+            if "show" in cmd_list:
+                return _fake_proc(stdout=json.dumps(child_wi))
+            if "audit-show" in cmd_list:
+                _i = cmd_list.index("audit-show")
+                target_id = cmd_list[_i + 1] if _i + 1 < len(cmd_list) else ""
+                if target_id == "SA-FRESH":
+                    # Audit persisted 1ms before the child's updatedAt bump
+                    # (the audit's own persistence write)
+                    audit_data = {
+                        "success": True,
+                        "workItemId": "SA-FRESH",
+                        "audit": {
+                            "workItemId": "SA-FRESH",
+                            "auditedAt": "2026-07-16T12:00:00.200Z",
+                            "rawOutput": "Ready to close: Yes\n\nAll good.",
+                        },
+                    }
+                else:
+                    audit_data = {"success": True, "workItemId": target_id, "audit": None}
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=True)
+
+        # The just-persisted audit must be trusted as fresh: no re-trigger,
+        # and the child is treated ready (child_audit_ready=True).
+        assert "SA-FRESH" not in triggered_children, (
+            "Recently-persisted child audit must not be re-audited, got: "
+            f"{triggered_children}"
+        )
+        assert pi_calls, "Parent should still have run its own AC review via Pi."
+
+    def test_child_just_persisted_not_ready_blocks_but_is_not_retriggered(self, monkeypatch, capsys):
+        """AC2: a just-persisted "No" child audit blocks parent closure without re-triggering."""
+        triggered_children = []
+
+        def fake_call_pi(prompt, model="test/model", pi_bin="pi", **kwargs):
+            return {"verdict": "met", "evidence": "x:1 — ok"}
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._call_pi",
+            fake_call_pi,
+        )
+
+        def fake_subprocess_run(cmd, **kwargs):
+            if "issue" in cmd:
+                for i, arg in enumerate(cmd):
+                    if arg == "issue" and i + 1 < len(cmd):
+                        triggered_children.append(cmd[i + 1])
+                        break
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner.subprocess.run",
+            fake_subprocess_run,
+        )
+
+        child_wi = _load_fixture("wi_with_numbered_ac.json")
+        child_wi["workItem"]["id"] = "SA-NOTREADY"
+        child_wi["workItem"]["title"] = "Not Ready Child"
+        child_wi["workItem"]["status"] = "in_progress"
+        child_wi["workItem"]["stage"] = "in_review"
+        child_wi["workItem"]["updatedAt"] = "2026-07-16T12:00:00.400Z"
+
+        parent_wi = _load_fixture("wi_with_numbered_ac.json")
+        parent_wi["children"] = [
+            {
+                "id": "SA-NOTREADY",
+                "title": "Not Ready Child",
+                "status": "in_progress",
+                "stage": "in_review",
+                "description": child_wi["workItem"]["description"],
+            },
+        ]
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "show" in cmd_list and "--children" in cmd_list:
+                return _fake_proc(stdout=json.dumps(parent_wi))
+            if "show" in cmd_list:
+                return _fake_proc(stdout=json.dumps(child_wi))
+            if "audit-show" in cmd_list:
+                _i = cmd_list.index("audit-show")
+                target_id = cmd_list[_i + 1] if _i + 1 < len(cmd_list) else ""
+                if target_id == "SA-NOTREADY":
+                    audit_data = {
+                        "success": True,
+                        "workItemId": "SA-NOTREADY",
+                        "audit": {
+                            "workItemId": "SA-NOTREADY",
+                            "auditedAt": "2026-07-16T12:00:00.200Z",
+                            "rawOutput": "Ready to close: No\n\nIssues remain.",
+                        },
+                    }
+                else:
+                    audit_data = {"success": True, "workItemId": target_id, "audit": None}
+                return _fake_proc(stdout=json.dumps(audit_data))
+            return _fake_proc(stdout=json.dumps({"success": True}))
+
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=True)
+
+        # A 'Not ready' child must NOT be blindly re-triggered either
+        # (its verdict is trusted fresh and still blocks closure downstream).
+        assert "SA-NOTREADY" not in triggered_children
 
 
 class TestRC1CompletedInReviewChildFilter:
@@ -2020,13 +2487,16 @@ class TestRC2RCFallbackVerdict:
             if "show" in cmd_list:
                 return _fake_proc(stdout=json.dumps(child_wi))
             if "audit-show" in cmd_list:
+                # Non-ready persisted audit: under P7 reuse the child goes
+                # through the Phase 1 screening path, exercising the RC2
+                # unparseable-output fallback below.
                 return _fake_proc(stdout=json.dumps({
                     "success": True,
                     "workItemId": "SA-CHILD",
                     "audit": {
                         "workItemId": "SA-CHILD",
                         "auditedAt": "2026-07-16T12:00:00Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nAll good.",
+                        "rawOutput": "Ready to close: No\n\n## Summary\nNeeds work.",
                     },
                 }))
             return _fake_proc(stdout=json.dumps({"success": True}))

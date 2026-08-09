@@ -16,6 +16,23 @@ Produce a machine-readable engineering estimate (effort + risk) and human-readab
 
 The pre-run status is captured and restored deterministically via the shared `StatusLifecycle` helpers (`StatusLifecycle.show` / `StatusLifecycle.update_status`). The `StatusLifecycle` **context manager** is deliberately not used here: its success exit sets `status=completed`, which would violate the documented lifecycle — items at `intake_complete`/`plan_complete` stay `open` until the post-release close.
 
+## Worklog resolution
+
+`orchestrate_estimate.py` injects the resolved `--worklog-dir` into every `wl`
+call (`wl show`, the effort/risk `wl update`, and `wl comment add`) via the
+shared resolution in `../shared/status_lifecycle.py`:
+
+1. **Explicit `--worklog-dir` value** (from a CLI flag / caller)
+2. **Prefix-to-sibling scan** — the work-item id prefix (e.g. `OSL`) is matched
+   against sibling projects' `config.yaml` so a non-SorraAgents item resolves
+   to its own worklog store even when the harness cwd is the framework repo
+3. **cwd chain** — `<cwd>/.worklog`, git root, nearest initialized ancestor
+4. **No flag** — `wl` resolves from cwd (failures surface real error detail)
+
+The script resolves the correct worklog store regardless of the directory it
+is invoked from. See `docs/dev/worklog-sync.md` for the shared resolution
+order and `wl sync` failure modes.
+
 ## Gating
 
 Issue MUST be in `intake_complete` or `plan_complete` stage. If not, refuse with: "The issue does not have a sufficiently detailed plan... Run the intake skill with `/skill:intake <issue-id>` or the plan command with `/skill:plan <issue-id>`." No other output on refusal.

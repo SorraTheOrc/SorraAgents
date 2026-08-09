@@ -40,14 +40,11 @@ __pycache__/
 *.pyc
 
 # Local build artifacts
-ampa.egg-info/
 build/
 tmp/
 
 # Local env files
 .env
-ampa/.env
-ampa/scheduler_store.json
 .venv/
 
 # Ralph event signals

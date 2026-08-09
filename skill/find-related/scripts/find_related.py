@@ -26,7 +26,11 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from skill.scripts.failure_notice import FailureNotice
-from skill.shared.status_lifecycle import StatusLifecycle
+from skill.shared.status_lifecycle import (
+    StatusLifecycle,
+    resolve_worklog_dir,
+    resolve_worklog_flags,
+)
 
 # ---------------------------------------------------------------------------
 # Stop words
@@ -69,10 +73,38 @@ MAX_WORK_ITEM_RESULTS: int = 3
 # matched. Ties are broken alphabetically for deterministic ordering.
 MAX_REPO_FILE_RESULTS: int = 3
 
+# Maximum number of matched keywords to list per repository file in the
+# automated report. Raw keyword word-lists are the dominant source of report
+# bloat (measured ~58% of the related-work section on SA-0MSF4AFX9007INSP),
+# inflating every prompt that carries the description. The full keyword list
+# is preserved in the persisted sidecar full report (see write_full_report).
+MAX_KEYWORDS_PER_FILE: int = 5
+
 
 # ---------------------------------------------------------------------------
 # CLI helpers
 # ---------------------------------------------------------------------------
+
+
+def _default_repo_path(work_item_id: str) -> Path:
+    """Resolve the target project's repository root for *work_item_id*.
+
+    The work item's own worklog store is resolved via the shared
+    prefix-to-sibling scan (:func:`resolve_worklog_dir`); the parent of the
+    ``.worklog`` directory is the target project root. Deriving the default
+    from the work item (rather than this script's own location) keeps repo
+    scans on the analyzed project even when the script runs from the
+    framework install dir (``~/.pi/agent/skills/find-related`` is a symlink
+    into SorraAgents).
+
+    Falls back to the framework ``REPO_ROOT`` when no store resolves
+    (e.g. an unknown prefix with an empty cwd chain) — the pre-fix
+    behavior.
+    """
+    wl_dir = resolve_worklog_dir(work_item_id)
+    if wl_dir is not None:
+        return wl_dir.parent
+    return REPO_ROOT
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -98,8 +130,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--repo-path",
-        default=str(REPO_ROOT),
-        help="Path to the repository root (default: auto-detected).",
+        default=None,
+        help="Path to the repository root (default: auto-detected from the "
+             "work item's worklog store; falls back to the framework repo).",
     )
     return parser.parse_args(argv)
 
@@ -135,14 +168,32 @@ def extract_keywords(title: str, description: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def run_wl_show(work_item_id: str) -> dict[str, Any] | None:
+def _wl_flags_for(work_item_id: str) -> list[str]:
+    """Resolve ``--worklog-dir`` flags pinned from the work-item id.
+
+    Search and semantic-probe commands carry no work-item id of their own,
+    so their target store is pinned from the id of the item being analyzed
+    (prefix-to-sibling scan, then cwd-chain fallback — see the shared
+    :func:`resolve_worklog_flags`). Commands that DO carry the id
+    (show/update) resolve the same way from the id embedded in the command.
+    """
+    return resolve_worklog_flags(["wl", "show", work_item_id, "--json"])
+
+
+def run_wl_show(work_item_id: str, worklog_flags: list[str] | None = None) -> dict[str, Any] | None:
     """Fetch a work item via `wl show <id> --json` and return parsed JSON.
 
     Unwraps the nested 'workItem' object from the wl response.
+    Injects the resolved ``--worklog-dir`` (prefix-to-sibling scan) into the
+    subprocess call so the item is fetched from its own worklog store
+    regardless of the caller's cwd.
     Returns None if the command fails or output is not valid JSON.
     """
     try:
         cmd = ["wl", "show", work_item_id, "--json"]
+        if worklog_flags is None:
+            worklog_flags = _wl_flags_for(work_item_id)
+        cmd[1:1] = worklog_flags
         out = subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         data = json.loads(out)
         # wl show --json returns {success: true, workItem: {...}}
@@ -153,18 +204,25 @@ def run_wl_show(work_item_id: str) -> dict[str, Any] | None:
         return None
 
 
-def run_wl_search(keyword: str, use_semantic: bool = False) -> list[dict[str, Any]]:
+def run_wl_search(keyword: str, use_semantic: bool = False,
+                  worklog_flags: list[str] | None = None) -> list[dict[str, Any]]:
     """Search Worklog for items matching a keyword.
 
     When use_semantic is True, includes the --semantic flag for hybrid
     lexical+semantic ranking. Falls back to keyword-only search on error.
 
+    ``worklog_flags`` pins the target worklog store (resolved from the
+    work-item id being analyzed); when None, wl resolves from cwd.
+
     Returns a list of matching work items (empty list on failure).
     """
     try:
-        cmd = ["wl", "search", keyword, "--json"]
+        cmd = ["wl"]
+        cmd.extend(worklog_flags or [])
+        cmd.append("search")
         if use_semantic:
-            cmd.insert(2, "--semantic")
+            cmd.append("--semantic")
+        cmd.extend([keyword, "--json"])
         out = subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         data = json.loads(out)
         # wl search returns {"success": true, "workItems": [...]}
@@ -180,13 +238,20 @@ def run_wl_search(keyword: str, use_semantic: bool = False) -> list[dict[str, An
         return []
 
 
-def run_wl_update(work_item_id: str, description: str) -> bool:
+def run_wl_update(work_item_id: str, description: str,
+                  worklog_flags: list[str] | None = None) -> bool:
     """Update a work item description via `wl update <id> --description <text>`.
+
+    Injects the resolved ``--worklog-dir`` (prefix-to-sibling scan) into the
+    subprocess call so the item is updated in its own worklog store.
 
     Returns True on success, False on failure.
     """
     try:
         cmd = ["wl", "update", work_item_id, "--description", description, "--json"]
+        if worklog_flags is None:
+            worklog_flags = _wl_flags_for(work_item_id)
+        cmd[1:1] = worklog_flags
         subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         return True
     except Exception:  # noqa: BLE001 -- update failure handled gracefully
@@ -198,14 +263,19 @@ def run_wl_update(work_item_id: str, description: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def is_semantic_available() -> bool:
+def is_semantic_available(worklog_flags: list[str] | None = None) -> bool:
     """Probe whether `wl search --semantic` is functional.
 
     Runs a simple probe query. Returns True if the command succeeds
     and returns a valid response. Falls back gracefully on any error.
+
+    ``worklog_flags`` pins the target worklog store (resolved from the
+    work-item id being analyzed); when None, wl resolves from cwd.
     """
     try:
-        cmd = ["wl", "search", "--semantic", "probe", "--json"]
+        cmd = ["wl"]
+        cmd.extend(worklog_flags or [])
+        cmd.extend(["search", "--semantic", "probe", "--json"])
         out = subprocess.check_output(cmd, encoding="utf-8", stderr=subprocess.PIPE)
         json.loads(out)
         # Any valid response (successful or with items) means --semantic is available
@@ -234,6 +304,7 @@ def _score_key(item: dict[str, Any]) -> float:
 def search_and_dedup(
     keywords: list[str],
     use_semantic: bool = False,
+    worklog_flags: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Search Worklog for each keyword, aggregate results, deduplicate, rank, and limit.
 
@@ -242,6 +313,9 @@ def search_and_dedup(
     without a score sort last. The final list is capped at
     MAX_WORK_ITEM_RESULTS.
 
+    ``worklog_flags`` pins the target worklog store (resolved from the
+    work-item id being analyzed) so every search targets the same store.
+
     Ranking heuristic: scored items are sorted by descending score
     (higher = more relevant). Unscored items sort after all scored items.
     """
@@ -249,7 +323,8 @@ def search_and_dedup(
     results: list[dict[str, Any]] = []
 
     for keyword in keywords:
-        items = run_wl_search(keyword, use_semantic=use_semantic)
+        items = run_wl_search(keyword, use_semantic=use_semantic,
+                              worklog_flags=worklog_flags)
         for item in items:
             item_id = item.get("id")
             if item_id and item_id not in seen:
@@ -347,12 +422,35 @@ def search_repo(repo_path: str, keywords: list[str]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+def _format_keyword_list(
+    keywords: list[str],
+    max_keywords: int | None,
+) -> str:
+    """Render a compact keyword list, capping at *max_keywords* entries.
+
+    When *max_keywords* is ``None`` the full list is rendered. When the list
+    is truncated, a ``(+N more)`` marker shows how many keywords were omitted
+    so readers know the full data lives in the persisted sidecar full report.
+    """
+    if max_keywords is None or len(keywords) <= max_keywords:
+        return ", ".join(keywords)
+    shown = ", ".join(keywords[:max_keywords])
+    return f"{shown} (+{len(keywords) - max_keywords} more)"
+
+
 def format_report(
     work_item_id: str,
     related_items: list[dict[str, Any]],
     repo_matches: list[dict[str, Any]],
+    max_keywords_per_file: int | None = MAX_KEYWORDS_PER_FILE,
 ) -> str:
     """Generate a Markdown report with related work items and repo matches.
+
+    Keyword word-lists per repository file match are capped at
+    *max_keywords_per_file* entries (default ``MAX_KEYWORDS_PER_FILE``) with a
+    ``(+N more)`` marker, keeping the section compact in descriptions and any
+    prompt that carries them. Pass ``max_keywords_per_file=None`` for the full
+    untruncated report (used when persisting the complete data).
 
     Returns a string containing the full report section including heading.
     """
@@ -377,11 +475,43 @@ def format_report(
         for match in repo_matches:
             file_path = match.get("file", "?")
             matched_keywords = match.get("matches", [])
-            kw_str = ", ".join(matched_keywords)
+            kw_str = _format_keyword_list(
+                matched_keywords, max_keywords_per_file
+            )
             lines.append(f"- `{file_path}` — matched: {kw_str}")
 
     lines.append("")
     return "\n".join(lines)
+
+
+def write_full_report(
+    work_item_id: str,
+    related_items: list[dict[str, Any]],
+    repo_matches: list[dict[str, Any]],
+    repo_root: Path = REPO_ROOT,
+) -> Path | None:
+    """Persist the complete (untruncated) related-work report to a sidecar file.
+
+    The work-item description carries the compact summary (see
+    ``format_report``); this writes the full keyword lists to
+    ``.worklog/tmp/find-related-full-<id>.md`` so the full related-work data
+    remains available without bloating descriptions or prompts.
+
+    Returns the path written, or ``None`` if persistence failed (best-effort:
+    the description update must never fail because of this).
+    """
+    try:
+        out_dir = repo_root / ".worklog" / "tmp"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / f"find-related-full-{work_item_id}.md"
+        full_report = format_report(
+            work_item_id, related_items, repo_matches,
+            max_keywords_per_file=None,
+        )
+        target.write_text(full_report, encoding="utf-8")
+        return target
+    except Exception:  # noqa: BLE001 -- best-effort persistence
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -392,28 +522,43 @@ def format_report(
 def update_description(original_desc: str, report_section: str) -> str:
     """Append or replace the automated report section in a work-item description.
 
-    If the description already contains a 'Related work (automated report)'
-    section, it is replaced. Otherwise the report is appended.
+    ALL existing 'Related work (automated report)' sections are removed
+    before the new report is inserted — earlier runs may have appended
+    duplicates (e.g. when a wrong-store run was followed by a correct
+    one). The new report is inserted at the position of the first removed
+    section (in-place replacement, preserving surrounding sections), or
+    appended when no section existed. Manual "Related work" sections
+    (without the automated marker) are preserved.
 
     Returns the updated description string.
     """
     heading_pattern = f"## {REPORT_HEADING}"
-    heading_idx = original_desc.find(heading_pattern)
+    remaining = original_desc
+    insertion_idx: int | None = None
 
-    if heading_idx == -1:
+    # Remove every automated report section: each spans from its heading to
+    # the next section heading (\n##) or the end of the description.
+    while True:
+        heading_idx = remaining.find(heading_pattern)
+        if heading_idx == -1:
+            break
+        if insertion_idx is None:
+            insertion_idx = heading_idx
+        next_section_idx = len(remaining)
+        for i in range(heading_idx + len(heading_pattern), len(remaining)):
+            if remaining[i : i + 3] == "\n##":
+                next_section_idx = i
+                break
+        remaining = remaining[:heading_idx] + remaining[next_section_idx:]
+
+    if insertion_idx is None:
         # No existing report section — append
         return original_desc.rstrip() + report_section
 
-    # Find the start of the next section after the report heading
-    next_section_idx = len(original_desc)
-    for i in range(heading_idx + len(heading_pattern), len(original_desc)):
-        if original_desc[i : i + 3] == "\n##":
-            next_section_idx = i
-            break
-
-    # Replace the old report section with the new one
-    before = original_desc[:heading_idx].rstrip()
-    after = original_desc[next_section_idx:]
+    # Replace the (first) report section position with the new report;
+    # everything after the last removed section follows unchanged.
+    before = remaining[:insertion_idx].rstrip()
+    after = remaining[insertion_idx:]
     return before + report_section + after
 
 
@@ -441,6 +586,13 @@ def main() -> None:
 def _main() -> None:
     args = parse_args()
 
+    # Resolve the default --repo-path from the work item's own worklog
+    # store (parent of .worklog) so repo scans target the analyzed project
+    # even when invoked from the framework install dir. An explicit
+    # --repo-path continues to override the default.
+    if args.repo_path is None:
+        args.repo_path = str(_default_repo_path(args.work_item_id))
+
     # StatusLifecycle manages work-item status transitions:
     #   - On entry: sets status to in_progress (captures original)
     #   - On exit: restores original status (restore_on_exit) — this skill
@@ -448,12 +600,17 @@ def _main() -> None:
     #   - On exception: restores original status
     with StatusLifecycle(args.work_item_id, restore_on_exit=True):
 
+        # Pin the target worklog store from the work-item id so every wl call
+        # (show/update/search/probe) targets the same store regardless of the
+        # caller's cwd (prefix-to-sibling scan, SA-0MSG57UNY009DE51).
+        wl_flags = _wl_flags_for(args.work_item_id)
+
         if args.verbose:
             print(f"[find-related] Work item: {args.work_item_id}", file=sys.stderr)
             print(f"[find-related] Repo path: {args.repo_path}", file=sys.stderr)
 
         # Fetch the work item
-        work_item = run_wl_show(args.work_item_id)
+        work_item = run_wl_show(args.work_item_id, worklog_flags=wl_flags)
         if work_item is None:
             msg = f"Failed to fetch work item {args.work_item_id}"
             notice = FailureNotice(
@@ -481,12 +638,13 @@ def _main() -> None:
             print(f"[find-related] Keywords: {keywords}", file=sys.stderr)
 
         # Probe semantic search availability
-        use_semantic = is_semantic_available()
+        use_semantic = is_semantic_available(worklog_flags=wl_flags)
         if args.verbose:
             print(f"[find-related] Semantic search available: {use_semantic}", file=sys.stderr)
 
         # Search Worklog (with semantic ranking when available)
-        related_items = search_and_dedup(keywords, use_semantic=use_semantic)
+        related_items = search_and_dedup(keywords, use_semantic=use_semantic,
+                                         worklog_flags=wl_flags)
 
         # Search repository (ranked and limited)
         repo_matches = search_repo(args.repo_path, keywords)
@@ -500,10 +658,18 @@ def _main() -> None:
         # Generate report
         report_section = format_report(args.work_item_id, related_items, repo_matches)
 
+        # Persist the full (untruncated) report so no related-work data is lost
+        # when the description carries only the compact summary (P11 / AC2).
+        full_report_path = write_full_report(
+            args.work_item_id, related_items, repo_matches,
+            repo_root=Path(args.repo_path),
+        )
+
         # Update description
         original_desc = work_item.get("description", "")
         updated_desc = update_description(original_desc, report_section)
-        update_success = run_wl_update(args.work_item_id, updated_desc)
+        update_success = run_wl_update(args.work_item_id, updated_desc,
+                                       worklog_flags=wl_flags)
 
         if args.verbose and not update_success:
             print("[find-related] Warning: Failed to update work item description",
@@ -519,6 +685,7 @@ def _main() -> None:
             "keywords": keywords,
             "relatedItemCount": len(related_items),
             "repoMatchCount": len(repo_matches),
+            "fullReportPath": str(full_report_path) if full_report_path else None,
         }
 
         if args.json_output:
@@ -530,6 +697,8 @@ def _main() -> None:
             if added_ids:
                 print(f"Added IDs: {', '.join(added_ids)}")
             print(f"Report inserted: {update_success}")
+            if full_report_path:
+                print(f"Full report persisted: {full_report_path}")
 
         sys.exit(0)
 

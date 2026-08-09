@@ -38,18 +38,20 @@ test('check-unmerged-branches: exports expected functions', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3. getUnmergedBranchNames filters worklog/ branches
+// 3. checkUnmergedBranches filters out worklog/ branches
 // ---------------------------------------------------------------------------
-test('check-unmerged-branches: getUnmergedBranchNames filters out worklog/ branches', async () => {
+test('check-unmerged-branches: checkUnmergedBranches filters out worklog/ branches', async () => {
   const mod = await import(MODULE_PATH);
-  const result = mod.getUnmergedBranchNames();
-  
-  // Ensure no worklog/ branches appear in the result
-  const worklogBranches = result.filter((b) => b.startsWith('worklog/'));
+  const report = mod.checkUnmergedBranches();
+
+  // getUnmergedBranchNames() is a thin wrapper over `git branch --no-merged`
+  // and does NOT filter; the worklog/ filtering lives in checkUnmergedBranches()
+  // via PROTECTED_BRANCHES. Assert the real filter behaviour.
+  const worklogBranches = report.unmergedBranches.filter((e) => e.branch.startsWith('worklog/'));
   assert.equal(
     worklogBranches.length,
     0,
-    `Expected no worklog/ branches in unmerged list, got: ${worklogBranches.join(', ')}`,
+    `Expected no worklog/ branches in unmerged list, got: ${worklogBranches.map((e) => e.branch).join(', ')}`,
   );
 });
 

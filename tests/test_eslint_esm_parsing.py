@@ -111,7 +111,6 @@ class TestEslintParsing:
         "skill/ship/scripts/run-release.js",
         "skill/ship/scripts/ship.js",
         "tests/helpers/git-sim.js",
-        "tests/run-installer-tests.js",
     ]
 
     @pytest.mark.parametrize("rel_path", AFFECTED_FILES)

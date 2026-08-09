@@ -67,6 +67,23 @@ The intake lifecycle script at `./scripts/intake.py` provides the canonical CLI 
 > wrapper so that SKILL.md instructions can invoke lifecycle operations
 > without embedding ad-hoc `wl update --status` commands.
 
+## Worklog resolution
+
+`intake.py` routes every `wl` call through the shared `run_wl` helper
+(`../shared/status_lifecycle.py`), which injects `--worklog-dir` with this
+precedence:
+
+1. **Explicit `--worklog-dir` value** (from a CLI flag / caller)
+2. **Prefix-to-sibling scan** — the work-item id prefix (e.g. `OSL`) is matched
+   against sibling projects' `config.yaml` so a non-SorraAgents item resolves
+   to its own worklog store even when the harness cwd is the framework repo
+3. **cwd chain** — `<cwd>/.worklog`, git root, nearest initialized ancestor
+4. **No flag** — `wl` resolves from cwd (failures surface real error detail)
+
+The script resolves the correct worklog store regardless of the directory it
+is invoked from. See `docs/dev/worklog-sync.md` for the shared resolution
+order and `wl sync` failure modes.
+
 ## Process (must follow)
 
 ### 0. Claim the work item
@@ -115,16 +132,32 @@ The intake lifecycle script at `./scripts/intake.py` provides the canonical CLI 
     ```bash
     wl update <work-item-id> --issue-type <correct-type> --json
     ```
-    - `bug` — problem/fix | `feature` — new capability | `chore` — maintenance | `task` — general work | `epic` — large scope with subtasks
 - If no id was provided:
   - Extract a working title from `<seed-intent>` (one line).
-  - Infer the issue type from context (bug/feature/chore/epic/task).
+  - Infer the issue type from context using the decision guide below.
   - Create:
     ```bash
     wl create --stage idea --status in_progress --title "<title>" --description "<seed-context>" --issue-type <type> --assignee Map --json
     ```
     (Creating a new item is a creation operation, not a status lifecycle transition — the initial status is set at creation time.)
   - Remember the returned id.
+
+**Issue type decision guide** — use these rules to assign the correct `issueType`:
+
+| Type     | Use when… | Do NOT use when… | Examples |
+|----------|-----------|-------------------|----------|
+| `bug`    | Something is currently **incorrect or broken** and needs fixing. The change corrects existing wrong behavior. | The work adds new behavior or capability. | Fixing a crash, correcting a wrong calculation, patching a security vulnerability, handling an edge case that causes incorrect output. |
+| `feature` | The work **adds new capability or functionality** that did not exist before. It introduces net-new behavior. | The work only fixes something that is already broken. | New API endpoint, new UI component, new integration, new command/flag. |
+| `chore`  | The work **does not change code behavior** — it is maintenance or housekeeping. This includes changes to configuration, CI, documentation, dependencies, or formatting. | The work changes how the application behaves. | Dependency updates, CI configuration changes, documentation updates, code formatting, license files, build script tweaks. |
+| `task`   | The work is general-purpose and does not fit cleanly into the other categories. | The work clearly fixes a bug, adds a feature, or is pure maintenance. | Writing tests, refactoring, performance profiling, investigation, benchmarking. |
+| `epic`   | The work is **large in scope** and must be decomposed into multiple subtasks. Typically an epic is itself a feature or bug fix. | The work is small enough to complete in a single iteration. | Large feature spanning multiple services, major refactor across the codebase, migration from one technology to another. |
+
+**Decision procedure** — when uncertain, ask:
+1. *Is something currently broken or incorrect?* → `bug`
+2. *Does this add net-new behavior/capability?* → `feature`
+3. *Does this change NO code behavior (docs, CI, deps, formatting)?* → `chore`
+4. *Is this general-purpose work (tests, refactoring, investigation)?* → `task`
+5. *Is this large enough to need subtasks?* → `epic` (with children)
 
 ### 4. Interview
 
@@ -200,6 +233,13 @@ This transitions `status=open`, `stage=intake_complete`.
 ### 11. Finishing (must do as the final step only)
 
 - `wl sync` to sync changes.
+
+  > **Note:** `wl sync` on a git repo with **no commits yet** fails with an
+  > actionable message (no-commit repos have an unborn HEAD, so git cannot
+  > create the temporary sync worktree). Create an initial commit
+  > (`git commit --allow-empty -m "chore: initial"`) or run
+  > `wl sync --no-push` to keep worklog data local. See
+  > `docs/dev/worklog-sync.md`.
 - `wl show <work-item-id>` (not --json) to display the full work item.
 - Remove temporary files: `.worklog/tmp/intake-draft-<title>-<work-item-id>.md`
 - Output a structured summary:

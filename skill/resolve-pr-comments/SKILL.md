@@ -79,7 +79,7 @@ Present a structured plan:
 Only proceed after user confirms the plan.
 
 1. **Implement fixes**: Edit files for each approved actionable fix; track addressed comment IDs.
-2. **Build, test, commit**: Follow build → test → commit order. Never commit without passing tests.
+2. **Build, test, commit**: Follow build → test → commit order. Never commit without passing tests. Run the full suite via the [test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green) so PR-comment fixes are verified against the whole project, not just a single command:
 
    ```bash
    npm run build && npm --silent test && git add <files> \

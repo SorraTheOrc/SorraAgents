@@ -59,10 +59,27 @@ For agents following this SKILL.md manually (without the orchestration script),
 use the `StatusLifecycle.update_status()` static method or the context manager
 pattern described in `../shared/status_lifecycle.py`.
 
+## Test Anti-Patterns
+
+Before writing tests, review the shared [Test Writing Guidelines
+](../shared/test-writing-guidelines.md) which documents six anti-patterns
+identified during a full audit of the Tableau-Card-Engine test suite (32
+low-value files removed). Never write tests that:
+
+1. Grep source code instead of asserting behaviour (source-code-grep tests).
+2. Contain `expect(true).toBe(true)` or zero assertions (placeholder tests).
+3. Re-implement production logic inside the test (self-referential simulations).
+4. Duplicate an existing core test under a different name (duplicates).
+5. Assert type-level satisfaction the compiler already checks (structural-only tests).
+6. Boot a browser / scene without asserting anything (zero-assertion tests).
+
+Follow the positive guidance in the same document: every test must assert
+observable behaviour via the public API.
+
 ## Best Practices
 
 - Follow the steps in order and do not skip steps.
-- **Write tests before implementation code** (test-driven development). Always create at least one test file before editing implementation code. Tests may fail on first run; write implementation code to make them pass. When external constraints prevent complete tests, create harnesses/mocks and document the limitation as a temporary placeholder.
+- **Testing is required — TDD is preferred, not mandatory.** Ensure code has excellent test coverage with meaningful tests. Write tests first (test-driven development) whenever practical; alternative strategies (e.g., test-after) are permitted when TDD would complicate implementation. When external constraints prevent complete tests, create harnesses/mocks and document the limitation. **Do NOT write placeholder tests** — if the feature is not yet implemented, track the work in a work item instead (see [Test Writing Guidelines](../shared/test-writing-guidelines.md)).
 - Do not use search tools (grep, ripgrep, code search). Rely on work-item context and linked docs. If insufficient context, run intake interview.
 - Keep implementation focused on meeting acceptance criteria with minimal changes.
 - Never edit code outside `src/`, `tests/`, `docs/` unless essential configuration files.
@@ -139,23 +156,43 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
   `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
   This signals to other agents that this item is being worked on.
 
-1. Safety gate: handle dirty working tree
+> **Code Freeze gate:** when using `implement.py start <id>`, the script checks
+> the Code Freeze marker (`.worklog/code-freeze.json`, contract
+> WL-0MSBU4KMA004PKSR) **before** claiming the work item. If a release is in
+> progress the script refuses with "Project is in Code Freeze — implementation
+> blocked until the release completes", exits non-zero, and does **not** change
+> the work item status. There is no `--force` bypass. Fail-open: a missing or
+> corrupt marker never blocks implementation.
+
+2. Safety gate: handle dirty working tree
 
 Check the git context and handle uncommitted changes before proceeding.
 
 - Run `git rev-parse --is-inside-work-tree` to detect if inside a worktree.
 - Run `git status --porcelain=v1 -b` to check for uncommitted changes.
+
+**CRITICAL: Never stash, commit, or revert the user's uncommitted changes
+without explicit permission.** Uncommitted changes in the working tree may be
+user-authored work; stashing them without asking can strand that work and is
+forbidden. When uncommitted changes exist, STOP and ask the operator how to
+proceed (commit, stash, revert, or abort) — act only after the operator
+explicitly chooses an option.
+
 - **Inside a worktree:**
   - If changes are limited to `.worklog/`, carry them forward.
-  - If other changes exist, present choices: carry, commit, stash, revert, or abort.
+  - If other changes exist, stop and ask the operator how to proceed (commit,
+    stash, revert, or abort); never stash/commit/revert unilaterally.
 - **In the main checkout:**
   - If changes are limited to `.worklog/`, carry them forward.
-  - Otherwise, report dirty files (they may be stale), proceed to create a worktree for isolation.
-  - If dirty files prevent worktree creation, follow the carry/commit/stash/revert/abort prompt.
+  - Otherwise, report the dirty files to the operator (they may be stale) and
+    proceed to create a worktree for isolation — without touching the user's
+    uncommitted changes.
+  - If dirty files prevent worktree creation, stop and ask the operator how to
+    proceed, and act only on their explicit choice.
 
 On abort: `StatusLifecycle.update_status(<work-item-id>, "open")`
 
-1. Understand the work item
+3. Understand the work item
 
 If not already assigned (or when using the orchestration script, this is handled
 by `phase_start()`): `StatusLifecycle.update_status(<work-item-id>, "in_progress", stage="in_progress", assignee="<AGENT>")`
@@ -169,7 +206,7 @@ Fetch details: `wl show <work-item-id> --json`. Pay attention to `description`, 
 
 Restate ACs and current status. Surface blockers, dependencies, missing requirements. Inspect linked PRDs, plans, or docs. Confirm expected tests or validation steps.
 
-1.1. Definition gate (must pass before implementation)
+3.1. Definition gate (must pass before implementation)
 
 Verify:
 
@@ -185,7 +222,14 @@ If the gate fails:
 3. If too large → run plan interview (`/skill:plan`) to decompose.
 4. Inform the user and ask if they want to restart implementation review.
 
-5. Create a worktree from dev and branch inside it
+4. Create a worktree from dev and branch inside it
+
+> **MANDATORY — worktree requirement:** All implementation work MUST be done
+> in a git worktree created from `dev`. Never edit, commit, or push directly
+> from the main checkout. `implement.py finish` enforces this: it refuses to
+> complete when it detects changes outside the worktree. When using the
+> orchestration script, `implement.py start` creates the worktree for you —
+> you must `cd` into it and do all work there.
 
 Follow the worktree convention in [[concepts/git-worktree-best-practices-for-agent-workflows]]:
 
@@ -194,13 +238,20 @@ git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-
 cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 ```
 
+> **`node_modules` is auto-symlinked:** when using `implement.py start`, the
+> worktree gets `<worktree>/node_modules -> <repo-root>/node_modules`
+> automatically whenever the main checkout has a `node_modules` and the
+> worktree does not (SA-0MSGS763C006SM1B). This lets dist-spawning tests
+> resolve dependencies without manual `ln -s`. **Do NOT run `npm install` inside a worktree** — writes pass through the symlink into the main
+> checkout's `node_modules`, corrupting the shared dependency tree.
+
 See [AGENTS.md](../../AGENTS.md#implement-the-work-item) for the top-level policy.
 
-1. Implement
+5. Implement
 
 - If the work item has open/in_progress blockers or dependencies, implement them first (recursively via this procedure).
 
-4.1. Parent-advancement check (epic/parent items only)
+5.1. Parent-advancement check (epic/parent items only)
 
 After all recursive child implementations are complete, check whether this work item has children:
 
@@ -216,13 +267,13 @@ After all recursive child implementations are complete, check whether this work 
 - Check for a recent audit record; if none, run `/skill:audit <work-item-id>` to establish work needed.
 - Write tests and code to meet acceptance criteria:
   - Make minimal, focused changes.
-  - **Write tests first** (TDD): create at least one test file before editing implementation code. Tests may fail initially; implement code to make them pass. If external constraints prevent complete tests, use harnesses/mocks and document the limitation.
+  - **Test adequately — TDD preferred.** Writing tests first (TDD) is the preferred approach, but alternative strategies (e.g., test-after) are acceptable when they better suit the implementation. Ensure excellent test coverage with meaningful tests; if external constraints prevent complete tests, use harnesses/mocks and document the limitation.
   - Follow project style and conventions.
   - Comment on significant design decisions.
   - If additional work is discovered, create linked work items: `wl create "<title>" --deps discovered-from:<work-item-id> --json`
 - Once all ACs are met:
   - **Build** the project and verify no errors.
-  - **Run the full test suite**. Report results. Fix any failures.
+  - **Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`)** — run → triage → evaluate → loop until green. Report results. Fix any failures.
   - If failing tests are outside this work item's scope, invoke the triage helper:
     `python3 ../triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`
     - If a new or incomplete critical issue is returned, implement it, fix the test, and re-run until all pass.
@@ -230,7 +281,7 @@ After all recursive child implementations are complete, check whether this work 
   - Summarize changes in the work item.
   - Wait for user confirmation before proceeding.
 
-1. Error/exception handling (abort on unexpected errors)
+### Error/exception handling (abort on unexpected errors)
 
 On unexpected error (API failure, network error, exception):
 
@@ -241,7 +292,7 @@ On unexpected error (API failure, network error, exception):
 
 ### User-initiated abort
 
-If the operator cancels after Step 0:
+If the operator cancels after Step 2:
 
 1. `StatusLifecycle.update_status(<work-item-id>, "open")`
 2. Return control to the operator.
@@ -249,7 +300,7 @@ If the operator cancels after Step 0:
 
 ---
 
-1. Optional refactor step
+7. Optional refactor step
 
 After implementation completes and before final commit, an automated refactor step may detect and remediate code smells:
 
@@ -266,18 +317,19 @@ After implementation completes and before final commit, an automated refactor st
 
 - See ``../refactor/SKILL.md`` for full documentation.
 
-1. Automated self-review
+6. Automated self-review
 
 - Build and lint the code; fix any issues.
-- Run all tests again using quiet test commands; fix any failures.
-- Audit the work item: `/skill:audit <work-item-id>`. If ACs are unmet, inform the user and return to step 3.
+- Run all tests again using the [test skill](../test/SKILL.md) (`/skill:test`) quiet-run discipline; fix any failures.
+- Audit the work item: `/skill:audit <work-item-id>`. If ACs are unmet, inform the user and return to step 5.
 - Perform sequential self-review passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff.
 - For each pass, make small, goal-aligned edits. If intent changes are discovered, create an Open Question and stop.
-- Run the full test suite; fix any failures before continuing.
+- Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`); fix any failures before continuing.
 
-1. Commit, Push to dev and mark in_review
+8. Commit, Push to dev and mark in_review
 
 - Follow the mandatory build → test → commit order before committing.
+- **Do NOT create a Pull Request to `main`.** Work is integrated into `dev`; the `dev`→`main` promotion is handled separately by the release process.
 - Push the feature branch into `dev` using:
   - Ship skill (preferred): `pushToDev()` from `../ship/scripts/ship.js`
   - Direct: `git push origin HEAD:refs/heads/dev`
@@ -300,7 +352,7 @@ After implementation completes and before final commit, an automated refactor st
   `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>." --author "<AGENT>" --json`
 - Close your response with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
 
-  > **Parent/epic items already advanced at Step 4.1:** if this item has children and parent advancement was already performed, skip the status update.
+  > **Parent/epic items already advanced at Step 5.1:** if this item has children and parent advancement was already performed, skip the status update.
   > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`
 
   > The work-item stays `in_review` until the release process promotes `dev` to `main`. See `../ship/SKILL.md` for push-to-dev workflow and `../ship/scripts/run-release.js` for release.
@@ -337,7 +389,7 @@ workflow phase. All transitions are managed via `StatusLifecycle` — ad-hoc
 |-------|-----------|--------|-------|
 | Start (Step 0 - Set status) | `StatusLifecycle.update_status(id, "in_progress")` or `phase_start()` | in_progress | (unchanged) |
 | Claim (Step 1) | `StatusLifecycle.update_status(id, "in_progress", stage="in_progress", assignee="<AGENT>")` | in_progress | in_progress |
-| Epic / parent: all children done (Step 4.1) | `StatusLifecycle.update_status(id, "completed", stage="in_review")` | completed | in_review |
+| Epic / parent: all children done (Step 5.1) | `StatusLifecycle.update_status(id, "completed", stage="in_review")` | completed | in_review |
 | Final (Step 6 - Mark in_review) | `with StatusLifecycle(id, target_stage="in_review"):` or `phase_start()`+`phase_finish()` | completed | in_review |
 | Abort - dirty work tree | `StatusLifecycle.update_status(id, "open")` via `phase_abort()` | open | (unchanged) |
 | Abort - definition gate failure | `StatusLifecycle.update_status(id, "open")` | open | (unchanged) |

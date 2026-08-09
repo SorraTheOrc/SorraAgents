@@ -3,8 +3,8 @@
 
 Provides functions for extracting user-facing text from the JSON-stream
 output produced by ``pi -p --mode json``. This matches the pattern used
-in ``skill/audit/scripts/audit_runner.py``, ``skill/intakeall/scripts/intakeall.py``,
-and other skills that invoke Pi non-interactively.
+in ``skill/audit/scripts/audit_runner.py`` and other skills that invoke Pi
+non-interactively.
 
 Usage:
     from skill.scripts.pi_utils import extract_pi_text

@@ -124,7 +124,7 @@ def _import_find_related():
 def test_script_uses_status_lifecycle():
     """The script must import and use StatusLifecycle as a context manager."""
     content = SCRIPT_PATH.read_text()
-    assert "from skill.shared.status_lifecycle import StatusLifecycle" in content, \
+    assert "from skill.shared.status_lifecycle import" in content, \
         "Script must import StatusLifecycle from the shared module"
     assert "with StatusLifecycle" in content, \
         "Script must use StatusLifecycle as a context manager"
@@ -448,7 +448,7 @@ def test_search_and_dedup_aggregates_results(monkeypatch):
 
     search_calls = []
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         search_calls.append((keyword, use_semantic))
         if "script" in keyword:
             return [{"id": "REL-001", "title": "Script related"}]
@@ -472,7 +472,7 @@ def test_search_and_dedup_removes_duplicates(monkeypatch):
     """Duplicate work items from different keywords should be removed."""
     mod = _import_find_related()
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         # Both keywords return the same item (duplicate)
         return [{"id": "REL-001", "title": "Same item"}]
 
@@ -495,7 +495,7 @@ def test_search_and_dedup_handles_search_failures(monkeypatch):
     """Search failures for individual keywords should not break the pipeline."""
     mod = _import_find_related()
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         if keyword == "broken":
             return []  # Simulating a failed/empty search
         return [{"id": "REL-001", "title": "Working item"}]
@@ -534,7 +534,7 @@ def test_search_and_dedup_limits_to_top_3_by_score(monkeypatch):
         {"id": "REL-005", "title": "Fifth item", "score": -2.0},
     ]
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         return items_with_scores
 
     monkeypatch.setattr(mod, "run_wl_search", mock_search)
@@ -561,7 +561,7 @@ def test_search_and_dedup_all_items_when_under_limit(monkeypatch):
         {"id": "REL-001", "title": "Only item", "score": -0.5},
     ]
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         return items
 
     monkeypatch.setattr(mod, "run_wl_search", mock_search)
@@ -581,7 +581,7 @@ def test_search_and_dedup_items_without_score_go_last(monkeypatch):
         {"id": "REL-003", "title": "Scored high", "score": -0.1},
     ]
 
-    def mock_search(keyword, use_semantic=False):
+    def mock_search(keyword, use_semantic=False, worklog_flags=None):
         return items
 
     monkeypatch.setattr(mod, "run_wl_search", mock_search)
@@ -705,6 +705,123 @@ def test_format_report_empty_shows_no_results():
     report = mod.format_report("TEST-123", [], [])
     assert mod.REPORT_HEADING in report
     assert "No related work items found" in report or "No related" in report
+
+
+# ---------------------------------------------------------------------------
+# P11: related-work report compaction (SA-0MSF4AFX9007INSP)
+# ---------------------------------------------------------------------------
+
+
+def test_format_report_caps_keyword_lists():
+    """P11: format_report caps raw keyword word-lists to MAX_KEYWORDS_PER_FILE.
+
+    Raw keyword word-lists are the dominant source of report bloat (measured
+    ~58% of the related-work section). Even when a file matches 20 keywords,
+    only MAX_KEYWORDS_PER_FILE may be rendered in the description report.
+    """
+    mod = _import_find_related()
+    repo_matches = [
+        {"file": "skill/audit/scripts/audit_runner.py",
+         "matches": [f"kw{i}" for i in range(20)]},
+    ]
+    report = mod.format_report("TEST-123", [], repo_matches)
+    line = next(l for l in report.splitlines() if "audit_runner.py" in l)
+    # Keywords beyond the cap must not appear in the rendered line
+    for i in range(mod.MAX_KEYWORDS_PER_FILE, 20):
+        assert f"kw{i}" not in line, f"Keyword kw{i} should be truncated"
+    # First keywords still present
+    assert "kw0" in line
+    # Truncation marker present so readers know data was omitted
+    assert "more" in line
+
+
+def test_format_report_truncation_marker_counts_omitted():
+    """P11: the (+N more) marker reflects exactly how many keywords were cut."""
+    mod = _import_find_related()
+    repo_matches = [{"file": "f.py", "matches": [f"k{i}" for i in range(8)]}]
+    report = mod.format_report("TEST-123", [], repo_matches)
+    assert f"(+{8 - mod.MAX_KEYWORDS_PER_FILE} more)" in report
+
+
+def test_format_report_no_marker_when_under_cap():
+    """P11: keyword lists at or under the cap render fully with no marker."""
+    mod = _import_find_related()
+    repo_matches = [{"file": "f.py", "matches": [f"k{i}" for i in range(3)]}]
+    report = mod.format_report("TEST-123", [], repo_matches)
+    assert "k0" in report and "k1" in report and "k2" in report
+    assert "more" not in report
+
+
+def test_format_report_full_keyword_list_when_unlimited():
+    """P11: max_keywords_per_file=None renders the full untruncated word list.
+
+    Used when persisting the full related-work report (sidecar), so no
+    related-work data is ever lost (AC2).
+    """
+    mod = _import_find_related()
+    repo_matches = [{"file": "f.py", "matches": [f"kw{i}" for i in range(12)]}]
+    report = mod.format_report("TEST-123", [], repo_matches,
+                               max_keywords_per_file=None)
+    for i in range(12):
+        assert f"kw{i}" in report
+    assert "more)" not in report
+
+
+def test_format_report_related_section_length_bound():
+    """AC1: the related-work section stays bounded with pathological word-lists.
+
+    Before P11, 3 files × 60 keywords rendered ~180 keywords (~3.6 KB). With
+    the per-file keyword cap the section must remain compact regardless of
+    upstream match-list size.
+    """
+    mod = _import_find_related()
+    repo_matches = [
+        {"file": f"src/file_{i}.py", "matches": [f"kw{j}" for j in range(60)]}
+        for i in range(3)
+    ]
+    items = [
+        {"id": f"REL-{i:03d}", "title": f"Item {i}", "status": "open"}
+        for i in range(3)
+    ]
+    report = mod.format_report("TEST-123", items, repo_matches)
+    assert len(report) <= 1200, (
+        f"Related-work section too large: {len(report)} chars"
+    )
+
+
+def test_write_full_report_persists_all_keywords(tmp_path):
+    """AC2: the full (untruncated) report is persisted to a sidecar file.
+
+    The description carries only the compact summary; the sidecar preserves
+    every keyword so the full related-work data remains available.
+    """
+    mod = _import_find_related()
+    items = [{"id": "REL-001", "title": "Item", "status": "open"}]
+    repo_matches = [{"file": "f.py", "matches": [f"kw{i}" for i in range(12)]}]
+    path = mod.write_full_report("TEST-123", items, repo_matches,
+                                 repo_root=tmp_path)
+    assert path is not None
+    assert path.exists()
+    content = path.read_text(encoding="utf-8")
+    assert mod.REPORT_HEADING in content
+    assert "REL-001" in content
+    for i in range(12):
+        assert f"kw{i}" in content  # every keyword preserved
+    # The sidecar lives under .worklog/tmp and is named after the work item
+    assert path.parent.name == "tmp"
+    assert "TEST-123" in path.name
+
+
+def test_write_full_report_returns_none_on_failure(tmp_path, monkeypatch):
+    """AC2: sidecar persistence is best-effort and never raises."""
+    mod = _import_find_related()
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "mkdir", _boom)
+    path = mod.write_full_report("TEST-123", [], [], repo_root=tmp_path)
+    assert path is None
 
 
 # ---------------------------------------------------------------------------

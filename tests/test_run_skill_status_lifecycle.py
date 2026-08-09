@@ -216,8 +216,10 @@ class TestRunSkillStatusBehavior:
         ]
         assert wl_calls, "expected at least one wl command"
 
-        # The only wl update is the restore to the original status (open)
-        updates = [c for c in wl_calls if c[1] == "update"]
+        # The only wl update is the restore to the original status (open).
+        # (Commands may carry a leading --worklog-dir when run from inside a
+        # git worktree, so match the "update" token position-independently.)
+        updates = [c for c in wl_calls if "update" in c]
         assert len(updates) == 1, f"expected exactly one wl update, got {updates}"
         assert "--status" in updates[0]
         assert updates[0][updates[0].index("--status") + 1] == "open"
@@ -270,7 +272,7 @@ class TestRunSkillStatusBehavior:
             for c in m.call_args_list
             if c.args and c.args[0] and c.args[0][0] == "wl"
         ]
-        updates = [c for c in wl_calls if c[1] == "update"]
+        updates = [c for c in wl_calls if "update" in c]
         assert updates, "expected a restore update even on failure"
         assert updates[0][updates[0].index("--status") + 1] == "plan_complete_open"
         assert "completed" not in [tok for c in wl_calls for tok in c]

@@ -1,12 +1,10 @@
-"""Tests that implement and implement-single skills enforce TDD (tests-first).
+"""Tests that the implement skill enforces TDD (tests-first).
 
 These tests verify that:
 - skill/implement/SKILL.md requires creating at least one test file before
-  implementation code (Step 4).
+  implementation code (Step 5).
 - skill/implement/SKILL.md includes guidance on harnesses/mocks/placeholders
   when external constraints prevent writing complete tests.
-- skill/implement-single/SKILL.md also includes the expanded tests-first
-  details with placeholder documentation requirements.
 
 Related work item: SA-0MQC4A11A008BSRI
 """
@@ -22,7 +20,6 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMPLEMENT_MD = _REPO_ROOT / "skill" / "implement" / "SKILL.md"
-_IMPLEMENT_SINGLE_MD = _REPO_ROOT / "skill" / "implement-single" / "SKILL.md"
 
 
 # ---------------------------------------------------------------------------
@@ -35,15 +32,6 @@ def implement_content() -> str:
     """Load implement SKILL.md content once per module."""
     assert _IMPLEMENT_MD.exists(), f"implement SKILL.md not found at {_IMPLEMENT_MD}"
     return _IMPLEMENT_MD.read_text(encoding="utf-8")
-
-
-@pytest.fixture(scope="module")
-def implement_single_content() -> str:
-    """Load implement-single SKILL.md content once per module."""
-    assert _IMPLEMENT_SINGLE_MD.exists(), (
-        f"implement-single SKILL.md not found at {_IMPLEMENT_SINGLE_MD}"
-    )
-    return _IMPLEMENT_SINGLE_MD.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +92,12 @@ def _find_section(content: str, heading: str) -> str | None:
 
 
 class TestImplementSkillTDD:
-    """Verify implement SKILL.md enforces tests-first in Step 4."""
+    """Verify implement SKILL.md enforces tests-first in Step 5."""
 
     def test_implement_step_4_requires_tests_first(self, implement_content: str) -> None:
-        """Step 4 must include explicit instruction to write tests first
+        """Step 5 must include explicit instruction to write tests first
         before implementation code."""
-        step4 = _find_step(implement_content, "1. Implement")
+        step4 = _find_step(implement_content, "5. Implement")
         assert step4 is not None, "Could not find 'Implement' step"
 
         # Must contain "write tests first" or equivalent
@@ -123,7 +111,7 @@ class TestImplementSkillTDD:
             re.search(pat, step4, re.IGNORECASE)
             for pat in tests_first_patterns
         ), (
-            "Step 4 must include explicit instruction to write tests before "
+            "Step 5 must include explicit instruction to write tests before "
             "implementation code. Expected language like 'Write tests first' "
             "or 'Create at least one test file before adding or editing "
             "implementation code'."
@@ -132,9 +120,9 @@ class TestImplementSkillTDD:
 
 
     def test_implement_step_4_harness_mock_guidance(self, implement_content: str) -> None:
-        """Step 4 must include guidance for creating harnesses or mocks
+        """Step 5 must include guidance for creating harnesses or mocks
         when external constraints prevent writing complete tests."""
-        step4 = _find_step(implement_content, "1. Implement")
+        step4 = _find_step(implement_content, "5. Implement")
         assert step4 is not None, "Could not find 'Implement' step"
 
         harness_patterns = [
@@ -148,7 +136,7 @@ class TestImplementSkillTDD:
             re.search(pat, step4, re.IGNORECASE)
             for pat in harness_patterns
         ), (
-            "Step 4 must include guidance for using harnesses, mocks, or "
+            "Step 5 must include guidance for using harnesses, mocks, or "
             "placeholders when external constraints prevent writing complete tests."
         )
 
@@ -172,55 +160,3 @@ class TestImplementSkillTDD:
             "Best Practices section must include a guideline about writing "
             "tests first or test-driven development."
         )
-
-
-
-
-# ===================================================================
-# Tests for skill/implement-single/SKILL.md
-# ===================================================================
-
-
-class TestImplementSingleTDD:
-    """Verify implement-single SKILL.md has expanded tests-first details."""
-
-    def test_implement_single_step_3_tests_first(self, implement_single_content: str) -> None:
-        """Step 3 must have explicit 'write tests first' instruction."""
-        step3 = _find_step(implement_single_content, "### Step 3")
-        assert step3 is not None, "Could not find 'Step 3' in implement-single"
-
-        tests_first_patterns = [
-            r"write tests?\s+first",
-            r"test.{1,5}driven development",
-            r"tests?\s+first",
-        ]
-        assert any(
-            re.search(pat, step3, re.IGNORECASE)
-            for pat in tests_first_patterns
-        ), (
-            "Step 3 must include explicit 'write tests first' instruction."
-        )
-
-    def test_implement_single_step_3_harness_guidance(self, implement_single_content: str) -> None:
-        """Step 3 must include guidance for using harnesses or mocks when
-        external infra blocks writing real tests."""
-        step3 = _find_step(implement_single_content, "### Step 3")
-        assert step3 is not None, "Could not find 'Step 3' in implement-single"
-
-        harness_patterns = [
-            r"harness(es)?",
-            r"mock(s)?",
-            r"placeholder",
-            r"external\s+(constraint|service|infra|dependenc)",
-            r"stub(s)?",
-            r"fixture(s)?",
-        ]
-        assert any(
-            re.search(pat, step3, re.IGNORECASE)
-            for pat in harness_patterns
-        ), (
-            "Step 3 must include guidance for using harnesses, mocks, or "
-            "placeholders when external constraints prevent writing complete tests."
-        )
-
-
