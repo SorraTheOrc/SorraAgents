@@ -53,7 +53,8 @@ class TestCleanupAuditGate:
         """Step 0 must invoke the existing audit skill, not new logic."""
         section = _step0_section()
         assert "/skill:audit" in section or "audit_runner.py issue" in section
-        assert "skill/audit/SKILL.md" in section
+        # Standardized relative path (see dcd591f4 worktree compatibility)
+        assert "../audit/SKILL.md" in section
 
     def test_decision_rule_met_proceeds(self):
         """All-met verdict must proceed to Step 1."""
