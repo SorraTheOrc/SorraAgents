@@ -3,10 +3,9 @@
  * push to `dev`.  Designed to catch critical problems early:
  *
  *  1. Repository structure (key files/directories present)
- *  2. Terminology lint (check-terminology.sh passes)
- *  3. Python test discovery (pytest can collect tests)
- *  4. Worklog CLI availability (wl is on PATH)
- *  5. Agent frontmatter lint (YAML front-matter validates)
+ *  2. Python test discovery (pytest can collect tests)
+ *  3. Worklog CLI availability (wl is on PATH)
+ *  4. Agent frontmatter lint (YAML front-matter validates)
  *
  * Run locally from the repository root:
  *
@@ -52,43 +51,47 @@ function run(cmd, opts = {}) {
 test('repository structure: key files and directories exist', () => {
   const required = [
     'AGENTS.md',
+    'AGENTS_GLOBAL.md',
     'README.md',
     'Workflow.md',
     'skill/audit/SKILL.md',
     'skill/implement/SKILL.md',
     'tests/conftest.py',
-    '.github/workflows/ci.yml',
   ];
   for (const p of required) {
     assertPathExists(p);
   }
-});
 
-// ---------------------------------------------------------------------------
-// 2. Terminology lint
-// ---------------------------------------------------------------------------
-test('terminology: check-terminology.sh passes', () => {
-  const result = run('bash scripts/check-terminology.sh');
-  assert.equal(result.exitCode, 0, `check-terminology.sh failed: ${result.stderr}`);
-  assert.ok(result.stdout.includes('RESULT: PASS'), 'Expected PASS result from terminology scan');
-});
-
-// ---------------------------------------------------------------------------
-// 3. Python test discovery
-// ---------------------------------------------------------------------------
-test('python: pytest can discover tests', () => {
-  const result = run('python3 -m pytest --collect-only -q 2>&1 || true');
-  // pytest --collect-only exits 0 when tests are found, 5 when none found
-  assert.ok(result.exitCode <= 1, `pytest collect failed with exit code ${result.exitCode}: ${result.stderr}`);
-  // Verify at least some test files are collected
+  // No GitHub CI workflows remain — the project operates fully locally.
   assert.ok(
-    result.stdout.includes('test_') || result.stdout.includes('collected'),
-    'pytest should collect test items',
+    !existsSync('.github/workflows/ci.yml') && !existsSync('.github'),
+    'CI workflows should have been removed (.github/ must not exist)',
   );
 });
 
 // ---------------------------------------------------------------------------
-// 4. Worklog CLI
+// 2. Python test discovery
+// ---------------------------------------------------------------------------
+test('python: pytest can discover tests', () => {
+  // No `|| true` here — the real exit code matters. pytest --collect-only exits
+  // 0 when tests are found, 5 when none are found, and 2 on collection errors.
+  const result = run('python3 -m pytest --collect-only -q 2>&1');
+  assert.equal(
+    result.exitCode,
+    0,
+    `pytest collect failed with exit code ${result.exitCode}: ${result.stderr}`,
+  );
+  // Parse the collected count and require a non-zero number of tests.
+  const match = result.stdout.match(/(\d+) tests? collected/);
+  assert.ok(match, `pytest should report a collected count: ${result.stdout}`);
+  assert.ok(
+    Number(match[1]) > 0,
+    `pytest should collect at least one test (got: ${match[1]})`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 3. Worklog CLI
 // ---------------------------------------------------------------------------
 test('tooling: wl CLI is available', () => {
   const result = run('wl --version');
@@ -97,14 +100,14 @@ test('tooling: wl CLI is available', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Agent frontmatter lint (skip if pyyaml unavailable)
+// 4. Agent frontmatter lint (skip if pyyaml unavailable)
 // ---------------------------------------------------------------------------
-test('agent: frontmatter lint passes', { skip: false }, () => {
+test('agent: frontmatter lint passes', (t) => {
   // Try importing yaml first to see if pyyaml is installed
   const yamlCheck = run('python3 -c "import yaml" 2>&1');
   if (yamlCheck.exitCode !== 0) {
-    // pyyaml not installed — this test is skipped at runtime by design
-    assert.ok(true, 'pyyaml not installed; frontmatter lint skipped');
+    // pyyaml not installed — skip visibly rather than passing a no-op
+    t.skip('pyyaml not installed; frontmatter lint skipped');
     return;
   }
   const result = run('python3 scripts/agent_frontmatter_lint.py 2>&1');

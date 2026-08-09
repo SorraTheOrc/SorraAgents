@@ -19,7 +19,7 @@ modified during the current session and takes appropriate action:
 - **Prevents technical debt accumulation** by detecting issues early.
 - **Separates concerns**: new issues are fixed; pre-existing issues are tracked
   for later resolution.
-- **Integrates seamlessly** with the implement and implement-single workflows.
+- **Integrates seamlessly** with the implement workflow.
 - **Configurable** via flags and config file.
 
 ## How It Works
@@ -94,7 +94,7 @@ reported again in future refactor runs.
 
 ### Via Implement Skills
 
-When using the implement or implement-single skill, the refactor step runs
+When using the implement skill, the refactor step runs
 automatically after implementation:
 
 ```bash
@@ -144,7 +144,7 @@ python3 skill/refactor/scripts/refactor.py --verbose
 ### Skipping the Refactor Step
 
 The simplest way to disable the refactor step is passing the `--no-refactor`
-flag to the implement or implement-single skill:
+flag to the implement skill:
 
 ```bash
 implement SA-0MPFD4SPC000MXWH --no-refactor
@@ -315,6 +315,5 @@ python3 skill/refactor/scripts/refactor.py --config .my-refactor.json
 ## Related Documentation
 
 - [Implement Skill](../skill/implement/SKILL.md)
-- [Implement-Single Skill](../skill/implement-single/SKILL.md)
 - [Refactor Skill](../skill/refactor/SKILL.md)
 - [Code Review Skill](../skill/code-review/SKILL.md)

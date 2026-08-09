@@ -142,7 +142,7 @@ The file `command/intake.md` has been migrated to `skill/intake/SKILL.md` as par
 
 **Overlap Assessment: LOW (~20% content overlap)**
 
-| Section | ~~command/intake.md~~ | skill/intakeall/SKILL.md | Verdict |
+| Section | ~~command/intake.md~~ | ~~skill/intakeall/SKILL.md~~ | Verdict |
 |---------|---------------------|-------------------------|---------|
 | Description | — | — | N/A (command removed) |
 | Inputs | — | — | N/A (command removed) |
@@ -152,7 +152,7 @@ The file `command/intake.md` has been migrated to `skill/intake/SKILL.md` as par
 **Key differences:**
 
 - ~~command/intake.md~~ (now `skill/intake/SKILL.md`) is the live interview process for gathering requirements and writing work items
-- skill/intakeall/SKILL.md is an orchestrator that runs intake across multiple items, with batch-processing concerns
+- ~~skill/intakeall/SKILL.md~~ is an orchestrator that runs intake across multiple items, with batch-processing concerns (skill removed in commit `1b56b64`)
 
 **Recommendation:** These files were genuinely different. Low deduplication opportunity.
 
@@ -217,10 +217,10 @@ The file `command/intake.md` has been migrated to `skill/intake/SKILL.md` as par
 
 | Source File | Target | Line | Type |
 |-------------|--------|------|------|
-| `skill/planall/SKILL.md` | `command/plan.md` | 140 | Reference (invokes plan for each item) |
+| ~~`skill/planall/SKILL.md`~~ | `command/plan.md` | 140 | Reference (invokes plan for each item) — skill removed in commit `1b56b64` |
 | `skill/implement/SKILL.md` | ~~`command/intake.md`~~ → `skill/intake/SKILL.md` | 176 | Reference (intake interview) — updated in SA-0MS3CIU0F00066CD |
 | `skill/implement/SKILL.md` | `command/plan.md` | 177 | Reference (plan interview) |
-| `skill/intakeall/SKILL.md` | ~~`command/intake.md`~~ → `skill/intake/SKILL.md` | 178 | Reference (invokes intake for each item) — updated in SA-0MS3CIU0F00066CD |
+| ~~`skill/intakeall/SKILL.md`~~ | ~~`command/intake.md`~~ → `skill/intake/SKILL.md` | 178 | Reference (invokes intake for each item) — skill removed in commit `1b56b64` |
 
 ### 3.3 Cross-Reference Map Summary
 
@@ -229,10 +229,10 @@ command/plan.md ──────► skill/plan/SKILL.md
                     ──► skill/plan/plan_helpers.py
                     ──► command/plan_helpers.py
                         ▲
-skill/planall/SKILL.md ─┘
+~~skill/planall/SKILL.md~~ ─┘
 
 ~~command/intake.md~~ ────► skill/ship/scripts/... (transitive reference) — removed in SA-0MS3CIU0F00066CD
-skill/intakeall/SKILL.md ──► ~~command/intake.md~~ → skill/intake/SKILL.md (updated)
+~~skill/intakeall/SKILL.md~~ ──► ~~command/intake.md~~ → skill/intake/SKILL.md (removed in `1b56b64`)
 skill/implement/SKILL.md ──► ~~command/intake.md~~ → skill/intake/SKILL.md (updated)
                         ──► command/plan.md
 

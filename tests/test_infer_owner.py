@@ -28,7 +28,7 @@ def test_owner_map_no_match(tmp_path):
     """Override map returns None when no pattern matches."""
     triage_dir = tmp_path / ".worklog" / "triage"
     triage_dir.mkdir(parents=True)
-    (triage_dir / "owner-map.yaml").write_text("ampa/*: ampa-team\n")
+    (triage_dir / "owner-map.yaml").write_text("team-a/*: team-a\n")
     result = io.check_owner_map(str(tmp_path), "tests/test_foo.py")
     assert result is None
 

@@ -42,6 +42,13 @@ Discover related work for a work item via Worklog search, file inspection, and o
 |----------|---------|-------------|
 | `MAX_WORK_ITEM_RESULTS` | 3 | Maximum related work items shown. Soft limit — may be replaced by minimum-relevance thresholds when semantic/embedding-based scoring is available. |
 | `MAX_REPO_FILE_RESULTS` | 3 | Maximum repo file matches shown. Same soft-limit semantics. |
+| `MAX_KEYWORDS_PER_FILE` | 5 | Maximum matched keywords listed per repo file match. Raw keyword word-lists are the dominant source of report bloat (measured ~58% of the related-work section), so lists are capped with a `(+N more)` marker to keep descriptions/prompts compact. |
+
+### Prompt-size management (P11)
+
+The related-work section is deliberately **compact**: keyword word-lists per repo file are capped at `MAX_KEYWORDS_PER_FILE` (default 5) with a `(+N more)` marker, so descriptions stay small and any prompt that carries the description stays within token limits.
+
+The **full** (untruncated) report — with every matched keyword — is persisted to `.worklog/tmp/find-related-full-<id>.md` on every run, so no related-work data is lost even though the description carries only the summary. The sidecar path is returned in JSON output as `fullReportPath`.
 
 ## Inputs / Outputs
 
@@ -65,6 +72,25 @@ manager from `../shared/status_lifecycle.py`:
 
 > **Note:** The script probes semantic search availability and auto-detects the correct `wl search` response format. No manual configuration needed.
 
+## Worklog resolution
+
+`find_related.py` pins the target worklog store from the work-item id and
+injects the resolved `--worklog-dir` into **every** `wl` subprocess call
+(show, update, search, and the `--semantic` probe) via the shared resolution
+in `../shared/status_lifecycle.py`:
+
+1. **Explicit `--worklog-dir` value** (from a CLI flag / caller)
+2. **Prefix-to-sibling scan** — the work-item id prefix (e.g. `OSL`) is matched
+   against sibling projects' `config.yaml` so a non-SorraAgents item resolves
+   to its own worklog store even when the harness cwd is the framework repo
+3. **cwd chain** — `<cwd>/.worklog`, git root, nearest initialized ancestor
+4. **No flag** — `wl` resolves from cwd (failures surface real error detail)
+
+Search and the semantic probe carry no work-item id of their own, so their
+store is pinned from the id of the item being analyzed (`_wl_flags_for`). The
+script resolves the correct worklog store regardless of the directory it is
+invoked from. See `docs/dev/worklog-sync.md` for the shared resolution order.
+
 ## Script
 
 `./scripts/find_related.py` (Python 3.8+, `wl` CLI required)
@@ -82,7 +108,7 @@ python3 ./scripts/find_related.py --work-item-id <id> [--json] [--verbose] [--re
 | `--work-item-id` | Yes | — | Work item to search |
 | `--verbose` | No | false | Debug output to stderr |
 | `--json` | No | false | JSON output |
-| `--repo-path` | No | auto | Repository root |
+| `--repo-path` | No | auto | Repository root. Defaults to the analyzed work item's own project (parent of its resolved `.worklog` store, prefix-to-sibling scan); falls back to the framework repo when no store resolves. An explicit path always overrides the default. |
 
 ### Output (default)
 
@@ -93,8 +119,10 @@ Work item: <id> | Related: 3 | Repo matches: 2 | Added IDs: REL-001, REL-002
 ### Output (JSON)
 
 ```json
-{"workItemId": "<id>", "found": true, "addedIds": [...], "reportInserted": true, "keywords": [...], "relatedItemCount": 3, "repoMatchCount": 2}
+{"workItemId": "<id>", "found": true, "addedIds": [...], "reportInserted": true, "keywords": [...], "relatedItemCount": 3, "repoMatchCount": 2, "fullReportPath": ".worklog/tmp/find-related-full-<id>.md"}
 ```
+
+`fullReportPath` points at the persisted full (untruncated) report; it is `null` if sidecar persistence failed (best-effort).
 
 ### Exit codes
 
@@ -105,7 +133,9 @@ Work item: <id> | Related: 3 | Repo matches: 2 | Added IDs: REL-001, REL-002
 
 ### Idempotency
 
-Safe to re-run: existing automated report is replaced, not duplicated. Manual "Related work" sections preserved.
+Safe to re-run: ALL prior automated report sections are removed before the
+new one is inserted (duplicates from earlier runs never accumulate). Manual
+"Related work" sections (without the automated marker) are preserved.
 
 ### Design
 

@@ -70,7 +70,7 @@ fi
 
 PROMPTS_SRC="$SRC_DIR/command"
 SKILLS_SRC="$SRC_DIR/skill"
-AGENTS_SRC="$SRC_DIR/AGENTS.md"
+AGENTS_SRC="$SRC_DIR/AGENTS_GLOBAL.md"
 
 # Validate source subdirs exist. If missing, prompt for a different root dir until both are found.
 while true; do

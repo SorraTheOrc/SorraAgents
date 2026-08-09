@@ -234,7 +234,7 @@ def record_audit_result(wl_id: str, ready_to_close: bool, summary: str, raw_outp
             '--ready-to-close', ready,
             '--summary', summary,
             '--raw-output', raw_output,
-            '--author', 'ampa-audit'
+            '--author', 'audit-bot'
         ])
         return True
     except Exception:  # noqa: BLE001
@@ -242,8 +242,8 @@ def record_audit_result(wl_id: str, ready_to_close: bool, summary: str, raw_outp
 
 
 def append_audit_comment(wl_id: str, audit_text: str, dry_run: bool = True) -> bool:
-    """Append a human-readable AMPA audit comment to the work item."""
-    comment = f"# AMPA Audit Result\n\n{audit_text}"
+    """Append a human-readable audit comment to the work item."""
+    comment = f"# Audit Result\n\n{audit_text}"
     if dry_run:
         outpath = os.path.abspath(os.path.join('.pi', 'tmp', f'audit-comment-{wl_id}.md'))
         os.makedirs(os.path.dirname(outpath), exist_ok=True)
@@ -251,7 +251,7 @@ def append_audit_comment(wl_id: str, audit_text: str, dry_run: bool = True) -> b
             f.write(comment)
         return True
     try:
-        subprocess.check_call(['wl', 'comment', 'add', wl_id, '--comment', comment, '--author', 'ampa-audit'])
+        subprocess.check_call(['wl', 'comment', 'add', wl_id, '--comment', comment, '--author', 'audit-bot'])
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -439,7 +439,7 @@ def main(argv=None):
                     raw_content = fh.read()
                 structured_content = extract_structured_audit_text(raw_content)
                 ready = extract_ready_to_close(structured_content)
-                summary = "AMPA Audit: See comment for details"  # Simplified summary for audit-set
+                summary = "Audit: See comment for details"  # Simplified summary for audit-set
                 recorded = record_audit_result(wl, ready, summary, structured_content, dry_run=args.dry_run)
                 commented = append_audit_comment(wl, structured_content, dry_run=args.dry_run)
                 print(f"Recorded audit to WL: {recorded}, comment appended: {commented}")

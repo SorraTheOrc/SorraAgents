@@ -137,7 +137,7 @@ def test_append_audit_comment_dry_run():
     assert ok is True
     fpath = os.path.join('.pi', 'tmp', 'audit-comment-SA-901.md')
     assert os.path.exists(fpath)
-    assert '# AMPA Audit Result' in open(fpath).read()  # noqa: SIM115
+    assert '# Audit Result' in open(fpath).read()  # noqa: SIM115
 
 
 def test_append_audit_comment_non_dry_run_invokes_wl(monkeypatch):

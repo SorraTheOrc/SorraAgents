@@ -117,17 +117,22 @@ class TestPersistAuditFailFlag:
 
         rc = persist_audit("SA-TEST", report_text, wl_bin="wl", runner=fake_runner, _fail=False)
         assert rc == 0
-        # persist_audit now does three wl calls: audit-set + show + update --audit-text
-        assert len(persist_calls) == 3
-        assert "audit-set" in persist_calls[0]
+        # persist_audit now does four wl calls for a 'Ready to close: Yes'
+        # report: show (priority check) + audit-set + show (stage) +
+        # update --audit-text
+        assert len(persist_calls) == 4
+        # first call: wl show for the priority check
+        assert "show" in persist_calls[0]
         assert "SA-TEST" in persist_calls[0]
-        assert "show" in persist_calls[1]
+        assert "audit-set" in persist_calls[1]
         assert "SA-TEST" in persist_calls[1]
-        assert "update" in persist_calls[2]
-        assert "--audit-text" in persist_calls[2]
+        assert "show" in persist_calls[2]
+        assert "SA-TEST" in persist_calls[2]
+        assert "update" in persist_calls[3]
+        assert "--audit-text" in persist_calls[3]
         # Stage should be explicitly preserved in the update call
-        assert "--stage" in persist_calls[2]
-        assert "in_review" in persist_calls[2]
+        assert "--stage" in persist_calls[3]
+        assert "in_review" in persist_calls[3]
 
     def test_persist_audit_normal_failure_returns_1(self, monkeypatch):
         """When wl update fails normally, return 1."""
@@ -138,6 +143,28 @@ class TestPersistAuditFailFlag:
 
         rc = persist_audit("SA-TEST", report_text, wl_bin="wl", runner=fake_runner, _fail=False)
         assert rc == 1
+
+    def test_persist_audit_injects_worklog_dir_flag(self):
+        """When a worklog_dir is provided, every wl command carries
+        ``--worklog-dir`` after ``wl`` (standalone CLI usage stays unaffected
+        because the param defaults to None).
+        """
+        report_text = "Ready to close: Yes"
+        persist_calls = []
+
+        def fake_runner(cmd, **kwargs):
+            persist_calls.append(list(cmd))
+            return _fake_proc(stdout='{"success": true, "workItem": {"id": "SA-TEST", "stage": "in_review", "status": "completed"}}')
+
+        rc = persist_audit("SA-TEST", report_text, wl_bin="wl",
+                           runner=fake_runner, _fail=False,
+                           worklog_dir="/explicit/.worklog")
+        assert rc == 0
+        assert len(persist_calls) == 4
+        for cmd in persist_calls:
+            assert cmd[0] == "wl"
+            assert cmd[1] == "--worklog-dir"
+            assert cmd[2] == "/explicit/.worklog"
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +225,7 @@ class TestAuditRunnerReportOnPersistFailure:
                     "audit": {
                         "workItemId": "SA-SUCCESS",
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nOK.",
+                        "rawOutput": "Audit report for work item SA-SUCCESS\nReady to close: Yes\n\n## Summary\nOK.",
                     },
                 }))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))
@@ -234,7 +261,7 @@ class TestAuditRunnerReportOnPersistFailure:
                     "success": True,
                     "audit": {
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nOK.",
+                        "rawOutput": "Audit report for work item SA-PARENT\nReady to close: Yes\n\n## Summary\nOK.",
                     },
                 }))
             return _fake_proc(stdout=json.dumps(WI_WITH_CHILDREN))
@@ -352,7 +379,7 @@ class TestReadbackVerification:
                     "audit": {
                         "workItemId": "SA-READBACK-OK",
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nAll good.",
+                        "rawOutput": "Audit report for work item SA-READBACK-OK\nReady to close: Yes\n\n## Summary\nAll good.",
                     },
                 }
                 return _fake_proc(stdout=json.dumps(audit_data))
@@ -511,7 +538,7 @@ class TestReadbackVerification:
                         "workItemId": "SA-SUMMARY-ONLY",
                         "auditedAt": "2026-07-20T10:00:00.000Z",
                         "rawOutput": None,
-                        "summary": "Ready to close: Yes\n\n## Summary\nStored in summary field.",
+                        "summary": "Audit report for work item SA-SUMMARY-ONLY\nReady to close: Yes\n\n## Summary\nStored in summary field.",
                     },
                 }
                 return _fake_proc(stdout=json.dumps(audit_data))
@@ -544,7 +571,7 @@ class TestReadbackVerification:
                     "audit": {
                         "workItemId": "SA-BOTH",
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nPrimary content.",
+                        "rawOutput": "Audit report for work item SA-BOTH\nReady to close: Yes\n\n## Summary\nPrimary content.",
                         "summary": "Audit result persisted via persist_audit.py",
                     },
                 }
@@ -613,7 +640,7 @@ class TestExitCodes:
                     "success": True,
                     "audit": {
                         "auditedAt": "2026-07-20T10:00:00.000Z",
-                        "rawOutput": "Ready to close: Yes\n\n## Summary\nOK.",
+                        "rawOutput": "Audit report for work item SA-OK\nReady to close: Yes\n\n## Summary\nOK.",
                     },
                 }))
             return _fake_proc(stdout=json.dumps(_load_fixture("wi_with_numbered_ac.json")))

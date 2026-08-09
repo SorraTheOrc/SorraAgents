@@ -110,6 +110,26 @@ class TestRuffSeverity:
         result = self.classify("ruff", "ZZ99")
         assert result in ("medium", "high", "low")
 
+    def test_ruff_EXE001_is_low_not_high(self):
+        """ruff 'EXE001' (shebang but not executable) must NOT classify as 'high'.
+
+        Regression: the single-character fallback mapped the 'EXE' prefix to
+        'E' (pycodestyle error) -> 'high', blocking audits on unrelated files.
+        """
+        result = self.classify("ruff", "EXE001")
+        assert result in ("low", "medium")
+        assert result != "high"
+
+    def test_ruff_EXE_prefix_is_low(self):
+        """The bare 'EXE' prefix should map to 'low' (Ruff convention rule)."""
+        result = self.classify("ruff", "EXE")
+        assert result == "low"
+
+    def test_ruff_pycodestyle_E_still_high(self):
+        """Real pycodestyle error codes (E501) must remain 'high'."""
+        result = self.classify("ruff", "E501")
+        assert result == "high"
+
     def test_ruff_full_error_code(self):
         """ruff full error codes like 'F841' should still classify based on prefix."""
         result = self.classify("ruff", "F841")

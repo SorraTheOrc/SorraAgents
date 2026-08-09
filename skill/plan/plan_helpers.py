@@ -16,10 +16,12 @@ The module provides:
   - A high-level ``make_autoplan_decision()`` orchestrator
   - ``run_effort_and_risk()`` wrapper for the effort-and-risk skill
   - ``append_autoplan_decision_comment()`` for idempotent comment posting
+  - ``should_request_plan_approval()`` for the plan skill's step-4 approval gate
   - ``validate_key_files_format()`` for syntactic validation of ``**Key Files:**``
   - ``validate_key_files_in_description()`` for validating key files within
     a full work item description
-  - CLI entry points ``plan-if-needed`` and ``check-effort-risk``
+  - CLI entry points ``plan-if-needed``, ``check-effort-risk`` and
+    ``plan-approval-gate``
 """  # noqa: EXE001
 
 from __future__ import annotations
@@ -29,9 +31,19 @@ import hashlib
 import json
 import logging
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+# Add repo root to sys.path for shared utility access (parity with
+# orchestrate_estimate.py). This lets the module run from any cwd — including
+# the installed skills dir (~/.pi/agent/skills is a symlink into the repo).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from skill.shared.status_lifecycle import resolve_worklog_flags
 
 logger = logging.getLogger("plan_helpers")
 
@@ -40,6 +52,14 @@ logger = logging.getLogger("plan_helpers")
 # skip /plan and proceed directly to implement.
 DEFAULT_AUTOPLAN_EFFORT_SKIP: frozenset[str] = frozenset({"Extra Small", "Small"})
 DEFAULT_AUTOPLAN_RISK_SKIP: frozenset[str] = frozenset({"Low"})
+
+# Thresholds for the plan-approval gate (plan skill step 4)
+# If the work item's effort t-shirt size is in this set OR its risk level
+# is in the risk set, the plan skill asks the user to approve the proposed
+# feature plan (and explains why). Otherwise the plan proceeds straight to
+# the automated review stages without an approval pause.
+PLAN_APPROVAL_EFFORT: frozenset[str] = frozenset({"Medium", "Large", "Extra Large"})
+PLAN_APPROVAL_RISK: frozenset[str] = frozenset({"Medium", "High"})
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +230,7 @@ def _wl_comment_list(
 ) -> list[dict]:
     """Call ``wl comment list <id> --json`` and return the comment list."""
     cmd = ["wl", "comment", "list", work_item_id, "--json"]
+    cmd[1:1] = resolve_worklog_flags(cmd)
     proc = _execute_subprocess(cmd, runner=runner)
     if proc.returncode != 0:
         logger.warning("wl comment list failed target=%s stderr=%s", work_item_id, proc.stderr)
@@ -243,6 +264,7 @@ def _wl_comment_add(
         comment,
         "--json",
     ]
+    cmd[1:1] = resolve_worklog_flags(cmd)
     proc = _execute_subprocess(cmd, runner=runner)
     if proc.returncode != 0:
         logger.warning(
@@ -314,6 +336,50 @@ def resolve_complexity_tier(item: dict, config: dict) -> str:
         return "low"
 
     return "medium"
+
+
+# ---------------------------------------------------------------------------
+# Plan-approval gate (plan skill step 4)
+# ---------------------------------------------------------------------------
+
+
+def should_request_plan_approval(work_item: dict) -> tuple[bool, str]:
+    """Decide whether the plan skill should ask the user to approve a feature plan.
+
+    Returns ``(request_approval, reason)``:
+    - ``request_approval``: True when the work item's effort t-shirt size is
+      Medium/Large/Extra Large ("scale") OR its risk level is Medium/High.
+    - ``reason``: a human-readable clause explaining what triggered the gate,
+      used to tell the user why a human checkpoint is required. Empty string
+      when approval is not needed.
+
+    Missing effort and/or risk values default conservatively to requesting
+    approval (mirroring ``resolve_complexity_tier``'s Medium default), so a
+    human checkpoint is never silently skipped.
+
+    Arguments:
+        work_item: The work item dict (from ``wl show --json``) with
+            ``effort`` (t-shirt size) and ``risk`` (level) fields.
+    """
+    effort = (work_item.get("effort") or "").strip()
+    risk = (work_item.get("risk") or "").strip()
+
+    # Missing values default conservatively to requesting approval.
+    if not effort and not risk:
+        return True, "its effort and risk are not set (defaulting to requesting approval)"
+    if not effort:
+        return True, f"its effort is not set and its risk is {risk}"
+    if not risk:
+        return True, f"its effort is {effort} and its risk is not set"
+
+    reasons: list[str] = []
+    if effort in PLAN_APPROVAL_EFFORT:
+        reasons.append(f"its effort is {effort} scale")
+    if risk in PLAN_APPROVAL_RISK:
+        reasons.append(f"its risk is {risk}")
+    if reasons:
+        return True, " and ".join(reasons)
+    return False, ""
 
 
 # ---------------------------------------------------------------------------
@@ -493,10 +559,17 @@ def make_autoplan_decision(
     - effort_risk: dict with "effort" (tshirt) and "risk" (level) keys,
         or None if effort/risk could not be determined
 
+    When the work item cannot be fetched (``wl show`` fails or the id is not
+    found), returns ``(True, "error", {"error": <message>})`` WITHOUT invoking
+    the effort-and-risk orchestration — the helper never writes to a work item
+    it could not read (a failed fetch must not overwrite genuine effort/risk
+    with the zeroed autoplan placeholder).
+
     When ``precomputed_item`` and ``precomputed_comments`` are provided, the
     function uses those instead of fetching the work item from the worklog.
     This allows callers to supply already-fetched data and avoid
-    redundant wl calls.
+    redundant wl calls. An empty ``precomputed_item`` (``{}``) is treated as a
+    failed fetch and returns the error result above.
 
     When ``runner`` is provided, uses it for all subprocess calls (enables
     test injection via FakeRunner). When ``runner`` is None, uses
@@ -513,6 +586,24 @@ def make_autoplan_decision(
     else:
         item = _wl_show(target_id, runner=runner)
         comments = _wl_comment_list(target_id, runner=runner)
+
+    # Fail fast when the work item could not be fetched: an empty item means
+    # ``wl show`` failed or the id was not found. Proceeding here would invoke
+    # run_effort_and_risk() with a zeroed placeholder payload that OVERWRITES
+    # the real item's effort/risk fields and posts a bogus comment (the item
+    # is found by prefix-resolved worklog in the orchestration, which succeeds
+    # even when this lookup failed). Never write to an item we could not read.
+    if not item:
+        logger.error(
+            "plan_helpers.fetch_failed target=%s — refusing to run effort-and-risk",
+            target_id,
+        )
+        return True, "error", {
+            "error": (
+                f"could not fetch work item {target_id}: "
+                "wl show failed or item not found; no changes were made"
+            ),
+        }
 
     # Idempotence check: skip re-computation if already computed
     if is_effort_risk_computed(item, comments):
@@ -571,9 +662,11 @@ def _wl_show(
 ) -> dict:
     """Call ``wl show <id> --json`` and return the workItem dict.
 
-    Returns an empty dict on failure.
+    Returns an empty dict on failure (callers must treat an empty result as
+    "could not read the item" and fail fast rather than write to it).
     """
     cmd = ["wl", "show", work_item_id, "--json"]
+    cmd[1:1] = resolve_worklog_flags(cmd)
     proc = _execute_subprocess(cmd, runner=runner)
     if proc.returncode != 0:
         logger.warning("wl show failed target=%s stderr=%s", work_item_id, proc.stderr)
@@ -594,21 +687,64 @@ def _wl_show(
 # ---------------------------------------------------------------------------
 
 
-def plan_if_needed(target_id: str) -> dict[str, Any]:
+def plan_if_needed(
+    target_id: str,
+    runner: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
     """CLI entry point for ``plan-if-needed``.
 
     Returns a JSON-serializable dict with keys:
       - target_id
-      - decision ("skip" | "plan")
-      - effort
-      - risk
+      - decision ("skip" | "plan" | "error")
+      - effort (t-shirt size, e.g. "Small"; empty when not determinable)
+      - risk (risk level, e.g. "Low"; empty when not determinable)
+      - error (present only when the work item could not be fetched)
+
+    ``effort``/``risk`` report the work item's actual values (never the stage
+    or the boolean decision). When the fetch fails, ``decision`` is
+    "error" and no write was made to the work item.
     """
-    do_plan, stage, _effort_risk = make_autoplan_decision(target_id, config={})
+    do_plan, stage, effort_risk = make_autoplan_decision(
+        target_id, config={}, runner=runner
+    )
+    if stage == "error" or (effort_risk and "error" in effort_risk):
+        return {
+            "target_id": target_id,
+            "decision": "error",
+            "effort": "",
+            "risk": "",
+            "error": (effort_risk or {}).get(
+                "error", f"could not fetch work item {target_id}"
+            ),
+        }
     return {
         "target_id": target_id,
         "decision": "plan" if do_plan else "skip",
-        "effort": stage,  # For backward compat: the stage indicates what happens
-        "risk": do_plan,
+        "effort": (effort_risk or {}).get("effort", ""),
+        "risk": (effort_risk or {}).get("risk", ""),
+    }
+
+
+def plan_approval_gate(
+    target_id: str,
+    runner: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """CLI helper for the plan skill's step-4 approval gate.
+
+    Fetches the work item (via ``wl show`` or the provided runner) and
+    returns a JSON-serializable dict with keys:
+      - target_id
+      - request_approval (bool): whether the plan skill should ask the user
+        to approve the proposed feature plan
+      - reason (str): human-readable explanation of the gate decision
+        (empty when approval is not needed)
+    """
+    item = _wl_show(target_id, runner=runner)
+    request_approval, reason = should_request_plan_approval(item)
+    return {
+        "target_id": target_id,
+        "request_approval": request_approval,
+        "reason": reason,
     }
 
 
@@ -654,6 +790,13 @@ def main() -> None:
     )
     check_parser.add_argument("target_id", help="Work item ID to check")
 
+    # plan-approval-gate subcommand
+    gate_parser = subparsers.add_parser(
+        "plan-approval-gate",
+        help="Check whether the plan skill should ask the user to approve the feature plan",
+    )
+    gate_parser.add_argument("target_id", help="Work item ID to check")
+
     args = parser.parse_args()
 
     if args.command == "plan-if-needed":
@@ -661,6 +804,9 @@ def main() -> None:
         print(json.dumps(result, indent=2))
     elif args.command == "check-effort-risk":
         result = check_effort_risk(args.target_id)
+        print(json.dumps(result, indent=2))
+    elif args.command == "plan-approval-gate":
+        result = plan_approval_gate(args.target_id)
         print(json.dumps(result, indent=2))
 
 

@@ -28,12 +28,35 @@ For testing or custom runners, an injectable ``runner`` callable can be passed::
 
     with StatusLifecycle(id, runner=my_runner):
         ...
+
+Worklog-dir resolution
+----------------------
+
+Skill scripts shell out to the ``wl`` CLI which resolves ``.worklog`` relative
+to the caller's cwd. To work regardless of cwd, every ``wl`` invocation is
+routed through :func:`run_wl` (or the lower-level ``_run_wl_with_runner``),
+which injects ``--worklog-dir`` flags with this precedence:
+
+    1. explicit ``--worklog-dir`` value (:func:`resolve_worklog_flags` arg)
+    2. prefix-to-sibling scan (:func:`_find_worklog_dir_by_prefix`) — the
+       work-item id prefix (e.g. ``OSL``) is matched against
+       ``SIBLING_SCAN_ROOT/*/.worklog/config.yaml`` so a non-SorraAgents item
+       resolves to its own project's store even when the harness cwd is the
+       framework repo
+    3. cwd chain (:func:`worklog_dir_flag`) — ``<cwd>/.worklog``, git root,
+       nearest initialized ancestor
+    4. no flag (wl resolves from cwd; failures surface real error detail)
+
+Public helpers: :func:`resolve_worklog_dir` (resolve a store for an id),
+:func:`resolve_worklog_flags` (resolve flags for a command), and
+:func:`worklog_dir_flag` (cwd-chain fallback only).
 """  # noqa: EXE001
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -44,10 +67,67 @@ LOG = logging.getLogger("skill.shared.status_lifecycle")
 # Takes a command list, returns a CompletedProcess (like subprocess.run).
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
+# Framework repository root: parent of ``skill/shared`` (this module's
+# location) — a cwd-independent path. Sibling projects whose worklog stores
+# are resolved by work-item prefix live alongside this repo.
+def _resolve_repo_root() -> Path:
+    """Resolve the framework repository root from this module's location.
+
+    The module may be imported from inside a git worktree — a full checkout
+    under ``<main>/.worklog/worktrees/<name>/`` whose ``skill/`` tree is a
+    complete copy. The sibling-projects scan base must be derived from the
+    MAIN checkout: a worktree has a ``.git`` FILE (gitdir pointer) at its
+    root, while the main checkout has a ``.git`` DIRECTORY. Walking up from
+    the module file, the first ancestor that owns ``skill/shared`` and is
+    NOT a worktree is the framework main checkout.
+    """
+    current = Path(__file__).resolve().parent  # skill/shared
+    for candidate in current.parents:
+        if not (candidate / "skill" / "shared" / "status_lifecycle.py").is_file():
+            continue
+        if (candidate / ".git").is_file():
+            continue  # worktree copy (gitdir pointer), not the main checkout
+        return candidate
+    # Fallback: conventional layout (repo root = two levels above skill/shared).
+    return Path(__file__).resolve().parents[2]
+
+
+REPO_ROOT = _resolve_repo_root()
+
+SIBLING_SCAN_ROOT: Path = REPO_ROOT.parent
+"""Directory scanned by the prefix-to-project sibling worklog resolution.
+
+Sibling projects (whose ``.worklog/config.yaml`` carries a ``prefix:`` marker)
+live alongside the framework repository that ships these shared helpers, i.e.
+under ``REPO_ROOT.parent``. Basing the scan on ``REPO_ROOT`` — a cwd-independent
+path derived from this module's own location — keeps worklog resolution correct
+when a skill script is launched from the framework repo, the skill install
+directory, or any other non-project cwd.
+"""
+
 
 # ======================================================================
 # Worklog-dir resolution
 # ======================================================================
+
+
+def _is_initialized_worklog(path: Path) -> bool:
+    """True when *path* is a usable (initialized) worklog directory.
+
+    An initialized worklog has an ``initialized`` marker file (or a
+    ``worklog.db``). A directory holding only ``config.yaml`` — e.g. a
+    git worktree's committed copy of ``.worklog/`` — is NOT initialized
+    and pointing ``wl`` at it fails with "Worklog system is not initialized".
+
+    Args:
+        path: Candidate ``.worklog`` directory.
+
+    Returns:
+        True if the directory exists and is initialized.
+    """
+    return path.is_dir() and (
+        (path / "initialized").is_file() or (path / "worklog.db").is_file()
+    )
 
 
 def _detect_worklog_dir() -> Path | None:
@@ -86,6 +166,89 @@ def _detect_worklog_dir() -> Path | None:
     return None
 
 
+def _extract_work_item_prefix(cmd: list[str] | tuple[str, ...]) -> str | None:
+    """Extract the work-item id prefix (e.g. ``OSL``) from a wl command.
+
+    Returns the prefix before the first ``-`` in an argument that looks like a
+    work item id (e.g. ``OSL-0MSABC7SB001NVUN``), or ``None`` when no such
+    argument is present (e.g. ``wl list``).
+    """
+    for arg in cmd:
+        m = re.match(r"^([A-Z]{2,5})-[A-Z0-9]+$", arg)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _find_worklog_dir_by_prefix(prefix: str) -> Path | None:
+    """Find the ``.worklog`` dir of a sibling project with matching config prefix.
+
+    Scans ``SIBLING_SCAN_ROOT/*/.worklog/config.yaml`` and returns the
+    first ``.worklog`` directory whose ``prefix:`` value equals *prefix*.
+    Returns ``None`` when no sibling project matches (or the scan is not
+    possible, e.g. SIBLING_SCAN_ROOT does not exist).
+    """
+    projects_root = SIBLING_SCAN_ROOT
+    try:
+        configs = sorted(projects_root.glob("*/.worklog/config.yaml"))
+    except OSError:
+        return None
+    for config in configs:
+        try:
+            text = config.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("prefix:"):
+                value = stripped.split(":", 1)[1].strip().strip('"\'')
+                if value == prefix:
+                    return config.parent
+    return None
+
+
+def resolve_worklog_dir(work_item_id: str) -> Path | None:
+    """Resolve the worklog directory that owns *work_item_id*.
+
+    Resolution order:
+      1. Prefix-to-sibling scan: extract the id prefix (e.g. ``OSL``) and
+         match it against ``SIBLING_SCAN_ROOT/*/.worklog/config.yaml``.
+      2. cwd-chain fallback (:func:`_detect_worklog_dir`).
+
+    Returns ``None`` when no worklog directory can be resolved.
+    """
+    prefix = _extract_work_item_prefix([work_item_id])
+    if prefix:
+        wl_dir = _find_worklog_dir_by_prefix(prefix)
+        if wl_dir is not None:
+            return wl_dir
+    return _detect_worklog_dir()
+
+
+def resolve_worklog_flags(
+    cmd: list[str] | tuple[str, ...],
+    explicit_dir: str | None = None,
+) -> list[str]:
+    """Resolve ``--worklog-dir`` flags for a wl command.
+
+    Resolution order:
+      1. explicit ``--worklog-dir`` value (from CLI / caller)
+      2. prefix-to-project sibling scan: extract the work-item id prefix from
+         the command and match it against
+         ``SIBLING_SCAN_ROOT/*/.worklog/config.yaml``
+      3. cwd-chain fallback (:func:`worklog_dir_flag`)
+      4. no flag (wl resolves from cwd)
+    """
+    if explicit_dir:
+        return ["--worklog-dir", explicit_dir]
+    prefix = _extract_work_item_prefix(cmd)
+    if prefix:
+        wl_dir = _find_worklog_dir_by_prefix(prefix)
+        if wl_dir is not None:
+            return ["--worklog-dir", str(wl_dir)]
+    return worklog_dir_flag()
+
+
 def worklog_dir_flag() -> list[str]:
     """Return ``["--worklog-dir", <path>]`` when cwd is not a worklog root.
 
@@ -94,10 +257,26 @@ def worklog_dir_flag() -> list[str]:
     project root (e.g. the skill install dir), pass the explicit
     ``--worklog-dir`` so the command succeeds regardless of cwd.
 
+    A git worktree's ``.worklog/`` contains only the committed
+    ``config.yaml`` and is NOT initialized, so ``wl`` fails from inside a
+    worktree. Since worktrees live under the main checkout's
+    ``.worklog/worktrees/``, the nearest ancestor with an initialized
+    ``.worklog`` is the main checkout — point ``wl`` at it.
+
     Returns an empty list when no worklog directory is resolvable (the
     command will run as-is and any failure will surface real error detail).
     """
-    if (Path.cwd() / ".worklog").is_dir():
+    cwd_worklog = Path.cwd() / ".worklog"
+    if cwd_worklog.is_dir():
+        if _is_initialized_worklog(cwd_worklog):
+            return []
+        # cwd/.worklog exists but is not initialized (e.g. a git worktree
+        # with only the committed config.yaml): resolve the nearest
+        # ancestor project .worklog that IS initialized (the main checkout).
+        for parent in Path.cwd().parents:
+            cand = parent / ".worklog"
+            if _is_initialized_worklog(cand):
+                return ["--worklog-dir", str(cand)]
         return []
     wl_dir = _detect_worklog_dir()
     if wl_dir is None:
@@ -160,9 +339,10 @@ def _run_wl_with_runner(runner: Runner, cmd: list[str]) -> dict:
     """
     full_cmd = list(cmd)
     if full_cmd and full_cmd[0] == "wl":
-        # Inject --worklog-dir when cwd is not the target worklog root so the
-        # command succeeds regardless of the caller's cwd.
-        full_cmd[1:1] = worklog_dir_flag()
+        # Inject --worklog-dir with precedence: explicit > prefix-to-sibling
+        # scan > cwd chain > none, so the command targets the correct worklog
+        # store regardless of the caller's cwd.
+        full_cmd[1:1] = resolve_worklog_flags(full_cmd)
     LOG.debug("Running: %s", " ".join(full_cmd))
     proc = runner(full_cmd)
     if proc.returncode != 0:

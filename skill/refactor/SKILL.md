@@ -35,11 +35,19 @@ refactor/
 
 ## When To Use
 
-- As a post-implementation quality check in the implement/implement-single
+- As a post-implementation quality check in the implement
   workflow.
 - Manually via `/refactor <work-item-id>` to run code smell analysis on
   session changes.
 - Integrated into CI/CD pipelines for automated code quality gates.
+
+## Verification
+
+Refactoring changes must be verified against the full project test suite
+before completion. Run the suite via the
+[test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate →
+loop until green), following the quiet pytest contract, so refactor fixes do
+not silently break behavior.
 
 ## Status Management
 
@@ -149,5 +157,4 @@ Comment delimiters vary by file type — `#` for Python, `//` for JS/TS, `<!-- -
 ## Related Skills
 
 - [Implement](../implement/SKILL.md) — Integrated refactor step
-- [Implement Single](../implement-single/SKILL.md) — Also includes refactor step
 - [Code Review](../code-review/SKILL.md) — Complementary code quality skill

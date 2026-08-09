@@ -91,13 +91,21 @@ the autoplan decision logic).
 
    - `target_id` — the work item id
    - `decision` — `"skip"` (effort and risk below threshold, planning not
-     needed) or `"plan"` (effort or risk above threshold, planning required)
+     needed), `"plan"` (effort or risk above threshold, planning required),
+     or `"error"` (the work item could not be fetched — the helper makes
+     NO writes to the work item in this case)
+   - `effort` — the work item's effort t-shirt size (e.g. `"Small"`) when
+     determinable, otherwise empty
+   - `risk` — the work item's risk level (e.g. `"Low"`) when determinable,
+     otherwise empty
+   - `error` — present only when `decision` is `"error"`; a human-readable
+     explanation (no changes were made to the work item)
 
 3. Act on the decision:
 
    - **If `decision == "skip"`**: The work item is small enough to implement
      directly without decomposition. However, before marking it as
-     `plan_complete`, run the five automated review stages (see
+     `plan_complete`, run the six automated review stages (see
      **Automated review on existing content** below) against the existing
      work item content (description and any existing child work items).
      The review stages will identify and address any gaps before the work
@@ -116,6 +124,14 @@ the autoplan decision logic).
      wl comment add <work-item-id> --author "plan" --comment "Auto-plan completed with review: effort and risk below threshold. Review summary: [summarise what each stage checked and any changes made]" --json
      ```
 
+   - **If `decision == "error"`**: The work item could not be fetched
+     (invalid id, wrong cwd, or worklog unavailable). The helper made **no
+     writes** — the item's effort/risk fields and comments are untouched;
+     it never invokes the effort-and-risk orchestration with placeholder
+     values when it could not read the item first. Default to full planning
+     as a safety measure: proceed to the Process steps below and log a
+     warning.
+
    - **If `decision == "plan"`**: Proceed to the Process steps below. The
      work item is large or risky enough to warrant full decomposition.
 
@@ -127,9 +143,41 @@ the autoplan decision logic).
    later, the pre-check will return `decision: "skip"` and the command will
    exit with the existing stage preserved (a warning comment is added).
 
+## Plan-approval gate (Process step 4)
+
+Before asking the user to approve a proposed feature plan (Process step 4),
+run the approval-gate check using the bundled `plan_helpers.py`:
+
+```bash
+python3 ./plan_helpers.py plan-approval-gate <work-item-id>
+```
+
+Parse the JSON result. Expected keys:
+
+- `request_approval` — `true` (ask the user to approve the plan) or `false`
+  (proceed without an approval pause)
+- `reason` — human-readable explanation of why approval is requested
+  (empty when approval is not needed)
+
+The gate requests approval when the work item's effort t-shirt size is
+Medium/Large/Extra Large (scale) **OR** its risk level is Medium/High, and
+**skips** approval when effort is Extra Small/Small **AND** risk is Low.
+When effort/risk values are absent from the work item, the gate defaults
+conservatively to requesting approval (mirroring `resolve_complexity_tier`'s
+Medium default), so a human checkpoint is never silently skipped.
+
+- **If `request_approval == true`**: present the plan and ask the user to
+  accept, edit, reorder, or split/merge — iterating until approved. When
+  asking, state the reason explicitly so the user understands why the
+  checkpoint is required, e.g. "This plan requires your confirmation because
+  its effort is Large scale and its risk is Medium."
+- **If `request_approval == false`**: do NOT ask the user to approve the
+  plan; proceed directly to Process step 5 (vertical slice verification)
+  and step 6 (automated review stages).
+
 ## Automated review on existing content (auto-complete path)
 
-When the pre-check returns `decision: "skip"`, the skill runs the five
+When the pre-check returns `decision: "skip"`, the skill runs the six
 review stages against whatever content exists in the work item
 description and any existing child work items. Unlike Process step 6
 (which reviews a freshly generated feature plan), this auto-complete
@@ -147,7 +195,16 @@ Each review stage MUST:
 
 Review stages (adapted for existing content):
 
-1. **Completeness review** — Ensure the work item has all required fields
+1. **Requirements & AC alignment review** — Verify the acceptance criteria
+   are a faithful match to the work item's requirements and use cases.
+   For each stated requirement or use case in the description (and any
+   referenced PRD), confirm there is at least one corresponding acceptance
+   criterion that would verify it, and that every acceptance criterion
+   traces back to a stated requirement or use case. Flag ACs that are
+   missing, contradictory, or cover requirements that were never stated;
+   add missing ACs only where the intent is clear and unambiguous,
+   otherwise record an Open Question and continue.
+2. **Completeness review** — Ensure the work item has all required fields
    (description, acceptance criteria) and that any existing child items
    are complete. Add missing fields if clearly definable from context.
 
@@ -166,19 +223,19 @@ Review stages (adapted for existing content):
    Any corrections (additions, removals, or corrections) to the ``**Key
    Files:**`` list identified during this review should be reflected in the
    work item description before the plan process completes.
-2. **Sequencing & dependencies review** — Verify any existing child item
+3. **Sequencing & dependencies review** — Verify any existing child item
    dependencies are coherent. Check that test/verification items appear
    before implementation items if both exist. Ensure test features come first
    when ordering child items.
-3. **Scope sizing review** — Ensure any existing features are sized as
+4. **Scope sizing review** — Ensure any existing features are sized as
    deliverable increments. If no child items exist, this stage is a no-op.
-4. **Acceptance & testability review** — Verify acceptance criteria are
+5. **Acceptance & testability review** — Verify acceptance criteria are
    pass/fail and testable. Improve vague or untestable criteria where
    the intent is clear and unambiguous.
-5. **Polish & handoff review** — Ensure the work item description is
+6. **Polish & handoff review** — Ensure the work item description is
    clear, well-formatted, and actionable.
 
-After all five stages complete, output a summary to the console listing
+After all six stages complete, output a summary to the console listing
 what each review stage checked and what (if anything) was found or changed.
 Then proceed to mark the work item as `plan_complete` (see skip path
 instructions above).
@@ -232,8 +289,18 @@ instructions above).
    Each feature must describe how the user experience changes and what ACs validate it.
 
    - **Test-first ordering**: test/verification features before implementation features.
-   - Present as numbered list and ask user to accept, edit, reorder, or split/merge.
-   - Iterate until approved.
+   - **Approval gate**: before asking for approval, run the approval-gate check
+     (see **Plan-approval gate** below). Approval is requested only when the
+     work item's effort t-shirt size is Medium/Large/Extra Large (scale) OR its
+     risk level is Medium/High, or when effort/risk are absent (conservative
+     default). When approval IS requested, state the reason explicitly
+     (e.g. "This plan requires your confirmation because its effort is Large
+     scale and its risk is Medium."). Present as numbered list and ask user to
+     accept, edit, reorder, or split/merge. Iterate until approved.
+   - When the gate says approval is NOT warranted (effort Extra Small or Small
+     AND risk Low), do NOT ask the user to approve the plan — proceed directly
+     to step 5 (vertical slice verification) and step 6 (automated review
+     stages) without an approval pause.
 
 5. Verify vertical slice phasing (agent responsibility)
 
@@ -244,7 +311,7 @@ instructions above).
 
 6. Automated review stages (must follow; no human intervention required)
 
-   After the user approves the feature list, run five review iterations.
+   After the user approves the feature list, run six review iterations.
    Each review MUST provide a new draft if any changes are recommended
    and then output exactly: "Finished <Stage Name> review: <brief notes
    of improvements>"
@@ -257,7 +324,14 @@ instructions above).
        automatically; instead record an Open Question and continue.
 
    Review stages and expected behavior:
-   1. Completeness review — Ensure every feature has all required fields.
+   1. Requirements & AC alignment review — Verify each feature's acceptance
+      criteria faithfully match its stated requirements and use cases.
+      For every requirement/use case there must be at least one AC that
+      verifies it, and every AC must trace back to a stated requirement.
+      Flag missing, contradictory, or invented ACs; add missing ACs only
+      where intent is clear and unambiguous, otherwise record an Open
+      Question and continue.
+   2. Completeness review — Ensure every feature has all required fields.
 
       Additionally, if the work item contains a ``**Key Files:**`` section
       (predicted during intake), validate the listed file paths:
@@ -274,14 +348,14 @@ instructions above).
       Any corrections (additions, removals, or corrections) to the ``**Key
       Files:**`` list identified during this review should be reflected in the
       work item description before the plan process completes.
-   2. Sequencing & dependencies review — Ensure dependencies are coherent
+   3. Sequencing & dependencies review — Ensure dependencies are coherent
       and actionable. Verify that test/verification features appear before
       implementation features.
-   3. Scope sizing review — Ensure features are sized as deliverable
+   4. Scope sizing review — Ensure features are sized as deliverable
       increments.
-   4. Acceptance & testability review — Ensure acceptance criteria are
+   5. Acceptance & testability review — Ensure acceptance criteria are
       pass/fail and testable.
-   5. Polish & handoff review — Make the plan copy-pasteable and easy to
+   6. Polish & handoff review — Make the plan copy-pasteable and easy to
       execute.
 
 7. Update work items (agent)
@@ -327,13 +401,15 @@ instructions above).
 
 - `plan_helpers.py` — Shared autoplan decision module. Provides the CLI
   entry points `plan-if-needed` and `check-effort-risk` used in the pre-check
-  above. Can also be imported as a Python module by other tools.
+  above, plus `plan-approval-gate` for the step-4 approval gate. Can also be
+  imported as a Python module by other tools.
 
   Usage:
 
   ```bash
   python3 ./plan_helpers.py plan-if-needed <work-item-id>
   python3 ./plan_helpers.py check-effort-risk <work-item-id>
+  python3 ./plan_helpers.py plan-approval-gate <work-item-id>
   ```
 
   Import:
@@ -342,6 +418,7 @@ instructions above).
   from skill.plan.plan_helpers import (
       make_autoplan_decision,
       resolve_complexity_tier,
+      should_request_plan_approval,
       is_effort_risk_computed,
       run_effort_and_risk,
       append_autoplan_decision_comment,
@@ -349,8 +426,11 @@ instructions above).
       validate_key_files_in_description,
       plan_if_needed,
       check_effort_risk,
+      plan_approval_gate,
       DEFAULT_AUTOPLAN_EFFORT_SKIP,
       DEFAULT_AUTOPLAN_RISK_SKIP,
+      PLAN_APPROVAL_EFFORT,
+      PLAN_APPROVAL_RISK,
   )
   ```
 

@@ -83,6 +83,7 @@ _RUFF_SEVERITY_MAP: dict[str, str] = {
     "RUF": "medium",      # Ruff-specific rules
     # Low: complexity, style
     "C": "low",
+    "EXE": "low",        # executable-bit conventions (shebang without +x)
     "ISC": "low",         # implicit-string-concatenation
     "PIE": "low",         # flake8-pie
     "COM": "low",         # flake8-commas

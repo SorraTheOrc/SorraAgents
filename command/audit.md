@@ -30,6 +30,13 @@ If `$ARGUMENTS` is `project`, use:
 python3 skill/audit/scripts/audit_runner.py project
 ```
 
+The runner is cwd-independent: every `wl` call targets the correct worklog
+store automatically (explicit `--worklog-dir` flag > prefix-to-project sibling
+scan > cwd-chain detection). It can be launched from any directory — including
+the skill install dir — and still audit items in another project's worklog,
+e.g. `audit_runner.py issue OSL-0MSABC7SB001NVUN`. Pass
+`--worklog-dir /path/to/.worklog` explicitly to override auto-resolution.
+
 ## Hard requirements
 
 - Execute immediately — do NOT ask for permission, confirmation, or offer alternatives.

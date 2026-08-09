@@ -63,9 +63,6 @@ The following skills use `FailureNotice` to surface script execution failures:
 
 - `skill/audit/scripts/audit_runner.py`
 - `skill/find-related/scripts/find_related.py`
-- `skill/implementall/scripts/implementall.py`
-- `skill/intakeall/scripts/intakeall.py`
-- `skill/planall/scripts/planall.py`
 - `skill/cleanup/scripts/lib.py` (via `run_main` helper)
 - `skill/effort-and-risk/scripts/orchestrate_estimate.py`
 - `skill/triage/scripts/check_or_create.py`

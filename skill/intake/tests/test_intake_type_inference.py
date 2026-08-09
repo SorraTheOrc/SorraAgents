@@ -64,6 +64,56 @@ def test_intake_md_instructs_type_inference_mapping():
     )
 
 
+def test_intake_md_has_categorization_decision_guide():
+    """The decision guide must cover all five issue types with distinguishing descriptions."""
+    content = INTAKE_MD.read_text()
+    # The decision guide must be anchored by an explicit heading
+    assert "**Issue type decision guide**" in content, (
+        "skill/intake/SKILL.md must include an 'Issue type decision guide' section"
+    )
+    guide = content.split("**Issue type decision guide**", 1)[1]
+    # Every supported type must appear as a table row with a distinguishing description
+    for issue_type in ["bug", "feature", "chore", "task", "epic"]:
+        assert f"`{issue_type}`" in guide, (
+            f"skill/intake/SKILL.md decision guide must cover the '{issue_type}' type"
+        )
+    # Each type must be distinguished by behavior change (or lack thereof)
+    assert "incorrect or broken" in guide, (
+        "skill/intake/SKILL.md decision guide must describe bug as incorrect/broken behavior"
+    )
+    assert "adds new capability" in guide, (
+        "skill/intake/SKILL.md decision guide must describe feature as new capability"
+    )
+    assert "does not change code behavior" in guide, (
+        "skill/intake/SKILL.md decision guide must describe chore as not changing code behavior"
+    )
+
+
+def test_intake_md_categorization_distinguishes_bug_from_feature():
+    """The decision guide must not mislabel a bug fix as a feature."""
+    content = INTAKE_MD.read_text()
+    guide = content.split("**Issue type decision guide**", 1)[1]
+    # bug row: must not claim it adds new capability
+    assert "The change corrects existing wrong behavior" in guide, (
+        "skill/intake/SKILL.md must state that a bug fix corrects existing wrong behavior"
+    )
+    # feature row: must explicitly exclude fixes of already-broken behavior
+    assert "The work only fixes something that is already broken" in guide, (
+        "skill/intake/SKILL.md must state that feature does NOT cover fixing broken behavior"
+    )
+
+
+def test_intake_md_categorization_distinguishes_chore_from_code_change():
+    """The decision guide must classify docs/CI/dependency changes as chore, not feature."""
+    content = INTAKE_MD.read_text()
+    guide = content.split("**Issue type decision guide**", 1)[1]
+    # chore row must explicitly list non-code examples (docs, CI, deps, formatting)
+    for example in ["documentation", "CI", "dependencies", "formatting"]:
+        assert example in guide, (
+            f"skill/intake/SKILL.md chore row must list '{example}' as a non-code-change example"
+        )
+
+
 def test_intake_md_corrects_existing_item_type():
     """Re-intake of an existing work item should review/correct issueType."""
     content = INTAKE_MD.read_text()

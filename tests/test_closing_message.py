@@ -1,8 +1,12 @@
-"""Tests for the closing message format in AGENTS.md and skill SKILL.md files.
+"""Tests for the closing message format in AGENTS_GLOBAL.md and skill SKILL.md files.
 
 This test ensures that the closing message agents output to operators
 correctly reflects that work has already been committed, rather than
 suggesting the operator commit the work themselves.
+
+The closing-message instruction lives in AGENTS_GLOBAL.md (the global
+agent guidance installed to ~/.pi/agent/AGENTS.md), not in the
+project-local AGENTS.md.
 
 Related work item: SA-0MQ037ZH000403K0
 """
@@ -15,10 +19,10 @@ _PI_SKILLS_DIR = Path("/home/rgardler/.pi/agent/skills")
 # Files that should contain the closing message instruction.
 # Pi skills files are only checked when they exist (they may not be present on CI runners).
 _TARGET_FILES = [
-    _REPO_ROOT / "AGENTS.md",
+    _REPO_ROOT / "AGENTS_GLOBAL.md",
 ]
 _EXTRA_FILES = []
-for _path in [_PI_SKILLS_DIR / "implement" / "SKILL.md", _PI_SKILLS_DIR / "implement-single" / "SKILL.md"]:
+for _path in [_PI_SKILLS_DIR / "implement" / "SKILL.md"]:
     if _path.exists():
         _EXTRA_FILES.append(_path)
 _ALL_TARGET_FILES = _TARGET_FILES + _EXTRA_FILES

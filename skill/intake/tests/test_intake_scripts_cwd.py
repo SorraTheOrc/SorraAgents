@@ -27,6 +27,23 @@ if str(REPO_ROOT) not in sys.path:
 from skill.intake.scripts import intake
 
 
+@pytest.fixture(autouse=True)
+def _neutralize_prefix_scan():
+    """Neutralize the prefix-to-sibling scan for deterministic unit tests.
+
+    The shared resolution (SA-0MSG57UNY009DE51) would otherwise scan the
+    real sibling-projects directory for a config matching the fake
+    ``TEST-123`` prefix; no real project matches, so the cwd-chain fallback
+    (``worklog_dir_flag``) is what these tests exercise. Patching the scan
+    keeps the tests hermetic regardless of which projects exist on the host.
+    """
+    with mock.patch(
+        "skill.shared.status_lifecycle._find_worklog_dir_by_prefix",
+        return_value=None,
+    ):
+        yield
+
+
 def _ok_proc(cmd):
     """A successful wl CompletedProcess returning success JSON."""
     return subprocess.CompletedProcess(cmd, 0, json.dumps({"success": True}), "")
@@ -100,7 +117,13 @@ class TestIntakeCwdIndependence:
 
     def test_cmd_finish_preserves_statuses(self):
         """finish still sets open + intake_complete (no behaviour change)."""
-        with mock.patch("skill.shared.status_lifecycle.subprocess.run") as m:
+        with (
+            mock.patch("skill.shared.status_lifecycle.subprocess.run") as m,
+            mock.patch(
+                "skill.shared.status_lifecycle.worklog_dir_flag",
+                return_value=[],
+            ),
+        ):
             m.return_value = _ok_proc(["wl"])
             result = intake.cmd_finish("TEST-123")
             assert result == {"success": True, "action": "finished", "item_id": "TEST-123"}

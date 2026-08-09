@@ -20,7 +20,7 @@ Usage: $0 [--dry-run] [--force] [--work-item-id <id>] [--bump patch|minor|major]
 
 Options:
   --dry-run       Do not push or create/merge the PR; just show planned actions
-  --force         Proceed even if CI checks are not green or other hard gates
+  --force         Merge the PR immediately without waiting for status checks
   --work-item-id  Worklog item id to record in logs (optional)
   --bump <type>   Version bump type: patch, minor, or major (default: patch).
                   The version in package.json is incremented before the merge.
@@ -76,6 +76,24 @@ if ! git rev-parse --show-toplevel >/dev/null 2>&1; then
   exit 1
 fi
 
+# ── Code Freeze marker (contract: WL-0MSBU4KMA004PKSR) ──────────────────────
+# Set a Code Freeze marker for the duration of the release so implement skills
+# refuse to start new implementation work. Cleared on every exit path (success,
+# failure, abort, dry-run) via the EXIT trap. This is a fallback for when the
+# run-release.js wrapper is bypassed; the wrapper sets/clears the same marker.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+FREEZE_MARKER="$REPO_ROOT/.worklog/code-freeze.json"
+write_code_freeze_marker() {
+  mkdir -p "$REPO_ROOT/.worklog"
+  printf '{"active": true, "reason": "ship release in progress", "startedAt": "%s", "pid": %s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" > "$FREEZE_MARKER"
+}
+clear_code_freeze_marker() {
+  rm -f "$FREEZE_MARKER"
+}
+write_code_freeze_marker
+trap clear_code_freeze_marker EXIT
+
 # Ensure clean workspace unless dry-run
 if [[ "$DRY_RUN" != "true" ]]; then
   if [[ -n "$(git status --porcelain)" ]]; then
@@ -95,9 +113,27 @@ fi
 # so they are excluded from the gate (mirrors match the JS gate in
 # check-worklog-refs.js).
 if git for-each-ref refs/worklog/ --format="%(refname)" 2>/dev/null | grep -v '^refs/worklog/remotes/' | grep -q .; then
-  echo "Error: Worklog refs detected under refs/worklog/. Aborting release to prevent accidental merge of worklog data into main." >&2
-  echo "The worklog ref (refs/worklog/data) is separate from regular branches and must not be merged into main." >&2
-  exit 1
+  # Collect flagged refs, excluding refs/worklog/data when it holds the
+  # worklog data file (it is the worklog's own git-branch sync mechanism,
+  # never a code branch to merge into main/dev).
+  DANGEROUS_REFS=0
+  while IFS= read -r ref; do
+    case "$ref" in
+      refs/worklog/remotes/*) continue ;;
+      refs/worklog/data)
+        if git cat-file -e refs/worklog/data:.worklog/worklog-data.jsonl 2>/dev/null; then
+          continue  # legitimate worklog data sync branch
+        fi
+        ;;
+    esac
+    DANGEROUS_REFS=1
+    echo "  - $ref" >&2
+  done < <(git for-each-ref refs/worklog/ --format='%(refname)' 2>/dev/null)
+  if [ "$DANGEROUS_REFS" -eq 1 ]; then
+    echo "Error: Dangerous worklog refs detected under refs/worklog/. Aborting release to prevent accidental merge of worklog data into main." >&2
+    echo "The worklog ref (refs/worklog/data) is separate from regular branches and must not be merged into main." >&2
+    exit 1
+  fi
 fi
 
 # Fetch latest
@@ -152,8 +188,32 @@ fi
 if git merge --no-ff origin/dev -m "Merge origin/dev into main (automated)"; then
   echo "Created merge commit on $BRANCH"
 else
-  echo "Merge failed; please resolve conflicts manually." >&2
-  exit 1
+  # Auto-resolve CHANGELOG.md conflicts: dev's CHANGELOG carries both the
+  # previously released history and the unreleased entries for this release
+  # (generate-changelog.js rewrites it for the new version afterwards).
+  if git ls-files -u | grep -q 'CHANGELOG.md'; then
+    echo "Resolving CHANGELOG.md merge conflict (taking dev's version)" >&2
+    git checkout --theirs CHANGELOG.md
+    git add CHANGELOG.md
+  fi
+  # Auto-resolve package.json conflicts: keep the bumped release version
+  # (the release branch bumped it before the merge; dev may be behind).
+  if git ls-files -u | grep -q 'package.json'; then
+    echo "Resolving package.json merge conflict (keeping bumped version)" >&2
+    git checkout --ours package.json
+    git add package.json
+  fi
+  if git ls-files -u | grep -q .; then
+    echo "Merge failed; please resolve conflicts manually." >&2
+    git status --short >&2
+    exit 1
+  fi
+  if git merge --continue --no-edit 2>/dev/null || git commit -m "Merge origin/dev into main (automated, CHANGELOG resolved)"; then
+    echo "Created merge commit on $BRANCH (with CHANGELOG resolution)"
+  else
+    echo "Merge failed; please resolve conflicts manually." >&2
+    exit 1
+  fi
 fi
 
 # ── Create git tag (only on actual release) ───────────────────────
@@ -210,8 +270,23 @@ if [[ "$FORCE" == "true" ]]; then
     exit 1
   }
   echo "PR merged: $PR_URL"
+  # ── Post-merge verification (defense in depth, SA-0MSJ2XMQL006CVQS) ──
+  # Confirm the merge actually landed on origin/main before signalling
+  # success. Without this, a silently-skipped/failed merge could still let
+  # the run-release.js close step run and spuriously close work items with
+  # a "Shipped in v<version>" reason even though the release never landed.
+  git fetch origin main:refs/remotes/origin/main || {
+    echo "Failed to fetch origin/main after PR merge" >&2
+    exit 1
+  }
+  if git merge-base --is-ancestor "$BRANCH" origin/main 2>/dev/null; then
+    echo "Merge verified: release branch $BRANCH is an ancestor of origin/main"
+  else
+    echo "ERROR: release branch $BRANCH is NOT on origin/main after merge — the release did not land." >&2
+    exit 1
+  fi
 else
-  echo "Release prepared. The PR $PR_URL should be merged once CI checks pass and reviewers approve."
+  echo "Release prepared. The PR $PR_URL should be merged once status checks pass (if any are configured) and reviewers approve."
 fi
 
 # Audit logging could be added here (e.g., call wl comment add ...)

@@ -1,8 +1,12 @@
 # Bug Report: `intakeall` script crashes on `_contains_questions` due to `_extract_pi_text` returning non-string
 
+> **Historical note (2026-08-03):** The `skill/intakeall/` skill was removed in
+> commit `1b56b64` (operator decision to delete the batch skills). This bug
+> report is retained for historical reference only and is no longer actionable.
+
 **Reported**: 2026-06-24
-**Script**: `skill/intakeall/scripts/intakeall.py`
-**Severity**: High — blocks batch intake for all `idea`-stage work items
+**Script**: `skill/intakeall/scripts/intakeall.py` (removed)
+**Severity**: High — blocks batch intake for all `idea`-stage work items (moot, skill removed)
 
 ---
 

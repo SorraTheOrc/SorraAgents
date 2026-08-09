@@ -192,20 +192,20 @@ class TestIntegrationFormat:
         assert "# Related Work Report" in wrapped
         assert "produced manually" in wrapped
 
-    def test_implementall_exception(self):
-        """Simulate implementall.py encountering a runtime exception."""
+    def test_find_related_exception(self):
+        """Simulate find_related.py encountering a runtime exception."""
         notice = FailureNotice(
-            script_name="implementall.py",
-            reason="RuntimeError: Failed to invoke implement for item SA-123",
+            script_name="find_related.py",
+            reason="RuntimeError: Failed to invoke find-related for item SA-123",
             stderr_context="Traceback (most recent call last):\n  ...\nKeyError: 'id'",
         )
-        report = "# ImplementAll Summary\n\n**Total processed**: 3\n**Implemented**: 2\n**Errors**: 1"
+        report = "# Find Related Report\n\n**Total processed**: 3\n**Processed**: 2\n**Errors**: 1"
         wrapped = notice.wrap(report)
 
         assert wrapped.count("⚠ Script Execution Failure:") == 2
-        assert "implementall.py" in wrapped
+        assert "find_related.py" in wrapped
         assert "RuntimeError" in wrapped
-        assert "Failed to invoke implement" in wrapped
-        assert "# ImplementAll Summary" in wrapped
+        assert "Failed to invoke find-related" in wrapped
+        assert "# Find Related Report" in wrapped
         assert "stderr_context" not in wrapped  # Using attribute, not "stderr_context" literal
         assert "KeyError: 'id'" in wrapped

@@ -55,34 +55,22 @@ From the repository root, on the `main` branch:
 ```bash
 git checkout main
 git pull origin main
-bash scripts/release/merge-dev-to-main.sh --dry-run
+node skill/ship/scripts/run-release.js --dry-run
 ```
 
 Expected behaviour:
 
 - The script runs pre-flight checks (gh auth, wl availability, clean tree).
-- It checks CI status for `dev-full-suite` on `dev`.
-  - If CI is not green, the script will **abort** (hard gate). In dry-run
-    mode it reports what it would have done.
 - It shows what the merge diff would look like.
 - It prints the audit comment that would be recorded.
 - **No changes are made** to any branch.
 
-### Step 5 — Verify CI workflow files
+### Step 5 — Verify release gates
 
-```bash
-# Check dev-full-suite workflow exists
-test -f .github/workflows/dev-full-suite.yml && echo "PASS: dev-full-suite.yml exists" || echo "FAIL: dev-full-suite.yml missing"
-
-# Check standard CI workflow exists
-test -f .github/workflows/ci.yml && echo "PASS: ci.yml exists" || echo "FAIL: ci.yml missing"
-```
-
-Verify `dev-full-suite.yml` contains:
-
-- [ ] `workflow_dispatch` trigger (allows manual pre-merge runs)
-- [ ] `full-suite` job that runs `pytest`
-- [ ] Test results uploaded as artifacts
+Review that the release process enforces its local gates (worklog refs,
+audit readiness, critical items, producer review) — see
+`docs/dev/release-process.md`. There are no CI workflow files; all tests run
+locally before release.
 
 ### Step 6 — Verify branch protection awareness
 
@@ -100,7 +88,7 @@ grep -c "main" agent/ship.md | xargs -I{} echo "Found {} references to main in s
 Run a dry-run with an explicit work item ID to confirm audit logging works:
 
 ```bash
-bash scripts/release/merge-dev-to-main.sh --dry-run --work-item-id SA-0MPDZE6LZ008WKR3
+node skill/ship/scripts/run-release.js --dry-run --work-item-id SA-0MPDZE6LZ008WKR3
 ```
 
 The output should include a structured audit comment template.
@@ -111,11 +99,10 @@ All of the following must pass for the release process to be considered
 ready for use:
 
 1. `docs/dev/release-process.md` exists and contains all required sections.
-2. `scripts/release/merge-dev-to-main.sh` exists, is executable, and runs
-   without errors in `--dry-run` mode.
-3. `.github/workflows/dev-full-suite.yml` exists and is properly configured.
-4. The dry-run merge produces a valid diff summary and audit comment.
-5. The script correctly rejects runs from non-`main` branches.
+2. The release script (`skill/ship/scripts/release/merge-dev-to-main.sh`)
+   exists, is executable, and runs without errors in `--dry-run` mode.
+3. The dry-run merge produces a valid diff summary and audit comment.
+4. The script correctly rejects runs from non-`main` branches.
 
 ## Reporting Results
 

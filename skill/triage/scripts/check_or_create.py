@@ -53,9 +53,12 @@ def list_critical_issues() -> list[dict[str, Any]]:
         return []
     try:
         data = json.loads(out)
-        # wl list may return {"items": [...]} or a bare list
-        if isinstance(data, dict) and "items" in data:
-            return data["items"]
+        # wl list may return {"workItems": [...]}, {"items": [...]} or a bare list
+        if isinstance(data, dict):
+            items = data.get("workItems") or data.get("items")
+            if isinstance(items, list):
+                return items
+            return []
         if isinstance(data, list):
             return data
         return []
