@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest import mock
 
 # ---------------------------------------------------------------------------
@@ -7044,7 +7045,7 @@ class TestCmdProjectPiOutputWiring:
     3. Unit tests cover both the wired path and the fallback path.
     """
 
-    _WORK_ITEMS = [
+    _WORK_ITEMS: ClassVar[list[dict[str, str]]] = [
         {"id": "SA-1", "status": "in_progress"},
         {"id": "SA-2", "status": "blocked"},
         {"id": "SA-3", "status": "completed"},
