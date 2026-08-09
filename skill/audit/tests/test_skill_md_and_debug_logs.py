@@ -83,6 +83,104 @@ class TestSkillMdScanningGuidance:
 
 
 # ===========================================================================
+# Monitored Run Execution guidance (for SA-0MSL51XSF0086KM5)
+# ===========================================================================
+
+
+class TestSkillMdMonitoredRunGuidance:
+    """SKILL.md documents the launch → monitor → abort workflow for long audits.
+
+    Work item: SA-0MSL51XSF0086KM5 (test-first verification contract, child
+    SA-0MSL6DQVN0036IGM). Audits can legitimately run for hours, so SKILL.md
+    must define an agent-side execution contract: a detached launch with a
+    180-minute hard budget, output captured to a unique log, a 3-minute
+    progress-monitoring cadence, and a defined abort + mitigation procedure.
+    Guidance-only change — these tests assert the documented markers exist.
+    """
+
+    @staticmethod
+    def _section() -> str:
+        """Return the Monitored Run Execution section of SKILL.md."""
+        text = SKILL_MD.read_text()
+        start = text.index("## Monitored Run Execution")
+        end = text.find("\n## ", start + 1)
+        return text[start : end if end != -1 else len(text)]
+
+    def test_skill_md_has_monitored_run_execution_section(self) -> None:
+        """SKILL.md contains a Monitored Run Execution section heading."""
+        assert "## Monitored Run Execution" in SKILL_MD.read_text()
+
+    def test_launch_captures_pre_audit_status_and_stage(self) -> None:
+        """Launch documents capturing the pre-audit status/stage via wl show."""
+        section = self._section()
+        assert "wl show <id> --json" in section
+        assert "pre-audit" in section.lower()
+        assert "status" in section
+        assert "stage" in section
+
+    def test_launch_is_detached_with_unique_log(self) -> None:
+        """Launch uses nohup/disown and a unique audit_run_ log path."""
+        section = self._section()
+        assert "nohup" in section
+        assert "disown" in section
+        assert "audit_run_" in section
+        assert "~/.audit_debug/" in section
+
+    def test_launch_enforces_180_minute_hard_budget(self) -> None:
+        """Launch enforces the 10800s (180-minute) outer budget."""
+        section = self._section()
+        assert "10800" in section
+        assert "180-minute" in section
+
+    def test_monitor_reports_every_3_minutes_with_alive_check(self) -> None:
+        """Monitor specifies the 3-minute cadence and kill -0 alive check."""
+        section = self._section()
+        assert "every 3 minutes" in section
+        assert "kill -0" in section
+
+    def test_monitor_tails_log_for_phase_markers(self) -> None:
+        """Monitor tails the log for the runner's phase/timing markers."""
+        section = self._section()
+        assert "tail -50" in section
+        assert "Phase 1 passed: running Phase 2 deep code analysis" in section
+        assert "Per-call timing:" in section
+
+    def test_monitor_confirms_log_growth(self) -> None:
+        """Monitor treats a stopped-growing log as a stall signal."""
+        section = self._section()
+        assert "growth" in section.lower() or "growing" in section.lower()
+
+    def test_abort_defines_stall_trigger(self) -> None:
+        """Abort defines the >=10 minute no-output stall trigger."""
+        section = self._section()
+        assert "10 minutes" in section
+
+    def test_abort_defines_repeated_failure_trigger(self) -> None:
+        """Abort defines the >=3 consecutive Pi-call-failure trigger."""
+        section = self._section()
+        assert "3 consecutive" in section
+        assert "Warning: Pi call failed" in section
+
+    def test_abort_restores_pre_audit_state_and_clears_assignee(self) -> None:
+        """Abort restores pre-audit status/stage and clears the assignee."""
+        section = self._section()
+        assert "restore" in section.lower()
+        assert "assignee" in section.lower()
+
+    def test_abort_kills_process_tree_and_appends_failure_notice(self) -> None:
+        """Abort kills the process tree and appends a failure notice."""
+        section = self._section()
+        assert "process tree" in section
+        assert "failure notice" in section.lower()
+
+    def test_abort_never_fabricates_or_overrides_a_verdict(self) -> None:
+        """Abort never persists a fabricated report or overrides a verdict."""
+        section = self._section()
+        assert "fabricat" in section.lower()
+        assert "override" in section.lower()
+
+
+# ===========================================================================
 # Debug-log lifecycle (for SA-0MSBSOAEM0078LAO)
 # ===========================================================================
 

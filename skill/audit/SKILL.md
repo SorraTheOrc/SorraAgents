@@ -65,6 +65,125 @@ wl update <id> --status "$ORIG_STATUS" --assignee "" --json
 
 Always include `--json` for machine-readable output.
 
+## Monitored Run Execution
+
+Audits invoked via the canonical runner (`python3 ./scripts/audit_runner.py
+issue <id>` / `project <id>`) can legitimately run for **hours** — Phase 1 +
+Phase 2 with children, a child audit cascade (`--audit-children`), or a large
+project audit. This section defines the agent-side
+**launch → monitor → abort** contract so that:
+
+- a default bash-tool timeout can never kill a long run mid-audit,
+- all output is captured to a log file the agent can inspect, and
+- a run that goes astray is stopped cleanly with the work item left in a
+  recoverable state.
+
+This is **guidance for the agent invoking the runner** — it does not change
+`audit_runner.py` / `persist_audit.py` behavior.
+
+### Launch
+
+1. **Capture the pre-audit state.** Before launching, record the work item's
+   current `status`/`stage` so an abort can restore them exactly:
+
+   ```bash
+   wl show <id> --json   # note workItem.status and workItem.stage
+   ```
+
+2. **Launch detached with output captured.** Start the runner in the
+   background, fully detached from the bash tool, with stdout+stderr
+   redirected to a **unique** log file under `~/.audit_debug/<project>/`
+   (the same directory family as the runner's own debug logs):
+
+   ```bash
+   mkdir -p ~/.audit_debug/<project>
+   LOG=~/.audit_debug/<project>/audit_run_<work-item-id>_$(date +%Y%m%dT%H%M%S).log
+   nohup python3 ./scripts/audit_runner.py issue <id> [flags] > "$LOG" 2>&1 &
+   disown
+   echo "PID $! LOG $LOG"   # record both for the monitor step
+   ```
+
+   - The log name is **always unique per run**
+     (`audit_run_<work-item-id>_<timestamp>.log`) — never a fixed shared
+     path (e.g. never `/tmp/audit.log`).
+   - Record the PID and the absolute log path; both are needed by the
+     monitor step.
+
+3. **Enforce a 180-minute hard budget.** The whole run must finish within
+   **10800s (180 min)** of launch. This is the agent-side outer budget —
+   distinct from the runner's per-call `CALL_PI_TIMEOUT` (1800s default,
+   `--timeout` / `AUDIT_PI_TIMEOUT`) and its child-count-scaled parent
+   elapsed-time guard (`--parent-timeout` / `AUDIT_PARENT_TIMEOUT`). When the
+   180-minute budget is exhausted the run MUST be aborted (see Abort &
+   Mitigate below).
+
+4. **Foreground fallback.** If a detached launch is not possible (e.g. the
+   harness does not keep background processes between bash-tool calls) and a
+   foreground call is used instead, the bash-tool call MUST be given a
+   timeout `>= 10800s` (180 min). If neither a detached launch nor a
+   `>= 10800s` tool timeout is available, **refuse to start the run**: an
+   unmonitorable audit must not be launched.
+
+### Monitor
+
+While the run is active, **report progress every 3 minutes**:
+
+1. **Alive check** — `kill -0 <pid>` (exit 0 = still running).
+2. **Tail the log** — `tail -50 <log>` and look for the runner's stderr
+   progress markers:
+   - `Phase 1 passed: running Phase 2 deep code analysis...`
+     (Phase 1 → Phase 2 transition),
+   - `Per-call timing: issue_id=... context=... elapsed_seconds=...` lines
+     (per-call instrumentation; a run stuck on one long call shows a
+     growing elapsed_seconds with no new context).
+3. **Confirm log growth** — the log file must grow between checks; a log
+   that stopped growing is a stall signal (see Abort & Mitigate).
+4. **Report to the operator** — on each check, report the elapsed time since
+   launch and the current phase (e.g. "Phase 1", "Phase 2 deep analysis",
+   "child audit cascade").
+
+### Abort & Mitigate
+
+**Going-astray triggers** — any one of the following requires stopping the
+run:
+
+- **(a) Stall** — no new log output for ≥10 minutes (the log size has not
+  grown and no new phase/timing line appeared).
+- **(b) Repeated failures** — ≥3 consecutive `Warning: Pi call failed` /
+  provider-error retries with no progress (no new phase marker since the
+  failures began).
+- **(c) Other agent-determined signals** — unexpected process exit, error
+  loops, or output that violates the audit contract (e.g. an attempt to
+  execute state-modifying commands outside the authorized flow).
+- **(d) Budget exhaustion** — 180 minutes elapsed since launch.
+
+**Abort procedure** — on any trigger:
+
+1. **Kill the process tree.** `pkill -TERM -P <pid>` (children first), then
+   `kill <pid>`; escalate to `kill -KILL <pid>` if the process does not exit.
+2. **Restore the pre-audit state** — ONLY when the runner did not already
+   complete its verdict-driven lifecycle (no verdict line was printed and no
+   terminal status transition was observed). Mirror the runner's own failure
+   fallback semantics: restore the `status`/`stage` captured before launch
+   and clear the assignee:
+
+   ```bash
+   wl update <id> --status <pre-audit-status> --stage <pre-audit-stage> --assignee "" --json
+   ```
+
+   A transient abort must **never demote** an `in_review` item to `open` —
+   restore exactly what was captured (fall back to `open`/`plan_complete`
+   only when the pre-audit state could not be determined).
+3. **Append a failure notice** to the run log with a progress summary:
+   elapsed time, the last phase marker seen, and the trigger that caused the
+   abort.
+4. **Report the outcome** to the operator (run id, log path, trigger,
+   restored status/stage).
+
+**Never** persist a fabricated audit report on abort, and **never** override
+or contradict a runner verdict that already completed its lifecycle: if the
+runner finished, its verdict and status transitions stand untouched.
+
 ## Freshness Gate
 
 Short-circuits item-level audits when a recent, valid audit exists to avoid unnecessary model calls.
