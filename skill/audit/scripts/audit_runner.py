@@ -5094,6 +5094,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # Compute the intended terminal state first (no wl calls), so the
         # failure warning can tell the operator exactly what to apply.
         restore_cmd: list[str] | None = None
+        # Conservative default: on any computation failure below, treat the
+        # run as fallback-tainted so the debug log is retained for forensics.
+        fallback_tainted = True
         try:
             # Infra-fallback provenance: a "No" derived from infrastructure-
             # failure fallbacks must restore, never demote. A "Yes" verdict
@@ -5145,6 +5148,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 f"Warning: could not compute terminal status for {issue_id}: {exc}",
                 file=sys.stderr,
             )
+
+        # ------------------------------------------------------------------
+        # Debug-log lifecycle: a successful audit run removes its debug file
+        # (including explicit --debug-log runs); failed or fallback-tainted
+        # runs retain full-content files for forensics (SA-0MSBSOAEM0078LAO
+        # AC3). A parse-failure/provider-error fallback keeps the file even
+        # though the run completed, because the raw output is the only
+        # forensic record of the failed evaluation.
+        # ------------------------------------------------------------------
+        if audit_completed and script_failure is None and not fallback_tainted:
+            _remove_debug_log(debug_log, issue_id)
 
         if restore_cmd is not None:
             # Apply the terminal transition, retrying transient failures. The
@@ -5283,6 +5297,7 @@ def cmd_project(timeout: int | None = None,
     # parseable, otherwise fall back to the locally computed values so the
     # report is never degraded by an unparseable or failed model call
     # (SA-0MSL1YWOG005QAH8).
+    pi_output_parsed = False
     prompt = (
         f"[READ-ONLY AUDIT] You are performing a read-only audit. "
         f"Do NOT close, modify, create, or delete any work items. "
@@ -5310,6 +5325,7 @@ def cmd_project(timeout: int | None = None,
         ):
             summary = parsed_summary.strip()
             recommendation = parsed_recommendation.strip()
+            pi_output_parsed = True
         elif raw_text:
             print(
                 "Warning: Unparseable Pi output for project summary — "
@@ -5339,6 +5355,13 @@ def cmd_project(timeout: int | None = None,
             )
             report = notice.wrap(report)
         print(report, end="")
+
+    # Debug-log lifecycle: a successful project audit removes its debug file;
+    # failed runs retain full-content files for forensics (SA-0MSBSOAEM0078LAO
+    # AC3). A script failure or an unparseable Pi output keeps the file — the
+    # raw output is the only forensic record of the failed evaluation.
+    if script_failure is None and pi_output_parsed:
+        _remove_debug_log(debug_log, "project")
     return 0
 
 

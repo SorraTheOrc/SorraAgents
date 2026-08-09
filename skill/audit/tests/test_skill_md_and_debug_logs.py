@@ -170,6 +170,95 @@ class TestDebugLogContentFidelity:
         assert len(written["raw_stderr"]) == 50_000
 
 
+class TestRunCompletionCleanup:
+    """Successful audit runs remove their debug file; failed runs retain it.
+
+    SA-0MSBSOAEM0078LAO AC3 (verified by SA-0MSLSHK9600667FO post-audit
+    remediation): ``_remove_debug_log`` is dead code unless wired into the
+    cmd_issue/cmd_project finally paths. These tests exercise the wiring
+    directly (the runner is unit-tested elsewhere with mocked _call_pi).
+    """
+
+    def test_remove_debug_log_removes_default_and_explicit(self) -> None:
+        """_remove_debug_log unlinks the default path and an explicit path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_p = Path(tmp)
+            explicit = tmp_p / "explicit.jsonl"
+            explicit.write_text('{"a": 1}\n')
+            default = tmp_p / "audit_debug_SA-1.jsonl"
+            default.write_text('{"b": 2}\n')
+            with mock.patch.object(audit_runner, "_default_debug_log_path",
+                                   return_value=default):
+                # Explicit path wins when provided.
+                audit_runner._remove_debug_log(str(explicit), "SA-1")
+                assert not explicit.exists()
+                assert default.exists()
+                # Without an explicit path, the default is removed.
+                audit_runner._remove_debug_log(None, "SA-1")
+                assert not default.exists()
+
+    def test_remove_debug_log_ignores_missing_file(self) -> None:
+        """Removing a non-existent debug file is a silent no-op."""
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_runner._remove_debug_log(str(Path(tmp) / "nope.jsonl"), "SA-1")
+        # No exception raised; nothing to assert beyond reaching here.
+
+    @staticmethod
+    def _fake_run_wl(runner, cmd, worklog_dir=None):
+        """Return plausible JSON for any wl command issued by cmd_issue/"cmd_project"."""
+        cmd_str = " ".join(cmd)
+        if "show" in cmd_str and "--children" not in cmd_str:
+            return {"success": True, "workItem": {"id": "SA-X", "status": "open", "stage": "plan_complete"}}
+        if "--children" in cmd_str:
+            return {"success": True, "workItem": {"id": "SA-X", "description": "", "status": "open"}, "children": []}
+        if "update" in cmd_str or "list" in cmd_str:
+            return {"success": True}
+        return {"success": True}
+
+    def test_cmd_issue_removes_debug_log_on_success(self) -> None:
+        """cmd_issue deletes the debug file when the audit completes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            debug_path = Path(tmp) / "audit_debug_SA-X.jsonl"
+            debug_path.write_text('{"raw_stdout": "x"}\n')
+            with mock.patch.object(audit_runner, "_call_pi", return_value={
+                "verdict": "no", "evidence": "gap", "raw_stdout": "",
+                "raw_stderr": "", "elapsed_seconds": 1.0,
+            }), mock.patch.object(audit_runner, "_run_wl",
+                                  side_effect=self._fake_run_wl), \
+                 mock.patch("skill.code_review.scripts.code_quality.run_code_quality",
+                            return_value={"success": True, "findings": [], "fixes_applied": 0}), \
+                 mock.patch.object(audit_runner, "_remove_debug_log") as mock_remove, \
+                 mock.patch.object(audit_runner, "_default_debug_log_path",
+                                   return_value=debug_path):
+                audit_runner.cmd_issue(
+                    "SA-X", persist=False, force=True, debug_log=str(debug_path),
+                )
+            # Cleanup invoked on the success path (even for a 'No' verdict).
+            assert mock_remove.called
+            args = mock_remove.call_args[0]
+            assert args[0] == str(debug_path)
+            assert args[1] == "SA-X"
+
+    def test_cmd_project_removes_debug_log_on_success(self) -> None:
+        """cmd_project deletes the debug file when the audit completes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            debug_path = Path(tmp) / "audit_debug_project.jsonl"
+            debug_path.write_text('{"raw_stdout": "x"}\n')
+            with mock.patch.object(audit_runner, "_call_pi", return_value={
+                "extracted_text": '{"summary": "s", "recommendation": "r"}',
+                "raw_stdout": "", "raw_stderr": "", "elapsed_seconds": 1.0,
+            }), mock.patch.object(audit_runner, "_run_wl",
+                                  side_effect=self._fake_run_wl), \
+                 mock.patch.object(audit_runner, "_remove_debug_log") as mock_remove, \
+                 mock.patch.object(audit_runner, "_default_debug_log_path",
+                                   return_value=debug_path):
+                audit_runner.cmd_project(debug_log=str(debug_path))
+            assert mock_remove.called
+            args = mock_remove.call_args[0]
+            assert args[0] == str(debug_path)
+            assert args[1] == "project"
+
+
 # ===========================================================================
 # cleanup_debug_logs.py
 # ===========================================================================

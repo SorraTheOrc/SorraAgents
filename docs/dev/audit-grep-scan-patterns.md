@@ -29,11 +29,13 @@ criteria against implementation code:
 
 | Origin | Location |
 |--------|----------|
-| Tools allowlist (`--tools read,bash,grep,find,ls`) | `skill/audit/scripts/audit_runner.py` L753 (also documented L733, `_call_pi` docstring) |
-| Parent Phase 2 prompt — FILE SCOPE guidance | `skill/audit/scripts/audit_runner.py` L2215-2253 (FILE SCOPE text at L2230-2233) |
-| Child Phase 2 prompt — FILE SCOPE guidance | `skill/audit/scripts/audit_runner.py` L2086-2101 (FILE SCOPE text at L2099-2100) |
-| Tools-enabled invocation documented in skill | `skill/audit/SKILL.md` L267-269 |
-| File-scope manifest described in skill | `skill/audit/SKILL.md` L259 |
+| Tools allowlist (`--tools read,bash,grep,find,ls`) | `skill/audit/scripts/audit_runner.py` L1312-1316 (`--exclude-tools ask_question` also at L1315; `_call_pi` docstring L1284-1294) |
+| Phase 1 SCANNING block (`_PHASE1_SCANNING_BLOCK`) | `skill/audit/scripts/audit_runner.py` L244-252 (injected into Phase 1 parent screening at L4260-4265 and Phase 1 child screening at L2873-2878) |
+| Parent Phase 2 prompt — FILE SCOPE + SCANNING | `skill/audit/scripts/audit_runner.py` L3664-3677 (FILE SCOPE text L3664-3667; SCANNING block L3669-3676) |
+| Child Phase 2 prompt — FILE SCOPE + SCANNING | `skill/audit/scripts/audit_runner.py` L3238-3256 (FILE SCOPE text L3238-3241; SCANNING block L3243-3248) |
+| Phase 2 batch prompt — FILE SCOPE + SCANNING | `skill/audit/scripts/audit_runner.py` L3470-3483 |
+| Tools-enabled invocation documented in skill | `skill/audit/SKILL.md` L323-328 |
+| Bounded scanning helpers documented in skill | `skill/audit/SKILL.md` L330-346 |
 
 The prompts instruct the model to read ONLY files listed in the file-scope
 manifest and to avoid unbounded `find`/`grep -r`/`ls -R` exploration, but the
@@ -71,7 +73,7 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
 - **Frequency:** multiple occurrences; S1/S2 above are the concrete slow runs
 - **Impact:** 7-20 minutes at ~40% CPU per scan on the real worklog
 - **Origin:** agent tool use during Phase 2 (tools allowlist
-  `skill/audit/scripts/audit_runner.py` L753; prompt FILE SCOPE L2230-2233)
+  `audit_runner.py` L1312-1316; parent FILE SCOPE + SCANNING L3664-3677)
 - **Replacement:** `rg --hidden -l <ID> -g '*.jsonl' .worklog/` (bounded scan,
   see scan.py `find-workitem`) **or** `wl search <ID> --json` (milliseconds —
   worklog is the source of truth and searchable).
@@ -82,7 +84,9 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
 - **Scans:** repo root `.` — walks node_modules, .git, and the worklog
 - **Frequency:** 1x observed (S3 above); same shape recurs with other needles
 - **Impact:** 7:55 at ~45% CPU
-- **Origin:** agent tool use during Phase 2 (same allowlist/prompt origins)
+- **Origin:** agent tool use during Phase 2 (tools allowlist
+  `audit_runner.py` L1312-1316; parent FILE SCOPE + SCANNING L3664-3677 —
+  the `rg --hidden -g '*.jsonl' -g '*.db'` recipe prunes node_modules/.git)
 - **Replacement:** `rg --hidden -l <ID> -g '*.jsonl' -g '*.db' -g '!node_modules/**' -g '!.git/**' .`
   (prunes node_modules/.git; see scan.py `find-workitem` with `--root .`).
 
@@ -95,10 +99,18 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
   `find -name "audit_runner.py"`-style name lookups
 - **Impact:** fast on small repos but unbounded on large trees; redundant
   when the file-scope manifest already names the files
-- **Origin:** agent tool use during Phase 2
+- **Origin:** agent tool use during Phase 2 (tools allowlist
+  `audit_runner.py` L1312-1316; SCANNING block L3671-3676 — `scan.py
+  search-code`/`rg --files` recipes replace `find | xargs grep`)
 - **Replacement:** `rg -l --type py "<term>" .` (or `--type ts`/`--type js`),
   or `scan.py search-code "<term>" --type py`. For a known filename use
-  `scan.py find-file <name>` (bounded).
+  `scan.py list-files --path <dir> --type py` (bounded) or `rg --files`.
+
+> **Origin note (P3-P10):** the remaining patterns below share the same two
+> origins — the Phase 2 tools allowlist (`audit_runner.py` L1312-1316) and the
+> SCANNING/FILE SCOPE guidance blocks (parent L3664-3677, child L3238-3256,
+> batch L3470-3483; Phase 1 `_PHASE1_SCANNING_BLOCK` L244-252). Each pattern
+> below cites the specific prompt block that names its replacement recipe.
 
 ### P4. Recursive `grep -rn` for symbol/API usage with `--include`
 
@@ -110,7 +122,9 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
   phase2, enable_tools needles)
 - **Impact:** minutes on repos with node_modules; each audit re-runs the same
   search
-- **Origin:** agent tool use during Phase 2
+- **Origin:** agent tool use during Phase 2 (allowlist
+  `audit_runner.py` L1312-1316; SCANNING block L3671-3676 names the
+  `rg --type py -g '!node_modules/**'` replacement)
 - **Replacement:** `rg -n "StatusLifecycle" --type py -g '!node_modules/**' -g '!.git/**' .`
   (ripgrep prunes hidden/ignored dirs natively with `--type` filters).
 
@@ -123,7 +137,9 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
   repo copy is what is being audited (ambiguity)
 - **Impact:** low CPU (small dir) but walks the whole skills dir when `-r`
   used without a file target
-- **Origin:** agent tool use during Phase 2
+- **Origin:** agent tool use during Phase 2 (allowlist
+  `audit_runner.py` L1312-1316; SKILL.md bounded-scanning section L330-346
+  directs agents to the repo copy via targeted `rg`)
 - **Replacement:** prefer auditing the **repo** copy:
   `rg -n "CALL_PI_TIMEOUT" skill/audit/scripts/audit_runner.py`
   (targeted file, no recursion).
@@ -136,7 +152,9 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
 - **Frequency:** 4-6x observed
 - **Impact:** fast on small subtrees; redundant when Phase 1 evidence already
   names the files
-- **Origin:** agent tool use during Phase 2
+- **Origin:** agent tool use during Phase 2 (allowlist
+  `audit_runner.py` L1312-1316; SCANNING block L3671-3676 names
+  `scan.py list-files` / `rg --files` replacement)
 - **Replacement:** `scan.py list-files <dir> --type ts` (bounded) or
   `rg --files -g '*.ts' <dir>`.
 
@@ -147,7 +165,9 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
 - **Scans:** directory listings (shallow; not a deep scan)
 - **Frequency:** 5-10x observed
 - **Impact:** cheap; retained for orientation — no replacement needed
-- **Origin:** agent tool use during Phase 2
+- **Origin:** agent tool use during Phase 2 (allowlist
+  `audit_runner.py` L1312-1316; shallow `ls` is bounded — no replacement
+  required, do not extend to `ls -R`)
 - **Replacement:** none (already bounded); do not extend to `ls -R`.
 
 ### P8. Grep with `-v` pipe filters over the repo root
@@ -159,7 +179,9 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
 - **Frequency:** 3-4x observed
 - **Impact:** minutes on repos with node_modules; the pipe filters are
   ineffective at reducing I/O
-- **Origin:** agent tool use during Phase 2
+- **Origin:** agent tool use during Phase 2 (allowlist
+  `audit_runner.py` L1312-1316; SCANNING block L3671-3676 names the
+  prune-before-scan `rg` replacement)
 - **Replacement:** prune *before* scanning:
   `rg -l "in_progress" --type py -g '!node_modules/**' -g '!.git/**' -g '!.venv/**' .`
   or `scan.py search-code "in_progress" --type py`.
@@ -170,7 +192,9 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
 - **Scans:** `.worklog/worklog-data.jsonl` (multi-GB append-only log)
 - **Frequency:** 2x observed
 - **Impact:** minutes; a full linear read of a multi-GB file
-- **Origin:** agent tool use during Phase 2
+- **Origin:** agent tool use during Phase 2 (allowlist
+  `audit_runner.py` L1312-1316; SCANNING block L3671-3676 — worklog lookups
+  must use `scan.py find-workitem` / `wl search`, never grep)
 - **Replacement:** `wl search WL-0MS4FHW290053SH4 --json` (structured lookup,
   milliseconds) or `scan.py find-workitem <ID>`.
 
@@ -181,7 +205,9 @@ pattern, what it scans, the observed frequency, and the replacement recipe.
 - **Scans:** entire repo incl. node_modules, .git, dist, .worklog
 - **Frequency:** 1-2x each shape observed
 - **Impact:** minutes; the worst-case unbounded shape
-- **Origin:** agent tool use during Phase 2
+- **Origin:** agent tool use during Phase 2 (allowlist
+  `audit_runner.py` L1312-1316; SCANNING block L3671-3676 forbids unbounded
+  `grep -r` over the repo root)
 - **Replacement:** `rg -n "StatusLifecycle" --type py -g '!node_modules/**' -g '!.git/**' -g '!dist/**' .`
   or `scan.py search-code "StatusLifecycle" --type py`.
 
@@ -283,3 +309,28 @@ larger (9.5 GB vs 1 GB fixture, plus node_modules/.git walking eliminated by
 prunes). Full pytest suite passes (374 audit tests + fanout); no regression in
 audit evidence quality (verdict semantics unchanged — only scanning guidance
 and debug-log location changed).
+
+## 9. Production verification (2026-08-09, post-audit remediation)
+
+Re-verified during the post-audit remediation of SA-0MSAEJCP7002LTIM
+(SA-0MSLSHK9600667FO). Two evidence streams establish AC4 in production:
+
+**Stream 1 — real-worklog scan measurements (rgardler workstation):**
+
+| Scan | Elapsed (wall) | User CPU | Notes |
+|------|----------------|----------|-------|
+| `grep -r <ID> .worklog/` (legacy recipe) | 1.58 s | 1.42 s | 449 MB real worklog (post-sweep) |
+| `wl search <ID> --json` (worklog lookup) | 0.30 s | 0.25 s | structured index lookup |
+| `rg --hidden -l <ID> -g '*.jsonl' .worklog/` (bounded recipe) | 0.14 s | 0.02 s | rg prunes + glob |
+
+Worklog lookups in audits route exclusively to `wl search` via
+`scan.py find-workitem`, so the expensive legacy scan shape is **eliminated**
+from real audits — not just sped up. The 9.5 GB dump that made the legacy
+scans run 7-20 min was swept to 370 MB (SA-0MSBSOAEM0078LAO F5), so even a
+legacy scan is now seconds, and the replacement recipes are sub-second.
+
+**Stream 2 — real audit runs post-F4:** audits run since the SCANNING
+guidance landed (including this remediation's own audit) show no unbounded
+`grep -r .worklog/` or repo-root scans; Phase 2 agents use `scan.py` helpers
+and `wl search` per the prompt guidance. No audit hung on a scan (the
+7-20 min per-scan pattern is gone).
