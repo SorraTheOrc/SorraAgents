@@ -67,6 +67,20 @@ Startup static-context budget (bytes / tokens):
 > Update `context-budget.thresholds.json` to the post-F2 values when F2 is
 > accepted (the gate should pin the approved budget, not the pre-change one).
 
+> **F4 update (2026-08-09):** after compacting `AGENTS_GLOBAL.md` to the
+> ≤8,192 B budget (SA-0MSLK7LGA003J0KP), the global-file contribution
+> dropped from 19,518 B to **8,170 B** (~58% cut). New measured budget:
+>
+> ```
+>   global_agents   :   8170 B /  2042 tok
+>   project_agents  :   1334 B /   334 tok
+>   skills_prose    :   1796 B /   449 tok (17 skills)
+>   total           :  11300 B /  2825 tok
+> ```
+>
+> `context-budget.thresholds.json` now pins `global_agents: 8192` (the F4
+> budget) with `total: 13049`.
+
 > **Intake measurement note:** the intake baseline (3,492 B prose) was
 > measured with a looser methodology that varied between sessions (3,371 B
 > → 3,505 B depending on block-style YAML handling). This tool defines the
@@ -80,10 +94,10 @@ PR/CI run when the startup budget regresses above the pre-change baseline:
 
 ```json
 {
-  "global_agents": 19518,
+  "global_agents": 8192,
   "project_agents": 1334,
   "skills_prose": 3523,
-  "total": 24375
+  "total": 13049
 }
 ```
 
