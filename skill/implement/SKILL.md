@@ -139,6 +139,23 @@ releases the item back to `open`. The handler uses `os._exit` so the reset
 cannot be undone by a `StatusLifecycle` context-manager rollback during
 exception unwinding.
 
+### Error/exception handling (abort on unexpected errors)
+
+On unexpected error (API failure, network error, exception):
+
+1. **Reset status to open:** `StatusLifecycle.update_status(<work-item-id>, "open")`
+2. **Log the error:** `wl comment add <work-item-id> --comment "Error: <description>" --author "<AGENT>" --json`
+3. **Return control** to the operator with error details.
+4. If transient, the operator may retry.
+
+### User-initiated abort
+
+If the operator cancels after Step 2:
+
+1. `StatusLifecycle.update_status(<work-item-id>, "open")`
+2. Return control to the operator.
+3. Document: `wl comment add <work-item-id> --comment "Aborted by operator" --author "<AGENT>" --json`
+
 ## Handling Assets
 
 - **Graphics/audio:** Create in `assets/images/` or `assets/audio/` with a `placeholder_` prefix. Reference in work item comments and commit. Optimize for size/performance. Use only assets you have rights to distribute; provide attribution where required.
@@ -153,8 +170,9 @@ Execute the following steps in order. Do not skip steps. Use the live commands w
 
 - **Before any other step**, claim the work item using the orchestration script
   or `StatusLifecycle`:
-  `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
-  This signals to other agents that this item is being worked on.
+  `StatusLifecycle.update_status(<work-item-id>, "in_progress", stage="in_progress", assignee="<AGENT>")`
+  This signals to other agents that this item is being worked on and assigns it
+  to the implementing agent.
 
 > **Code Freeze gate:** when using `implement.py start <id>`, the script checks
 > the Code Freeze marker (`.worklog/code-freeze.json`, contract
@@ -194,8 +212,8 @@ On abort: `StatusLifecycle.update_status(<work-item-id>, "open")`
 
 3. Understand the work item
 
-If not already assigned (or when using the orchestration script, this is handled
-by `phase_start()`): `StatusLifecycle.update_status(<work-item-id>, "in_progress", stage="in_progress", assignee="<AGENT>")`
+The work item is already claimed from Step 1 (or by `phase_start()` when using
+the orchestration script).
 
 Check the most recent worklog action, comment, or audit entry:
 
@@ -264,7 +282,6 @@ After all recursive child implementations are complete, check whether this work 
     `wl comment add <work-item-id> --comment "Not all children are in a terminal stage. Needs producer review." --author "<AGENT>" --json`
   - Return control to the operator.
 
-- Check for a recent audit record; if none, run `/skill:audit <work-item-id>` to establish work needed.
 - Write tests and code to meet acceptance criteria:
   - Make minimal, focused changes.
   - **Test adequately — TDD preferred.** Writing tests first (TDD) is the preferred approach, but alternative strategies (e.g., test-after) are acceptable when they better suit the implementation. Ensure excellent test coverage with meaningful tests; if external constraints prevent complete tests, use harnesses/mocks and document the limitation.
@@ -279,26 +296,13 @@ After all recursive child implementations are complete, check whether this work 
     - If a new or incomplete critical issue is returned, implement it, fix the test, and re-run until all pass.
   - Update documentation (excluding `CHANGELOG.md`, which is managed by the ship pipeline).
   - Summarize changes in the work item.
-  - Wait for user confirmation before proceeding.
 
-### Error/exception handling (abort on unexpected errors)
+6. Automated self-review
 
-On unexpected error (API failure, network error, exception):
-
-1. **Reset status to open:** `StatusLifecycle.update_status(<work-item-id>, "open")`
-2. **Log the error:** `wl comment add <work-item-id> --comment "Error: <description>" --author "<AGENT>" --json`
-3. **Return control** to the operator with error details.
-4. If transient, the operator may retry.
-
-### User-initiated abort
-
-If the operator cancels after Step 2:
-
-1. `StatusLifecycle.update_status(<work-item-id>, "open")`
-2. Return control to the operator.
-3. Document: `wl comment add <work-item-id> --comment "Aborted by operator" --author "<AGENT>" --json`
-
----
+- Build and lint the code; fix any issues.
+- Audit the work item: `/skill:audit <work-item-id>`. If ACs are unmet, inform the user and return to step 5.
+- Perform sequential self-review passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff.
+- For each pass, make small, goal-aligned edits. If intent changes are discovered, create an Open Question and stop.
 
 7. Optional refactor step
 
@@ -316,15 +320,6 @@ After implementation completes and before final commit, an automated refactor st
   ```
 
 - See ``../refactor/SKILL.md`` for full documentation.
-
-6. Automated self-review
-
-- Build and lint the code; fix any issues.
-- Run all tests again using the [test skill](../test/SKILL.md) (`/skill:test`) quiet-run discipline; fix any failures.
-- Audit the work item: `/skill:audit <work-item-id>`. If ACs are unmet, inform the user and return to step 5.
-- Perform sequential self-review passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff.
-- For each pass, make small, goal-aligned edits. If intent changes are discovered, create an Open Question and stop.
-- Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`); fix any failures before continuing.
 
 8. Commit, Push to dev and mark in_review
 
@@ -360,7 +355,9 @@ After implementation completes and before final commit, an automated refactor st
 Pre-push blocking check
 -----------------------
 
-Invoke the triage helper and fix any failing tests before pushing.
+Run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`) and
+fix any failing tests before pushing. If failures are outside this work item's
+scope, invoke the triage helper.
 
 Final cleanup (belt-and-suspenders)
 ---------------------------------------
@@ -371,7 +368,7 @@ Before exiting the implement skill at any point, check and reset status as a saf
 wl show <work-item-id> --json
 ```
 
-If `status: in_progress` and work is not complete (not at Step 7), reset via `StatusLifecycle`:
+If `status: in_progress` and work is not complete (not at Step 8), reset via `StatusLifecycle`:
 
 ```python
 StatusLifecycle.update_status(work_item_id, "open")
@@ -387,10 +384,9 @@ workflow phase. All transitions are managed via `StatusLifecycle` — ad-hoc
 
 | Phase | Mechanism | Status | Stage |
 |-------|-----------|--------|-------|
-| Start (Step 0 - Set status) | `StatusLifecycle.update_status(id, "in_progress")` or `phase_start()` | in_progress | (unchanged) |
-| Claim (Step 1) | `StatusLifecycle.update_status(id, "in_progress", stage="in_progress", assignee="<AGENT>")` | in_progress | in_progress |
+| Claim (Step 1 - Set status) | `StatusLifecycle.update_status(id, "in_progress", stage="in_progress", assignee="<AGENT>")` or `phase_start()` | in_progress | in_progress |
 | Epic / parent: all children done (Step 5.1) | `StatusLifecycle.update_status(id, "completed", stage="in_review")` | completed | in_review |
-| Final (Step 6 - Mark in_review) | `with StatusLifecycle(id, target_stage="in_review"):` or `phase_start()`+`phase_finish()` | completed | in_review |
+| Final (Step 8 - Commit, push, mark in_review) | `with StatusLifecycle(id, target_stage="in_review"):` or `phase_finish()` | completed | in_review |
 | Abort - dirty work tree | `StatusLifecycle.update_status(id, "open")` via `phase_abort()` | open | (unchanged) |
 | Abort - definition gate failure | `StatusLifecycle.update_status(id, "open")` | open | (unchanged) |
 | Abort - user-initiated | `StatusLifecycle.update_status(id, "open")` via `phase_abort()` | open | (unchanged) |
