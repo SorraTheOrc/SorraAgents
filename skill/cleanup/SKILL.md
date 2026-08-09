@@ -39,6 +39,27 @@ Scripts (implementation)
 
 ## Steps
 
+### 0. Work-item audit gate
+
+Before any branch operations, determine whether the current branch is associated with a work item and, if so, verify its acceptance criteria are met via the audit skill. This gate applies to interactive skill invocations; scheduled non-interactive runs of the cleanup scripts are unaffected.
+
+1. **Inspect the current branch.** Run `./scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json` (the same script used in Step 1) and read the `work_item_id` field from the JSON report.
+
+   - **No `work_item_id`** (e.g. on `main` or a branch without a work-item token) → skip this step and proceed to Step 1.
+   - **`work_item_id` present** → continue below.
+
+2. **Invoke the audit skill.** Audit the work item using the existing audit skill — e.g. `/skill:audit <work-item-id>` or the canonical runner `python3 ./scripts/audit_runner.py issue <work-item-id>` (see `skill/audit/SKILL.md`). Do not implement audit logic here; reuse the audit skill as-is. For long-running audits, follow the audit skill's Monitored Run Execution contract.
+
+3. **Apply the decision rule.** Read the audit report's `Ready to close:` verdict and its `## Acceptance Criteria Status` table (or `No acceptance criteria defined.` when none exist):
+
+   - **`Ready to close: Yes`** (every criterion `met` or `adjusted`) → the work is verified complete:
+     1. Transition the work item: `wl update <work-item-id> --status completed --stage in_review --json`
+     2. Add a comment: `wl comment add <work-item-id> --comment "Cleanup audit passed on branch <branch-name>. Work item transitioned to in_review." --author <agent-name> --json`
+     3. Proceed to Step 1.
+   - **Any criterion `unmet` or `partial`** → **abort cleanup**. Output a clear message listing which criteria failed and their verdicts, referencing the audit report. Do not perform any branch operations — skip Steps 1-8 entirely. Suggest next steps (e.g. "Fix the unmet criteria and re-run cleanup").
+   - **No acceptance criteria defined** → **abort cleanup**. Output a message explaining that the work item's completion cannot be verified and cleanup is aborted. Suggest adding acceptance criteria to the work item and re-running cleanup.
+   - **No parseable verdict / audit failure** → **abort cleanup** (completion cannot be verified). Follow the audit skill's failure handling and report the outcome to the user.
+
 ### 1. Inspect current branch
 
 Run `./scripts/inspect_current_branch.py --report /tmp/cleanup/inspect_current.json` to detect the default branch, merge status, uncommitted changes, and unpushed commits.
