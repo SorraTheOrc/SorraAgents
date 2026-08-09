@@ -23,7 +23,7 @@ _SCRIPT_DIR = (
 )
 sys.path.insert(0, str(_SCRIPT_DIR))
 
-import measure_context as mc  # noqa: E402
+import measure_context as mc
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HIDDEN_SKILLS = [
