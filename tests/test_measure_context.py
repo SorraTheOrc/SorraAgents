@@ -88,6 +88,18 @@ class TestParseDescription:
         frontmatter = "description: |\n  prose\nname: x\n"
         assert mc.parse_description(frontmatter) == "prose"
 
+    def test_indented_plain_scalar(self):
+        frontmatter = (
+            "name: x\n"
+            "description:\n"
+            "  Use this skill to review local code.\n"
+            "  It focuses on correctness.\n"
+        )
+        assert (
+            mc.parse_description(frontmatter)
+            == "Use this skill to review local code.\nIt focuses on correctness."
+        )
+
     def test_missing_returns_empty(self):
         assert mc.parse_description("name: x\n") == ""
 

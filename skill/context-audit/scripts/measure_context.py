@@ -71,7 +71,14 @@ def parse_description(frontmatter: str) -> str:
             continue
         rest = line[len("description:"):].strip()
         if not rest:
-            continue
+            # Indented plain scalar: collect indented continuation lines.
+            block_lines: list[str] = []
+            for sub in lines[index + 1:]:
+                if sub == "" or sub.startswith(("  ", "\t")):
+                    block_lines.append(sub[2:] if sub.startswith("  ") else sub)
+                else:
+                    break
+            return "\n".join(block_lines).strip()
         if rest.startswith(("|", ">")):
             block_lines: list[str] = []
             for sub in lines[index + 1:]:
