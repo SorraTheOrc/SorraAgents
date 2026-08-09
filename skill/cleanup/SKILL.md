@@ -48,7 +48,7 @@ Before any branch operations, determine whether the current branch is associated
    - **No `work_item_id`** (e.g. on `main` or a branch without a work-item token) → skip this step and proceed to Step 1.
    - **`work_item_id` present** → continue below.
 
-2. **Invoke the audit skill.** Audit the work item using the existing audit skill — e.g. `/skill:audit <work-item-id>` or the canonical runner `python3 ./scripts/audit_runner.py issue <work-item-id>` (see `skill/audit/SKILL.md`). Do not implement audit logic here; reuse the audit skill as-is. For long-running audits, follow the audit skill's Monitored Run Execution contract.
+2. **Invoke the audit skill.** Audit the work item using the existing audit skill — e.g. `/skill:audit <work-item-id>` or the canonical runner `python3 ./scripts/audit_runner.py issue <work-item-id>` (see `../audit/SKILL.md`). Do not implement audit logic here; reuse the audit skill as-is. For long-running audits, follow the audit skill's Monitored Run Execution contract.
 
 3. **Apply the decision rule.** Read the audit report's `Ready to close:` verdict and its `## Acceptance Criteria Status` table (or `No acceptance criteria defined.` when none exist):
 
