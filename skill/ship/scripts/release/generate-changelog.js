@@ -34,50 +34,34 @@ const CHANGELOG_PATH = resolve(REPO_ROOT, 'CHANGELOG.md');
 
 /**
  * Fetch all work items that should appear in the changelog:
- * those with status=completed OR stage=in_review.
+ * those with status=completed AND stage=in_review (the release candidate
+ * set per the stage/status model).
+ *
+ * A single AND-filtered `wl list` query replaces the previous two-query
+ * union. The output is piped through `jq` so only the needed field
+ * projection enters execSync's buffer — the full `wl list --json` output
+ * for a large worklog can exceed the default 1 MB buffer (ENOBUFS), while
+ * the OS pipe between `wl` and `jq` is unbounded. `set -o pipefail`
+ * ensures a `wl` failure still surfaces as an execSync error so the
+ * warning path below fires.
  *
  * @returns {Array<{id:string, title:string, issueType:string, description:string}>}
  */
-function getCompletedOrInReviewItems() {
-  const seen = new Set();
-  const items = [];
-
-  // Items with status=completed
+export function getCompletedOrInReviewItems() {
   try {
-    const completedOut = execSync('wl list --status completed --json', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const completed = JSON.parse(completedOut);
-    for (const item of (completed.workItems || [])) {
-      if (!seen.has(item.id)) {
-        seen.add(item.id);
-        items.push(item);
-      }
-    }
+    // Single AND query (status=completed AND stage=in_review), piped through
+    // jq so only {id, title, issueType, description} enters the buffer.
+    const output = execSync(
+      `set -o pipefail; wl list --status completed --stage in_review --json ` +
+      `| jq -c '[.workItems[] | {id, title, issueType, description}]'`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    return JSON.parse(output) || [];
   } catch {
     // wl may not be available; caller handles this gracefully
-    console.error('Warning: could not query completed work items (wl not available?)');
+    console.error('Warning: could not query completed/in_review work items (wl not available?)');
+    return [];
   }
-
-  // Items with stage=in_review (regardless of status)
-  try {
-    const inReviewOut = execSync('wl list --stage in_review --json', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const inReview = JSON.parse(inReviewOut);
-    for (const item of (inReview.workItems || [])) {
-      if (!seen.has(item.id)) {
-        seen.add(item.id);
-        items.push(item);
-      }
-    }
-  } catch {
-    console.error('Warning: could not query in_review work items (wl not available?)');
-  }
-
-  return items;
 }
 
 // ── Miscategorization keywords ─────────────────────────────────────────────
