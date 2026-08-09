@@ -111,19 +111,35 @@ def file_bytes(path: Path) -> int:
         return 0
 
 
-def skill_description_prose(repo_root: Path) -> dict[str, str]:
+def skill_description_prose(
+    repo_root: Path, include_hidden: bool = False
+) -> dict[str, str]:
     """Map each ``skill/<name>/SKILL.md`` to its frontmatter description.
 
     Only directories containing a ``SKILL.md`` are counted (internal script
-    dirs such as ``skill/scripts/`` are excluded automatically).
+    dirs such as ``skill/scripts/`` are excluded automatically). Skills with
+    ``disable-model-invocation: true`` are excluded by default because they
+    do not appear in the session's skills-discovery block; pass
+    ``include_hidden=True`` to audit all skills.
     """
     result: dict[str, str] = {}
     for skill_md in sorted(repo_root.glob(SKILL_MD_GLOB)):
         text = skill_md.read_text(encoding="utf-8")
-        result[skill_md.parent.name] = parse_description(
-            extract_frontmatter(text)
-        )
+        frontmatter = extract_frontmatter(text)
+        if not include_hidden and "disable-model-invocation: true" in frontmatter:
+            continue
+        result[skill_md.parent.name] = parse_description(frontmatter)
     return result
+
+
+def hidden_skill_names(repo_root: Path) -> list[str]:
+    """Names of skills with ``disable-model-invocation: true``."""
+    names: list[str] = []
+    for skill_md in sorted(repo_root.glob(SKILL_MD_GLOB)):
+        frontmatter = extract_frontmatter(skill_md.read_text(encoding="utf-8"))
+        if "disable-model-invocation: true" in frontmatter:
+            names.append(skill_md.parent.name)
+    return names
 
 
 def _component(chars: int) -> dict:
@@ -131,14 +147,20 @@ def _component(chars: int) -> dict:
     return {"chars": chars, "bytes": chars, "tokens": estimate_tokens(chars)}
 
 
-def measure(repo_root: Path) -> dict:
+def measure(repo_root: Path, include_hidden: bool = False) -> dict:
     """Measure the startup-context surface for a repo root.
+
+    Args:
+        repo_root: Repository root to measure.
+        include_hidden: Include ``disable-model-invocation`` skills in the
+            prose count (default False matches the session startup surface,
+            which excludes hidden skills).
 
     Returns a dict of component name → measurement, plus ``total``.
     """
     global_chars = file_bytes(repo_root / GLOBAL_AGENTS_FILENAME)
     project_chars = file_bytes(repo_root / PROJECT_AGENTS_FILENAME)
-    prose = skill_description_prose(repo_root)
+    prose = skill_description_prose(repo_root, include_hidden=include_hidden)
     prose_chars = sum(len(desc) for desc in prose.values())
 
     components: dict[str, dict] = {
@@ -147,6 +169,7 @@ def measure(repo_root: Path) -> dict:
         "skills_prose": {
             **_component(prose_chars),
             "skill_count": len(prose),
+            "hidden_skill_count": len(hidden_skill_names(repo_root)),
         },
     }
     total_chars = global_chars + project_chars + prose_chars
@@ -254,6 +277,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit machine-readable key=value lines.",
     )
     parser.add_argument(
+        "--include-hidden",
+        action="store_true",
+        help="Count disable-model-invocation skills in skills prose "
+        "(default excludes them, matching the session startup surface).",
+    )
+    parser.add_argument(
         "--thresholds",
         dest="thresholds_file",
         metavar="FILE",
@@ -285,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
         return EXIT_ERROR  # pragma: no cover (argparse exits)
 
-    components = measure(repo_root)
+    components = measure(repo_root, include_hidden=args.include_hidden)
     exceeded = sorted(
         name for name, limit in thresholds.items()
         if components.get(name, {}).get("bytes", 0) > limit

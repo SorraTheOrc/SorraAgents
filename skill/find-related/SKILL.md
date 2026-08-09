@@ -1,5 +1,6 @@
 ---
 name: find-related
+disable-model-invocation: true
 description: "Find related work for a Worklog item; generate an auditable report. Use when discovering related work."
 ---
 

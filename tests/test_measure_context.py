@@ -148,6 +148,52 @@ class TestMeasure:
         comps = mc.measure(repo_root)
         assert comps["skills_prose"]["skill_count"] == 2
 
+    def test_hidden_skills_excluded_by_default(self, tmp_path: Path):
+        """disable-model-invocation skills are excluded from the startup
+        surface (they do not appear in the session skills block)."""
+        (tmp_path / GLOBAL_MD).write_text("G" * 10, encoding="utf-8")
+        hidden = tmp_path / "skill" / "triage"
+        hidden.mkdir(parents=True)
+        (hidden / "SKILL.md").write_text(
+            "---\nname: triage\ndisable-model-invocation: true\n"
+            "description: hidden prose\n---\n# Triage\n",
+            encoding="utf-8",
+        )
+        visible = tmp_path / "skill" / "audit"
+        visible.mkdir(parents=True)
+        (visible / "SKILL.md").write_text(
+            "---\nname: audit\ndescription: visible prose\n---\n# Audit\n",
+            encoding="utf-8",
+        )
+        comps = mc.measure(tmp_path)
+        assert comps["skills_prose"]["skill_count"] == 1
+        assert comps["skills_prose"]["hidden_skill_count"] == 1
+        assert comps["skills_prose"]["bytes"] == len("visible prose")
+
+    def test_include_hidden_counts_all(self, tmp_path: Path):
+        (tmp_path / GLOBAL_MD).write_text("G" * 10, encoding="utf-8")
+        hidden = tmp_path / "skill" / "triage"
+        hidden.mkdir(parents=True)
+        (hidden / "SKILL.md").write_text(
+            "---\nname: triage\ndisable-model-invocation: true\n"
+            "description: hidden prose\n---\n# Triage\n",
+            encoding="utf-8",
+        )
+        comps = mc.measure(tmp_path, include_hidden=True)
+        assert comps["skills_prose"]["skill_count"] == 1
+        assert comps["skills_prose"]["bytes"] == len("hidden prose")
+
+    def test_hidden_skill_names(self, tmp_path: Path):
+        (tmp_path / GLOBAL_MD).write_text("G" * 10, encoding="utf-8")
+        hidden = tmp_path / "skill" / "triage"
+        hidden.mkdir(parents=True)
+        (hidden / "SKILL.md").write_text(
+            "---\nname: triage\ndisable-model-invocation: true\n"
+            "description: x\n---\n",
+            encoding="utf-8",
+        )
+        assert mc.hidden_skill_names(tmp_path) == ["triage"]
+
 
 # ── Output formats ─────────────────────────────────────────────────────────
 

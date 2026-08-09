@@ -1,5 +1,6 @@
 ---
 name: git-management
+disable-model-invocation: true
 description: "Manage the feature-branch lifecycle: create, commit, push, PR, merge, cleanup. Use when asked to manage git branches."
 ---
 

@@ -342,3 +342,20 @@ For multi-step tasks, state a brief plan:
 ```
 
 Strong success criteria let the LLM loop independently. Weak criteria ("make it work") require constant clarification.
+
+## Skill invocation map (hidden helper skills)
+
+The following skills set `disable-model-invocation: true`: they are internal
+helpers or always invoked explicitly, so they do **not** appear in the
+session's available-skills block. They remain fully invocable via
+`/skill:<name>` or by orchestrating skills' scripts — do not reimplement
+their logic inline; invoke them as documented below.
+
+| Skill | How it is invoked | Purpose |
+|---|---|---|
+| `owner-inference` | Invoked by the triage skill's `check_or_create.py` script | Infer a suspected owner for a failing test file |
+| `triage` | Invoked by the test skill's scripts (`check_or_create.py`) | Search/create critical `test-failure` work items |
+| `find-related` | `/skill:find-related <work-item-id>` | Discover related work for a work item |
+| `effort-and-risk` | `/skill:effort-and-risk <work-item-id>` (run by plan/implement) | Produce effort/risk estimates |
+| `speak` | `/skill:speak <text>` or `./scripts/speak.sh` | Generate audible speech from text |
+| `git-management` | `/skill:git-management` | Unified git feature-branch lifecycle management |

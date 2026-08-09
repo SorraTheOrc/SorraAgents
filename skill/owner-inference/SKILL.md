@@ -1,5 +1,6 @@
 ---
 name: owner-inference
+disable-model-invocation: true
 description: "Infer a suspected owner for a failing test via CODEOWNERS, git blame, recent commits. Use when attributing failures."
 ---
 

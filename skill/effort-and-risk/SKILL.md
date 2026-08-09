@@ -1,5 +1,6 @@
 ---
 name: effort-and-risk
+disable-model-invocation: true
 description: "Estimate effort/risk via WBS, PERT, risk matrix for a planned work item. Use when estimating."
 ---
 

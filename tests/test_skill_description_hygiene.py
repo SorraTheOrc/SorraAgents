@@ -27,7 +27,9 @@ MAX_TOTAL_PROSE_BYTES = 1800
 
 
 def _prose() -> dict[str, str]:
-    return mc.skill_description_prose(REPO_ROOT)
+    # F2's template budget applies to every skill description, including
+    # hidden (disable-model-invocation) skills — audit all of them.
+    return mc.skill_description_prose(REPO_ROOT, include_hidden=True)
 
 
 class TestDescriptionTemplate:

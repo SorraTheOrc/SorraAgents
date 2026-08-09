@@ -1,5 +1,6 @@
 ---
 name: speak
+disable-model-invocation: true
 description: "Generate audible speech from text via TTS and play it back. Use when asked to speak text aloud."
 ---
 

@@ -1,5 +1,6 @@
 ---
 name: triage
+disable-model-invocation: true
 description: "Triage test failures: search or create critical test-failure work items. Use when triaging failing tests."
 ---
 
