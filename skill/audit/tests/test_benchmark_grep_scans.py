@@ -205,8 +205,8 @@ def test_catalogue_documents_at_least_8_patterns_with_origins() -> None:
     # Origins reference audit_runner.py or SKILL.md with file:line.
     assert "audit_runner.py" in text
     assert "SKILL.md" in text
-    assert "L753" in text  # tools allowlist origin
-    assert "L2230" in text  # parent prompt FILE SCOPE origin
+    assert "L1312-1316" in text  # tools allowlist origin
+    assert "L3664-3677" in text  # parent prompt FILE SCOPE + SCANNING origin
 
 
 def test_catalogue_records_baseline_numbers() -> None:

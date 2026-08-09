@@ -12,7 +12,7 @@ Covered:
 
   - ``find-workitem <ID>``: resolves the work item via ``wl search`` (mocked),
     never greps ``.worklog/`` recursively, and exits non-zero with a message
-    when not found.
+    when not found. Prints the work item as JSON on stdout.
   - ``search-code <TERM>``: invokes ``rg`` with prunes (``!node_modules``,
     ``!.git``, ``!.worklog``, ``!**/audit_debug_*.jsonl``), a size cap, and an
     explicit path; returns matches; exits non-zero when nothing matches.
@@ -23,6 +23,8 @@ All tests run offline (subprocesses mocked or pointed at tmp fixtures).
 """  # noqa: EXE001
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -106,8 +108,33 @@ class TestFindWorkitem:
             scan = importlib.util.module_from_spec(spec)
             assert spec.loader is not None
             spec.loader.exec_module(scan)
-            rc = scan.main(["find-workitem", "SA-NOPE"])
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = scan.main(["find-workitem", "SA-NOPE"])
         assert rc != 0
+        assert "SA-NOPE" in stderr.getvalue()
+        assert "not found" in stderr.getvalue().lower()
+
+    def test_find_workitem_prints_work_item_json(self) -> None:
+        """Found -> the work item is printed as JSON on stdout."""
+        item = {"id": "SA-X", "title": "found", "status": "open"}
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                ["wl", "search"], 0,
+                stdout=json.dumps({"success": True, "items": [item]}),
+            )
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("scan", SCAN_SCRIPT)
+            scan = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(scan)
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = scan.main(["find-workitem", "SA-X"])
+        assert rc == 0
+        printed = json.loads(stdout.getvalue())
+        assert printed["id"] == "SA-X"
+        assert printed["title"] == "found"
 
     def test_find_workitem_no_recursive_grep_over_worklog(self) -> None:
         """The recipe must never run `grep -r ... .worklog/`."""
@@ -201,9 +228,33 @@ class TestSearchCode:
             scan = importlib.util.module_from_spec(spec)
             assert spec.loader is not None
             spec.loader.exec_module(scan)
-            scan.main(["search-code", "FIXME_TODO"])
-        out = mock_run.return_value.stdout
-        assert "src/mod.py" in out
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = scan.main(["search-code", "FIXME_TODO"])
+        assert rc == 0
+        assert "src/mod.py" in stdout.getvalue()
+
+    def test_search_code_grep_fallback_is_bounded(self) -> None:
+        """grep fallback (no rg on PATH) stays bounded: -r, --exclude-dir prunes,
+        and NO rg-only flags like --max-filesize (GNU grep rejects them)."""
+        with mock.patch("shutil.which", side_effect=lambda name: {"rg": None, "grep": "/usr/bin/grep"}.get(name)), \
+             mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                ["grep"], 1, stdout="",
+            )
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("scan", SCAN_SCRIPT)
+            scan = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(scan)
+            rc = scan.main(["search-code", "FIXME_TODO", "--path", "src"])
+        assert rc == 1
+        called_cmds = [c.args[0] for c in mock_run.call_args_list]
+        joined = " ".join(" ".join(str(a) for a in c) for c in called_cmds)
+        assert "--max-filesize" not in joined
+        assert "--exclude-dir" in joined
+        assert "--exclude" in joined
+        assert "node_modules" in joined
 
 
 # ===========================================================================
@@ -231,6 +282,35 @@ class TestListFiles:
         assert "!node_modules" in joined
         assert "!.git" in joined
         assert "!.worklog" in joined
+
+    def test_list_files_applies_maxdepth(self) -> None:
+        """list-files passes a --max-depth limit (default 2) to rg."""
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                ["rg"], 0, stdout="src/mod.py\n",
+            )
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("scan", SCAN_SCRIPT)
+            scan = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(scan)
+            scan.main(["list-files", "--path", "src"])
+            joined_default = " ".join(
+                " ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list
+            )
+            assert "--max-depth" in joined_default
+            assert "2" in joined_default
+
+            mock_run.reset_mock()
+            mock_run.return_value = subprocess.CompletedProcess(
+                ["rg"], 0, stdout="src/mod.py\n",
+            )
+            scan.main(["list-files", "--path", "src", "--maxdepth", "4"])
+            joined_custom = " ".join(
+                " ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list
+            )
+            assert "--max-depth" in joined_custom
+            assert " 4" in joined_custom
 
     def test_list_files_no_descent_into_traps(self) -> None:
         """The rg command must not include node_modules/.git/.worklog as roots."""

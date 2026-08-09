@@ -137,7 +137,9 @@ def _build_search_cmd(pattern: str, path: str, type_: str | None,
         cmd += [pattern, path]
     else:
         # grep fallback: bounded with --include and --exclude-dir prunes.
-        cmd += ["-r", "-l", "--max-filesize", max_filesize]
+        # NOTE: GNU grep has no file-size filter, so --max-filesize is an
+        # rg-only flag — it must NOT be passed to grep (SA-0MSLSHK9600667FO).
+        cmd += ["-r", "-l"]
         if type_:
             cmd += ["--include", f"*.{type_}"]
         for prune in ("node_modules", ".git", ".worklog"):
@@ -172,7 +174,7 @@ def _build_list_cmd(path: str, type_: str | None, maxdepth: int) -> list[str]:
     tool = _rg_or_grep()
     cmd = [tool]
     if Path(tool).name == "rg":
-        cmd += ["--files", "--hidden"]
+        cmd += ["--files", "--hidden", "--max-depth", str(maxdepth)]
         cmd += _prune_flag_pairs()
         if type_:
             cmd += ["-g", f"*.{type_}"]
