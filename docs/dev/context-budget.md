@@ -35,8 +35,8 @@ It reports bytes and a rough token estimate (`chars/4`) per component:
 |---|---|---|---|
 | Global AGENTS.md (`AGENTS_GLOBAL.md`) | 19,518 | ~4,880 | startup, every session |
 | Project AGENTS.md (`AGENTS.md`) | 1,334 | ~334 | startup, this repo |
-| Skills-section description prose (17 skills) | 3,407 | ~852 | startup, every session |
-| **Total** | **24,259** | **~6,065** | startup |
+| Skills-section description prose (17 skills) | 3,523 | ~881 | startup, every session |
+| **Total** | **24,375** | **~6,094** | startup |
 
 Measured with the canonical tool:
 
@@ -44,14 +44,28 @@ Measured with the canonical tool:
 Startup static-context budget (bytes / tokens):
   global_agents   :  19518 B /  4880 tok
   project_agents  :   1334 B /   334 tok
-  skills_prose    :   3407 B /   852 tok (17 skills)
-  total           :  24259 B /  6065 tok
+  skills_prose    :   3523 B /   881 tok (17 skills)
+  total           :  24375 B /  6094 tok
 ```
 
 > The full on-demand `SKILL.md` contents (172,905 B across 17 files, ~43K
 > tokens) are **not** part of the startup surface — they load only when a
 > skill is invoked — and are therefore excluded from this budget (they are
 > addressed separately by F5, which trims them for on-demand cost).
+
+> **F2 update (2026-08-09):** after compacting all 17 skill descriptions
+> (SA-0MSLK78W7009HIXC), skills prose dropped from 3,523 B to **1,796 B**
+> (~49% cut). New measured budget:
+>
+> ```
+>   global_agents   :  19518 B /  4880 tok
+>   project_agents  :   1334 B /   334 tok
+>   skills_prose    :   1796 B /   449 tok (17 skills)
+>   total           :  22648 B /  5662 tok
+> ```
+>
+> Update `context-budget.thresholds.json` to the post-F2 values when F2 is
+> accepted (the gate should pin the approved budget, not the pre-change one).
 
 > **Intake measurement note:** the intake baseline (3,492 B prose) was
 > measured with a looser methodology that varied between sessions (3,371 B
@@ -68,8 +82,8 @@ PR/CI run when the startup budget regresses above the pre-change baseline:
 {
   "global_agents": 19518,
   "project_agents": 1334,
-  "skills_prose": 3407,
-  "total": 24259
+  "skills_prose": 3523,
+  "total": 24375
 }
 ```
 
