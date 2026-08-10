@@ -53,6 +53,13 @@ if str(_REPO_ROOT) not in sys.path:
 from skill.shared.code_freeze import is_code_freeze_active
 from skill.shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
 from skill.test_cache import run_cached
+from skill.test_runner import canonicalize_quiet_test_command
+
+# Canonical quiet full-suite commands — identical cache keys to the test
+# skill's run_tests.py (SA-0MSN6FBFS006Z5QP) so cached runs are shared
+# full-suite evidence rather than a fail-fast partial run.
+PYTEST_CMD = canonicalize_quiet_test_command("pytest")  # pytest -q -r a --disable-warnings
+NPM_TEST_CMD = canonicalize_quiet_test_command("npm test")  # npm --silent test
 
 LOG = logging.getLogger("implement.scripts.implement")
 
@@ -1209,7 +1216,7 @@ def run_tests(cwd: str) -> dict[str, Any]:
     # 2. pytest (with npm test fallback when the repo also has a test script)
     if tooling == "pytest":
         pytest_run = run_cached(
-            "python3 -m pytest -x --tb=short -q",
+            PYTEST_CMD,
             cwd=cwd,
             timeout=600,
             runner=lambda command, cwd_, timeout_: run_cmd(
@@ -1219,9 +1226,9 @@ def run_tests(cwd: str) -> dict[str, Any]:
         result = pytest_run
         final_tooling = "pytest"
         if result["exit_code"] != 0 and _has_test_script(cwd):
-            # Try npm test as fallback (also cached)
+            # Try npm test as fallback (also cached, canonical form)
             npm_run = run_cached(
-                "npm test",
+                NPM_TEST_CMD,
                 cwd=cwd,
                 timeout=600,
                 runner=lambda command, cwd_, timeout_: run_cmd(
@@ -1239,7 +1246,7 @@ def run_tests(cwd: str) -> dict[str, Any]:
     if tooling == "npm":
         return _finalize_test_result(
             run_cached(
-                "npm test",
+                NPM_TEST_CMD,
                 cwd=cwd,
                 timeout=600,
                 runner=lambda command, cwd_, timeout_: run_cmd(

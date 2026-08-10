@@ -316,7 +316,10 @@ configured runner):
 - Repos WITH tooling are unaffected: the detected command runs (through
   the run cache) and a real failure still blocks finish. When pytest is
   detected, `npm test` remains the fallback if the repo also defines a
-  `scripts.test` entry.
+  `scripts.test` entry. Commands are the canonical quiet forms
+  (`pytest -q -r a --disable-warnings` / `npm --silent test`, via
+  `canonicalize_quiet_test_command`) so cached runs share the test skill's
+  cache keys and count as full-suite evidence (SA-0MSN6FBFS006Z5QP).
 - `IMPLEMENT_TEST_COMMAND` overrides detection entirely (per-repo test
   command, e.g. a Unity test runner invoked via a repo-local script).
 

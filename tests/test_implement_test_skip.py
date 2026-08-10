@@ -16,13 +16,16 @@ Contract (per work item SA-0MSN4AXIQ007IZG2 ACs, umbrella SA-0MSI8YLTN0007KN8):
 - AC5: unit tests cover both paths (tooling absent → skipped; tooling
   present → runs, failure blocks).
 
-Background: ``run_tests()`` unconditionally ran ``python3 -m pytest`` and
-fell back to ``npm test``, so bash-only / Unity repos without either tool
+Background: ``run_tests()`` unconditionally ran ``python3 -m pytest -x --tb=short -q``
+and fell back to ``npm test``, so bash-only / Unity repos without either tool
 aborted the finish phase. The fix detects the repo's test tooling first and
 reports the test step as a skipped no-op when none exists. The per-repo
 ``IMPLEMENT_TEST_COMMAND`` override and repo-local runner scripts
 (``run_tests.sh`` / ``run_unity_tests.sh`` / ``run_unity_tests.bat``) are
-also honoured.
+also honoured. Since SA-0MSN6FBFS006Z5QP the pytest/npm commands routed
+through the cache are the canonical quiet forms (``pytest -q -r a
+--disable-warnings`` / ``npm --silent test``) so cached runs share the test
+skill's cache keys.
 """
 
 from __future__ import annotations
@@ -144,15 +147,16 @@ def test_tests_skipped_when_only_unity_project(implement_mod, repo_dir, monkeypa
 def test_pytest_runs_when_suite_detected(
     implement_mod, repo_dir, stub_run_cached, monkeypatch
 ):
-    """pytest detected → python3 -m pytest is executed (through the cache)."""
+    """pytest detected → canonical pytest command is executed (through cache)."""
     monkeypatch.setattr(implement_mod, "_detect_test_tooling", lambda cwd: "pytest")
     calls = stub_run_cached()
 
     result = implement_mod.run_tests(str(repo_dir))
 
-    assert calls == ["python3 -m pytest -x --tb=short -q"], (
+    assert calls == [implement_mod.PYTEST_CMD], (
         f"expected exactly one pytest run, got {calls}"
     )
+    assert implement_mod.PYTEST_CMD == "pytest -q -r a --disable-warnings"
     assert result["success"] is True
     assert result["skipped"] is False
     assert result["tooling"] == "pytest"
@@ -192,7 +196,7 @@ def test_pytest_failure_falls_back_to_npm_test_when_test_script_exists(
 
     result = implement_mod.run_tests(str(repo_dir))
 
-    assert calls == ["python3 -m pytest -x --tb=short -q", "npm test"]
+    assert calls == [implement_mod.PYTEST_CMD, implement_mod.NPM_TEST_CMD]
     assert result["success"] is True
     assert result["tooling"] == "npm"
 
@@ -206,7 +210,7 @@ def test_pytest_without_test_script_does_not_try_npm(
 
     result = implement_mod.run_tests(str(repo_dir))
 
-    assert calls == ["python3 -m pytest -x --tb=short -q"]
+    assert calls == [implement_mod.PYTEST_CMD]
     assert result["success"] is False
 
 
@@ -218,13 +222,14 @@ def test_pytest_without_test_script_does_not_try_npm(
 def test_npm_test_runs_when_no_pytest_suite(
     implement_mod, repo_dir, stub_run_cached, monkeypatch
 ):
-    """No pytest, but scripts.test exists → npm test is executed."""
+    """No pytest, but scripts.test exists → canonical npm test is executed."""
     monkeypatch.setattr(implement_mod, "_detect_test_tooling", lambda cwd: "npm")
     calls = stub_run_cached()
 
     result = implement_mod.run_tests(str(repo_dir))
 
-    assert calls == ["npm test"]
+    assert calls == [implement_mod.NPM_TEST_CMD]
+    assert implement_mod.NPM_TEST_CMD == "npm --silent test"
     assert result["success"] is True
     assert result["skipped"] is False
     assert result["tooling"] == "npm"
