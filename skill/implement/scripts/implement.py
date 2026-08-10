@@ -810,16 +810,64 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _has_build_script(cwd: str) -> bool:
+    """Check whether the repo root package.json defines a ``build`` script.
+
+    A repo without a ``scripts.build`` entry (e.g. Python-only projects) has
+    nothing to build: ``npm run build`` would exit 1 with
+    ``Missing script: "build"`` and block the finish phase for every
+    implementation. Reads the root ``package.json`` directly so the check
+    works without npm.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True if the root package.json exists and contains a non-empty
+        ``scripts.build`` entry. Malformed JSON or a non-object ``scripts``
+        value counts as "no build script" (fail-open — never block finish on
+        a broken manifest).
+    """
+    package_json = Path(cwd) / "package.json"
+    if not package_json.exists():
+        return False
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if not isinstance(scripts, dict):
+        return False
+    return bool(scripts.get("build"))
+
+
 def run_build(cwd: str) -> dict[str, Any]:
     """Run the project build script.
+
+    Repos whose root package.json has no ``build`` script (e.g. Python-only
+    projects) skip the build step: it is reported as a no-op with
+    ``success: True`` so the finish phase proceeds to tests → commit → push
+    instead of aborting. Repos WITH a build script run ``npm run build``
+    unchanged — a real build failure still blocks finish.
 
     Args:
         cwd: Working directory (worktree root).
 
     Returns:
         A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
-        ``exit_code`` (int).
+        ``exit_code`` (int), and ``skipped`` (bool) — ``skipped`` is True
+        when the build step was bypassed because no build script exists.
     """
+    if not _has_build_script(cwd):
+        msg = "No build script in package.json — skipping build step (no-op)."
+        LOG.info(msg)
+        return {
+            "success": True,
+            "stdout": msg,
+            "stderr": "",
+            "exit_code": 0,
+            "skipped": True,
+        }
     result = run_cmd(
         ["npm", "run", "build"],
         cwd=cwd,
@@ -832,6 +880,7 @@ def run_build(cwd: str) -> dict[str, Any]:
         "stdout": result.stdout.strip(),
         "stderr": result.stderr.strip(),
         "exit_code": result.returncode,
+        "skipped": False,
     }
 
 

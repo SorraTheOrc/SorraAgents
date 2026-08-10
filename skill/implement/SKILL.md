@@ -281,6 +281,23 @@ the steps above and invokes project-local build/test and linters. When a
 repository provides an "implement" helper script, prefer it for deterministic
 behavior.
 
+### Build step for repos without a build script
+
+The `implement.py finish` build step (`run_build()`) is tolerant of repos
+whose root `package.json` has no `build` script (e.g. Python-only projects):
+
+- No `scripts.build` entry (or no root `package.json` at all) → the build
+  step is **skipped** and reported as a no-op (`success: True`), so finish
+  proceeds to tests → commit → push instead of aborting on `npm run build`
+  exit 1 (`Missing script: "build"`). Malformed `package.json` also counts
+  as "no build script" (fail-open — never block finish on a broken
+  manifest).
+- `scripts.build` present → `npm run build` runs unchanged; a real build
+  failure still blocks finish.
+
+The returned dict includes a `skipped` flag (True when the step was
+bypassed) in addition to `success`/`stdout`/`stderr`/`exit_code`.
+
 Example commands (documentation example, SA-0MPYMFZXO0004ZU4):
 
 ```bash
