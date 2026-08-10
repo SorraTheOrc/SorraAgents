@@ -2,9 +2,12 @@
 # worklog:pre-push-hook:v2
 # 1. Auto-sync Worklog data before pushing (committed hooks).
 # 2. Enforce branch naming policy: block pushes to protected branches.
+# 3. Context-budget regression gate (F6, SA-0MSLK7XNZ00366YY): fail the push
+#    when the startup context surface exceeds committed thresholds.
 #
 # Set WORKLOG_SKIP_PRE_PUSH=1 to bypass worklog sync.
 # Set BRANCH_POLICY_SKIP=1 to bypass branch policy check (not recommended).
+# Set CONTEXT_BUDGET_SKIP=1 to bypass the context-budget gate (not recommended).
 set -e
 
 # ── Branch policy enforcement ────────────────────────────────────────────────
@@ -22,6 +25,27 @@ if [ "$BRANCH_POLICY_SKIP" != "1" ]; then
       exit 1
     fi
   done
+fi
+
+# ── Context-budget regression gate ──────────────────────────────────────────
+# Fail the push when the pi session startup context surface exceeds the
+# committed thresholds (docs/dev/context-budget.thresholds.json). The gate is
+# fail-open when the tooling or thresholds file is absent (e.g. worktrees of
+# old commits, or repositories that do not ship the context-audit skill).
+if [ "$CONTEXT_BUDGET_SKIP" != "1" ]; then
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  measure="$repo_root/skill/context-audit/scripts/measure_context.py"
+  thresholds="$repo_root/docs/dev/context-budget.thresholds.json"
+  if [ -n "$repo_root" ] && [ -f "$measure" ] && [ -f "$thresholds" ]; then
+    if python3 "$measure" --include-hidden --thresholds "$thresholds" >/dev/null 2>&1; then
+      :
+    else
+      echo "ERROR: Context budget exceeded committed thresholds." >&2
+      echo "  Run: python3 $measure --include-hidden --thresholds $thresholds" >&2
+      echo "  See docs/dev/context-budget.md. Set CONTEXT_BUDGET_SKIP=1 to bypass." >&2
+      exit 1
+    fi
+  fi
 fi
 
 # ── Worklog sync ─────────────────────────────────────────────────────────────

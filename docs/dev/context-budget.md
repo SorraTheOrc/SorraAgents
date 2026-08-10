@@ -133,6 +133,41 @@ Exit codes: `0` within budget, `2` when a threshold is exceeded, `1` on
 usage/measurement errors. `--threshold NAME=BYTES` overrides (repeatable)
 and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 
+> **F6 verification (2026-08-09, SA-0MSLK7XNZ00366YY):** end-to-end
+> verification of the context-reduction epic. Before/after measurements vs
+> the F1 baseline (24,375 B total):
+>
+> | Component | F1 baseline (B) | After F2–F5 (B) | Reduction |
+> |---|---|---|---|
+> | global_agents | 19,518 | 8,144 | ~58% |
+> | project_agents | 1,334 | 1,334 | — |
+> | skills_prose | 3,523 | 1,796 | ~49% |
+> | **total** | **24,375** | **11,274** | **~54%** |
+>
+> This is a **~54% reduction** in startup static context (~13.1 KB saved per
+> session, well above the epic's ≥15% target). On-demand SKILL.md content also
+> dropped ~48% (F5: 135,798 → 70,919 B across the six largest skills).
+>
+> ### Enforcement (committed gate)
+>
+> The regression gate is enforced in two places:
+>
+> 1. **Pre-push hook** (`.githooks/pre-push`): runs the gate on every push and
+>    fails the push when a threshold is exceeded. Bypass with
+>    `CONTEXT_BUDGET_SKIP=1` (not recommended). Fail-open when the tooling is
+>    absent (e.g. worktrees of old commits).
+> 2. **Full-suite test** (`tests/test_context_budget_gate.py`): asserts the
+>    gate passes with the committed thresholds; runs on every test-suite
+>    execution, so CI and pre-`in_review` runs fail on regression.
+>
+> Manual invocation:
+>
+> ```bash
+> python3 skill/context-audit/scripts/measure_context.py \
+>   --include-hidden --thresholds docs/dev/context-budget.thresholds.json
+> ```
+> Exit 0 = within budget, 2 = exceeded.
+
 ## Updating this baseline
 
 After any intentional, reviewed context-surface change (e.g. F2–F5), re-run
