@@ -36,6 +36,15 @@ if str(REPO_ROOT) not in sys.path:
 from skill.audit.scripts import audit_runner
 
 SKILL_MD = REPO_ROOT / "skill" / "audit" / "SKILL.md"
+SKILL_REF = REPO_ROOT / "docs" / "dev" / "audit-skill-reference.md"
+
+
+def _skill_docs() -> str:
+    """Return SKILL.md + reference-doc content (F5 relocated detail to docs)."""
+    parts = [SKILL_MD.read_text()]
+    if SKILL_REF.exists():
+        parts.append(SKILL_REF.read_text())
+    return "\n".join(parts)
 
 # ===========================================================================
 # SKILL.md scanning guidance
@@ -45,35 +54,35 @@ SKILL_MD = REPO_ROOT / "skill" / "audit" / "SKILL.md"
 class TestSkillMdScanningGuidance:
     def test_skill_md_references_scan_helpers(self) -> None:
         """SKILL.md Tools-Enabled section references scan.py helpers."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "scan.py" in text
 
     def test_skill_md_forbids_unbounded_recursive_grep(self) -> None:
         """SKILL.md forbids unbounded recursive grep / repo-root scans."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "grep -r" in text or "unbounded" in text
         assert "node_modules" in text or "prune" in text
 
     def test_skill_md_documents_debug_logs_as_transient(self) -> None:
         """SKILL.md describes debug files as transient, non-scanned forensics."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "transient" in text.lower() or "forensic" in text.lower()
 
     def test_skill_md_documents_batch_phase2(self) -> None:
         """SKILL.md documents --batch-phase2 and AUDIT_PHASE2_BATCH."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "--batch-phase2" in text
         assert "AUDIT_PHASE2_BATCH" in text
 
     def test_skill_md_documents_max_concurrency(self) -> None:
         """SKILL.md documents --max-concurrency and AUDIT_MAX_CONCURRENCY."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "--max-concurrency" in text
         assert "AUDIT_MAX_CONCURRENCY" in text
 
     def test_skill_md_runner_line_includes_batch_and_concurrency(self) -> None:
         """The Runner usage line lists --batch-phase2 and --max-concurrency."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         runner_line = next(
             line for line in text.splitlines()
             if line.strip().startswith("- **Runner:**")
@@ -100,15 +109,22 @@ class TestSkillMdMonitoredRunGuidance:
 
     @staticmethod
     def _section() -> str:
-        """Return the Monitored Run Execution section of SKILL.md."""
-        text = SKILL_MD.read_text()
-        start = text.index("## Monitored Run Execution")
-        end = text.find("\n## ", start + 1)
-        return text[start : end if end != -1 else len(text)]
+        """Return the Monitored Run Execution section (reference doc preferred;
+        F5 relocated the full detail to docs/dev/audit-skill-reference.md)."""
+        candidates = []
+        if SKILL_REF.exists():
+            candidates.append(SKILL_REF.read_text())
+        candidates.append(SKILL_MD.read_text())
+        for text in candidates:
+            start = text.find("## Monitored Run Execution")
+            if start != -1:
+                end = text.find("\n## ", start + 1)
+                return text[start : end if end != -1 else len(text)]
+        return ""
 
     def test_skill_md_has_monitored_run_execution_section(self) -> None:
         """SKILL.md contains a Monitored Run Execution section heading."""
-        assert "## Monitored Run Execution" in SKILL_MD.read_text()
+        assert "## Monitored Run Execution" in _skill_docs()
 
     def test_launch_captures_pre_audit_status_and_stage(self) -> None:
         """Launch documents capturing the pre-audit status/stage via wl show."""
@@ -193,22 +209,22 @@ class TestSkillMdDocumentsBatchAndConcurrencyFlags:
 
     def test_skill_md_documents_batch_phase2_flag(self) -> None:
         """--batch-phase2 appears in SKILL.md."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "--batch-phase2" in text
 
     def test_skill_md_documents_batch_env_var(self) -> None:
         """AUDIT_PHASE2_BATCH appears in SKILL.md."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "AUDIT_PHASE2_BATCH" in text
 
     def test_skill_md_documents_max_concurrency_flag(self) -> None:
         """--max-concurrency appears in SKILL.md."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "--max-concurrency" in text
 
     def test_skill_md_runner_usage_line_includes_flags(self) -> None:
         """The Runner usage line lists --batch-phase2 and --max-concurrency."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         usage_line = next(
             line for line in text.splitlines()
             if "audit_runner.py issue|project" in line
