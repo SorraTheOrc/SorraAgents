@@ -1478,7 +1478,12 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     Returns a dict with keys ``verdict`` and ``evidence``.
     On success, implementations may also include additional diagnostic keys
     such as ``raw_stdout``, ``raw_stderr`` and ``extracted_text`` which are
-    useful for debugging. This function returns at minimum
+    useful for debugging. When the pi JSON stream reported provider usage,
+    the dict also carries ``input_tokens`` (initial input-token count for
+    the call, from the ``agent_end`` message's usage block) and
+    ``elapsed_seconds`` (wall-clock duration incl. retries) — both feed the
+    per-call timing line and the context-reduction verification
+    (SA-0MSISKM8F004NW1U AC2). This function returns at minimum
     ``{"verdict": <met|unmet|partial|adjusted>, "evidence": <text>}``.
 
     Uses the same JSON-stream protocol as ralph (``pi -p --mode json``).
@@ -1596,6 +1601,13 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     if not text:
         return {"verdict": "unmet", "evidence": "", "raw_stdout": stdout, "raw_stderr": stderr, "elapsed_seconds": elapsed_seconds}
 
+    # Input-token capture (AC2 of SA-0MSISKM8F004NW1U): the pi JSON stream's
+    # agent_end message carries the provider usage block, so each call's
+    # initial context size (static context + prompt) is measurable. This
+    # lets operators verify the context-reduction bound (<10K input tokens
+    # per audit session) from the per-call timing line alone.
+    input_tokens = _extract_input_tokens(raw)
+
     # Try to parse the text as JSON with verdict/evidence
     try:
         obj = json.loads(text)
@@ -1607,12 +1619,51 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                 "raw_stderr": stderr,
                 "extracted_text": text,
                 "elapsed_seconds": elapsed_seconds,
+                "input_tokens": input_tokens,
             }
     except json.JSONDecodeError:
         pass
 
     # If Pi returned free-form text, use it as evidence and default to met
-    return {"verdict": "met", "evidence": text.strip()[:200], "raw_stdout": stdout, "raw_stderr": stderr, "extracted_text": text, "elapsed_seconds": elapsed_seconds}
+    return {"verdict": "met", "evidence": text.strip()[:200], "raw_stdout": stdout, "raw_stderr": stderr, "extracted_text": text, "elapsed_seconds": elapsed_seconds, "input_tokens": input_tokens}
+
+
+def _extract_input_tokens(raw: str) -> int | None:
+    """Extract the initial input-token count from a pi ``--mode json`` stream.
+
+    pi emits an ``agent_end`` event whose ``messages`` array contains the
+    final assistant message with a ``usage`` block, e.g.
+    ``{"input": 769, "output": 10, "totalTokens": 779}``. ``input`` is the
+    total prompt tokens for that call (static context + user prompt) and is
+    used to verify the context-reduction bound (SA-0MSISKM8F004NW1U AC2:
+    fewer than 10K input tokens per audit session). Returns None when the
+    stream has no usable usage data.
+    """
+    if not raw:
+        return None
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "agent_end":
+            continue
+        messages = obj.get("messages")
+        if not isinstance(messages, list):
+            return None
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            usage = msg.get("usage")
+            if isinstance(usage, dict):
+                input_tokens = usage.get("input")
+                if isinstance(input_tokens, int) and input_tokens >= 0:
+                    return input_tokens
+        return None
+    return None
 
 
 def _extract_pi_text(raw: str) -> str:
@@ -2800,14 +2851,20 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
 
     # Emit a per-call timing line to stderr (performance baseline). Includes
     # issue id, call context, and elapsed seconds so Phase 2 durations are
-    # measurable and regressions are visible without a debug log.
+    # measurable and regressions are visible without a debug log. When the pi
+    # stream reported usage, the initial input-token count is appended so the
+    # context-reduction bound (<10K tokens, SA-0MSISKM8F004NW1U AC2) is
+    # verifiable from the timing line alone.
     elapsed = result.get("elapsed_seconds")
     if elapsed is not None:
-        print(
+        timing = (
             f"Per-call timing: issue_id={issue_id} context={context} "
-            f"elapsed_seconds={float(elapsed):.2f}",
-            file=sys.stderr,
+            f"elapsed_seconds={float(elapsed):.2f}"
         )
+        input_tokens = result.get("input_tokens")
+        if input_tokens is not None:
+            timing += f" input_tokens={input_tokens}"
+        print(timing, file=sys.stderr)
 
     # Decide whether to write a debug line
     reason = None
@@ -2830,6 +2887,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             "evidence": result.get("evidence"),
             "provider_error": result.get("_provider_error_message"),
             "elapsed_seconds": result.get("elapsed_seconds"),
+            "input_tokens": result.get("input_tokens"),
             "prompt": prompt[:1000],
         }
         try:

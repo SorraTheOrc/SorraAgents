@@ -148,6 +148,16 @@ Synonym for "Acceptance Criteria"; **Acceptance Criteria** is canonical.
 
 Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, test-cache auto-verification, `--run-tests`, batch/parallel Phase 2, tools-enabled invocation, bounded scanning, debug logs, file-scope manifest, child verdict reuse, phase-1/2 performance) are fully documented in [docs/dev/audit-skill-reference.md](../docs/dev/audit-skill-reference.md). Execution-dependent ACs can also be verified via the [test skill](../test/SKILL.md) (`/skill:test`).
 
+**Context reduction:** every pi call (`_call_pi`) runs with `--no-context-files --no-skills` in both tool-enabled and tool-less modes (SA-0MSISKM8F004NW1U). Audit prompts are fully self-contained — they carry the read-only mandate, JSON output format, FILE SCOPE manifest, SCANNING block, and criteria — so the global+project AGENTS.md load and the skills section are dropped from each session's static context, cutting per-call static context from ~14.6KB (~3.7K tokens) to ~1.6KB (~410 tokens) — a ~9x margin under the 10K-token bound. Prompts must never depend on AGENTS.md or skill descriptions: that is an invariant of this skill.
+
+**Per-call timing & token capture:** every pi call records wall-clock duration (`elapsed_seconds`, all return paths) and, when the pi stream reports provider usage, the initial input-token count (`input_tokens`, from the `agent_end` message's usage block). `_call_pi_and_maybe_log` emits one line per call to stderr:
+
+```text
+Per-call timing: issue_id=<id> context=<context> elapsed_seconds=<seconds> input_tokens=<n>
+```
+
+`input_tokens` makes the context-reduction bound (<10K initial input tokens per audit session) verifiable from the timing line alone.
+
 ## Guidance for models
 
 ### Authority and Runner Verdicts (CRITICAL)

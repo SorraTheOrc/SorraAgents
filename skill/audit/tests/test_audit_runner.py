@@ -976,6 +976,87 @@ class TestCallPiAndMaybeLogTiming:
         assert entry["elapsed_seconds"] == 5.5
 
 
+class TestInputTokensCapture:
+    """Tests for input-token capture (SA-0MSISKM8F004NW1U AC2).
+
+    Every successful ``_call_pi`` return attaches ``input_tokens`` extracted
+    from the ``agent_end`` message's usage block, so the per-call timing line
+    can verify the context-reduction bound (<10K initial input tokens per
+    audit session) without a debug log.
+    """
+
+    def _make_mock_popen(self, stdout_text: str):
+        """Create a mock Popen that returns a process-like object."""
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (stdout_text, "")
+        mock_process.returncode = 0
+        return mock_process
+
+    def _agent_end_stream(self, usage: dict | None, text: str = '{"verdict": "met", "evidence": "ok"}') -> str:
+        """Build a pi --mode json stream with an agent_end carrying usage."""
+        assistant = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        if usage is not None:
+            assistant["usage"] = usage
+        return json.dumps({"type": "agent_end", "messages": [assistant]})
+
+    def test_extract_input_tokens_helper(self):
+        """The helper reads input from the agent_end assistant usage block."""
+        stream = self._agent_end_stream({"input": 769, "output": 10, "totalTokens": 779})
+        assert audit_runner._extract_input_tokens(stream) == 769
+        # No usage block -> None
+        assert audit_runner._extract_input_tokens(self._agent_end_stream(None)) is None
+        # No agent_end event -> None
+        assert audit_runner._extract_input_tokens('{"type": "turn_end"}') is None
+        assert audit_runner._extract_input_tokens("") is None
+
+    def test_input_tokens_attached_on_success(self):
+        """_call_pi attaches input_tokens from the agent_end usage block."""
+        mock_process = self._make_mock_popen(self._agent_end_stream({"input": 769}))
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result["verdict"] == "met"
+        assert result["input_tokens"] == 769
+
+    def test_input_tokens_none_when_no_usage(self):
+        """input_tokens is None when the stream carries no usage data."""
+        mock_process = self._make_mock_popen(self._agent_end_stream(None))
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result["verdict"] == "met"
+        assert result["input_tokens"] is None
+
+    def test_input_tokens_attached_on_free_form_text(self):
+        """input_tokens is attached even when pi returns free-form text."""
+        stream = self._agent_end_stream({"input": 500}, text="plain response")
+        mock_process = self._make_mock_popen(stream)
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result["verdict"] == "met"
+        assert result["input_tokens"] == 500
+
+    def test_timing_line_includes_input_tokens(self, capsys):
+        """The per-call timing line appends input_tokens when captured."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "met", "evidence": "ok",
+                "elapsed_seconds": 3.0, "input_tokens": 769,
+            }
+            audit_runner._call_pi_and_maybe_log("SA-123", "parent", "prompt")
+        captured = capsys.readouterr()
+        assert "input_tokens=769" in captured.err
+
+    def test_timing_line_omits_input_tokens_when_absent(self, capsys):
+        """The timing line keeps the legacy format when input_tokens is None."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "met", "evidence": "ok", "elapsed_seconds": 3.0,
+            }
+            audit_runner._call_pi_and_maybe_log("SA-123", "parent", "prompt")
+        captured = capsys.readouterr()
+        assert "input_tokens" not in captured.err
+        assert "elapsed_seconds=3.00" in captured.err
+
+
 class TestPhase2TimingInstrumentation:
     """Tests that Phase 2 parent and child calls emit per-call timings (AC4)."""
 
