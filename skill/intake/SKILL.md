@@ -10,79 +10,37 @@ You are authoring a new Worklog work item for a feature or bug fix, following an
 
 ## Inputs
 
-- `$1` — The work-item-id (format `<prefix>-<hash>`). If valid, fetch and use it. If missing or invalid, treat `$ARGUMENTS` as the seed intent and create a new work item as needed. If the user intended to reference an existing item but provided an invalid id, ask for a valid one.
-- `$ARGUMENTS` — Optional freeform arguments after `<work-item-id>` to guide your work.
+- `$1` — The work-item-id (`<prefix>-<hash>`). If valid, fetch and use it; if missing/invalid, treat `$ARGUMENTS` as seed intent and create a new item as needed; if the user meant an existing item, ask for a valid id.
+- `$ARGUMENTS` — Optional freeform arguments after `<work-item-id>`.
 
 ## Results and Outputs
 
-- A 1–2 sentence headline summary of the intake brief
-- Final brief text and the new or updated work item
-- Idempotence: rerunning `/skill:intake` reuses existing work items when they represent the same item
-
-## Behavior
-
-The skill implements the procedural workflow below. Each numbered step is part of the canonical execution path; substeps describe concrete checks or commands to run.
+- A 1–2 sentence headline summary of the intake brief; final brief text and the new or updated work item.
+- Idempotence: rerunning `/skill:intake` reuses existing work items representing the same item.
 
 ## Hard requirements
 
-- Do not create a work item for this intake process itself; the output is a completed description for the target work item.
-- If additional information is needed, use an interview style: concise, high-signal questions, max three per round.
-- Do not invent requirements — ask the user. Do not ask leading questions or unnecessary questions if an obvious answer exists.
+- Do not create a work item for this intake process itself.
+- Interview style: concise, high-signal questions, max three per round.
+- Do not invent requirements — ask the user; don't ask leading or unnecessary questions when an obvious answer exists.
 - If a response is unclear or ambiguous, ask for clarification rather than guessing.
-- Respect `.gitignore` and agent framework ignore rules.
-- Prefer short multiple-choice suggestions, but always allow freeform responses.
+- Respect `.gitignore` and agent framework ignore rules; prefer short multiple-choice suggestions but allow freeform.
 - All work-item descriptions and comments **must be written in Markdown**.
-- The goal is sufficient detail to create a clear work item — not an exhaustive spec.
-- Do not include procedural next steps (e.g., "Proceed to planning") in the intake brief or work item description. Workflow progression is handled by stage transitions, not by work item content.
+- The goal is sufficient detail for a clear work item — not an exhaustive spec.
+- Do not include procedural next steps (e.g., "Proceed to planning") in the brief; progression is handled by stage transitions.
 
 ## Status Lifecycle
 
-All work-item status transitions are managed by the shared `StatusLifecycle` context manager (from `../shared/status_lifecycle.py`). Do **not** use ad-hoc `wl update --status` commands.
+All status transitions are managed by the shared `StatusLifecycle` context manager (from `../shared/status_lifecycle.py`) — never ad-hoc `wl update --status` commands. The lifecycle script at `./scripts/intake.py` is the canonical CLI:
 
-The intake lifecycle script at `./scripts/intake.py` provides the canonical CLI interface for lifecycle operations:
-
-- **Claim the item** — run before any other step:
-  ```bash
-  python3 ./scripts/intake.py start <work-item-id> --assignee "<AGENT>"
-  ```
-  This sets `status=in_progress`, claims the item, and prevents concurrent claims.
-
-- **Auto-complete** — skip full intake for sufficiently defined items:
-  ```bash
-  python3 ./scripts/intake.py auto-complete <work-item-id>
-  ```
-
-- **Finish intake** — complete the process and advance stage:
-  ```bash
-  python3 ./scripts/intake.py finish <work-item-id> [--description-file <path>]
-  ```
-
-- **Abort** — release the item on failure or interruption:
-  ```bash
-  python3 ./scripts/intake.py abort <work-item-id>
-  ```
-
-> **Design rationale:** The `StatusLifecycle` context manager from `../shared/status_lifecycle.py` is the single source of truth for all
-> status lifecycle management. The `intake.py` script provides a CLI
-> wrapper so that SKILL.md instructions can invoke lifecycle operations
-> without embedding ad-hoc `wl update --status` commands.
+- **Claim** (before any other step): `python3 ./scripts/intake.py start <work-item-id> --assignee "<AGENT>"` — sets `status=in_progress`, prevents concurrent claims.
+- **Auto-complete** (skip full intake for sufficiently defined items): `python3 ./scripts/intake.py auto-complete <work-item-id>`.
+- **Finish**: `python3 ./scripts/intake.py finish <work-item-id> [--description-file <path>]`.
+- **Abort** (release on failure): `python3 ./scripts/intake.py abort <work-item-id>`.
 
 ## Worklog resolution
 
-`intake.py` routes every `wl` call through the shared `run_wl` helper
-(`../shared/status_lifecycle.py`), which injects `--worklog-dir` with this
-precedence:
-
-1. **Explicit `--worklog-dir` value** (from a CLI flag / caller)
-2. **Prefix-to-sibling scan** — the work-item id prefix (e.g. `OSL`) is matched
-   against sibling projects' `config.yaml` so a non-SorraAgents item resolves
-   to its own worklog store even when the harness cwd is the framework repo
-3. **cwd chain** — `<cwd>/.worklog`, git root, nearest initialized ancestor
-4. **No flag** — `wl` resolves from cwd (failures surface real error detail)
-
-The script resolves the correct worklog store regardless of the directory it
-is invoked from. See `docs/dev/worklog-sync.md` for the shared resolution
-order and `wl sync` failure modes.
+`intake.py` routes every `wl` call through the shared `run_wl` helper, which injects `--worklog-dir` with precedence: (1) explicit `--worklog-dir`, (2) prefix-to-sibling scan (item-id prefix → sibling projects' worklog stores), (3) cwd chain (`<cwd>/.worklog`, git root, nearest ancestor), (4) no flag — `wl` resolves from cwd. Full detail: [docs/dev/intake-skill-reference.md](../docs/dev/intake-skill-reference.md) and `docs/dev/worklog-sync.md`.
 
 ## Process (must follow)
 
@@ -92,125 +50,73 @@ order and `wl sync` failure modes.
   ```bash
   python3 ./scripts/intake.py start <work-item-id> --assignee Map
   ```
-  This must be done before any evaluation, context gathering, or preflight checks. The status signals that this item is being processed and prevents concurrent claims.
+  This must happen before any evaluation, context gathering, or preflight checks.
 
 ### 1. Evaluate whether intake is required (agent responsibility)
 
-- Before performing full intake, run a lightweight evaluation to determine whether the work item already contains sufficient information to skip the interview/draft process.
-- Suggested heuristics (conservative, idempotent):
-  - If `stage` is already `intake_complete` or later, skip.
-  - If the description has a clear one-line headline, an "## Acceptance Criteria" section with 1–3 measurable bullets, and concise implementation notes (≤~200 words), it is likely well-defined enough to skip.
-  - If the item is small (`task` or `bug`, not `epic`) with explicit ACs and a minimal implementation sketch, prefer to mark intake complete.
-  - If parent/child relationships already express the required context, consider skipping.
-- If intake is not needed:
-  ```bash
-  python3 ./scripts/intake.py auto-complete <work-item-id>
-  ```
-  Optionally add a comment:
-  ```bash
-  wl comment add <work-item-id> "Intake auto-complete: work item appears sufficiently defined (ACs present / small task)." --actor Map --json
-  ```
-- If uncertain, fall back to the normal intake process (do not auto-complete on borderline evidence).
+Run a lightweight evaluation to decide whether the item is well-defined enough to skip the interview/draft. Conservative, idempotent heuristics: `stage` already `intake_complete` or later → skip; description has a clear one-line headline + an "## Acceptance Criteria" section (1–3 measurable bullets) + concise implementation notes (≤~200 words) → well-defined; small item (`task`/`bug`, not `epic`) with explicit ACs + minimal implementation sketch → prefer to complete; parent/child relationships already express the context → consider skipping.
+
+If intake is not needed:
+
+```bash
+python3 ./scripts/intake.py auto-complete <work-item-id>
+wl comment add <work-item-id> "Intake auto-complete: work item appears sufficiently defined (ACs present / small task)." --actor Map --json   # optional
+```
+
+If uncertain, fall back to the normal intake process (no auto-complete on borderline evidence).
 
 ### 2. Gather context (agent responsibility)
 
-- Derive 2–6 keywords from `<seed-context>` and user input.
-- Search work items (`wl search <keywords> --json`) and the repository for additional context (ignore `node_modules`, `.git`, and most `.`-prefixed folders).
-- If duplicates are found:
-  - Highlight them and ask if any represent the work to be done.
-  - If confirmed as duplicates, ask the user to resolve instead of proceeding.
-  - If confirmed as parent/child, create the appropriate relationship when creating work items.
-- Output labelled lists:
-  - "Potentially related docs" (file paths)
-  - "Potentially related work items" (titles + IDs)
-- Read and summarize each related artifact for later reference.
+- Derive 2–6 keywords from `<seed-context>` and user input; search work items (`wl search <keywords> --json`) and the repo (ignore `node_modules`, `.git`, `.`-prefixed folders).
+- Duplicates: highlight and ask if they represent the work; if confirmed, ask the user to resolve; if parent/child, create the relationship when creating work items.
+- Output labelled lists — "Potentially related docs" (paths) and "Potentially related work items" (titles + IDs) — and summarize each.
 
 ### 3. Work Item prep (agent responsibility)
 
-- If `<work-item-id>` was provided:
-  - Review the item's `issueType`. If it doesn't match the nature of the work, update:
-    ```bash
-    wl update <work-item-id> --issue-type <correct-type> --json
-    ```
-- If no id was provided:
-  - Extract a working title from `<seed-intent>` (one line).
-  - Infer the issue type from context using the decision guide below.
-  - Create:
-    ```bash
-    wl create --stage idea --status in_progress --title "<title>" --description "<seed-context>" --issue-type <type> --assignee Map --json
-    ```
-    (Creating a new item is a creation operation, not a status lifecycle transition — the initial status is set at creation time.)
-  - Remember the returned id.
+- If `<work-item-id>` was provided: review `issueType`; update if it doesn't match: `wl update <work-item-id> --issue-type <correct-type> --json`.
+- If no id was provided: extract a working title, infer the issue type (guide below), and create:
+  ```bash
+  wl create --stage idea --status in_progress --title "<title>" --description "<seed-context>" --issue-type <type> --assignee Map --json
+  ```
+  (Creation is not a status transition — the initial status is set at creation.) Remember the returned id.
 
-**Issue type decision guide** — use these rules to assign the correct `issueType`:
+**Issue type decision guide** — full table in [docs/dev/intake-skill-reference.md](../docs/dev/intake-skill-reference.md). Summary:
 
-| Type     | Use when… | Do NOT use when… | Examples |
-|----------|-----------|-------------------|----------|
-| `bug`    | Something is currently **incorrect or broken** and needs fixing. The change corrects existing wrong behavior. | The work adds new behavior or capability. | Fixing a crash, correcting a wrong calculation, patching a security vulnerability, handling an edge case that causes incorrect output. |
-| `feature` | The work **adds new capability or functionality** that did not exist before. It introduces net-new behavior. | The work only fixes something that is already broken. | New API endpoint, new UI component, new integration, new command/flag. |
-| `chore`  | The work **does not change code behavior** — it is maintenance or housekeeping. This includes changes to configuration, CI, documentation, dependencies, or formatting. | The work changes how the application behaves. | Dependency updates, CI configuration changes, documentation updates, code formatting, license files, build script tweaks. |
-| `task`   | The work is general-purpose and does not fit cleanly into the other categories. | The work clearly fixes a bug, adds a feature, or is pure maintenance. | Writing tests, refactoring, performance profiling, investigation, benchmarking. |
-| `epic`   | The work is **large in scope** and must be decomposed into multiple subtasks. Typically an epic is itself a feature or bug fix. | The work is small enough to complete in a single iteration. | Large feature spanning multiple services, major refactor across the codebase, migration from one technology to another. |
+- `bug` — currently **incorrect/broken**; the change corrects wrong behavior (not net-new capability).
+- `feature` — **adds new capability** that did not exist before (not merely fixing broken).
+- `chore` — **does not change code behavior** (config, CI, docs, deps, formatting).
+- `task` — general-purpose (tests, refactoring, investigation, benchmarking).
+- `epic` — **large scope** needing decomposition into subtasks.
 
-**Decision procedure** — when uncertain, ask:
-1. *Is something currently broken or incorrect?* → `bug`
-2. *Does this add net-new behavior/capability?* → `feature`
-3. *Does this change NO code behavior (docs, CI, deps, formatting)?* → `chore`
-4. *Is this general-purpose work (tests, refactoring, investigation)?* → `task`
-5. *Is this large enough to need subtasks?* → `epic` (with children)
+**Decision procedure** — when uncertain, ask: (1) *broken/incorrect?* → `bug`; (2) *net-new behavior?* → `feature`; (3) *no code-behavior change (docs/CI/deps/formatting)?* → `chore`; (4) *general-purpose (tests/refactoring/investigation)?* → `task`; (5) *large enough for subtasks?* → `epic`.
 
 ### 4. Interview
 
-If the seed context is sufficient to draft a clear intake brief, skip this step. Otherwise, proceed with the interview.
-
-- Soft limit of 3 questions per round, 1 or more rounds as needed.
-- Do not ask questions answerable by repo search — use gathered context. If context is insufficient, ask for the specific missing piece.
-- Goal: build sufficient understanding to draft a problem definition with user stories, ACs, and related work — not a complete spec.
-- If anything is ambiguous, ask for clarification rather than guessing.
-- Do not proceed until sufficient information is gathered.
+Skip if the seed context suffices to draft a clear brief. Otherwise: soft limit of 3 questions per round (1+ rounds); do NOT ask questions answerable by repo search — use gathered context; goal is enough understanding to draft a problem definition with user stories, ACs, and related work (not a complete spec); if ambiguous, ask for clarification rather than guessing; do not proceed until sufficient information is gathered.
 
 ### 5. Draft intake brief (agent responsibility)
 
-- Write a brief to `.worklog/tmp/intake-draft-<title>-<work-item-id>.md` with these sections:
-  - **Problem statement:** 1–2 sentences summarizing the problem.
-  - **Users:** who benefits, with example user stories.
-  - **Acceptance Criteria:** 3–5 measurable bullets describing success.
-  - **Constraints:** technical, business, or regulatory.
-  - **Existing state:** current state of affairs.
-  - **Desired change:** likely changes needed.
-  - **Key Files (predicted):** files likely to change, with brief explanations. Published as a `**Key Files:**` section in the work item description; update if it already exists (e.g., ``- `path/to/file.py` — Needs new function for X feature``).
-  - **Related work:** related docs or work items with descriptions and links/ids.
-- Present the draft to the user and invite feedback. Incorporate edits when supplied, but don't block waiting for approval — proceed automatically to review stages.
+- Write a brief to `.worklog/tmp/intake-draft-<title>-<work-item-id>.md` with: **Problem statement** (1–2 sentences), **Users** (with example user stories), **Acceptance Criteria** (3–5 measurable bullets), **Constraints**, **Existing state**, **Desired change**, **Key Files (predicted)** (published as a `**Key Files:**` section; e.g. ``- `path/to/file.py` — Needs new function for X feature``), **Related work**.
+- Present the draft and invite feedback; incorporate edits but don't block for approval — proceed automatically to the review stages.
 
 ### 6. Five mini-review stages (agent responsibility; must follow)
 
-Run five conservative review iterations on the draft brief. If a proposed change could alter intent, ask a clarifying question first.
+Run five conservative review iterations on the draft brief. If a proposed change could alter intent, ask a clarifying question first. After each stage: "Finished <type> review: <changes>" or "Finished <type> review: no changes needed".
 
-After each stage: "Finished <type> review: <changes>" or "Finished <type> review: no changes needed"
-
-1. **Completeness** — Ensure Problem, ACs, and Constraints are present and actionable. Add missing bullets or concise placeholders when obvious.
-2. **Capture fidelity** — Verify user answers are accurately and neutrally represented. Shorten only for clarity; don't change meaning.
-3. **Related-work & traceability** — Confirm related docs/work items are correctly referenced.
-4. **Risks & assumptions** — Add missing risks, mitigations, failure modes, and assumptions in short bullets. Include a scope-creep risk: record extra opportunities as linked work items rather than expanding scope. Don't invent mitigations beyond note-level.
-5. **Polish & handoff** — Tighten language, ensure copy-paste-ready commands, produce the final 1–2 sentence headline.
+1. **Completeness** — Problem, ACs, Constraints present and actionable; add missing bullets or concise placeholders when obvious.
+2. **Capture fidelity** — User answers accurately/neutrally represented; shorten only for clarity.
+3. **Related-work & traceability** — Related docs/work items correctly referenced.
+4. **Risks & assumptions** — Add missing risks, mitigations, failure modes, assumptions in short bullets; include a scope-creep risk (record extra opportunities as linked work items, not scope).
+5. **Polish & handoff** — Tighten language, copy-paste-ready commands, final 1–2 sentence headline.
 
 ### 7. Call the find_related skill
 
-Collect related work via `/skill:find-related <work-item-id>` and add a report to the work item description.
+Collect related work via `/skill:find-related <work-item-id>`; add a report to the work item description.
 
 ### 8. Review the new issue in project context
 
-Consider:
-
-- Adding dependencies:
-  ```bash
-  wl comment add <work-item-id> --comment "Blocks:<blocked-id>" --json
-  wl comment add <work-item-id> --comment "Blocked-by:<blocking-id>" --json
-  ```
-- Adjusting priority:
-  ```bash
-  wl update <work-item-id> --priority <level> --json
-  ```
+- Adding dependencies: `wl comment add <work-item-id> --comment "Blocks:<blocked-id>" --json` / `wl comment add <work-item-id> --comment "Blocked-by:<blocking-id>" --json`
+- Adjusting priority: `wl update <work-item-id> --priority <level> --json`
 
 ### 9. Update the work item
 
@@ -224,7 +130,7 @@ This transitions `status=open`, `stage=intake_complete`.
 
 ### 10. Calculate Effort and Risk (agent responsibility; must follow)
 
-- Call the effort_and_risk skill on the new or updated work item to produce an estimate:
+- Call the effort_and_risk skill on the new or updated work item:
   ```bash
   python3 ../effort-and-risk/scripts/orchestrate_estimate.py <work-item-id>
   ```
@@ -232,42 +138,9 @@ This transitions `status=open`, `stage=intake_complete`.
 
 ### 11. Finishing (must do as the final step only)
 
-- `wl sync` to sync changes.
-
-  > **Note:** `wl sync` on a git repo with **no commits yet** fails with an
-  > actionable message (no-commit repos have an unborn HEAD, so git cannot
-  > create the temporary sync worktree). Create an initial commit
-  > (`git commit --allow-empty -m "chore: initial"`) or run
-  > `wl sync --no-push` to keep worklog data local. See
-  > `docs/dev/worklog-sync.md`.
-- `wl show <work-item-id>` (not --json) to display the full work item.
-- Remove temporary files: `.worklog/tmp/intake-draft-<title>-<work-item-id>.md`
-- Output a structured summary:
-
-```markdown
-# Objective
-
-  Headline summary of the issue
-
-# Acceptance Criteria
-
-  Complete list of measurable acceptance criteria. If any are not measurable, add a clarifying question to the Appendix and mark as "TBD pending clarification".
-
-  Always include:
-
-- At least one criterion related to testing and validation.
-- "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries."
-- "Full project test suite must pass with the new changes."
-
-  > **Note:** CHANGELOG.md is **excluded** from this list. It is managed automatically by the ship skill's release pipeline (`../ship/scripts/release/generate-changelog.js`). Implementing agents should not manually update CHANGELOG.md.
-
-  Do not include CI/CD pipeline tests.
-
-# Effort and Risk
-
-  T-shirt sizing and one-line description of the biggest risks
-```
-
+- `wl sync` to sync changes.  > **Note:** on a repo with **no commits yet** `wl sync` fails (unborn HEAD) — create an initial commit (`git commit --allow-empty -m "chore: initial"`) or use `wl sync --no-push`. See `docs/dev/worklog-sync.md`.
+- `wl show <work-item-id>` (not --json); remove temp files (`.worklog/tmp/intake-draft-<title>-<work-item-id>.md`).
+- Output a structured summary (`# Objective` headline, `# Acceptance Criteria` list, `# Effort and Risk` sizing; full template in [docs/dev/intake-skill-reference.md](../docs/dev/intake-skill-reference.md)). The AC list always includes: at least one testing/validation criterion; "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries."; and "Full project test suite must pass with the new changes."  > **Note:** CHANGELOG.md is **excluded** — managed by the ship skill's release pipeline. Do not include CI/CD pipeline tests.
 - Finish with "This completes the Intake process for <work-item-id> <work-item-title>"
 
 ### 12. Error/abort handling
@@ -287,35 +160,18 @@ This resets `status=open`, releasing the item for other agents.
 ## Editing rules & safety
 
 - Preserve author intent; if uncertain, add a clarifying question instead of assuming.
-- Keep edits minimal and conservative.
-- Respect `.gitignore` and other ignore rules when searching the repo.
+- Keep edits minimal and conservative. Respect `.gitignore` and other ignore rules when searching the repo.
 - If any automated step fails or is ambiguous, surface an explicit Open Question and pause for guidance.
 
 ## Appendix: Clarifying questions & answers (must include)
 
-- **Purpose:** Every interview-driven intake must produce an auditable Appendix listing all clarifying questions asked and the answers provided. Append the complete Appendix to the final draft file AND include it in the work item description when running `wl update --description-file`.
+Every interview-driven intake must produce an auditable Appendix of clarifying questions asked and answers provided. Append it to the final draft file AND include it in the work item description (`wl update --description-file`).
 
-- **Required contents per entry** (one line acceptable; context paragraphs where needed):
-  - The question text as asked.
-  - The answer, answering party, and evidence/link (work item id, file path, PR).
-  - If the answer changed, record earlier answers and the final accepted answer.
-  - If the question led to research, include a concise summary (1–6 sentences) with links.
+Per entry: question text as asked; answer, answering party, and evidence/link (id, path, PR); prior answers if changed + final accepted answer; research summary (1–6 sentences) with links when applicable.
 
-- **Example format:**
-  - Q: "Who is the primary user?" — Answer (user@acme): "Internal support engineers". Source: interactive reply.
-  - Q: "Is migration required?" — Answer (user@acme): "No, data model unchanged". Source: interactive reply.
-  - Q: "Can we reuse service X?" — Answer (engineer@acme): "Partially; need a small wrapper. Research: inspected services/x, found no adapter — created follow-up wl-789".
+Example:
 
-- **Behavior and placement:**
-  - Append the complete Appendix to the draft file before final approval.
-  - Include it in the `wl update --description-file` content.
-  - **Idempotent:** rerunning `/skill:intake` must not duplicate earlier entries — update existing records instead.
-  - Open questions: mark as "OPEN QUESTION" with context.
-  - Respect `.gitignore` and agent framework ignore rules.
+- Q: "Who is the primary user?" — Answer (user@acme): "Internal support engineers". Source: interactive reply.
+- Q: "Can we reuse service X?" — Answer (engineer@acme): "Partially; need a small wrapper. Research: inspected services/x, no adapter — created follow-up wl-789".
 
-- **Privacy & scope:**
-  - Record only information provided by the user or authorized stakeholders. Redact secrets with a note (e.g., "[REDACTED sensitive snippet]").
-  - If a user pastes sensitive content by mistake, redact and note.
-
-- **Traceability:**
-  - Each entry should be linkable from the work item. When practical, include `related-to:<work-item-id>` or file path references.
+Behavior: append before final approval; **idempotent** (update existing records, never duplicate); mark open questions "OPEN QUESTION" with context; respect `.gitignore`. Privacy: record only user/authorized-stakeholder info; redact secrets with a note ("[REDACTED sensitive snippet]"). Traceability: each entry linkable; include `related-to:<work-item-id>` or file-path references when practical.
