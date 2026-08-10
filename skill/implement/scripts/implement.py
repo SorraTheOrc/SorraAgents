@@ -19,6 +19,9 @@ Optional flags:
   --worktree-path <path>    Override worktree path
   -v, --verbose             Verbose logging
 
+Environment:
+  IMPLEMENT_TEST_COMMAND    Override the finish test-step command (shell string)
+
 Exit codes:
   0 – success
   1 – error during execution (non-abort)
@@ -32,6 +35,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -810,6 +814,34 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _package_script(cwd: str, name: str) -> Any:
+    """Return the raw ``scripts.<name>`` value from the root package.json.
+
+    Reads the root ``package.json`` directly so the check works without npm.
+    Malformed JSON, a non-object ``scripts`` value, or a missing file counts
+    as "no script" (fail-open — never block finish on a broken manifest).
+
+    Args:
+        cwd: Working directory (worktree root).
+        name: Script name, e.g. ``build`` or ``test``.
+
+    Returns:
+        The raw ``scripts.<name>`` value, or None when the entry (or a
+        readable package.json) does not exist.
+    """
+    package_json = Path(cwd) / "package.json"
+    if not package_json.exists():
+        return None
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if not isinstance(scripts, dict):
+        return None
+    return scripts.get(name)
+
+
 def _has_build_script(cwd: str) -> bool:
     """Check whether the repo root package.json defines a ``build`` script.
 
@@ -828,17 +860,24 @@ def _has_build_script(cwd: str) -> bool:
         value counts as "no build script" (fail-open — never block finish on
         a broken manifest).
     """
-    package_json = Path(cwd) / "package.json"
-    if not package_json.exists():
-        return False
-    try:
-        data = json.loads(package_json.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return False
-    scripts = data.get("scripts") if isinstance(data, dict) else None
-    if not isinstance(scripts, dict):
-        return False
-    return bool(scripts.get("build"))
+    return bool(_package_script(cwd, "build"))
+
+
+def _has_test_script(cwd: str) -> bool:
+    """Check whether the repo root package.json defines a ``test`` script.
+
+    Mirrors :func:`_has_build_script` for the test step: a repo without a
+    ``scripts.test`` entry has no npm test suite — ``npm test`` would exit 1
+    with ``Missing script: "test"``.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True if the root package.json exists and contains a non-empty
+        ``scripts.test`` entry.
+    """
+    return bool(_package_script(cwd, "test"))
 
 
 def run_build(cwd: str) -> dict[str, Any]:
@@ -884,71 +923,374 @@ def run_build(cwd: str) -> dict[str, Any]:
     }
 
 
-def run_tests(cwd: str) -> dict[str, Any]:
-    """Run the full test suite, routed through the per-repo run cache.
+# ---------------------------------------------------------------------------
+# Test helpers
+# ---------------------------------------------------------------------------
 
-    The pytest (and, on failure, npm test) command runs through
-    ``skill.test_cache.run_cached``: a valid cached result for the same
-    worktree git state within the TTL is reused without re-executing the
-    suite (see SA-0MSGN5OJ4002OZKY). Caching is worktree-aware — the
-    fingerprint reflects *cwd*'s HEAD + working-tree changes, so edits in the
-    worktree invalidate stale entries automatically.
+_PYTEST_CONFIG_MARKERS = (
+    ("pyproject.toml", "[tool.pytest.ini_options]"),
+    ("setup.cfg", "[tool:pytest]"),
+    ("tox.ini", "[pytest]"),
+)
+
+
+def _pytest_importable(cwd: str) -> bool:
+    """Whether ``python3 -m pytest`` would work in *cwd*.
+
+    Probes with the same interpreter that runs the suite (``python3``) so
+    venv/global-path differences are respected — ``shutil.which`` alone is
+    not enough because pytest is commonly only available as a module inside
+    a project venv.
 
     Args:
         cwd: Working directory (worktree root).
 
     Returns:
-        A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
-        ``exit_code`` (int), ``failures`` (list[str]) — semantics unchanged
-        from the raw-execution version.
+        True when ``python3 -c "import pytest"`` exits 0.
     """
-    # Route through the cache so repeated verification at the same git state
-    # reuses the prior run instead of re-executing a multi-minute suite.
-    pytest_run = run_cached(
-        "python3 -m pytest -x --tb=short -q",
-        cwd=cwd,
-        timeout=600,
-        runner=lambda command, cwd_, timeout_: run_cmd(
-            command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
-        ),
+    try:
+        probe = run_cmd(
+            ["python3", "-c", "import pytest"],
+            cwd=cwd,
+            check=False,
+            timeout=60,
+            capture=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
+
+def _has_pytest_markers(cwd: str) -> bool:
+    """Whether the repo declares pytest configuration.
+
+    A ``pytest.ini`` file alone counts; for the other config files the
+    relevant section must be present (``[tool.pytest.ini_options]`` in
+    pyproject.toml, ``[tool:pytest]`` in setup.cfg, ``[pytest]`` in tox.ini)
+    so an unrelated config file does not trigger a pytest run.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True when the repo declares pytest configuration.
+    """
+    root = Path(cwd)
+    if (root / "pytest.ini").is_file():
+        return True
+    for name, marker in _PYTEST_CONFIG_MARKERS:
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            if marker in path.read_text(encoding="utf-8"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _has_pytest_test_files(cwd: str) -> bool:
+    """Whether the repo contains pytest-style test files.
+
+    Checks a bounded set of conventional locations (``tests/`` and ``test/``
+    dirs, plus root/``src`` ``test_*.py`` / ``*_test.py`` globs) so the scan
+    never walks into node_modules or other vendored trees.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True when the repo contains Python test files.
+    """
+    root = Path(cwd)
+    for dirname in ("tests", "test"):
+        test_dir = root / dirname
+        if test_dir.is_dir() and any(test_dir.rglob("*.py")):
+            return True
+    for base in (root, root / "src"):
+        if base.is_dir() and (
+            any(base.glob("test_*.py")) or any(base.glob("*_test.py"))
+        ):
+            return True
+    return False
+
+
+def _has_pytest_suite(cwd: str) -> bool:
+    """Whether the repo has a runnable pytest suite.
+
+    Both conditions must hold: pytest must be importable via ``python3``
+    (otherwise running it would fail with ModuleNotFoundError) AND the repo
+    must declare pytest (config marker or test files). The second condition
+    prevents false positives on hosts with a global pytest that would
+    otherwise run on empty bash-only repos and block finish with pytest's
+    "no tests ran" exit code.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True when the repo has a runnable pytest suite.
+    """
+    return _pytest_importable(cwd) and (
+        _has_pytest_markers(cwd) or _has_pytest_test_files(cwd)
     )
 
-    result = pytest_run
-    if result["exit_code"] != 0:
-        # Try npm test as fallback (also cached)
-        npm_run = run_cached(
-            "npm test",
-            cwd=cwd,
-            timeout=600,
-            runner=lambda command, cwd_, timeout_: run_cmd(
-                command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
-            ),
-        )
-        if npm_run["exit_code"] == 0:
-            return {
-                "success": True,
-                "stdout": npm_run["stdout"].strip(),
-                "stderr": npm_run["stderr"].strip(),
-                "exit_code": 0,
-                "failures": [],
-            }
-        # Use the npm result if pytest also failed
-        result = npm_run
 
-    # Parse failures from output
+def _is_unity_project(cwd: str) -> bool:
+    """Whether *cwd* looks like a Unity project root.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True when an ``Assets/`` directory or
+        ``ProjectSettings/ProjectVersion.txt`` exists.
+    """
+    root = Path(cwd)
+    return (root / "Assets").is_dir() or (root / "ProjectSettings" / "ProjectVersion.txt").is_file()
+
+
+def _find_repo_test_runner(cwd: str) -> str | None:
+    """Locate a repo-local test runner script at the repo root.
+
+    Unity repos (and other non-npm/non-pytest repos) commonly ship their own
+    runner, e.g. ``run_tests.sh`` or ``run_unity_tests.bat``; when present it
+    is executed instead of skipping the test step.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        The script file name, or None when no runner is present.
+    """
+    root = Path(cwd)
+    for name in ("run_tests.sh", "run_unity_tests.sh", "run_unity_tests.bat"):
+        if (root / name).is_file():
+            return name
+    return None
+
+
+def _detect_test_tooling(cwd: str) -> str | None:
+    """Detect the repo's test tooling, in precedence order.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        ``pytest`` | ``npm`` | ``repo-script`` | ``unity``, or None when the
+        repo has no test tooling at all.
+    """
+    if _has_pytest_suite(cwd):
+        return "pytest"
+    if _has_test_script(cwd):
+        return "npm"
+    if _find_repo_test_runner(cwd) is not None:
+        return "repo-script"
+    if _is_unity_project(cwd):
+        return "unity"
+    return None
+
+
+def _skip_test_result(message: str, tooling: str | None) -> dict[str, Any]:
+    """Build a skipped/no-op test result.
+
+    Args:
+        message: Informative no-op message (also logged).
+        tooling: The detected tooling, if any (e.g. ``unity``).
+
+    Returns:
+        A result dict with ``success: True`` so finish proceeds.
+    """
+    LOG.info(message)
+    return {
+        "success": True,
+        "stdout": message,
+        "stderr": "",
+        "exit_code": 0,
+        "failures": [],
+        "skipped": True,
+        "tooling": tooling,
+    }
+
+
+def _finalize_test_result(result: dict[str, Any], tooling: str | None) -> dict[str, Any]:
+    """Add metadata keys and parse failures from a raw run result.
+
+    Args:
+        result: Raw run dict (stdout/stderr/exit_code).
+        tooling: The runner that produced the result.
+
+    Returns:
+        The result dict with ``success``, ``failures``, ``skipped: False``
+        and ``tooling`` keys.
+    """
     failures: list[str] = []
     combined = f"{result['stdout']}\n{result['stderr']}"
     for line in combined.splitlines():
         if "FAILED" in line or "failed" in line.lower():
             failures.append(line.strip())
-
     return {
         "success": result["exit_code"] == 0,
         "stdout": result["stdout"].strip(),
         "stderr": result["stderr"].strip(),
         "exit_code": result["exit_code"],
         "failures": failures,
+        "skipped": False,
+        "tooling": tooling,
     }
+
+
+def _shell_command_runner(
+    command: str, cwd: str, timeout: int
+) -> subprocess.CompletedProcess:
+    """Run a shell command string through bash (per-repo overrides/runners)."""
+    return run_cmd(
+        ["bash", "-c", command],
+        cwd=cwd,
+        check=False,
+        timeout=timeout,
+        capture=True,
+    )
+
+
+def run_tests(cwd: str) -> dict[str, Any]:
+    """Run the full test suite, routed through the per-repo run cache.
+
+    The test step is tolerant of repos with no test tooling: when neither
+    pytest, an npm ``test`` script, nor a repo-local runner is detected, the
+    step is skipped and reported as a no-op (``success: True``,
+    ``skipped: True``) so finish proceeds to commit → push instead of
+    aborting on ENOENT / ``Missing script: "test"``.
+
+    Detection order:
+
+    1. ``IMPLEMENT_TEST_COMMAND`` env var — per-repo override; run as-is.
+    2. pytest — when the repo declares pytest (config markers or test files)
+       AND the module imports via ``python3``.
+    3. npm — when the root package.json defines a ``scripts.test`` entry.
+    4. repo-local runner — ``run_tests.sh`` / ``run_unity_tests.sh`` /
+       ``run_unity_tests.bat`` at the repo root.
+    5. Unity project (``Assets/`` or ``ProjectSettings/ProjectVersion.txt``)
+       without a configured runner → skipped with a Unity-specific message.
+    6. Otherwise → skipped with a generic no-tooling message.
+
+    Repos WITH tooling behave as before: the detected command runs (through
+    ``skill.test_cache.run_cached`` — a valid cached result for the same
+    worktree git state within the TTL is reused, see SA-0MSGN5OJ4002OZKY)
+    and a non-zero exit still blocks finish. When pytest is the detected
+    tooling, npm test remains the fallback if the repo also defines a
+    ``scripts.test`` entry.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
+        ``exit_code`` (int), ``failures`` (list[str]), plus ``skipped``
+        (bool — True when no tooling was found) and ``tooling`` (str | None —
+        the detected runner: pytest/npm/repo-script/override/unity).
+    """
+    # 1. Per-repo override (env var) — highest precedence
+    override = os.environ.get("IMPLEMENT_TEST_COMMAND", "").strip()
+    if override:
+        return _finalize_test_result(
+            run_cached(
+                override,
+                cwd=cwd,
+                timeout=600,
+                runner=_shell_command_runner,
+            ),
+            tooling="override",
+        )
+
+    tooling = _detect_test_tooling(cwd)
+
+    # 2. pytest (with npm test fallback when the repo also has a test script)
+    if tooling == "pytest":
+        pytest_run = run_cached(
+            "python3 -m pytest -x --tb=short -q",
+            cwd=cwd,
+            timeout=600,
+            runner=lambda command, cwd_, timeout_: run_cmd(
+                command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+            ),
+        )
+        result = pytest_run
+        final_tooling = "pytest"
+        if result["exit_code"] != 0 and _has_test_script(cwd):
+            # Try npm test as fallback (also cached)
+            npm_run = run_cached(
+                "npm test",
+                cwd=cwd,
+                timeout=600,
+                runner=lambda command, cwd_, timeout_: run_cmd(
+                    command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                ),
+            )
+            if npm_run["exit_code"] == 0:
+                return _finalize_test_result(npm_run, tooling="npm")
+            # Use the npm result if pytest also failed
+            result = npm_run
+            final_tooling = "npm"
+        return _finalize_test_result(result, tooling=final_tooling)
+
+    # 3. npm test script (no pytest suite)
+    if tooling == "npm":
+        return _finalize_test_result(
+            run_cached(
+                "npm test",
+                cwd=cwd,
+                timeout=600,
+                runner=lambda command, cwd_, timeout_: run_cmd(
+                    command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                ),
+            ),
+            tooling="npm",
+        )
+
+    # 4. Repo-local runner script
+    if tooling == "repo-script":
+        runner_script = _find_repo_test_runner(cwd)
+        if runner_script is None:
+            return _skip_test_result(
+                "Repo-local runner script disappeared before execution — "
+                "skipping test step (no-op).",
+                tooling="repo-script",
+            )
+        if runner_script.endswith(".bat"):
+            if shutil.which("cmd.exe") is None:
+                return _skip_test_result(
+                    f"Repo-local test runner {runner_script} requires cmd.exe "
+                    "which is not available on this host — skipping test step "
+                    "(no-op).",
+                    tooling="repo-script",
+                )
+            command = f"cmd.exe /c {runner_script}"
+        else:
+            command = f"bash {runner_script}"
+        return _finalize_test_result(
+            run_cached(command, cwd=cwd, timeout=600, runner=_shell_command_runner),
+            tooling="repo-script",
+        )
+
+    # 5. Unity project without a configured runner → Unity-specific skip
+    if tooling == "unity":
+        return _skip_test_result(
+            "Unity project detected (Assets/ or ProjectSettings/ProjectVersion.txt) "
+            "but no test runner configured — no pytest suite, no npm test script, "
+            "and no repo-local runner (run_tests.sh / run_unity_tests.sh / "
+            "run_unity_tests.bat). Skipping test step (no-op). Set "
+            "IMPLEMENT_TEST_COMMAND to run Unity tests if needed.",
+            tooling="unity",
+        )
+
+    # 6. No tooling at all → generic skip
+    return _skip_test_result(
+        "No test tooling detected (no pytest suite, no npm test script, no "
+        "repo-local test runner) — skipping test step (no-op).",
+        tooling=None,
+    )
 
 
 def run_refactor(work_item_id: str, cwd: str) -> dict[str, Any]:
@@ -1413,6 +1755,8 @@ def phase_finish(
         "attempt": test_attempts + 1,
         "success": test_result["success"],
         "failures": test_result.get("failures", []),
+        "skipped": test_result.get("skipped", False),
+        "tooling": test_result.get("tooling"),
     })
 
     while not test_result["success"] and test_attempts < max_retry:
@@ -1484,6 +1828,8 @@ def phase_finish(
             "attempt": test_attempts + 1,
             "success": test_result["success"],
             "failures": test_result.get("failures", []),
+            "skipped": test_result.get("skipped", False),
+            "tooling": test_result.get("tooling"),
         })
 
     if not test_result["success"]:
