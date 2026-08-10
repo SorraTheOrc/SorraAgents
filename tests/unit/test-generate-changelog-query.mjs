@@ -91,7 +91,8 @@ describe('getCompletedOrInReviewItems - single AND query + jq projection', () =>
       title: 'One',
       issueType: 'feature',
       description: 'desc one',
-    }], 'projection should expose exactly id/title/issueType/description');
+      parentId: null,
+    }], 'projection should expose exactly id/title/issueType/description/parentId');
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -101,7 +102,7 @@ describe('getCompletedOrInReviewItems - single AND query + jq projection', () =>
     const argsLogPath = join(tmpDir, 'args.log');
     // ~200 items x ~6KB of audit enrichment (NOT projected) ≈ 1.2MB raw
     // output — over execSync's default 1MB maxBuffer. jq drops the
-    // enrichment so only the 4 projected fields enter Node's buffer.
+    // enrichment so only the 5 projected fields enter Node's buffer.
     const workItems = Array.from({ length: 200 }, (_, i) => ({
       id: `SA-LARGE-${i}`,
       title: `Large item ${i}`,

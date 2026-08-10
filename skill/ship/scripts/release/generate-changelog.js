@@ -3,9 +3,10 @@
 /**
  * generate-changelog.js — CHANGELOG.md generator for the ship release process.
  *
- * Queries Worklog for all completed / in_review work items, categorizes them
- * by issue_type, applies a simple keyword-based miscategorization check,
- * and updates / creates CHANGELOG.md in the repository root.
+ * Queries Worklog for all completed / in_review work items, filters to
+ * parent-level items, categorizes them by issue_type with an LLM review
+ * pass, generates player-focused descriptions via an LLM prompt, and
+ * updates / creates CHANGELOG.md in the repository root.
  *
  * Usage:
  *   node generate-changelog.js <version>
@@ -45,15 +46,16 @@ const CHANGELOG_PATH = resolve(REPO_ROOT, 'CHANGELOG.md');
  * ensures a `wl` failure still surfaces as an execSync error so the
  * warning path below fires.
  *
- * @returns {Array<{id:string, title:string, issueType:string, description:string}>}
+ * @returns {Array<{id:string, title:string, issueType:string, description:string, parentId?:string|null}>}
  */
 export function getCompletedOrInReviewItems() {
   try {
     // Single AND query (status=completed AND stage=in_review), piped through
-    // jq so only {id, title, issueType, description} enters the buffer.
+    // jq so only {id, title, issueType, description, parentId} enters the buffer.
+    // parentId is needed to filter parent-only work items for the changelog.
     const output = execSync(
       `set -o pipefail; wl list --status completed --stage in_review --json ` +
-      `| jq -c '[.workItems[] | {id, title, issueType, description}]'`,
+      `| jq -c '[.workItems[] | {id, title, issueType, description, parentId}]'`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     );
     return JSON.parse(output) || [];
@@ -61,6 +63,118 @@ export function getCompletedOrInReviewItems() {
     // wl may not be available; caller handles this gracefully
     console.error('Warning: could not query completed/in_review work items (wl not available?)');
     return [];
+  }
+}
+
+// ── Parent-only filtering ──────────────────────────────────────────────────
+
+/**
+ * Filter work items to only parent items (those with no parentId).
+ * This excludes child/subtask items that would create redundant changelog entries.
+ *
+ * @param {Array<{id:string, title:string, issueType:string, description:string, parentId?:string|null}>} items
+ * @returns {Array<{id:string, title:string, issueType:string, description:string}>}
+ */
+export function getParentsOnly(items) {
+  return items.filter(
+    (item) => item.parentId === null || item.parentId === undefined,
+  );
+}
+
+// ── LLM-based player description generation ─────────────────────────────────
+
+/**
+ * Generate a player-focused description for a work item using an LLM.
+ *
+ * Uses the DeepSeek API (OpenAI-compatible) if the DEEPSEEK_API_KEY
+ * environment variable is set; otherwise falls back to the raw title.
+ *
+ * @param {{id:string, title:string, issueType:string, description:string}} item
+ * @returns {Promise<string>} A player-friendly description.
+ */
+export async function generatePlayerDescription(item) {
+  const prompt = `
+You are a changelog writer for a game. Convert the following work item into a short, player-friendly description.
+
+Focus on WHY this change matters to players, not technical implementation details.
+Keep it concise (under 100 characters). Do NOT include the work item ID, technical jargon, or markdown formatting.
+
+Title: ${escapeForPrompt(item.title)}
+Description: ${escapeForPrompt(item.description || 'No additional description.')}
+
+Player-facing description:`;
+
+  const content = await callLlm([
+    { role: 'system', content: 'You are a helpful changelog writer. Always respond with a single line — the player-friendly description. No extra text, no quotes, no ID references.' },
+    { role: 'user', content: prompt.trim() },
+  ]);
+
+  if (content === null) {
+    // No LLM API available: fall back to the raw title (backward compatible)
+    return item.title;
+  }
+
+  // Clean up the response: remove surrounding quotes, extra whitespace
+  return content
+    .trim()
+    .replace(/^"|"$/g, '')
+    .replace(/^'|'$/g, '');
+}
+
+/**
+ * Escape special characters in a string for safe inclusion in a prompt.
+ *
+ * @param {string} str
+ * @returns {string}
+ */
+function escapeForPrompt(str) {
+  return str
+    .replace(/\\/g, '\\\\')
+    .replace(/\n/g, '\\n')
+    .replace(/"/g, '\\"');
+}
+
+/**
+ * Shared LLM chat-completion caller (DeepSeek, OpenAI-compatible API).
+ *
+ * Returns the assistant message content, or null when no API key is
+ * configured or the call fails. Callers fall back to their non-LLM
+ * behaviour in that case, so the script stays backward-compatible
+ * when no key is present.
+ *
+ * @param {Array<{role:string, content:string}>} messages
+ * @param {{maxTokens?:number, temperature?:number}} opts
+ * @returns {Promise<string|null>}
+ */
+async function callLlm(messages, opts = {}) {
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  if (!apiKey) return null;
+
+  try {
+    const response = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'deepseek-chat',
+        messages,
+        max_tokens: opts.maxTokens ?? 120,
+        temperature: opts.temperature ?? 0.3,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!response.ok) {
+      throw new Error(`API error: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content ?? null;
+  } catch (err) {
+    console.error(`[LLM] ${err.message}`);
+    return null;
   }
 }
 
@@ -135,24 +249,142 @@ function checkMiscategorization(item) {
   return item.issueType;
 }
 
+// ── Classification review ──────────────────────────────────────────────────
+
+/**
+ * Map a Worklog issue type to a changelog category.
+ *
+ * @type {Record<string, 'feature'|'bug'|'other'>}
+ */
+const ISSUE_TYPE_CATEGORY = {
+  feature: 'feature',
+  bug: 'bug',
+  chore: 'other',
+  docs: 'other',
+  task: 'other',
+  epic: 'other',
+};
+
+/**
+ * Convert a Worklog issue type to a changelog category.
+ *
+ * @param {string} issueType
+ * @returns {'feature'|'bug'|'other'}
+ */
+export function toCategory(issueType) {
+  return ISSUE_TYPE_CATEGORY[issueType] || 'other';
+}
+
+/**
+ * Review and validate the classification of a work item.
+ *
+ * Starts from the keyword-based classification (including the
+ * miscategorization heuristic) and, when an LLM API key is configured,
+ * asks the LLM to confirm or correct it. If the LLM disagrees, its
+ * classification wins and the entry is flagged for the operator's
+ * attention in stderr.
+ *
+ * @param {{id:string, title:string, issueType:string, description:string}} item
+ * @returns {Promise<{type:'feature'|'bug'|'other', flagged:boolean, note:string}>}
+ */
+export async function reviewClassification(item) {
+  const keywordType = toCategory(checkMiscategorization(item));
+
+  const prompt = `
+Classify this work item as exactly one of: feature, bug, other.
+
+Work item title: ${escapeForPrompt(item.title)}
+Description: ${escapeForPrompt(item.description || 'No description.')}
+Current classification: ${keywordType}
+
+Respond with ONLY the word 'feature', 'bug', or 'other' — nothing else.`;
+
+  const content = await callLlm([
+    { role: 'system', content: 'You are a changelog classifier. Always respond with exactly one word: feature, bug, or other.' },
+    { role: 'user', content: prompt.trim() },
+  ], { maxTokens: 10, temperature: 0.1 });
+
+  if (content === null) {
+    // No LLM API available: keyword-based classification stands
+    return { type: keywordType, flagged: false, note: '' };
+  }
+
+  const llmType = content.trim().toLowerCase();
+  if (llmType === 'feature' || llmType === 'bug' || llmType === 'other') {
+    if (llmType !== keywordType) {
+      return {
+        type: llmType,
+        flagged: true,
+        note: `${item.id}: LLM reclassified ${keywordType} → ${llmType}`,
+      };
+    }
+    return { type: keywordType, flagged: false, note: '' };
+  }
+
+  // Unparseable LLM response: keep keyword-based classification
+  console.error(`[classification review] ${item.id}: unexpected LLM response "${content.trim()}"`);
+  return { type: keywordType, flagged: false, note: '' };
+}
+
 // ── Categorization ─────────────────────────────────────────────────────────
+
+/**
+ * Map `fn` over `items` with a bounded concurrency limit.
+ *
+ * Prevents overwhelming the LLM API when a release has many work items.
+ *
+ * @param {Array} items
+ * @param {number} limit  Maximum concurrent executions
+ * @param {(item: unknown) => Promise<unknown>} fn
+ * @returns {Promise<Array<unknown>>}
+ */
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+
+  async function worker() {
+    while (next < items.length) {
+      const idx = next;
+      next += 1;
+      results[idx] = await fn(items[idx]);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
 
 /**
  * Group items into Features, Bug Fixes, and Other categories.
  *
+ * Only parent-level items (no parentId) are processed — child items are
+ * skipped so they never create redundant changelog entries (AC1). Each item
+ * is processed by the LLM to generate a player-focused description (AC2) and
+ * its classification is reviewed and corrected if needed (AC3). When no LLM
+ * API key is configured the raw title and keyword-based classification are
+ * used — backward-compatible behaviour.
+ *
  * @param {Array} items
- * @returns {{features:string[], bugFixes:string[], other:string[]}}
+ * @returns {Promise<{features:string[], bugFixes:string[], other:string[]}>}
  */
-function categorizeItems(items) {
+export async function categorizeItems(items) {
   const features = [];
   const bugFixes = [];
   const other = [];
 
-  for (const item of items) {
-    const effectiveType = checkMiscategorization(item);
-    const entry = `- ${item.title} (${item.id})`;
+  const parents = getParentsOnly(items);
+  const processed = await mapWithConcurrency(parents, 4, async (item) => {
+    const description = await generatePlayerDescription(item);
+    const review = await reviewClassification(item);
+    return { item, description, ...review };
+  });
 
-    switch (effectiveType) {
+  for (const { item, description, type, flagged, note } of processed) {
+    if (flagged) console.error(`[classification review] ${note}`);
+    const entry = `- ${description} (${item.id})`;
+
+    switch (type) {
       case 'feature':
         features.push(entry);
         break;
@@ -272,7 +504,7 @@ Examples:
 `);
 }
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
 
   if (args.length < 1 || args[0] === '-h' || args[0] === '--help') {
@@ -285,10 +517,13 @@ function main() {
 
   console.error(`Generating CHANGELOG.md for v${version} (${date}) ...`);
 
-  const items = getCompletedOrInReviewItems();
-  console.error(`Found ${items.length} work item(s) (completed + in_review)`);
+  const allItems = getCompletedOrInReviewItems();
+  console.error(`Found ${allItems.length} work item(s) (completed + in_review)`);
 
-  const categorized = categorizeItems(items);
+  const parentItems = getParentsOnly(allItems);
+  console.error(`Of those, ${parentItems.length} parent item(s) will appear in the changelog`);
+
+  const categorized = await categorizeItems(parentItems);
   console.error(
     `Categorised: ${categorized.features.length} feature(s), ` +
     `${categorized.bugFixes.length} bug fix(es), ` +
@@ -306,5 +541,8 @@ const isMainModule = process.argv[1] &&
   realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(process.argv[1]));
 
 if (isMainModule) {
-  main();
+  main().catch((err) => {
+    console.error(`Error generating changelog: ${err.message}`);
+    process.exit(1);
+  });
 }
