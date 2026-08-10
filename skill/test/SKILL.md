@@ -37,6 +37,15 @@ Workflow
 python3 ./scripts/run_tests.py --json
 ```
 
+**Project-root resolution:** the runner targets the **invoking project** —
+it resolves the project root from the current working directory via
+`git rev-parse --show-toplevel` at CLI time (falling back to the framework's
+install location when cwd is not inside a git repo, e.g. legacy/standalone
+use). Running it from a non-framework project (e.g. the llm repo) therefore
+tests and caches *that* project's suite under its own `.worklog/cache/`,
+with the git-state fingerprint taken at that project's HEAD. Pass
+`--project-root <path>` to override detection explicitly (SA-0MSNQV9J20010LE7).
+
 The runner executes, in quiet mode:
 
 - **pytest**: `pytest -q -r a --disable-warnings` (canonicalized via `canonicalize_quiet_test_command` from `../test_runner.py`)

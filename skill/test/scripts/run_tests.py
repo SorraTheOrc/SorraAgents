@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -53,6 +54,36 @@ CACHE_TTL_SECONDS = DEFAULT_TTL_SECONDS
 
 PYTEST_CMD = canonicalize_quiet_test_command("pytest")
 NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
+
+
+def detect_project_root() -> Path:
+    """Resolve the project the CLI should target, from the invoking cwd.
+
+    Uses ``git rev-parse --show-toplevel`` at CLI time (mirroring the audit
+    skill's ``TARGET_PROJECT_ROOT``, SA-0MSNQV9J20010LE7) so that running
+    ``run_tests.py`` from a non-framework project (e.g. the llm repo) tests
+    and caches THAT project's suite — not the framework's install location.
+    Falls back to ``REPO_ROOT`` when git is unavailable or cwd is not inside
+    a git repo (preserving legacy behavior).
+
+    Returns:
+        The project root Path.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=os.getcwd(),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            root = Path(proc.stdout.strip())
+            if root.is_dir():
+                return root
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return REPO_ROOT
 
 _FAILED_RE = re.compile(r"^FAILED\s+(.+?)\s+-\s+(.*)$", re.MULTILINE)
 _SECTION_RE = re.compile(r"^_{5,}\s+(.+?)\s+_{5,}$", re.MULTILINE)
@@ -456,6 +487,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Custom grep pattern for --summary line filtering.",
     )
+    parser.add_argument(
+        "--project-root",
+        default=None,
+        help="Explicit project root to test/cache against (default: detected from "
+        "cwd via git rev-parse --show-toplevel, falling back to the framework "
+        "install location).",
+    )
     return parser
 
 
@@ -493,8 +531,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     suites = ("pytest", "node") if args.suite == "all" else (args.suite,)
 
+    # Resolve the project root: explicit flag wins, else detect from cwd at
+    # CLI time so a non-framework invocation tests that project (SA-0MSNQV9J20010LE7).
+    project_root = Path(args.project_root).resolve() if args.project_root else detect_project_root()
+
     if args.summary:
-        summary = run_summary(suites, pattern=args.summary_grep)
+        summary = run_summary(suites, cwd=project_root, pattern=args.summary_grep)
         if args.json:
             print(json.dumps(summary, indent=2))
         else:
@@ -509,6 +551,7 @@ def main(argv: list[str] | None = None) -> int:
 
     result = run_all(
         suites=suites,
+        cwd=project_root,
         timeout=args.timeout,
         use_cache=not args.no_cache,
         force=args.force,

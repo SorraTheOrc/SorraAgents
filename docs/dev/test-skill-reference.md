@@ -14,6 +14,17 @@ same git state within the **2-hour TTL** is served from cache **without
 re-executing the suite**. This prevents agents from burning 1.5–7 minutes
 re-running an identical suite just to extract summary lines.
 
+**Project-root resolution (SA-0MSNQV9J20010LE7):** the CLI targets the
+*invoking* project, not the framework's install location. `main()` resolves
+the project root at CLI time via `git rev-parse --show-toplevel` from the
+current working directory (mirroring the audit skill's
+`TARGET_PROJECT_ROOT`), falling back to the framework `REPO_ROOT` when cwd
+is not inside a git repo. `--project-root <path>` overrides detection
+explicitly. This means a run from e.g. the llm repo writes/reads
+`<llm>/.worklog/cache/` with the fingerprint at llm's HEAD — and the audit
+skill's read-only `query_cached(..., cwd=TARGET_PROJECT_ROOT)` continues to
+hit the same entries because both resolve the same project root.
+
 - **Storage**: `<repo>/.worklog/cache/` (fallback `<repo>/.git/test-cache/`,
   resolved worktree-aware). Gitignored; never committed.
 - **Invalidation**: git-state fingerprint (HEAD sha + working-tree changes) +
