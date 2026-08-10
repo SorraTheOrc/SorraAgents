@@ -6,7 +6,7 @@ description: "Write tests, docs, and code for a Worklog item via a deterministic
 ## Purpose
 
 Deterministic, step-by-step workflow for completing a Worklog work item
-through code, tests, and documentation.
+through code, tests, and docs.
 
 ## Inputs
 
@@ -15,7 +15,7 @@ through code, tests, and documentation.
 
 ## Outputs
 
-- Tests and implementation code meeting ACs, committed to a branch and pushed to `dev`.
+- Tests and implementation code meeting ACs, committed and pushed to `dev`.
 - Work item updated to `in_review` (NOT closed; stays open until the release promotes the changes to `main`).
 
 ## References to Bundled Resources
@@ -39,8 +39,9 @@ from `../shared/status_lifecycle.py`. The orchestration script (`implement.py`)
 uses it automatically: `phase_start()` claims (`in_progress`); `phase_finish()`
 wraps build/test/commit/push in `with StatusLifecycle(..., target_stage="in_review"):`
 (success → `completed`/`in_review`; error → original status restored);
-`phase_abort()` resets to `open`. Manual use: `StatusLifecycle.update_status()`
-or the context-manager pattern in `../shared/status_lifecycle.py`.
+`phase_abort()` resets to `open` (also available as `implement.py abort
+<WIP-id>`). Manual use: `StatusLifecycle.update_status()` or the
+context-manager pattern in `../shared/status_lifecycle.py`.
 
 ## Test Anti-Patterns
 
@@ -51,9 +52,7 @@ tests that: (1) grep source code instead of asserting behaviour, (2) contain
 `expect(true).toBe(true)` or zero assertions, (3) re-implement production
 logic, (4) duplicate an existing core test, (5) assert type-level satisfaction
 the compiler already checks, (6) boot a browser/scene without asserting
-anything.
-
-Every test must assert observable behaviour via the public API.
+anything. Every test must assert observable behaviour via the public API.
 
 ## Best Practices
 
@@ -73,7 +72,7 @@ Every test must assert observable behaviour via the public API.
 - Document process/decisions/next steps in work item comments; handle errors
   gracefully with actionable remediation.
 - Not well-defined → intake interview; implement blockers/dependencies first.
-- Follow AGENTS.md policies for branch naming, commit discipline, worktree workflow, and push-to-dev integration ([AGENTS.md](../../AGENTS.md#implement-the-work-item)); after `in_review`, use the cleanup skill to tidy local feature branches (not `dev`/`main`).
+- Follow AGENTS.md policies for branch naming, commit discipline, worktree workflow, and push-to-dev ([AGENTS.md](../../AGENTS.md#implement-the-work-item)); after `in_review`, use the cleanup skill to tidy local feature branches (not `dev`/`main`).
 - Use `StatusLifecycle` for all status transitions — never ad-hoc `wl update --status` commands.
 
 ## Status Safety & Abort Handling
@@ -120,7 +119,7 @@ document: `wl comment add <work-item-id> --comment "Aborted by operator" --autho
 
 - **Graphics/audio:** create in `assets/images/` or `assets/audio/` with a `placeholder_` prefix; reference in comments and commit; optimize size/performance; only use assets you have rights to distribute (attribute where required).
 - **Documentation:** update relevant markdown in `docs/`; keep changes clear and accurate.
-- **Exception:** `CHANGELOG.md` is excluded — managed by the ship skill's release pipeline.
+- **Exception:** `CHANGELOG.md` excluded — managed by the ship skill's release pipeline.
 
 ## Steps
 
@@ -152,9 +151,9 @@ abort); act only after the operator explicitly chooses.
 - **Inside a worktree:** `.worklog/`-only → carry forward; otherwise stop and
   ask the operator; never stash/commit/revert unilaterally.
 - **Main checkout:** `.worklog/`-only → carry forward; otherwise report the
-  dirty files (may be stale) and proceed to create a worktree for isolation
-  without touching the user's changes; if dirty files prevent worktree
-  creation, stop and ask the operator (act only on their explicit choice).
+  dirty files (may be stale) and create a worktree for isolation without
+  touching the user's changes; if dirty files prevent worktree creation, stop
+  and ask the operator (act only on their explicit choice).
 
 On abort: `StatusLifecycle.update_status(<work-item-id>, "open")`
 
@@ -213,7 +212,7 @@ stage. Needs producer review." + return control.
   - External constraints prevent complete tests → harnesses/mocks/placeholders,
     documented; follow project style; comment on significant decisions.
   - Discovered additional work → `wl create "<title>" --deps discovered-from:<work-item-id> --json`
-- Once all ACs are met: **build** (no errors); **run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`)** — run → triage → evaluate → loop until green; report; fix failures. Failures outside this scope → triage helper (`python3 ../triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
+- Once all ACs are met: **build** (no errors); **run the full test suite via the [test skill](../test/SKILL.md) (`/skill:test`)** — run → triage → evaluate → loop until green; report; fix failures. Failures outside scope → triage helper (`python3 ../triage/scripts/check_or_create.py '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...", "parent_work_item_id":"<this-work-item-id>"}'`); implement returned critical issues, re-run until green. Update docs (except `CHANGELOG.md`); summarize changes.
 
 6. Automated self-review
 

@@ -81,6 +81,27 @@ Startup static-context budget (bytes / tokens):
 > `context-budget.thresholds.json` now pins `global_agents: 8192` (the F4
 > budget) with `total: 13049`.
 
+> **F5 update (2026-08-09):** after trimming the six largest SKILL.md files
+> (SA-0MSLK7SAE0032V9K), the **on-demand** skill-load surface dropped
+> substantially (implementation-reference detail relocated to
+> `docs/dev/*-skill-reference.md`, loaded only on demand):
+>
+> | Skill | Before (B) | After (B) | Reduction |
+> |---|---|---|---|
+> | audit | 52,116 | 11,991 | ~77% |
+> | plan | 23,602 | 16,589 | ~30% |
+> | implement | 21,911 | 15,447 | ~30% |
+> | intake | 17,541 | 12,213 | ~30% |
+> | ship | 12,306 | 8,672 | ~30% |
+> | test | 8,322 | 6,007 | ~28% |
+> | **Total** | **135,798** | **70,919** | **~48%** |
+>
+> The six heaviest skills now load with ≥28–77% less context per invocation,
+> with all relocated detail preserved verbatim (or summarized with link + SA
+> reference) in `docs/dev/`. Skill-doc tests were updated to check the
+> reference docs (F5 AC4). The audit skill's `--no-context-files --no-skills`
+> invariant is unchanged (enforced by `skill/audit/tests`).
+
 > **Intake measurement note:** the intake baseline (3,492 B prose) was
 > measured with a looser methodology that varied between sessions (3,371 B
 > → 3,505 B depending on block-style YAML handling). This tool defines the
