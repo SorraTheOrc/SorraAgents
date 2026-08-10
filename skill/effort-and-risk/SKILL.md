@@ -67,15 +67,17 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 
 1. Fetch issue: `wl show <issue-id> --json`
 2. Prepare JSON input with items, O/M/P, overheads, risk, certainty, assumptions, unknowns
-3. Run orchestrator, capture output to `<issue-id>`-based filename:
+3. Run orchestrator, capture output to a **temp path outside the repository**:
 
    ```sh
-   python3 ./scripts/run_skill.py --issue <id> <<'JSON' > final-<id>.json
+   python3 ./scripts/run_skill.py --issue <id> <<'JSON' > /tmp/effort-risk-final-<id>.json
    { "items": [...], "o": ..., "m": ..., "p": ..., "overheads": {...}, "parent": {...}, "children": [...], "certainty": 85, "assumptions": [...], "unknowns": [...] }
    JSON
    ```
 
    The script gates, computes, updates issue metadata, and posts a comment. Returns JSON with `human_text` and `comment_result`.
+
+   > **Important:** Always redirect output to `/tmp/` — never to a repo-relative path. Transient artifacts in tracked directories dirty the working tree and block `implement.py start`.
 
 4. Verify: `wl show <issue-id> --format full`
 
@@ -94,7 +96,7 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 ### Example
 
 ```sh
-python3 ./scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > final-SA-0MPYMFZXO0004ZU4.json
+python3 ./scripts/run_skill.py --issue SA-0MPYMFZXO0004ZU4 <<'JSON' > /tmp/effort-risk-final-SA-0MPYMFZXO0004ZU4.json
 { ... }
 JSON
 wl show SA-0MPYMFZXO0004ZU4 --format full
