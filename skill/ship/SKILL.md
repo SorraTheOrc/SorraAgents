@@ -9,13 +9,11 @@ Canonical agent-side dev-to-main release execution with automated gating.
 
 ## Purpose
 
-Provide a single, deterministic release workflow: `dev` is promoted to `main` via a gated, PR-based merge. All helper functions (branch naming, validation, unmerged-branch detection, audit readiness, etc.) are internal implementation details.
+Provide a single, deterministic release workflow: `dev` is promoted to `main` via a gated, PR-based merge. Helper functions (branch naming, validation, unmerged-branch detection, audit readiness, etc.) are internal details.
 
 ## When To Use
 
-- Execute a release (promote `dev` to `main`).
-
-Triggers: "ship it", "shipit", "ship", "release", "promote dev", "merge dev to main", "release the changes" — all map to the `release` action.
+Execute a release (promote `dev` to `main`). Triggers: "ship it", "shipit", "ship", "release", "promote dev", "merge dev to main", "release the changes" — all map to `release`.
 
 ## How Agents Invoke This Skill
 
@@ -23,27 +21,13 @@ Triggers: "ship it", "shipit", "ship", "release", "promote dev", "merge dev to m
 /skill:ship release
 ```
 
-The `release` action runs the full dev→main release pipeline (see Release Process below).
-
 ## Prerequisites
 
-- **Node.js** 18+, **git**, **gh** CLI, **wl** CLI (Worklog), **jq** CLI
+**Node.js** 18+, **git**, **gh** CLI, **wl** CLI, **jq** CLI
 
 ## Internal Scripts and Modules
 
-All scripts below are internal implementation details — they are not exposed as user-facing actions. The only user-facing action is `release`.
-
-| Script | Purpose |
-|--------|---------|
-| `./scripts/run-release.js` | Release wrapper (includes gating, post-release dev sync) |
-| `./scripts/release/merge-dev-to-main.sh` | Canonical release merge script |
-| `./scripts/ship.js` | Push-to-dev helper (`pushToDev`, `pushToBranch`, `validatePushTarget`) — used by the implement workflow |
-| `./scripts/git-helpers.js` | Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`) |
-| `./scripts/check-unmerged-branches.js` | Unmerged branch detection |
-| `./scripts/check-audit-gate.js` | Audit readiness and producer-review gating |
-| `./scripts/check-critical-items.js` | Critical-items gating |
-| `./scripts/check-worklog-refs.js` | Worklog refs gating |
-| `./scripts/remediate-spurious-closes.js` | Idempotent remediation sweep for test-suite-spuriously-closed work items (SA-0MSJ2XMQL006CVQS) |
+All scripts are internal implementation details — the only user-facing action is `release`. Full inventory: [docs/dev/ship-skill-reference.md](../docs/dev/ship-skill-reference.md). Key scripts: `run-release.js` (release wrapper + gating + dev sync), `release/merge-dev-to-main.sh` (canonical merge), `ship.js` (`pushToDev`), `git-helpers.js` (branch naming/policy), `check-unmerged-branches.js`, `check-audit-gate.js`, `check-critical-items.js`, `check-worklog-refs.js`, `remediate-spurious-closes.js`.
 
 ## Usage
 
@@ -55,57 +39,30 @@ node ./scripts/run-release.js
 For programmatic access to internal helpers (used by the implement workflow):
 
 ```javascript
-// Push completed work into dev (internal to implement workflow)
 import { pushToDev } from './scripts/ship.js';
-
 const result = pushToDev('origin');
-if (!result.success) {
-  // handle failure — e.g., create a merge-conflict work item
-}
-
-// Generate a canonical branch name
+if (!result.success) { /* handle failure, e.g. create a merge-conflict work item */ }
 import { makeBranchName, validateBranchName, isBranchBlocked } from './scripts/git-helpers.js';
-
-const branchName = makeBranchName('SA-001', 'fix-login-bug');
-// Returns: 'wl-SA-001-fix-login-bug'
-
-const validation = validateBranchName('wl-SA-001-fix-login-bug');
-// Returns: { valid: true }
-
-const blocked = isBranchBlocked('main');
-// Returns: true
+makeBranchName('SA-001', 'fix-login-bug');     // → 'wl-SA-001-fix-login-bug'
+validateBranchName('wl-SA-001-fix-login-bug'); // → { valid: true }
+isBranchBlocked('main');                       // → true
 ```
 
 ## Gating
 
 The `release` action runs five gating checks before merging `dev` to `main`:
 
-1. **Unmerged branches check** — aborts with report if feature branches pending; exit code 3; `--skip-checks` bypasses.
-2. **Audit readiness gate** — verifies all `in_review`/`completed` items pass audits; exit code 6; `--skip-checks` bypasses. Timed-out or transient audits (provider error, script execution failure) are reported as warnings and do **not** block the release — only genuine "not ready to close" verdicts block.
-3. **Critical-items gate** — aborts if non-terminal critical items exist; exit code 7; `--skip-checks` bypasses.
-4. **Worklog refs gate** — aborts if worklog refs are still present in merged code; exit code 8.
-5. **Producer-review gate** — aborts if items need producer review; exit code 9; `--skip-checks` bypasses.
+1. **Unmerged branches check** — abort if feature branches pending; exit 3.
+2. **Audit readiness gate** — verifies `in_review`/`completed` items pass audits; exit 6. Timed-out/transient audits are warnings and do **not** block — only genuine "not ready to close" verdicts do.
+3. **Critical-items gate** — abort if non-terminal critical items exist; exit 7.
+4. **Worklog refs gate** — abort if worklog refs remain in merged code; exit 8.
+5. **Producer-review gate** — abort if items need producer review; exit 9.
 
-CI is **optional**: if the PR has status checks (e.g., a CI workflow is configured) they must pass before merge; if no status checks exist, the merge proceeds without waiting. See [Release Process](#release-process) step 6.
-
-Bypass all checks: `node ./scripts/run-release.js --skip-checks`
+All gates bypass with `--skip-checks`. CI is **optional**: PR status checks must pass if present; none → merge proceeds without waiting.
 
 ### Code Freeze
 
-While a release is running, the ship skill sets a **Code Freeze marker** at
-`.worklog/code-freeze.json` (cross-repo contract WL-0MSBU4KMA004PKSR):
-
-```json
-{ "active": true, "reason": "ship release in progress", "startedAt": "<ISO>", "pid": <pid> }
-```
-
-The marker is written **before** the gating checks run and cleared on **every**
-exit path (success, failure, abort, `--dry-run`, and gating failures) via a
-`try/finally` in `run-release.js` and an `EXIT` trap in
-`merge-dev-to-main.sh`. While the marker is present, the implement skill
-refuses to start new implementation work (fail-open: a missing/corrupt marker
-never blocks implementation). A stale marker from a crashed release can be
-removed manually by deleting `.worklog/code-freeze.json`.
+While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/code-freeze.json` (contract WL-0MSBU4KMA004PKSR), written **before** gating and cleared on **every** exit path (success, failure, abort, `--dry-run`, gating failures) via `try/finally` + an `EXIT` trap. While present, the implement skill refuses to start new implementation (fail-open: missing/corrupt marker never blocks). Stale markers can be removed by deleting the file. Schema: [docs/dev/ship-skill-reference.md](../docs/dev/ship-skill-reference.md).
 
 ### Exit Codes
 
@@ -116,12 +73,12 @@ removed manually by deleting `.worklog/code-freeze.json`.
 | 3 | Unmerged branches found |
 | 4 | PR merge failed |
 | 5 | Dev sync failed |
-| 6 | Audit gate failure (items not ready to close) |
-| 7 | Critical-items gate failure (critical items not in terminal state) |
-| 8 | Worklog-ref gate failure (worklog refs present) |
-| 9 | Producer-review gate failure (items need producer review) |
-| 10 | Release script timed out (killed after `SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
-| 11 | Release merge verification failed (close-work-items step refused — no verified dev→main merge) |
+| 6 | Audit gate failure |
+| 7 | Critical-items gate failure |
+| 8 | Worklog-ref gate failure |
+| 9 | Producer-review gate failure |
+| 10 | Release script timed out (`SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
+| 11 | Release merge verification failed (no verified dev→main merge) |
 
 ## Release Process
 
@@ -129,50 +86,24 @@ removed manually by deleting `.worklog/code-freeze.json`.
 node ./scripts/run-release.js
 ```
 
-Steps:
-
-1. **Unmerged branches check** — aborts with report if branches pending; `--skip-checks` bypasses.
-2. **Pre-flight checks** — verifies `gh`, `wl`, clean worktree.
-3. **Critical-priority items check** — aborts with exit 7 if non-terminal critical items exist.
-4. **Merge commit** — fetch latest dev/main, create `--no-ff` merge commit.
-5. **PR creation** — push to `release/dev-to-main-<timestamp>`, create PR targeting `main`.
-6. **Status check wait & merge** — if the PR has status checks, waits for them to pass (default 10 min), then `gh pr merge --merge --delete-branch`. If the PR has **no** status checks (no CI configured), the merge proceeds immediately. `--force` skips the wait.
-7. **Audit logging** — records merge hash, PR URL in worklog.
-8. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push.
-   > Release ops run from **main checkout**, not worktrees.
-9. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): the close step only runs after the release actually landed on main. Both conditions must hold:
-   - the released version tag `v<version>` exists on origin (`git ls-remote`), and
-   - the tag commit is an ancestor of `origin/main` (`git merge-base --is-ancestor`).
-   If verification fails, the release aborts with **exit code 11** and **no work items are closed** — a spurious "Shipped" record cannot be created without a real dev→main merge.
-10. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items, filtering to only close items with `needsProducerReview === false`. Items with `needsProducerReview = true`, `null`, or `undefined` are skipped and logged as "Skipped (needs producer review)". Logs warnings on individual close failures.
+1. **Unmerged branches check** — abort if branches pending; `--skip-checks` bypasses.
+2. **Pre-flight checks** — verify `gh`, `wl`, clean worktree.
+3. **Critical-priority items check** — exit 7 if non-terminal critical items exist.
+4. **Merge commit** — fetch dev/main, `--no-ff` merge commit.
+5. **PR creation** — push `release/dev-to-main-<timestamp>`, create PR to `main`.
+6. **Status check wait & merge** — if the PR has status checks, wait for them (default 10 min), then `gh pr merge --merge --delete-branch`; no checks → merge immediately; `--force` skips the wait.
+7. **Audit logging** — record merge hash, PR URL in worklog.
+8. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push. Release ops run from **main checkout**, not worktrees.
+9. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): close only after the release landed on main — tag `v<version>` exists on origin AND is an ancestor of `origin/main`; else exit 11, no items closed.
+10. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: close `in_review`/`completed` items only when `needsProducerReview === false`; others skipped + logged.
 
 #### Test isolation (mandatory)
 
-The close-work-items unit tests must **never mutate the live worklog**. Root cause
-of SA-0MSJ2XMQL006CVQS: `tests/unit/test-close-work-items-after-release.mjs`
-called the real `closeWorkItemsAfterRelease('1.0.0'/'1.2.3')` export against the
-live worklog, spuriously closing ~360 real work items with "Shipped in v1.0.0"/
-"v1.2.3" reasons on every suite run. `closeWorkItemsAfterRelease` therefore
-accepts injectable `getCandidateItemsFn`/`runCloseCommand` boundaries; tests must
-inject fakes (or mock `wl` on PATH) and must never invoke the close function
-with the default worklog boundary outside a real, verified release flow.
+Close-work-items unit tests must **never mutate the live worklog** (SA-0MSJ2XMQL006CVQS): `closeWorkItemsAfterRelease` accepts injectable `getCandidateItemsFn`/`runCloseCommand` boundaries; tests must inject fakes (or mock `wl`) and never call it with the default boundary outside a real, verified release.
 
 ### Remediation sweep: test-spuriously-closed work items
 
-If the test-isolation bug ever recurs (work items closed with reason
-"Shipped in v1.0.0" or "Shipped in v1.2.3" that never shipped), run the
-idempotent sweep helper from the main checkout:
-
-```bash
-node ./scripts/remediate-spurious-closes.js
-```
-
-The sweep scans every work item, deletes close comments authored by `worklog`
-with content exactly `Closed with reason: Shipped in v1.0.0` / `v1.2.3`, and
-restores each affected item to `status=completed, stage=in_review` (the valid
-status/stage pair for a release-ready item — the worklog rejects
-`open`/`in_review`). Legitimate close comments (real versions such as v0.1.11)
-are never touched. Re-running after a successful sweep is a no-op.
+If the test-isolation bug recurs (items closed "Shipped in v1.0.0"/"v1.2.3" that never shipped), run the idempotent sweep from the main checkout: `node ./scripts/remediate-spurious-closes.js` — deletes close comments authored by `worklog` with exactly those reasons and restores each item to `status=completed, stage=in_review`. Legitimate close comments (real versions) are never touched; re-running after success is a no-op. Details: [docs/dev/ship-skill-reference.md](../docs/dev/ship-skill-reference.md).
 
 ## Fallback: Human Release Manager
 
@@ -186,65 +117,35 @@ For repos where the automated merge is unsuitable, follow [`docs/dev/release-pro
 
 ### Pre-merge checklist
 
-1. No open merge conflicts between `dev` and `main`.
-2. No open critical work items (automated by critical-items gate; `--skip-checks` bypasses).
-3. If CI status checks are configured on the PR, they must pass (automated by step 6). If no CI is configured, this is satisfied automatically.
-4. `CHANGELOG.md` is generated automatically by the release script.
+1. No open merge conflicts `dev`↔`main`. 2. No open critical items (automated; `--skip-checks` bypasses). 3. Configured CI checks pass (step 6); no CI → satisfied. 4. `CHANGELOG.md` auto-generated by the release script.
 
 ### Cached test verification at release time
 
-Verifying the full project suite is green before promoting `dev` to `main` is
-an **optional pre-release verification step** driven by the
-[test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate →
-loop until green, quiet pytest contract). Release Managers may invoke it to
-confirm the suite is green before merging; the release itself does not
-depend on it unless the operator chooses to gate on it.
-
-Repeated full-suite verification at the same HEAD is expensive (minutes per
-run). Route release-time test checks through the **cached runner** so
-repeat verifications reuse the prior run instead of re-executing (see
-`test_cache.py` at the repo root, SA-0MSGN5OJ4002OZKY):
+Verifying the full suite is green before promoting `dev` to `main` is an **optional pre-release step** driven by the [test skill](../test/SKILL.md) (`/skill:test`). Route repeat verifications through the **cached runner** (`test_cache.py`, SA-0MSGN5OJ4002OZKY):
 
 ```bash
-# Fresh full run (populates the cache)
-python3 ../test/scripts/run_tests.py --json
-
-# Subsequent verification at the same state reuses the cache (fast)
-python3 ../test/scripts/run_tests.py --json
-
-# Read-only summary query — never executes the suite
-python3 ../test/scripts/run_tests.py --summary --suite all
-
-# Force a genuinely fresh run for the final release gate
-python3 ../test/scripts/run_tests.py --force --json
+python3 ../test/scripts/run_tests.py --json                    # fresh run (populates cache)
+python3 ../test/scripts/run_tests.py --summary --suite all     # read-only summary, never executes
+python3 ../test/scripts/run_tests.py --force --json            # fresh run for the final gate
 ```
 
-Cached results are valid for the same git state within the 2-hour TTL; a
-changed tree, expired TTL, or corrupt entry always triggers a fresh run.
-This optional release test gate is wired via SA-0MSBXQZCG0078SEW.
-
-See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md) for local test commands.
+Cached results are valid for the same git state within the 2-hour TTL; a changed tree, expired TTL, or corrupt entry always triggers a fresh run. See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md).
 
 ## Preferred execution behaviour (policy)
 
-- Always invoke `./scripts/run-release.js` for dev→main merges.
-- Do NOT substitute ad-hoc git commands for the canonical script.
-- Fallback to manual commands only in narrow edge cases: script missing, script fails with operator-okayed fallback, or human explicitly requests manual steps.
-- If the release script is unavailable, refuse automatic release and direct operator to `docs/dev/release-process.md`.
+- Always invoke `./scripts/run-release.js` for dev→main merges; do NOT substitute ad-hoc git commands.
+- Manual fallback only in narrow edge cases: script missing, fails with operator-okayed fallback, or human explicitly requests manual steps.
+- Script unavailable → refuse automatic release and direct operator to `docs/dev/release-process.md`.
 
 ## Preconditions & safety
 
-- Never force-push or rewrite history on `main` or `dev`.
-- Never bypass required status checks unless `--force` is explicitly instructed.
-- Always log merge audit to worklog via `wl comment add`.
-- Agents must never push directly to `main`. All merges go through a PR satisfying branch protection rules.
+- Never force-push or rewrite history on `main` or `dev`; never bypass required status checks unless `--force` is explicitly instructed.
+- Always log merge audit via `wl comment add`; never push directly to `main` — all merges go through a PR satisfying branch protection.
 
 ## Integration with AGENTS.md
 
-The implement workflow uses `pushToDev()` internally to push feature branches into `dev`. The ship skill's `release` action promotes `dev` to `main`. See [AGENTS.md](../../AGENTS.md) and [[concepts/git-worktree-best-practices-for-agent-workflows]] for the full workflow.
+The implement workflow uses `pushToDev()` internally; the ship `release` action promotes `dev` to `main`. See [AGENTS.md](../../AGENTS.md) and [[concepts/git-worktree-best-practices-for-agent-workflows]].
 
 ## Outputs
 
-- GitHub PR from `release/dev-to-main-<timestamp>` to `main`.
-- Worklog audit comment with merge hash and PR URL.
-- Operator notification summarising the merge.
+GitHub PR `release/dev-to-main-<timestamp>` → `main`; worklog audit comment (merge hash + PR URL); operator notification summarising the merge.
