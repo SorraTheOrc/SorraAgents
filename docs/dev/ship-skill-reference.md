@@ -114,7 +114,7 @@ are never touched. Re-running after a successful sweep is a no-op.
 
 Verifying the full project suite is green before promoting `dev` to `main` is
 an **optional pre-release verification step** driven by the
-[test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate →
+[test skill](../../skill/test/SKILL.md) (`/skill:test` — run → triage → evaluate →
 loop until green, quiet pytest contract). Release Managers may invoke it to
 confirm the suite is green before merging; the release itself does not
 depend on it unless the operator chooses to gate on it.
@@ -142,6 +142,6 @@ Cached results are valid for the same git state within the 2-hour TTL; a
 changed tree, expired TTL, or corrupt entry always triggers a fresh run.
 This optional release test gate is wired via SA-0MSBXQZCG0078SEW.
 
-See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md) for local test commands.
+See [`docs/dev/release-tests.md`](release-tests.md) for local test commands.
 
 ## Preferred execution behaviour (policy)

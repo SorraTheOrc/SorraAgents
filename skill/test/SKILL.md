@@ -37,7 +37,7 @@ Workflow
 python3 ./scripts/run_tests.py --json
 ```
 
-**Project-root resolution:** the runner targets the invoking project (see [docs/dev/test-skill-reference.md](../docs/dev/test-skill-reference.md)).
+**Project-root resolution:** the runner targets the invoking project (see [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md)).
 
 The runner executes, in quiet mode:
 
@@ -50,7 +50,7 @@ Output: JSON with per-suite results and a flat `failures` array (`test_name`, `s
 
 `run_tests.py` caches each suite run per-repo — re-running the same command at
 the same git state within the **2-hour TTL** is served from cache. Details:
-[docs/dev/test-skill-reference.md](../docs/dev/test-skill-reference.md).
+[docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md).
 
 Query a cached run without executing:
 

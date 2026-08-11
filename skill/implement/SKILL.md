@@ -282,7 +282,7 @@ repository provides an "implement" helper script, prefer it for deterministic
 behavior.
 
 Build/test steps for repos without build/test tooling:
-[docs/dev/implement-skill-reference.md](../docs/dev/implement-skill-reference.md).
+[docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md).
 
 Example commands (documentation example, SA-0MPYMFZXO0004ZU4):
 

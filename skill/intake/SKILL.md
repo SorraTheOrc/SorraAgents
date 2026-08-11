@@ -40,7 +40,7 @@ All status transitions are managed by the shared `StatusLifecycle` context manag
 
 ## Worklog resolution
 
-`intake.py` routes every `wl` call through the shared `run_wl` helper, which injects `--worklog-dir` with precedence: (1) explicit `--worklog-dir`, (2) prefix-to-sibling scan (item-id prefix → sibling projects' worklog stores), (3) cwd chain (`<cwd>/.worklog`, git root, nearest ancestor), (4) no flag — `wl` resolves from cwd. Full detail: [docs/dev/intake-skill-reference.md](../docs/dev/intake-skill-reference.md) and `docs/dev/worklog-sync.md`.
+`intake.py` routes every `wl` call through the shared `run_wl` helper, which injects `--worklog-dir` with precedence: (1) explicit `--worklog-dir`, (2) prefix-to-sibling scan (item-id prefix → sibling projects' worklog stores), (3) cwd chain (`<cwd>/.worklog`, git root, nearest ancestor), (4) no flag — `wl` resolves from cwd. Full detail: [docs/dev/intake-skill-reference.md](../../docs/dev/intake-skill-reference.md) and `docs/dev/worklog-sync.md`.
 
 ## Process (must follow)
 
@@ -80,7 +80,7 @@ If uncertain, fall back to the normal intake process (no auto-complete on border
   ```
   (Creation is not a status transition — the initial status is set at creation.) Remember the returned id.
 
-**Issue type decision guide** — full table in [docs/dev/intake-skill-reference.md](../docs/dev/intake-skill-reference.md). Summary:
+**Issue type decision guide** — full table in [docs/dev/intake-skill-reference.md](../../docs/dev/intake-skill-reference.md). Summary:
 
 - `bug` — currently **incorrect/broken**; the change corrects wrong behavior (not net-new capability).
 - `feature` — **adds new capability** that did not exist before (not merely fixing broken).
@@ -140,7 +140,7 @@ This transitions `status=open`, `stage=intake_complete`.
 
 - `wl sync` to sync changes.  > **Note:** on a repo with **no commits yet** `wl sync` fails (unborn HEAD) — create an initial commit (`git commit --allow-empty -m "chore: initial"`) or use `wl sync --no-push`. See `docs/dev/worklog-sync.md`.
 - `wl show <work-item-id>` (not --json); remove temp files (`.worklog/tmp/intake-draft-<title>-<work-item-id>.md`).
-- Output a structured summary (`# Objective` headline, `# Acceptance Criteria` list, `# Effort and Risk` sizing; full template in [docs/dev/intake-skill-reference.md](../docs/dev/intake-skill-reference.md)). The AC list always includes: at least one testing/validation criterion; "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries."; and "Full project test suite must pass with the new changes."  > **Note:** CHANGELOG.md is **excluded** — managed by the ship skill's release pipeline. Do not include CI/CD pipeline tests.
+- Output a structured summary (`# Objective` headline, `# Acceptance Criteria` list, `# Effort and Risk` sizing; full template in [docs/dev/intake-skill-reference.md](../../docs/dev/intake-skill-reference.md)). The AC list always includes: at least one testing/validation criterion; "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries."; and "Full project test suite must pass with the new changes."  > **Note:** CHANGELOG.md is **excluded** — managed by the ship skill's release pipeline. Do not include CI/CD pipeline tests.
 - Finish with "This completes the Intake process for <work-item-id> <work-item-title>"
 
 ### 12. Error/abort handling
