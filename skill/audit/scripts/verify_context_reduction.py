@@ -144,7 +144,7 @@ def measure_static_context(cwd: Path, agent_dir: Path | None) -> dict:
     try:
         proc = subprocess.run(
             ["node", tmp_path, str(cwd), str(agent_dir) if agent_dir else "", flags_json],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=120, check=False,
         )
         if proc.returncode != 0:
             raise RuntimeError(
@@ -214,7 +214,7 @@ def collect_session_tokens(min_items: int = 5, max_items: int | None = None,
                 if not m:
                     continue
                 try:
-                    file_dt = datetime.strptime(m.group(1) + "T" + m.group(2), "%Y-%m-%dT%H-%M-%S")
+                    file_dt = datetime.strptime(m.group(1) + "T" + m.group(2) + "+00:00", "%Y-%m-%dT%H-%M-%S%z").replace(tzinfo=None)
                 except ValueError:
                     continue
                 if file_dt < since_date:
@@ -269,15 +269,14 @@ def collect_session_tokens(min_items: int = 5, max_items: int | None = None,
                             break
             except OSError:
                 continue
-            if is_audit and item_id and first_input is not None:
-                if item_id not in seen_items:
-                    seen_items.add(item_id)
-                    if max_items and len(seen_items) > max_items:
-                        break
-                    samples.append(SessionSample(
-                        item_id=item_id, input_tokens=first_input,
-                        session_file=str(jsonl), ts=ts,
-                    ))
+            if is_audit and item_id and first_input is not None and item_id not in seen_items:
+                seen_items.add(item_id)
+                if max_items and len(seen_items) > max_items:
+                    break
+                samples.append(SessionSample(
+                    item_id=item_id, input_tokens=first_input,
+                    session_file=str(jsonl), ts=ts,
+                ))
         if max_items and len(seen_items) >= max_items:
             break
 
@@ -355,7 +354,7 @@ def _stage_for_audit(item: AuditItem) -> None:
             _wl(["wl", "update", item.item_id,
                  "--status", "in_progress", "--stage", "in_progress"],
                 timeout=60)
-        except Exception:  # noqa: BLE001 -- best-effort; runner reports
+        except Exception:  # noqa: BLE001, S110 -- best-effort; runner reports
             pass
 
 
@@ -377,6 +376,7 @@ def _run_audit(runner_path: Path, item_id: str, repo_root: Path,
         cwd=str(repo_root),
         capture_output=True, text=True,
         timeout=timeout_min * 60,
+        check=False,
     )
 
 
@@ -436,7 +436,7 @@ def _wl(cmd: list[str], timeout: int = 120) -> dict:
     full = list(cmd)
     if full and full[0] == "wl":
         full[1:1] = _wl_flags()
-    proc = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(full, capture_output=True, text=True, timeout=timeout, check=False)
     if proc.returncode != 0:
         raise RuntimeError(
             f"wl command failed ({' '.join(full)}): {proc.stderr[-300:]} "
@@ -459,7 +459,7 @@ def _fetch_item_state(item_id: str) -> AuditItem:
         m = READY_RE.search(audit.get("text") or "")
         if m:
             item.persisted_verdict = m.group(1)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 -- best-effort parse
         pass
     return item
 
@@ -471,14 +471,14 @@ def _restore_item_state(item: AuditItem) -> None:
             _wl(["wl", "update", item.item_id,
                  "--status", item.pre_status, "--stage", item.pre_stage],
                 timeout=60)
-        except Exception:  # noqa: BLE001 -- restore is best-effort
+        except Exception:  # noqa: BLE001, S110 -- restore is best-effort
             pass
     if item.pre_assignee:
         try:
             _wl(["wl", "update", item.item_id,
                  "--assignee", item.pre_assignee],
                 timeout=60)
-        except Exception:  # noqa: BLE001 -- restore is best-effort
+        except Exception:  # noqa: BLE001, S110 -- restore is best-effort
             pass
 
 
@@ -496,7 +496,7 @@ def _sample_audited_items(count: int, seed: int, repo_root: Path) -> list[str]:
     """
     proc = subprocess.run(
         ["wl", "list", "--json"],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=120, check=False,
     )
     d = json.loads(proc.stdout)
     items = d.get("workItems") or d.get("items") or []
@@ -531,7 +531,7 @@ def _sample_audited_items(count: int, seed: int, repo_root: Path) -> list[str]:
             break
         try:
             state = _fetch_item_state(item_id)
-        except Exception:  # noqa: BLE001 -- skip unreadable items
+        except Exception:  # noqa: BLE001, S112 -- skip unreadable items
             continue
         if state.persisted_verdict:
             picked.append(item_id)
@@ -641,8 +641,8 @@ def _markdown(report: dict) -> str:
     ]
     if report["check"] == "sessions":
         lines += [
-            f"Distinct audited items sampled: {report['distinct_items']} "
-            f"(min required: {report['min_items']})",
+            (f"Distinct audited items sampled: {report['distinct_items']} "
+             f"(min required: {report['min_items']})"),
             f"Session window: since {report.get('since') or 'all'}",
             "",
             "| item | first-call input tokens | < 10K | session |",

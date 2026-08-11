@@ -79,7 +79,7 @@ class TestVerdictParsing:
             "input_tokens=99\n"
         )
         proc = type("P", (), {"stdout": "", "stderr": out})()
-        verdict, tokens = vcr._parse_verdict(proc)
+        _, tokens = vcr._parse_verdict(proc)
         assert tokens == [410, 99]
 
 

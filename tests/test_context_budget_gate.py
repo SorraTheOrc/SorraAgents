@@ -43,6 +43,7 @@ def test_context_budget_gate_within_committed_thresholds() -> None:
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
+        check=False,
     )
 
     assert result.returncode == 0, (

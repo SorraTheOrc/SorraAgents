@@ -72,7 +72,7 @@ anything. Every test must assert observable behaviour via the public API.
 - Document process/decisions/next steps in work item comments; handle errors
   gracefully with actionable remediation.
 - Not well-defined → intake interview; implement blockers/dependencies first.
-- Follow AGENTS.md policies for branch naming, commit discipline, worktree workflow, and push-to-dev ([AGENTS_GLOBAL.md](../../AGENTS_GLOBAL.md#implement-the-work-item)); after `in_review`, use the cleanup skill to tidy local feature branches (not `dev`/`main`).
+- Follow AGENTS.md policies for branch naming, commit discipline, worktree workflow, and push-to-dev ([AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item)); after `in_review`, use the cleanup skill to tidy local feature branches (not `dev`/`main`).
 - Use `StatusLifecycle` for all status transitions — never ad-hoc `wl update --status` commands.
 
 ## Status Safety & Abort Handling
@@ -192,7 +192,7 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 > `<worktree>/node_modules -> <repo-root>/node_modules` when the main checkout
 > has one (SA-0MSGS763C006SM1B). **Do NOT run `npm install` inside a worktree** — writes pass through the symlink, corrupting the shared tree.
 
-See [AGENTS_GLOBAL.md](../../AGENTS_GLOBAL.md#implement-the-work-item).
+See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
 
 5. Implement
 

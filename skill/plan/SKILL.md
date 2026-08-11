@@ -37,7 +37,7 @@ by the autoplan decision logic).
 
 ## Status lifecycle (first action)
 
-See [AGENTS_GLOBAL.md](../../AGENTS_GLOBAL.md#workflow-for-ai-agents) for the standard claim-first pattern.
+See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#workflow-for-ai-agents) for the claim-first pattern.
 
 Claim with `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
 before starting, and always leave the item in a **valid terminal status**
