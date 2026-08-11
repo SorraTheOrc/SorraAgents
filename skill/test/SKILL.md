@@ -37,14 +37,7 @@ Workflow
 python3 ./scripts/run_tests.py --json
 ```
 
-**Project-root resolution:** the runner targets the **invoking project** —
-it resolves the project root from the current working directory via
-`git rev-parse --show-toplevel` at CLI time (falling back to the framework's
-install location when cwd is not inside a git repo, e.g. legacy/standalone
-use). Running it from a non-framework project (e.g. the llm repo) therefore
-tests and caches *that* project's suite under its own `.worklog/cache/`,
-with the git-state fingerprint taken at that project's HEAD. Pass
-`--project-root <path>` to override detection explicitly (SA-0MSNQV9J20010LE7).
+**Project-root resolution:** the runner targets the invoking project (see [docs/dev/test-skill-reference.md](../docs/dev/test-skill-reference.md)).
 
 The runner executes, in quiet mode:
 
@@ -55,12 +48,11 @@ Output: JSON with per-suite results and a flat `failures` array (`test_name`, `s
 
 ### 0. Cached execution (default)
 
-`run_tests.py` caches each suite run per-repo by default — re-running the same
-command at the same git state within the **2-hour TTL** is served from cache.
-Storage/invalidation/pipeline-normalization details:
+`run_tests.py` caches each suite run per-repo — re-running the same command at
+the same git state within the **2-hour TTL** is served from cache. Details:
 [docs/dev/test-skill-reference.md](../docs/dev/test-skill-reference.md).
 
-Query a cached run without executing anything:
+Query a cached run without executing:
 
 ```bash
 python3 ./scripts/run_tests.py --summary --suite all                         # summary lines
@@ -68,11 +60,9 @@ python3 ./scripts/run_tests.py --summary --summary-grep "Test Files|failed"  # r
 python3 ./scripts/run_tests.py --force                                       # fresh run
 ```
 
-Agents needing only summary info (release verification, read-only audits)
-should use `--summary` instead of re-running. The **audit skill** consumes the
-cache read-only via `query_cached()`: a green full-suite run at the audited git
-state within the TTL lets the audit runner verify execution-dependent ACs
-automatically (SA-0MSIU5HFI0024D7W).
+The **audit skill** consumes the cache read-only via `query_cached()`: a green
+full-suite run at the audited git state within the TTL auto-verifies
+execution-dependent ACs (SA-0MSIU5HFI0024D7W).
 
 ### 2. Triage every failure
 

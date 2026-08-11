@@ -398,3 +398,44 @@ Notes:
 - The `_extract_json_array()` function strips prose text before/after JSON arrays,
   so it works correctly regardless of whether the model wraps its output in
   explanatory text (common in agent mode).
+
+## Context reduction (SA-0MSISKM8F004NW1U)
+
+Every pi call (`_call_pi`) runs with `--no-context-files --no-skills` in both
+tool-enabled and tool-less modes (SA-0MSISKM8F004NW1U). Audit prompts are fully
+self-contained — they carry the read-only mandate, JSON output format, FILE
+SCOPE manifest, SCANNING block, and criteria — so the global+project AGENTS.md
+load and the skills section are dropped from each session's static context,
+cutting per-call static context from ~14.9KB (~3.7K tokens) to ~1.7KB (~430
+tokens) — an 88% reduction and a ~23x margin under the 10K-token bound
+(measured via `verify_context_reduction.py check-static`, 2026-08-11). Prompts
+must never depend on AGENTS.md or skill descriptions: that is an invariant of
+this skill.
+
+### Per-call timing & token capture
+
+Every pi call records wall-clock duration (`elapsed_seconds`, all return paths)
+and, when the pi stream reports provider usage, the initial input-token count
+(`input_tokens`, from the `agent_end` message's usage block).
+`_call_pi_and_maybe_log` emits one line per call to stderr:
+
+```text
+Per-call timing: issue_id=<id> context=<context> elapsed_seconds=<seconds> input_tokens=<n>
+```
+
+`input_tokens` makes the context-reduction bound (<10K initial input tokens per
+audit session) verifiable from the timing line alone.
+
+### Verification script
+
+`skill/audit/scripts/verify_context_reduction.py` implements the AC2/AC3 checks
+as in-scope code (SA-0MSISKM8F004NW1U): `check-static` measures pi's
+static-context bytes via pi's own loaders with and without the flags;
+`check-sessions` extracts first-call `usage.input` from real audit-runner
+session files (scoped with `--since` to sessions after the flags landed) and
+asserts every session starts under the 10K bound across at least 5 distinct
+items; `reaudit-sample` re-audits a deterministic sample with the current
+runner and a flag-off runner copy, comparing verdicts (controlled before/after
+comparison). Exit status is 0 iff all checks pass; reports are written to
+`--report-dir` as JSON+Markdown for the work item's evidence record. Unit
+tests: `skill/audit/tests/test_verify_context_reduction.py`.

@@ -45,21 +45,20 @@ wl update <id> --status in_progress --json
 
 ## Monitored Run Execution
 
-Audits via the canonical runner can run for **hours**. The **launch → monitor → abort** contract is fully documented in [docs/dev/audit-skill-reference.md](../docs/dev/audit-skill-reference.md). Summary:
+Audits can run for **hours**; the **launch → monitor → abort** contract is in [docs/dev/audit-skill-reference.md](../docs/dev/audit-skill-reference.md). Summary:
 
-- **Launch:** capture pre-audit state; launch detached with output to a **unique** log under `~/.audit_debug/<project>/`; **180-min budget** (foreground fallback: `>= 10800s` timeout or refuse).
-- **Monitor:** every 3 min — `kill -0 <pid>`, `tail -50 <log>` for markers (`Phase 1 passed: running Phase 2 deep code analysis...`, `Per-call timing: ...`); confirm growth.
-- **Abort triggers:** (a) stale log ≥10 min, (b) ≥3 provider-error retries w/o progress, (c) unexpected exits/loops, (d) 180-min budget.
-- **Abort:** kill tree (`pkill -TERM -P <pid>`, then `kill`, escalate `-KILL`); restore pre-audit status/stage ONLY if the runner didn't complete its lifecycle (never demote `in_review`→`open`); append failure notice; report. Never fabricate a report or override a completed verdict.
+- **Launch:** detached, unique log under `~/.audit_debug/<project>/`; **180-min budget**.
+- **Monitor:** every 3 min — `kill -0 <pid>`, `tail -50 <log>` (markers: `Phase 1 passed: running Phase 2 deep code analysis...`, `Per-call timing:`); confirm log growth.
+- **Abort:** stale log ≥10 min, ≥3 provider-error retries w/o progress, unexpected exits/loops, or 180-min budget → kill tree (`pkill -TERM -P` → `kill` → `-KILL`); restore pre-audit status/stage only if the runner didn't complete its lifecycle (never demote `in_review`→`open`); append failure notice. Never fabricate a report or override a completed verdict.
 
 ## Freshness Gate
 
-Short-circuits item-level audits when a recent, valid audit exists. Full behavior in [docs/dev/audit-skill-reference.md](../docs/dev/audit-skill-reference.md). Summary:
+Short-circuits item-level audits when a recent, valid audit exists. Full behavior in [docs/dev/audit-skill-reference.md](../docs/dev/audit-skill-reference.md):
 
-1. **Content-based (primary):** fingerprint = HEAD sha + description hash + Key Files (`Audit content fingerprint: <sha256hex>`); unchanged → existing report in seconds (SA-0MSKB6US1009CNHT).
-2. **Time gate (floor):** legacy reports without a fingerprint use the 60s timestamp gate (`auditedAt` vs `updatedAt + 60s`).
-3. Fresh → `Skipping: audit still fresh` + existing report, exit 0, **no** lifecycle/persistence.
-4. `--force` bypasses (item-level only). Config: `AUDIT_FRESHNESS_BUFFER_SECONDS = 60`.
+1. **Content-based (primary):** fingerprint = HEAD sha + description hash + Key Files; unchanged → existing report (SA-0MSKB6US1009CNHT).
+2. **Time gate (floor):** legacy reports use the 60s gate (`auditedAt` vs `updatedAt + 60s`).
+3. Fresh → `Skipping: audit still fresh`, exit 0, **no** lifecycle/persistence.
+4. `--force` bypasses. Config: `AUDIT_FRESHNESS_BUFFER_SECONDS = 60`.
 
 ## Safety and prompt design
 
@@ -148,17 +147,7 @@ Synonym for "Acceptance Criteria"; **Acceptance Criteria** is canonical.
 
 Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, test-cache auto-verification, `--run-tests`, batch/parallel Phase 2, tools-enabled invocation, bounded scanning, debug logs, file-scope manifest, child verdict reuse, phase-1/2 performance) are fully documented in [docs/dev/audit-skill-reference.md](../docs/dev/audit-skill-reference.md). Execution-dependent ACs can also be verified via the [test skill](../test/SKILL.md) (`/skill:test`).
 
-**Context reduction:** every pi call (`_call_pi`) runs with `--no-context-files --no-skills` in both tool-enabled and tool-less modes (SA-0MSISKM8F004NW1U). Audit prompts are fully self-contained — they carry the read-only mandate, JSON output format, FILE SCOPE manifest, SCANNING block, and criteria — so the global+project AGENTS.md load and the skills section are dropped from each session's static context, cutting per-call static context from ~14.9KB (~3.7K tokens) to ~1.7KB (~430 tokens) — an 88% reduction and a ~23x margin under the 10K-token bound (measured via `verify_context_reduction.py check-static`, 2026-08-11). Prompts must never depend on AGENTS.md or skill descriptions: that is an invariant of this skill.
-
-**Per-call timing & token capture:** every pi call records wall-clock duration (`elapsed_seconds`, all return paths) and, when the pi stream reports provider usage, the initial input-token count (`input_tokens`, from the `agent_end` message's usage block). `_call_pi_and_maybe_log` emits one line per call to stderr:
-
-```text
-Per-call timing: issue_id=<id> context=<context> elapsed_seconds=<seconds> input_tokens=<n>
-```
-
-`input_tokens` makes the context-reduction bound (<10K initial input tokens per audit session) verifiable from the timing line alone.
-
-**Verification script:** `skill/audit/scripts/verify_context_reduction.py` implements the AC2/AC3 checks as in-scope code (SA-0MSISKM8F004NW1U): `check-static` measures pi's static-context bytes via pi's own loaders with and without the flags; `check-sessions` extracts first-call `usage.input` from real audit-runner session files (scoped with `--since` to sessions after the flags landed) and asserts every session starts under the 10K bound across at least 5 distinct items; `reaudit-sample` re-audits a deterministic sample with the current runner and a flag-off runner copy, comparing verdicts (controlled before/after comparison). Exit status is 0 iff all checks pass; reports are written to `--report-dir` as JSON+Markdown for the work item's evidence record. Unit tests: `skill/audit/tests/test_verify_context_reduction.py`.
+**Context reduction (SA-0MSISKM8F004NW1U):** every `_call_pi` runs with `--no-context-files --no-skills`; per-call timing + verification script: [docs/dev/audit-skill-reference.md](../docs/dev/audit-skill-reference.md).
 
 ## Guidance for models
 
