@@ -12,9 +12,7 @@ directory.
 """
 
 import json
-import re
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -22,8 +20,7 @@ import pytest
 sys.path.insert(
     0, str(Path(__file__).resolve().parent.parent / "scripts")
 )
-import verify_context_reduction as vcr  # noqa: E402
-
+import verify_context_reduction as vcr
 
 # ---------------------------------------------------------------------------
 # Timing-line parsing (input_tokens capture format)

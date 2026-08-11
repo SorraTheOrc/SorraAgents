@@ -505,7 +505,7 @@ def _sample_audited_items(count: int, seed: int, repo_root: Path) -> list[str]:
     # per-call input_tokens). Fall back to any audited item otherwise.
     def _has_acs(wi: dict) -> bool:
         desc = wi.get("description") or ""
-        return bool(re.search(r"acceptance criter", desc, re.I)) and len(desc) > 300
+        return bool(re.search(r"acceptance criter", desc, re.IGNORECASE)) and len(desc) > 300
 
     audited = sorted(
         wi["id"] for wi in items
