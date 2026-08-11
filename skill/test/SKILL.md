@@ -42,7 +42,7 @@ python3 ./scripts/run_tests.py --json
 The runner executes, in quiet mode:
 
 - **pytest**: `pytest -q -r a --disable-warnings` (canonicalized via `canonicalize_quiet_test_command` from `../test_runner.py`)
-- **Node**: `node --test "tests/node/**/*.mjs" "tests/cli/**/*.mjs" "tests/unit/**/*.mjs"` (or `npm --silent test` per suite dir). Glob patterns required — node v22.22.1 rejects a bare dir (SA-0MSF8KNE3003JDVD).
+- **Node**: `node --test "tests/node/**/*.mjs" "tests/cli/**/*.mjs" "tests/unit/**/*.mjs"` (or `npm --silent test` per suite dir). Glob patterns required — node v22.22.1 rejects a bare dir (SA-0MSF8KNE3003JDVD). Only suite dirs that **exist** under the target repo are included — missing dirs are skipped (SA-0MSJELL44009XYIL), so a repo without `tests/node` never gets a guaranteed-failing phantom command.
 
 Output: JSON with per-suite results and a flat `failures` array (`test_name`, `stdout_excerpt`, `stack_trace`).
 
@@ -62,7 +62,9 @@ python3 ./scripts/run_tests.py --force                                       # f
 
 The **audit skill** consumes the cache read-only via `query_cached()`: a green
 full-suite run at the audited git state within the TTL auto-verifies
-execution-dependent ACs (SA-0MSIU5HFI0024D7W).
+execution-dependent ACs (SA-0MSIU5HFI0024D7W). Failed (non-zero-exit) runs use
+a short 5-minute TTL so transient infra failures are not re-served as current
+results (SA-0MSJELL44009XYIL).
 
 ### 2. Triage every failure
 

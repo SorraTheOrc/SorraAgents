@@ -5762,6 +5762,21 @@ _AUTO_GREEN_ENTRY = {
 """A plausible green entry returned by ``query_cached``."""
 
 
+_NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
+
+
+def _make_suite_dirs(tmp_path) -> Path:
+    """Create the canonical node suite dirs under *tmp_path*.
+
+    ``full_suite_commands`` skips missing suite dirs (SA-0MSJELL44009XYIL), so
+    tests that exercise the full 4-command set must create the dirs first —
+    otherwise only the pytest command is queried.
+    """
+    for d in _NODE_SUITE_DIRS:
+        (tmp_path / d).mkdir(parents=True, exist_ok=True)
+    return tmp_path
+
+
 class TestAutoGreenRunResolution:
     """Unit tests for the read-only automatic green-run resolution."""
 
@@ -5814,6 +5829,8 @@ class TestAutoGreenRunResolution:
 
     def test_partial_cache_no_evidence(self, tmp_path):
         """AC2: only some suites cached → fail-closed (no evidence)."""
+        _make_suite_dirs(tmp_path)
+
         def _side_effect(command, **kwargs):
             # pytest + two node dirs cached green; the tests/unit run is missing
             return _AUTO_GREEN_ENTRY if "tests/unit" not in command else None
@@ -5846,8 +5863,9 @@ class TestAutoGreenRunResolution:
         assert sha is None
         mock_q.assert_not_called()
 
-    def test_query_cached_consumed_read_only(self, tmp_path):
+    def test_query_cached_consumed_read_only(self, tmp_path, capsys):
         """AC1: resolution consumes the cache (never executes) at the project cwd."""
+        _make_suite_dirs(tmp_path)
         with mock.patch.object(
             audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
         ) as mock_q:
@@ -5858,6 +5876,61 @@ class TestAutoGreenRunResolution:
         for call in mock_q.call_args_list:
             assert call.kwargs["cwd"] == str(tmp_path.resolve())
             assert call.kwargs["ttl"] == audit_runner.DEFAULT_TTL_SECONDS
+
+    # -----------------------------------------------------------------------
+    # Diagnostic output (SA-0MSJELL44009XYIL AC: clear diagnostic on failure)
+    # -----------------------------------------------------------------------
+
+    def test_missing_cache_emits_diagnostic(self, tmp_path, capsys):
+        """A cache miss yields a clear diagnostic naming the command + remedy."""
+        _make_suite_dirs(tmp_path)
+        with mock.patch.object(audit_runner, "query_cached", return_value=None):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+        err = capsys.readouterr().err
+        assert "Automatic full-suite verification unavailable" in err
+        assert "pytest -q -r a --disable-warnings" in err
+        assert "no cached full-suite run" in err
+        assert "run_tests.py --force" in err or "/skill:test" in err
+        assert "--green-run HEAD" in err
+
+    def test_failed_cached_run_emits_diagnostic(self, tmp_path, capsys):
+        """A non-zero cached run is distinguished from a miss in the diagnostic."""
+        _make_suite_dirs(tmp_path)
+
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "tests/cli" in command:
+                entry["exit_code"] = 7
+            return entry
+
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+        err = capsys.readouterr().err
+        assert "Automatic full-suite verification unavailable" in err
+        assert "exited non-zero" in err
+        assert "(7)" in err
+        assert "--green-run HEAD" in err
+
+    def test_green_run_no_diagnostic(self, tmp_path, capsys):
+        """A fully green cache set yields evidence and no diagnostic noise."""
+        _make_suite_dirs(tmp_path)
+        with mock.patch.object(
+            audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
+        ):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert sha == _GREEN_RUN_HEAD
+        assert block is not None
+        assert "Automatic full-suite verification unavailable" not in capsys.readouterr().err
 
 
 class TestAutoGreenRunReportLine:
@@ -6169,6 +6242,7 @@ class TestRunTestsViaTestSkill:
 
     def test_green_run_success_refreshes_cache(self, tmp_path, capsys):
         """AC1: a green executed suite yields success and refreshes the cache."""
+        _make_suite_dirs(tmp_path)
         with mock.patch.object(
             audit_runner, "run_cached", side_effect=self._green_run
         ) as mock_run:

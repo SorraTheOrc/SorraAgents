@@ -147,6 +147,8 @@ Synonym for "Acceptance Criteria"; **Acceptance Criteria** is canonical.
 
 Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, test-cache auto-verification, `--run-tests`, batch/parallel Phase 2, tools-enabled invocation, bounded scanning, debug logs, file-scope manifest, child verdict reuse, phase-1/2 performance) are fully documented in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md). Execution-dependent ACs can also be verified via the [test skill](../test/SKILL.md) (`/skill:test`).
 
+**Automatic full-suite verification (SA-0MSIU5HFI0024D7W / SA-0MSJELL44009XYIL):** the runner auto-verifies execution-dependent ACs from a green cached full-suite run (read-only `query_cached()`, never executes the suite). Suite commands are repo-aware — only node suite dirs that exist under the target repo are required (`tests/node`, `tests/cli`, `tests/unit`; missing dirs skipped), so any layout can auto-verify. When verification fails, the runner prints a clear diagnostic distinguishing a cache miss (run `/skill:test` / `run_tests.py --force` once at HEAD to populate the cache, then re-audit) from a non-zero cached run (suite is red — fix or attest with `--green-run HEAD`); execution-dependent ACs stay `partial`. Failed runs get a short 5-min cache TTL so transient infra failures are not re-served as current results.
+
 **Context reduction (SA-0MSISKM8F004NW1U):** every `_call_pi` runs with `--no-context-files --no-skills`; per-call timing + verification script: [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md).
 
 ## Guidance for models

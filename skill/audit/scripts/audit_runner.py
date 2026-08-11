@@ -1043,12 +1043,17 @@ def _resolve_auto_green_run(
     query never executes anything, so the audit's read-only mandate is
     preserved unconditionally (SA-0MSIU5HFI0024D7W).
 
+    Suite commands only cover dirs that exist in the target repo
+    (SA-0MSJELL44009XYIL), so a repo without tests/node is never asked about
+    a phantom tests/node command.
+
     Returns ``(prompt_block, head_sha)`` when EVERY suite command has a cached
     entry at the audited git state within the cache TTL AND every entry's exit
-    code is 0. Returns ``(None, None)`` otherwise — fail-closed: a cache miss,
-    a non-zero (or timed-out) run, a partially cached suite set, an
-    unresolvable HEAD, or any cache/infra error yields NO evidence and never
-    crashes the audit (execution-dependent ACs stay partial).
+    code is 0. Otherwise prints a clear diagnostic to stderr — distinguishing
+    a cache miss ('run /skill:test once to populate the cache') from a
+    non-zero cached run ('suite is red; fix or attest with --green-run HEAD')
+    — and returns ``(None, None)``, fail-closed: no evidence, the audit
+    completes normally, and execution-dependent ACs stay partial.
     """
     try:
         head_sha = _resolve_audited_head(runner)
@@ -1056,15 +1061,40 @@ def _resolve_auto_green_run(
             return None, None
 
         project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
-        for command in full_suite_commands(project_root):
+        commands = full_suite_commands(project_root)
+        problems: list[str] = []
+        for command in commands:
             entry = query_cached(
                 command, cwd=str(project_root), ttl=DEFAULT_TTL_SECONDS,
             )
-            if entry is None or int(entry.get("exit_code", -1)) != 0:
-                return None, None
-    except Exception:  # noqa: BLE001 -- fail-closed: never crash the audit
-        return None, None
-    return _auto_green_run_prompt_block(head_sha), head_sha
+            if entry is None:
+                problems.append(
+                    f"no cached full-suite run for '{command}' at HEAD {head_sha}"
+                )
+            elif int(entry.get("exit_code", -1)) != 0:
+                problems.append(
+                    f"cached full-suite run for '{command}' exited non-zero "
+                    f"({int(entry.get('exit_code'))})"
+                )
+        if not problems:
+            return _auto_green_run_prompt_block(head_sha), head_sha
+        print(
+            "Automatic full-suite verification unavailable: "
+            f"{len(problems)} of {len(commands)} suite command(s) not "
+            f"verifiably green at HEAD {head_sha}. " + "; ".join(problems)
+            + ". Run the full suite once at this commit (/skill:test or "
+            "run_tests.py --force) to populate the test cache, then re-audit "
+            "— or attest manually with --green-run HEAD. Execution-dependent "
+            "criteria stay partial.",
+            file=sys.stderr,
+        )
+    except Exception as exc:  # noqa: BLE001 -- fail-closed: never crash the audit
+        print(
+            f"Automatic full-suite verification unavailable: {exc}. "
+            "Execution-dependent criteria stay partial.",
+            file=sys.stderr,
+        )
+    return None, None
 
 
 def _test_skill_run_prompt_block(sha: str) -> str:

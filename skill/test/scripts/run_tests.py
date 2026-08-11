@@ -128,6 +128,15 @@ def node_suite_commands(project_root: Path | None = None) -> list[str]:
 
     cmds: list[str] = []
     for suite_dir in NODE_SUITE_DIRS:
+        if not (root / suite_dir).is_dir():
+            # Skip suite dirs that don't exist in this project
+            # (SA-0MSJELL44009XYIL): emitting a command for a missing dir
+            # yields a guaranteed-failing run (e.g. vitest "No test files
+            # found", exit 1) that defeats read-only consumers' fail-closed
+            # auto-verification (audit skill) for repos whose layout diverges
+            # from NODE_SUITE_DIRS. The framework repo itself has all three
+            # dirs, so its command set is unchanged.
+            continue
         if has_npm_test_script:
             cmds.append(canonicalize_quiet_test_command(f"npm test -- {suite_dir}"))
         else:
