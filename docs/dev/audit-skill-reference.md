@@ -289,8 +289,9 @@ of improvised recursive greps:
   (maxdepth 2, same prunes).
 
 Unbounded recursive greps over the repo root or `.worklog/` (e.g.
-`grep -r ... .` or `grep -r ... .worklog/`) are forbidden. Single-file greps of
-`.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).
+`grep -r ... .` or `grep -r ... .worklog/`) are forbidden. Worklog lookups use
+`wl search <keywords> --json` or `wl list <term> --json` for substring
+matching, `scan.py find-workitem <id>` for exact match.
 See `docs/dev/audit-grep-scan-patterns.md` (SA-0MSBR06GX0051T1Q) for the
 pattern catalogue and benchmark.
 

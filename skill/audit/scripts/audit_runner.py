@@ -272,11 +272,10 @@ _STATUS_RESTORE_RETRY_DELAY_S = 0.5
 
 _PHASE1_SCANNING_BLOCK = (
     "SCANNING — When you need to look something up, use the bounded helpers:\n"
-    "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
+    "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
     "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
     "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
-    "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n"
-    "- Single-file greps of `.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).\n\n"
+    "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
 )
 """Bounded-scanning guidance injected into Phase 1 AC review prompts (P7).
 
@@ -3495,10 +3494,9 @@ def _deep_analyze_child(
         "searching for it.\n\n"
         f"{child_file_scope}\n\n"
         "SCANNING — When you need to look something up, use the bounded helpers:\n"
-        "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
+        "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
         "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
-        "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n"
-        "- Single-file greps of `.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).\n\n"
+        "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
         f"{green_run_block or ''}"
         "For each criterion, read the actual implementation files and verify "
         "the code genuinely satisfies the stated requirements. "
@@ -3921,11 +3919,10 @@ def _run_phase2_deep_analysis(
             "here, state that in the evidence instead of searching for it.\n\n"
             f"{file_scope}\n\n"
             "SCANNING — When you need to look something up, use the bounded helpers:\n"
-            "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
+            "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
             "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
             "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
-            "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n"
-            "- Single-file greps of `.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).\n\n"
+            "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
             f"{green_run_block or ''}"
             "For each acceptance criterion:\n"
             "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
