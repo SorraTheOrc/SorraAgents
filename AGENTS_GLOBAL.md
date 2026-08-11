@@ -40,8 +40,6 @@ If you already have a current work-item id, continue using it; otherwise ask the
 
 <!-- WORKFLOW: end -->
 
-## work-item Tracking with Worklog (wl)
-
 ## CRITICAL RULES
 
 - Use wl for ALL task tracking — never markdown TODOs or task lists.
