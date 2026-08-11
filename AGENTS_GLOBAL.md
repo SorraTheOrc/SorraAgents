@@ -30,7 +30,7 @@ If you already have a current work-item id, continue using it; otherwise ask the
 7. **Repeat** — return to step 4.
 8. **End session** — inform operator, summarize remaining tasks, clean up worktrees.
 
-> **Push policy:** Push only to `dev` — never to `main`. [ship skill](/home/rgardler/.pi/agent/skills/ship/SKILL.md) / `scripts/release/merge-dev-to-main.sh` promotes `dev` to `main`; see [docs/dev/release-process.md](docs/dev/release-process.md).
+> **Push policy:** Push only to `dev` — never to `main`. [ship skill](/home/rgardler/.pi/agent/skills/ship/SKILL.md) / `skill/ship/scripts/release/merge-dev-to-main.sh` promotes `dev` to `main`; see [docs/dev/release-process.md](docs/dev/release-process.md).
 
 > **Do NOT close the work-item at this stage.** Closed only after the `dev`→`main` release. "Close a work item" means stage `in_review` or mark `completed` — NOT a release. Agents SHOULD NOT push directly to `main` unless explicitly authorized.
 

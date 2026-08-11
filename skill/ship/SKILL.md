@@ -29,6 +29,8 @@ Execute a release (promote `dev` to `main`). Triggers: "ship it", "shipit", "shi
 
 All scripts are internal implementation details — the only user-facing action is `release`. Full inventory: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md). Key scripts: `run-release.js` (release wrapper + gating + dev sync), `release/merge-dev-to-main.sh` (canonical merge), `ship.js` (`pushToDev`), `git-helpers.js` (branch naming/policy), `check-unmerged-branches.js`, `check-audit-gate.js`, `check-critical-items.js`, `check-worklog-refs.js`, `remediate-spurious-closes.js`.
 
+> **Path resolution:** all `./scripts/...` and `../` paths in this document are **relative to the skill directory** (the `ship` skill folder under the repo's `skill/` tree, or under the installed skills folder) — not the repo root. When invoking from the repo root, prefix with the full skill path instead of `./`.
+
 ## Usage
 
 ```bash

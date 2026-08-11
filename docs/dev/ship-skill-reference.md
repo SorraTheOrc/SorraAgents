@@ -12,15 +12,15 @@ All scripts below are internal implementation details — they are not exposed a
 
 | Script | Purpose |
 |--------|---------|
-| `./scripts/run-release.js` | Release wrapper (includes gating, post-release dev sync) |
-| `./scripts/release/merge-dev-to-main.sh` | Canonical release merge script |
-| `./scripts/ship.js` | Push-to-dev helper (`pushToDev`, `pushToBranch`, `validatePushTarget`) — used by the implement workflow |
-| `./scripts/git-helpers.js` | Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`) |
-| `./scripts/check-unmerged-branches.js` | Unmerged branch detection |
-| `./scripts/check-audit-gate.js` | Audit readiness and producer-review gating |
-| `./scripts/check-critical-items.js` | Critical-items gating |
-| `./scripts/check-worklog-refs.js` | Worklog refs gating |
-| `./scripts/remediate-spurious-closes.js` | Idempotent remediation sweep for test-suite-spuriously-closed work items (SA-0MSJ2XMQL006CVQS) |
+| `./skill/ship/scripts/run-release.js` | Release wrapper (includes gating, post-release dev sync) |
+| `./skill/ship/scripts/release/merge-dev-to-main.sh` | Canonical release merge script |
+| `./skill/ship/scripts/ship.js` | Push-to-dev helper (`pushToDev`, `pushToBranch`, `validatePushTarget`) — used by the implement workflow |
+| `./skill/ship/scripts/git-helpers.js` | Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`) |
+| `./skill/ship/scripts/check-unmerged-branches.js` | Unmerged branch detection |
+| `./skill/ship/scripts/check-audit-gate.js` | Audit readiness and producer-review gating |
+| `./skill/ship/scripts/check-critical-items.js` | Critical-items gating |
+| `./skill/ship/scripts/check-worklog-refs.js` | Worklog refs gating |
+| `./skill/ship/scripts/remediate-spurious-closes.js` | Idempotent remediation sweep for test-suite-spuriously-closed work items (SA-0MSJ2XMQL006CVQS) |
 
 ## Usage
 ### Code Freeze
@@ -60,7 +60,7 @@ removed manually by deleting `.worklog/code-freeze.json`.
 ## Release Process
 
 ```bash
-node ./scripts/run-release.js
+node ./skill/ship/scripts/run-release.js
 ```
 
 Steps:
@@ -99,7 +99,7 @@ If the test-isolation bug ever recurs (work items closed with reason
 idempotent sweep helper from the main checkout:
 
 ```bash
-node ./scripts/remediate-spurious-closes.js
+node ./skill/ship/scripts/remediate-spurious-closes.js
 ```
 
 The sweep scans every work item, deletes close comments authored by `worklog`
