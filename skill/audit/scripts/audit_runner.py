@@ -2779,6 +2779,16 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 f"{child['status']}/{child['stage']}"
             )
             lines.append("")
+            if child.get("reused_from"):
+                # Child-verdict reuse (LP-0MSQ32MF200675AR): the child's
+                # fresh valid audit (content fingerprint unchanged + verdict
+                # present) was reused — no fresh audit was performed, so the
+                # verdict table comes from the child's own report.
+                lines.append(
+                    f"**Child verdict reused from {child['reused_from']} — "
+                    "content unchanged, no fresh audit performed.**"
+                )
+                lines.append("")
             if child.get("inherited_pass"):
                 # Parent-first pass-through (SA-0MSKB6VJA005N43F): the child
                 # inherited the parent's pass — explicit, never silent.
@@ -2857,7 +2867,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
 
 def _assemble_child_audit_report(child: dict, ac_results: list[dict],
                                  model: str | None = _MISSING,
-                                 model_source: str | None = _MISSING) -> str:
+                                 model_source: str | None = _MISSING,
+                                 content_fingerprint: str | None = None) -> str:
     """Assemble an audit report for a single child work item.
 
     *child* is a dict with keys ``title``, ``id``, ``status``, ``stage``.
@@ -2866,6 +2877,12 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict],
       no model line is emitted. When ``None`` or empty, the fallback
       ``Model: manual (no provider)`` is used.
     *model_source* is the source of the model (``"local"`` or ``"remote"``).
+    *content_fingerprint* is the content fingerprint (git HEAD sha +
+      description hash + Key Files, see ``_compute_content_fingerprint``)
+      captured at audit time. When provided, an
+      ``Audit content fingerprint: <hex>`` line is emitted near the header so
+      the persisted child report stays content-gate-able on future parent
+      runs (LP-0MSQ32MF200675AR).
 
     Ready-to-close logic:
       - All acceptance criteria must be ``met`` or ``adjusted``.
@@ -2887,6 +2904,10 @@ def _assemble_child_audit_report(child: dict, ac_results: list[dict],
             lines.append(f"Model: {effective_model} (provider: {effective_source})")
         else:
             lines.append(f"Model: {effective_model} (no provider)")
+        lines.append("")
+
+    if content_fingerprint:
+        lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
         lines.append("")
 
     lines.extend([
@@ -2944,6 +2965,7 @@ def _persist_child_audit(
     model: str | None = None,
     model_source: str | None = None,
     worklog_dir: str | None = None,
+    content_fingerprint: str | None = None,
 ) -> tuple[bool, str]:
     """Assemble and persist an audit report for a single child work item.
 
@@ -2951,6 +2973,9 @@ def _persist_child_audit(
     ``_assemble_child_audit_report()`` for inclusion in the child report.
     *worklog_dir* is forwarded to ``persist_audit`` so the wl invocation
     targets the correct worklog store regardless of the caller's cwd.
+    *content_fingerprint* (when provided) is embedded in the child report so
+    parent-persisted child audits stay content-gate-able on future runs
+    (LP-0MSQ32MF200675AR).
 
     Returns (rc, report_text).
     rc == 0 on success; rc == PERSIST_CONTENT_INVALID (4) when only the
@@ -2966,7 +2991,10 @@ def _persist_child_audit(
         "status": child_status,
         "stage": child_stage,
     }
-    report = _assemble_child_audit_report(child, ac_results, model=model, model_source=model_source)
+    report = _assemble_child_audit_report(
+        child, ac_results, model=model, model_source=model_source,
+        content_fingerprint=content_fingerprint,
+    )
 
     rc = persist_audit(child_id, report, worklog_dir=worklog_dir)
     return rc, report
@@ -3166,22 +3194,31 @@ def _demote_met_to_partial(results: list[dict]) -> list[dict]:
 
 
 def _get_child_audit_verdict(runner: Runner, child_id: str,
-                             worklog_dir: str | None = None) -> tuple[bool | None, str]:
+                             worklog_dir: str | None = None,
+                             force: bool = False) -> tuple[bool | None, str, str | None]:
     """Check a child's persisted audit verdict via wl audit-show.
 
-    Returns a (verdict, reason) tuple:
-        (True, "ready")      — Child audit says "Ready to close: Yes"
-        (False, "not_ready") — Child audit says "Ready to close: No"
-        (None, "no_audit")   — No audit data found (audit-show returned null/empty)
-        (None, "stale")      — Audit exists but is stale (within freshness buffer)
-        (None, "error")      — wl audit-show command failed
+    Returns a (verdict, reason, audited_at) tuple:
+        (True, "ready", audited_at)      — Child audit says "Ready to close: Yes"
+        (False, "not_ready", audited_at) — Child audit says "Ready to close: No"
+        (None, "no_audit", None)         — No audit data found (audit-show returned null/empty)
+        (None, "stale", audited_at)      — Audit exists but is stale (content changed / time gate)
+        (None, "force", audited_at)      — --force bypassed reuse (LP-0MSQ32MF200675AR)
+        (None, "error", None)            — wl audit-show command failed
 
-    Freshness is determined by comparing the audit's auditedAt timestamp against
-    the child's updatedAt timestamp plus AUDIT_FRESHNESS_BUFFER_SECONDS. An
-    audit whose auditedAt coincides with the child's updatedAt within
-    AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS (i.e. the updatedAt bump was the
-    audit's own persistence write) is treated as fresh rather than stale so the
-    parent runner does not re-trigger child audits forever.
+    Freshness (LP-0MSQ32MF200675AR) uses the CONTENT-fingerprint gate
+    FIRST — same logic as the item-level gate (_check_audit_freshness,
+    SA-0MSKB6US1009CNHT): when the stored report carries a content
+    fingerprint (git HEAD sha + description hash + Key Files captured at
+    audit time), the audit is fresh iff the fingerprint is unchanged, so a
+    child whose updatedAt moved for non-content reasons (comments, status
+    bumps) is reused instead of re-audited. The legacy TIME gate
+    (auditedAt vs updatedAt + AUDIT_FRESHNESS_BUFFER_SECONDS) is kept as
+    the floor for fingerprint-less legacy reports. When *force* is set,
+    BOTH gates are bypassed and every child is re-audited.
+
+    The child's auditedAt is returned so callers can record the reuse
+    marker ("reused from <auditedAt>") in the parent report.
     """
     from datetime import datetime, timedelta, timezone
 
@@ -3189,24 +3226,52 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
         data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"],
                        worklog_dir=worklog_dir)
     except RuntimeError:
-        return None, "error"
+        return None, "error", None
 
     if not isinstance(data, dict) or data.get("success") is False:
-        return None, "error"
+        return None, "error", None
 
     audit = data.get("audit")
     if not audit:
-        return None, "no_audit"
+        return None, "no_audit", None
 
     raw_output = audit.get("rawOutput")
     if not raw_output:
-        return None, "no_audit"
+        return None, "no_audit", None
 
     audited_at = audit.get("auditedAt")
     if not audited_at:
-        return None, "no_audit"
+        return None, "no_audit", None
 
-    # Check freshness against the child's updatedAt
+    if force:
+        # --force on the parent bypasses child reuse (LP-0MSQ32MF200675AR
+        # AC4): every child is re-audited, even one with a fresh stored
+        # audit — no content gate, no time gate.
+        return None, "force", audited_at
+
+    # ── Content-fingerprint gate (primary, LP-0MSQ32MF200675AR) ─────────
+    # Same freshness logic as the item-level gate: when the stored report
+    # carries a content fingerprint, freshness is decided by content match
+    # (unchanged = fresh). This is what lets a parent reuse children that
+    # were individually audited (in_review, all ACs acceptable) instead of
+    # re-running Phase 1 + Phase 2 for them — the child-audit cost driver.
+    stored_fingerprint = _extract_content_fingerprint(raw_output)
+    if stored_fingerprint is not None:
+        current_fingerprint = _compute_content_fingerprint(
+            runner, child_id, worklog_dir=worklog_dir,
+        )
+        if current_fingerprint is None:
+            # Fingerprint cannot be computed now (e.g. git unavailable) —
+            # fail open and let the child pipeline re-run.
+            return None, "stale", audited_at
+        if current_fingerprint != stored_fingerprint:
+            # Content changed → stale → re-audit.
+            return None, "stale", audited_at
+        # Fingerprint unchanged + verdict present → fresh.
+        return _parse_child_audit_verdict(raw_output, audited_at)
+
+    # ── Time gate (floor): legacy audits without a fingerprint ──────────
+    # Get the work item's updatedAt
     try:
         wi_data = _run_wl(runner, ["wl", "show", child_id, "--json"],
                           worklog_dir=worklog_dir)
@@ -3237,20 +3302,48 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
                     write_delta = update_time - audit_time
                     if not (timedelta(0) <= write_delta
                             <= timedelta(seconds=AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS)):
-                        return None, "stale"
+                        return None, "stale", audited_at
             except (ValueError, TypeError):
                 pass  # Can't parse timestamps; treat as fresh since we have an audit
 
-    # Parse the raw output for "Ready to close:"
-    for line in raw_output.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Ready to close:"):
-            verdict = stripped.split(":", 1)[1].strip()
-            if verdict.lower() == "yes":
-                return True, "ready"
-            return False, "not_ready"
+    return _parse_child_audit_verdict(raw_output, audited_at)
 
-    return None, "no_audit"
+
+def _parse_child_audit_verdict(raw_output: str,
+                               audited_at: str) -> tuple[bool | None, str, str | None]:
+    """Parse the ``Ready to close:`` verdict from a child audit report.
+
+    Returns ``(True, "ready", audited_at)`` / ``(False, "not_ready",
+    audited_at)`` when a verdict line is found, otherwise
+    ``(None, "no_audit", audited_at)``.
+    """
+    ready = _parse_ready_to_close(raw_output)
+    if ready is None:
+        return None, "no_audit", audited_at
+    if ready == "yes":
+        return True, "ready", audited_at
+    return False, "not_ready", audited_at
+
+
+def _fetch_child_audited_at(runner: Runner, child_id: str,
+                            worklog_dir: str | None = None) -> str | None:
+    """Return the child audit's ``auditedAt`` (None when unavailable).
+
+    Used by the auto-trigger loop's content-freshness reuse branch to record
+    the ``reused from <auditedAt>`` marker (LP-0MSQ32MF200675AR). The branch
+    is a defense-in-depth fallback — the primary child reuse happens in the
+    Phase 1 pre-pass where ``_get_child_audit_verdict`` already returns the
+    auditedAt.
+    """
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"],
+                       worklog_dir=worklog_dir)
+    except RuntimeError:
+        return None
+    audit = data.get("audit") if isinstance(data, dict) else None
+    if not audit:
+        return None
+    return audit.get("auditedAt")
 
 
 # Matches the canonical audit report AC table row:
@@ -5016,15 +5109,23 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     child_results.append(cr)
                     continue
 
-                verdict, reason = _get_child_audit_verdict(
+                verdict, reason, audited_at = _get_child_audit_verdict(
                     runner, child["id"], worklog_dir=worklog_dir,
+                    force=force,
                 )
                 pre_verdicts[child["id"]] = (verdict, reason)
-                if verdict is True:
-                    # Fresh ready audit: skip the Phase 1 child AC review and reuse
-                    # the AC verdicts persisted in the child's own audit report
-                    # (fallback to met when the table cannot be parsed).
-                    cr["child_audit_ready"] = True
+                if verdict is not None:
+                    # Fresh valid audit (LP-0MSQ32MF200675AR child-verdict
+                    # reuse): the content-fingerprint gate (primary) or the
+                    # legacy time gate (fingerprint-less reports) judged the
+                    # child's own audit fresh, so the parent reuses its
+                    # persisted AC verdicts with ZERO pi calls — no child
+                    # Phase 1 screening, no child Phase 2 deep/batch entry.
+                    # Applies to ready AND not-ready verdicts (P12): the
+                    # child's own pipeline already deep-analyzed these ACs.
+                    cr["child_audit_ready"] = verdict is True
+                    cr["child_audit_not_ready"] = verdict is False
+                    cr["reused_from"] = audited_at
                     cr["ac_results"] = _child_acs_from_own_audit(
                         child, runner, worklog_dir=worklog_dir,
                     )
@@ -5101,14 +5202,18 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         # Content-based freshness skip (AC4): a child whose content
                         # fingerprint is unchanged has a still-valid audit — do not
                         # re-trigger it; re-evaluate the verdict from the stored
-                        # report instead.
-                        fresh_report = _check_audit_freshness(
+                        # report instead. --force bypasses reuse entirely: every
+                        # child is re-audited (LP-0MSQ32MF200675AR AC4).
+                        fresh_report = None if force else _check_audit_freshness(
                             runner, child["id"], worklog_dir=worklog_dir,
                         )
                         if fresh_report is not None:
                             fresh_ready = _parse_ready_to_close(fresh_report)
                             verdict = fresh_ready == "yes"
                             reason = "ready" if fresh_ready == "yes" else "not_ready"
+                            child["reused_from"] = _fetch_child_audited_at(
+                                runner, child["id"], worklog_dir=worklog_dir,
+                            )
                             print(
                                 f"Reusing fresh audit for child {child['id']} "
                                 f"({child['title']}) — content unchanged",
@@ -5180,8 +5285,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
                                     timeout=effective_timeout,
                                 )
                                 # Re-check verdict after triggered audit
-                                verdict, reason = _get_child_audit_verdict(runner, child["id"],
-                                                                           worklog_dir=worklog_dir)
+                                verdict, reason, _audited_at = _get_child_audit_verdict(
+                                    runner, child["id"], worklog_dir=worklog_dir,
+                                )
                             except subprocess.TimeoutExpired:
                                 print(
                                     f"Warning: Auto-triggered audit for child {child['id']} "
@@ -5215,6 +5321,16 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # Persist child audits to individual child work items (if persist is True)
             if persist:
                 for child in child_results:
+                    if child.get("reused_from"):
+                        # Persistence hygiene (LP-0MSQ32MF200675AR AC5): a
+                        # reused child keeps its own authoritative audit —
+                        # re-persisting it would overwrite the child's own
+                        # fingerprint-bearing report with a parent-style one
+                        # and break future content-gate reuse.
+                        continue
+                    child_fingerprint = _compute_content_fingerprint(
+                        runner, child["id"], worklog_dir=worklog_dir,
+                    )
                     child_rc, _child_report = _persist_child_audit(
                         child_id=child["id"],
                         child_title=child["title"],
@@ -5225,6 +5341,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         model=resolved_model,
                         model_source=model_source,
                         worklog_dir=worklog_dir,
+                        content_fingerprint=child_fingerprint,
                     )
                     child_persist_results.append({
                         "id": child["id"],
@@ -5471,6 +5588,16 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 for child in child_results:
                     if child.get("inherited_pass") or child.get("pass_through"):
                         continue  # no per-child audit was run
+                    if child.get("reused_from"):
+                        # Persistence hygiene (LP-0MSQ32MF200675AR AC5): a
+                        # reused child keeps its own authoritative audit —
+                        # re-persisting it would overwrite the child's own
+                        # fingerprint-bearing report and break future
+                        # content-gate reuse.
+                        continue
+                    child_fingerprint = _compute_content_fingerprint(
+                        runner, child["id"], worklog_dir=worklog_dir,
+                    )
                     child_rc, _child_report = _persist_child_audit(
                         child_id=child["id"],
                         child_title=child["title"],
@@ -5481,6 +5608,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         model=resolved_model,
                         model_source=model_source,
                         worklog_dir=worklog_dir,
+                        content_fingerprint=child_fingerprint,
                     )
                     child_persist_results.append({
                         "id": child["id"],
