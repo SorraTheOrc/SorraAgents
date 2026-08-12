@@ -119,6 +119,7 @@ def _run_parent(
     with (
         mock.patch.object(mod, "wl_show", return_value=wl_show_result),
         mock.patch.object(mod, "wl_show_children", return_value=children),
+        mock.patch.object(mod, "wl_dep_blockers", return_value=[]),
         mock.patch.object(mod, "phase_start", side_effect=fake_phase_start),
         mock.patch.object(mod.StatusLifecycle, "update_status", side_effect=fake_update_status),
         mock.patch.object(mod, "wl_add_comment", side_effect=fake_add_comment),

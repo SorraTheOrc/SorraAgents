@@ -341,6 +341,40 @@ def wl_show_children(work_item_id: str) -> list[dict[str, Any]]:
     return children if isinstance(children, list) else []
 
 
+def wl_dep_blockers(work_item_id: str) -> list[dict[str, Any]]:
+    """Fetch a work item's outbound (depends-on) dependency edges.
+
+    Uses ``wl dep list <id> --json`` and returns the ``outbound`` array —
+    the items this work item is blocked by / depends on. Empty when the
+    item has no dependencies or the fetch fails.
+
+    Args:
+        work_item_id: The work item ID.
+
+    Returns:
+        List of outbound dependency-edge dicts (may be empty).
+    """
+    cmd = ["wl", "dep", "list", work_item_id, "--json"]
+    cmd[1:1] = worklog_dir_flag()
+    result = run_cmd(cmd, check=False)
+    if result.returncode != 0:
+        LOG.error(
+            "Failed to fetch dependencies of %s: %s",
+            work_item_id,
+            result.stderr.strip(),
+        )
+        return []
+    try:
+        data = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, ValueError) as exc:
+        LOG.error("Invalid JSON from wl dep list: %s", exc)
+        return []
+    if not isinstance(data, dict):
+        return []
+    outbound = data.get("outbound")
+    return outbound if isinstance(outbound, list) else []
+
+
 def wl_add_comment(work_item_id: str, comment: str) -> bool:
     """Add a comment to a work item.
 
@@ -432,24 +466,123 @@ def _classify_child(child: dict[str, Any]) -> str:
     return "implement"
 
 
-def _next_child_to_implement(children: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _resolve_implementation_order(
+    children: list[dict[str, Any]],
+    blockers: dict[str, list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return children in dependency order (blockers first).
+
+    Builds a graph over the parent's children using outbound (depends-on)
+    edges: for each child, the blockers that are THEMSELVES children of the
+    parent form in-chain edges (blocker must be implemented before child).
+    Blockers outside the children set (e.g. cross-project) do not create
+    edges — they are reported as coordination notes by the caller.
+
+    Ordering is a deterministic topological sort (Kahn's algorithm) with
+    stable tie-breaks (``sortIndex``, then id). A dependency cycle fails
+    fast: the function returns an empty list plus a clear error message
+    naming the remaining (cyclic) children — no infinite recursion.
+
+    Args:
+        children: List of child work-item dicts from ``wl show --children``.
+        blockers: Mapping child id → outbound dependency-edge dicts from
+            ``wl dep list`` (may be empty).
+
+    Returns:
+        ``(ordered_children, None)`` on success, or
+        ``([], error_message)`` when a cycle is detected.
+    """
+    child_by_id: dict[str, dict[str, Any]] = {
+        str(c.get("id")): c for c in children if c.get("id")
+    }
+    child_ids = set(child_by_id)
+
+    # in_degree[c] = number of in-chain blockers (blockers that are also
+    # children of this parent). dependents[b] = children blocked by b.
+    in_degree: dict[str, int] = {cid: 0 for cid in child_ids}
+    dependents: dict[str, list[str]] = {cid: [] for cid in child_ids}
+    for child in children:
+        cid = str(child.get("id", ""))
+        if cid not in child_ids:
+            continue
+        for edge in blockers.get(cid, []):
+            bid = str(edge.get("id", ""))
+            if bid in child_ids:
+                in_degree[cid] += 1
+                dependents[bid].append(cid)
+
+    def _key(cid: str) -> tuple[int, str]:
+        return (int(child_by_id[cid].get("sortIndex") or 0), cid)
+
+    ready = sorted((cid for cid in child_ids if in_degree[cid] == 0), key=_key)
+    ordered: list[str] = []
+    while ready:
+        cid = ready.pop(0)
+        ordered.append(cid)
+        for dep in dependents[cid]:
+            in_degree[dep] -= 1
+            if in_degree[dep] == 0:
+                ready.append(dep)
+        ready.sort(key=_key)
+
+    if len(ordered) != len(child_ids):
+        remaining = sorted(child_ids - set(ordered), key=_key)
+        cycle_path = " -> ".join(remaining)
+        return [], (
+            f"Dependency cycle detected among children: {cycle_path}. "
+            f"Resolve the blocking relationships and re-run."
+        )
+    return [child_by_id[cid] for cid in ordered], None
+
+
+def _next_child_to_implement(
+    children: list[dict[str, Any]],
+    blockers_map: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any] | None:
     """Return the next child to run through the standard implement workflow.
 
     Children already terminal or in progress elsewhere are skipped
-    (AC-4/AC-7). V1 uses the order returned by ``wl show --children``;
-    V2 (SA-0MSQIJBTB008RHS1) replaces this with dependency-graph order so a
-    blocked child is implemented only after its blockers.
+    (AC-4/AC-7). The *children* argument must already be in dependency
+    order (see :func:`_resolve_implementation_order`). A child is startable
+    only when every in-chain blocker (a blocker that is also one of these
+    children) is already terminal — a blocked child is never implemented
+    before its blockers (AC-2). Independent siblings of an in-progress
+    child may still start.
 
     Args:
-        children: List of child work-item dicts.
+        children: List of child work-item dicts in dependency order.
+        blockers_map: Mapping child id → outbound dependency-edge dicts from
+            ``wl dep list`` (defaults to {}).
 
     Returns:
-        The next child dict, or None when every child is terminal or in
-        progress elsewhere (nothing left to start).
+        The next child dict, or None when no child is startable (every
+        remaining child is terminal, in progress elsewhere, or blocked by a
+        non-terminal sibling).
     """
+    blockers_map = blockers_map or {}
+    child_ids = {str(c.get("id")) for c in children}
+    terminal_ids = {
+        str(c.get("id"))
+        for c in children
+        if _is_terminal_status(str(c.get("status", "")))
+    }
     for child in children:
-        if _classify_child(child) == "implement":
+        action = _classify_child(child)
+        if action == "skip-terminal":
+            continue
+        if action == "skip-in-progress":
+            continue  # never clobber another agent's claim
+        cid = str(child.get("id", ""))
+        in_chain_blockers = [
+            str(b.get("id"))
+            for b in blockers_map.get(cid, [])
+            if str(b.get("id")) in child_ids
+        ]
+        if all(bid in terminal_ids for bid in in_chain_blockers):
             return child
+        # else: blocked by a non-terminal sibling — dependents come later
+        # in the order and are transitively blocked; keep scanning for an
+        # independent sibling that is startable.
     return None
 
 
@@ -2132,14 +2265,19 @@ def phase_parent(
 
     1. Fetch the parent and its children (``wl show --children``).
     2. No children → behave like a leaf (no status change; use start/finish).
-    3. Classify children: terminal → skip; in_progress elsewhere → skip+report;
+    3. Resolve the dependency graph among children (outbound
+       ``wl dep list`` edges): in-chain blockers are implemented before
+       the children they block; cycles fail fast; cross-project blockers
+       are reported as coordination notes.
+    4. Classify children: terminal → skip; in_progress elsewhere → skip+report;
+       blocked by a non-terminal sibling → not startable (reported);
        otherwise → implementable.
-    4. All children terminal → advance the parent to ``completed``/``in_review``
+    5. All children terminal → advance the parent to ``completed``/``in_review``
        (existing Step 5.1 advancement retained) and comment a per-child summary.
-    5. Otherwise → start the next child (claim + worktree via ``phase_start``)
-       and report the worktree path; the caller implements that child with the
-       standard workflow (``implement.py finish <child>``), then re-invokes
-       this phase for the next child.
+    6. Otherwise → start the next startable child (claim + worktree via
+       ``phase_start``) and report the worktree path; the caller implements
+       that child with the standard workflow (``implement.py finish
+       <child>``), then re-invokes this phase for the next child.
 
     Worktree isolation is preserved per child: every child is implemented in
     its own worktree created by ``phase_start`` (never the main checkout);
@@ -2226,14 +2364,45 @@ def phase_parent(
 
     # ── Step 5: Classify children ──────────────────────────────────
     classifications: list[dict[str, Any]] = []
+    blockers_map: dict[str, list[dict[str, Any]]] = {}
     for child in children:
+        cid = str(child.get("id", ""))
+        # Outbound (depends-on) edges: what this child is blocked by.
+        child_blockers = wl_dep_blockers(cid) if cid else []
+        blockers_map[cid] = child_blockers
+        # Blockers outside the children set (e.g. cross-project) are
+        # coordination notes, not in-chain edges (SA-0MSQBM2FK005NW1T).
+        in_chain_ids = {str(c.get("id")) for c in children}
+        external = [
+            str(b.get("id"))
+            for b in child_blockers
+            if str(b.get("id")) not in in_chain_ids
+        ]
         classifications.append({
-            "id": child.get("id", ""),
+            "id": cid,
             "title": child.get("title", ""),
             "status": child.get("status", ""),
             "action": _classify_child(child),
+            "external_blockers": external,
         })
     report["children"] = classifications
+
+    # ── Step 5.5: Resolve dependency order (blockers first) ────────
+    ordered_children, cycle_error = _resolve_implementation_order(
+        children, blockers_map
+    )
+    if cycle_error:
+        report["success"] = False
+        report["message"] = cycle_error
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print()
+            print("=" * 60)
+            print(f"  ⛔ {cycle_error}")
+            print("=" * 60)
+            print()
+        return report
 
     # ── Step 6: All children terminal → advance the parent ─────────
     if all(c["action"] == "skip-terminal" for c in classifications):
@@ -2275,14 +2444,23 @@ def phase_parent(
         return report
 
     # ── Step 7: Start the next child (claim + worktree) ────────────
-    next_child = _next_child_to_implement(children)
+    next_child = _next_child_to_implement(ordered_children, blockers_map)
     if next_child is None:
-        # Every non-terminal child is in progress elsewhere — report, do not clobber.
+        # No startable child: every remaining child is terminal, in progress
+        # elsewhere, or blocked by a non-terminal sibling.
+        blocked = [
+            c["id"]
+            for c in classifications
+            if c["action"] not in ("skip-terminal", "skip-in-progress")
+        ]
         report["message"] = (
-            f"No child of {work_item_id} is available to start: every "
-            f"non-terminal child is in progress by another agent. "
-            f"Re-run this phase after one completes."
+            f"No child of {work_item_id} is currently startable: "
+            f"non-terminal children not in progress are blocked by "
+            f"non-terminal siblings or unavailable. Re-run this phase "
+            f"after one completes."
         )
+        if blocked:
+            report["blocked_children"] = blocked
         if json_output:
             print(format_json_output(report))
         else:
