@@ -503,8 +503,8 @@ def _sample_audited_items(count: int, seed: int, repo_root: Path) -> list[str]:
     for status in ("open", "in-progress", "blocked", "completed"):
         proc = subprocess.run(
             ["bash", "-c",
-             f"wl list --status {status} --json "
-             "| jq -c '[.workItems[] | {id, auditedAt, description}]'"],
+             (f"wl list --status {status} --json "
+              "| jq -c '[.workItems[] | {id, auditedAt, description}]'")],
             capture_output=True, text=True, timeout=120, check=False,
         )
         if proc.returncode != 0:

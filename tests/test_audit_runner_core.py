@@ -1753,7 +1753,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason, audited_at = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is True
         assert reason == "ready"
 
@@ -1773,7 +1773,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason, audited_at = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is False
         assert reason == "not_ready"
 
@@ -1789,7 +1789,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason, audited_at = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is None
         assert reason == "no_audit"
 
@@ -1820,7 +1820,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(wi_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason, audited_at = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is None
         assert reason == "stale"
 
@@ -1851,7 +1851,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(wi_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason, audited_at = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is True
         assert reason == "ready"
 
@@ -1892,7 +1892,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(wi_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason, audited_at = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is True
         assert reason == "ready"
 
@@ -1927,7 +1927,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(wi_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason, audited_at = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is False
         assert reason == "not_ready"
 
@@ -1963,7 +1963,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(wi_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason, audited_at = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is None
         assert reason == "stale"
 
@@ -1974,7 +1974,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(returncode=1, stderr="command failed")
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason, audited_at = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is None
         assert reason == "error"
 
@@ -1994,7 +1994,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason, audited_at = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is None
         assert reason == "no_audit"
 

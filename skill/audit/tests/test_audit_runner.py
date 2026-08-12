@@ -3130,7 +3130,7 @@ class TestOptInChildAuditCascade:
             # Working-tree fingerprint (SA-0MSL1YXG7004F2BZ): a clean tree
             # yields an empty marker — matches the stored fingerprint computed
             # with a MagicMock runner (no git output).
-            if cmd_str.startswith("git status") or cmd_str.startswith("git diff"):
+            if cmd_str.startswith(("git status", "git diff")):
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
 
             return SimpleNamespace(
@@ -3523,8 +3523,7 @@ class TestChildVerdictReuseInParentAudits:
         """True when a pi call context targets a child (Phase 1 ``child:<id>``
         or Phase 2 ``phase2_child:<i>`` / ``phase2_batch``)."""
         return (
-            context.startswith("child:")
-            or context.startswith("phase2_child")
+            context.startswith(("child:", "phase2_child"))
             or context == "phase2_batch"
         )
 

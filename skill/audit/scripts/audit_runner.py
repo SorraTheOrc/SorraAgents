@@ -1061,7 +1061,7 @@ def _resolve_working_tree_hash(runner: Runner) -> str:
     for cmd in (["git", "status", "--porcelain"], ["git", "diff", "--name-only", "HEAD"]):
         try:
             proc = runner(cmd)
-        except Exception:  # noqa: BLE001 -- git is best-effort here
+        except Exception:  # noqa: S112, BLE001 -- git is best-effort; swallow to stay fail-open
             continue
         if proc.returncode == 0:
             for line in proc.stdout.splitlines():

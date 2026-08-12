@@ -197,7 +197,7 @@ def _find_worklog_dir_by_prefix(prefix: str) -> Path | None:
     return _find_worklog_dir_by_prefix_cached(SIBLING_SCAN_ROOT, prefix)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _find_worklog_dir_by_prefix_cached(scan_root: Path, prefix: str) -> Path | None:
     """Memoized core of :func:`_find_worklog_dir_by_prefix`.
 

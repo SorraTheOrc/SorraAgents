@@ -72,7 +72,8 @@ def list_critical_issues() -> list[dict[str, Any]]:
                     items.extend(batch)
             elif isinstance(data, list):
                 items.extend(data)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 -- triage is best-effort; swallow to keep the scan resilient
+            print(f"[triage] wl list parse failed: {exc}", file=sys.stderr)
             continue
     return items
 
