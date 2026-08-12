@@ -195,6 +195,22 @@ class TestSkillMdMonitoredRunGuidance:
         assert "fabricat" in section.lower()
         assert "override" in section.lower()
 
+    def test_abort_reports_outcome_to_operator(self) -> None:
+        """Abort requires reporting the outcome to the operator.
+
+        AC4 (SA-0MSL6E6KD006KJ0K): the operator-report step must appear in
+        SKILL.md itself, not only in the reference doc. The reference doc is
+        preferred by ``_section()``, so read SKILL.md directly to catch a
+        regression where the summary omits the report step.
+        """
+        text = SKILL_MD.read_text()
+        start = text.find("## Monitored Run Execution")
+        assert start != -1
+        end = text.find("\n## ", start + 1)
+        section = text[start : end if end != -1 else len(text)]
+        assert "report" in section.lower()
+        assert "operator" in section.lower()
+
 
 # ===========================================================================
 # Debug-log lifecycle (for SA-0MSBSOAEM0078LAO)
