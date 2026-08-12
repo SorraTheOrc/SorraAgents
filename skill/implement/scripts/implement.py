@@ -2406,19 +2406,22 @@ def phase_parent(
 
     # ── Step 6: All children terminal → advance the parent ─────────
     if all(c["action"] == "skip-terminal" for c in classifications):
-        try:
-            StatusLifecycle.update_status(
-                work_item_id, "completed", stage="in_review"
-            )
-        except RuntimeError:
-            msg = f"Failed to advance parent {work_item_id}"
-            report["success"] = False
-            report["message"] = msg
-            if json_output:
-                print(format_json_output(report))
-            else:
-                LOG.error(msg)
-            return report
+        parent_status = str(parent.get("status", ""))
+        already_terminal = _is_terminal_status(parent_status)
+        if not already_terminal:
+            try:
+                StatusLifecycle.update_status(
+                    work_item_id, "completed", stage="in_review"
+                )
+            except RuntimeError:
+                msg = f"Failed to advance parent {work_item_id}"
+                report["success"] = False
+                report["message"] = msg
+                if json_output:
+                    print(format_json_output(report))
+                else:
+                    LOG.error(msg)
+                return report
         summary = "\n".join(
             f"- {c['id']} ({c['status']})" for c in classifications
         )
@@ -2432,6 +2435,11 @@ def phase_parent(
             f"All children of {work_item_id} are terminal; parent advanced "
             f"to completed/in_review."
         )
+        if already_terminal:
+            report["message"] = (
+                f"All children of {work_item_id} are terminal; parent is "
+                f"already in a terminal state ({parent_status})."
+            )
         if json_output:
             print(format_json_output(report))
         else:

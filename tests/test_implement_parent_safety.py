@@ -169,7 +169,7 @@ class TestMixedStatuses:
         called per child, never for the parent id itself."""
         children = [_child("SA-C1"), _child("SA-C2")]
         h = ParentHarness(implement_mod, children)
-        report = h.run()
+        h.run()
         assert h.calls["phase_start"] == ["SA-C1"]
         assert "SA-PARENT001" not in h.calls["phase_start"]
 
