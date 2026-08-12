@@ -6665,12 +6665,34 @@ class TestAutoGreenRunPromptInjection:
         assert _GREEN_RUN_HEAD in prompts["parent"]
         assert "GREEN-RUN ATTESTATION" not in prompts["parent"]
 
-    def test_cache_miss_no_auto_block_no_crash(self):
-        """AC2: a cache miss leaves the prompts unchanged and the audit completes."""
-        prompts = self._capture_context_prompts(cache_result=None)
-        assert "parent" in prompts
-        assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
-        assert "GREEN-RUN ATTESTATION" not in prompts["parent"]
+    def test_cache_miss_blocks_audit(self, capsys):
+        """SA-0MSQ72BVV0011SRU AC1: a cache miss blocks the audit (no Phase 1).
+
+        This replaces the historical 'miss → diagnostic + continue' behavior:
+        a missing full-suite cache with no opt-out must exit non-zero before
+        any Phase 1 pi call so execution-dependent ACs can never be marked
+        'met' from implementer-reported evidence (the degraded-verdict bug
+        the pre-flight gate fixes).
+        """
+        mock_runner = self._make_cmd_issue_runner()
+
+        def _fake_call(*args, **kwargs):  # pragma: no cover - must not run
+            raise AssertionError("Phase 1 pi call must not happen on a cache miss")
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=None
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "Audit blocked" in err
+        assert "/skill:test" in err
+        assert "--green-run HEAD" in err
+        assert "NOT produce a report" in err
 
     def test_failing_cache_no_auto_block(self):
         """AC2: a non-zero cached exit never injects the block."""
@@ -6823,6 +6845,282 @@ class TestAutoGreenRunCmdIssue:
         out = capsys.readouterr().out
         assert "AUTO-VERIFIED GREEN RUN" not in out
         assert "Automatic green run evidence" not in out
+
+
+# ===========================================================================
+# Pre-flight full-suite cache gate (SA-0MSQ72BVV0011SRU)
+# ===========================================================================
+
+
+class TestFullSuiteCacheClassification:
+    """Unit tests for _classify_full_suite_cache statuses."""
+
+    def test_green_all_commands_cached(self, tmp_path):
+        """Every suite command cached green at HEAD → 'green' + evidence sha."""
+        with mock.patch.object(
+            audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
+        ):
+            status, sha, problems = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == "green"
+        assert sha == _GREEN_RUN_HEAD
+        assert problems == []
+
+    def test_miss_any_command_uncached(self, tmp_path):
+        """At least one command without a cached entry → 'miss'."""
+        def _side_effect(command, **kwargs):
+            return None if "tests/unit" in command else _AUTO_GREEN_ENTRY
+
+        _make_suite_dirs(tmp_path)
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            status, sha, problems = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == "miss"
+        assert sha == _GREEN_RUN_HEAD
+        assert any("no cached full-suite run" in p for p in problems)
+
+    def test_red_nonzero_cached_run(self, tmp_path):
+        """All commands cached but one exited non-zero → 'red'."""
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "tests/cli" in command:
+                entry["exit_code"] = 7
+            return entry
+
+        _make_suite_dirs(tmp_path)
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            status, sha, problems = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == "red"
+        assert sha == _GREEN_RUN_HEAD
+        assert any("exited non-zero" in p for p in problems)
+
+    def test_miss_dominates_over_red(self, tmp_path):
+        """A mix of missing + red entries classifies as 'miss' (gate fires)."""
+        def _side_effect(command, **kwargs):
+            if "tests/unit" in command:
+                return None
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "tests/cli" in command:
+                entry["exit_code"] = 7
+            return entry
+
+        _make_suite_dirs(tmp_path)
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            status, _, _ = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == "miss"
+
+    def test_error_when_head_unresolvable(self, tmp_path):
+        """Unresolvable HEAD → 'error' with no cache query."""
+        with mock.patch.object(audit_runner, "query_cached") as mock_q:
+            status, sha, _ = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(head_sha=None), cwd=str(tmp_path),
+            )
+        assert status == "error"
+        assert sha is None
+        mock_q.assert_not_called()
+
+
+class TestEffectiveSuiteCommands:
+    """Repo-aware command set (AC3): no phantom pytest for no-pytest repos."""
+
+    def test_pytest_ini_counts_as_pytest_suite(self, tmp_path):
+        (tmp_path / "pytest.ini").write_text("[pytest]\n")
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is True
+        assert any(
+            "pytest" in c
+            for c in audit_runner._effective_suite_commands(tmp_path)
+        )
+
+    def test_pyproject_marker_counts_as_pytest_suite(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is True
+
+    def test_python_test_files_count_as_pytest_suite(self, tmp_path):
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_x.py").write_text("def test_x(): pass\n")
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is True
+
+    def test_no_pytest_suite_skips_pytest_command(self, tmp_path):
+        """A node-only repo keeps node commands but drops the pytest command."""
+        _make_suite_dirs(tmp_path)
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is False
+        cmds = audit_runner._effective_suite_commands(tmp_path)
+        assert cmds  # node commands remain
+        assert not any("pytest" in c for c in cmds)
+
+    def test_no_suite_at_all_yields_empty_set(self, tmp_path):
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is False
+        assert audit_runner._effective_suite_commands(tmp_path) == []
+
+
+class TestPreflightCacheGate:
+    """Unit tests for the gate decision (repo-aware, fail-open on red/error)."""
+
+    def _gate_message(self, tmp_path, side_effect=None, return_value=None):
+        if side_effect is not None:
+            patcher = mock.patch.object(
+                audit_runner, "query_cached", side_effect=side_effect
+            )
+        else:
+            patcher = mock.patch.object(
+                audit_runner, "query_cached", return_value=return_value
+            )
+        with patcher:
+            return audit_runner._preflight_cache_gate(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+
+    def _with_pytest(self, tmp_path):
+        (tmp_path / "pytest.ini").write_text("[pytest]\n")
+        return tmp_path
+
+    def test_miss_returns_blocking_message(self, tmp_path):
+        """AC1: a cache miss yields an actionable blocking message."""
+        self._with_pytest(tmp_path)
+        message = self._gate_message(tmp_path, return_value=None)
+        assert message is not None
+        assert "Audit blocked" in message
+        assert "/skill:test" in message
+        assert "--green-run HEAD" in message
+        assert "NOT produce a report" in message
+        assert "pre-audit work-item status/stage" in message
+
+    def test_green_returns_none(self, tmp_path):
+        """A green cache proceeds (no message)."""
+        self._with_pytest(tmp_path)
+        assert self._gate_message(tmp_path, return_value=_AUTO_GREEN_ENTRY) is None
+
+    def test_red_returns_none(self, tmp_path):
+        """AC2: a red cached run keeps partial + diagnostic (no gate)."""
+        self._with_pytest(tmp_path)
+
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "pytest" in command:
+                entry["exit_code"] = 1
+            return entry
+
+        assert self._gate_message(tmp_path, side_effect=_side_effect) is None
+
+    def test_cache_error_fails_open(self, tmp_path):
+        """AC2: a cache/infra error never blocks the audit."""
+        self._with_pytest(tmp_path)
+        assert self._gate_message(
+            tmp_path, side_effect=RuntimeError("cache corrupt")
+        ) is None
+
+    def test_no_pytest_repo_not_blocked(self, tmp_path):
+        """AC3: a repo without a pytest suite is not falsely gated."""
+        _make_suite_dirs(tmp_path)  # node dirs; no pytest config/test files
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is False
+        # node suites cached green → the effective set has no miss
+        assert self._gate_message(tmp_path, return_value=_AUTO_GREEN_ENTRY) is None
+
+    def test_no_suite_repo_not_blocked(self, tmp_path):
+        """AC3: a repo with no suite at all (docs-only) is never gated."""
+        assert self._gate_message(tmp_path, return_value=None) is None
+
+
+class TestPreflightGateCmdIssue:
+    """End-to-end gate matrix at the cmd_issue level (AC1/AC2/AC4)."""
+
+    def _make_cmd_issue_runner(self, **kwargs):
+        return TestAutoGreenRunPromptInjection()._make_cmd_issue_runner(**kwargs)
+
+    def _run_issue(self, *, cache_return=None, cache_side_effect=None,
+                   green_run=None, run_tests=False):
+        """Run cmd_issue (force, no persist) with a mocked pi call."""
+        mock_runner = self._make_cmd_issue_runner()
+        calls: list[str] = []
+
+        def _fake_call(*args, **kwargs):
+            calls.append(args[1])
+            return {"extracted_text": "[]"}
+
+        patches = [
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                mock.MagicMock(
+                    return_value={"success": True, "findings": [], "fixes_applied": 0}
+                ),
+            ),
+        ]
+        if cache_side_effect is not None:
+            patches.append(mock.patch.object(
+                audit_runner, "query_cached", side_effect=cache_side_effect
+            ))
+        else:
+            patches.append(mock.patch.object(
+                audit_runner, "query_cached", return_value=cache_return
+            ))
+        if run_tests:
+            patches.append(mock.patch.object(
+                audit_runner, "_run_tests_via_test_skill",
+                return_value={
+                    "success": True, "results": [], "failures": [],
+                    "triaged": [], "notice": "",
+                },
+            ))
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+                green_run=green_run, run_tests=run_tests,
+            )
+        return rc, calls, mock_runner
+
+    def test_cache_miss_exits_nonzero_before_phase1(self, capsys):
+        """AC1: cache miss + no opt-out → rc 1, zero pi calls, no status change."""
+        rc, calls, runner = self._run_issue(cache_return=None)
+        assert rc == 1
+        assert calls == []  # no Phase 1 pi call
+        # pre-audit status/stage preserved: no wl update reached the runner
+        assert not any(
+            "update" in " ".join(c.args[0]) for c in runner.call_args_list
+        )
+        err = capsys.readouterr().err
+        assert "Audit blocked" in err
+        assert "run_tests.py --force" in err
+
+    def test_cache_miss_with_run_tests_proceeds(self):
+        """AC1/AC2: cache miss + --run-tests executes the suite and proceeds."""
+        rc, calls, _ = self._run_issue(cache_return=None, run_tests=True)
+        assert rc == 0
+        assert "parent" in calls  # reached Phase 1
+
+    def test_cache_miss_with_green_run_proceeds(self):
+        """AC1/AC2: cache miss + --green-run HEAD attests and proceeds."""
+        rc, calls, _ = self._run_issue(cache_return=None, green_run="HEAD")
+        assert rc == 0
+        assert "parent" in calls
+
+    def test_green_cache_proceeds(self):
+        """A green cached full-suite run proceeds (auto-verified)."""
+        rc, calls, _ = self._run_issue(cache_return=_AUTO_GREEN_ENTRY)
+        assert rc == 0
+        assert "parent" in calls
+
+    def test_red_cache_proceeds_partial(self):
+        """AC2: a red cached run keeps current behavior (partial, no gate)."""
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "pytest" in command:
+                entry["exit_code"] = 1
+            return entry
+
+        rc, calls, _ = self._run_issue(cache_side_effect=_side_effect)
+        assert rc == 0
+        assert "parent" in calls
 
 
 # ===========================================================================
@@ -7053,16 +7351,38 @@ class TestRunTestsPromptInjection:
         assert _GREEN_RUN_HEAD in prompts["parent"]
         assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
 
-    def test_without_run_tests_never_invokes_test_skill(self):
-        """AC2: without --run-tests the behavior is unchanged — the test skill is
-        never invoked on a cache miss and no block is injected."""
-        prompts, mock_run_tests = self._capture_context_prompts(
-            cache_result=None,
-        )
-        assert "parent" in prompts
+    def test_without_run_tests_never_invokes_test_skill(self, capsys):
+        """AC2/AC1: without --run-tests the test skill is never invoked — and on
+        a cache miss the pre-flight gate blocks the audit (SA-0MSQ72BVV0011SRU)
+        before the invocation could ever be reached: no report, no persistence,
+        non-zero exit."""
+        mock_runner = self._make_cmd_issue_runner()
+
+        def _fake_call(*args, **kwargs):  # pragma: no cover - must not run
+            raise AssertionError("Phase 1 pi call must not happen on a cache miss")
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=None
+        ), mock.patch.object(
+            audit_runner, "_run_tests_via_test_skill",
+            return_value={
+                "success": True, "results": [], "failures": [],
+                "triaged": [], "notice": "",
+            },
+        ) as mock_run_tests, mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+        assert rc == 1
         mock_run_tests.assert_not_called()
-        assert "TEST-SKILL GREEN RUN" not in prompts["parent"]
-        assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
+        err = capsys.readouterr().err
+        assert "Audit blocked" in err
+        assert "--run-tests" in err  # the message names the explicit opt-outs
 
     def test_green_cache_skips_test_skill_invocation(self):
         """AC1: a green cached run short-circuits the invocation entirely."""

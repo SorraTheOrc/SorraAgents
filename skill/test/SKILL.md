@@ -10,6 +10,14 @@ Deterministic loop for verifying "the full project test suite passes" before
 marking any work item `in_review`. Every failing test is fixed, removed (if
 useless), or escalated with a clear justification.
 
+**Part of the contract:** every run is cached per-repo (git state + 2h TTL) and
+consumed read-only by the audit skill to auto-verify execution-dependent ACs —
+the pre-`in_review` suite pass MUST therefore go through this skill. An ad-hoc
+`npx vitest run`/`pytest` at the same commit does not populate the cache, and the
+audit's pre-flight cache gate then blocks the audit outright (non-zero exit, no
+report) until the suite is re-run through this skill at the commit or the
+operator attests with `--green-run HEAD`.
+
 Inputs
 ------
 

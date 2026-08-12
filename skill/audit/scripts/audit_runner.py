@@ -90,6 +90,7 @@ from skill.test.scripts.run_tests import (
     full_suite_commands,
     parse_node_failures,
     parse_pytest_failures,
+    pytest_command,
 )
 from skill.test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
 
@@ -1394,52 +1395,166 @@ def _auto_green_run_prompt_block(sha: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Full-suite cache classification (shared by the automatic verification path
+# and the pre-flight gate, SA-0MSQ72BVV0011SRU)
+# ---------------------------------------------------------------------------
+
+# Classification statuses returned by _classify_full_suite_cache.
+_FULL_SUITE_CACHE_GREEN = "green"
+_FULL_SUITE_CACHE_MISS = "miss"
+_FULL_SUITE_CACHE_RED = "red"
+_FULL_SUITE_CACHE_ERROR = "error"
+
+# pytest config markers, mirroring implement.py's _has_pytest_markers so the
+# audit and the implement/test skills agree on whether a repo has a pytest
+# suite (SA-0MSQ72BVV0011SRU AC3).
+_PYTEST_CONFIG_MARKERS = (
+    ("pyproject.toml", "[tool.pytest.ini_options]"),
+    ("setup.cfg", "[tool:pytest]"),
+    ("tox.ini", "[pytest]"),
+)
+
+
+def _repo_has_pytest_suite(project_root: Path) -> bool:
+    """Whether *project_root* declares a runnable pytest suite.
+
+    True when the repo carries a pytest config marker (pytest.ini, or the
+    pytest section of pyproject.toml / setup.cfg / tox.ini) or pytest-style
+    test files (``tests/``/``test/`` dirs containing ``*.py``, or root-level
+    ``test_*.py`` / ``*_test.py``). Importability is deliberately NOT probed:
+    the audit process runs from the framework interpreter which always
+    provides pytest, so the presence of markers or test files is the
+    discriminator that decides whether the pytest suite command applies to
+    this repo.
+
+    Mirrors implement.py's pytest-suite detection so a repo the implement
+    skill treats as having no pytest suite is never falsely gated on a
+    phantom pytest cache miss (AC3).
+    """
+    if (project_root / "pytest.ini").is_file():
+        return True
+    for name, marker in _PYTEST_CONFIG_MARKERS:
+        path = project_root / name
+        if not path.is_file():
+            continue
+        try:
+            if marker in path.read_text(encoding="utf-8"):
+                return True
+        except OSError:
+            continue
+    for dirname in ("tests", "test"):
+        test_dir = project_root / dirname
+        if test_dir.is_dir() and any(test_dir.rglob("*.py")):
+            return True
+    return bool(
+        any(project_root.glob("test_*.py")) or any(project_root.glob("*_test.py"))
+    )
+
+
+def _effective_suite_commands(project_root: Path) -> list[str]:
+    """The full-suite command set that actually applies to *project_root*.
+
+    ``full_suite_commands`` is already node-dir-aware: node suite commands
+    are emitted only for ``tests/node``, ``tests/cli`` and ``tests/unit``
+    dirs that exist in the repo (SA-0MSJELL44009XYIL). The pytest command is
+    additionally dropped when the repo does not declare a pytest suite
+    (SA-0MSQ72BVV0011SRU AC3) — a phantom pytest command would otherwise
+    produce a permanent cache miss that falsely blocks audits of no-pytest
+    repos (e.g. a docs-only repo) even after the real suites ran green.
+    """
+    commands = full_suite_commands(project_root)
+    if _repo_has_pytest_suite(project_root):
+        return commands
+    pytest_cmd = pytest_command()
+    return [c for c in commands if c != pytest_cmd]
+
+
+def _classify_full_suite_cache(
+    runner: Runner,
+    cwd: str | Path | None = None,
+    commands: list[str] | None = None,
+) -> tuple[str, str | None, list[str]]:
+    """Classify the read-only full-suite cache state at *cwd*.
+
+    Queries the per-repo test cache (``query_cached``) for each command in
+    the canonical full-suite set at *cwd* (default ``TARGET_PROJECT_ROOT``)
+    — never executing anything, so the audit's read-only mandate is preserved
+    unconditionally (SA-0MSIU5HFI0024D7W). *commands* overrides the set
+    (the pre-flight gate passes ``_effective_suite_commands``); the default
+    is ``full_suite_commands`` — already node-dir-aware
+    (SA-0MSJELL44009XYIL), so a repo without tests/node is never asked
+    about a phantom tests/node command.
+
+    Returns ``(status, head_sha, problems)``:
+
+    - ``"green"`` — EVERY command has a cached entry at the audited git
+      state within the cache TTL AND every entry's exit code is 0
+      (``head_sha`` set, ``problems`` empty).
+    - ``"miss"``  — at least one command has NO cached entry at HEAD
+      (``head_sha`` set; ``problems`` name the missing commands). This is
+      the state the pre-flight gate blocks on.
+    - ``"red"``   — every command is cached but at least one entry exited
+      non-zero (``head_sha`` set; ``problems`` name the failing commands).
+      Keeps the historical partial + diagnostic behavior — NOT a gate state.
+    - ``"error"`` — HEAD could not be resolved (``head_sha`` None). A cache
+      query exception propagates to the caller, which decides fail-closed
+      (``_resolve_auto_green_run``) vs fail-open (the pre-flight gate).
+    """
+    head_sha = _resolve_audited_head(runner)
+    if head_sha is None:
+        return _FULL_SUITE_CACHE_ERROR, None, []
+
+    project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
+    if commands is None:
+        commands = full_suite_commands(project_root)
+    problems: list[str] = []
+    for command in commands:
+        entry = query_cached(
+            command, cwd=str(project_root), ttl=DEFAULT_TTL_SECONDS,
+        )
+        if entry is None:
+            problems.append(
+                f"no cached full-suite run for '{command}' at HEAD {head_sha}"
+            )
+        elif int(entry.get("exit_code", -1)) != 0:
+            problems.append(
+                f"cached full-suite run for '{command}' exited non-zero "
+                f"({int(entry.get('exit_code'))})"
+            )
+    if not problems:
+        return _FULL_SUITE_CACHE_GREEN, head_sha, []
+    if any(p.startswith("no cached full-suite run") for p in problems):
+        return _FULL_SUITE_CACHE_MISS, head_sha, problems
+    return _FULL_SUITE_CACHE_RED, head_sha, problems
+
+
 def _resolve_auto_green_run(
     runner: Runner,
     cwd: str | Path | None = None,
 ) -> tuple[str | None, str | None]:
     """Resolve an automatically-verified green full-suite run, read-only.
 
-    Queries the per-repo test cache (``query_cached``) for each command in the
-    canonical full-suite set at *cwd* (default ``TARGET_PROJECT_ROOT``). The
-    query never executes anything, so the audit's read-only mandate is
-    preserved unconditionally (SA-0MSIU5HFI0024D7W).
+    Delegates the cache query to :func:`_classify_full_suite_cache` (the
+    single source of truth shared with the pre-flight gate) and maps the
+    classification onto the historical contract:
 
-    Suite commands only cover dirs that exist in the target repo
-    (SA-0MSJELL44009XYIL), so a repo without tests/node is never asked about
-    a phantom tests/node command.
-
-    Returns ``(prompt_block, head_sha)`` when EVERY suite command has a cached
-    entry at the audited git state within the cache TTL AND every entry's exit
-    code is 0. Otherwise prints a clear diagnostic to stderr — distinguishing
-    a cache miss ('run /skill:test once to populate the cache') from a
-    non-zero cached run ('suite is red; fix or attest with --green-run HEAD')
-    — and returns ``(None, None)``, fail-closed: no evidence, the audit
-    completes normally, and execution-dependent ACs stay partial.
+    Returns ``(prompt_block, head_sha)`` when the cache is GREEN (every
+    suite command has a cached entry at the audited git state within the
+    cache TTL AND every entry's exit code is 0). Otherwise prints a clear
+    diagnostic to stderr — distinguishing a cache miss ('run /skill:test
+    once to populate the cache') from a non-zero cached run ('suite is red;
+    fix or attest with --green-run HEAD') — and returns ``(None, None)``,
+    fail-closed: no evidence, the audit completes normally, and
+    execution-dependent ACs stay partial.
     """
     try:
-        head_sha = _resolve_audited_head(runner)
+        status, head_sha, problems = _classify_full_suite_cache(runner, cwd=cwd)
+        if status == _FULL_SUITE_CACHE_GREEN and head_sha is not None:
+            return _auto_green_run_prompt_block(head_sha), head_sha
         if head_sha is None:
             return None, None
-
-        project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
-        commands = full_suite_commands(project_root)
-        problems: list[str] = []
-        for command in commands:
-            entry = query_cached(
-                command, cwd=str(project_root), ttl=DEFAULT_TTL_SECONDS,
-            )
-            if entry is None:
-                problems.append(
-                    f"no cached full-suite run for '{command}' at HEAD {head_sha}"
-                )
-            elif int(entry.get("exit_code", -1)) != 0:
-                problems.append(
-                    f"cached full-suite run for '{command}' exited non-zero "
-                    f"({int(entry.get('exit_code'))})"
-                )
-        if not problems:
-            return _auto_green_run_prompt_block(head_sha), head_sha
+        commands = full_suite_commands(Path(cwd or TARGET_PROJECT_ROOT).resolve())
         print(
             "Automatic full-suite verification unavailable: "
             f"{len(problems)} of {len(commands)} suite command(s) not "
@@ -1457,6 +1572,56 @@ def _resolve_auto_green_run(
             file=sys.stderr,
         )
     return None, None
+
+
+def _preflight_cache_gate(
+    runner: Runner,
+    cwd: str | Path | None = None,
+) -> str | None:
+    """Return an actionable blocking message when the full-suite cache is MISSING at HEAD.
+
+    The pre-flight gate (SA-0MSQ72BVV0011SRU): turns the cache-miss
+    *diagnostic* into an *early exit* so the audit can never ship a report
+    with degraded 'met' verdicts on execution-dependent ACs when no
+    full-suite evidence exists and the caller did not explicitly opt out
+    (``--run-tests`` executes the suite; ``--green-run`` attests it).
+
+    Fires ONLY on a cache **miss** — at least one command in the repo's
+    effective suite set has no cached run at HEAD. It is repo-aware: the
+    pytest command is not required for repos without a pytest suite
+    (``_effective_suite_commands``, AC3), so a docs-only or vitest-only repo
+    is never falsely blocked. A **red** cached run keeps the historical
+    partial + diagnostic behavior (evidence exists that the suite ran; it
+    just failed), a **green** cache proceeds, and cache errors fail open
+    (an infra hiccup must not block an audit that today proceeds partial).
+
+    Returns the message for the caller to print (and exit non-zero with),
+    or None to proceed.
+    """
+    project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
+    try:
+        status, head_sha, problems = _classify_full_suite_cache(
+            runner, cwd=str(project_root),
+            commands=_effective_suite_commands(project_root),
+        )
+    except Exception:  # noqa: BLE001 -- fail-open: infra hiccups never block
+        return None
+    if status != _FULL_SUITE_CACHE_MISS:
+        return None
+    missing = [p for p in problems if p.startswith("no cached full-suite run")]
+    detail = "; ".join(missing) if missing else "; ".join(problems)
+    return (
+        "Audit blocked: no green full-suite run is cached at HEAD "
+        f"{head_sha or 'unknown'} (full-suite cache miss: {detail}). The "
+        "audit cannot verify execution-dependent acceptance criteria "
+        "without evidence, so it will NOT produce a report or persist an "
+        "audit — degraded 'met' verdicts are not allowed. Run the full "
+        "suite once at this commit (/skill:test or run_tests.py --force) to "
+        "populate the test cache, then re-audit — or explicitly opt out "
+        "with --run-tests (executes the suite and populates the cache) or "
+        "--green-run HEAD (operator attestation). The pre-audit work-item "
+        "status/stage were left untouched."
+    )
 
 
 def _test_skill_run_prompt_block(sha: str) -> str:
@@ -5093,6 +5258,33 @@ def cmd_issue(issue_id: str, persist: bool = True,
             print("Skipping: audit still fresh")
             print(fresh_report)
             return 0
+
+    # ------------------------------------------------------------------
+    # Pre-flight full-suite cache gate (SA-0MSQ72BVV0011SRU): a MISSING
+    # full-suite cache at HEAD (no green cached run via query_cached) with
+    # no explicit opt-out (--run-tests executes the suite; --green-run
+    # attests it) blocks the audit BEFORE any Phase 1 pi call, report, or
+    # persistence — and before the status lifecycle, so pre-audit
+    # status/stage are preserved. Without the gate a cache miss degraded to
+    # a diagnostic and the run continued, letting the Phase 2 model mark
+    # execution-dependent ACs 'met' from implementer-reported evidence with
+    # no forcing function to populate the cache (the degraded-verdict bug
+    # this gate fixes). A red cached run and cache errors keep the
+    # historical partial + diagnostic behavior (fail-open); only a miss
+    # exits non-zero, and only for repos whose effective suite set actually
+    # requires the suite (no-pytest repos are never falsely blocked, AC3).
+    # ------------------------------------------------------------------
+    if (green_run_sha is None and auto_green_run_sha is None
+            and test_skill_run_sha is None and not run_tests):
+        gate_message = _preflight_cache_gate(
+            runner, cwd=str(TARGET_PROJECT_ROOT),
+        )
+        if gate_message is not None:
+            if json_mode:
+                print(json.dumps({"error": gate_message}, indent=2))
+            else:
+                print(f"Error: {gate_message}", file=sys.stderr)
+            return 1
 
     # Track script execution failures for prominent surfacing
     script_failure: dict | None = None
