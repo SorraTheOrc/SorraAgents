@@ -20,7 +20,7 @@ If you already have a current work-item id, continue using it; otherwise ask the
 1. **Claim** — `wl update <id> --status in_progress --assignee <agent>`.
 2. **Define** — `wl show <id> --children --json`; verify clear goal + testable ACs; advance stage `intake_complete`.
 3. **Plan** — break into sub-tasks; `wl create --parent <id> --issue-type <type> --priority <level> --json`; advance stage `plan_complete`.
-4. **Decide** — `wl next --json`; recurse into children until reaching a leaf item; if none remain, go to End session.
+4. **Decide** — `wl next --json`; recurse into children until reaching a leaf item; if none remain, go to End session. (`/skill:implement <parent>` recurses automatically.)
 5. **Implement** — see [Implement the work-item](#implement-the-work-item) below.
 6. **Update** — close with `<WIP-id>: <summary>`.
 

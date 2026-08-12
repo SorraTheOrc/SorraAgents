@@ -198,13 +198,42 @@ See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
 
 - Open/in_progress blockers or dependencies → implement them first (recursively via this procedure).
 
-5.1. Parent-advancement check (epic/parent items only)
+5.1. Parent recursion (epic/parent items only)
 
-Check children via `wl show <work-item-id> --children --json`: all terminal
-(`in_review`/`completed`/`done`) → advance parent
-(`StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`);
-any not terminal → set open + comment "Not all children are in a terminal
-stage. Needs producer review." + return control.
+A parent invocation recurses into its children automatically. Run:
+
+```bash
+python3 scripts/implement.py parent <parent-id>
+```
+
+(`implement.py parent` — orchestrated by `phase_parent()`):
+
+- **No children** → behaves like a leaf: use the standard `start`/`finish`
+  workflow unchanged.
+- **All children terminal** (`in_review`/`completed`/`done`) → the parent is
+  advanced to `completed`/`in_review` (existing Step 5.1 advancement
+  retained) and a per-child summary (ids, statuses) is commented.
+- **Children remain** → the next child is claimed (`in_progress`), its own
+  worktree is created from `dev`, and the worktree path is reported.
+
+Then implement that child by recursing into this procedure (steps 1–8),
+run `implement.py finish <child-id>`, and re-run
+`implement.py parent <parent-id>` for the next child. Repeat until the
+parent reports all children terminal. Each child is implemented in its own
+worktree (never the main checkout); sequential children reuse/rotate the
+`.worklog/worktrees` machinery.
+
+Guards (deterministic, in `phase_parent`):
+
+- **Dependency order** — a child `blocked` by another item is implemented
+  only after its blockers; the chain is resolved dependency-order correct.
+- **Terminal children are never re-implemented** (skipped, reported).
+- **In-progress by another agent** → skipped and reported, never clobbered.
+- **Cycles fail fast** with a clear error (no infinite recursion).
+- **Abort/failure** in a child resets THAT child to `open` (StatusLifecycle
+  abort semantics) and stops the chain with a report of what completed and
+  what failed; already-completed siblings are not regressed.
+- A parent with no children or all-terminal children behaves as today.
 
 - Write tests and code to meet ACs:
   - **Write tests first** (TDD preferred) — at least one test file before

@@ -9,6 +9,7 @@ Usage:
   implement.py start <work-item-id>          # Phase 1: setup
   implement.py finish <work-item-id>         # Phase 2: build, test, commit, push, cleanup
   implement.py abort <work-item-id>          # Abort and cleanup
+  implement.py parent <parent-id>            # Recurse into children (epic/parent items)
 
 Optional flags:
   --json                    JSON output for agents
@@ -307,6 +308,39 @@ def wl_show(work_item_id: str) -> dict[str, Any]:
         return {}
 
 
+def wl_show_children(work_item_id: str) -> list[dict[str, Any]]:
+    """Fetch a work item's children as a list of dicts.
+
+    Uses ``wl show <id> --children --json`` and returns the ``children``
+    array (empty when the item has no children or the fetch fails).
+
+    Args:
+        work_item_id: The parent work item ID.
+
+    Returns:
+        List of child work-item dicts (may be empty).
+    """
+    cmd = ["wl", "show", work_item_id, "--children", "--json"]
+    cmd[1:1] = worklog_dir_flag()
+    result = run_cmd(cmd, check=False)
+    if result.returncode != 0:
+        LOG.error(
+            "Failed to fetch children of %s: %s",
+            work_item_id,
+            result.stderr.strip(),
+        )
+        return []
+    try:
+        data = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, ValueError) as exc:
+        LOG.error("Invalid JSON from wl show --children: %s", exc)
+        return []
+    if not isinstance(data, dict):
+        return []
+    children = data.get("children")
+    return children if isinstance(children, list) else []
+
+
 def wl_add_comment(work_item_id: str, comment: str) -> bool:
     """Add a comment to a work item.
 
@@ -351,6 +385,72 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
         LOG.info("Safety reset: %s status in-progress -> open", work_item_id)
     else:
         LOG.info("Safety reset skipped: %s status is %r", work_item_id, current)
+
+
+# ---------------------------------------------------------------------------
+# Parent-recursion helpers
+# ---------------------------------------------------------------------------
+
+TERMINAL_STATUSES = {"in_review", "completed", "done"}
+
+
+def _is_terminal_status(status: str) -> bool:
+    """Whether a work-item status is terminal for parent advancement.
+
+    A terminal child is never re-implemented and counts toward parent
+    advancement (AC-4). ``in_review``/``completed``/``done`` are terminal;
+    ``open``/``blocked``/``in_progress`` are not.
+
+    Args:
+        status: The work-item status string.
+
+    Returns:
+        True if the status is terminal.
+    """
+    return status in TERMINAL_STATUSES
+
+
+def _classify_child(child: dict[str, Any]) -> str:
+    """Classify a child for the parent-recursion plan.
+
+    Returns one of:
+      - ``"skip-terminal"`` — already in a terminal state; never re-implemented.
+      - ``"skip-in-progress"`` — claimed by another agent; reported, not clobbered.
+      - ``"implement"`` — the standard workflow should run on this child.
+
+    Args:
+        child: A child work-item dict from ``wl show --children``.
+
+    Returns:
+        The classification string.
+    """
+    status = str(child.get("status", ""))
+    if _is_terminal_status(status):
+        return "skip-terminal"
+    if status in ("in-progress", "in_progress"):
+        return "skip-in-progress"
+    return "implement"
+
+
+def _next_child_to_implement(children: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the next child to run through the standard implement workflow.
+
+    Children already terminal or in progress elsewhere are skipped
+    (AC-4/AC-7). V1 uses the order returned by ``wl show --children``;
+    V2 (SA-0MSQIJBTB008RHS1) replaces this with dependency-graph order so a
+    blocked child is implemented only after its blockers.
+
+    Args:
+        children: List of child work-item dicts.
+
+    Returns:
+        The next child dict, or None when every child is terminal or in
+        progress elsewhere (nothing left to start).
+    """
+    for child in children:
+        if _classify_child(child) == "implement":
+            return child
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -2016,6 +2116,237 @@ def phase_abort(
     return report
 
 
+def phase_parent(
+    work_item_id: str,
+    json_output: bool = False,
+    no_refactor: bool = False,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Phase: implement a parent work item by recursing into its children.
+
+    Invoking the implement skill on a parent/epic item must automatically
+    implement the children (and their blockers) in dependency order instead
+    of dead-ending at the old Step 5.1 gate (SA-0MSQBM2FK005NW1T). Each
+    invocation of this phase advances the chain by one child:
+
+    1. Fetch the parent and its children (``wl show --children``).
+    2. No children → behave like a leaf (no status change; use start/finish).
+    3. Classify children: terminal → skip; in_progress elsewhere → skip+report;
+       otherwise → implementable.
+    4. All children terminal → advance the parent to ``completed``/``in_review``
+       (existing Step 5.1 advancement retained) and comment a per-child summary.
+    5. Otherwise → start the next child (claim + worktree via ``phase_start``)
+       and report the worktree path; the caller implements that child with the
+       standard workflow (``implement.py finish <child>``), then re-invokes
+       this phase for the next child.
+
+    Worktree isolation is preserved per child: every child is implemented in
+    its own worktree created by ``phase_start`` (never the main checkout);
+    sequential children reuse/rotate the same ``.worklog/worktrees``
+    machinery. No worktree is created for the parent itself.
+
+    Args:
+        work_item_id: The parent work item ID.
+        json_output: If True, output JSON.
+        no_refactor: If True, skip the refactor step for started children.
+        parent_branch: Parent branch for child worktrees.
+        verbose: Enable verbose logging.
+
+    Returns:
+        Dict with the recursion plan: per-child classifications, the next
+        child started (with its worktree), or parent advancement when all
+        children are terminal.
+    """
+    report: dict[str, Any] = {
+        "phase": "parent",
+        "work_item_id": work_item_id,
+        "success": True,
+        "children": [],
+        "message": "",
+    }
+
+    # ── Step 1: Validate work item ID ──────────────────────────────
+    if not WORK_ITEM_ID_PATTERN.match(work_item_id):
+        msg = f"Invalid work item ID format: {work_item_id}. Expected pattern like SA-XXXXXXXXXXX"
+        report["success"] = False
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            LOG.error(msg)
+        return report
+
+    # ── Step 2: Code Freeze gate (before claiming/starting children) ──
+    if is_code_freeze_active():
+        msg = (
+            "Project is in Code Freeze — implementation blocked until the "
+            "release completes."
+        )
+        LOG.error(msg)
+        report["success"] = False
+        report["message"] = msg
+        report["code_freeze"] = True
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {msg}\n")
+        return report
+
+    # ── Step 3: Fetch parent + children ────────────────────────────
+    parent = wl_show(work_item_id)
+    if not parent:
+        msg = f"Work item {work_item_id} not found or failed to fetch"
+        report["success"] = False
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            LOG.error(msg)
+        return report
+    children = wl_show_children(work_item_id)
+
+    # ── Step 4: No children → behave like a leaf ───────────────────
+    if not children:
+        report["leaf"] = True
+        report["message"] = (
+            f"Work item {work_item_id} has no children — behave as a leaf "
+            "item: use `implement.py start/finish` as usual (no recursion)."
+        )
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print()
+            print("=" * 60)
+            print(f"  Parent: {work_item_id} — no children (leaf)")
+            print("=" * 60)
+            print(f"  {report['message']}")
+            print()
+        return report
+
+    # ── Step 5: Classify children ──────────────────────────────────
+    classifications: list[dict[str, Any]] = []
+    for child in children:
+        classifications.append({
+            "id": child.get("id", ""),
+            "title": child.get("title", ""),
+            "status": child.get("status", ""),
+            "action": _classify_child(child),
+        })
+    report["children"] = classifications
+
+    # ── Step 6: All children terminal → advance the parent ─────────
+    if all(c["action"] == "skip-terminal" for c in classifications):
+        try:
+            StatusLifecycle.update_status(
+                work_item_id, "completed", stage="in_review"
+            )
+        except RuntimeError:
+            msg = f"Failed to advance parent {work_item_id}"
+            report["success"] = False
+            report["message"] = msg
+            if json_output:
+                print(format_json_output(report))
+            else:
+                LOG.error(msg)
+            return report
+        summary = "\n".join(
+            f"- {c['id']} ({c['status']})" for c in classifications
+        )
+        wl_add_comment(
+            work_item_id,
+            f"All children are in a terminal stage. Parent advanced to "
+            f"in_review.\n{summary}",
+        )
+        report["parent_advanced"] = True
+        report["message"] = (
+            f"All children of {work_item_id} are terminal; parent advanced "
+            f"to completed/in_review."
+        )
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print()
+            print("=" * 60)
+            print(f"  ✅ Parent advanced: {work_item_id} → in_review")
+            print("=" * 60)
+            print(summary)
+            print()
+        return report
+
+    # ── Step 7: Start the next child (claim + worktree) ────────────
+    next_child = _next_child_to_implement(children)
+    if next_child is None:
+        # Every non-terminal child is in progress elsewhere — report, do not clobber.
+        report["message"] = (
+            f"No child of {work_item_id} is available to start: every "
+            f"non-terminal child is in progress by another agent. "
+            f"Re-run this phase after one completes."
+        )
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print()
+            print("=" * 60)
+            print(f"  ⏳ {report['message']}")
+            print("=" * 60)
+            print()
+        return report
+
+    next_id = next_child.get("id", "")
+    LOG.info("Starting next child %s of parent %s...", next_id, work_item_id)
+    start_result = phase_start(
+        next_id,
+        json_output=False,
+        no_refactor=no_refactor,
+        parent_branch=parent_branch,
+        verbose=verbose,
+    )
+    if not start_result.get("success"):
+        msg = (
+            f"Failed to start child {next_id}: "
+            f"{start_result.get('message', 'unknown error')}"
+        )
+        LOG.error(msg)
+        report["success"] = False
+        report["next_child"] = next_id
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {msg}\n")
+        return report
+
+    report["next_child"] = next_id
+    report["worktree_path"] = start_result.get("worktree_path", "")
+    report["branch"] = start_result.get("branch", "")
+    report["message"] = (
+        f"Started child {next_id}. Implement it in "
+        f"{start_result.get('worktree_path', '')}, then run "
+        f"`implement.py finish {next_id}`, then re-run "
+        f"`implement.py parent {work_item_id}` for the next child."
+    )
+
+    if json_output:
+        print(format_json_output(report))
+    else:
+        print()
+        print("=" * 60)
+        print(f"  Implement child: {next_id} (of {work_item_id})")
+        print("=" * 60)
+        print(f"  Worktree: {report['worktree_path']}")
+        print(f"  Branch:   {report['branch']}")
+        print()
+        print("  Next steps:")
+        print(f"  1. cd {report['worktree_path']}")
+        print("  2. Write tests and implementation code")
+        print(f"  3. Run: python3 scripts/implement.py finish {next_id}")
+        print(f"  4. Re-run: python3 scripts/implement.py parent {work_item_id}")
+        print()
+
+    return report
+
+
 def _is_worktree(path: Path) -> bool:
     """Check if *path* is a git worktree (not the main working tree).
 
@@ -2188,7 +2519,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "action",
-        choices=["start", "finish", "abort"],
+        choices=["start", "finish", "abort", "parent"],
         help="Workflow phase to execute",
     )
     parser.add_argument(
@@ -2298,6 +2629,14 @@ def _main(argv: list[str] | None = None) -> int:
         result = phase_abort(
             work_item_id=args.work_item_id,
             json_output=args.json,
+            verbose=args.verbose,
+        )
+    elif args.action == "parent":
+        result = phase_parent(
+            work_item_id=args.work_item_id,
+            json_output=args.json,
+            no_refactor=args.no_refactor,
+            parent_branch=args.parent_branch,
             verbose=args.verbose,
         )
     else:
