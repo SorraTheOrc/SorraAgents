@@ -54,6 +54,7 @@ Public helpers: :func:`resolve_worklog_dir` (resolve a store for an id),
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
@@ -187,10 +188,24 @@ def _find_worklog_dir_by_prefix(prefix: str) -> Path | None:
     first ``.worklog`` directory whose ``prefix:`` value equals *prefix*.
     Returns ``None`` when no sibling project matches (or the scan is not
     possible, e.g. SIBLING_SCAN_ROOT does not exist).
+
+    The scan is memoized (SA-0MSL1YX24000V2MG): the prefix→dir mapping is
+    static within a process, and the audit runner resolves this per ``wl``
+    command (dozens per multi-child audit). The cache key includes the scan
+    root so tests that patch ``SIBLING_SCAN_ROOT`` remain isolated.
     """
-    projects_root = SIBLING_SCAN_ROOT
+    return _find_worklog_dir_by_prefix_cached(SIBLING_SCAN_ROOT, prefix)
+
+
+@functools.lru_cache(maxsize=None)
+def _find_worklog_dir_by_prefix_cached(scan_root: Path, prefix: str) -> Path | None:
+    """Memoized core of :func:`_find_worklog_dir_by_prefix`.
+
+    Keyed on ``(scan_root, prefix)`` — the scan root is included so callers
+    that swap ``SIBLING_SCAN_ROOT`` (tests) never observe stale results.
+    """
     try:
-        configs = sorted(projects_root.glob("*/.worklog/config.yaml"))
+        configs = sorted(scan_root.glob("*/.worklog/config.yaml"))
     except OSError:
         return None
     for config in configs:
