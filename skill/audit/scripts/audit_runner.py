@@ -597,6 +597,186 @@ non-project cwd (SA-0MSG48MEI0083K82).
 
 
 # ---------------------------------------------------------------------------
+# Launch-context guard (LP-0MSQ32HNR007AI6B)
+# ---------------------------------------------------------------------------
+
+
+class AuditScopeError(Exception):
+    """Raised when an audit resolves a wrong project/file scope.
+
+    Distinct from genuine audit failures: a scope error means the launch
+    context (cwd-derived project root, or the Phase 2 FILE SCOPE manifest)
+    does not own the audited work item — the run must abort loudly instead
+    of producing a misleading all-unmet report (incident: an audit of
+    LP-0MSORQVK50012Q4D launched from the SorraAgents cwd ran Phase 2
+    against the audit skill's own tree and wasted ~124 min of model time).
+    """
+
+
+def _resolve_owning_project_root(issue_id: str,
+                                 worklog_dir: str | None = None) -> Path | None:
+    """Resolve the project root expected to own *issue_id*.
+
+    Precedence mirrors the shared wl worklog resolution (explicit dir >
+    prefix-to-sibling scan): an explicit ``--worklog-dir`` overrides auto
+    resolution (its parent is the expected project root); otherwise the
+    item's id prefix is matched against sibling projects' ``.worklog``
+    configs. Returns ``None`` when ownership cannot be determined — callers
+    fail open rather than block (unknown prefix / no sibling match).
+    """
+    if worklog_dir:
+        return Path(worklog_dir).resolve().parent
+    prefix = _extract_work_item_prefix_shared([issue_id])
+    if not prefix:
+        return None
+    wl_dir = _find_worklog_dir_by_prefix(prefix)
+    if wl_dir is None:
+        return None
+    return wl_dir.parent
+
+
+def _same_git_repository(root_a: Path, root_b: Path) -> bool:
+    """True when *root_a* and *root_b* are checkouts of the same git repo.
+
+    Compares resolved ``git rev-parse --git-common-dir`` outputs so a
+    worktree of the owning project (e.g. ``<owning>/.worklog/worktrees/``)
+    counts as the owning project. Returns False on any git failure — callers
+    fall back to direct path comparison.
+    """
+    try:
+        def _common_dir(root: Path) -> str | None:
+            proc = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "--git-common-dir"],
+                capture_output=True, text=True, check=False, timeout=30,
+            )
+            if proc.returncode != 0 or not proc.stdout.strip():
+                return None
+            return str((root / proc.stdout.strip()).resolve())
+        a = _common_dir(root_a)
+        b = _common_dir(root_b)
+        return a is not None and a == b
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _verify_launch_context(issue_id: str,
+                           worklog_dir: str | None = None) -> str | None:
+    """Return a fatal error message when the launch context does not own *issue_id*.
+
+    The launch context is the cwd-derived ``TARGET_PROJECT_ROOT`` — the
+    repository that Phase 1/2 would target. The owning project is resolved
+    from the worklog (explicit ``--worklog-dir`` parent, else
+    prefix-to-sibling scan). A mismatch (e.g. an LP item audited from the
+    SorraAgents checkout) means the run would scope its FILE SCOPE manifest
+    to the wrong repository and emit misleading 'unmet' verdicts — fail
+    fast with zero pi calls.
+
+    Returns ``None`` when the context is correct (or ownership cannot be
+    determined — fail open).
+    """
+    owning_root = _resolve_owning_project_root(issue_id, worklog_dir=worklog_dir)
+    if owning_root is None:
+        return None
+    launch_root = TARGET_PROJECT_ROOT.resolve()
+    if launch_root == owning_root.resolve():
+        return None
+    if _same_git_repository(launch_root, owning_root):
+        # A worktree of the owning project is a legitimate same-repo launch.
+        return None
+    # Fallback when git is unavailable (e.g. a mocked subprocess in tests):
+    # the implement-worktree convention places worktrees under
+    # <owning>/.worklog/worktrees/ — same repository as the owning project.
+    if (owning_root / ".worklog" / "worktrees") in launch_root.parents:
+        return None
+    return (
+        f"Audit launch-context error: work item {issue_id} is owned by "
+        f"project {owning_root} (resolved from the worklog prefix scan), "
+        f"but this run was launched from project {launch_root}. The audit "
+        f"would target the wrong repository and waste model time. Re-launch "
+        f"from {owning_root} — the project that owns the item. Note: "
+        f"--worklog-dir does not change the project scope; only the launch "
+        f"directory does."
+    )
+
+
+def _project_top_levels(project_root: Path) -> list[str]:
+    """Return the tracked top-level paths of *project_root* (git ls-files).
+
+    Falls back to a directory listing when git is unavailable. Returns an
+    empty list on any failure (callers fail open). Dot-entries are excluded
+    (they are never manifest markers).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(project_root), "ls-files"],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            tops: set[str] = set()
+            for ln in proc.stdout.splitlines():
+                rel = ln.strip()
+                if not rel:
+                    continue
+                top = rel.split("/", 1)[0] if "/" in rel else rel
+                if not top.startswith("."):
+                    tops.add(top)
+            return sorted(tops)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        return sorted(
+            e.name for e in project_root.iterdir()
+            if not e.name.startswith(".")
+        )
+    except OSError:
+        return []
+
+
+def _distinctive_project_top_levels(owning_root: Path) -> list[str]:
+    """Return *owning_root*'s top-level entries not shared with the framework.
+
+    The framework repo (``REPO_ROOT``) ships the audit skill; its top-level
+    layout (skill/, tests/, docs/, scripts/, ...) can appear in a manifest
+    built from the audit skill's own tree. Distinctive entries are markers
+    that prove the manifest was built from the item's repository. An empty
+    list means the owning project IS the framework repo (mono-repo) or has
+    no verifiable marker — callers fail open.
+    """
+    owning_tops = set(_project_top_levels(owning_root))
+    framework_tops = set(_project_top_levels(REPO_ROOT))
+    return sorted(owning_tops - framework_tops)
+
+
+def _validate_file_scope_manifest(file_scope: str,
+                                  owning_root: Path | None) -> str | None:
+    """Validate the FILE SCOPE manifest covers the work item's repository.
+
+    Returns an error message when the manifest does NOT reference the owning
+    project's files (e.g. it was built from the audit skill's own tree after
+    a mis-scoped launch), or ``None`` when valid / unverifiable (fail-open).
+
+    The check is inclusion-based (per the risk mitigation): at least one
+    distinctive top-level entry of the item repo must appear in the manifest
+    — the manifest need not equal the item repo, so mono-repo items whose
+    files legitimately live in the framework tree stay valid.
+    """
+    if owning_root is None:
+        return None
+    distinctive = _distinctive_project_top_levels(owning_root)
+    if not distinctive:
+        return None  # nothing distinctive to verify against — fail open
+    manifest_lower = file_scope.lower()
+    if any(entry.lower() in manifest_lower for entry in distinctive):
+        return None
+    return (
+        f"Audit scope error: the Phase 2 FILE SCOPE manifest does not contain "
+        f"the work item repository files (owning project: {owning_root}). The "
+        f"resolved scope is the audit skill's own tree or another repository; "
+        f"re-launch the audit from {owning_root} and re-run."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Freshness gate
 # ---------------------------------------------------------------------------
 
@@ -2712,7 +2892,12 @@ def _persist_child_audit(
     *worklog_dir* is forwarded to ``persist_audit`` so the wl invocation
     targets the correct worklog store regardless of the caller's cwd.
 
-    Returns (success, report_text).
+    Returns (rc, report_text).
+    rc == 0 on success; rc == PERSIST_CONTENT_INVALID (4) when only the
+    compact fallback notice was persisted (usable, identity/readback guards
+    pass); any other non-zero rc means NOTHING was persisted — callers abort
+    the parent run rather than emit a misleading parent report whose child
+    audits never landed (LP-0MSQ32HNR007AI6B).
     On failure the report text is still returned so callers can log it.
     """
     child = {
@@ -2724,8 +2909,7 @@ def _persist_child_audit(
     report = _assemble_child_audit_report(child, ac_results, model=model, model_source=model_source)
 
     rc = persist_audit(child_id, report, worklog_dir=worklog_dir)
-    success = rc == 0
-    return success, report
+    return rc, report
 
 
 def _assemble_project_report(summary: str, recommendation: str) -> str:
@@ -3820,6 +4004,7 @@ def _run_phase2_deep_analysis(
     ac_fallback_used: threading.Event | None = None,
     green_run_block: str | None = None,
     skip_parent_deep: bool = False,
+    owning_root: Path | None = None,
 ) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
@@ -3843,6 +4028,13 @@ def _run_phase2_deep_analysis(
     FIRST (parent-only), then passes the already-deep-verified parent
     ``ac_results`` back in with the gap-mapped children so the parent call is
     not duplicated.
+
+    *owning_root* is the project root that owns the audited item (resolved
+    by the launch-context guard); when omitted it is re-resolved from the
+    issue id. The FILE SCOPE manifest is validated against it and an
+    ``AuditScopeError`` is raised when the manifest lacks the item repo
+    (LP-0MSQ32HNR007AI6B) — the caller aborts instead of emitting 'unmet'
+    verdicts from a wrong scope.
 
     Returns (updated_ac_results, updated_child_results, phase2_completed).
     The ``phase2_completed`` flag is ``False`` when the Pi call times out,
@@ -3901,6 +4093,14 @@ def _run_phase2_deep_analysis(
 
     if not skip_parent_deep:
         file_scope = _build_file_scope_manifest(issue, ac_results, runner=runner)
+        # Validate the Phase 2 FILE SCOPE manifest covers the item repository
+        # (LP-0MSQ32HNR007AI6B): a wrong scope must abort with a scope error
+        # instead of emitting misleading 'unmet' verdicts.
+        if owning_root is None:
+            owning_root = _resolve_owning_project_root(issue.get("id", ""))
+        scope_error = _validate_file_scope_manifest(file_scope, owning_root)
+        if scope_error:
+            raise AuditScopeError(scope_error)
 
         # Build a detailed prompt for deep analysis
         ac_list_json = json.dumps([
@@ -4309,6 +4509,26 @@ def cmd_issue(issue_id: str, persist: bool = True,
     children are audited when it does). ``--audit-children`` forces the full
     per-child flow described above (explicit override).
     """
+    # ------------------------------------------------------------------
+    # Launch-context guard (LP-0MSQ32HNR007AI6B): fail fast BEFORE any
+    # phase runs or pi/model calls when the launch project does not own
+    # the audited work item. A mis-scoped launch previously produced a
+    # full wasted run whose Phase 2 targeted the wrong repository
+    # (see _verify_launch_context). Non-zero exit, clear error, zero pi
+    # calls, no status lifecycle.
+    # ------------------------------------------------------------------
+    launch_error = _verify_launch_context(issue_id, worklog_dir=worklog_dir)
+    if launch_error:
+        if json_mode:
+            print(json.dumps({"error": launch_error}, indent=2))
+        else:
+            print(f"Error: {launch_error}", file=sys.stderr)
+        return 1
+
+    # Owning project root used by the Phase 1/2 FILE SCOPE manifest
+    # validation (resolved once; None → fail open).
+    owning_root = _resolve_owning_project_root(issue_id, worklog_dir=worklog_dir)
+
     # Resolve the effective model from config + CLI
     config = _load_config()
     resolved_model = _resolve_model_for_phase(
@@ -4530,6 +4750,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
         if acs and acs[0] != "No acceptance criteria defined.":
             ac_list_json = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(acs)])
             file_scope = _build_file_scope_manifest(work_item, [], runner=runner)
+            # Validate the FILE SCOPE manifest covers the item repository
+            # (LP-0MSQ32HNR007AI6B): a manifest built from the wrong scope
+            # (e.g. the audit skill's own tree) would emit misleading
+            # 'unmet' verdicts — abort with a scope error instead.
+            scope_error = _validate_file_scope_manifest(file_scope, owning_root)
+            if scope_error:
+                if json_mode:
+                    print(json.dumps({"error": scope_error}, indent=2))
+                else:
+                    print(f"Error: {scope_error}", file=sys.stderr)
+                return 1
             prompt = (
                 f"[READ-ONLY AUDIT] You are performing a read-only audit. "
                 f"Do NOT close, modify, create, or delete any work items. "
@@ -4926,7 +5157,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # Persist child audits to individual child work items (if persist is True)
             if persist:
                 for child in child_results:
-                    child_success, _child_report = _persist_child_audit(
+                    child_rc, _child_report = _persist_child_audit(
                         child_id=child["id"],
                         child_title=child["title"],
                         child_status=child["status"],
@@ -4940,12 +5171,26 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     child_persist_results.append({
                         "id": child["id"],
                         "title": child["title"],
-                        "success": child_success,
+                        "success": child_rc == 0,
                     })
-                    if not child_success:
+                    # Child persistence failure is FATAL (LP-0MSQ32HNR007AI6B): a
+                    # parent report whose child audits were never persisted is
+                    # misleading — abort with a non-zero exit instead of warning.
+                    if child_rc != 0 and child_rc != PERSIST_CONTENT_INVALID:
                         print(
-                            f"Warning: Failed to persist audit for child {child['id']} "
-                            f"({child['title']}): wl returned exit code {1}",
+                            f"Error: Failed to persist audit for child {child['id']} "
+                            f"({child['title']}): persist_audit returned exit code "
+                            f"{child_rc}. Aborting the run — the parent report "
+                            f"would be misleading without the child audit.",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    if child_rc == PERSIST_CONTENT_INVALID:
+                        # Fallback notice WAS persisted (usable); keep the warning.
+                        print(
+                            f"Warning: audit for child {child['id']} "
+                            f"({child['title']}) persisted with fallback content "
+                            "(verdict JSON rejected); the child audit is usable.",
                             file=sys.stderr,
                         )
 
@@ -4990,6 +5235,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     worklog_dir=worklog_dir,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    owning_root=owning_root,
                 )
         else:
             # ── PARENT-FIRST flow (default, SA-0MSKB6VJA005N43F) ──
@@ -5030,6 +5276,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     worklog_dir=worklog_dir,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    owning_root=owning_root,
                 )
 
             # 2. Parent verdict: any gaps? (unmet/partial ACs or blocking CQ).
@@ -5156,6 +5403,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
                     skip_parent_deep=True,
+                    owning_root=owning_root,
                 )
 
             # 6. Persist child audits (inherited children are explicit in the
@@ -5165,7 +5413,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 for child in child_results:
                     if child.get("inherited_pass") or child.get("pass_through"):
                         continue  # no per-child audit was run
-                    child_success, _child_report = _persist_child_audit(
+                    child_rc, _child_report = _persist_child_audit(
                         child_id=child["id"],
                         child_title=child["title"],
                         child_status=child["status"],
@@ -5179,12 +5427,25 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     child_persist_results.append({
                         "id": child["id"],
                         "title": child["title"],
-                        "success": child_success,
+                        "success": child_rc == 0,
                     })
-                    if not child_success:
+                    # Child persistence failure is FATAL (LP-0MSQ32HNR007AI6B): a
+                    # parent report whose child audits were never persisted is
+                    # misleading — abort with a non-zero exit instead of warning.
+                    if child_rc != 0 and child_rc != PERSIST_CONTENT_INVALID:
                         print(
-                            f"Warning: Failed to persist audit for child {child['id']} "
-                            f"({child['title']}): wl returned exit code {1}",
+                            f"Error: Failed to persist audit for child {child['id']} "
+                            f"({child['title']}): persist_audit returned exit code "
+                            f"{child_rc}. Aborting the run — the parent report "
+                            f"would be misleading without the child audit.",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    if child_rc == PERSIST_CONTENT_INVALID:
+                        print(
+                            f"Warning: audit for child {child['id']} "
+                            f"({child['title']}) persisted with fallback content "
+                            "(verdict JSON rejected); the child audit is usable.",
                             file=sys.stderr,
                         )
 
@@ -5356,6 +5617,16 @@ def cmd_issue(issue_id: str, persist: bool = True,
             return 0
         audit_completed = True
         return 0
+
+    except AuditScopeError as exc:
+        # Scope error (LP-0MSQ32HNR007AI6B): the Phase 2 FILE SCOPE
+        # manifest does not cover the item repository. Fail loudly with a
+        # non-zero exit; the finally block restores the pre-audit status.
+        if json_mode:
+            print(json.dumps({"error": str(exc)}, indent=2))
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     finally:
         # ------------------------------------------------------------------

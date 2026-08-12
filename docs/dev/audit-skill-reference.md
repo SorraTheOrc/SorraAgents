@@ -166,18 +166,42 @@ for each `wl` command:
    git root, or nearest ancestor.
 4. No flag — `wl` resolves from cwd.
 
-This means the runner can be launched from the skill install directory (or any
-other cwd) and still audit items in a *different* project's worklog, e.g.:
+**Fail-fast launch context (LP-0MSQ32HNR007AI6B):** while `wl` resolution is
+cwd-independent, the *project scope* is not — `TARGET_PROJECT_ROOT` (the
+git root of the launch cwd) is the repository Phase 1/2 target. An audit
+MUST be launched from the project root that owns the work item. Before any
+phase runs (and before any pi/model call) the runner verifies:
+
+1. **Owning project** — the item's id prefix resolves to its owning project
+   via the prefix-to-sibling scan (explicit `--worklog-dir` takes
+   precedence: its parent is the expected project). A launch from a
+   non-owning checkout aborts with `Error: Audit launch-context error:` and
+   a non-zero exit — zero pi calls, no status lifecycle. A worktree of the
+   owning project counts as owning.
+2. **FILE SCOPE manifest** — before Phase 1 and again before Phase 2, the
+   manifest must reference the item repository's files; a manifest built
+   from the audit skill's own tree (or lacking the item repo) aborts with
+   `Error: Audit scope error:` and a non-zero exit instead of emitting
+   misleading "unmet" verdicts.
+3. **Child persistence** — a child audit that cannot be persisted
+   (`wl audit-set` rc!=0, e.g. "Work item not found") aborts the run with a
+   non-zero exit; `PERSIST_CONTENT_INVALID` (fallback notice persisted)
+   remains a warning (the child audit is usable).
+
+To audit an item, cd into its owning project root and launch from there:
 
 ```bash
-python3 ./scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN --do-not-persist
+cd /path/to/owning-project
+python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN --do-not-persist
 ```
 
-If auto-resolution cannot determine the target store, pass an explicit dir:
+`--worklog-dir` does NOT change the project scope; only the launch
+directory does. If auto-resolution cannot determine the target store while
+launching from the owning project root, pass an explicit dir:
 
 ```bash
-python3 ./scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN \
-    --worklog-dir /path/to/project/.worklog
+python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN \
+    --worklog-dir /path/to/owning-project/.worklog
 ```
 
 Failure diagnostics surface the real `wl` error (stdout JSON error field first,

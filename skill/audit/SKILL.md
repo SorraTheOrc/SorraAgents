@@ -43,6 +43,35 @@ wl update <id> --status in_progress --json
 # Fail: wl update <id> --status "$ORIG_STATUS" --assignee "" --json
 ```
 
+## Fail-Fast Launch Contract
+
+An audit MUST be launched from the project root that owns the work item
+(LP-0MSQ32HNR007AI6B). Before any phase runs — and before any pi/model call —
+the runner verifies the launch context:
+
+1. **Owning project check:** the work item's id prefix is resolved to its
+   owning project via the worklog prefix-to-sibling scan (explicit
+   `--worklog-dir` takes precedence: its parent is the expected project).
+   If the launch cwd's git root (`TARGET_PROJECT_ROOT`) does not own the
+   item, the run aborts with `Error: Audit launch-context error: ...` and a
+   non-zero exit — zero pi calls, no status lifecycle, no persisted report.
+2. **FILE SCOPE manifest check:** before Phase 1 and again before Phase 2,
+   the FILE SCOPE manifest must reference the item repository's files. A
+   manifest built from the audit skill's own tree (or lacking the item
+   repo) aborts with `Error: Audit scope error: ...` and a non-zero exit
+   instead of emitting misleading "unmet" verdicts.
+3. **Child persistence is fatal:** a child audit that cannot be persisted
+   (`wl audit-set` rc!=0, e.g. "Work item not found") aborts the run with a
+   non-zero exit — a parent report whose child audits never landed is
+   misleading. `PERSIST_CONTENT_INVALID` (fallback notice persisted) stays
+   a warning; the child audit is usable.
+
+A mis-scoped audit is indistinguishable from a failed audit, so it MUST fail
+fast (seconds, no pi calls) rather than waste model time. To re-launch
+correctly, cd into the owning project root (a worktree of the owning project
+counts as owning). `--worklog-dir` does not change the project scope; only
+the launch directory does.
+
 ## Monitored Run Execution
 
 Audits via the canonical runner can run for **hours**. The **launch → monitor → abort** contract is fully documented in [docs/dev/audit-skill-reference.md](../docs/dev/audit-skill-reference.md). Summary:
