@@ -256,7 +256,13 @@ class TestSamplePreference:
     def _fake_list(self, monkeypatch, items):
         import subprocess as _sp
         def fake_run(cmd, *a, **kw):
-            out = json.dumps({"success": True, "workItems": items})
+            # The sampler now pipes `wl list --json` through jq via bash -c
+            # (SA-0MSLVQMKF000ESPZ); the mock emits the projected shape
+            # ({id, auditedAt, description} per item) that jq would produce.
+            out = json.dumps([
+                {k: it.get(k) for k in ("id", "auditedAt", "description")}
+                for it in items
+            ])
             return type("P", (), {"returncode": 0, "stdout": out, "stderr": ""})()
         monkeypatch.setattr(_sp, "run", fake_run)
 
@@ -271,8 +277,11 @@ class TestSamplePreference:
         ]
         # Only the second item has AC markers; give it a runner verdict too.
         def fake_run(cmd, *a, **kw):
-            if "list" in cmd[:4]:
-                out = json.dumps({"success": True, "workItems": items})
+            if "list --json" in (" ".join(cmd) if isinstance(cmd, list) else str(cmd)):
+                out = json.dumps([
+                    {k: it.get(k) for k in ("id", "auditedAt", "description")}
+                    for it in items
+                ])
             else:
                 # wl show may carry --worklog-dir flags; find the id after 'show'
                 try:

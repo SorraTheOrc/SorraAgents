@@ -510,10 +510,11 @@ test('check-audit-gate: ship.js re-exports checkProducerReviewStatus', async () 
 });
 
 // ---------------------------------------------------------------------------
-// 17. getCandidateItems — single AND query + jq projection (SA-0MSLW5P7J0068UFZ)
+// 17. getCandidateItems — single stage query + jq projection (SA-0MSLW5P7J0068UFZ,
+//     SA-0MSPPDCTH004561Z)
 // ---------------------------------------------------------------------------
 // These tests mock `wl` on PATH to verify the query/projection contract:
-// exactly ONE `wl list --status completed --stage in_review --json`
+// exactly ONE `wl list --stage in_review --json`
 // invocation piped through jq, so large outputs cannot overflow execSync's
 // default 1 MB buffer (ENOBUFS).
 
@@ -553,8 +554,8 @@ function withWlMock(binDir, fn) {
   }
 }
 
-describe('getCandidateItems - single AND query + jq projection', () => {
-  test('issues exactly one combined query (status + stage)', async () => {
+describe('getCandidateItems - single stage query + jq projection', () => {
+  test('issues exactly one stage-only query', async () => {
     const mod = await import(MODULE_PATH);
     const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
     const argsLogPath = join(tmpDir, 'args.log');
@@ -565,8 +566,8 @@ describe('getCandidateItems - single AND query + jq projection', () => {
     const calls = readFileSync(argsLogPath, 'utf-8').trim().split('\n').filter(Boolean);
 
     assert.equal(calls.length, 1, 'should be exactly one wl list invocation');
-    assert.ok(calls[0].includes('--status completed'), `should filter status, got: ${calls[0]}`);
     assert.ok(calls[0].includes('--stage in_review'), `should filter stage, got: ${calls[0]}`);
+    assert.ok(!calls[0].includes('--status completed'), `should drop redundant status filter (completed-minus-done == in_review), got: ${calls[0]}`);
     assert.ok(calls[0].includes('--json'), `should request JSON, got: ${calls[0]}`);
     assert.deepEqual(items, [{ id: 'SA-1', title: 'One', needsProducerReview: false }]);
     rmSync(tmpDir, { recursive: true, force: true });

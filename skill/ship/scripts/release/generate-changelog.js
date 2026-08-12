@@ -35,11 +35,14 @@ const CHANGELOG_PATH = resolve(REPO_ROOT, 'CHANGELOG.md');
 
 /**
  * Fetch all work items that should appear in the changelog:
- * those with status=completed AND stage=in_review (the release candidate
+ * those with stage=in_review (status=completed — the release candidate
  * set per the stage/status model).
  *
- * A single AND-filtered `wl list` query replaces the previous two-query
- * union. The output is piped through `jq` so only the needed field
+ * A single `--stage in_review` query replaces the previous union
+ * (SA-0MSPPHTYA002212R): the old `--status completed` arm contributed only
+ * stage=done items, which are already released and already appear in prior
+ * changelog sections (a correctness bug — previously released items were
+ * re-listed). The output is piped through `jq` so only the needed field
  * projection enters execSync's buffer — the full `wl list --json` output
  * for a large worklog can exceed the default 1 MB buffer (ENOBUFS), while
  * the OS pipe between `wl` and `jq` is unbounded. `set -o pipefail`
@@ -50,11 +53,11 @@ const CHANGELOG_PATH = resolve(REPO_ROOT, 'CHANGELOG.md');
  */
 export function getCompletedOrInReviewItems() {
   try {
-    // Single AND query (status=completed AND stage=in_review), piped through
+    // Single query (stage=in_review implies status=completed), piped through
     // jq so only {id, title, issueType, description, parentId} enters the buffer.
     // parentId is needed to filter parent-only work items for the changelog.
     const output = execSync(
-      `set -o pipefail; wl list --status completed --stage in_review --json ` +
+      `set -o pipefail; wl list --stage in_review --json ` +
       `| jq -c '[.workItems[] | {id, title, issueType, description, parentId}]'`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     );

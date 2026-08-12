@@ -171,7 +171,7 @@ mark `plan_complete` (see skip path instructions above).
    Before the full interview, assess if the item already has a sufficient plan:
    - If `stage` is `plan_complete` or later → no-op skip.
    - If not an `epic` and description has measurable ACs and a minimal implementation sketch → mark complete.
-   - If existing child items already cover the scope (`wl list --parent <id> --json`) → skip.
+   - If existing child items already cover the scope (`wl list --parent <id> --number 1 --json` existence check) → skip.
    - If a concise plan block exists → treat as sufficient.
 
    If planning is not needed:

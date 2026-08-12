@@ -485,8 +485,11 @@ def _restore_item_state(item: AuditItem) -> None:
 def _sample_audited_items(count: int, seed: int, repo_root: Path) -> list[str]:
     """Deterministic sample of previously-audited work items.
 
-    Enumerates all work items via ``wl list --json``, keeps those with a
-    persisted audit record, sorts by id, and draws candidates with
+    Enumerates audited work items via a ``wl list --json`` piped through
+    ``jq`` (SA-0MSLVQMKF000ESPZ): only the ``{id, auditedAt, description}``
+    projection crosses the unbounded OS pipe into the process buffer — the
+    5.3 MB full dump never enters memory. Keeps those with a persisted
+    audit record, sorts by id, and draws candidates with
     ``random.Random(seed)`` in a deterministic order. Probes candidates
     (via ``wl show``) until *count* items whose persisted audit text
     carries a runner verdict (``Ready to close: Yes|No``) are found, so
@@ -495,11 +498,12 @@ def _sample_audited_items(count: int, seed: int, repo_root: Path) -> list[str]:
     enumeration fast.
     """
     proc = subprocess.run(
-        ["wl", "list", "--json"],
+        ["bash", "-c",
+         "wl list --json | jq -c '[.workItems[] | {id, auditedAt, description}]'"],
         capture_output=True, text=True, timeout=120, check=False,
     )
     d = json.loads(proc.stdout)
-    items = d.get("workItems") or d.get("items") or []
+    items = d if isinstance(d, list) else (d.get("workItems") or d.get("items") or [])
     # Pre-filter: prefer items whose description carries acceptance criteria
     # so the re-audit exercises the parent pi call (and therefore captures
     # per-call input_tokens). Fall back to any audited item otherwise.

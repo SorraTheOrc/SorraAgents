@@ -7937,6 +7937,9 @@ class TestCmdProjectPiOutputWiring:
                 return_value={"success": True, "workItems": self._WORK_ITEMS},
             ),
             mock.patch.object(
+                audit_runner, "_run_wl_projected", return_value=1
+            ),
+            mock.patch.object(
                 audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
             ),
         ):
@@ -7982,6 +7985,9 @@ class TestCmdProjectPiOutputWiring:
                 audit_runner,
                 "_run_wl",
                 return_value={"success": True, "workItems": self._WORK_ITEMS},
+            ),
+            mock.patch.object(
+                audit_runner, "_run_wl_projected", return_value=1
             ),
             mock.patch.object(
                 audit_runner,

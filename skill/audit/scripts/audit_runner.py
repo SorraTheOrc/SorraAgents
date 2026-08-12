@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -546,6 +547,34 @@ def _run_wl(runner: Runner, cmd: Sequence[str],
             f"Worklog command failed: {data.get('error', 'unknown error')}"
         )
     return data
+
+
+def _run_wl_projected(runner: Runner, cmd: Sequence[str], jq_expr: str,
+                      worklog_dir: str | None = None):
+    """Run a ``wl`` command piped through ``jq`` and return the projection.
+
+    Injects ``--worklog-dir`` flags exactly like :func:`_run_wl`, then pipes
+    the full output through ``jq <jq_expr>``. The OS pipe between ``wl`` and
+    ``jq`` is unbounded, so only the small projection crosses into the
+    process buffer — large dumps (e.g. ``wl list --status completed`` at
+    4.9 MB) never enter memory (SA-0MSLVQMKF000ESPZ).
+
+    Returns the parsed projection (typically an int or small dict).
+    """
+    full_cmd = list(cmd)
+    if full_cmd and full_cmd[0] == "wl":
+        full_cmd[1:1] = _resolve_worklog_flags(full_cmd, explicit_dir=worklog_dir)
+    shell_cmd = " ".join(shlex.quote(part) for part in full_cmd)
+    shell_cmd += f" | jq -c {shlex.quote(jq_expr)}"
+    proc = runner(["bash", "-c", shell_cmd])
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"wl command failed ({shell_cmd}): {_wl_error_detail(proc)}"
+        )
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON from wl projection: {exc}") from exc
 
 
 def _detect_project_root() -> Path:
@@ -6006,8 +6035,25 @@ def cmd_project(timeout: int | None = None,
         }
 
     try:
-        data = _run_wl(runner, ["wl", "list", "--json"],
-                       worklog_dir=worklog_dir)
+        # Scoped status queries only (SA-0MSLVQMKF000ESPZ): the project audit
+        # needs per-status counts plus the first few blocked ids. A bare
+        # `wl list --json` (5.3 MB) is replaced by three small scoped queries
+        # (in-progress ~43 KB, blocked ~11 items) plus a jq-projected count
+        # for completed (the OS pipe between wl and jq is unbounded, so only
+        # the tiny `.count` crosses into the process buffer — the 4.9 MB
+        # completed-item dump never enters memory).
+        in_progress_data = _run_wl(
+            runner, ["wl", "list", "--status", "in-progress", "--json"],
+            worklog_dir=worklog_dir,
+        )
+        blocked_data = _run_wl(
+            runner, ["wl", "list", "--status", "blocked", "--json"],
+            worklog_dir=worklog_dir,
+        )
+        completed_count = _run_wl_projected(
+            runner, ["wl", "list", "--status", "completed", "--json"],
+            ".count", worklog_dir=worklog_dir,
+        )
     except RuntimeError as exc:
         _record_script_failure("wl list", exc)
         fail_notice = FailureNotice(
@@ -6027,14 +6073,23 @@ def cmd_project(timeout: int | None = None,
         return 1
 
     script_failure = None
-    work_items = data.get("workItems", data) if isinstance(data, dict) else data
-    in_progress = [w for w in work_items if w.get("status") == "in_progress"] if isinstance(work_items, list) else []
-    blocked = [w for w in work_items if w.get("status") == "blocked"] if isinstance(work_items, list) else []
-    completed = [w for w in work_items if w.get("status") == "completed"] if isinstance(work_items, list) else []
+    # The scoped queries return only the items with the requested status, so
+    # the lists are direct (no in-memory filtering of a 5.3 MB dump needed).
+    # The status filter is retained as a defensive invariant check.
+    def _items(data: dict) -> list[dict]:
+        items = data.get("workItems", data) if isinstance(data, dict) else data
+        return items if isinstance(items, list) else []
+
+    in_progress = [w for w in _items(in_progress_data)
+                   if w.get("status") == "in_progress"]
+    blocked = [w for w in _items(blocked_data)
+               if w.get("status") == "blocked"]
+    if not isinstance(completed_count, int):
+        completed_count = 0
 
     summary = (
         f"Project-level audit: {len(in_progress)} items in progress, "
-        f"{len(blocked)} blocked, {len(completed)} completed."
+        f"{len(blocked)} blocked, {completed_count} completed."
     )
 
     if blocked:

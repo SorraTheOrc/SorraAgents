@@ -11,31 +11,32 @@ import skill.triage.scripts.check_or_create as cc
 
 
 def test_list_critical_issues_parses_workitems_wrapper(monkeypatch):
-    """list_critical_issues() parses the real wl list output {"workItems": [...]}."""
+    """list_critical_issues() parses the real wl list output {"workItems": [...]}.
+
+    The function now queries each incomplete status separately
+    (SA-0MSPPI2FL005UQCR), so the mock filters by the requested --status.
+    """
 
     def fake_run_wl(args):
-        return json.dumps(
+        status = args[args.index("--status") + 1] if "--status" in args else None
+        all_items = [
             {
-                "success": True,
-                "count": 2,
-                "workItems": [
-                    {
-                        "id": "SA-WRAP-1",
-                        "title": "[test-failure] test_wrap_a — failing",
-                        "description": "Test name: test_wrap_a",
-                        "status": "open",
-                        "updatedAt": "2026-02-20T00:00:00Z",
-                    },
-                    {
-                        "id": "SA-WRAP-2",
-                        "title": "[test-failure] test_wrap_b — failing",
-                        "description": "Test name: test_wrap_b",
-                        "status": "in_progress",
-                        "updatedAt": "2026-02-21T00:00:00Z",
-                    },
-                ],
-            }
-        )
+                "id": "SA-WRAP-1",
+                "title": "[test-failure] test_wrap_a — failing",
+                "description": "Test name: test_wrap_a",
+                "status": "open",
+                "updatedAt": "2026-02-20T00:00:00Z",
+            },
+            {
+                "id": "SA-WRAP-2",
+                "title": "[test-failure] test_wrap_b — failing",
+                "description": "Test name: test_wrap_b",
+                "status": "in-progress",
+                "updatedAt": "2026-02-21T00:00:00Z",
+            },
+        ]
+        filtered = [it for it in all_items if it["status"] == status]
+        return json.dumps({"success": True, "count": len(filtered), "workItems": filtered})
 
     monkeypatch.setattr(cc, "run_wl", fake_run_wl)
     items = cc.list_critical_issues()
@@ -64,8 +65,11 @@ def test_list_critical_issues_legacy_items_wrapper(monkeypatch):
 
     monkeypatch.setattr(cc, "run_wl", fake_run_wl)
     items = cc.list_critical_issues()
-    assert len(items) == 1
-    assert items[0]["id"] == "SA-LEGACY"
+    # The legacy mock returns the same items for both status queries; the
+    # function merges them. De-duplicate by id to count distinct items.
+    distinct = {it["id"] for it in items}
+    assert len(distinct) == 1
+    assert "SA-LEGACY" in distinct
 
 
 # ---------------------------------------------------------------------------

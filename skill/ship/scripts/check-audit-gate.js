@@ -34,11 +34,13 @@ import { execSync } from 'node:child_process';
 /**
  * Query Worklog for candidate work items.
  *
- * Release candidates are exactly the items with `status: completed` AND
- * `stage: in_review` (per the stage/status model, items advanced to
- * `in_review` have status `completed`; items stuck in `in_progress` are
- * NOT candidates). A single AND-filtered `wl list` query replaces the
- * previous two-query union.
+ * Release candidates are exactly the items with `stage: in_review` (status
+ * `completed` — per the stage/status model, `in_review` items have status
+ * `completed`; items stuck in `in_progress` are NOT candidates). A single
+ * `--stage in_review` query replaces the previous two-query union
+ * (SA-0MSPPDCTH004561Z): the old `--status completed` arm contributed zero
+ * candidates (completed-minus-done == in_review) while re-downloading
+ * ~4.9 MB of already-released items.
  *
  * The full `wl list --json` output for a large worklog can exceed
  * execSync's default 1 MB buffer (ENOBUFS), so the query is piped through
@@ -55,10 +57,11 @@ import { execSync } from 'node:child_process';
  */
 export function getCandidateItems() {
   try {
-    // Single AND query (status=completed AND stage=in_review), piped through
-    // jq so only {id, title, needsProducerReview} enters the execSync buffer.
+    // Single query: stage=in_review implies status=completed (the
+    // completed-minus-done == in_review invariant), piped through jq so only
+    // {id, title, needsProducerReview} enters the execSync buffer.
     const output = execSync(
-      `set -o pipefail; wl list --status completed --stage in_review --json ` +
+      `set -o pipefail; wl list --stage in_review --json ` +
       `| jq -c '[.workItems[] | {id, title, needsProducerReview}]'`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     );

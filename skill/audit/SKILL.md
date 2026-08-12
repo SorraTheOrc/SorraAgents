@@ -16,7 +16,7 @@ Provide a concise, human-friendly summary of project status or a specific work i
 ## When To Use
 
 1. **Scan for a work item ID** — `[A-Z]{2}-[A-Z0-9]+`; found → item-level (step 3), not found → project-level (step 2).
-2. **No ID found (project-level)** — `wl list --json`, `wl in_progress --json`, `wl blocked --json` ("status", "audit" queries).
+2. **No ID found (project-level)** — scoped status overview only (never a bare full dump): `wl next --json`, `wl in_progress --json`, `wl list --stage in_review --json`, `wl list --priority critical --status open --json`, `wl recent --number 10 --json` ("status", "audit" queries).
 3. **ID found (item-level)** — `wl show <id> --children --json`.
 
 ## Pre-flight affirmation
