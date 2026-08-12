@@ -16,7 +16,7 @@ through code, tests, and docs.
 ## Outputs
 
 - Tests and implementation code meeting ACs, committed and pushed to `dev`.
-- Work item updated to `in_review` (NOT closed; stays open until the release promotes the changes to `main`).
+- Work item updated to `in_review` (NOT closed; stays open until release).
 
 ## References to Bundled Resources
 
@@ -29,8 +29,8 @@ credential. When in doubt, produce the exact `git`/`gh`/`wl` commands for a
 human to run.
 
 Privacy note: Avoid secrets/tokens/PII in comments or PR bodies — reference by
-work-item id or document path instead of pasting values; mask/redact sensitive
-values before writing to logs or comments.
+work-item id or document path; mask/redact sensitive values before writing to
+logs or comments.
 
 ## StatusLifecycle Integration
 
@@ -39,29 +39,29 @@ from `../shared/status_lifecycle.py`. The orchestration script (`implement.py`)
 uses it automatically: `phase_start()` claims (`in_progress`); `phase_finish()`
 wraps build/test/commit/push in `with StatusLifecycle(..., target_stage="in_review"):`
 (success → `completed`/`in_review`; error → original status restored);
-`phase_abort()` resets to `open` (also available as `implement.py abort
-<WIP-id>`). Manual use: `StatusLifecycle.update_status()` or the
-context-manager pattern in `../shared/status_lifecycle.py`.
+`phase_abort()` resets to `open` (also `implement.py abort <WIP-id>`). Manual
+use: `StatusLifecycle.update_status()` or the context-manager pattern in
+`../shared/status_lifecycle.py`.
 
 ## Test Anti-Patterns
 
-Before writing tests, review the shared [Test Writing Guidelines
-](../shared/test-writing-guidelines.md) (six anti-patterns from a full audit
-of the Tableau-Card-Engine suite; 32 low-value files removed). Never write
-tests that: (1) grep source code instead of asserting behaviour, (2) contain
+Review the shared [Test Writing Guidelines](../shared/test-writing-guidelines.md)
+before writing tests (six anti-patterns from a full audit of the
+Tableau-Card-Engine suite; 32 low-value files removed). Never write tests
+that: (1) grep source instead of asserting behaviour, (2) contain
 `expect(true).toBe(true)` or zero assertions, (3) re-implement production
-logic, (4) duplicate an existing core test, (5) assert type-level satisfaction
-the compiler already checks, (6) boot a browser/scene without asserting
+logic, (4) duplicate an existing core test, (5) assert type-level
+satisfaction the compiler checks, (6) boot a browser/scene without asserting
 anything. Every test must assert observable behaviour via the public API.
 
 ## Best Practices
 
 - Follow the steps in order; do not skip steps.
-- **Testing is required — TDD is preferred, not mandatory.** Write tests first
-  whenever practical; alternatives (e.g., test-after) are permitted when TDD
-  would complicate implementation. When external constraints prevent complete
-  tests, create harnesses/mocks and document the limitation. **Do NOT write
-  placeholder tests** — track unimplemented features in a work item instead
+- **Testing is required — TDD preferred, not mandatory.** Write tests first
+  whenever practical; test-after is permitted when TDD would complicate
+  implementation. When external constraints prevent complete tests, create
+  harnesses/mocks and document the limitation. **Do NOT write placeholder
+  tests** — track unimplemented features in a work item instead
   ([Test Writing Guidelines](../shared/test-writing-guidelines.md)).
 - No search tools (grep/ripgrep/code search) — rely on work-item context and
   linked docs; if insufficient, run intake interview.
@@ -72,7 +72,7 @@ anything. Every test must assert observable behaviour via the public API.
 - Document process/decisions/next steps in work item comments; handle errors
   gracefully with actionable remediation.
 - Not well-defined → intake interview; implement blockers/dependencies first.
-- Follow AGENTS.md policies for branch naming, commit discipline, worktree workflow, and push-to-dev ([AGENTS.md](../../AGENTS.md#implement-the-work-item)); after `in_review`, use the cleanup skill to tidy local feature branches (not `dev`/`main`).
+- Follow AGENTS.md policies for branch naming, commit discipline, worktree workflow, and push-to-dev ([AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item)); after `in_review`, use the cleanup skill to tidy local feature branches (not `dev`/`main`).
 - Use `StatusLifecycle` for all status transitions — never ad-hoc `wl update --status` commands.
 
 ## Status Safety & Abort Handling
@@ -99,8 +99,8 @@ user-initiated abort, (4) error/exception during implementation, (5)
 unexpected termination (covered by the Final cleanup step).
 
 > **Status reset is conditional, not blind:** `_safety_reset_if_in_progress()`
-> resets to `open` **only if** currently `in-progress`, protecting terminal
-> items; SIGINT/SIGTERM during any phase releases the item via `os._exit`.
+> resets to `open` **only if** currently `in-progress`; SIGINT/SIGTERM during
+> any phase releases the item via `os._exit`.
 
 ### Error/exception handling (abort on unexpected errors)
 
@@ -192,7 +192,7 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 > `<worktree>/node_modules -> <repo-root>/node_modules` when the main checkout
 > has one (SA-0MSGS763C006SM1B). **Do NOT run `npm install` inside a worktree** — writes pass through the symlink, corrupting the shared tree.
 
-See [AGENTS.md](../../AGENTS.md#implement-the-work-item).
+See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
 
 5. Implement
 
@@ -270,7 +270,7 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 | Claim (Step 1) | `update_status(id, "in_progress", stage="in_progress", assignee="<AGENT>")` / `phase_start()` | in_progress | in_progress |
 | Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review")` | completed | in_review |
 | Final (Step 8) | `with StatusLifecycle(id, target_stage="in_review"):` / `phase_finish()` | completed | in_review |
-| Abort (dirty/gate/user/error/termination) | `update_status(id, "open")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets if incomplete) | open | unchanged |
+| Abort (dirty/gate/user/error/termination) | `update_status(id, "open")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |
 
 > **All abort/failure transitions reset to `open`.** Never leave a work item in `in_progress` unless actively implementing.
 
@@ -281,50 +281,8 @@ the steps above and invokes project-local build/test and linters. When a
 repository provides an "implement" helper script, prefer it for deterministic
 behavior.
 
-### Build step for repos without a build script
-
-The `implement.py finish` build step (`run_build()`) is tolerant of repos
-whose root `package.json` has no `build` script (e.g. Python-only projects):
-
-- No `scripts.build` entry (or no root `package.json` at all) → the build
-  step is **skipped** and reported as a no-op (`success: True`), so finish
-  proceeds to tests → commit → push instead of aborting on `npm run build`
-  exit 1 (`Missing script: "build"`). Malformed `package.json` also counts
-  as "no build script" (fail-open — never block finish on a broken
-  manifest).
-- `scripts.build` present → `npm run build` runs unchanged; a real build
-  failure still blocks finish.
-
-The returned dict includes a `skipped` flag (True when the step was
-bypassed) in addition to `success`/`stdout`/`stderr`/`exit_code`.
-
-### Test step for repos without test tooling
-
-The `implement.py finish` test step (`run_tests()`) is tolerant of repos
-with no test tooling (e.g. bash-only repos, Unity projects without a
-configured runner):
-
-- No pytest suite (no pytest config markers/test files, or pytest not
-  importable via `python3`), no `scripts.test` in the root `package.json`,
-  and no repo-local runner → the test step is **skipped** and reported as
-  a no-op (`success: True`, `skipped: True`), so finish proceeds to commit
-  → push instead of aborting on ENOENT or `Missing script: "test"`.
-- Detection order: `IMPLEMENT_TEST_COMMAND` env override → pytest → npm
-  `test` script → repo-local runner (`run_tests.sh` /
-  `run_unity_tests.sh` / `run_unity_tests.bat`) → Unity project
-  (Unity-specific skip message) → generic skip.
-- Repos WITH tooling are unaffected: the detected command runs (through
-  the run cache) and a real failure still blocks finish. When pytest is
-  detected, `npm test` remains the fallback if the repo also defines a
-  `scripts.test` entry. Commands are the canonical quiet forms
-  (`pytest -q -r a --disable-warnings` / `npm --silent test`, via
-  `canonicalize_quiet_test_command`) so cached runs share the test skill's
-  cache keys and count as full-suite evidence (SA-0MSN6FBFS006Z5QP).
-- `IMPLEMENT_TEST_COMMAND` overrides detection entirely (per-repo test
-  command, e.g. a Unity test runner invoked via a repo-local script).
-
-The returned dict includes `skipped` (bool) and `tooling` (str | None) in
-addition to `success`/`stdout`/`stderr`/`exit_code`/`failures`.
+Build/test steps for repos without build/test tooling:
+[docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md).
 
 Example commands (documentation example, SA-0MPYMFZXO0004ZU4):
 

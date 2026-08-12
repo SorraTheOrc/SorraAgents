@@ -272,11 +272,10 @@ _STATUS_RESTORE_RETRY_DELAY_S = 0.5
 
 _PHASE1_SCANNING_BLOCK = (
     "SCANNING — When you need to look something up, use the bounded helpers:\n"
-    "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
+    "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
     "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
     "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
-    "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n"
-    "- Single-file greps of `.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).\n\n"
+    "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
 )
 """Bounded-scanning guidance injected into Phase 1 AC review prompts (P7).
 
@@ -907,12 +906,17 @@ def _compute_content_fingerprint(runner: Runner, issue_id: str,
                                  work_item: dict | None = None) -> str | None:
     """Compute the content fingerprint for a work item at the current state.
 
-    The fingerprint combines three components so that a change in ANY of them
-    invalidates freshness (SA-0MSKB6US1009CNHT):
+    The fingerprint combines four components so that a change in ANY of them
+    invalidates freshness (SA-0MSKB6US1009CNHT, SA-0MSL1YXG7004F2BZ):
 
     1. **git HEAD sha** — the repository state being audited.
     2. **work-item description hash** — the audited acceptance criteria text.
     3. **Key Files list** — the file-scope manifest of the audited item.
+    4. **working-tree state** — a hash of ``git status --porcelain`` +
+       ``git diff --name-only HEAD`` output, so uncommitted/untracked
+       changes between audits invalidate freshness (the audit reads the
+       working tree, not just HEAD). Degrades to an empty marker when git
+       is unavailable so fail-open callers keep working.
 
     *work_item* may be passed in to avoid a redundant ``wl show`` call when
     the caller already fetched the work item (e.g. ``cmd_issue``). When
@@ -938,7 +942,33 @@ def _compute_content_fingerprint(runner: Runner, issue_id: str,
         "head_sha": head_sha,
         "description_hash": hashlib.sha256(description.encode("utf-8")).hexdigest(),
         "key_files": key_files,
+        "working_tree_hash": _resolve_working_tree_hash(runner),
     }, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _resolve_working_tree_hash(runner: Runner) -> str:
+    """Hash the working-tree state for the fingerprint (SA-0MSL1YXG7004F2BZ).
+
+    Combines ``git status --porcelain`` (untracked + unstaged changes) with
+    ``git diff --name-only HEAD`` (staged changes) into a deterministic
+    sorted payload, hashed with sha256. Returns a fixed empty-string marker
+    when git is unavailable so the fingerprint still works fail-open.
+    """
+    lines: list[str] = []
+    for cmd in (["git", "status", "--porcelain"], ["git", "diff", "--name-only", "HEAD"]):
+        try:
+            proc = runner(cmd)
+        except Exception:  # noqa: BLE001 -- git is best-effort here
+            continue
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    lines.append(line)
+    if not lines:
+        return ""
+    payload = "\n".join(sorted(set(lines)))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -1224,12 +1254,17 @@ def _resolve_auto_green_run(
     query never executes anything, so the audit's read-only mandate is
     preserved unconditionally (SA-0MSIU5HFI0024D7W).
 
+    Suite commands only cover dirs that exist in the target repo
+    (SA-0MSJELL44009XYIL), so a repo without tests/node is never asked about
+    a phantom tests/node command.
+
     Returns ``(prompt_block, head_sha)`` when EVERY suite command has a cached
     entry at the audited git state within the cache TTL AND every entry's exit
-    code is 0. Returns ``(None, None)`` otherwise — fail-closed: a cache miss,
-    a non-zero (or timed-out) run, a partially cached suite set, an
-    unresolvable HEAD, or any cache/infra error yields NO evidence and never
-    crashes the audit (execution-dependent ACs stay partial).
+    code is 0. Otherwise prints a clear diagnostic to stderr — distinguishing
+    a cache miss ('run /skill:test once to populate the cache') from a
+    non-zero cached run ('suite is red; fix or attest with --green-run HEAD')
+    — and returns ``(None, None)``, fail-closed: no evidence, the audit
+    completes normally, and execution-dependent ACs stay partial.
     """
     try:
         head_sha = _resolve_audited_head(runner)
@@ -1237,15 +1272,40 @@ def _resolve_auto_green_run(
             return None, None
 
         project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
-        for command in full_suite_commands(project_root):
+        commands = full_suite_commands(project_root)
+        problems: list[str] = []
+        for command in commands:
             entry = query_cached(
                 command, cwd=str(project_root), ttl=DEFAULT_TTL_SECONDS,
             )
-            if entry is None or int(entry.get("exit_code", -1)) != 0:
-                return None, None
-    except Exception:  # noqa: BLE001 -- fail-closed: never crash the audit
-        return None, None
-    return _auto_green_run_prompt_block(head_sha), head_sha
+            if entry is None:
+                problems.append(
+                    f"no cached full-suite run for '{command}' at HEAD {head_sha}"
+                )
+            elif int(entry.get("exit_code", -1)) != 0:
+                problems.append(
+                    f"cached full-suite run for '{command}' exited non-zero "
+                    f"({int(entry.get('exit_code'))})"
+                )
+        if not problems:
+            return _auto_green_run_prompt_block(head_sha), head_sha
+        print(
+            "Automatic full-suite verification unavailable: "
+            f"{len(problems)} of {len(commands)} suite command(s) not "
+            f"verifiably green at HEAD {head_sha}. " + "; ".join(problems)
+            + ". Run the full suite once at this commit (/skill:test or "
+            "run_tests.py --force) to populate the test cache, then re-audit "
+            "— or attest manually with --green-run HEAD. Execution-dependent "
+            "criteria stay partial.",
+            file=sys.stderr,
+        )
+    except Exception as exc:  # noqa: BLE001 -- fail-closed: never crash the audit
+        print(
+            f"Automatic full-suite verification unavailable: {exc}. "
+            "Execution-dependent criteria stay partial.",
+            file=sys.stderr,
+        )
+    return None, None
 
 
 def _test_skill_run_prompt_block(sha: str) -> str:
@@ -3679,10 +3739,9 @@ def _deep_analyze_child(
         "searching for it.\n\n"
         f"{child_file_scope}\n\n"
         "SCANNING — When you need to look something up, use the bounded helpers:\n"
-        "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
+        "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
         "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
-        "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n"
-        "- Single-file greps of `.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).\n\n"
+        "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
         f"{green_run_block or ''}"
         "For each criterion, read the actual implementation files and verify "
         "the code genuinely satisfies the stated requirements. "
@@ -4121,11 +4180,10 @@ def _run_phase2_deep_analysis(
             "here, state that in the evidence instead of searching for it.\n\n"
             f"{file_scope}\n\n"
             "SCANNING — When you need to look something up, use the bounded helpers:\n"
-            "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
+            "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
             "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
             "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
-            "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n"
-            "- Single-file greps of `.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).\n\n"
+            "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
             f"{green_run_block or ''}"
             "For each acceptance criterion:\n"
             "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"

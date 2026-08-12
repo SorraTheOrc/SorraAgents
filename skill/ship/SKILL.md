@@ -27,7 +27,9 @@ Execute a release (promote `dev` to `main`). Triggers: "ship it", "shipit", "shi
 
 ## Internal Scripts and Modules
 
-All scripts are internal implementation details — the only user-facing action is `release`. Full inventory: [docs/dev/ship-skill-reference.md](../docs/dev/ship-skill-reference.md). Key scripts: `run-release.js` (release wrapper + gating + dev sync), `release/merge-dev-to-main.sh` (canonical merge), `ship.js` (`pushToDev`), `git-helpers.js` (branch naming/policy), `check-unmerged-branches.js`, `check-audit-gate.js`, `check-critical-items.js`, `check-worklog-refs.js`, `remediate-spurious-closes.js`.
+All scripts are internal implementation details — the only user-facing action is `release`. Full inventory: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md). Key scripts: `run-release.js` (release wrapper + gating + dev sync), `release/merge-dev-to-main.sh` (canonical merge), `ship.js` (`pushToDev`), `git-helpers.js` (branch naming/policy), `check-unmerged-branches.js`, `check-audit-gate.js`, `check-critical-items.js`, `check-worklog-refs.js`, `remediate-spurious-closes.js`.
+
+> **Path resolution:** all `./scripts/...` and `../` paths in this document are **relative to the skill directory** (the `ship` skill folder under the repo's `skill/` tree, or under the installed skills folder) — not the repo root. When invoking from the repo root, prefix with the full skill path instead of `./`.
 
 ## Usage
 
@@ -62,7 +64,7 @@ All gates bypass with `--skip-checks`. CI is **optional**: PR status checks must
 
 ### Code Freeze
 
-While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/code-freeze.json` (contract WL-0MSBU4KMA004PKSR), written **before** gating and cleared on **every** exit path (success, failure, abort, `--dry-run`, gating failures) via `try/finally` + an `EXIT` trap. While present, the implement skill refuses to start new implementation (fail-open: missing/corrupt marker never blocks). Stale markers can be removed by deleting the file. Schema: [docs/dev/ship-skill-reference.md](../docs/dev/ship-skill-reference.md).
+While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/code-freeze.json` (contract WL-0MSBU4KMA004PKSR), written **before** gating and cleared on **every** exit path (success, failure, abort, `--dry-run`, gating failures) via `try/finally` + an `EXIT` trap. While present, the implement skill refuses to start new implementation (fail-open: missing/corrupt marker never blocks). Stale markers can be removed by deleting the file. Schema: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md).
 
 ### Exit Codes
 
@@ -103,11 +105,11 @@ Close-work-items unit tests must **never mutate the live worklog** (SA-0MSJ2XMQL
 
 ### Remediation sweep: test-spuriously-closed work items
 
-If the test-isolation bug recurs (items closed "Shipped in v1.0.0"/"v1.2.3" that never shipped), run the idempotent sweep from the main checkout: `node ./scripts/remediate-spurious-closes.js` — deletes close comments authored by `worklog` with exactly those reasons and restores each item to `status=completed, stage=in_review`. Legitimate close comments (real versions) are never touched; re-running after success is a no-op. Details: [docs/dev/ship-skill-reference.md](../docs/dev/ship-skill-reference.md).
+If the test-isolation bug recurs (items closed "Shipped in v1.0.0"/"v1.2.3" that never shipped), run the idempotent sweep from the main checkout: `node ./scripts/remediate-spurious-closes.js` — deletes close comments authored by `worklog` with exactly those reasons and restores each item to `status=completed, stage=in_review`. Legitimate close comments (real versions) are never touched; re-running after success is a no-op. Details: [docs/dev/ship-skill-reference.md](../../docs/dev/ship-skill-reference.md).
 
 ## Fallback: Human Release Manager
 
-For repos where the automated merge is unsuitable, follow [`docs/dev/release-process.md`](../docs/dev/release-process.md).
+For repos where the automated merge is unsuitable, follow [`docs/dev/release-process.md`](../../docs/dev/release-process.md).
 
 | Approach | Description | When to use |
 |----------|-------------|-------------|
@@ -129,7 +131,7 @@ python3 ../test/scripts/run_tests.py --summary --suite all     # read-only summa
 python3 ../test/scripts/run_tests.py --force --json            # fresh run for the final gate
 ```
 
-Cached results are valid for the same git state within the 2-hour TTL; a changed tree, expired TTL, or corrupt entry always triggers a fresh run. See [`docs/dev/release-tests.md`](../docs/dev/release-tests.md).
+Cached results are valid for the same git state within the 2-hour TTL; a changed tree, expired TTL, or corrupt entry always triggers a fresh run. See [`docs/dev/release-tests.md`](../../docs/dev/release-tests.md).
 
 ## Preferred execution behaviour (policy)
 

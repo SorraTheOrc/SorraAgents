@@ -111,6 +111,19 @@ def test_full_suite_commands_cover_pytest_and_node() -> None:
     assert "tests/unit" in joined
 
 
+def _make_repo(tmp_path: Path, npm_test_script: bool = False, dirs: tuple[str, ...] = ("tests/node", "tests/cli", "tests/unit")) -> Path:
+    """Create a throwaway project root with the given npm test script and suite dirs."""
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    for d in dirs:
+        (repo / d).mkdir(parents=True, exist_ok=True)
+    if npm_test_script:
+        (repo / "package.json").write_text(
+            json.dumps({"scripts": {"test": "vitest"}})
+        )
+    return repo
+
+
 def test_node_suite_commands_respect_custom_project_root(
     tmp_path: Path,
 ) -> None:
@@ -120,11 +133,7 @@ def test_node_suite_commands_respect_custom_project_root(
     suite directory; the framework repo (no npm test script) keeps the
     `node --test "<dir>/**/*.mjs"` glob form.
     """
-    repo = tmp_path / "proj"
-    repo.mkdir()
-    (repo / "package.json").write_text(
-        json.dumps({"scripts": {"test": "vitest"}})
-    )
+    repo = _make_repo(tmp_path, npm_test_script=True)
     cmds = node_suite_commands(repo)
     assert len(cmds) == 3
     assert all(c.startswith("npm --silent test -- ") for c in cmds)
@@ -132,6 +141,70 @@ def test_node_suite_commands_respect_custom_project_root(
 
     framework_cmds = node_suite_commands()
     assert all(c.startswith("node --test ") for c in framework_cmds)
+
+
+# ---------------------------------------------------------------------------
+# Skip-missing-dir behavior (SA-0MSJELL44009XYIL)
+# ---------------------------------------------------------------------------
+
+
+def test_node_suite_commands_skip_missing_dirs(tmp_path: Path) -> None:
+    """A suite dir that does not exist in the project must be skipped.
+
+    A repo without tests/node must NOT receive a `tests/node` command: the
+    guaranteed-failing run (vitest 'No test files found') would defeat the
+    audit skill's fail-closed auto-verification for repos whose layout
+    diverges from NODE_SUITE_DIRS (SA-0MSJELL44009XYIL).
+    """
+    repo = _make_repo(tmp_path, dirs=("tests/cli", "tests/unit"))
+    cmds = node_suite_commands(repo)
+    assert len(cmds) == 2
+    joined = " | ".join(cmds)
+    assert "tests/node" not in joined
+    assert "tests/cli" in joined
+    assert "tests/unit" in joined
+
+
+def test_full_suite_commands_skip_missing_dirs(tmp_path: Path) -> None:
+    """full_suite_commands emits only commands that can pass for the repo."""
+    repo = _make_repo(tmp_path, dirs=("tests/cli",))
+    cmds = full_suite_commands(repo)
+    assert cmds[0] == "pytest -q -r a --disable-warnings"
+    assert len(cmds) == 2  # pytest + tests/cli only
+    assert "tests/node" not in " | ".join(cmds)
+    assert "tests/unit" not in " | ".join(cmds)
+
+
+def test_node_suite_commands_no_dirs_yields_empty(tmp_path: Path) -> None:
+    """A repo with no node suite dirs yields no node commands at all."""
+    repo = _make_repo(tmp_path, dirs=())
+    assert node_suite_commands(repo) == []
+    cmds = full_suite_commands(repo)
+    assert cmds == ["pytest -q -r a --disable-warnings"]
+
+
+def test_node_suite_commands_skip_missing_dirs_with_npm_script(
+    tmp_path: Path,
+) -> None:
+    """The skip applies to the npm test-script form too."""
+    repo = _make_repo(tmp_path, npm_test_script=True, dirs=("tests/unit",))
+    cmds = node_suite_commands(repo)
+    assert len(cmds) == 1
+    assert cmds[0] == "npm --silent test -- tests/unit"
+
+
+def test_full_suite_commands_framework_regression_unchanged(tmp_path: Path) -> None:
+    """The framework repo (all three suite dirs) keeps the full command set."""
+    # The framework itself has tests/node, tests/cli and tests/unit: a repo
+    # with all three dirs must produce the exact pre-fix command set (no
+    # accidental skips), preserving existing read-only consumers.
+    repo = _make_repo(tmp_path)
+    cmds = full_suite_commands(repo)
+    assert len(cmds) == 4  # pytest + 3 node suite dirs
+    joined = " | ".join(cmds)
+    assert "tests/node" in joined
+    assert "tests/cli" in joined
+    assert "tests/unit" in joined
 
 
 # ---------------------------------------------------------------------------

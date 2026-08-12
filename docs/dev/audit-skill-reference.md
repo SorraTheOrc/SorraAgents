@@ -131,7 +131,7 @@ Short-circuits item-level audits when a recent, valid audit exists to avoid unne
 
 ### Behavior
 
-1. **Content-based gate (primary):** each audit captures a content fingerprint — git HEAD sha + work-item description hash + Key Files list — and embeds it in the persisted report (`Audit content fingerprint: <sha256hex>`). Re-auditing an item whose fingerprint is unchanged returns the existing report in seconds instead of re-running the pipeline (SA-0MSKB6US1009CNHT). A change in ANY fingerprint component (new commit, edited description/ACs, changed Key Files) invalidates freshness and re-runs the full audit.
+1. **Content-based gate (primary):** each audit captures a content fingerprint — git HEAD sha + work-item description hash + Key Files list + working-tree state (hash of `git status --porcelain` + `git diff --name-only HEAD` output) — and embeds it in the persisted report (`Audit content fingerprint: <sha256hex>`). Re-auditing an item whose fingerprint is unchanged returns the existing report in seconds instead of re-running the pipeline (SA-0MSKB6US1009CNHT). A change in ANY fingerprint component (new commit, edited description/ACs, changed Key Files, uncommitted or untracked working-tree changes) invalidates freshness and re-runs the full audit. The working-tree component degrades to an empty marker when git is unavailable (fail-open).
 2. **Time gate (floor):** audits persisted without a fingerprint (legacy reports) fall back to the 60s timestamp gate — compare ``auditedAt`` against ``updatedAt + 60s``.
 3. If fresh: prints ``Skipping: audit still fresh`` + existing report, exits code 0 **without** status lifecycle.
 4. If stale or error: falls through to normal full audit.
@@ -228,7 +228,7 @@ python3 ./scripts/audit_runner.py issue SA-123 --audit-children
 - `--max-child-audits N` (env `AUDIT_MAX_CHILD_AUDITS`) bounds the number of child audits a single run may auto-trigger (default: `5`).
 - Children with unchanged content are skipped via the content-based freshness gate — their stored verdict is reused instead of re-auditing.
 
-**Operator-attested green test run (`--green-run` / `AUDIT_GREEN_RUN`):** Some acceptance criteria are inherently execution-dependent — e.g. "Full project test suite passes with the new changes" — and the audit's read-only mandate forbids the runner (and its Phase 1/2 models) from executing the suite. Without external evidence such criteria can NEVER be verified inside the audit, so they always return `partial`. Operators should run the full suite via the [test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green) so the run is quiet-mode, triaged, and genuinely green. An operator who has verifiably run the full suite at the audited commit can then attest that fact and unblock those criteria:
+**Operator-attested green test run (`--green-run` / `AUDIT_GREEN_RUN`):** Some acceptance criteria are inherently execution-dependent — e.g. "Full project test suite passes with the new changes" — and the audit's read-only mandate forbids the runner (and its Phase 1/2 models) from executing the suite. Without external evidence such criteria can NEVER be verified inside the audit, so they always return `partial`. Operators should run the full suite via the [test skill](../../skill/test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green) so the run is quiet-mode, triaged, and genuinely green. An operator who has verifiably run the full suite at the audited commit can then attest that fact and unblock those criteria:
 
 ```bash
 python3 ./scripts/audit_runner.py issue SA-123 --green-run HEAD
@@ -247,14 +247,17 @@ Semantics:
 - **The runner never executes the test suite.** The attestation is external, operator-provided evidence; a false attestation is an operator/process violation the runner cannot detect — the operator is responsible for attesting truthfully and only for commits whose full suite they have actually run green.
 - Without an attestation, execution-dependent ACs remain `partial` and block closure exactly as before — this flag only adds an evidence path, it never relaxes the default read-only behavior.
 
-**Automatic full-suite verification (read-only test cache):** The runner can also verify execution-dependent criteria automatically — without any operator attestation — by consuming a green full-suite run from the per-repo test cache (`../test_cache.py`, SA-0MSGNUWQ9002LSMS / SA-0MSGN5OJ4002OZKY). When `/skill:test` (or any `run_tests.py` invocation) ran the full suite green at the audited git state within the cache TTL (2h), the runner looks the cached result up **read-only** via `query_cached()` — which never executes anything — and, when EVERY suite command (pytest + all node suite dirs) has a cached entry with exit code 0, injects an **AUTO-VERIFIED GREEN RUN** block into the Phase 1 parent prompt and ALL Phase 2 prompts. The model MAY then mark execution-dependent criteria (e.g. "full test suite passes") met based on the verified cached result, and the sha is recorded in the persisted report as an `Automatic green run evidence: <sha> (cached full-suite run)` line near the `Ready to close:` header.
+**Automatic full-suite verification (read-only test cache):** The runner can also verify execution-dependent criteria automatically — without any operator attestation — by consuming a green full-suite run from the per-repo test cache (`../test_cache.py`, SA-0MSGNUWQ9002LSMS / SA-0MSGN5OJ4002OZKY). When `/skill:test` (or any `run_tests.py` invocation) ran the full suite green at the audited git state within the cache TTL (2h), the runner looks the cached result up **read-only** via `query_cached()` — which never executes anything — and, when EVERY suite command (pytest + the node suite dirs that exist in the target repo) has a cached entry with exit code 0, injects an **AUTO-VERIFIED GREEN RUN** block into the Phase 1 parent prompt and ALL Phase 2 prompts. The model MAY then mark execution-dependent criteria (e.g. "full test suite passes") met based on the verified cached result, and the sha is recorded in the persisted report as an `Automatic green run evidence: <sha> (cached full-suite run)` line near the `Ready to close:` header.
+
+**Suite-command set is repo-aware (SA-0MSJELL44009XYIL):** `full_suite_commands()` emits a node command only for suite dirs that exist under the target repo (`tests/node`, `tests/cli`, `tests/unit`; missing dirs are skipped). A repo without `tests/node` (e.g. ContextHub's vitest-only layout) is therefore never asked about a phantom `tests/node` command that could only fail — auto-verification works for any layout instead of being structurally impossible.
 
 Semantics:
 
 - **No flag needed** — the automatic path is always attempted when no `--green-run`/`AUDIT_GREEN_RUN` attestation is present, and a valid operator attestation takes precedence (the automatic path augments rather than replaces SA-0MSGLAVCZ002LVZ4).
-- **Fail-closed:** a cache miss, a non-zero (or timed-out) cached run, a partially cached suite set (e.g. pytest but not node), an unresolvable HEAD, or any cache/infra error yields NO evidence — execution-dependent ACs stay `partial` and the audit completes normally (never crashes, never fabricates a green verdict).
+- **Fail-closed with a diagnostic:** a cache miss, a non-zero (or timed-out) cached run, a partially cached suite set (e.g. pytest but not node), an unresolvable HEAD, or any cache/infra error yields NO evidence — execution-dependent ACs stay `partial` and the audit completes normally (never crashes, never fabricates a green verdict). When verification fails, the runner prints a clear diagnostic to stderr that distinguishes a **cache miss** (`no cached full-suite run for '<cmd>' at HEAD <sha>`) from a **failed run** (`cached full-suite run for '<cmd>' exited non-zero (<code>)`), counts the unverifiable commands, and states the remedy: run the full suite once at the commit (`/skill:test` or `run_tests.py --force`) to populate the cache, then re-audit — or attest manually with `--green-run HEAD`.
 - **Read-only by construction:** `query_cached()` executes nothing, so the audit's read-only mandate is preserved unconditionally — the suite is never executed inside the audit. The cached run must match the audited git state exactly (HEAD sha + working-tree fingerprint) and be within the 2h TTL, so the evidence is a genuine full-suite result at the audited commit.
-- **Workflow:** run the full suite once via the [test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green; this populates the cache), then audits at the same git state within the TTL automatically verify execution-dependent ACs. This removes the manual attestation step for automated/read-only pipelines (e.g. the herdr downtime worker's auto-audit dispatches).
+- **Failed runs expire fast (SA-0MSJELL44009XYIL):** cache entries with a non-zero exit use a short 5-minute TTL, so a transient infra failure is never re-served as a current result for the full 2h TTL — a stale red entry degrades to a miss and re-execution instead of blocking auto-verification indefinitely.
+- **Workflow:** run the full suite once via the [test skill](../../skill/test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green; this populates the cache), then audits at the same git state within the TTL automatically verify execution-dependent ACs. This removes the manual attestation step for automated/read-only pipelines (e.g. the herdr downtime worker's auto-audit dispatches).
 
 **Auto-invoked test skill (`--run-tests`, SA-0MSJELSWS002UF60):** For environments that authorize test execution during audits (e.g. the herdr downtime worker's auto-audit dispatches, where the manual `/skill:test` round-trip stalls the pipeline), the `--run-tests` flag removes the operator round-trip entirely:
 
@@ -313,8 +316,9 @@ of improvised recursive greps:
   (maxdepth 2, same prunes).
 
 Unbounded recursive greps over the repo root or `.worklog/` (e.g.
-`grep -r ... .` or `grep -r ... .worklog/`) are forbidden. Single-file greps of
-`.worklog/worklog-data.jsonl` are permitted (e.g. `grep -n <id> .worklog/worklog-data.jsonl`).
+`grep -r ... .` or `grep -r ... .worklog/`) are forbidden. Worklog lookups use
+`wl search <keywords> --json` or `wl list <term> --json` for substring
+matching, `scan.py find-workitem <id>` for exact match.
 See `docs/dev/audit-grep-scan-patterns.md` (SA-0MSBR06GX0051T1Q) for the
 pattern catalogue and benchmark.
 
@@ -421,3 +425,44 @@ Notes:
 - The `_extract_json_array()` function strips prose text before/after JSON arrays,
   so it works correctly regardless of whether the model wraps its output in
   explanatory text (common in agent mode).
+
+## Context reduction (SA-0MSISKM8F004NW1U)
+
+Every pi call (`_call_pi`) runs with `--no-context-files --no-skills` in both
+tool-enabled and tool-less modes (SA-0MSISKM8F004NW1U). Audit prompts are fully
+self-contained — they carry the read-only mandate, JSON output format, FILE
+SCOPE manifest, SCANNING block, and criteria — so the global+project AGENTS.md
+load and the skills section are dropped from each session's static context,
+cutting per-call static context from ~14.9KB (~3.7K tokens) to ~1.7KB (~430
+tokens) — an 88% reduction and a ~23x margin under the 10K-token bound
+(measured via `verify_context_reduction.py check-static`, 2026-08-11). Prompts
+must never depend on AGENTS.md or skill descriptions: that is an invariant of
+this skill.
+
+### Per-call timing & token capture
+
+Every pi call records wall-clock duration (`elapsed_seconds`, all return paths)
+and, when the pi stream reports provider usage, the initial input-token count
+(`input_tokens`, from the `agent_end` message's usage block).
+`_call_pi_and_maybe_log` emits one line per call to stderr:
+
+```text
+Per-call timing: issue_id=<id> context=<context> elapsed_seconds=<seconds> input_tokens=<n>
+```
+
+`input_tokens` makes the context-reduction bound (<10K initial input tokens per
+audit session) verifiable from the timing line alone.
+
+### Verification script
+
+`skill/audit/scripts/verify_context_reduction.py` implements the AC2/AC3 checks
+as in-scope code (SA-0MSISKM8F004NW1U): `check-static` measures pi's
+static-context bytes via pi's own loaders with and without the flags;
+`check-sessions` extracts first-call `usage.input` from real audit-runner
+session files (scoped with `--since` to sessions after the flags landed) and
+asserts every session starts under the 10K bound across at least 5 distinct
+items; `reaudit-sample` re-audits a deterministic sample with the current
+runner and a flag-off runner copy, comparing verdicts (controlled before/after
+comparison). Exit status is 0 iff all checks pass; reports are written to
+`--report-dir` as JSON+Markdown for the work item's evidence record. Unit
+tests: `skill/audit/tests/test_verify_context_reduction.py`.

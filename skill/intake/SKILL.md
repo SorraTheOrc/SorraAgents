@@ -40,7 +40,7 @@ All status transitions are managed by the shared `StatusLifecycle` context manag
 
 ## Worklog resolution
 
-`intake.py` routes every `wl` call through the shared `run_wl` helper, which injects `--worklog-dir` with precedence: (1) explicit `--worklog-dir`, (2) prefix-to-sibling scan (item-id prefix → sibling projects' worklog stores), (3) cwd chain (`<cwd>/.worklog`, git root, nearest ancestor), (4) no flag — `wl` resolves from cwd. Full detail: [docs/dev/intake-skill-reference.md](../docs/dev/intake-skill-reference.md) and `docs/dev/worklog-sync.md`.
+`intake.py` routes every `wl` call through the shared `run_wl` helper, which injects `--worklog-dir` with precedence: (1) explicit `--worklog-dir`, (2) prefix-to-sibling scan (item-id prefix → sibling projects' worklog stores), (3) cwd chain (`<cwd>/.worklog`, git root, nearest ancestor), (4) no flag — `wl` resolves from cwd. Full detail: [docs/dev/intake-skill-reference.md](../../docs/dev/intake-skill-reference.md) and `docs/dev/worklog-sync.md`.
 
 ## Process (must follow)
 
@@ -80,7 +80,7 @@ If uncertain, fall back to the normal intake process (no auto-complete on border
   ```
   (Creation is not a status transition — the initial status is set at creation.) Remember the returned id.
 
-**Issue type decision guide** — full table in [docs/dev/intake-skill-reference.md](../docs/dev/intake-skill-reference.md). Summary:
+**Issue type decision guide** — full table in [docs/dev/intake-skill-reference.md](../../docs/dev/intake-skill-reference.md). Summary:
 
 - `bug` — currently **incorrect/broken**; the change corrects wrong behavior (not net-new capability).
 - `feature` — **adds new capability** that did not exist before (not merely fixing broken).
@@ -89,6 +89,23 @@ If uncertain, fall back to the normal intake process (no auto-complete on border
 - `epic` — **large scope** needing decomposition into subtasks.
 
 **Decision procedure** — when uncertain, ask: (1) *broken/incorrect?* → `bug`; (2) *net-new behavior?* → `feature`; (3) *no code-behavior change (docs/CI/deps/formatting)?* → `chore`; (4) *general-purpose (tests/refactoring/investigation)?* → `task`; (5) *large enough for subtasks?* → `epic`.
+
+**Priority classification guide** — use these rules to assign the correct `priority` (consulted only when the operator has not supplied an explicit priority value via `--priority` or similar flag):
+
+| Priority  | Use when… | Do NOT use when… | Examples |
+|-----------|-----------|-------------------|----------|
+| `critical` | Security vulnerabilities, data loss, broken builds, or blocking the release pipeline | The issue is not blocking or does not involve data security/integrity | Patching a CVE, fixing CI pipeline failure, recovering from data corruption |
+| `high`    | Major features, important bugs, or anything blocking other work | The work is not urgent or blocking | Shipping a major feature, fixing a significant user-facing bug |
+| `medium`  | Default priority for standard features, enhancements, or non-blocking bugs | The issue is critical/high urgency or trivial | Regular feature development, minor bug fixes, improvements |
+| `low`     | Polish, minor optimizations, nice-to-have improvements | The issue affects functionality or user experience | Cosmetic fixes, minor refactoring, documentation polish |
+
+**Decision procedure** — when priority is not specified by the operator, ask:
+1. *Does this involve security, data loss, or a broken build/release pipeline?* → `critical`
+2. *Is this a major feature, important bug, or is it blocking other work?* → `high`
+3. *Is this trivial polish or a nice-to-have with no functional impact?* → `low`
+4. *Otherwise?* → `medium` (default for standard work)
+
+> **Precedence rule:** Operator-specified priority (via `--priority` flag or explicit directive) always takes absolute precedence over classification. Classification is a fallback only.
 
 ### 4. Interview
 
@@ -140,7 +157,7 @@ This transitions `status=open`, `stage=intake_complete`.
 
 - `wl sync` to sync changes.  > **Note:** on a repo with **no commits yet** `wl sync` fails (unborn HEAD) — create an initial commit (`git commit --allow-empty -m "chore: initial"`) or use `wl sync --no-push`. See `docs/dev/worklog-sync.md`.
 - `wl show <work-item-id>` (not --json); remove temp files (`.worklog/tmp/intake-draft-<title>-<work-item-id>.md`).
-- Output a structured summary (`# Objective` headline, `# Acceptance Criteria` list, `# Effort and Risk` sizing; full template in [docs/dev/intake-skill-reference.md](../docs/dev/intake-skill-reference.md)). The AC list always includes: at least one testing/validation criterion; "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries."; and "Full project test suite must pass with the new changes."  > **Note:** CHANGELOG.md is **excluded** — managed by the ship skill's release pipeline. Do not include CI/CD pipeline tests.
+- Output a structured summary (`# Objective` headline, `# Acceptance Criteria` list, `# Effort and Risk` sizing; full template in [docs/dev/intake-skill-reference.md](../../docs/dev/intake-skill-reference.md)). The AC list always includes: at least one testing/validation criterion; "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries."; and "Full project test suite must pass with the new changes."  > **Note:** CHANGELOG.md is **excluded** — managed by the ship skill's release pipeline. Do not include CI/CD pipeline tests.
 - Finish with "This completes the Intake process for <work-item-id> <work-item-title>"
 
 ### 12. Error/abort handling

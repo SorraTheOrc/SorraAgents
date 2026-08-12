@@ -17,6 +17,7 @@ the test exercises the command-routing branches without needing a real repo.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -141,16 +142,31 @@ def test_run_tests_cache_keys_match_test_skill_canonical_commands(
 
 
 def test_run_tests_uses_shlex_safe_split(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The canonical commands must be split into clean argv lists (no quoting)."""
+    """The canonical commands must be split into clean argv lists (no quoting).
+
+    The subprocess boundary (``mod.run_cmd``) is stubbed so the test does not
+    require a real ``pytest`` console-script binary on PATH — environments
+    where pytest is installed under ``~/.local/bin`` (not on PATH) previously
+    failed this test with FileNotFoundError (SA-0MSOMWTXV008BVA8).
+    """
     mod = _load_implement()
     argv_calls: list[list[str]] = []
 
     monkeypatch.setattr(mod, "_detect_test_tooling", lambda cwd: "pytest")
 
+    def fake_run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+        argv_calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(mod, "run_cmd", fake_run_cmd)
+
     def fake_run_cached(command: str, **kwargs) -> dict:
         runner = kwargs["runner"]
         proc = runner(command, "/tmp", 600)
-        argv_calls.append(proc.args)
+        assert argv_calls == [
+            ["pytest", "-q", "-r", "a", "--disable-warnings"]
+        ]  # argv already captured by the stubbed run_cmd
+        assert proc.args == ["pytest", "-q", "-r", "a", "--disable-warnings"]
         return _canned_run(exit_code=0)
 
     monkeypatch.setattr(mod, "run_cached", fake_run_cached)
