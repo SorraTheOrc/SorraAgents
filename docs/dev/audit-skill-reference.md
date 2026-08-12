@@ -135,7 +135,7 @@ Short-circuits item-level audits when a recent, valid audit exists to avoid unne
 2. **Time gate (floor):** audits persisted without a fingerprint (legacy reports) fall back to the 60s timestamp gate — compare ``auditedAt`` against ``updatedAt + 60s``.
 3. If fresh: prints ``Skipping: audit still fresh`` + existing report, exits code 0 **without** status lifecycle.
 4. If stale or error: falls through to normal full audit.
-5. ``--force`` bypasses the gate. Applies only to item-level audits (``cmd_issue``).
+5. ``--force`` bypasses the gate — both for the item being audited and, on a parent run, for child verdict reuse (LP-0MSQ32MF200675AR): ``--force`` re-audits every child instead of reusing stored verdicts.
 
 Configuration: ``AUDIT_FRESHNESS_BUFFER_SECONDS = 60`` (in ``./scripts/audit_runner.py``).
 
@@ -145,6 +145,8 @@ Skipping: audit still fresh
 ```
 
 No status lifecycle transitions occur, and no persistence is performed. An explicit ``Ready to close: No`` verdict in the stored report is returned verbatim — it is never masked by a freshness skip.
+
+**Child verdict reuse uses the same content gate (primary):** the content-based fingerprint gate is the PRIMARY freshness test for child verdict reuse in parent audits, not just item-level audits (LP-0MSQ32MF200675AR). A child whose stored audit carries an unchanged fingerprint AND a parseable verdict is reused: its persisted AC verdict table appears in the parent report (with a ``Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`` marker) and NO pi calls are issued for that child — no child Phase 1 screening, no child Phase 2 deep/batch entry. The time gate remains the legacy floor for fingerprint-less child reports. ``--force`` bypasses child reuse exactly as it bypasses the item-level gate.
 
 ## Scripts
 
@@ -226,7 +228,7 @@ python3 ./scripts/audit_runner.py issue SA-123 --audit-children
 
 - `--audit-children` forces the full per-child flow (override of the default parent-first pass-through): each child without a fresh audit is independently reviewed; children without fresh audits that stay not-ready block the parent, verdict semantics unchanged.
 - `--max-child-audits N` (env `AUDIT_MAX_CHILD_AUDITS`) bounds the number of child audits a single run may auto-trigger (default: `5`).
-- Children with unchanged content are skipped via the content-based freshness gate — their stored verdict is reused instead of re-auditing.
+- Children with a fresh valid audit (content fingerprint unchanged + verdict present, LP-0MSQ32MF200675AR) are **reused with zero pi calls** — no child Phase 1 screening, no child Phase 2 deep/batch entry — and their persisted verdict table appears in the parent report with a `Child verdict reused from <auditedAt>` marker. `--force` bypasses reuse: all children are re-audited. Children WITHOUT a fresh audit are audited exactly as before (cascade, cap, and verdict semantics unchanged); reused children are NOT re-persisted (their own audit is authoritative), and child audits persisted by the parent embed the content fingerprint so they stay reusable on future runs.
 
 **Operator-attested green test run (`--green-run` / `AUDIT_GREEN_RUN`):** Some acceptance criteria are inherently execution-dependent — e.g. "Full project test suite passes with the new changes" — and the audit's read-only mandate forbids the runner (and its Phase 1/2 models) from executing the suite. Without external evidence such criteria can NEVER be verified inside the audit, so they always return `partial`. Operators should run the full suite via the [test skill](../../skill/test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green) so the run is quiet-mode, triaged, and genuinely green. An operator who has verifiably run the full suite at the audited commit can then attest that fact and unblock those criteria:
 
@@ -288,7 +290,7 @@ where `<context>` is the call type (e.g. `parent`, `phase2_deep`, `phase2_child:
 
 **File-scope manifest (Phase 2):** Each Phase 2 prompt (parent `phase2_deep` and every child `phase2_child:<i>`) now includes a **FILE SCOPE** section built from the work item's **Key Files** section, the **git changed-file list** (`git diff --name-only HEAD` + `git status --porcelain`), **Phase 1 evidence file:line references** (so the model verifies named files rather than re-discovering them), and a lightweight **repository index** (top-level layout with file counts). The prompt instructs the model to read ONLY in-scope files and to avoid unbounded `find`/`grep -r`/`ls -R` exploration. This bounds the dominant Phase 2 cost (unbounded repo exploration) without changing verdict semantics. If git is unavailable, the manifest degrades gracefully to the Key Files/evidence/index entries that can still be determined. See `docs/dev/audit-phase2-performance-evaluation.md` (SA-0MSAHR63100415PM) for the underlying evaluation.
 
-**Child verdict reuse (Phase 2):** When a child's own fresh audit already produced a ready verdict (`child_audit_ready=True`, from `cmd_issue`'s auto-triggered child audit), the parent Phase 2 **skips** the duplicated child deep-analysis call (`phase2_child:<i>`) and reuses the child's existing `ac_results`. The same skip applies to children whose own fresh audit returned an explicit **'not ready to close'** verdict (`child_audit_not_ready=True`, P12): their own pipeline already ran deep analysis on the same ACs, so the parent Phase 2 reuses the child's own persisted audit findings (parsed from the child's audit report AC table, falling back to the Phase 1 screening results when the table cannot be parsed). Children with no fresh audit verdict (stale / no audit) still get parent deep analysis. This eliminates duplicated child verification work without changing verdict semantics — a 'not ready' child still blocks the parent's Ready-to-close evaluation.
+**Child verdict reuse (Phase 2):** When a child's own fresh audit already produced a ready verdict (`child_audit_ready=True`), the parent Phase 2 **skips** the duplicated child deep-analysis call (`phase2_child:<i>`) and reuses the child's existing `ac_results`. The same skip applies to children whose own fresh audit returned an explicit **'not ready to close'** verdict (`child_audit_not_ready=True`, P12): their own pipeline already ran deep analysis on the same ACs, so the parent Phase 2 reuses the child's own persisted audit findings (parsed from the child's audit report AC table, falling back to the Phase 1 screening results when the table cannot be parsed). Children with no fresh audit verdict (stale / no audit) still get parent deep analysis. Freshness is decided by `_get_child_audit_verdict`: the content-fingerprint gate is the PRIMARY test (stored fingerprint vs the child's current state; unchanged + verdict present = fresh), with the legacy time gate as the floor for fingerprint-less reports (LP-0MSQ32MF200675AR); `--force` bypasses both. Because the reuse decision is made in the Phase 1 pre-pass (see below), a reused child costs ZERO pi calls across the whole run — no Phase 1 screening and no Phase 2 deep/batch entry — while a 'not ready' child still blocks the parent's Ready-to-close evaluation.
 
 **Parallel child deep analysis (Phase 2):** Independent child deep-analysis calls (`phase2_child:<i>`) run concurrently with bounded concurrency (default 2; configurable via the `AUDIT_PHASE2_PARALLELISM` env var, set to `1` for strictly-sequential historical behavior). The parent deep-analysis call always runs first and is never parallelized. Child workers are exception-isolated: a failure or timeout in one child degrades that child to `partial` (or falls back to its existing ACs) without affecting the others; on persistent executor failure the runner falls back to sequential execution. This collapses Phase 2 wall-clock from N sequential calls to ~N/cap while preserving per-child verdict isolation.
 
@@ -343,16 +345,7 @@ wall-clock cost (unbounded repository exploration during AC screening):
   `scan.py` helpers instead of unbounded `find`/`grep -r`/`ls -R` exploration.
   Phase 1 prompts keep the same verdict guidance (met/unmet/partial/adjusted
   with the same normalization) — only the reading strategy changed.
-- **Child verdict reuse (Phase 1):** The child persisted-audit verdict
-  (`child_audit_ready`) is now computed **before** the Phase 1 child AC review
-  loop. A child whose own fresh audit already produced a ready verdict
-  (`child_audit_ready=True`) **skips the Phase 1 child AC screening call** and
-  reuses the AC verdicts persisted in its own audit report (parsed from the
-  report's AC table; if the table cannot be parsed, each extracted AC falls
-  back to `met` with a reuse note, since a fresh ready audit deems all ACs
-  acceptable). Completed/done children remain exempt (AC5). The auto-trigger
-  loop reuses these pre-computed verdicts instead of re-querying
-  `wl audit-show` per child.
+- **Child verdict reuse (Phase 1, LP-0MSQ32MF200675AR):** The child persisted-audit verdict is computed **before** the Phase 1 child AC review loop, using the same content-fingerprint freshness gate as the item-level gate (stored fingerprint unchanged + verdict present = fresh; legacy time gate only for fingerprint-less reports). A child with a fresh valid audit — ready OR explicit not-ready verdict — **skips the Phase 1 child AC screening call entirely** (zero pi calls) and reuses the AC verdicts persisted in its own audit report (parsed from the report's AC table; if the table cannot be parsed, each extracted AC falls back to `met` with a reuse note, since a fresh ready audit deems all ACs acceptable). The child result records `reused_from=<auditedAt>` and the parent report marks it (`Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`). `--force` bypasses reuse (all children re-audited); reused children are NOT re-persisted by the parent (their own audit is authoritative) and child reports the parent does persist embed the content fingerprint. Completed/done children remain exempt (AC5). The auto-trigger loop reuses these pre-computed verdicts instead of re-querying `wl audit-show` per child.
 - **Parallel Phase 1 child screening:** Pending (no-audit / not-ready)
   children are reviewed concurrently with the same bounded concurrency used by
   Phase 2 (`_resolve_phase2_parallelism()` — default 2, configurable via the
