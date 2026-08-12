@@ -255,14 +255,17 @@ class TestReport:
 class TestSamplePreference:
     def _fake_list(self, monkeypatch, items):
         import subprocess as _sp
+        seen = []
         def fake_run(cmd, *a, **kw):
-            # The sampler now pipes `wl list --json` through jq via bash -c
-            # (SA-0MSLVQMKF000ESPZ); the mock emits the projected shape
-            # ({id, auditedAt, description} per item) that jq would produce.
+            # The sampler now runs per-status `wl list --status <s>` queries
+            # piped through jq via bash -c (SA-0MSLVQMKF000ESPZ); the mock
+            # emits the projected shape ({id, auditedAt, description} per
+            # item) that jq would produce, once per status loop (deduped).
             out = json.dumps([
                 {k: it.get(k) for k in ("id", "auditedAt", "description")}
                 for it in items
             ])
+            seen.append(cmd)
             return type("P", (), {"returncode": 0, "stdout": out, "stderr": ""})()
         monkeypatch.setattr(_sp, "run", fake_run)
 
@@ -277,7 +280,7 @@ class TestSamplePreference:
         ]
         # Only the second item has AC markers; give it a runner verdict too.
         def fake_run(cmd, *a, **kw):
-            if "list --json" in (" ".join(cmd) if isinstance(cmd, list) else str(cmd)):
+            if "list --status" in (" ".join(cmd) if isinstance(cmd, list) else str(cmd)):
                 out = json.dumps([
                     {k: it.get(k) for k in ("id", "auditedAt", "description")}
                     for it in items

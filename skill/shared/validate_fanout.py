@@ -75,7 +75,10 @@ def setup_worklog() -> tuple[Path, list[str]]:
             capture_output=True,
             check=False,
         )
-    out = subprocess.run(["wl", "list", "--json"], cwd=tmp, capture_output=True, text=True, check=False)
+    # The 8 items just created above all carry the default status (open);
+    # scope the list query per AGENTS.md (SA-0MSLVQMKF000ESPZ) instead of a
+    # bare dump.
+    out = subprocess.run(["wl", "list", "--status", "open", "--json"], cwd=tmp, capture_output=True, text=True, check=False)
     try:
         data = json.loads(out.stdout)
         items = data.get("workItems", [])

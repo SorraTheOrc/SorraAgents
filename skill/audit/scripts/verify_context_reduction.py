@@ -485,25 +485,36 @@ def _restore_item_state(item: AuditItem) -> None:
 def _sample_audited_items(count: int, seed: int, repo_root: Path) -> list[str]:
     """Deterministic sample of previously-audited work items.
 
-    Enumerates audited work items via a ``wl list --json`` piped through
-    ``jq`` (SA-0MSLVQMKF000ESPZ): only the ``{id, auditedAt, description}``
-    projection crosses the unbounded OS pipe into the process buffer — the
-    5.3 MB full dump never enters memory. Keeps those with a persisted
-    audit record, sorts by id, and draws candidates with
-    ``random.Random(seed)`` in a deterministic order. Probes candidates
-    (via ``wl show``) until *count* items whose persisted audit text
-    carries a runner verdict (``Ready to close: Yes|No``) are found, so
-    the before/after cross-check has real persisted verdicts to compare
-    against. Probing is bounded (20 probes per item wanted) to keep the
-    enumeration fast.
+    Enumerates audited work items via per-status scoped ``wl list --status
+    <s>`` queries piped through ``jq`` (SA-0MSLVQMKF000ESPZ): every query
+    carries a ``--status`` scoping filter per AGENTS.md, and only the
+    ``{id, auditedAt, description}`` projection crosses the unbounded OS
+    pipe into the process buffer — the 5.3 MB full dump never enters
+    memory. Audited items span all statuses, so the four statuses are
+    queried and merged. Keeps those with a persisted audit record, sorts
+    by id, and draws candidates with ``random.Random(seed)`` in a
+    deterministic order. Probes candidates (via ``wl show``) until *count*
+    items whose persisted audit text carries a runner verdict (``Ready to
+    close: Yes|No``) are found, so the before/after cross-check has real
+    persisted verdicts to compare against. Probing is bounded (20 probes
+    per item wanted) to keep the enumeration fast.
     """
-    proc = subprocess.run(
-        ["bash", "-c",
-         "wl list --json | jq -c '[.workItems[] | {id, auditedAt, description}]'"],
-        capture_output=True, text=True, timeout=120, check=False,
-    )
-    d = json.loads(proc.stdout)
-    items = d if isinstance(d, list) else (d.get("workItems") or d.get("items") or [])
+    items: list[dict] = []
+    for status in ("open", "in-progress", "blocked", "completed"):
+        proc = subprocess.run(
+            ["bash", "-c",
+             f"wl list --status {status} --json "
+             "| jq -c '[.workItems[] | {id, auditedAt, description}]'"],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        if proc.returncode != 0:
+            continue
+        try:
+            d = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            continue
+        batch = d if isinstance(d, list) else (d.get("workItems") or d.get("items") or [])
+        items.extend(batch)
     # Pre-filter: prefer items whose description carries acceptance criteria
     # so the re-audit exercises the parent pi call (and therefore captures
     # per-call input_tokens). Fall back to any audited item otherwise.
