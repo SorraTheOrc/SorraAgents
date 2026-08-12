@@ -189,6 +189,24 @@ class TestSkillMdMonitoredRunGuidance:
         assert "process tree" in section
         assert "failure notice" in section.lower()
 
+    def test_abort_failure_notice_includes_progress_summary(self) -> None:
+        """Failure notice mandates elapsed time, last phase marker, and trigger.
+
+        AC3 (SA-0MSL6E6KD006KJ0K): the progress-summary fields must appear in
+        SKILL.md itself, not only in the reference doc. The reference doc is
+        preferred by ``_section()``, so read SKILL.md directly to catch a
+        regression where the summary omits the required fields.
+        """
+        text = SKILL_MD.read_text()
+        start = text.find("## Monitored Run Execution")
+        assert start != -1
+        end = text.find("\n## ", start + 1)
+        section = text[start : end if end != -1 else len(text)]
+        assert "failure notice" in section.lower()
+        assert "elapsed time" in section.lower()
+        assert "phase marker" in section.lower()
+        assert "trigger" in section.lower()
+
     def test_abort_never_fabricates_or_overrides_a_verdict(self) -> None:
         """Abort never persists a fabricated report or overrides a verdict."""
         section = self._section()

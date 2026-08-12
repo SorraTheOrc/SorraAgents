@@ -2017,6 +2017,15 @@ class TestCmdIssueChildAuditAutoTrigger:
             fake_call_pi,
         )
 
+        # Fail the launch-context / file-scope guards open (LP-0MSQ32HNR007AI6B):
+        # these tests exercise child auto-trigger logic with fake work items,
+        # not scope validation — an unknown owning project is the documented
+        # fail-open path for both guards.
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._resolve_owning_project_root",
+            lambda *args, **kwargs: None,
+        )
+
         triggered_children = []
 
         def fake_subprocess_run(cmd, **kwargs):
@@ -2109,6 +2118,15 @@ class TestCmdIssueChildAuditAutoTrigger:
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
             fake_call_pi,
+        )
+
+        # Fail the launch-context / file-scope guards open (LP-0MSQ32HNR007AI6B):
+        # these tests exercise child auto-trigger logic with fake work items,
+        # not scope validation — an unknown owning project is the documented
+        # fail-open path for both guards.
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._resolve_owning_project_root",
+            lambda *args, **kwargs: None,
         )
 
         def fake_subprocess_run(cmd, **kwargs):
