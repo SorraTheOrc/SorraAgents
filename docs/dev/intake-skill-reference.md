@@ -41,6 +41,25 @@ order and `wl sync` failure modes.
 4. *Is this general-purpose work (tests, refactoring, investigation)?* → `task`
 5. *Is this large enough to need subtasks?* → `epic` (with children)
 
+## Priority classification guide (full)
+
+**Priority classification guide** — use these rules to assign the correct `priority` (consulted only when the operator has not supplied an explicit priority value via `--priority` or similar flag):
+
+| Priority  | Use when… | Do NOT use when… | Examples |
+|-----------|-----------|-------------------|----------|
+| `critical` | Security vulnerabilities, data loss, broken builds, or blocking the release pipeline | The issue is not blocking or does not involve data security/integrity | Patching a CVE, fixing CI pipeline failure, recovering from data corruption |
+| `high`    | Major features, important bugs, or anything blocking other work | The work is not urgent or blocking | Shipping a major feature, fixing a significant user-facing bug |
+| `medium`  | Default priority for standard features, enhancements, or non-blocking bugs | The issue is critical/high urgency or trivial | Regular feature development, minor bug fixes, improvements |
+| `low`     | Polish, minor optimizations, nice-to-have improvements | The issue affects functionality or user experience | Cosmetic fixes, minor refactoring, documentation polish |
+
+**Decision procedure** — when priority is not specified by the operator, ask:
+1. *Does this involve security, data loss, or a broken build/release pipeline?* → `critical`
+2. *Is this a major feature, important bug, or is it blocking other work?* → `high`
+3. *Is this trivial polish or a nice-to-have with no functional impact?* → `low`
+4. *Otherwise?* → `medium` (default for standard work)
+
+> **Precedence rule:** Operator-specified priority (via `--priority` flag or explicit directive) always takes absolute precedence over classification. Classification is a fallback only.
+
 ## Finishing output template (full)
 
 # Objective
