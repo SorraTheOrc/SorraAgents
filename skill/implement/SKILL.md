@@ -233,7 +233,15 @@ Guards (deterministic, in `phase_parent`):
 - **Abort/failure** in a child resets THAT child to `open` (StatusLifecycle
   abort semantics) and stops the chain with a report of what completed and
   what failed; already-completed siblings are not regressed.
+- **No orphaned `in_progress`** — a child start failure or abort leaves no
+  in-progress state behind; re-run the parent phase after resolving the
+  blocker to continue the chain.
 - A parent with no children or all-terminal children behaves as today.
+
+Worktree isolation per child is preserved: every child is implemented in
+its own worktree created by `phase_start` (never the main checkout);
+sequential children reuse/rotate the `.worklog/worktrees` machinery. The
+parent itself gets no worktree.
 
 - Write tests and code to meet ACs:
   - **Write tests first** (TDD preferred) — at least one test file before
