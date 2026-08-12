@@ -119,6 +119,75 @@ class TestFindWorklogDirByPrefix:
 
 
 # ===========================================================================
+# Sibling scan caching (SA-0MSL1YX24000V2MG)
+# ===========================================================================
+
+
+class TestFindWorklogDirByPrefixCaching:
+    """The sibling scan runs at most once per process per (scan-root, prefix).
+
+    AC1: the scan is memoized; repeated resolutions for the same prefix and
+    scan root must not re-run ``glob``/config reads. The cache key includes
+    the scan root so tests that patch ``SIBLING_SCAN_ROOT`` stay isolated.
+    """
+
+    def test_scan_runs_once_per_prefix(self, tmp_path):
+        """AC1: two resolutions with the same prefix run the scan once."""
+        target, patcher = _make_sibling_projects(tmp_path, prefix="OSL")
+        calls: list[tuple[Path, str]] = []
+        original_glob = Path.glob
+
+        def counting_glob(self, pattern: str):
+            calls.append((self, pattern))
+            return original_glob(self, pattern)
+
+        with patcher, mock.patch.object(Path, "glob", counting_glob):
+            first = status_lifecycle._find_worklog_dir_by_prefix("OSL")
+            second = status_lifecycle._find_worklog_dir_by_prefix("OSL")
+
+        assert first == target
+        assert second == target
+        scan_calls = [c for c in calls if c[1] == "*/.worklog/config.yaml"]
+        assert len(scan_calls) == 1
+
+    def test_different_prefixes_scan_separately(self, tmp_path):
+        """AC1: distinct prefixes are cached independently."""
+        _target, patcher = _make_sibling_projects(tmp_path, prefix="OSL")
+        calls: list[tuple[Path, str]] = []
+        original_glob = Path.glob
+
+        def counting_glob(self, pattern: str):
+            calls.append((self, pattern))
+            return original_glob(self, pattern)
+
+        with patcher, mock.patch.object(Path, "glob", counting_glob):
+            assert status_lifecycle._find_worklog_dir_by_prefix("OSL") is not None
+            assert status_lifecycle._find_worklog_dir_by_prefix("ZZZ") is None
+            assert status_lifecycle._find_worklog_dir_by_prefix("OSL") is not None
+
+        scan_calls = [c for c in calls if c[1] == "*/.worklog/config.yaml"]
+        # OSL cached after first call; ZZZ cached after first call -> 2 scans.
+        assert len(scan_calls) == 2
+
+    def test_miss_is_cached_too(self, tmp_path):
+        """AC1: a None (miss) result is cached like a hit."""
+        _target, patcher = _make_sibling_projects(tmp_path, prefix="OSL")
+        calls: list[tuple[Path, str]] = []
+        original_glob = Path.glob
+
+        def counting_glob(self, pattern: str):
+            calls.append((self, pattern))
+            return original_glob(self, pattern)
+
+        with patcher, mock.patch.object(Path, "glob", counting_glob):
+            assert status_lifecycle._find_worklog_dir_by_prefix("ZZZ") is None
+            assert status_lifecycle._find_worklog_dir_by_prefix("ZZZ") is None
+
+        scan_calls = [c for c in calls if c[1] == "*/.worklog/config.yaml"]
+        assert len(scan_calls) == 1
+
+
+# ===========================================================================
 # Framework root derivation (worktree-safe, SA-0MSG57UNY009DE51)
 # ===========================================================================
 
