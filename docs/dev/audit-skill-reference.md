@@ -131,7 +131,7 @@ Short-circuits item-level audits when a recent, valid audit exists to avoid unne
 
 ### Behavior
 
-1. **Content-based gate (primary):** each audit captures a content fingerprint — git HEAD sha + work-item description hash + Key Files list — and embeds it in the persisted report (`Audit content fingerprint: <sha256hex>`). Re-auditing an item whose fingerprint is unchanged returns the existing report in seconds instead of re-running the pipeline (SA-0MSKB6US1009CNHT). A change in ANY fingerprint component (new commit, edited description/ACs, changed Key Files) invalidates freshness and re-runs the full audit.
+1. **Content-based gate (primary):** each audit captures a content fingerprint — git HEAD sha + work-item description hash + Key Files list + working-tree state (hash of `git status --porcelain` + `git diff --name-only HEAD` output) — and embeds it in the persisted report (`Audit content fingerprint: <sha256hex>`). Re-auditing an item whose fingerprint is unchanged returns the existing report in seconds instead of re-running the pipeline (SA-0MSKB6US1009CNHT). A change in ANY fingerprint component (new commit, edited description/ACs, changed Key Files, uncommitted or untracked working-tree changes) invalidates freshness and re-runs the full audit. The working-tree component degrades to an empty marker when git is unavailable (fail-open).
 2. **Time gate (floor):** audits persisted without a fingerprint (legacy reports) fall back to the 60s timestamp gate — compare ``auditedAt`` against ``updatedAt + 60s``.
 3. If fresh: prints ``Skipping: audit still fresh`` + existing report, exits code 0 **without** status lifecycle.
 4. If stale or error: falls through to normal full audit.

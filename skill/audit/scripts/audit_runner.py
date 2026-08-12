@@ -726,12 +726,17 @@ def _compute_content_fingerprint(runner: Runner, issue_id: str,
                                  work_item: dict | None = None) -> str | None:
     """Compute the content fingerprint for a work item at the current state.
 
-    The fingerprint combines three components so that a change in ANY of them
-    invalidates freshness (SA-0MSKB6US1009CNHT):
+    The fingerprint combines four components so that a change in ANY of them
+    invalidates freshness (SA-0MSKB6US1009CNHT, SA-0MSL1YXG7004F2BZ):
 
     1. **git HEAD sha** — the repository state being audited.
     2. **work-item description hash** — the audited acceptance criteria text.
     3. **Key Files list** — the file-scope manifest of the audited item.
+    4. **working-tree state** — a hash of ``git status --porcelain`` +
+       ``git diff --name-only HEAD`` output, so uncommitted/untracked
+       changes between audits invalidate freshness (the audit reads the
+       working tree, not just HEAD). Degrades to an empty marker when git
+       is unavailable so fail-open callers keep working.
 
     *work_item* may be passed in to avoid a redundant ``wl show`` call when
     the caller already fetched the work item (e.g. ``cmd_issue``). When
@@ -757,7 +762,33 @@ def _compute_content_fingerprint(runner: Runner, issue_id: str,
         "head_sha": head_sha,
         "description_hash": hashlib.sha256(description.encode("utf-8")).hexdigest(),
         "key_files": key_files,
+        "working_tree_hash": _resolve_working_tree_hash(runner),
     }, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _resolve_working_tree_hash(runner: Runner) -> str:
+    """Hash the working-tree state for the fingerprint (SA-0MSL1YXG7004F2BZ).
+
+    Combines ``git status --porcelain`` (untracked + unstaged changes) with
+    ``git diff --name-only HEAD`` (staged changes) into a deterministic
+    sorted payload, hashed with sha256. Returns a fixed empty-string marker
+    when git is unavailable so the fingerprint still works fail-open.
+    """
+    lines: list[str] = []
+    for cmd in (["git", "status", "--porcelain"], ["git", "diff", "--name-only", "HEAD"]):
+        try:
+            proc = runner(cmd)
+        except Exception:  # noqa: BLE001 -- git is best-effort here
+            continue
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    lines.append(line)
+    if not lines:
+        return ""
+    payload = "\n".join(sorted(set(lines)))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

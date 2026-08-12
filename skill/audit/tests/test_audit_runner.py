@@ -3124,6 +3124,12 @@ class TestOptInChildAuditCascade:
                     stderr="",
                 )
 
+            # Working-tree fingerprint (SA-0MSL1YXG7004F2BZ): a clean tree
+            # yields an empty marker — matches the stored fingerprint computed
+            # with a MagicMock runner (no git output).
+            if cmd_str.startswith("git status") or cmd_str.startswith("git diff"):
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
             return SimpleNamespace(
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
@@ -6765,6 +6771,14 @@ class TestContentFreshnessGate:
     Legacy audits without a fingerprint fall back to the 60s time floor.
     """
 
+    @staticmethod
+    def _proc(returncode: int, stdout: str):
+        """Build a canned CompletedProcess for git subprocess calls."""
+        return subprocess.CompletedProcess(
+            args=[], returncode=returncode, stdout=stdout, stderr="",
+        )
+
+
     _HEAD = "a" * 40
     _DESC = "## Acceptance Criteria\n- AC1: do the thing\n\n## Key Files\n- `src/a.py`"
 
@@ -6882,6 +6896,106 @@ class TestContentFreshnessGate:
         assert audit_runner._extract_content_fingerprint(
             "Ready to close: Yes\n\n## Summary\nok"
         ) is None
+
+    # ------------------------------------------------------------------
+    # Working-tree state in the fingerprint (SA-0MSL1YXG7004F2BZ)
+    # ------------------------------------------------------------------
+
+    def _tree_state(self, *status_lines):
+        """Compute a fingerprint given git status/diff output lines."""
+        status = "\n".join(status_lines)
+
+        def _fake_runner(cmd):
+            cmd_str = " ".join(cmd)
+            if cmd_str.startswith("git status"):
+                return self._proc(0, status)
+            if cmd_str.startswith("git diff"):
+                return self._proc(0, "")  # diff name-only folded into status output
+            raise AssertionError(f"unexpected cmd: {cmd_str}")
+
+        return audit_runner._compute_content_fingerprint(
+            _fake_runner, "TEST-1", work_item={"description": self._DESC},
+        )
+
+    def test_fingerprint_changes_with_uncommitted_modified_file(self):
+        """AC1: an uncommitted tracked-file change invalidates the fingerprint."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            f_clean = self._tree_state()
+            f_dirty = self._tree_state(" M src/a.py")
+        assert f_clean != f_dirty
+
+    def test_fingerprint_changes_with_untracked_file(self):
+        """AC2: an added untracked file invalidates the fingerprint."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            f_clean = self._tree_state()
+            f_untracked = self._tree_state("?? new_file.py")
+        assert f_clean != f_untracked
+
+    def test_fingerprint_committed_change_invalidates_via_head(self):
+        """AC3: committing a change invalidates via the existing HEAD sha component."""
+        with mock.patch.object(audit_runner, "_resolve_audited_head") as mock_head:
+            mock_head.side_effect = ["h" * 40, "g" * 40]
+            f1 = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+            f2 = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+        assert f1 != f2
+
+    def test_fingerprint_stable_for_untouched_tree(self):
+        """AC4: an untouched working tree keeps the same fingerprint."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            f1 = self._tree_state()
+            f2 = self._tree_state()
+        assert f1 == f2
+
+    def test_fingerprint_stable_when_git_status_unavailable(self):
+        """AC4 (fail-open): git status failure does not break the fingerprint.
+
+        The working-tree component degrades to an empty marker so audits in
+        environments without git (or with a broken runner) keep working;
+        freshness still works off the remaining components.
+        """
+        def _fake_runner(cmd):
+            cmd_str = " ".join(cmd)
+            if cmd_str.startswith("git status"):
+                return self._proc(1, "fatal: not a git repository")
+            raise AssertionError(f"unexpected cmd: {cmd_str}")
+
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                _fake_runner, "TEST-1", work_item={"description": self._DESC},
+            )
+        assert fp is not None
+        assert len(fp) == 64
+
+    def test_fingerprint_changes_with_git_diff_output(self):
+        """AC1: staged changes reported by git diff --name-only HEAD count too."""
+        def _fake_runner(cmd):
+            cmd_str = " ".join(cmd)
+            if cmd_str.startswith("git status"):
+                return self._proc(0, "")
+            if cmd_str.startswith("git diff"):
+                return self._proc(0, "src/a.py\nsrc/b.py")
+            raise AssertionError(f"unexpected cmd: {cmd_str}")
+
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            f_clean = self._tree_state()
+            f_staged = audit_runner._compute_content_fingerprint(
+                _fake_runner, "TEST-1", work_item={"description": self._DESC},
+            )
+        assert f_clean != f_staged
 
     # ------------------------------------------------------------------
     # Freshness gate decisions (AC1, AC3)

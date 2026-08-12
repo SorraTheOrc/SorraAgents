@@ -55,7 +55,7 @@ Audits can run for **hours**; the **launch → monitor → abort** contract is i
 
 Short-circuits item-level audits when a recent, valid audit exists. Full behavior in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md):
 
-1. **Content-based (primary):** fingerprint = HEAD sha + description hash + Key Files; unchanged → existing report (SA-0MSKB6US1009CNHT).
+1. **Content-based (primary):** fingerprint = HEAD sha + description hash + Key Files + working-tree state (`git status --porcelain` + `git diff --name-only HEAD`); unchanged → existing report (SA-0MSKB6US1009CNHT).
 2. **Time gate (floor):** legacy reports use the 60s gate (`auditedAt` vs `updatedAt + 60s`).
 3. Fresh → `Skipping: audit still fresh`, exit 0, **no** lifecycle/persistence.
 4. `--force` bypasses. Config: `AUDIT_FRESHNESS_BUFFER_SECONDS = 60`.
