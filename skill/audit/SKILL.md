@@ -80,6 +80,14 @@ Audits can run for **hours**; the **launch → monitor → abort** contract is i
 - **Monitor:** every 3 min — `kill -0 <pid>`, `tail -50 <log>` (markers: `Phase 1 passed: running Phase 2 deep code analysis...`, `Per-call timing:`); confirm log growth.
 - **Abort:** stale log ≥10 min, ≥3 provider-error retries w/o progress, unexpected exits/loops, or 180-min budget → kill tree (`pkill -TERM -P` → `kill` → `-KILL`); restore pre-audit status/stage only if the runner didn't complete its lifecycle (never demote `in_review`→`open`); append failure notice (progress summary: elapsed time, last phase marker, trigger) and **report the outcome to the operator** (run id, log path, trigger, restored status/stage). Never fabricate a report or override a completed verdict.
 
+### In-process per-call safeguards (complementary to the external monitor)
+
+The runner also protects individual Pi calls in-process, so the external monitor is a **backstop** rather than the primary abort mechanism (LP-0MSQ32S2M001EA74):
+
+- **Short child Phase-1 screen budget:** lightweight child Phase-1 AC-review screens use a short per-call budget (default 600 s; `AUDIT_CHILD_SCREEN_TIMEOUT` env or `--child-screen-timeout` flag). A screen that exceeds its budget returns a clean timeout verdict (`_timeout` marker + timeout evidence) — never a full 1800 s burn. Phase 2 calls (parent + child deep analysis) and parent Phase-1 screens keep the 1800 s budget.
+- **In-process stall abort:** any single Pi call (Phase 1 or Phase 2) that produces no output for ≥ `AUDIT_STALL_TIMEOUT` seconds (default 600 = 10 min) is aborted in-process inside `_call_pi` (kill + drain) with a `_timeout` verdict and stall evidence, instead of waiting out the remaining per-call budget. The external stale-log abort (≥10 min) remains as a backstop.
+- **Slot-aware child-call concurrency:** the parallel child-call ceiling (Phase-1 child AC review and Phase-2 child deep analysis) is derived dynamically from the local proxy slot status (`/llama/local/status` → `available_slots`/`total_slots`; `AUDIT_SLOT_STATUS_URL`, short 1 s timeout, fail-open). The ceiling is `min(free-slots, configured_max)` with a floor of 1; when the slot query fails the runner degrades to the configured static ceiling (`AUDIT_MAX_CHILD_CONCURRENCY` > `AUDIT_PHASE2_PARALLELISM` > 2).
+
 ## Freshness Gate
 
 Short-circuits item-level audits when a recent, valid audit exists. Full behavior in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md):

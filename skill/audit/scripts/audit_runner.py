@@ -46,11 +46,13 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -173,6 +175,44 @@ the effective per-call Pi model timeout instead of ``CALL_PI_TIMEOUT``.
 This lets release operators raise the audit runner's tolerance for slow
 Pi model calls (e.g. ``AUDIT_PI_TIMEOUT=3600``) without changing defaults.
 """
+
+AUDIT_CHILD_SCREEN_TIMEOUT_ENV = "AUDIT_CHILD_SCREEN_TIMEOUT"
+"""Environment variable name for the child Phase-1 AC-review screen budget.
+
+Child Phase-1 AC-review screens are lightweight (30-190 s healthy) so they
+use a short per-call budget (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 600 s)
+instead of the full 1800 s Phase-2 budget. A screen that exceeds this
+budget returns a clean timeout verdict (existing ``_timeout`` marker +
+timeout evidence) — never a full 1800 s burn. Overridable via the
+``--child-screen-timeout`` CLI flag (flag wins) or this env var.
+"""
+
+_CHILD_SCREEN_TIMEOUT_DEFAULT = 600
+"""Default per-call budget (seconds) for child Phase-1 AC-review screens.
+
+Set conservatively above healthy child Phase-1 durations (30-190 s) but far
+below the 1800 s Phase-2 budget, so a stalled lightweight child screen fails
+fast instead of burning a full 30-min budget (LP-0MSQ32S2M001EA74 AC1).
+"""
+
+AUDIT_STALL_TIMEOUT_ENV = "AUDIT_STALL_TIMEOUT"
+"""Environment variable name for the in-process stall-abort threshold.
+
+Any single Pi call (Phase 1 or Phase 2) that produces no output/progress
+for at least this many seconds is aborted in-process inside ``_call_pi``
+(``proc.kill()`` + drain) instead of waiting out the remaining per-call
+budget. Default ``_STALL_TIMEOUT_DEFAULT`` = 600 s (10 min); invalid values
+are ignored with a warning. The external monitored-run stale-log abort
+(>= 10 min, SKILL.md) remains as a backstop.
+"""
+
+_STALL_TIMEOUT_DEFAULT = 600
+"""Default in-process stall-abort threshold (seconds).
+
+10 min is generous vs healthy Phase 1 screens (30-190 s) while still aborting
+a genuinely hung call well before its 1800 s budget (LP-0MSQ32S2M001EA74 AC2).
+"""
+
 
 AUDIT_GREEN_RUN_ENV = "AUDIT_GREEN_RUN"
 """Environment variable name for the operator-attested green test run.
@@ -315,6 +355,38 @@ Chosen conservatively so the local model proxy is not overwhelmed while
 still collapsing the N-sequential-calls wall-clock to N/cap. Operators can
 override via ``AUDIT_PHASE2_PARALLELISM``.
 """
+
+AUDIT_SLOT_STATUS_URL_ENV = "AUDIT_SLOT_STATUS_URL"
+"""Environment variable name for the local proxy slot-status endpoint.
+
+The runner queries this endpoint to derive the dynamic child-call
+concurrency ceiling (LP-0MSQ32S2M001EA74 AC3). Defaults to
+``AUDIT_SLOT_STATUS_URL_DEFAULT`` (http://localhost:8000/llama/local/status).
+"""
+
+AUDIT_SLOT_STATUS_URL_DEFAULT = "http://localhost:8000/llama/local/status"
+"""Default local proxy slot-status endpoint (``/llama/local/status``).
+
+Reports ``available_slots``/``total_slots`` from llama-server ``/slots`` with
+fail-open to ``session_slot_pool_size`` when no model is loaded
+(LP-0MSI06HPB0043MV1).
+"""
+
+AUDIT_SLOT_STATUS_TIMEOUT = 1.0
+"""Short timeout (seconds) for the slot-status query (fail-open).
+
+The dynamic ceiling must never block or fail the audit when the endpoint
+is unavailable — a 1 s timeout keeps the best-effort query cheap.
+"""
+
+AUDIT_MAX_CHILD_CONCURRENCY_ENV = "AUDIT_MAX_CHILD_CONCURRENCY"
+"""Environment variable name for the max child-call concurrency cap.
+
+Caps the dynamic slot-aware ceiling (LP-0MSQ32S2M001EA74 AC3). Defaults to
+``_resolve_phase2_parallelism()`` (``AUDIT_PHASE2_PARALLELISM`` env or 2),
+preserving the existing static knob as the floor/fallback.
+"""
+
 
 AUDIT_FRESHNESS_BUFFER_SECONDS = 60
 """Freshness buffer (seconds) for the recent-audit gate.
@@ -1158,6 +1230,56 @@ def _resolve_effective_timeout(cli_timeout: int | None) -> int | None:
     return None
 
 
+def _resolve_child_screen_timeout(cli_timeout: int | None) -> int | None:
+    """Resolve the per-call budget for child Phase-1 AC-review screens.
+
+    Precedence:
+      1. ``--child-screen-timeout`` CLI flag (explicit override)
+      2. ``AUDIT_CHILD_SCREEN_TIMEOUT`` environment variable (seconds)
+      3. ``None`` — falls back to ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (600 s)
+         inside ``_call_pi`` for child screens
+
+    An invalid value (non-integer) is ignored with a warning so a
+    misconfigured environment cannot break the audit run.
+    """
+    if cli_timeout is not None:
+        return cli_timeout
+    env_value = os.environ.get(AUDIT_CHILD_SCREEN_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_CHILD_SCREEN_TIMEOUT_ENV} value {env_value!r}; "
+                "using default child-screen timeout",
+                file=sys.stderr,
+            )
+    return None
+
+
+def _resolve_stall_timeout() -> int:
+    """Resolve the in-process stall-abort threshold in seconds.
+
+    Precedence:
+      1. ``AUDIT_STALL_TIMEOUT`` environment variable (seconds)
+      2. ``_STALL_TIMEOUT_DEFAULT`` (600)
+
+    An invalid value (non-integer) is ignored with a warning so a
+    misconfigured environment cannot break the audit run.
+    """
+    env_value = os.environ.get(AUDIT_STALL_TIMEOUT_ENV)
+    if env_value:
+        try:
+            return int(env_value)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_STALL_TIMEOUT_ENV} value {env_value!r}; "
+                "using default stall timeout",
+                file=sys.stderr,
+            )
+    return _STALL_TIMEOUT_DEFAULT
+
+
 def _green_run_prompt_block(sha: str) -> str:
     """Build the GREEN-RUN attestation block injected into audit prompts.
 
@@ -1576,6 +1698,86 @@ def _resolve_phase2_parallelism() -> int:
     return _PHASE2_DEFAULT_PARALLELISM
 
 
+def _query_slot_status(url: str | None = None,
+                       timeout: float = AUDIT_SLOT_STATUS_TIMEOUT) -> tuple[int | None, int | None]:
+    """Best-effort query of the local proxy slot-status endpoint.
+
+    Returns ``(available_slots, total_slots)`` from
+    ``/llama/local/status``, or ``(None, None)`` when the endpoint is
+    unreachable, times out, returns non-JSON, or lacks the slot fields
+    (fail-open — the caller degrades to the configured static ceiling).
+
+    The query uses a short timeout (``AUDIT_SLOT_STATUS_TIMEOUT`` = 1 s) and
+    never raises: the dynamic ceiling must never block or fail the audit
+    when the endpoint is unavailable (LP-0MSQ32S2M001EA74 AC3).
+    """
+    target = url or os.environ.get(AUDIT_SLOT_STATUS_URL_ENV, AUDIT_SLOT_STATUS_URL_DEFAULT)
+    try:
+        with urllib.request.urlopen(target, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        available = data.get("available_slots")
+        total = data.get("total_slots")
+        if available is None or total is None:
+            return None, None
+        return int(available), int(total)
+    except Exception:  # noqa: BLE001 — best-effort, fail-open
+        return None, None
+
+
+def _resolve_max_child_concurrency() -> int:
+    """Resolve the max child-call concurrency cap (static floor).
+
+    Precedence:
+      1. ``AUDIT_MAX_CHILD_CONCURRENCY`` environment variable (integer >= 1)
+      2. ``_resolve_phase2_parallelism()`` (``AUDIT_PHASE2_PARALLELISM`` env or 2)
+
+    Values below 1 are clamped to 1. An invalid (non-integer) value is
+    ignored with a warning so a misconfigured environment cannot break the
+    audit run.
+    """
+    env_value = os.environ.get(AUDIT_MAX_CHILD_CONCURRENCY_ENV)
+    if env_value:
+        try:
+            parsed = int(env_value)
+            return max(1, parsed)
+        except ValueError:
+            print(
+                f"Warning: invalid {AUDIT_MAX_CHILD_CONCURRENCY_ENV} value {env_value!r}; "
+                "using default max child concurrency",
+                file=sys.stderr,
+            )
+    return _resolve_phase2_parallelism()
+
+
+def _resolve_child_concurrency() -> int:
+    """Resolve the slot-aware dynamic child-call concurrency ceiling.
+
+    Queries the local proxy status endpoint for ``available_slots`` /
+    ``total_slots`` and derives the child-call ceiling from the available
+    headroom: ``min(max(1, available_headroom), configured_max)`` where
+    ``available_headroom = total_slots - slots_in_use`` (i.e. the free
+    slots reported by the endpoint).
+
+    - When the slot query fails (unreachable/timeout/error), the runner
+      degrades gracefully to the configured static ceiling
+      (``AUDIT_MAX_CHILD_CONCURRENCY`` > ``AUDIT_PHASE2_PARALLELISM`` > 2)
+      — the dynamic ceiling never blocks or fails the audit (fail-open).
+    - The result is always at least 1 (never 0) so a saturated pool
+      degrades to sequential execution rather than stalling the audit.
+
+    The dynamic ceiling is queried once per child-call batch dispatch
+    (not per call) to avoid oscillation (LP-0MSQ32S2M001EA74 AC3).
+    """
+    configured_max = _resolve_max_child_concurrency()
+    available, total = _query_slot_status()
+    if available is None or total is None:
+        return configured_max
+    # Available headroom = free slots reported by the endpoint
+    # (available_slots; slots_in_use = total - available).
+    headroom = max(0, int(available))
+    return max(1, min(headroom, configured_max))
+
+
 AUDIT_PHASE2_BATCH_ENV = "AUDIT_PHASE2_BATCH"
 """Environment variable enabling Phase 2 batch deep analysis (P6).
 
@@ -1716,12 +1918,109 @@ def _resolve_model_for_phase(phase: str, config: dict,
 # Pi integration (duplicated from ralph for now – see OQ-1)
 # ---------------------------------------------------------------------------
 
+def _resolve_call_timeout(timeout: int | None, child_screen: bool = False) -> int:
+    """Resolve the effective per-call Pi timeout for a single call.
+
+    Precedence:
+      1. explicit ``timeout`` arg (from ``--timeout`` / ``AUDIT_PI_TIMEOUT``)
+      2. child Phase-1 AC-review screens: ``AUDIT_CHILD_SCREEN_TIMEOUT``
+         env or ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (600 s) — a lightweight
+         child screen that exceeds its short budget fails fast instead of
+         burning the full 1800 s (LP-0MSQ32S2M001EA74 AC1)
+      3. all other calls: ``CALL_PI_TIMEOUT`` (1800 s)
+    """
+    if timeout is not None:
+        return timeout
+    if child_screen:
+        return _resolve_child_screen_timeout(None) or _CHILD_SCREEN_TIMEOUT_DEFAULT
+    return CALL_PI_TIMEOUT
+
+
+def _communicate_with_stall(process, cmd: list[str],
+                            effective_timeout: int,
+                            stall_timeout: int) -> tuple[str, str]:
+    """Communicate with the pi process, aborting early on stall.
+
+    Incrementally reads stdout/stderr (no pipe-buffer deadlocks) and tracks
+    the last output-arrival time. When no output arrives for
+    ``stall_timeout`` seconds, raises ``subprocess.TimeoutExpired`` with
+    ``timeout=stall_timeout`` so the caller can kill the process and emit a
+    stall-abort verdict (LP-0MSQ32S2M001EA74 AC2). When the total
+    ``effective_timeout`` budget expires first, raises
+    ``subprocess.TimeoutExpired`` with ``timeout=effective_timeout``.
+
+    Returns ``(stdout, stderr)`` on normal completion. Falls back to the
+    historical blocking ``communicate(timeout=...)`` when the process does
+    not expose select-able stdout/stderr streams (e.g. mocked processes in
+    unit tests), preserving the existing contract for those callers.
+    """
+    # Mocked processes (unit tests) expose MagicMock streams without real
+    # fds; a real Popen with text=True exposes TextIOWrapper objects whose
+    # fileno() is an int. Fall back to blocking communicate() for the mock
+    # path so existing callers/tests are unchanged.
+    try:
+        out_fd = process.stdout.fileno()
+        err_fd = process.stderr.fileno()
+        if not (isinstance(out_fd, int) and isinstance(err_fd, int)):
+            return process.communicate(timeout=effective_timeout)
+    except (AttributeError, OSError, ValueError):
+        return process.communicate(timeout=effective_timeout)
+
+    deadline = time.monotonic() + effective_timeout
+    last_output = time.monotonic()
+    out_chunks: list[str] = []
+    err_chunks: list[str] = []
+    fds = {out_fd: (process.stdout, out_chunks), err_fd: (process.stderr, err_chunks)}
+    while fds:
+        now = time.monotonic()
+        remaining = deadline - now
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(cmd, effective_timeout)
+        stall_remaining = stall_timeout - (now - last_output)
+        if stall_remaining <= 0:
+            raise subprocess.TimeoutExpired(cmd, stall_timeout)
+        wait = min(remaining, stall_remaining)
+        try:
+            rlist, _, _ = select.select(list(fds.keys()), [], [], max(wait, 0.01))
+        except (OSError, ValueError):
+            break  # pipes closed / process gone
+        if process.poll() is not None and not rlist:
+            break
+        for fd in rlist:
+            _stream, chunks = fds[fd]
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
+                del fds[fd]
+                continue
+            if not data:
+                # EOF on this pipe: stop watching it (select keeps reporting
+                # EOF'd fds as readable, so we must drop it to avoid a busy loop).
+                del fds[fd]
+                continue
+            last_output = time.monotonic()
+            chunks.append(data.decode(errors="replace"))
+    # Drain any remaining buffered output after the process exits
+    for fd, (_stream, chunks) in ((out_fd, (process.stdout, out_chunks)),
+                                  (err_fd, (process.stderr, err_chunks))):
+        try:
+            while True:
+                data = os.read(fd, 65536)
+                if not data:
+                    break
+                chunks.append(data.decode(errors="replace"))
+        except OSError:
+            break
+    return "".join(out_chunks), "".join(err_chunks)
+
+
 def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              pi_bin: str = "pi",
              enable_tools: bool = False,
              timeout: int | None = None,
              max_retries: int | None = None,
-             ac_fallback_used: threading.Event | None = None) -> dict:
+             ac_fallback_used: threading.Event | None = None,
+             child_screen: bool = False) -> dict:
     """Call Pi via subprocess and parse the JSON-stream response.
 
     Args:
@@ -1744,6 +2043,12 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             agent-mode Phase 2 calls pass 1 so a provider error does not
             restart a long call multiple times (evaluation lever P5).
 
+        child_screen: If True, this is a lightweight child Phase-1 AC-review
+            screen; it uses the short per-call budget
+            (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 600 s, configurable via
+            ``AUDIT_CHILD_SCREEN_TIMEOUT`` / ``--child-screen-timeout``)
+            instead of the 1800 s Phase-2 budget (LP-0MSQ32S2M001EA74 AC1).
+
     Returns a dict with keys ``verdict`` and ``evidence``.
     On success, implementations may also include additional diagnostic keys
     such as ``raw_stdout``, ``raw_stderr`` and ``extracted_text`` which are
@@ -1756,7 +2061,10 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     ``{"verdict": <met|unmet|partial|adjusted>, "evidence": <text>}``.
 
     Uses the same JSON-stream protocol as ralph (``pi -p --mode json``).
-    Uses ``communicate()`` to avoid pipe-buffer deadlocks.
+    Uses ``communicate()`` to avoid pipe-buffer deadlocks. In-process
+    stall detection (LP-0MSQ32S2M001EA74 AC2) aborts a call that produces
+    no output for ``AUDIT_STALL_TIMEOUT`` seconds (default 600) well
+    before the full per-call budget expires.
     """
     cmd = [pi_bin, "-p", "--mode", "json", "--model", model, prompt]
     if enable_tools:
@@ -1771,7 +2079,8 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
     # --tools; prompts must never rely on AGENTS.md or skill descriptions.
     cmd.extend(["--no-context-files", "--no-skills"])
 
-    effective_timeout = CALL_PI_TIMEOUT if timeout is None else timeout
+    effective_timeout = _resolve_call_timeout(timeout, child_screen=child_screen)
+    stall_timeout = _resolve_stall_timeout()
     effective_max_retries = _PI_MAX_RETRIES if max_retries is None else max_retries
     attempt = 0
     provider_error: str | None = None
@@ -1801,18 +2110,28 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
                     raise RuntimeError(f"pi binary not found: {pi_bin}")
 
                 try:
-                    stdout, stderr = process.communicate(timeout=effective_timeout)
-                except subprocess.TimeoutExpired:
+                    stdout, stderr = _communicate_with_stall(
+                        process, cmd, effective_timeout, stall_timeout,
+                    )
+                except subprocess.TimeoutExpired as exc:
                     process.kill()
                     stdout, stderr = process.communicate()
                     if ac_fallback_used is not None:
                         ac_fallback_used.set()
-                    return {
-                        "verdict": "unmet",
-                        "evidence": (
+                    stalled = exc.timeout == stall_timeout
+                    if stalled:
+                        evidence = (
+                            f"Pi model call stalled (no output for {stall_timeout}s); "
+                            "aborted early. Manual audit required."
+                        )
+                    else:
+                        evidence = (
                             f"Pi model call timed out after {effective_timeout}s. "
                             "Manual audit required."
-                        ),
+                        )
+                    return {
+                        "verdict": "unmet",
+                        "evidence": evidence,
                         "raw_stdout": stdout,
                         "raw_stderr": stderr,
                         "extracted_text": "",
@@ -3121,7 +3440,8 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            enable_tools: bool = False,
                            timeout: int | None = None,
                            max_retries: int | None = None,
-                           ac_fallback_used: threading.Event | None = None) -> dict:
+                           ac_fallback_used: threading.Event | None = None,
+                           child_screen: bool = False) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
     Args:
@@ -3137,6 +3457,9 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             _call_pi(). Phase 2 deep analysis passes 1 (see
             ``_PHASE2_MAX_RETRIES``) so long agent-mode calls are not
             restarted multiple times on a provider error.
+        child_screen: If True, forwards to _call_pi() so child Phase-1
+            AC-review screens use the short per-call budget
+            (LP-0MSQ32S2M001EA74 AC1).
 
         # Context reduction: every forwarded pi call runs with
         ``--no-context-files --no-skills`` (see _call_pi) so audit sessions
@@ -3148,7 +3471,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     default path from ``_default_debug_log_path`` will be used and the reason
     will be "parse_failure".
     """
-    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout, max_retries=max_retries, ac_fallback_used=ac_fallback_used)
+    result = _call_pi(prompt, model=model, pi_bin=pi_bin, enable_tools=enable_tools, timeout=timeout, max_retries=max_retries, ac_fallback_used=ac_fallback_used, child_screen=child_screen)
 
     # Emit a per-call timing line to stderr (performance baseline). Includes
     # issue id, call context, and elapsed seconds so Phase 2 durations are
@@ -3507,6 +3830,7 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
                 model=resolved_model, pi_bin=pi_bin, debug_log=debug_log,
                 enable_tools=True, timeout=timeout,
                 ac_fallback_used=ac_fallback_used,
+                child_screen=True,
             )
         except RuntimeError as exc:
             script_failure_callback("pi (child AC review)", exc)
@@ -4464,7 +4788,7 @@ def _run_phase2_deep_analysis(
     # Also run deep analysis on active children
     child_timeout_occurred = False
 
-    parallelism = _resolve_phase2_parallelism()
+    parallelism = _resolve_child_concurrency()
 
     def _merge_result(result: tuple[int, dict, bool]) -> None:
         nonlocal child_timeout_occurred
@@ -5174,7 +5498,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # bounded parallelism; fall back to a sequential loop for a single
             # pending child or parallelism=1 (mirrors the Phase 2 parallel pattern).
             if pending_children:
-                parallelism = _resolve_phase2_parallelism()
+                parallelism = _resolve_child_concurrency()
                 if parallelism > 1 and len(pending_children) > 1:
                     with ThreadPoolExecutor(max_workers=parallelism) as executor:
                         futures = [
@@ -5565,7 +5889,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # 4. Phase 1 child AC review for pending (gap-mapped / changed)
             # children only — the parent's critical path is unaffected.
             if pending_children:
-                parallelism = _resolve_phase2_parallelism()
+                parallelism = _resolve_child_concurrency()
                 if parallelism > 1 and len(pending_children) > 1:
                     with ThreadPoolExecutor(max_workers=parallelism) as executor:
                         futures = [
@@ -5663,7 +5987,6 @@ def cmd_issue(issue_id: str, persist: bool = True,
                             "(verdict JSON rejected); the child audit is usable.",
                             file=sys.stderr,
                         )
-
 
 
         # ------------------------------------------------------------------
@@ -6184,6 +6507,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_issue.add_argument("issue_id", help="Work item id to audit")
     p_issue.add_argument("--timeout", type=int, default=None,
                          help="Override the per-call Pi model timeout in seconds")
+    p_issue.add_argument("--child-screen-timeout", type=int, default=None,
+                         help=(
+                             "Override the per-call Pi timeout for child Phase-1 "
+                             "AC-review screens in seconds (default: "
+                             "AUDIT_CHILD_SCREEN_TIMEOUT env or 600; lightweight "
+                             "child screens fail fast instead of burning the full "
+                             "1800s budget)"
+                         ))
     p_issue.add_argument("--parent-timeout", type=int, default=None,
                          help=(
                              "Override the cumulative elapsed-time guard in seconds "
@@ -6286,6 +6617,13 @@ def main(argv: list[str] | None = None) -> int:
     max_concurrency = getattr(args, "max_concurrency", None)
     if max_concurrency is not None:
         os.environ[ENV_MAX_WORKERS] = str(max_concurrency)
+
+    # CLI --child-screen-timeout overrides AUDIT_CHILD_SCREEN_TIMEOUT for this
+    # process. _call_pi resolves the child Phase-1 screen budget via the env
+    # var (mirrors the --max-concurrency pattern; LP-0MSQ32S2M001EA74 AC1).
+    child_screen_timeout = getattr(args, "child_screen_timeout", None)
+    if child_screen_timeout is not None:
+        os.environ[AUDIT_CHILD_SCREEN_TIMEOUT_ENV] = str(child_screen_timeout)
 
     if args.command == "issue":
         return cmd_issue(args.issue_id, persist=not args.do_not_persist,

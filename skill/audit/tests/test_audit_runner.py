@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -1096,7 +1098,7 @@ class TestPhase2TimingInstrumentation:
 
         def _fake_call_pi(prompt, model="test-model", pi_bin="pi",
                           enable_tools=False, timeout=None, max_retries=None,
-                          ac_fallback_used=None):
+                          ac_fallback_used=None, child_screen=False):
             return {
                 "verdict": "met",
                 "evidence": "file.py:10 works",
@@ -8026,3 +8028,263 @@ class TestCmdProjectPiOutputWiring:
         payload = json.loads(out)
         assert payload["summary"] == self._LOCAL_SUMMARY
         assert payload["recommendation"] == self._LOCAL_RECOMMENDATION
+
+
+# ===========================================================================
+# LP-0MSQ32S2M001EA74: stall-abort, short-budget, slot-aware concurrency
+# (AC4a/AC4b/AC4c/AC5) — additive tests only.
+# ===========================================================================
+
+
+class _StallingProcess:
+    """Fake Popen whose stdout/stderr are real pipes that never emit output.
+
+    Used by the stall-abort tests (AC4a): a process whose output streams
+    stay completely silent while ``poll()`` reports it still running. The
+    in-process stall detector must kill it well before the full 1800s
+    budget and return a ``_timeout`` verdict.
+    """
+
+    def __init__(self):
+        r1, w1 = os.pipe()
+        r2, w2 = os.pipe()
+        self.stdout = os.fdopen(r1, "rb", buffering=0)
+        self.stderr = os.fdopen(r2, "rb", buffering=0)
+        self._w1, self._w2 = w1, w2
+        self.returncode = None
+
+    def poll(self):
+        return None  # never exits
+
+    def kill(self):
+        try:
+            os.close(self._w1)
+            os.close(self._w2)
+        except OSError:
+            pass
+
+    def communicate(self, timeout=None):
+        return "", ""
+
+    def close(self):
+        self.stdout.close()
+        self.stderr.close()
+        for fd in (self._w1, self._w2):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+class TestStallAbort:
+    """AC4a: a stalled Pi call aborts in-process well before the 1800s budget."""
+
+    def _call_pi_with_stall(self, stall_env: str, effective_timeout: int | None = None) -> tuple[dict, float]:
+        proc = _StallingProcess()
+        try:
+            with mock.patch.object(audit_runner.subprocess, "Popen", return_value=proc), \
+                 mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_STALL_TIMEOUT_ENV: stall_env}, clear=False):
+                start = time.monotonic()
+                kwargs = {"model": "test-model"} if effective_timeout is None else {"model": "test-model", "timeout": effective_timeout}
+                result = audit_runner._call_pi("test prompt", **kwargs)
+                elapsed = time.monotonic() - start
+        finally:
+            proc.close()
+        return result, elapsed
+
+    def test_stalled_call_aborts_well_before_full_budget(self):
+        """A call with no output for the stall threshold aborts in-process.
+
+        With ``AUDIT_STALL_TIMEOUT=1`` the call must return a ``_timeout``
+        verdict after ~1s, not after the full 1800s budget.
+        """
+        result, elapsed = self._call_pi_with_stall("1")
+        assert result.get("_timeout") is True
+        assert result.get("verdict") == "unmet"
+        assert elapsed < 60, f"stalled call took {elapsed:.1f}s; expected abort well before 1800s"
+        assert result.get("elapsed_seconds", 0) < 60
+        assert "stall" in result.get("evidence", "").lower()
+
+    def test_stall_abort_sets_timeout_marker(self):
+        """The stall abort returns the existing ``_timeout`` marker (AC4a)."""
+        result, _ = self._call_pi_with_stall("1")
+        assert result.get("_timeout") is True
+        assert result.get("raw_stdout") is not None
+
+    def test_stall_timeout_env_resolution(self):
+        """AUDIT_STALL_TIMEOUT env var is honored; invalid values warn + default."""
+        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_STALL_TIMEOUT_ENV: "120"}, clear=False):
+            assert audit_runner._resolve_stall_timeout() == 120
+        with mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            assert audit_runner._resolve_stall_timeout() == 600
+        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_STALL_TIMEOUT_ENV: "abc"}, clear=False), \
+             mock.patch("sys.stderr") as mock_err:
+            assert audit_runner._resolve_stall_timeout() == 600
+            assert "invalid" in mock_err.write.call_args_list[0][0][0].lower()
+
+
+class TestChildScreenShortBudget:
+    """AC4b: child Phase-1 screens get a short budget; Phase 2 keeps 1800."""
+
+    def _timeout_mock_process(self):
+        """Mock Popen whose communicate() raises TimeoutExpired then drains."""
+        mock_process = mock.MagicMock()
+        timeout_error = subprocess.TimeoutExpired(cmd="pi", timeout=10, output="", stderr="")
+        mock_process.communicate.side_effect = [timeout_error, ("", "")]
+        return mock_process
+
+    def test_child_screen_uses_short_budget(self):
+        """A child Phase-1 screen exceeding its short budget returns a clean timeout verdict.
+
+        The effective per-call budget for a child screen defaults to
+        ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (600s), never the full 1800s.
+        """
+        mock_process = self._timeout_mock_process()
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            result = audit_runner._call_pi("test prompt", model="test-model", child_screen=True)
+        assert result.get("_timeout") is True
+        assert result.get("verdict") == "unmet"
+        assert str(audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT) in result.get("evidence", "")
+        assert "1800" not in result.get("evidence", "")
+
+    def test_child_screen_timeout_env_override(self):
+        """AUDIT_CHILD_SCREEN_TIMEOUT overrides the default short budget."""
+        mock_process = self._timeout_mock_process()
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_CHILD_SCREEN_TIMEOUT_ENV: "300"}, clear=False):
+            result = audit_runner._call_pi("test prompt", model="test-model", child_screen=True)
+        assert result.get("_timeout") is True
+        assert "300" in result.get("evidence", "")
+
+    def test_phase2_retains_1800_budget(self):
+        """Phase 2 (non-child) calls keep the existing 1800s budget."""
+        mock_process = self._timeout_mock_process()
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result.get("_timeout") is True
+        assert str(audit_runner.CALL_PI_TIMEOUT) in result.get("evidence", "")
+
+    def test_parent_phase1_retains_1800_budget(self):
+        """Parent Phase-1 screens (child_screen=False) keep 1800s."""
+        mock_process = self._timeout_mock_process()
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            result = audit_runner._call_pi("test prompt", model="test-model", child_screen=False)
+        assert str(audit_runner.CALL_PI_TIMEOUT) in result.get("evidence", "")
+
+    def test_explicit_timeout_arg_wins_over_short_budget(self):
+        """An explicit timeout arg still wins over the child-screen default."""
+        mock_process = self._timeout_mock_process()
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            result = audit_runner._call_pi("test prompt", model="test-model", child_screen=True, timeout=3600)
+        assert "3600" in result.get("evidence", "")
+
+    def test_child_screen_timeout_constants_defined(self):
+        assert audit_runner.AUDIT_CHILD_SCREEN_TIMEOUT_ENV == "AUDIT_CHILD_SCREEN_TIMEOUT"
+        assert audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT == 600
+
+    def test_phase1_review_child_acs_forwards_child_screen(self):
+        """_phase1_review_child_acs passes child_screen=True to _call_pi."""
+        child = {
+            "id": "CHILD-1",
+            "title": "Child Issue",
+            "description": "## Acceptance Criteria\n1. AC one\n2. AC two",
+        }
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}, {"index": 1, "verdict": "met", "evidence": "ok"}]'},
+        ) as mock_call, mock.patch.object(audit_runner, "_build_file_scope_manifest", return_value="manifest"):
+            audit_runner._phase1_review_child_acs(
+                0, child, "test-model", "pi", None, None,
+                mock.MagicMock(), lambda *a, **k: None,
+            )
+        _args, kwargs = mock_call.call_args
+        assert kwargs.get("child_screen") is True
+
+
+class TestSlotAwareConcurrency:
+    """AC4c: dynamic child-call ceiling from proxy slots; fail-open fallback."""
+
+    def _mock_slot_status(self, available, total):
+        return mock.patch.object(
+            audit_runner, "_query_slot_status", return_value=(available, total),
+        )
+
+    def test_dynamic_ceiling_caps_by_available_slots(self):
+        """available=2 → ceiling min(2, max); available=1 → 1; available=0 → 1 floor."""
+        with self._mock_slot_status(2, 4):
+            assert audit_runner._resolve_child_concurrency() == 2
+        with self._mock_slot_status(1, 4):
+            assert audit_runner._resolve_child_concurrency() == 1
+        with self._mock_slot_status(0, 4):
+            assert audit_runner._resolve_child_concurrency() == 1  # floor, never 0
+        with self._mock_slot_status(8, 8):
+            assert audit_runner._resolve_child_concurrency() == 2  # capped by configured max
+
+    def test_fallback_to_static_on_query_failure(self):
+        """Query failure (None, None) degrades to the static ceiling (fail-open)."""
+        with self._mock_slot_status(None, None):
+            assert audit_runner._resolve_child_concurrency() == 2  # AUDIT_PHASE2_PARALLELISM default
+        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "3"}, clear=False), \
+             self._mock_slot_status(None, None):
+            assert audit_runner._resolve_child_concurrency() == 3
+
+    def test_slot_status_query_parses_endpoint_json(self):
+        """_query_slot_status parses the proxy /llama/local/status payload."""
+        mock_resp = mock.MagicMock()
+        mock_resp.read.return_value = b'{"available_slots": 2, "total_slots": 4}'
+        mock_resp.__enter__.return_value = mock_resp
+        with mock.patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
+            available, total = audit_runner._query_slot_status(url="http://localhost:8000/llama/local/status")
+        assert (available, total) == (2, 4)
+        mock_open.assert_called_once()
+        _args, kwargs = mock_open.call_args
+        assert kwargs.get("timeout") == audit_runner.AUDIT_SLOT_STATUS_TIMEOUT
+
+    def test_slot_status_query_fail_open_on_error(self):
+        """A failed/erroring slot query returns (None, None) — never raises."""
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            assert audit_runner._query_slot_status(url="http://localhost:8000/llama/local/status") == (None, None)
+        with mock.patch("urllib.request.urlopen", side_effect=Exception("boom")):
+            assert audit_runner._query_slot_status(url="http://x") == (None, None)
+
+    def test_slot_status_constants(self):
+        assert audit_runner.AUDIT_SLOT_STATUS_URL_ENV == "AUDIT_SLOT_STATUS_URL"
+        assert audit_runner.AUDIT_SLOT_STATUS_URL_DEFAULT.endswith("/llama/local/status")
+        assert audit_runner.AUDIT_SLOT_STATUS_TIMEOUT <= 2  # short timeout (1s)
+
+    def test_max_child_concurrency_env(self):
+        """AUDIT_MAX_CHILD_CONCURRENCY caps the dynamic ceiling."""
+        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_MAX_CHILD_CONCURRENCY_ENV: "1"}, clear=False), \
+             self._mock_slot_status(4, 4):
+            assert audit_runner._resolve_child_concurrency() == 1
+
+
+class TestStallAndBudgetRegression:
+    """AC5: healthy audits complete unchanged with the new knobs."""
+
+    def test_healthy_call_with_default_stall_detection(self):
+        """A healthy call producing output promptly is unaffected by stall detection."""
+        mock_process = mock.MagicMock()
+        inner = json.dumps({"verdict": "met", "evidence": "ok"})
+        stdout_text = json.dumps({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_end", "content": inner},
+        })
+        mock_process.communicate.return_value = (stdout_text, "")
+        mock_process.returncode = 0
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result.get("verdict") == "met"
+        assert result.get("_timeout") is None
+
+    def test_full_budget_still_available_for_phase2(self):
+        """Phase 2 calls (no child_screen) still resolve to CALL_PI_TIMEOUT=1800."""
+        assert audit_runner.CALL_PI_TIMEOUT == 1800
+        with mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            assert audit_runner._resolve_call_timeout(None, child_screen=False) == audit_runner.CALL_PI_TIMEOUT
+            assert audit_runner._resolve_call_timeout(None, child_screen=True) == audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT
