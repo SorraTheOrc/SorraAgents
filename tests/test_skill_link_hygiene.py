@@ -44,7 +44,7 @@ def _relative_links(skill_file: Path) -> list[tuple[int, str, str]]:
         for match in LINK_RE.finditer(line):
             target = match.group(1).strip()
             # Skip anchors, URLs, and mailto links.
-            if target.startswith("#") or "://" in target or target.startswith("mailto:"):
+            if target.startswith(("#", "mailto:")) or "://" in target:
                 continue
             # Strip a trailing #fragment before resolving the file path.
             file_target = target.split("#", 1)[0]
