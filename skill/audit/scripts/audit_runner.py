@@ -2865,20 +2865,35 @@ def _strip_checkbox(text: str) -> str:
     return _CHECKBOX_MARKER_RE.sub("", text, count=1)
 
 
+def _normalize_heading_line(line: str) -> str:
+    """Strip markdown heading / bold / angle-bracket markers from *line* so
+    heading variants all match the core Acceptance / Success Criteria
+    pattern (SA-0MSJLC8XA00178YD).
+    """
+    line = line.strip()
+    line = re.sub(r"^#{0,3}\s*", "", line)
+    line = line.replace("**", "")
+    line = re.sub(r"<<([^>]*)>>", r"\1", line)
+    return line.strip()
+
+
 def _extract_acs(description: str) -> list[str]:
     """Extract acceptance criteria lines from a markdown description."""
-    pattern = re.compile(
-        r"^#{0,3}\s*(?:Acceptance|Success)\s+Criteria:?\s*$",
-        re.MULTILINE | re.IGNORECASE,
+    heading_re = re.compile(
+        r"^(?:Acceptance|Success)\s+Criteria:?\s*(?:\([^)]*\))?\s*$",
+        re.IGNORECASE,
     )
-    match = pattern.search(description)
-    if not match:
+    lines = description.splitlines()
+    heading_idx = None
+    for idx, raw in enumerate(lines):
+        if heading_re.search(_normalize_heading_line(raw)):
+            heading_idx = idx
+            break
+    if heading_idx is None:
         return ["No acceptance criteria defined."]
 
-    start = match.end()
-    lines = description[start:].splitlines()
     acs: list[str] = []
-    for line in lines:
+    for line in lines[heading_idx + 1 :]:
         stripped = line.strip()
         if re.match(r"^#{1,6}\s", stripped):
             break

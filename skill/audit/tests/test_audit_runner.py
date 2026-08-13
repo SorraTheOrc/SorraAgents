@@ -7709,6 +7709,139 @@ class TestExtractAcs:
         ) == ["No acceptance criteria defined."]
         assert audit_runner._extract_acs("") == ["No acceptance criteria defined."]
 
+    # ------------------------------------------------------------------
+    # Heading variant coverage (SA-0MSJLC8XA00178YD)
+    # ------------------------------------------------------------------
+
+    def test_parenthetical_heading(self):
+        """Headings with parenthetical suffixes are matched (AC1)."""
+        desc = (
+            "## Acceptance criteria (testable)\n"
+            "\n"
+            "1. First criterion\n"
+            "2. Second criterion\n"
+        )
+        acs = audit_runner._extract_acs(desc)
+        assert acs == ["First criterion", "Second criterion"]
+
+    def test_no_suffix_no_regression(self):
+        """Standard Acceptance Criteria headings still work (AC2)."""
+        assert audit_runner._extract_acs(
+            "## Acceptance Criteria\n"
+            "- [ ] Criterion one\n"
+        ) == ["Criterion one"]
+        assert audit_runner._extract_acs(
+            "## Acceptance Criteria:\n"
+            "- [ ] Criterion one\n"
+        ) == ["Criterion one"]
+
+    def test_bold_heading(self):
+        """Bold-formatted Acceptance Criteria headings are matched (AC4)."""
+        desc = (
+            "**Acceptance criteria:**\n"
+            "\n"
+            "- [ ] First criterion\n"
+            "- [ ] Second criterion\n"
+        )
+        acs = audit_runner._extract_acs(desc)
+        assert acs == ["First criterion", "Second criterion"]
+
+    def test_angle_bracket_heading(self):
+        """Angle-bracket convention headings are matched (AC4)."""
+        desc = (
+            "<<Acceptance>> <<criteria>>\n"
+            "\n"
+            "1. First criterion\n"
+            "2. Second criterion\n"
+        )
+        acs = audit_runner._extract_acs(desc)
+        assert acs == ["First criterion", "Second criterion"]
+
+
+class TestExtractAcsHeadingVariantsIntegration:
+    """Re-audit AC table integration (SA-0MSJLC8XA00178YD AC3/AC5).
+
+    Driving cmd_issue over a mocked wl runner whose parent description uses
+    a parenthetical / bold / angle-bracket heading, the rendered report's
+    Acceptance Criteria Status table lists the item's REAL ACs instead of
+    the 'No acceptance criteria defined.' fallback — the same outcome the
+    re-audit of LP-0MSG45I8Q0020N1F / NV-0MSGM4XQP007V6UM now produces.
+    """
+
+    _MET_JSON = json.dumps([
+        {"index": 0, "verdict": "met", "evidence": "f.py:1"},
+        {"index": 1, "verdict": "met", "evidence": "f.py:2"},
+    ])
+
+    def _mock_cq(self):
+        return mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+    def _run(self, parent_desc):
+        mock_runner, _audit_shows = _make_phase1_runner(
+            [], parent_desc=parent_desc,
+        )
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": self._MET_JSON},
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            return audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+
+    def _assert_real_acs_in_table(self, capsys, *expected):
+        report = capsys.readouterr().out
+        assert "No acceptance criteria defined." not in report
+        for ac in expected:
+            assert ac in report
+
+    def test_parenthetical_heading_acs_in_table(self, capsys):
+        """AC3: parenthetical heading item reports its real ACs."""
+        desc = (
+            "## Acceptance criteria (testable)\n"
+            "\n"
+            "1. First criterion\n"
+            "2. Second criterion\n"
+        )
+        rc = self._run(desc)
+        assert rc == 0
+        self._assert_real_acs_in_table(
+            capsys, "First criterion", "Second criterion",
+        )
+
+    def test_bold_heading_acs_in_table(self, capsys):
+        """AC5: bold-heading item reports its real ACs."""
+        desc = (
+            "**Acceptance criteria:**\n"
+            "\n"
+            "1. First criterion\n"
+            "2. Second criterion\n"
+        )
+        rc = self._run(desc)
+        assert rc == 0
+        self._assert_real_acs_in_table(
+            capsys, "First criterion", "Second criterion",
+        )
+
+    def test_angle_bracket_heading_acs_in_table(self, capsys):
+        """Angle-bracket convention item reports its real ACs."""
+        desc = (
+            "<<Acceptance>> <<criteria>>\n"
+            "\n"
+            "1. First criterion\n"
+            "2. Second criterion\n"
+        )
+        rc = self._run(desc)
+        assert rc == 0
+        self._assert_real_acs_in_table(
+            capsys, "First criterion", "Second criterion",
+        )
+
+
 # ===========================================================================
 # Content-based freshness gate (SA-0MSKB6US1009CNHT)
 # ===========================================================================
