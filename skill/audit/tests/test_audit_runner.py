@@ -7904,6 +7904,89 @@ class TestExtractAcsHeadingVariantsIntegration:
 # ===========================================================================
 
 
+class TestCmdIssuePhases:
+    """SA-0MSL1ZB5J005ENLI: the decomposed cmd_issue phases are
+    independently callable module-level functions operating on a shared
+    :class:`_AuditContext` — each is testable in isolation.
+    """
+
+    @staticmethod
+    def _make_ctx(runner, **overrides):
+        defaults = {
+            "issue_id": "TEST-1", "persist": False, "timeout": None,
+            "parent_timeout": None, "pi_bin": "pi", "model": None,
+            "model_source": "default", "runner": runner,
+            "json_mode": False, "debug_log": None, "force": False,
+            "worklog_dir": None, "batch_phase2": False, "green_run": None,
+            "audit_children": False, "max_child_audits": None,
+            "run_tests": False,
+        }
+        defaults.update(overrides)
+        return audit_runner._AuditContext(**defaults)
+
+    def test_fetch_phase_syncs_context(self):
+        """_phase_fetch_and_cq fills ctx.work_item/children/acs from a single
+        --children fetch (no extra fetches)."""
+        calls = []
+
+        def _runner(cmd):
+            calls.append(list(cmd))
+            cs = " ".join(cmd)
+            if "--children" in cs:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": "## Acceptance Criteria\n- AC1: x",
+                        },
+                        "children": [{"id": "CHILD-1", "title": "C"}],
+                    }),
+                    stderr="",
+                )
+            if "git" in cs:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        ctx = self._make_ctx(_runner)
+        with mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            return_value={"success": True, "findings": [], "fixes_applied": 0},
+        ):
+            rc = audit_runner._phase_fetch_and_cq(ctx)
+        assert rc is None
+        assert ctx.work_item["id"] == "TEST-1"
+        assert ctx.children[0]["id"] == "CHILD-1"
+        assert ctx.acs == ["AC1: x"]
+        children_shows = [c for c in calls if "show" in c and "CHILD-1" in c]
+        assert children_shows == []
+
+    def test_terminal_lifecycle_restores_on_incomplete_audit(self):
+        """_apply_terminal_lifecycle restores the pre-audit state when the
+        audit did not complete (never leaves the item in_progress)."""
+        updates = []
+
+        def _runner(cmd):
+            cs = " ".join(cmd)
+            if "update" in cs:
+                updates.append(list(cmd))
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        ctx = self._make_ctx(_runner)
+        ctx.audit_completed = False
+        audit_runner._apply_terminal_lifecycle(ctx)
+        assert updates, "expected a terminal wl update"
+        last = updates[-1]
+        assert "TEST-1" in last
+        assert "--status" in last and "open" in last
+        assert "--stage" in last and "plan_complete" in last
+
+
 class TestWlShowDedup:
     """SA-0MSL1Z7E9005TLBA: no duplicate ``wl show`` of the same item when
     the data is already in hand.
