@@ -36,6 +36,15 @@ if str(REPO_ROOT) not in sys.path:
 from skill.audit.scripts import audit_runner
 
 SKILL_MD = REPO_ROOT / "skill" / "audit" / "SKILL.md"
+SKILL_REF = REPO_ROOT / "docs" / "dev" / "audit-skill-reference.md"
+
+
+def _skill_docs() -> str:
+    """Return SKILL.md + reference-doc content (F5 relocated detail to docs)."""
+    parts = [SKILL_MD.read_text()]
+    if SKILL_REF.exists():
+        parts.append(SKILL_REF.read_text())
+    return "\n".join(parts)
 
 # ===========================================================================
 # SKILL.md scanning guidance
@@ -45,41 +54,180 @@ SKILL_MD = REPO_ROOT / "skill" / "audit" / "SKILL.md"
 class TestSkillMdScanningGuidance:
     def test_skill_md_references_scan_helpers(self) -> None:
         """SKILL.md Tools-Enabled section references scan.py helpers."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "scan.py" in text
 
     def test_skill_md_forbids_unbounded_recursive_grep(self) -> None:
         """SKILL.md forbids unbounded recursive grep / repo-root scans."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "grep -r" in text or "unbounded" in text
         assert "node_modules" in text or "prune" in text
 
     def test_skill_md_documents_debug_logs_as_transient(self) -> None:
         """SKILL.md describes debug files as transient, non-scanned forensics."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "transient" in text.lower() or "forensic" in text.lower()
 
     def test_skill_md_documents_batch_phase2(self) -> None:
         """SKILL.md documents --batch-phase2 and AUDIT_PHASE2_BATCH."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "--batch-phase2" in text
         assert "AUDIT_PHASE2_BATCH" in text
 
     def test_skill_md_documents_max_concurrency(self) -> None:
         """SKILL.md documents --max-concurrency and AUDIT_MAX_CONCURRENCY."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "--max-concurrency" in text
         assert "AUDIT_MAX_CONCURRENCY" in text
 
     def test_skill_md_runner_line_includes_batch_and_concurrency(self) -> None:
         """The Runner usage line lists --batch-phase2 and --max-concurrency."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         runner_line = next(
             line for line in text.splitlines()
             if line.strip().startswith("- **Runner:**")
         )
         assert "--batch-phase2" in runner_line
         assert "--max-concurrency" in runner_line
+
+
+# ===========================================================================
+# Monitored Run Execution guidance (for SA-0MSL51XSF0086KM5)
+# ===========================================================================
+
+
+class TestSkillMdMonitoredRunGuidance:
+    """SKILL.md documents the launch → monitor → abort workflow for long audits.
+
+    Work item: SA-0MSL51XSF0086KM5 (test-first verification contract, child
+    SA-0MSL6DQVN0036IGM). Audits can legitimately run for hours, so SKILL.md
+    must define an agent-side execution contract: a detached launch with a
+    180-minute hard budget, output captured to a unique log, a 3-minute
+    progress-monitoring cadence, and a defined abort + mitigation procedure.
+    Guidance-only change — these tests assert the documented markers exist.
+    """
+
+    @staticmethod
+    def _section() -> str:
+        """Return the Monitored Run Execution section (reference doc preferred;
+        F5 relocated the full detail to docs/dev/audit-skill-reference.md)."""
+        candidates = []
+        if SKILL_REF.exists():
+            candidates.append(SKILL_REF.read_text())
+        candidates.append(SKILL_MD.read_text())
+        for text in candidates:
+            start = text.find("## Monitored Run Execution")
+            if start != -1:
+                end = text.find("\n## ", start + 1)
+                return text[start : end if end != -1 else len(text)]
+        return ""
+
+    def test_skill_md_has_monitored_run_execution_section(self) -> None:
+        """SKILL.md contains a Monitored Run Execution section heading."""
+        assert "## Monitored Run Execution" in _skill_docs()
+
+    def test_launch_captures_pre_audit_status_and_stage(self) -> None:
+        """Launch documents capturing the pre-audit status/stage via wl show."""
+        section = self._section()
+        assert "wl show <id> --json" in section
+        assert "pre-audit" in section.lower()
+        assert "status" in section
+        assert "stage" in section
+
+    def test_launch_is_detached_with_unique_log(self) -> None:
+        """Launch uses nohup/disown and a unique audit_run_ log path."""
+        section = self._section()
+        assert "nohup" in section
+        assert "disown" in section
+        assert "audit_run_" in section
+        assert "~/.audit_debug/" in section
+
+    def test_launch_enforces_180_minute_hard_budget(self) -> None:
+        """Launch enforces the 10800s (180-minute) outer budget."""
+        section = self._section()
+        assert "10800" in section
+        assert "180-minute" in section
+
+    def test_monitor_reports_every_3_minutes_with_alive_check(self) -> None:
+        """Monitor specifies the 3-minute cadence and kill -0 alive check."""
+        section = self._section()
+        assert "every 3 minutes" in section
+        assert "kill -0" in section
+
+    def test_monitor_tails_log_for_phase_markers(self) -> None:
+        """Monitor tails the log for the runner's phase/timing markers."""
+        section = self._section()
+        assert "tail -50" in section
+        assert "Phase 1 passed: running Phase 2 deep code analysis" in section
+        assert "Per-call timing:" in section
+
+    def test_monitor_confirms_log_growth(self) -> None:
+        """Monitor treats a stopped-growing log as a stall signal."""
+        section = self._section()
+        assert "growth" in section.lower() or "growing" in section.lower()
+
+    def test_abort_defines_stall_trigger(self) -> None:
+        """Abort defines the >=10 minute no-output stall trigger."""
+        section = self._section()
+        assert "10 minutes" in section
+
+    def test_abort_defines_repeated_failure_trigger(self) -> None:
+        """Abort defines the >=3 consecutive Pi-call-failure trigger."""
+        section = self._section()
+        assert "3 consecutive" in section
+        assert "Warning: Pi call failed" in section
+
+    def test_abort_restores_pre_audit_state_and_clears_assignee(self) -> None:
+        """Abort restores pre-audit status/stage and clears the assignee."""
+        section = self._section()
+        assert "restore" in section.lower()
+        assert "assignee" in section.lower()
+
+    def test_abort_kills_process_tree_and_appends_failure_notice(self) -> None:
+        """Abort kills the process tree and appends a failure notice."""
+        section = self._section()
+        assert "process tree" in section
+        assert "failure notice" in section.lower()
+
+    def test_abort_failure_notice_includes_progress_summary(self) -> None:
+        """Failure notice mandates elapsed time, last phase marker, and trigger.
+
+        AC3 (SA-0MSL6E6KD006KJ0K): the progress-summary fields must appear in
+        SKILL.md itself, not only in the reference doc. The reference doc is
+        preferred by ``_section()``, so read SKILL.md directly to catch a
+        regression where the summary omits the required fields.
+        """
+        text = SKILL_MD.read_text()
+        start = text.find("## Monitored Run Execution")
+        assert start != -1
+        end = text.find("\n## ", start + 1)
+        section = text[start : end if end != -1 else len(text)]
+        assert "failure notice" in section.lower()
+        assert "elapsed time" in section.lower()
+        assert "phase marker" in section.lower()
+        assert "trigger" in section.lower()
+
+    def test_abort_never_fabricates_or_overrides_a_verdict(self) -> None:
+        """Abort never persists a fabricated report or overrides a verdict."""
+        section = self._section()
+        assert "fabricat" in section.lower()
+        assert "override" in section.lower()
+
+    def test_abort_reports_outcome_to_operator(self) -> None:
+        """Abort requires reporting the outcome to the operator.
+
+        AC4 (SA-0MSL6E6KD006KJ0K): the operator-report step must appear in
+        SKILL.md itself, not only in the reference doc. The reference doc is
+        preferred by ``_section()``, so read SKILL.md directly to catch a
+        regression where the summary omits the report step.
+        """
+        text = SKILL_MD.read_text()
+        start = text.find("## Monitored Run Execution")
+        assert start != -1
+        end = text.find("\n## ", start + 1)
+        section = text[start : end if end != -1 else len(text)]
+        assert "report" in section.lower()
+        assert "operator" in section.lower()
 
 
 # ===========================================================================
@@ -95,22 +243,22 @@ class TestSkillMdDocumentsBatchAndConcurrencyFlags:
 
     def test_skill_md_documents_batch_phase2_flag(self) -> None:
         """--batch-phase2 appears in SKILL.md."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "--batch-phase2" in text
 
     def test_skill_md_documents_batch_env_var(self) -> None:
         """AUDIT_PHASE2_BATCH appears in SKILL.md."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "AUDIT_PHASE2_BATCH" in text
 
     def test_skill_md_documents_max_concurrency_flag(self) -> None:
         """--max-concurrency appears in SKILL.md."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         assert "--max-concurrency" in text
 
     def test_skill_md_runner_usage_line_includes_flags(self) -> None:
         """The Runner usage line lists --batch-phase2 and --max-concurrency."""
-        text = SKILL_MD.read_text()
+        text = _skill_docs()
         usage_line = next(
             line for line in text.splitlines()
             if "audit_runner.py issue|project" in line
@@ -257,6 +405,58 @@ class TestRunCompletionCleanup:
             args = mock_remove.call_args[0]
             assert args[0] == str(debug_path)
             assert args[1] == "project"
+
+    def test_cmd_issue_retains_debug_log_on_failure(self) -> None:
+        """cmd_issue keeps the debug file when a script failure occurs (SA-0MSBSOAEM0078LAO AC3)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            debug_path = Path(tmp) / "audit_debug_SA-X.jsonl"
+            debug_path.write_text('{"raw_stdout": "x"}\n')
+            original_content = debug_path.read_text()
+            # Provide an AC in the description so Phase 1 calls _call_pi
+            # (which raises, triggering script_failure → debug log retained).
+            work_with_ac = {"success": True,
+                            "workItem": {"id": "SA-X",
+                                         "status": "open",
+                                         "stage": "plan_complete",
+                                         "description": "Acceptance Criteria:\n- Verify X works"}}
+            def _run_wl_with_ac(runner, cmd, worklog_dir=None):
+                cmd_str = " ".join(cmd)
+                if "show" in cmd_str:  # both --json and --children --json
+                    return work_with_ac
+                if "update" in cmd_str or "list" in cmd_str:
+                    return {"success": True}
+                return {"success": True}
+            with mock.patch.object(audit_runner, "_call_pi",
+                                   side_effect=RuntimeError("provider timeout")), \
+                 mock.patch.object(audit_runner, "_run_wl",
+                                   side_effect=_run_wl_with_ac), \
+                 mock.patch("skill.code_review.scripts.code_quality.run_code_quality",
+                            return_value={"success": True, "findings": [], "fixes_applied": 0}), \
+                 mock.patch.object(audit_runner, "_default_debug_log_path",
+                                   return_value=debug_path):
+                audit_runner.cmd_issue("SA-X", persist=False, force=True,
+                                       debug_log=str(debug_path))
+            # Debug file retained for forensics (may contain additional entries).
+            assert debug_path.exists()
+            # The original content must still be present (file was NOT deleted).
+            assert original_content in debug_path.read_text()
+
+    def test_cmd_project_retains_debug_log_on_failure(self) -> None:
+        """cmd_project keeps the debug file when _call_pi raises (failure-path retention)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            debug_path = Path(tmp) / "audit_debug_project.jsonl"
+            debug_path.write_text('{"raw_stdout": "x"}\n')
+            original_content = debug_path.read_text()
+            with mock.patch.object(audit_runner, "_call_pi",
+                                   side_effect=RuntimeError("pi unavailable")), \
+                 mock.patch.object(audit_runner, "_run_wl",
+                                   side_effect=self._fake_run_wl), \
+                 mock.patch.object(audit_runner, "_default_debug_log_path",
+                                   return_value=debug_path):
+                audit_runner.cmd_project(debug_log=str(debug_path))
+            # Debug file retained for forensics.
+            assert debug_path.exists()
+            assert debug_path.read_text() == original_content
 
 
 # ===========================================================================

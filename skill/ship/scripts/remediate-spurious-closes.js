@@ -9,14 +9,15 @@
 // strings v1.0.0/v1.2.3 never existed as release tags — legitimate releases
 // use real versions (e.g. "Shipped in v0.1.11").
 //
-// This helper:
-//   1. Lists ALL work items (`wl list --json`).
-//   2. For each item, lists its comments (`wl comment list <id> --json`).
-//   3. Finds spurious close comments: author === 'worklog' with content
-//      exactly 'Closed with reason: Shipped in v1.0.0' or
-//      'Closed with reason: Shipped in v1.2.3'.
-//   4. Deletes those comments (`wl comment delete <comment-id>`).
-//   5. Restores each affected item to `status=completed, stage=in_review`
+// This helper (one-time historical remediation, SA-0MSJ2XMQL006CVQS; flagged
+// for deprecation in SA-0MSPPILOS003IRRE):
+//   1. Runs a single `wl export --file <tmp>` (one wl call, replacing the
+//      old `wl list` 5.3 MB dump + one `wl comment list` per item).
+//   2. Scans the exported JSONL locally for spurious close comments
+//      (author === 'worklog' with content exactly 'Closed with reason:
+//      Shipped in v1.0.0' or 'Closed with reason: Shipped in v1.2.3').
+//   3. Deletes those comments (`wl comment delete <comment-id>`).
+//   4. Restores each affected item to `status=completed, stage=in_review`
 //      (`wl update <id> --status completed --stage in_review`) — the valid
 //      status/stage pair for a release-ready item.
 //
@@ -28,9 +29,10 @@
 //   node skill/ship/scripts/remediate-spurious-closes.js
 
 import { execSync } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { realpathSync, readFileSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 // ── Spurious close comment definitions ───────────────────────────────────────
 
@@ -75,28 +77,87 @@ function runWl(args) {
   });
 }
 
+// Cache of a single `wl export` parse: { items, commentsByItem }.
+// Populated lazily by the first boundary call so the whole sweep needs
+// exactly one `wl` invocation for reads (SA-0MSPPILOS003IRRE).
+let exportCache = null;
+
 /**
- * Default worklog boundary: list all work items.
+ * Run `wl export --file <tmp>` once and parse the JSONL locally.
  *
- * `wl list --json` (no status filter) returns every item, including
- * completed/closed ones, so a single call covers the whole database.
+ * The export contains one JSON object per line: work items with
+ * `type: "workitem"` ({data: {id, title, ...}}) and comments with
+ * `type: "comment"` ({data: {id, author, comment, workItemId}}).
+ * Returns `{ items, commentsByItem }` where `commentsByItem` maps a
+ * work-item id to its comment list.
+ *
+ * @returns {{ items: Array<{id: string, title: string}>, commentsByItem: Map<string, Array<{id: string, author: string, comment: string}>> }}
+ */
+export function exportWorklogOnce() {
+  if (exportCache) {
+    return exportCache;
+  }
+  const tmpFile = join(tmpdir(), `wl-export-${process.pid}.jsonl`);
+  try {
+    runWl(['export', '--file', tmpFile]);
+    const items = [];
+    const commentsByItem = new Map();
+    const lines = readFileSync(tmpFile, 'utf-8').split('\n');
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const data = entry.data || entry;
+      if (entry.type === 'comment' || (data.workItemId !== undefined && data.author !== undefined)) {
+        const wid = data.workItemId;
+        if (!commentsByItem.has(wid)) {
+          commentsByItem.set(wid, []);
+        }
+        commentsByItem.get(wid).push({
+          id: data.id,
+          author: data.author,
+          comment: data.comment,
+        });
+      } else if (data.id && data.title) {
+        items.push({ id: data.id, title: data.title });
+      }
+    }
+    exportCache = { items, commentsByItem };
+    return exportCache;
+  } finally {
+    try {
+      unlinkSync(tmpFile);
+    } catch { /* tmp file already gone */ }
+  }
+}
+
+/**
+ * Default worklog boundary: all work items from the single export scan.
+ *
+ * Replaces the old `wl list --json` (unbounded dump of every item) with a
+ * local scan of the one-time export — no extra `wl` call (SA-0MSPPILOS003IRRE).
  *
  * @returns {Array<{id: string, title: string}>} All work items.
  */
 export function listAllWorkItems() {
-  const data = JSON.parse(runWl(['list']));
-  return (data.workItems && Array.isArray(data.workItems)) ? data.workItems : [];
+  return exportWorklogOnce().items;
 }
 
 /**
- * Default worklog boundary: list comments for a work item.
+ * Default worklog boundary: comments for a work item, from the local scan.
+ *
+ * Replaces the old per-item `wl comment list <id>` call — the export already
+ * contains every comment, so this is a Map lookup (SA-0MSPPILOS003IRRE).
  *
  * @param {string} itemId - The work item id.
  * @returns {Array<{id: string, author: string, comment: string}>} Comments.
  */
 export function listComments(itemId) {
-  const data = JSON.parse(runWl(['comment', 'list', itemId]));
-  return (data.comments && Array.isArray(data.comments)) ? data.comments : [];
+  return exportWorklogOnce().commentsByItem.get(itemId) || [];
 }
 
 /**

@@ -1,6 +1,6 @@
 ---
 name: resolve-pr-comments
-description: Fetch GitHub PR review comments, propose fixes with a plan, and resolve threads after approval
+description: "Fetch GitHub PR review comments, propose fixes, resolve threads after approval. Use when handling PR comments."
 license: MIT
 compatibility: pi
 metadata:
@@ -82,7 +82,20 @@ Only proceed after user confirms the plan.
 2. **Build, test, commit**: Follow build → test → commit order. Never commit without passing tests. Run the full suite via the [test skill](../test/SKILL.md) (`/skill:test` — run → triage → evaluate → loop until green) so PR-comment fixes are verified against the whole project, not just a single command:
 
    ```bash
-   npm run build && npm --silent test && git add <files> \
+   npm run build   # build first (skip if the project has no build script)
+   ```
+
+   Then run the full suite through the canonical cached pipeline — never
+   `npm --silent test` directly, which bypasses the per-repo test cache:
+
+   ```
+   /skill:test
+   ```
+
+   Only when green, stage, commit, and push:
+
+   ```bash
+   git add <files> \
      && git commit -m "Address PR review feedback\n\n- <summary of fix 1>\n- <summary of fix 2>" \
      && git push origin <branch_name>
    ```

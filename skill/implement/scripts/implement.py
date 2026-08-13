@@ -9,6 +9,7 @@ Usage:
   implement.py start <work-item-id>          # Phase 1: setup
   implement.py finish <work-item-id>         # Phase 2: build, test, commit, push, cleanup
   implement.py abort <work-item-id>          # Abort and cleanup
+  implement.py parent <parent-id>            # Recurse into children (epic/parent items)
 
 Optional flags:
   --json                    JSON output for agents
@@ -18,6 +19,9 @@ Optional flags:
   --parent-branch <branch>  Override parent branch (default: dev)
   --worktree-path <path>    Override worktree path
   -v, --verbose             Verbose logging
+
+Environment:
+  IMPLEMENT_TEST_COMMAND    Override the finish test-step command (shell string)
 
 Exit codes:
   0 – success
@@ -32,6 +36,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -49,6 +54,13 @@ if str(_REPO_ROOT) not in sys.path:
 from skill.shared.code_freeze import is_code_freeze_active
 from skill.shared.status_lifecycle import StatusLifecycle, worklog_dir_flag
 from skill.test_cache import run_cached
+from skill.test_runner import canonicalize_quiet_test_command
+
+# Canonical quiet full-suite commands — identical cache keys to the test
+# skill's run_tests.py (SA-0MSN6FBFS006Z5QP) so cached runs are shared
+# full-suite evidence rather than a fail-fast partial run.
+PYTEST_CMD = canonicalize_quiet_test_command("pytest")  # pytest -q -r a --disable-warnings
+NPM_TEST_CMD = canonicalize_quiet_test_command("npm test")  # npm --silent test
 
 LOG = logging.getLogger("implement.scripts.implement")
 
@@ -296,6 +308,73 @@ def wl_show(work_item_id: str) -> dict[str, Any]:
         return {}
 
 
+def wl_show_children(work_item_id: str) -> list[dict[str, Any]]:
+    """Fetch a work item's children as a list of dicts.
+
+    Uses ``wl show <id> --children --json`` and returns the ``children``
+    array (empty when the item has no children or the fetch fails).
+
+    Args:
+        work_item_id: The parent work item ID.
+
+    Returns:
+        List of child work-item dicts (may be empty).
+    """
+    cmd = ["wl", "show", work_item_id, "--children", "--json"]
+    cmd[1:1] = worklog_dir_flag()
+    result = run_cmd(cmd, check=False)
+    if result.returncode != 0:
+        LOG.error(
+            "Failed to fetch children of %s: %s",
+            work_item_id,
+            result.stderr.strip(),
+        )
+        return []
+    try:
+        data = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, ValueError) as exc:
+        LOG.error("Invalid JSON from wl show --children: %s", exc)
+        return []
+    if not isinstance(data, dict):
+        return []
+    children = data.get("children")
+    return children if isinstance(children, list) else []
+
+
+def wl_dep_blockers(work_item_id: str) -> list[dict[str, Any]]:
+    """Fetch a work item's outbound (depends-on) dependency edges.
+
+    Uses ``wl dep list <id> --json`` and returns the ``outbound`` array —
+    the items this work item is blocked by / depends on. Empty when the
+    item has no dependencies or the fetch fails.
+
+    Args:
+        work_item_id: The work item ID.
+
+    Returns:
+        List of outbound dependency-edge dicts (may be empty).
+    """
+    cmd = ["wl", "dep", "list", work_item_id, "--json"]
+    cmd[1:1] = worklog_dir_flag()
+    result = run_cmd(cmd, check=False)
+    if result.returncode != 0:
+        LOG.error(
+            "Failed to fetch dependencies of %s: %s",
+            work_item_id,
+            result.stderr.strip(),
+        )
+        return []
+    try:
+        data = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, ValueError) as exc:
+        LOG.error("Invalid JSON from wl dep list: %s", exc)
+        return []
+    if not isinstance(data, dict):
+        return []
+    outbound = data.get("outbound")
+    return outbound if isinstance(outbound, list) else []
+
+
 def wl_add_comment(work_item_id: str, comment: str) -> bool:
     """Add a comment to a work item.
 
@@ -340,6 +419,171 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
         LOG.info("Safety reset: %s status in-progress -> open", work_item_id)
     else:
         LOG.info("Safety reset skipped: %s status is %r", work_item_id, current)
+
+
+# ---------------------------------------------------------------------------
+# Parent-recursion helpers
+# ---------------------------------------------------------------------------
+
+TERMINAL_STATUSES = {"in_review", "completed", "done"}
+
+
+def _is_terminal_status(status: str) -> bool:
+    """Whether a work-item status is terminal for parent advancement.
+
+    A terminal child is never re-implemented and counts toward parent
+    advancement (AC-4). ``in_review``/``completed``/``done`` are terminal;
+    ``open``/``blocked``/``in_progress`` are not.
+
+    Args:
+        status: The work-item status string.
+
+    Returns:
+        True if the status is terminal.
+    """
+    return status in TERMINAL_STATUSES
+
+
+def _classify_child(child: dict[str, Any]) -> str:
+    """Classify a child for the parent-recursion plan.
+
+    Returns one of:
+      - ``"skip-terminal"`` — already in a terminal state; never re-implemented.
+      - ``"skip-in-progress"`` — claimed by another agent; reported, not clobbered.
+      - ``"implement"`` — the standard workflow should run on this child.
+
+    Args:
+        child: A child work-item dict from ``wl show --children``.
+
+    Returns:
+        The classification string.
+    """
+    status = str(child.get("status", ""))
+    if _is_terminal_status(status):
+        return "skip-terminal"
+    if status in ("in-progress", "in_progress"):
+        return "skip-in-progress"
+    return "implement"
+
+
+def _resolve_implementation_order(
+    children: list[dict[str, Any]],
+    blockers: dict[str, list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return children in dependency order (blockers first).
+
+    Builds a graph over the parent's children using outbound (depends-on)
+    edges: for each child, the blockers that are THEMSELVES children of the
+    parent form in-chain edges (blocker must be implemented before child).
+    Blockers outside the children set (e.g. cross-project) do not create
+    edges — they are reported as coordination notes by the caller.
+
+    Ordering is a deterministic topological sort (Kahn's algorithm) with
+    stable tie-breaks (``sortIndex``, then id). A dependency cycle fails
+    fast: the function returns an empty list plus a clear error message
+    naming the remaining (cyclic) children — no infinite recursion.
+
+    Args:
+        children: List of child work-item dicts from ``wl show --children``.
+        blockers: Mapping child id → outbound dependency-edge dicts from
+            ``wl dep list`` (may be empty).
+
+    Returns:
+        ``(ordered_children, None)`` on success, or
+        ``([], error_message)`` when a cycle is detected.
+    """
+    child_by_id: dict[str, dict[str, Any]] = {
+        str(c.get("id")): c for c in children if c.get("id")
+    }
+    child_ids = set(child_by_id)
+
+    # in_degree[c] = number of in-chain blockers (blockers that are also
+    # children of this parent). dependents[b] = children blocked by b.
+    in_degree: dict[str, int] = {cid: 0 for cid in child_ids}
+    dependents: dict[str, list[str]] = {cid: [] for cid in child_ids}
+    for child in children:
+        cid = str(child.get("id", ""))
+        if cid not in child_ids:
+            continue
+        for edge in blockers.get(cid, []):
+            bid = str(edge.get("id", ""))
+            if bid in child_ids:
+                in_degree[cid] += 1
+                dependents[bid].append(cid)
+
+    def _key(cid: str) -> tuple[int, str]:
+        return (int(child_by_id[cid].get("sortIndex") or 0), cid)
+
+    ready = sorted((cid for cid in child_ids if in_degree[cid] == 0), key=_key)
+    ordered: list[str] = []
+    while ready:
+        cid = ready.pop(0)
+        ordered.append(cid)
+        for dep in dependents[cid]:
+            in_degree[dep] -= 1
+            if in_degree[dep] == 0:
+                ready.append(dep)
+        ready.sort(key=_key)
+
+    if len(ordered) != len(child_ids):
+        remaining = sorted(child_ids - set(ordered), key=_key)
+        cycle_path = " -> ".join(remaining)
+        return [], (
+            f"Dependency cycle detected among children: {cycle_path}. "
+            f"Resolve the blocking relationships and re-run."
+        )
+    return [child_by_id[cid] for cid in ordered], None
+
+
+def _next_child_to_implement(
+    children: list[dict[str, Any]],
+    blockers_map: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any] | None:
+    """Return the next child to run through the standard implement workflow.
+
+    Children already terminal or in progress elsewhere are skipped
+    (AC-4/AC-7). The *children* argument must already be in dependency
+    order (see :func:`_resolve_implementation_order`). A child is startable
+    only when every in-chain blocker (a blocker that is also one of these
+    children) is already terminal — a blocked child is never implemented
+    before its blockers (AC-2). Independent siblings of an in-progress
+    child may still start.
+
+    Args:
+        children: List of child work-item dicts in dependency order.
+        blockers_map: Mapping child id → outbound dependency-edge dicts from
+            ``wl dep list`` (defaults to {}).
+
+    Returns:
+        The next child dict, or None when no child is startable (every
+        remaining child is terminal, in progress elsewhere, or blocked by a
+        non-terminal sibling).
+    """
+    blockers_map = blockers_map or {}
+    child_ids = {str(c.get("id")) for c in children}
+    terminal_ids = {
+        str(c.get("id"))
+        for c in children
+        if _is_terminal_status(str(c.get("status", "")))
+    }
+    for child in children:
+        action = _classify_child(child)
+        if action == "skip-terminal":
+            continue
+        if action == "skip-in-progress":
+            continue  # never clobber another agent's claim
+        cid = str(child.get("id", ""))
+        in_chain_blockers = [
+            str(b.get("id"))
+            for b in blockers_map.get(cid, [])
+            if str(b.get("id")) in child_ids
+        ]
+        if all(bid in terminal_ids for bid in in_chain_blockers):
+            return child
+        # else: blocked by a non-terminal sibling — dependents come later
+        # in the order and are transitively blocked; keep scanning for an
+        # independent sibling that is startable.
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -810,16 +1054,99 @@ def cleanup_worktree_processes(worktree_path: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _package_script(cwd: str, name: str) -> Any:
+    """Return the raw ``scripts.<name>`` value from the root package.json.
+
+    Reads the root ``package.json`` directly so the check works without npm.
+    Malformed JSON, a non-object ``scripts`` value, or a missing file counts
+    as "no script" (fail-open — never block finish on a broken manifest).
+
+    Args:
+        cwd: Working directory (worktree root).
+        name: Script name, e.g. ``build`` or ``test``.
+
+    Returns:
+        The raw ``scripts.<name>`` value, or None when the entry (or a
+        readable package.json) does not exist.
+    """
+    package_json = Path(cwd) / "package.json"
+    if not package_json.exists():
+        return None
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    if not isinstance(scripts, dict):
+        return None
+    return scripts.get(name)
+
+
+def _has_build_script(cwd: str) -> bool:
+    """Check whether the repo root package.json defines a ``build`` script.
+
+    A repo without a ``scripts.build`` entry (e.g. Python-only projects) has
+    nothing to build: ``npm run build`` would exit 1 with
+    ``Missing script: "build"`` and block the finish phase for every
+    implementation. Reads the root ``package.json`` directly so the check
+    works without npm.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True if the root package.json exists and contains a non-empty
+        ``scripts.build`` entry. Malformed JSON or a non-object ``scripts``
+        value counts as "no build script" (fail-open — never block finish on
+        a broken manifest).
+    """
+    return bool(_package_script(cwd, "build"))
+
+
+def _has_test_script(cwd: str) -> bool:
+    """Check whether the repo root package.json defines a ``test`` script.
+
+    Mirrors :func:`_has_build_script` for the test step: a repo without a
+    ``scripts.test`` entry has no npm test suite — ``npm test`` would exit 1
+    with ``Missing script: "test"``.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True if the root package.json exists and contains a non-empty
+        ``scripts.test`` entry.
+    """
+    return bool(_package_script(cwd, "test"))
+
+
 def run_build(cwd: str) -> dict[str, Any]:
     """Run the project build script.
+
+    Repos whose root package.json has no ``build`` script (e.g. Python-only
+    projects) skip the build step: it is reported as a no-op with
+    ``success: True`` so the finish phase proceeds to tests → commit → push
+    instead of aborting. Repos WITH a build script run ``npm run build``
+    unchanged — a real build failure still blocks finish.
 
     Args:
         cwd: Working directory (worktree root).
 
     Returns:
         A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
-        ``exit_code`` (int).
+        ``exit_code`` (int), and ``skipped`` (bool) — ``skipped`` is True
+        when the build step was bypassed because no build script exists.
     """
+    if not _has_build_script(cwd):
+        msg = "No build script in package.json — skipping build step (no-op)."
+        LOG.info(msg)
+        return {
+            "success": True,
+            "stdout": msg,
+            "stderr": "",
+            "exit_code": 0,
+            "skipped": True,
+        }
     result = run_cmd(
         ["npm", "run", "build"],
         cwd=cwd,
@@ -832,74 +1159,378 @@ def run_build(cwd: str) -> dict[str, Any]:
         "stdout": result.stdout.strip(),
         "stderr": result.stderr.strip(),
         "exit_code": result.returncode,
+        "skipped": False,
     }
 
 
-def run_tests(cwd: str) -> dict[str, Any]:
-    """Run the full test suite, routed through the per-repo run cache.
+# ---------------------------------------------------------------------------
+# Test helpers
+# ---------------------------------------------------------------------------
 
-    The pytest (and, on failure, npm test) command runs through
-    ``skill.test_cache.run_cached``: a valid cached result for the same
-    worktree git state within the TTL is reused without re-executing the
-    suite (see SA-0MSGN5OJ4002OZKY). Caching is worktree-aware — the
-    fingerprint reflects *cwd*'s HEAD + working-tree changes, so edits in the
-    worktree invalidate stale entries automatically.
+_PYTEST_CONFIG_MARKERS = (
+    ("pyproject.toml", "[tool.pytest.ini_options]"),
+    ("setup.cfg", "[tool:pytest]"),
+    ("tox.ini", "[pytest]"),
+)
+
+
+def _pytest_importable(cwd: str) -> bool:
+    """Whether ``python3 -m pytest`` would work in *cwd*.
+
+    Probes with the same interpreter that runs the suite (``python3``) so
+    venv/global-path differences are respected — ``shutil.which`` alone is
+    not enough because pytest is commonly only available as a module inside
+    a project venv.
 
     Args:
         cwd: Working directory (worktree root).
 
     Returns:
-        A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
-        ``exit_code`` (int), ``failures`` (list[str]) — semantics unchanged
-        from the raw-execution version.
+        True when ``python3 -c "import pytest"`` exits 0.
     """
-    # Route through the cache so repeated verification at the same git state
-    # reuses the prior run instead of re-executing a multi-minute suite.
-    pytest_run = run_cached(
-        "python3 -m pytest -x --tb=short -q",
-        cwd=cwd,
-        timeout=600,
-        runner=lambda command, cwd_, timeout_: run_cmd(
-            command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
-        ),
+    try:
+        probe = run_cmd(
+            ["python3", "-c", "import pytest"],
+            cwd=cwd,
+            check=False,
+            timeout=60,
+            capture=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
+
+def _has_pytest_markers(cwd: str) -> bool:
+    """Whether the repo declares pytest configuration.
+
+    A ``pytest.ini`` file alone counts; for the other config files the
+    relevant section must be present (``[tool.pytest.ini_options]`` in
+    pyproject.toml, ``[tool:pytest]`` in setup.cfg, ``[pytest]`` in tox.ini)
+    so an unrelated config file does not trigger a pytest run.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True when the repo declares pytest configuration.
+    """
+    root = Path(cwd)
+    if (root / "pytest.ini").is_file():
+        return True
+    for name, marker in _PYTEST_CONFIG_MARKERS:
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            if marker in path.read_text(encoding="utf-8"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _has_pytest_test_files(cwd: str) -> bool:
+    """Whether the repo contains pytest-style test files.
+
+    Checks a bounded set of conventional locations (``tests/`` and ``test/``
+    dirs, plus root/``src`` ``test_*.py`` / ``*_test.py`` globs) so the scan
+    never walks into node_modules or other vendored trees.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True when the repo contains Python test files.
+    """
+    root = Path(cwd)
+    for dirname in ("tests", "test"):
+        test_dir = root / dirname
+        if test_dir.is_dir() and any(test_dir.rglob("*.py")):
+            return True
+    for base in (root, root / "src"):
+        if base.is_dir() and (
+            any(base.glob("test_*.py")) or any(base.glob("*_test.py"))
+        ):
+            return True
+    return False
+
+
+def _has_pytest_suite(cwd: str) -> bool:
+    """Whether the repo has a runnable pytest suite.
+
+    Both conditions must hold: pytest must be importable via ``python3``
+    (otherwise running it would fail with ModuleNotFoundError) AND the repo
+    must declare pytest (config marker or test files). The second condition
+    prevents false positives on hosts with a global pytest that would
+    otherwise run on empty bash-only repos and block finish with pytest's
+    "no tests ran" exit code.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True when the repo has a runnable pytest suite.
+    """
+    return _pytest_importable(cwd) and (
+        _has_pytest_markers(cwd) or _has_pytest_test_files(cwd)
     )
 
-    result = pytest_run
-    if result["exit_code"] != 0:
-        # Try npm test as fallback (also cached)
-        npm_run = run_cached(
-            "npm test",
-            cwd=cwd,
-            timeout=600,
-            runner=lambda command, cwd_, timeout_: run_cmd(
-                command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
-            ),
-        )
-        if npm_run["exit_code"] == 0:
-            return {
-                "success": True,
-                "stdout": npm_run["stdout"].strip(),
-                "stderr": npm_run["stderr"].strip(),
-                "exit_code": 0,
-                "failures": [],
-            }
-        # Use the npm result if pytest also failed
-        result = npm_run
 
-    # Parse failures from output
+def _is_unity_project(cwd: str) -> bool:
+    """Whether *cwd* looks like a Unity project root.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        True when an ``Assets/`` directory or
+        ``ProjectSettings/ProjectVersion.txt`` exists.
+    """
+    root = Path(cwd)
+    return (root / "Assets").is_dir() or (root / "ProjectSettings" / "ProjectVersion.txt").is_file()
+
+
+def _find_repo_test_runner(cwd: str) -> str | None:
+    """Locate a repo-local test runner script at the repo root.
+
+    Unity repos (and other non-npm/non-pytest repos) commonly ship their own
+    runner, e.g. ``run_tests.sh`` or ``run_unity_tests.bat``; when present it
+    is executed instead of skipping the test step.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        The script file name, or None when no runner is present.
+    """
+    root = Path(cwd)
+    for name in ("run_tests.sh", "run_unity_tests.sh", "run_unity_tests.bat"):
+        if (root / name).is_file():
+            return name
+    return None
+
+
+def _detect_test_tooling(cwd: str) -> str | None:
+    """Detect the repo's test tooling, in precedence order.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        ``pytest`` | ``npm`` | ``repo-script`` | ``unity``, or None when the
+        repo has no test tooling at all.
+    """
+    if _has_pytest_suite(cwd):
+        return "pytest"
+    if _has_test_script(cwd):
+        return "npm"
+    if _find_repo_test_runner(cwd) is not None:
+        return "repo-script"
+    if _is_unity_project(cwd):
+        return "unity"
+    return None
+
+
+def _skip_test_result(message: str, tooling: str | None) -> dict[str, Any]:
+    """Build a skipped/no-op test result.
+
+    Args:
+        message: Informative no-op message (also logged).
+        tooling: The detected tooling, if any (e.g. ``unity``).
+
+    Returns:
+        A result dict with ``success: True`` so finish proceeds.
+    """
+    LOG.info(message)
+    return {
+        "success": True,
+        "stdout": message,
+        "stderr": "",
+        "exit_code": 0,
+        "failures": [],
+        "skipped": True,
+        "tooling": tooling,
+    }
+
+
+def _finalize_test_result(result: dict[str, Any], tooling: str | None) -> dict[str, Any]:
+    """Add metadata keys and parse failures from a raw run result.
+
+    Args:
+        result: Raw run dict (stdout/stderr/exit_code).
+        tooling: The runner that produced the result.
+
+    Returns:
+        The result dict with ``success``, ``failures``, ``skipped: False``
+        and ``tooling`` keys.
+    """
     failures: list[str] = []
     combined = f"{result['stdout']}\n{result['stderr']}"
     for line in combined.splitlines():
         if "FAILED" in line or "failed" in line.lower():
             failures.append(line.strip())
-
     return {
         "success": result["exit_code"] == 0,
         "stdout": result["stdout"].strip(),
         "stderr": result["stderr"].strip(),
         "exit_code": result["exit_code"],
         "failures": failures,
+        "skipped": False,
+        "tooling": tooling,
     }
+
+
+def _shell_command_runner(
+    command: str, cwd: str, timeout: int
+) -> subprocess.CompletedProcess:
+    """Run a shell command string through bash (per-repo overrides/runners)."""
+    return run_cmd(
+        ["bash", "-c", command],
+        cwd=cwd,
+        check=False,
+        timeout=timeout,
+        capture=True,
+    )
+
+
+def run_tests(cwd: str) -> dict[str, Any]:
+    """Run the full test suite, routed through the per-repo run cache.
+
+    The test step is tolerant of repos with no test tooling: when neither
+    pytest, an npm ``test`` script, nor a repo-local runner is detected, the
+    step is skipped and reported as a no-op (``success: True``,
+    ``skipped: True``) so finish proceeds to commit → push instead of
+    aborting on ENOENT / ``Missing script: "test"``.
+
+    Detection order:
+
+    1. ``IMPLEMENT_TEST_COMMAND`` env var — per-repo override; run as-is.
+    2. pytest — when the repo declares pytest (config markers or test files)
+       AND the module imports via ``python3``.
+    3. npm — when the root package.json defines a ``scripts.test`` entry.
+    4. repo-local runner — ``run_tests.sh`` / ``run_unity_tests.sh`` /
+       ``run_unity_tests.bat`` at the repo root.
+    5. Unity project (``Assets/`` or ``ProjectSettings/ProjectVersion.txt``)
+       without a configured runner → skipped with a Unity-specific message.
+    6. Otherwise → skipped with a generic no-tooling message.
+
+    Repos WITH tooling behave as before: the detected command runs (through
+    ``skill.test_cache.run_cached`` — a valid cached result for the same
+    worktree git state within the TTL is reused, see SA-0MSGN5OJ4002OZKY)
+    and a non-zero exit still blocks finish. When pytest is the detected
+    tooling, npm test remains the fallback if the repo also defines a
+    ``scripts.test`` entry.
+
+    Args:
+        cwd: Working directory (worktree root).
+
+    Returns:
+        A dict with ``success`` (bool), ``stdout`` (str), ``stderr`` (str),
+        ``exit_code`` (int), ``failures`` (list[str]), plus ``skipped``
+        (bool — True when no tooling was found) and ``tooling`` (str | None —
+        the detected runner: pytest/npm/repo-script/override/unity).
+    """
+    # 1. Per-repo override (env var) — highest precedence
+    override = os.environ.get("IMPLEMENT_TEST_COMMAND", "").strip()
+    if override:
+        return _finalize_test_result(
+            run_cached(
+                override,
+                cwd=cwd,
+                timeout=600,
+                runner=_shell_command_runner,
+            ),
+            tooling="override",
+        )
+
+    tooling = _detect_test_tooling(cwd)
+
+    # 2. pytest (with npm test fallback when the repo also has a test script)
+    if tooling == "pytest":
+        pytest_run = run_cached(
+            PYTEST_CMD,
+            cwd=cwd,
+            timeout=600,
+            runner=lambda command, cwd_, timeout_: run_cmd(
+                command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+            ),
+        )
+        result = pytest_run
+        final_tooling = "pytest"
+        if result["exit_code"] != 0 and _has_test_script(cwd):
+            # Try npm test as fallback (also cached, canonical form)
+            npm_run = run_cached(
+                NPM_TEST_CMD,
+                cwd=cwd,
+                timeout=600,
+                runner=lambda command, cwd_, timeout_: run_cmd(
+                    command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                ),
+            )
+            if npm_run["exit_code"] == 0:
+                return _finalize_test_result(npm_run, tooling="npm")
+            # Use the npm result if pytest also failed
+            result = npm_run
+            final_tooling = "npm"
+        return _finalize_test_result(result, tooling=final_tooling)
+
+    # 3. npm test script (no pytest suite)
+    if tooling == "npm":
+        return _finalize_test_result(
+            run_cached(
+                NPM_TEST_CMD,
+                cwd=cwd,
+                timeout=600,
+                runner=lambda command, cwd_, timeout_: run_cmd(
+                    command.split(), cwd=cwd_, check=False, timeout=timeout_, capture=True
+                ),
+            ),
+            tooling="npm",
+        )
+
+    # 4. Repo-local runner script
+    if tooling == "repo-script":
+        runner_script = _find_repo_test_runner(cwd)
+        if runner_script is None:
+            return _skip_test_result(
+                "Repo-local runner script disappeared before execution — "
+                "skipping test step (no-op).",
+                tooling="repo-script",
+            )
+        if runner_script.endswith(".bat"):
+            if shutil.which("cmd.exe") is None:
+                return _skip_test_result(
+                    f"Repo-local test runner {runner_script} requires cmd.exe "
+                    "which is not available on this host — skipping test step "
+                    "(no-op).",
+                    tooling="repo-script",
+                )
+            command = f"cmd.exe /c {runner_script}"
+        else:
+            command = f"bash {runner_script}"
+        return _finalize_test_result(
+            run_cached(command, cwd=cwd, timeout=600, runner=_shell_command_runner),
+            tooling="repo-script",
+        )
+
+    # 5. Unity project without a configured runner → Unity-specific skip
+    if tooling == "unity":
+        return _skip_test_result(
+            "Unity project detected (Assets/ or ProjectSettings/ProjectVersion.txt) "
+            "but no test runner configured — no pytest suite, no npm test script, "
+            "and no repo-local runner (run_tests.sh / run_unity_tests.sh / "
+            "run_unity_tests.bat). Skipping test step (no-op). Set "
+            "IMPLEMENT_TEST_COMMAND to run Unity tests if needed.",
+            tooling="unity",
+        )
+
+    # 6. No tooling at all → generic skip
+    return _skip_test_result(
+        "No test tooling detected (no pytest suite, no npm test script, no "
+        "repo-local test runner) — skipping test step (no-op).",
+        tooling=None,
+    )
 
 
 def run_refactor(work_item_id: str, cwd: str) -> dict[str, Any]:
@@ -1364,6 +1995,8 @@ def phase_finish(
         "attempt": test_attempts + 1,
         "success": test_result["success"],
         "failures": test_result.get("failures", []),
+        "skipped": test_result.get("skipped", False),
+        "tooling": test_result.get("tooling"),
     })
 
     while not test_result["success"] and test_attempts < max_retry:
@@ -1435,6 +2068,8 @@ def phase_finish(
             "attempt": test_attempts + 1,
             "success": test_result["success"],
             "failures": test_result.get("failures", []),
+            "skipped": test_result.get("skipped", False),
+            "tooling": test_result.get("tooling"),
         })
 
     if not test_result["success"]:
@@ -1614,6 +2249,290 @@ def phase_abort(
     return report
 
 
+def phase_parent(
+    work_item_id: str,
+    json_output: bool = False,
+    no_refactor: bool = False,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Phase: implement a parent work item by recursing into its children.
+
+    Invoking the implement skill on a parent/epic item must automatically
+    implement the children (and their blockers) in dependency order instead
+    of dead-ending at the old Step 5.1 gate (SA-0MSQBM2FK005NW1T). Each
+    invocation of this phase advances the chain by one child:
+
+    1. Fetch the parent and its children (``wl show --children``).
+    2. No children → behave like a leaf (no status change; use start/finish).
+    3. Resolve the dependency graph among children (outbound
+       ``wl dep list`` edges): in-chain blockers are implemented before
+       the children they block; cycles fail fast; cross-project blockers
+       are reported as coordination notes.
+    4. Classify children: terminal → skip; in_progress elsewhere → skip+report;
+       blocked by a non-terminal sibling → not startable (reported);
+       otherwise → implementable.
+    5. All children terminal → advance the parent to ``completed``/``in_review``
+       (existing Step 5.1 advancement retained) and comment a per-child summary.
+    6. Otherwise → start the next startable child (claim + worktree via
+       ``phase_start``) and report the worktree path; the caller implements
+       that child with the standard workflow (``implement.py finish
+       <child>``), then re-invokes this phase for the next child.
+
+    Worktree isolation is preserved per child: every child is implemented in
+    its own worktree created by ``phase_start`` (never the main checkout);
+    sequential children reuse/rotate the same ``.worklog/worktrees``
+    machinery. No worktree is created for the parent itself.
+
+    Args:
+        work_item_id: The parent work item ID.
+        json_output: If True, output JSON.
+        no_refactor: If True, skip the refactor step for started children.
+        parent_branch: Parent branch for child worktrees.
+        verbose: Enable verbose logging.
+
+    Returns:
+        Dict with the recursion plan: per-child classifications, the next
+        child started (with its worktree), or parent advancement when all
+        children are terminal.
+    """
+    report: dict[str, Any] = {
+        "phase": "parent",
+        "work_item_id": work_item_id,
+        "success": True,
+        "children": [],
+        "message": "",
+    }
+
+    # ── Step 1: Validate work item ID ──────────────────────────────
+    if not WORK_ITEM_ID_PATTERN.match(work_item_id):
+        msg = f"Invalid work item ID format: {work_item_id}. Expected pattern like SA-XXXXXXXXXXX"
+        report["success"] = False
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            LOG.error(msg)
+        return report
+
+    # ── Step 2: Code Freeze gate (before claiming/starting children) ──
+    if is_code_freeze_active():
+        msg = (
+            "Project is in Code Freeze — implementation blocked until the "
+            "release completes."
+        )
+        LOG.error(msg)
+        report["success"] = False
+        report["message"] = msg
+        report["code_freeze"] = True
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {msg}\n")
+        return report
+
+    # ── Step 3: Fetch parent + children ────────────────────────────
+    parent = wl_show(work_item_id)
+    if not parent:
+        msg = f"Work item {work_item_id} not found or failed to fetch"
+        report["success"] = False
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            LOG.error(msg)
+        return report
+    children = wl_show_children(work_item_id)
+
+    # ── Step 4: No children → behave like a leaf ───────────────────
+    if not children:
+        report["leaf"] = True
+        report["message"] = (
+            f"Work item {work_item_id} has no children — behave as a leaf "
+            "item: use `implement.py start/finish` as usual (no recursion)."
+        )
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print()
+            print("=" * 60)
+            print(f"  Parent: {work_item_id} — no children (leaf)")
+            print("=" * 60)
+            print(f"  {report['message']}")
+            print()
+        return report
+
+    # ── Step 5: Classify children ──────────────────────────────────
+    classifications: list[dict[str, Any]] = []
+    blockers_map: dict[str, list[dict[str, Any]]] = {}
+    for child in children:
+        cid = str(child.get("id", ""))
+        # Outbound (depends-on) edges: what this child is blocked by.
+        child_blockers = wl_dep_blockers(cid) if cid else []
+        blockers_map[cid] = child_blockers
+        # Blockers outside the children set (e.g. cross-project) are
+        # coordination notes, not in-chain edges (SA-0MSQBM2FK005NW1T).
+        in_chain_ids = {str(c.get("id")) for c in children}
+        external = [
+            str(b.get("id"))
+            for b in child_blockers
+            if str(b.get("id")) not in in_chain_ids
+        ]
+        classifications.append({
+            "id": cid,
+            "title": child.get("title", ""),
+            "status": child.get("status", ""),
+            "action": _classify_child(child),
+            "external_blockers": external,
+        })
+    report["children"] = classifications
+
+    # ── Step 5.5: Resolve dependency order (blockers first) ────────
+    ordered_children, cycle_error = _resolve_implementation_order(
+        children, blockers_map
+    )
+    if cycle_error:
+        report["success"] = False
+        report["message"] = cycle_error
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print()
+            print("=" * 60)
+            print(f"  ⛔ {cycle_error}")
+            print("=" * 60)
+            print()
+        return report
+
+    # ── Step 6: All children terminal → advance the parent ─────────
+    if all(c["action"] == "skip-terminal" for c in classifications):
+        parent_status = str(parent.get("status", ""))
+        already_terminal = _is_terminal_status(parent_status)
+        if not already_terminal:
+            try:
+                StatusLifecycle.update_status(
+                    work_item_id, "completed", stage="in_review"
+                )
+            except RuntimeError:
+                msg = f"Failed to advance parent {work_item_id}"
+                report["success"] = False
+                report["message"] = msg
+                if json_output:
+                    print(format_json_output(report))
+                else:
+                    LOG.error(msg)
+                return report
+        summary = "\n".join(
+            f"- {c['id']} ({c['status']})" for c in classifications
+        )
+        wl_add_comment(
+            work_item_id,
+            f"All children are in a terminal stage. Parent advanced to "
+            f"in_review.\n{summary}",
+        )
+        report["parent_advanced"] = True
+        report["message"] = (
+            f"All children of {work_item_id} are terminal; parent advanced "
+            f"to completed/in_review."
+        )
+        if already_terminal:
+            report["message"] = (
+                f"All children of {work_item_id} are terminal; parent is "
+                f"already in a terminal state ({parent_status})."
+            )
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print()
+            print("=" * 60)
+            print(f"  ✅ Parent advanced: {work_item_id} → in_review")
+            print("=" * 60)
+            print(summary)
+            print()
+        return report
+
+    # ── Step 7: Start the next child (claim + worktree) ────────────
+    next_child = _next_child_to_implement(ordered_children, blockers_map)
+    if next_child is None:
+        # No startable child: every remaining child is terminal, in progress
+        # elsewhere, or blocked by a non-terminal sibling.
+        blocked = [
+            c["id"]
+            for c in classifications
+            if c["action"] not in ("skip-terminal", "skip-in-progress")
+        ]
+        report["message"] = (
+            f"No child of {work_item_id} is currently startable: "
+            f"non-terminal children not in progress are blocked by "
+            f"non-terminal siblings or unavailable. Re-run this phase "
+            f"after one completes."
+        )
+        if blocked:
+            report["blocked_children"] = blocked
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print()
+            print("=" * 60)
+            print(f"  ⏳ {report['message']}")
+            print("=" * 60)
+            print()
+        return report
+
+    next_id = next_child.get("id", "")
+    LOG.info("Starting next child %s of parent %s...", next_id, work_item_id)
+    start_result = phase_start(
+        next_id,
+        json_output=False,
+        no_refactor=no_refactor,
+        parent_branch=parent_branch,
+        verbose=verbose,
+    )
+    if not start_result.get("success"):
+        msg = (
+            f"Failed to start child {next_id}: "
+            f"{start_result.get('message', 'unknown error')}"
+        )
+        LOG.error(msg)
+        report["success"] = False
+        report["next_child"] = next_id
+        report["message"] = msg
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {msg}\n")
+        return report
+
+    report["next_child"] = next_id
+    report["worktree_path"] = start_result.get("worktree_path", "")
+    report["branch"] = start_result.get("branch", "")
+    report["message"] = (
+        f"Started child {next_id}. Implement it in "
+        f"{start_result.get('worktree_path', '')}, then run "
+        f"`implement.py finish {next_id}`, then re-run "
+        f"`implement.py parent {work_item_id}` for the next child."
+    )
+
+    if json_output:
+        print(format_json_output(report))
+    else:
+        print()
+        print("=" * 60)
+        print(f"  Implement child: {next_id} (of {work_item_id})")
+        print("=" * 60)
+        print(f"  Worktree: {report['worktree_path']}")
+        print(f"  Branch:   {report['branch']}")
+        print()
+        print("  Next steps:")
+        print(f"  1. cd {report['worktree_path']}")
+        print("  2. Write tests and implementation code")
+        print(f"  3. Run: python3 scripts/implement.py finish {next_id}")
+        print(f"  4. Re-run: python3 scripts/implement.py parent {work_item_id}")
+        print()
+
+    return report
+
+
 def _is_worktree(path: Path) -> bool:
     """Check if *path* is a git worktree (not the main working tree).
 
@@ -1786,7 +2705,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "action",
-        choices=["start", "finish", "abort"],
+        choices=["start", "finish", "abort", "parent"],
         help="Workflow phase to execute",
     )
     parser.add_argument(
@@ -1896,6 +2815,14 @@ def _main(argv: list[str] | None = None) -> int:
         result = phase_abort(
             work_item_id=args.work_item_id,
             json_output=args.json,
+            verbose=args.verbose,
+        )
+    elif args.action == "parent":
+        result = phase_parent(
+            work_item_id=args.work_item_id,
+            json_output=args.json,
+            no_refactor=args.no_refactor,
+            parent_branch=args.parent_branch,
             verbose=args.verbose,
         )
     else:

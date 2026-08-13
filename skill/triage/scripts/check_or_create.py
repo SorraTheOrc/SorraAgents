@@ -47,23 +47,35 @@ def run_wl(args: list[str]) -> str | None:
 
 
 def list_critical_issues() -> list[dict[str, Any]]:
-    """List all critical issues tagged test-failure."""
-    out = run_wl(["list", "--priority", "critical", "--tags", "test-failure", "--json"])
-    if not out:
-        return []
-    try:
-        data = json.loads(out)
-        # wl list may return {"workItems": [...]}, {"items": [...]} or a bare list
-        if isinstance(data, dict):
-            items = data.get("workItems") or data.get("items")
-            if isinstance(items, list):
-                return items
-            return []
-        if isinstance(data, list):
-            return data
-        return []
-    except Exception:  # noqa: BLE001
-        return []
+    """List critical test-failure issues that are still incomplete.
+
+    The heuristics only accept ``open``/``in_progress`` items
+    (:func:`_is_incomplete`), so the query filters by those statuses
+    directly — the old unfiltered query downloaded every critical
+    test-failure item (52 KB today, of which 0 matched) to filter in
+    Python (SA-0MSPPI2FL005UQCR). Same result set, ~55 bytes payload.
+    """
+    items: list[dict[str, Any]] = []
+    for status in ("open", "in-progress"):
+        out = run_wl([
+            "list", "--priority", "critical", "--tags", "test-failure",
+            "--status", status, "--json",
+        ])
+        if not out:
+            continue
+        try:
+            data = json.loads(out)
+            # wl list may return {"workItems": [...]}, {"items": [...]} or a bare list
+            if isinstance(data, dict):
+                batch = data.get("workItems") or data.get("items")
+                if isinstance(batch, list):
+                    items.extend(batch)
+            elif isinstance(data, list):
+                items.extend(data)
+        except Exception as exc:  # noqa: BLE001 -- triage is best-effort; swallow to keep the scan resilient
+            print(f"[triage] wl list parse failed: {exc}", file=sys.stderr)
+            continue
+    return items
 
 
 def create_issue(title: str, body: str, parent_id: str | None = None) -> dict[str, Any] | None:

@@ -174,23 +174,28 @@ describe('remediateSpuriousCloses CLI (mocked wl on PATH)', () => {
     const binDir = join(tmpDir, 'bin');
     mkdirSync(binDir, { recursive: true });
 
-    // Mock `wl`: returns one item with one spurious close comment, then
+    // Mock `wl`: export writes the JSONL the real CLI would produce, then
     // records every `comment delete` and `update` invocation.
     const actionLog = join(tmpDir, 'actions.log');
     const wlMock = join(binDir, 'wl');
     writeFileSync(wlMock, `#!/usr/bin/env bash
 case "$1" in
-  list)
-    echo '{"success":true,"workItems":[{"id":"SA-MOCK1","title":"Mock One"},{"id":"SA-MOCK2","title":"Mock Two"}]}'
+  export)
+    # -f/--file <path>
+    OUTFILE=""
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == "--file" || "$1" == "-f" ]]; then OUTFILE="$2"; shift 2; else shift; fi
+    done
+    cat > "$OUTFILE" <<'JSONL'
+{"data":{"id":"SA-MOCK1","title":"Mock One"},"type":"workitem"}
+{"data":{"id":"SA-MOCK2","title":"Mock Two"},"type":"workitem"}
+{"data":{"id":"SA-C0MOCKSPUR","author":"worklog","comment":"Closed with reason: Shipped in v1.0.0","workItemId":"SA-MOCK1"},"type":"comment"}
+{"data":{"id":"SA-C0MOCKNORM","author":"map","comment":"normal","workItemId":"SA-MOCK2"},"type":"comment"}
+JSONL
+    echo '{"success":true}'
     ;;
   comment)
-    if [[ "$2" == "list" ]]; then
-      if [[ "$3" == "SA-MOCK1" ]]; then
-        echo '{"success":true,"comments":[{"id":"SA-C0MOCKSPUR","author":"worklog","comment":"Closed with reason: Shipped in v1.0.0"}]}'
-      else
-        echo '{"success":true,"comments":[{"id":"SA-C0MOCKNORM","author":"map","comment":"normal"}]}'
-      fi
-    elif [[ "$2" == "delete" ]]; then
+    if [[ "$2" == "delete" ]]; then
       echo "\$@" >> "$ACTION_LOG"
       echo '{"success":true}'
     fi

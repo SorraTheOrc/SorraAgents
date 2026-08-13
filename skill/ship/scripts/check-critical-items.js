@@ -24,32 +24,16 @@
 
 import { execSync } from 'node:child_process';
 
-// ── isTerminalState ─────────────────────────────────────────────────────────
-
-/**
- * Determine whether a work item is in a terminal state.
- *
- * A terminal state is defined as:
- *   `status === 'completed'` AND (`stage === 'in_review'` OR `stage === 'done'`)
- *
- * @param {{ status: string, stage: string }} workItem - The work item to check.
- * @returns {boolean} True if the item is in a terminal (releasable) state.
- */
-export function isTerminalState(workItem) {
-  return (
-    workItem.status === 'completed' &&
-    (workItem.stage === 'in_review' || workItem.stage === 'done')
-  );
-}
-
 // ── checkCriticalItems ──────────────────────────────────────────────────────
 
 /**
  * Check all critical-priority work items for release-readiness.
  *
- * Queries `wl list --priority critical --json` to fetch all critical-priority
- * items, then checks each one for terminal state. Any item not in a terminal
- * state is flagged as blocking.
+ * Queries `wl list --priority critical --status <open|in-progress|blocked>
+ * --json` directly — the returned items ARE the blockers, so no in-script
+ * terminal-state filter is needed (SA-0MSPPHLF9009UMWA). The full
+ * `--priority critical` dump (~94 KB) is replaced by three small scoped
+ * queries (~16 KB total).
  *
  * @returns {{
  *   hasBlockingItems: boolean,
@@ -63,37 +47,43 @@ export function isTerminalState(workItem) {
  * }}
  */
 export function checkCriticalItems() {
-  let criticalItems = [];
-
-  // Step 1: Query all critical-priority work items
-  try {
-    const output = execSync('wl list --priority critical --json', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const data = JSON.parse(output);
-    if (data.workItems && Array.isArray(data.workItems)) {
-      criticalItems = data.workItems;
-    }
-  } catch (err) {
-    // If wl CLI fails entirely (not installed, network error), treat as
-    // non-blocking — the release should not be blocked by a tooling failure.
-    // Log a warning so operators are aware.
-    console.warn(
-      `Warning: Failed to query critical items: ${err.stderr?.toString()?.trim() || err.message}`
-    );
-    return {
-      hasBlockingItems: false,
-      blockingItems: [],
-      message: 'Could not query critical work items (wl CLI unavailable or error). Gate skipped.',
-    };
-  }
-
-  // Step 2: Filter for non-terminal (blocking) items
+  // Non-terminal statuses: open / in-progress / blocked. Terminal is
+  // status=completed (stage in_review|done), so querying only the blocking
+  // statuses returns exactly the blockers — no in-script filter needed
+  // (SA-0MSPPHLF9009UMWA). Payload drops from ~94 KB to ~16 KB.
+  const blockingStatuses = ['open', 'in-progress', 'blocked'];
   const blockingItems = [];
+  let queriedCount = 0;
 
-  for (const item of criticalItems) {
-    if (!isTerminalState(item)) {
+  for (const status of blockingStatuses) {
+    let items = [];
+    try {
+      const output = execSync(
+        `wl list --priority critical --status ${status} --json`, {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+      );
+      const data = JSON.parse(output);
+      if (data.workItems && Array.isArray(data.workItems)) {
+        items = data.workItems;
+      }
+    } catch (err) {
+      // If wl CLI fails entirely (not installed, network error), treat as
+      // non-blocking — the release should not be blocked by a tooling failure.
+      // Log a warning so operators are aware.
+      console.warn(
+        `Warning: Failed to query critical items (status ${status}): ` +
+        `${err.stderr?.toString()?.trim() || err.message}`
+      );
+      return {
+        hasBlockingItems: false,
+        blockingItems: [],
+        message: 'Could not query critical work items (wl CLI unavailable or error). Gate skipped.',
+      };
+    }
+    queriedCount += items.length;
+    for (const item of items) {
       blockingItems.push({
         workItemId: item.id,
         title: item.title || item.id,
@@ -103,24 +93,24 @@ export function checkCriticalItems() {
     }
   }
 
-  // Step 3: Build report
+  // Step 2: Build report
   if (blockingItems.length === 0) {
-    if (criticalItems.length === 0) {
+    if (queriedCount === 0) {
       return {
         hasBlockingItems: false,
         blockingItems: [],
-        message: 'No critical-priority work items found. Critical-items gate passed.',
+        message: 'No non-terminal critical-priority work items found. Critical-items gate passed.',
       };
     }
     return {
       hasBlockingItems: false,
       blockingItems: [],
-      message: `All ${criticalItems.length} critical-priority work item(s) are in a terminal state. Critical-items gate passed.`,
+      message: `All queried non-terminal critical-priority work item(s) (${queriedCount}) are accounted for. Critical-items gate passed.`,
     };
   }
 
   const lines = [
-    `⚠️  Critical-items gate check failed — ${blockingItems.length} of ${criticalItems.length} critical-priority work item(s) are not in a terminal state:`,
+    `⚠️  Critical-items gate check failed — ${blockingItems.length} critical-priority work item(s) are not in a terminal state:`,
     '',
   ];
 

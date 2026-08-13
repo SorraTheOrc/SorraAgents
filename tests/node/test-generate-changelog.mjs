@@ -17,13 +17,23 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdtempSync } from
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 
+// Real implementations imported for the new parent-filtering and
+// entry-generation tests (AC5). These fall back to deterministic behaviour
+// when no DEEPSEEK_API_KEY is set, so the tests stay offline.
+import {
+  getParentsOnly,
+  generatePlayerDescription,
+  reviewClassification,
+  categorizeItems,
+} from '../../skill/ship/scripts/release/generate-changelog.js';
+
 // ── Load script functions by importing the module ──────────────────────────
 
-// Note: We import functions that are exported. Since the main script
-// currently only exports via the CLI, we extract testable functions by
-// reading the source and wrapping the internal functions.
-// For comprehensive testing we re-implement the core logic as small
-// testable helpers here, mirroring the script's actual implementation.
+// The script exports the pure logic functions used by the tests below
+// (getParentsOnly, generatePlayerDescription, reviewClassification,
+// categorizeItems). The older tests below still mirror the internal
+// helpers (checkMiscategorization, generateReleaseSection, updateChangelog)
+// for historical reasons; both styles assert observable behaviour.
 
 // ── Test helpers (mirror script logic) ──────────────────────────────────────
 
@@ -121,6 +131,29 @@ function test(name, fn) {
   } catch (err) {
     console.error(`  ✗ ${name}\n    ${err.message}`);
     process.exitCode = 1;
+  }
+}
+
+function asyncTest(name, fn) {
+  fn().then(
+    () => console.log(`  ✓ ${name}`),
+    (err) => {
+      console.error(`  ✗ ${name}\n    ${err.message}`);
+      process.exitCode = 1;
+    },
+  );
+}
+
+// Run a function with DEEPSEEK_API_KEY disabled so LLM-based functions
+// exercise their deterministic fallback paths (no network, no cost).
+async function withoutApiKey(fn) {
+  const saved = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = '';
+  try {
+    return await fn();
+  } finally {
+    if (saved === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = saved;
   }
 }
 
@@ -329,6 +362,102 @@ test('adds heading if no heading exists in legacy content', () => {
   assert.ok(result.startsWith('# Changelog'), 'should add top-level heading');
 });
 
+console.log('\ngetParentsOnly() — filtering to parent-level work items (AC1)\n');
+
+test('keeps only items with no parentId', () => {
+  const items = [
+    { id: 'SA-P1', title: 'Add co-op mode', issueType: 'feature', parentId: null },
+    { id: 'SA-C1', title: 'Co-op backend', issueType: 'task', parentId: 'SA-P1' },
+    { id: 'SA-P2', title: 'Fix login crash', issueType: 'bug' },
+  ];
+  const parents = getParentsOnly(items);
+  assert.deepEqual(
+    parents.map(i => i.id),
+    ['SA-P1', 'SA-P2'],
+    'should exclude items with a parentId and keep parents (null or missing)',
+  );
+});
+
+test('handles empty input', () => {
+  assert.deepEqual(getParentsOnly([]), [], 'should return empty array');
+});
+
+test('handles parentId as empty string (treated as child — only null/undefined are parents)', () => {
+  const items = [{ id: 'SA-C1', title: 'Child', issueType: 'task', parentId: '' }];
+  const parents = getParentsOnly(items);
+  assert.deepEqual(parents, [], 'empty-string parentId should be excluded');
+});
+
+console.log('\ngeneratePlayerDescription() / reviewClassification() — LLM fallback without API key (AC2/AC3)\n');
+
+asyncTest('generatePlayerDescription falls back to raw title without API key (backward compatible)', async () => {
+  await withoutApiKey(async () => {
+    const desc = await generatePlayerDescription({
+      id: 'SA-P1',
+      title: 'Add co-op mode',
+      issueType: 'feature',
+      description: 'Implement co-op support',
+    });
+    assert.equal(desc, 'Add co-op mode', 'should return the raw title as fallback');
+  });
+});
+
+asyncTest('reviewClassification returns keyword classification without API key', async () => {
+  await withoutApiKey(async () => {
+    const review = await reviewClassification({
+      id: 'SA-P2',
+      title: 'Fix login crash',
+      issueType: 'bug',
+      description: 'Fix the crash when logging in',
+    });
+    assert.deepEqual(review, { type: 'bug', flagged: false, note: '' }, 'should keep bug classification un-flagged');
+  });
+});
+
+console.log('\ncategorizeItems() — entry generation with player-focused descriptions (AC5)\n');
+
+asyncTest('generates categorized entries falling back to raw titles without API key', async () => {
+  await withoutApiKey(async () => {
+    const items = [
+      { id: 'SA-P1', title: 'Add co-op mode', issueType: 'feature', description: 'Play with friends', parentId: null },
+      { id: 'SA-P2', title: 'Fix login crash', issueType: 'bug', description: 'Stop the crash', parentId: null },
+      { id: 'SA-P3', title: 'Update dependencies', issueType: 'chore', description: 'Bump versions', parentId: null },
+    ];
+    const categorized = await categorizeItems(items);
+    assert.deepEqual(
+      categorized.features,
+      ['- Add co-op mode (SA-P1)'],
+      'feature entry should be "- title (id)" without API key',
+    );
+    assert.deepEqual(
+      categorized.bugFixes,
+      ['- Fix login crash (SA-P2)'],
+      'bug entry should be "- title (id)" without API key',
+    );
+    assert.deepEqual(
+      categorized.other,
+      ['- Update dependencies (SA-P3)'],
+      'other entry should be "- title (id)" without API key',
+    );
+  });
+});
+
+asyncTest('categorizeItems does not include items with a parentId', async () => {
+  await withoutApiKey(async () => {
+    const items = [
+      { id: 'SA-P1', title: 'Add co-op mode', issueType: 'feature', description: 'Play with friends', parentId: null },
+      { id: 'SA-C1', title: 'Co-op backend', issueType: 'task', description: 'Backend work', parentId: 'SA-P1' },
+    ];
+    const categorized = await categorizeItems(items);
+    const allEntries = [
+      ...categorized.features,
+      ...categorized.bugFixes,
+      ...categorized.other,
+    ];
+    assert.ok(allEntries.every(e => !e.includes('SA-C1')), 'child work items should not appear as entries');
+  });
+});
+
 console.log('\n--- All generate-changelog logic tests complete ---\n');
 
 // ── CLI invocation test ────────────────────────────────────────────────────
@@ -359,13 +488,18 @@ if (wlAvailable) {
   const savedContent = hadChangelog ? readFileSync(changelogPath, 'utf-8') : null;
 
   try {
-    // Generate a test changelog
+    // Generate a test changelog (strip DEEPSEEK_API_KEY so the CLI uses
+    // its deterministic offline fallback paths — no network, no cost)
     const result = spawnSync(
       'node', [
         resolve(dirname(fileURLToPath(import.meta.url)), '../../skill/ship/scripts/release/generate-changelog.js'),
         '0.0.0-test',
       ],
-      { encoding: 'utf-8', cwd: repoRoot },
+      {
+        encoding: 'utf-8',
+        cwd: repoRoot,
+        env: { ...process.env, DEEPSEEK_API_KEY: '' },
+      },
     );
 
     if (result.status === 0) {
