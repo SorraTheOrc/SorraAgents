@@ -8615,6 +8615,115 @@ class TestSlotAwareConcurrency:
             assert audit_runner._resolve_child_concurrency() == 1
 
 
+class TestProxyModeSerialization:
+    """Proxy cheap-mode detection + per-run serialization (SA-0MSN04X2S006ONH0).
+
+    The runner queries ``GET <base>/admin/mode`` at start (fail-open, ~3 s
+    timeout, read-only) and, when the mode is exactly ``"cheap"``, forces
+    ``AUDIT_PARALLELISM=1`` and ``AUDIT_MAX_CONCURRENCY=1`` for this run.
+    """
+
+    @staticmethod
+    def _mock_mode_response(body: str, status: int = 200):
+        mock_resp = mock.MagicMock()
+        mock_resp.status = status
+        mock_resp.read.return_value = body.encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        return mock.patch("urllib.request.urlopen", return_value=mock_resp)
+
+    def test_proxy_mode_constants(self):
+        assert audit_runner.AUDIT_PROXY_BASE_URL_ENV == "AUDIT_PROXY_BASE_URL"
+        assert audit_runner.AUDIT_PROXY_BASE_URL_DEFAULT == "http://192.168.0.199:8000"
+        assert audit_runner.AUDIT_PROXY_MODE_TIMEOUT <= 3  # short timeout (~3s)
+
+    def test_query_proxy_mode_parses_json(self):
+        """GET <base>/admin/mode JSON mode field is parsed."""
+        with self._mock_mode_response('{"mode": "fast"}') as mock_open:
+            mode = audit_runner._query_proxy_mode("http://proxy:8000")
+        assert mode == "fast"
+        _args, kwargs = mock_open.call_args
+        assert _args[0] == "http://proxy:8000/admin/mode"
+        assert kwargs.get("timeout") == audit_runner.AUDIT_PROXY_MODE_TIMEOUT
+
+    def test_query_proxy_mode_cheap(self):
+        """Mode 'cheap' is returned as-is."""
+        with self._mock_mode_response('{"mode": "cheap"}'):
+            assert audit_runner._query_proxy_mode("http://proxy:8000") == "cheap"
+
+    def test_query_proxy_mode_uses_env_base_url(self):
+        """AUDIT_PROXY_BASE_URL env overrides the default base URL."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PROXY_BASE_URL_ENV: "http://alt:9000"},
+            clear=False,
+        ), self._mock_mode_response('{"mode": "fast"}') as mock_open:
+            assert audit_runner._query_proxy_mode() == "fast"
+        assert mock_open.call_args[0][0] == "http://alt:9000/admin/mode"
+
+    def test_query_proxy_mode_fail_open_on_network_error(self):
+        """Unreachable/timeout/error → None (never raises)."""
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            assert audit_runner._query_proxy_mode("http://x") is None
+        with mock.patch("urllib.request.urlopen", side_effect=Exception("boom")):
+            assert audit_runner._query_proxy_mode("http://x") is None
+
+    def test_query_proxy_mode_non_200_returns_none(self):
+        """A non-200 response is treated as a failed query (fail-open)."""
+        with self._mock_mode_response("oops", status=503):
+            assert audit_runner._query_proxy_mode("http://x") is None
+
+    def test_query_proxy_mode_unparseable_returns_none(self):
+        """Non-JSON body → None."""
+        with self._mock_mode_response("not-json"):
+            assert audit_runner._query_proxy_mode("http://x") is None
+
+    def test_query_proxy_mode_missing_mode_field_returns_none(self):
+        """JSON without a 'mode' string field → None."""
+        with self._mock_mode_response('{"other": 1}'):
+            assert audit_runner._query_proxy_mode("http://x") is None
+        with self._mock_mode_response('{"mode": 5}'):
+            assert audit_runner._query_proxy_mode("http://x") is None
+
+    def test_apply_serialization_cheap_sets_both_env_and_logs(self, capsys):
+        """Mode 'cheap' → AUDIT_PARALLELISM=1 and AUDIT_MAX_CONCURRENCY=1 + stderr line."""
+        with mock.patch.object(audit_runner, "_query_proxy_mode", return_value="cheap"), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            audit_runner._apply_proxy_mode_serialization()
+            assert audit_runner.os.environ[audit_runner.AUDIT_PARALLELISM_ENV] == "1"
+            assert audit_runner.os.environ[audit_runner.ENV_MAX_WORKERS] == "1"
+        err = capsys.readouterr().err
+        assert "cheap" in err
+        assert "AUDIT_PARALLELISM=1" in err
+
+    def test_apply_serialization_fast_leaves_env_unchanged(self, capsys):
+        """Mode 'fast' → no env mutation, no log output."""
+        with mock.patch.object(audit_runner, "_query_proxy_mode", return_value="fast"), \
+             mock.patch.dict(
+                 audit_runner.os.environ,
+                 {audit_runner.AUDIT_PARALLELISM_ENV: "2", audit_runner.ENV_MAX_WORKERS: "5"},
+                 clear=True,
+             ):
+            audit_runner._apply_proxy_mode_serialization()
+            assert audit_runner.os.environ[audit_runner.AUDIT_PARALLELISM_ENV] == "2"
+            assert audit_runner.os.environ[audit_runner.ENV_MAX_WORKERS] == "5"
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert captured.err == ""
+
+    def test_apply_serialization_failure_fail_open_warns(self, capsys):
+        """Query failure → no env mutation + warning logged (fail-open)."""
+        with mock.patch.object(audit_runner, "_query_proxy_mode", return_value=None), \
+             mock.patch.dict(
+                 audit_runner.os.environ,
+                 {audit_runner.AUDIT_PARALLELISM_ENV: "2", audit_runner.ENV_MAX_WORKERS: "5"},
+                 clear=True,
+             ):
+            audit_runner._apply_proxy_mode_serialization()
+            assert audit_runner.os.environ[audit_runner.AUDIT_PARALLELISM_ENV] == "2"
+            assert audit_runner.os.environ[audit_runner.ENV_MAX_WORKERS] == "5"
+            assert "Warning" in capsys.readouterr().err
+
+
 class TestStallAndBudgetRegression:
     """AC5: healthy audits complete unchanged with the new knobs."""
 

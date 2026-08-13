@@ -39,6 +39,15 @@ child screenings run with bounded concurrency (default 2, configurable via
 `AUDIT_PARALLELISM`), and ready children skip Phase 1 screening
 entirely, reusing their persisted AC verdicts.
 
+**Cheap-mode serialization (SA-0MSN04X2S006ONH0):** the runner now also
+queries the llm-manager proxy mode at start (`GET <base>/admin/mode`, base
+from `AUDIT_PROXY_BASE_URL` default `http://192.168.0.199:8000`, ~3 s
+fail-open). When the proxy reports `"cheap"` (1-slot local pool), the runner
+forces `AUDIT_PARALLELISM=1` and `AUDIT_MAX_CONCURRENCY=1` for the run, so
+both Phase 1 child screening and Phase 2 deep analysis serialize instead of
+racing the single slot; any other mode or query failure leaves settings
+unchanged (fail-open).
+
 **Verdict semantics are unchanged** — Phase 1 verdicts remain
 `met/unmet/partial/adjusted` with the same normalization and adjusted-verdict
 guidance. Only the reading strategy (tools + manifest + parallelism + reuse)
