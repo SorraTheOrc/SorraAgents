@@ -4940,7 +4940,7 @@ class TestCallPiParseNormalizesVerdict:
         with mock.patch.object(
             audit_runner.subprocess, "Popen", return_value=mock_process
         ), mock.patch.object(
-            audit_runner, "_extract_pi_text",
+            audit_runner, "extract_pi_text",
             return_value='{"verdict": "pass", "evidence": "ok"}',
         ):
             result = audit_runner._call_pi("test prompt", model="test-model")
@@ -4953,7 +4953,7 @@ class TestCallPiParseNormalizesVerdict:
         with mock.patch.object(
             audit_runner.subprocess, "Popen", return_value=mock_process
         ), mock.patch.object(
-            audit_runner, "_extract_pi_text",
+            audit_runner, "extract_pi_text",
             return_value='{"verdict": "met", "evidence": "ok"}',
         ):
             result = audit_runner._call_pi("test prompt", model="test-model")

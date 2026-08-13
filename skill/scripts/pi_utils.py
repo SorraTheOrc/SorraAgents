@@ -63,6 +63,12 @@ def parse_pi_json_line(line: str):
 
     if event_type in ("message_start", "message_end", "turn_end"):
         message = obj.get("message")
+        # Only extract text from assistant messages. The user prompt echo
+        # (message_start with role=user) must never be treated as model
+        # output — it caused false parse failures when the model errored out
+        # mid-stream and the prompt was the last complete text block.
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return "", False, None
         text = _extract_text_from_assistant_message(message)
         if text:
             return "", False, text

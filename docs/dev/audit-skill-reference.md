@@ -427,9 +427,11 @@ Notes:
 - Phase 2 deep analysis now runs Pi in agent mode (with `--tools`). The agent-mode
   JSON-stream output may contain additional event types (`agent_start`, `turn_start`,
   `message_start`, `tool_execution_start`, `tool_execution_end`, `agent_end`) not
-  present in bare LLM pipe mode. The `_extract_pi_text()` and `_parse_pi_json_line()`
-  functions handle these transparently by extracting text content from
-  `message_update` events (same as bare LLM mode).
+  present in bare LLM pipe mode. The shared `extract_pi_text()` /
+  `parse_pi_json_line()` in `skill/scripts/pi_utils.py` handle these
+  transparently by extracting text content from `message_update` events (same as
+  bare LLM mode), and skip user-role `message_start` events so the prompt echo is
+  never mistaken for model output.
 - If response parsing fails, check debug logs (use `--debug-log`) to see the raw
   agent output. The runner automatically falls back to Phase 1 results on Phase 2
   failure.
