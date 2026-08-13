@@ -235,7 +235,7 @@ python3 ./scripts/audit_runner.py issue SA-123 --force           # in-progress i
 
 ## Script Execution Failure Notice
 
-On runner failure (non-zero exit, timeout, exception), the report is wrapped with an `⚠ Script Execution Failure: <script_name> — <reason>` banner above and below (informational, no state changes; `./scripts/failure_notice.py`; JSON key `script_failure`).
+On runner failure (non-zero exit, timeout, exception), the report is wrapped with an `⚠ Script Execution Failure: <script_name> — <reason>` banner above and below (informational, no state changes; `../scripts/failure_notice.py` — note this module lives one level above the audit scripts in the shared scripts dir, unlike the `./scripts/...` runner/persister; JSON key `script_failure`).
 
 ## Common failure modes
 

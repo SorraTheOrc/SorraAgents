@@ -22,6 +22,7 @@ All tests run offline.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -89,6 +90,59 @@ class TestSkillMdScanningGuidance:
         )
         assert "--batch-phase2" in runner_line
         assert "--max-concurrency" in runner_line
+
+
+# ===========================================================================
+# SKILL.md path resolvability (SA-0MSL1ZBY0007PIVD)
+# ===========================================================================
+
+
+class TestSkillMdPathResolvability:
+    """Every repo path referenced in SKILL.md resolves to a real file.
+
+    Catches doc-drift like the stale ``./scripts/failure_notice.py``
+    reference (the module lives one level up in ``skill/scripts/``). Only
+    concrete repo-relative paths are checked: flags, env vars, commands
+    (``/skill:test``), placeholders (``<id>``), home paths (``~``), and
+    absolute paths (``/llama/...``) are out of scope.
+    """
+
+    SKILL_DIR = REPO_ROOT / "skill" / "audit"
+
+    def _path_tokens(self):
+        """Backtick-quoted tokens + markdown-link targets from SKILL.md."""
+        text = SKILL_MD.read_text()
+        tokens = set(re.findall(r"`([^`]+)`", text))
+        tokens |= set(re.findall(r"\]\(([^)]+)\)", text))
+        return sorted(t.strip() for t in tokens)
+
+    def _resolve(self, token):
+        """Resolve a token to a repo path, or None when out of scope."""
+        if token.startswith(("~", "/", "<")):
+            return None  # home / absolute / placeholder
+        if token.startswith(("./", "../", "evidence/")):
+            return self.SKILL_DIR / token
+        if token.startswith(("skill/", "docs/", "tests/")):
+            return REPO_ROOT / token
+        return None  # bare flag / command / env var / filename mention
+
+    def test_every_referenced_path_resolves(self):
+        """AC1: every repo path referenced in SKILL.md exists on disk."""
+        missing = []
+        for token in self._path_tokens():
+            path = self._resolve(token)
+            if path is not None and not path.exists():
+                missing.append(f"{token} -> {path}")
+        assert missing == [], \
+            "SKILL.md references paths that do not exist:\n" + "\n".join(missing)
+
+    def test_failure_notice_points_at_shared_module(self):
+        """The failure-notice banner references ../scripts/ (one level up),
+        never the stale ./scripts/failure_notice.py (the module lives in
+        the shared scripts dir, above the audit scripts)."""
+        text = SKILL_MD.read_text()
+        assert "../scripts/failure_notice.py" in text
+        assert not re.search(r"`\./scripts/failure_notice\.py`", text)
 
 
 # ===========================================================================
