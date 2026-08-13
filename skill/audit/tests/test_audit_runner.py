@@ -820,6 +820,7 @@ class TestEffectiveTimeoutResolution:
         with (
             mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
             mock.patch.object(audit_runner, "cmd_project") as mock_project,
+            mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"),
             mock.patch.dict(
                 audit_runner.os.environ,
                 {audit_runner.AUDIT_PI_TIMEOUT_ENV: "3600"},
@@ -841,6 +842,7 @@ class TestEffectiveTimeoutResolution:
         with (
             mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
             mock.patch.object(audit_runner, "cmd_project") as mock_project,
+            mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"),
             mock.patch.dict(
                 audit_runner.os.environ,
                 {audit_runner.AUDIT_PI_TIMEOUT_ENV: "3600"},
@@ -2620,6 +2622,7 @@ class TestParentTimeoutResolution:
         """AC1: main() resolves the parent timeout from env var and passes it through."""
         with (
             mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
+            mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"),
             mock.patch.dict(
                 audit_runner.os.environ,
                 {audit_runner.AUDIT_PARENT_TIMEOUT_ENV: "600"},
@@ -2635,6 +2638,7 @@ class TestParentTimeoutResolution:
         """AC1: main() prefers the CLI --parent-timeout flag over the env var."""
         with (
             mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
+            mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"),
             mock.patch.dict(
                 audit_runner.os.environ,
                 {audit_runner.AUDIT_PARENT_TIMEOUT_ENV: "600"},
@@ -2706,6 +2710,7 @@ class TestMaxChildAuditsResolution:
         """AC3: main() resolves the cap from env var and passes it through."""
         with (
             mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
+            mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"),
             mock.patch.dict(
                 audit_runner.os.environ,
                 {audit_runner.AUDIT_MAX_CHILD_AUDITS_ENV: "4"},
@@ -2719,7 +2724,8 @@ class TestMaxChildAuditsResolution:
 
     def test_main_resolves_audit_children_flag(self):
         """AC2: main() passes the --audit-children flag through to cmd_issue."""
-        with mock.patch.object(audit_runner, "cmd_issue") as mock_cmd:
+        with mock.patch.object(audit_runner, "cmd_issue") as mock_cmd, \
+                mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"):
             audit_runner.main(
                 ["issue", "SA-123", "--do-not-persist", "--audit-children"]
             )
@@ -2728,7 +2734,8 @@ class TestMaxChildAuditsResolution:
 
     def test_main_defaults_audit_children_off(self):
         """AC1: main() defaults --audit-children to off (no cascade)."""
-        with mock.patch.object(audit_runner, "cmd_issue") as mock_cmd:
+        with mock.patch.object(audit_runner, "cmd_issue") as mock_cmd, \
+                mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"):
             audit_runner.main(["issue", "SA-123", "--do-not-persist"])
             _args, kwargs = mock_cmd.call_args
             assert kwargs["audit_children"] is False
@@ -6148,7 +6155,8 @@ class TestGreenRunPromptInjection:
 
     def test_main_forwards_green_run_flag(self):
         """AC1: main() accepts --green-run on the issue subcommand and forwards it."""
-        with mock.patch.object(audit_runner, "cmd_issue") as mock_cmd:
+        with mock.patch.object(audit_runner, "cmd_issue") as mock_cmd, \
+                mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"):
             rc = audit_runner.main(
                 ["issue", "SA-123", "--do-not-persist", "--green-run", "HEAD"]
             )

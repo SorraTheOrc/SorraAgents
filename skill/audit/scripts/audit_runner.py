@@ -363,6 +363,28 @@ still collapsing the N-sequential-calls wall-clock to N/cap. Operators can
 override via ``AUDIT_PARALLELISM``.
 """
 
+AUDIT_PROXY_BASE_URL_ENV = "AUDIT_PROXY_BASE_URL"
+"""Environment variable name for the llm-manager proxy base URL.
+
+The runner queries ``GET <base>/admin/mode`` at start to detect the proxy's
+operating mode (fast/cheap) and serialize parallelism when cheap
+(SA-0MSN04X2S006ONH0). Defaults to ``AUDIT_PROXY_BASE_URL_DEFAULT``.
+"""
+
+AUDIT_PROXY_BASE_URL_DEFAULT = "http://192.168.0.199:8000"
+"""Default llm-manager proxy base URL (matches pi ``models.json`` "Local Proxy").
+
+Overridable via ``AUDIT_PROXY_BASE_URL`` if the proxy address changes — no
+code change required.
+"""
+
+AUDIT_PROXY_MODE_TIMEOUT = 3.0
+"""Short timeout (seconds) for the proxy-mode query (fail-open).
+
+The mode query is best-effort: a timeout/unreachable proxy must never block
+or fail the audit, so the wait is capped at ~3 s.
+"""
+
 AUDIT_SLOT_STATUS_URL_ENV = "AUDIT_SLOT_STATUS_URL"
 """Environment variable name for the local proxy slot-status endpoint.
 
@@ -1898,6 +1920,70 @@ def _query_slot_status(url: str | None = None,
         return int(available), int(total)
     except Exception:  # noqa: BLE001 — best-effort, fail-open
         return None, None
+
+
+def _query_proxy_mode(base_url: str | None = None,
+                      timeout: float = AUDIT_PROXY_MODE_TIMEOUT) -> str | None:
+    """Best-effort query of the llm-manager proxy operating mode.
+
+    GETs ``<base>/admin/mode`` and returns the ``mode`` field (e.g.
+    ``"fast"`` / ``"cheap"``), or ``None`` when the endpoint is unreachable,
+    times out, returns non-JSON, a non-200 status, or lacks the ``mode``
+    field (fail-open — the caller leaves parallelism settings unchanged).
+
+    Read-only by mandate: this function never issues ``POST /admin/set-mode``
+    (mode switching is operator/herdr territory; the audit mandate stays
+    read-only, SA-0MSN04X2S006ONH0).
+
+    The query uses a short timeout (``AUDIT_PROXY_MODE_TIMEOUT`` = 3 s) and
+    never raises: the mode check must never block or fail the audit.
+    """
+    target = base_url or os.environ.get(
+        AUDIT_PROXY_BASE_URL_ENV, AUDIT_PROXY_BASE_URL_DEFAULT
+    )
+    endpoint = target.rstrip("/") + "/admin/mode"
+    try:
+        with urllib.request.urlopen(endpoint, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+        mode = data.get("mode")
+        return mode if isinstance(mode, str) else None
+    except Exception:  # noqa: BLE001 — best-effort, fail-open
+        return None
+
+
+def _apply_proxy_mode_serialization() -> None:
+    """Serialize parallelism when the proxy is in ``cheap`` mode.
+
+    Called once at runner start (before any pi call). When the proxy reports
+    mode exactly ``"cheap"`` (case-sensitive), this run's pi launches are
+    capped to one at a time by setting both ``AUDIT_PARALLELISM=1`` and
+    ``AUDIT_MAX_CONCURRENCY=1`` in this process's environment — so the
+    audit does not race the proxy's single-slot cheap-mode pool.
+
+    Fail-open: any other mode (including ``"fast"``) or a failed query
+    (unreachable / timeout / non-200 / unparseable) leaves all parallelism
+    settings unchanged; a warning is logged to stderr only on query
+    failure. The change is per-process (``os.environ``) — it affects only
+    this run's spawned pi subprocesses, never other processes or audits.
+    """
+    mode = _query_proxy_mode()
+    if mode == "cheap":
+        os.environ[AUDIT_PARALLELISM_ENV] = "1"
+        os.environ[ENV_MAX_WORKERS] = "1"
+        print(
+            "Proxy mode is 'cheap' — serializing audit pi calls "
+            "(AUDIT_PARALLELISM=1, AUDIT_MAX_CONCURRENCY=1).",
+            file=sys.stderr,
+        )
+    elif mode is None:
+        print(
+            "Warning: could not determine proxy mode (fail-open — "
+            "parallelism settings unchanged).",
+            file=sys.stderr,
+        )
+    # Any other reported mode (e.g. "fast") → unchanged, no log noise.
 
 
 def _resolve_max_child_concurrency() -> int:
@@ -6827,6 +6913,12 @@ def main(argv: list[str] | None = None) -> int:
     child_screen_timeout = getattr(args, "child_screen_timeout", None)
     if child_screen_timeout is not None:
         os.environ[AUDIT_CHILD_SCREEN_TIMEOUT_ENV] = str(child_screen_timeout)
+
+    # Detect proxy 'cheap' mode before any pi call and serialize this run's
+    # parallelism (AUDIT_PARALLELISM=1 + AUDIT_MAX_CONCURRENCY=1) so the
+    # audit does not race the proxy's single-slot pool (SA-0MSN04X2S006ONH0).
+    # Fail-open: a failed query or any other mode leaves settings unchanged.
+    _apply_proxy_mode_serialization()
 
     if args.command == "issue":
         return cmd_issue(args.issue_id, persist=not args.do_not_persist,
