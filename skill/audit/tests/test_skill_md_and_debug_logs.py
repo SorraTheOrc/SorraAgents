@@ -406,6 +406,59 @@ class TestRunCompletionCleanup:
             assert args[0] == str(debug_path)
             assert args[1] == "project"
 
+    def test_cmd_issue_retains_debug_log_on_failure(self) -> None:
+        """cmd_issue keeps the debug file when a script failure occurs (SA-0MSBSOAEM0078LAO AC3)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            debug_path = Path(tmp) / "audit_debug_SA-X.jsonl"
+            debug_path.write_text('{"raw_stdout": "x"}\n')
+            original_content = debug_path.read_text()
+            # Provide an AC in the description so Phase 1 calls _call_pi
+            # (which raises, triggering script_failure → debug log retained).
+            work_with_ac = {"success": True,
+                            "workItem": {"id": "SA-X",
+                                         "status": "open",
+                                         "stage": "plan_complete",
+                                         "description": "Acceptance Criteria:\n- Verify X works"}}
+            fake_run_ac = self._fake_run_wl
+            def _run_wl_with_ac(runner, cmd, worklog_dir=None):
+                cmd_str = " ".join(cmd)
+                if "show" in cmd_str:  # both --json and --children --json
+                    return work_with_ac
+                if "update" in cmd_str or "list" in cmd_str:
+                    return {"success": True}
+                return {"success": True}
+            with mock.patch.object(audit_runner, "_call_pi",
+                                   side_effect=RuntimeError("provider timeout")), \
+                 mock.patch.object(audit_runner, "_run_wl",
+                                   side_effect=_run_wl_with_ac), \
+                 mock.patch("skill.code_review.scripts.code_quality.run_code_quality",
+                            return_value={"success": True, "findings": [], "fixes_applied": 0}), \
+                 mock.patch.object(audit_runner, "_default_debug_log_path",
+                                   return_value=debug_path):
+                audit_runner.cmd_issue("SA-X", persist=False, force=True,
+                                       debug_log=str(debug_path))
+            # Debug file retained for forensics (may contain additional entries).
+            assert debug_path.exists()
+            # The original content must still be present (file was NOT deleted).
+            assert original_content in debug_path.read_text()
+
+    def test_cmd_project_retains_debug_log_on_failure(self) -> None:
+        """cmd_project keeps the debug file when _call_pi raises (failure-path retention)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            debug_path = Path(tmp) / "audit_debug_project.jsonl"
+            debug_path.write_text('{"raw_stdout": "x"}\n')
+            original_content = debug_path.read_text()
+            with mock.patch.object(audit_runner, "_call_pi",
+                                   side_effect=RuntimeError("pi unavailable")), \
+                 mock.patch.object(audit_runner, "_run_wl",
+                                   side_effect=self._fake_run_wl), \
+                 mock.patch.object(audit_runner, "_default_debug_log_path",
+                                   return_value=debug_path):
+                audit_runner.cmd_project(debug_log=str(debug_path))
+            # Debug file retained for forensics.
+            assert debug_path.exists()
+            assert debug_path.read_text() == original_content
+
 
 # ===========================================================================
 # cleanup_debug_logs.py
