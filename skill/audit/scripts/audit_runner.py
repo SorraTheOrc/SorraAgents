@@ -5160,6 +5160,27 @@ def _reask_verdict_array_once(
     return repaired
 
 
+def _format_script_failure(script_name: str, exc: Exception) -> dict:
+    """Map a script execution exception to a structured failure record.
+
+    Shared by ``cmd_issue`` and ``cmd_project`` (SA-0MSL1Z67Z001ZO87): each
+    command keeps a tiny first-failure-only wrapper, but the reason mapping
+    lives in exactly one place. Maps ``TimeoutExpired`` to a readable
+    timeout reason and ``FileNotFoundError`` to the missing filename; other
+    exceptions keep their str() as the reason.
+    """
+    reason = str(exc)
+    if isinstance(exc, subprocess.TimeoutExpired):
+        reason = f"Timeout after {exc.timeout}s"
+    elif isinstance(exc, FileNotFoundError):
+        reason = f"File not found: {exc.filename}"
+    return {
+        "script_name": script_name,
+        "reason": reason,
+        "stderr": str(exc),
+    }
+
+
 def cmd_issue(issue_id: str, persist: bool = True,
               timeout: int | None = None,
               parent_timeout: int | None = None,
@@ -5364,21 +5385,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
         """Record a script execution failure into the enclosing scope.
 
         Only records the first failure; subsequent failures are suppressed
-        to avoid overwriting the root cause.
+        to avoid overwriting the root cause. The failure record itself is
+        built by the shared :func:`_format_script_failure`.
         """
         nonlocal script_failure
         if script_failure is not None:
             return
-        reason = str(exc)
-        if isinstance(exc, subprocess.TimeoutExpired):
-            reason = f"Timeout after {exc.timeout}s"
-        elif isinstance(exc, FileNotFoundError):
-            reason = f"File not found: {exc.filename}"
-        script_failure = {
-            "script_name": script_name,
-            "reason": reason,
-            "stderr": str(exc),
-        }
+        script_failure = _format_script_failure(script_name, exc)
 
     # ------------------------------------------------------------------
     # Capture original status + stage before setting in_progress, so the
@@ -6708,19 +6721,16 @@ def cmd_project(timeout: int | None = None,
     script_failure: dict | None = None
 
     def _record_script_failure(script_name: str, exc: Exception) -> None:
+        """Record a script execution failure into the enclosing scope.
+
+        Only records the first failure; subsequent failures are suppressed
+        to avoid overwriting the root cause. The failure record itself is
+        built by the shared :func:`_format_script_failure`.
+        """
         nonlocal script_failure
         if script_failure is not None:
             return
-        reason = str(exc)
-        if isinstance(exc, subprocess.TimeoutExpired):
-            reason = f"Timeout after {exc.timeout}s"
-        elif isinstance(exc, FileNotFoundError):
-            reason = f"File not found: {exc.filename}"
-        script_failure = {
-            "script_name": script_name,
-            "reason": reason,
-            "stderr": str(exc),
-        }
+        script_failure = _format_script_failure(script_name, exc)
 
     try:
         # Scoped status queries only (SA-0MSLVQMKF000ESPZ): the project audit

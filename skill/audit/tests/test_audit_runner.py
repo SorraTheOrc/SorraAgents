@@ -8447,6 +8447,38 @@ class TestExtractJsonObject:
         assert audit_runner._extract_json_object('"just a string"') is None
 
 
+class TestFormatScriptFailure:
+    """Unit tests for the shared _format_script_failure helper (SA-0MSL1Z67Z001ZO87).
+
+    Both ``cmd_issue`` and ``cmd_project`` delegate their nested
+    ``_record_script_failure`` closures to this single module-level
+    function, so the reason mapping lives in exactly one place.
+    """
+
+    def test_generic_exception_uses_str_reason(self):
+        """A generic exception keeps its str() as the reason."""
+        result = audit_runner._format_script_failure("pi", RuntimeError("boom"))
+        assert result == {
+            "script_name": "pi",
+            "reason": "boom",
+            "stderr": "boom",
+        }
+
+    def test_timeout_maps_to_readable_reason(self):
+        """TimeoutExpired maps to a readable 'Timeout after Ns' reason."""
+        exc = subprocess.TimeoutExpired(cmd=["pi"], timeout=120)
+        result = audit_runner._format_script_failure("pi", exc)
+        assert result["script_name"] == "pi"
+        assert result["reason"] == "Timeout after 120s"
+        assert "timed out after 120 seconds" in result["stderr"]
+
+    def test_file_not_found_maps_to_filename(self):
+        """FileNotFoundError maps to the missing executable filename."""
+        exc = FileNotFoundError(2, "No such file or directory", "pi")
+        result = audit_runner._format_script_failure("wl", exc)
+        assert result["reason"] == "File not found: pi"
+
+
 class TestCmdProjectPiOutputWiring:
     """cmd_project uses Pi output when parseable and falls back to local values.
 
@@ -8545,6 +8577,9 @@ class TestCmdProjectPiOutputWiring:
         payload = json.loads(capsys.readouterr().out)
         assert payload["summary"] == self._LOCAL_SUMMARY
         assert payload["recommendation"] == self._LOCAL_RECOMMENDATION
+        # The recorded failure is surfaced with the mapped reason (AC2).
+        assert payload["script_failure"]["script_name"] == "pi (project-level summary)"
+        assert payload["script_failure"]["reason"] == "pi binary not found"
 
     def test_fallback_on_unparseable_pi_output(self, capsys):
         """Unparseable model output preserves locally computed values."""
