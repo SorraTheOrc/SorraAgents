@@ -77,7 +77,7 @@ the launch directory does.
 Audits can run for **hours**; the **launch → monitor → abort** contract is in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md). Summary:
 
 - **Launch:** detached, unique log under `~/.audit_debug/<project>/`; **180-min budget**.
-- **Monitor:** every 3 min — `kill -0 <pid>`, `tail -50 <log>` (markers: `Phase 1 passed: running Phase 2 deep code analysis...`, `Per-call timing:`); confirm log growth.
+- **Monitor:** every 3 min — `kill -0 <pid>`, `tail -50 <log>` (markers: `Phase 1 passed: running Phase 2 deep code analysis...`, `Skipping Phase 2 deep analysis: effort=... risk=...`, `Per-call timing:`); confirm log growth.
 - **Abort:** stale log ≥10 min, ≥3 provider-error retries w/o progress, unexpected exits/loops, or 180-min budget → kill tree (`pkill -TERM -P` → `kill` → `-KILL`); restore pre-audit status/stage only if the runner didn't complete its lifecycle (never demote `in_review`→`open`); append failure notice (progress summary: elapsed time, last phase marker, trigger) and **report the outcome to the operator** (run id, log path, trigger, restored status/stage). Never fabricate a report or override a completed verdict.
 
 ### In-process per-call safeguards (complementary to the external monitor)
@@ -114,8 +114,9 @@ Phase 2 (model verifies code against each AC)
 ```
 
 - **Phase 1 — Automated Screening:** order (1) code quality check, (2) children stage check (must be `in_review`/`done`), (3) surface AC assessment. Blocking: critical/high findings, or any non-deleted child not in `in_review`/`done`.
-- **Decision Gate:** blocking → all "met" ACs → "partial" ("pending deep code review"), skip Phase 2, "Ready to close: No" — **FINAL**, MUST NOT be overridden. No blockers → proceed to Phase 2 (**MANDATORY**).
-- **Phase 2 — Deep Code Analysis:** **MANDATORY when reached** — model reads actual implementation files, verifies each AC, provides file:line evidence. Never skipped once the gate passes.
+- **Decision Gate:** blocking → all "met" ACs → "partial" ("pending deep code review"), skip Phase 2, "Ready to close: No" — **FINAL**, MUST NOT be overridden. No blockers → proceed to Phase 2 (**MANDATORY**), **except** the narrow low-risk/small-item skip below.
+- **Phase 2 — Deep Code Analysis:** **MANDATORY when reached** — model reads actual implementation files, verifies each AC, provides file:line evidence. Never skipped once the gate passes, except for the single, unconditional exception in the next bullet.
+- **Low-risk/small-item exception (SA-0MSQ026T3009QY2L):** when a work item has `effort` ∈ {Extra Small, Small} **and** `risk` = Low, Phase 2 deep analysis is skipped — Phase 1 verdicts stand unchanged (`met` remains `met`) and the report/evidence records the skip reason. The rule applies tree-wide: the parent and every child in the cascade are evaluated independently against the criterion. **Fail-closed:** missing/unknown `effort` or `risk` ⇒ Phase 2 runs as usual (never skip on absent data). No override flag or env var forces deep analysis for a qualifying node — the skip is unconditional.
 - **Final Verdict:** "met" only when BOTH phases confirm; disagreement → "partial".
 - **Ready-to-close criteria:** (1) all ACs `met`/`adjusted`, (2) all active children `in_review`/`done` (empty stage excluded), (3) no critical/high findings.
 
@@ -201,7 +202,7 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 ### Two-Phase Pipeline (MANDATORY)
 
 - Return a structured markdown report with `Ready to close:` header and canonical sections (pipeline sections above are normative).
-- **Phase 2 is MANDATORY when Phase 1 passes — never skip it**; verify each AC against actual code with file:line evidence.
+- **Phase 2 is MANDATORY when Phase 1 passes — never skip it**; verify each AC against actual code with file:line evidence. **Sole exception (SA-0MSQ026T3009QY2L):** items with `effort` ∈ {Extra Small, Small} **and** `risk` = Low skip Phase 2 — Phase 1 verdicts stand unchanged, evidence notes the skip, and the rule is fail-closed (missing/unknown values ⇒ deep analysis runs). Applies independently to the parent and every child in the cascade; unconditional (no override flag/env).
 - **Blocking issues are narrow:** only (1) **critical/high** findings and (2) an active child not in `in_review`/`done` block Phase 2. AC ambiguity, medium warnings, or preference are NOT valid reasons to skip.
 - **Ready-to-close criteria:** all ACs `met`/`adjusted`, all active children `in_review`/`done`, no critical/high findings. **Children in `in_review` do NOT block closure** — only pre-review stages do.
 - **Do NOT add release-process or merge-status constraints** — not audit concerns.

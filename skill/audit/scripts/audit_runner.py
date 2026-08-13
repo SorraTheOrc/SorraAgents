@@ -3094,6 +3094,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            model: str | None = _MISSING,
                            model_source: str | None = _MISSING,
                            phase2_completed: bool = False,
+                           phase2_skip_note: str | None = None,
                            green_run_sha: str | None = None,
                            auto_green_run_sha: str | None = None,
                            test_skill_run_sha: str | None = None,
@@ -3292,7 +3293,9 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             if adjusted_count > 0:
                 parts.append(f"({adjusted_count} with acceptable variance)")
             parts.append(". All children are in in_review or done stage.")
-            if phase2_completed:
+            if phase2_skip_note:
+                parts.append(f" Phase 2 deep analysis skipped: {phase2_skip_note}.")
+            elif phase2_completed:
                 parts.append(" Deep code analysis (Phase 2) completed and confirmed all verdicts.")
             lines.append(" ".join(parts))
     else:
@@ -4259,6 +4262,53 @@ def _map_gaps_to_children(ac_results: list[dict],
     return mapped
 
 
+# ---------------------------------------------------------------------------
+# Small/low-risk Phase 2 skip helper (SA-0MSQ026T3009QY2L)
+# ---------------------------------------------------------------------------
+
+_SMALL_EFFORTS = frozenset({"Extra Small", "Small", "XS", "S"})
+_LOW_RISK = frozenset({"Low", "low", "L"})
+
+
+def _is_low_risk_small(effort: str | None, risk: str | None) -> bool:
+    """Return True when effort is XS/Small AND risk is Low.
+
+    This is the **only** exception to "Phase 2 mandatory": when a work item
+    is both small (Extra Small or Small effort) **and** low risk, deep code
+    analysis is skipped — Phase 1 verdicts stand unchanged with a skip
+    diagnostic.
+
+    Fail-closed: when either value is missing or unknown the function
+    returns ``False`` so Phase 2 runs as usual.
+    """
+    if effort is None or risk is None:
+        return False
+    effort_stripped = effort.strip()
+    risk_stripped = risk.strip()
+    return (
+        effort_stripped in _SMALL_EFFORTS and risk_stripped in _LOW_RISK
+    )
+
+
+def _annotate_skip_evidence(ac_results: list[dict], note: str) -> list[dict]:
+    """Append a Phase 2 skip note to each AC's evidence (verdicts unchanged).
+
+    Returns a new list; the verdict of every AC is preserved verbatim — the
+    skip only records why deep analysis did not run (SA-0MSQ026T3009QY2L).
+    """
+    updated: list[dict] = []
+    for ac in ac_results:
+        item = dict(ac)
+        evidence = item.get("evidence", "") or ""
+        if evidence:
+            evidence = f"{evidence}; {note}"
+        else:
+            evidence = note
+        item["evidence"] = evidence
+        updated.append(item)
+    return updated
+
+
 def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict]) -> tuple[bool, str]:
     """Check whether Phase 1 automated screening has blocking issues.
 
@@ -4315,7 +4365,8 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
                       child_results: list[dict],
                       code_quality_findings: list[dict] | None = None,
                       code_quality_fixes_applied: int = 0,
-                      phase2_completed: bool = False) -> dict:
+                      phase2_completed: bool = False,
+                      phase2_skip_note: str | None = None) -> dict:
     """Build structured JSON payload for issue-mode audit.
 
     Ready-to-close logic:
@@ -4373,7 +4424,11 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     unmet_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_UNMET)
     adjusted_count = sum(1 for r in all_criteria if r["verdict"] == VERDICT_ADJUSTED)
 
-    phase2_note = " Deep analysis completed." if phase2_completed else " Phase 2 skipped."
+    phase2_note = (
+        f" Phase 2 deep analysis skipped: {phase2_skip_note}."
+        if phase2_skip_note
+        else (" Deep analysis completed." if phase2_completed else " Phase 2 skipped.")
+    )
     if all_ac_acceptable:
         if adjusted_count > 0:
             summary = (
@@ -4796,6 +4851,15 @@ def _run_phase2_deep_analysis(
     ``ac_results`` back in with the gap-mapped children so the parent call is
     not duplicated.
 
+    Small/low-risk children (SA-0MSQ026T3009QY2L): children with ``effort``
+    ∈ {Extra Small, Small} AND ``risk`` = Low are dropped from the Phase 2
+    pending list — their Phase 1 ``ac_results`` stand unchanged with the
+    skip reason annotated into the AC evidence. Non-qualifying children
+    (and children with missing/unknown effort or risk — fail-closed) still
+    get deep analysis. The parent's own skip is decided by the caller's
+    Phase 2 gate, which passes ``skip_parent_deep=True`` here when the
+    parent qualifies.
+
     *owning_root* is the project root that owns the audited item (resolved
     by the launch-context guard); when omitted it is re-resolved from the
     issue id. The FILE SCOPE manifest is validated against it and an
@@ -4840,6 +4904,23 @@ def _run_phase2_deep_analysis(
             )
             continue
         if not child.get("ac_results"):
+            continue
+        if _is_low_risk_small(child.get("effort"), child.get("risk")):
+            # Small effort + Low risk — skip this child's Phase 2 deep
+            # analysis (SA-0MSQ026T3009QY2L). Phase 1 verdicts stand
+            # unchanged; annotate the AC evidence with the skip reason.
+            print(
+                f"Skipping Phase 2 deep analysis for child "
+                f"{child.get('id', '')}: effort={child.get('effort')}, "
+                f"risk={child.get('risk')}. Phase 1 verdicts stand unchanged.",
+                file=sys.stderr,
+            )
+            child["ac_results"] = _annotate_skip_evidence(
+                child.get("ac_results", []),
+                f"Phase 2 deep analysis skipped (effort={child.get('effort')}, "
+                f"risk={child.get('risk')}): small, low-risk item per "
+                f"SA-0MSQ026T3009QY2L. Phase 1 verdict stands.",
+            )
             continue
         pending.append((ci, child))
 
@@ -5713,6 +5794,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     "id": child.get("id", ""),
                     "status": child.get("status", ""),
                     "stage": child.get("stage", ""),
+                    "effort": child.get("effort"),
+                    "risk": child.get("risk"),
                 }
                 # Skip remaining children if we're too close to the parent
                 # timeout (elapsed_guard). This prevents a silent external kill
@@ -6018,6 +6101,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 cq_findings, child_results
             )
             phase2_completed = False
+            phase2_skip_note = None
 
             if phase1_blocked:
                 # Phase 1 blocked → demote all "met" verdicts to "partial"
@@ -6037,6 +6121,49 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     "No acceptance criteria defined: skipping Phase 2 deep analysis.",
                     file=sys.stderr,
                 )
+            elif _is_low_risk_small(
+                work_item.get("effort"), work_item.get("risk")
+            ):
+                # Small effort + Low risk — skip Phase 2 per SA-0MSQ026T3009QY2L.
+                # Phase 1 verdicts stand unchanged; evidence notes the skip reason.
+                # Children are evaluated independently (AC3): qualifying
+                # children are dropped (and annotated) inside
+                # _run_phase2_deep_analysis; non-qualifying children still get
+                # deep analysis via skip_parent_deep=True.
+                print(
+                    f"Skipping Phase 2 deep analysis: "
+                    f"effort={work_item.get('effort')}, risk={work_item.get('risk')}. "
+                    f"Phase 1 verdicts stand unchanged.",
+                    file=sys.stderr,
+                )
+                ac_results = _annotate_skip_evidence(
+                    ac_results,
+                    f"Phase 2 deep analysis skipped (effort={work_item.get('effort')}, "
+                    f"risk={work_item.get('risk')}): small, low-risk item per "
+                    f"SA-0MSQ026T3009QY2L. Phase 1 verdict stands.",
+                )
+                phase2_skip_note = (
+                    f"small, low-risk item (effort={work_item.get('effort')}, "
+                    f"risk={work_item.get('risk')}) per SA-0MSQ026T3009QY2L"
+                )
+                ac_results, child_results, phase2_completed = _run_phase2_deep_analysis(
+                    work_item, ac_results, child_results,
+                    resolved_model=resolved_model,
+                    pi_bin=pi_bin,
+                    debug_log=debug_log,
+                    script_failure_callback=_record_script_failure,
+                    timeout=timeout,
+                    runner=runner,
+                    batch_phase2=batch_phase2,
+                    worklog_dir=worklog_dir,
+                    ac_fallback_used=ac_fallback_used,
+                    green_run_block=green_run_block,
+                    skip_parent_deep=True,
+                    owning_root=owning_root,
+                )
+                # The parent's deep analysis definitively did not run — never
+                # report it as completed regardless of child outcomes.
+                phase2_completed = False
             else:
                 # Phase 1 passed → run Phase 2 deep code analysis
                 print("Phase 1 passed: running Phase 2 deep code analysis...", file=sys.stderr)
@@ -6065,6 +6192,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
             #     unrelated children are not audited
             # --audit-children (Feature 2) forces the full per-child flow.
             phase2_completed = False
+            phase2_skip_note = None
             has_blocking_cq = any(
                 f.get("severity") in ("critical", "high") for f in cq_findings
             )
@@ -6075,6 +6203,27 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 # already "Ready to close: No" via the CQ findings, so the
                 # parent deep call would only burn model latency).
                 ac_results = _demote_met_to_partial(ac_results)
+            elif _is_low_risk_small(
+                work_item.get("effort"), work_item.get("risk")
+            ):
+                # Small effort + Low risk — skip Phase 2 per SA-0MSQ026T3009QY2L.
+                # Phase 1 verdicts stand unchanged; evidence notes the skip reason.
+                print(
+                    f"Skipping Phase 2 deep analysis (parent-first): "
+                    f"effort={work_item.get('effort')}, risk={work_item.get('risk')}. "
+                    f"Phase 1 verdicts stand unchanged.",
+                    file=sys.stderr,
+                )
+                ac_results = _annotate_skip_evidence(
+                    ac_results,
+                    f"Phase 2 deep analysis skipped (effort={work_item.get('effort')}, "
+                    f"risk={work_item.get('risk')}): small, low-risk item per "
+                    f"SA-0MSQ026T3009QY2L. Phase 1 verdict stands.",
+                )
+                phase2_skip_note = (
+                    f"small, low-risk item (effort={work_item.get('effort')}, "
+                    f"risk={work_item.get('risk')}) per SA-0MSQ026T3009QY2L"
+                )
             elif acs and acs[0] != "No acceptance criteria defined.":
                 print(
                     "Phase 1 passed: running Phase 2 deep code analysis "
@@ -6110,6 +6259,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     "id": child.get("id", ""),
                     "status": child.get("status", ""),
                     "stage": child.get("stage", ""),
+                    "effort": child.get("effort"),
+                    "risk": child.get("risk"),
                 }
                 if _elapsed() >= elapsed_guard:
                     cr["ac_results"] = [{
@@ -6304,6 +6455,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 model=resolved_model,
                 model_source=model_source,
                 phase2_completed=phase2_completed,
+                phase2_skip_note=phase2_skip_note,
                 green_run_sha=green_run_sha,
                 auto_green_run_sha=auto_green_run_sha,
                 test_skill_run_sha=test_skill_run_sha,
@@ -6332,6 +6484,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 code_quality_findings=cq_findings,
                 code_quality_fixes_applied=cq_fixes_applied,
                 phase2_completed=phase2_completed,
+                phase2_skip_note=phase2_skip_note,
             )
             payload["child_persist_results"] = child_persist_results
             # Include script failure info in JSON output
