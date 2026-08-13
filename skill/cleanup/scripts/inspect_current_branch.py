@@ -88,10 +88,18 @@ def inspect_current_branch(
     wid = ""
     import re
 
-    m = re.search(r"([A-Za-z]+-[0-9]+)", current_branch or "")
+    # Match work-item IDs: legacy numeric IDs (e.g. WL-123) and alphanumeric
+    # hash IDs (e.g. SA-0MLPU8H3B1LWK3B3). Hash IDs start with 2-3 uppercase
+    # letters, a dash, a digit, and 10+ alphanumeric characters.
+    m = re.search(
+        r"([A-Z]{2,3}-[0-9][A-Z0-9]{10,}|[A-Za-z]+-[0-9]+)", current_branch or ""
+    )
     if m:
         token = m.group(1)
-        if token.rsplit("-", 1)[-1].isdigit():
+        suffix = token.rsplit("-", 1)[-1]
+        # Accept both numeric suffixes (WL-123) and hash suffixes
+        # (SA-0MLPU8H3B1LWK3B3) as work-item IDs.
+        if suffix.isdigit() or re.fullmatch(r"[0-9][A-Z0-9]{10,}", suffix):
             wid = token
 
     requires_interaction = False

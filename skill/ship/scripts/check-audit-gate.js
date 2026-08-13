@@ -34,9 +34,20 @@ import { execSync } from 'node:child_process';
 /**
  * Query Worklog for candidate work items.
  *
- * Fetches items with `stage: in_review` OR `status: completed`, deduplicating
- * by ID. Items in `status: completed` with `stage: done` are already released
- * and are excluded from the candidate set.
+ * Release candidates are exactly the items with `stage: in_review` (status
+ * `completed` — per the stage/status model, `in_review` items have status
+ * `completed`; items stuck in `in_progress` are NOT candidates). A single
+ * `--stage in_review` query replaces the previous two-query union
+ * (SA-0MSPPDCTH004561Z): the old `--status completed` arm contributed zero
+ * candidates (completed-minus-done == in_review) while re-downloading
+ * ~4.9 MB of already-released items.
+ *
+ * The full `wl list --json` output for a large worklog can exceed
+ * execSync's default 1 MB buffer (ENOBUFS), so the query is piped through
+ * `jq` and only the needed field projection crosses into Node's buffer
+ * (the OS pipe between `wl` and `jq` is unbounded). `set -o pipefail`
+ * ensures a `wl` failure still surfaces as an execSync error so the
+ * warning path below fires.
  *
  * Extracts `needsProducerReview` from each item's `wl list` output,
  * defaulting to `null` when the field is missing. This field is used
@@ -45,63 +56,32 @@ import { execSync } from 'node:child_process';
  * @returns {Array<{ id: string, title: string, needsProducerReview: boolean|null }>}
  */
 export function getCandidateItems() {
-  const seen = new Set();
-  const items = [];
-
-  // Helper: extract fields from a work item, defaulting needsProducerReview to null
-  function extractItem(item) {
-    return {
+  try {
+    // Single query: stage=in_review implies status=completed (the
+    // completed-minus-done == in_review invariant), piped through jq so only
+    // {id, title, needsProducerReview} enters the execSync buffer.
+    const output = execSync(
+      `set -o pipefail; wl list --stage in_review --json ` +
+      `| jq -c '[.workItems[] | {id, title, needsProducerReview}]'`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    const projected = JSON.parse(output);
+    if (!Array.isArray(projected)) {
+      return [];
+    }
+    // jq emits null for a missing needsProducerReview; normalize it to null
+    // (the same default the previous extraction applied for undefined).
+    return projected.map((item) => ({
       id: item.id,
       title: item.title || item.id,
       needsProducerReview: item.needsProducerReview !== undefined
         ? item.needsProducerReview
         : null,
-    };
-  }
-
-  // Query 1: items in in_review stage (main case — about to be released)
-  try {
-    const output = execSync('wl list --stage in_review --json', {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const data = JSON.parse(output);
-    if (data.workItems && Array.isArray(data.workItems)) {
-      for (const item of data.workItems) {
-        if (!seen.has(item.id)) {
-          seen.add(item.id);
-          items.push(extractItem(item));
-        }
-      }
-    }
+    }));
   } catch (err) {
-    console.error(`Warning: Failed to query in_review items: ${err.message}`);
+    console.error(`Warning: Failed to query release candidates: ${err.message}`);
+    return [];
   }
-
-  // Query 2: items with status completed (catches edge cases where an item
-  // is completed but its stage is not yet in_review). Items already in
-  // stage: done are excluded since they have already been released.
-  // Use a large maxBuffer to handle potentially large output sets.
-  try {
-    const output = execSync('wl list --status completed --json', {
-      encoding: 'utf-8',
-      maxBuffer: 5 * 1024 * 1024, // 5 MB
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const data = JSON.parse(output);
-    if (data.workItems && Array.isArray(data.workItems)) {
-      for (const item of data.workItems) {
-        if (!seen.has(item.id) && item.stage !== 'done') {
-          seen.add(item.id);
-          items.push(extractItem(item));
-        }
-      }
-    }
-  } catch (err) {
-    console.error(`Warning: Failed to query completed items: ${err.message}`);
-  }
-
-  return items;
 }
 
 // ── getAuditStatus ───────────────────────────────────────────────────────────

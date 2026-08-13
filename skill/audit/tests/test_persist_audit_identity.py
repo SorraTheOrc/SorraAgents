@@ -166,6 +166,14 @@ class TestUniqueFileNaming:
         """SKILL.md must document the unique file naming convention."""
         skill_md = Path(__file__).resolve().parents[2] / "audit" / "SKILL.md"
         content = skill_md.read_text(encoding="utf-8")
+        ref = (
+            Path(__file__).resolve().parents[3]
+            / "docs"
+            / "dev"
+            / "audit-skill-reference.md"
+        )
+        if ref.exists():
+            content += "\n" + ref.read_text(encoding="utf-8")
         # The convention should be documented
         assert "audit_report_" in content or "unique name" in content.lower(), (
             "SKILL.md should document the unique naming convention "

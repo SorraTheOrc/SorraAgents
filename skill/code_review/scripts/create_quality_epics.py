@@ -165,12 +165,16 @@ def find_or_create_epic(
         A tuple of (epic_id, was_created).
         was_created is True if a new epic was created, False if reused.
     """
-    # Use wl list instead of wl search — wl search may return 0 results
-    # even when matching epics exist.
+    # Use wl list with the exact known title as a LIKE search term — the
+    # AGENTS.md-sanctioned pattern (wl list <term> does full-record LIKE
+    # matching; wl search returns compact snippets and may miss epics). The
+    # title term scopes the query so only matching epics are returned
+    # (SA-0MSPPIC4P00849VK): the old unfiltered --status dumps (353 KB +
+    # 43 KB) are replaced by ~55-byte scoped queries.
     for status_filter in ("open", "in_progress"):
         try:
             list_result = _run_wl(runner, [
-                "wl", "list", "--status", status_filter, "--json",
+                "wl", "list", EPIC_TITLE, "--status", status_filter, "--json",
             ])
         except RuntimeError as exc:
             print(f"Warning: wl list --status {status_filter} failed: {exc}", file=sys.stderr)

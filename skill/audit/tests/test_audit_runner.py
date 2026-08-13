@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest import mock
 
 # ---------------------------------------------------------------------------
@@ -975,6 +978,87 @@ class TestCallPiAndMaybeLogTiming:
         assert entry["elapsed_seconds"] == 5.5
 
 
+class TestInputTokensCapture:
+    """Tests for input-token capture (SA-0MSISKM8F004NW1U AC2).
+
+    Every successful ``_call_pi`` return attaches ``input_tokens`` extracted
+    from the ``agent_end`` message's usage block, so the per-call timing line
+    can verify the context-reduction bound (<10K initial input tokens per
+    audit session) without a debug log.
+    """
+
+    def _make_mock_popen(self, stdout_text: str):
+        """Create a mock Popen that returns a process-like object."""
+        mock_process = mock.MagicMock()
+        mock_process.communicate.return_value = (stdout_text, "")
+        mock_process.returncode = 0
+        return mock_process
+
+    def _agent_end_stream(self, usage: dict | None, text: str = '{"verdict": "met", "evidence": "ok"}') -> str:
+        """Build a pi --mode json stream with an agent_end carrying usage."""
+        assistant = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        if usage is not None:
+            assistant["usage"] = usage
+        return json.dumps({"type": "agent_end", "messages": [assistant]})
+
+    def test_extract_input_tokens_helper(self):
+        """The helper reads input from the agent_end assistant usage block."""
+        stream = self._agent_end_stream({"input": 769, "output": 10, "totalTokens": 779})
+        assert audit_runner._extract_input_tokens(stream) == 769
+        # No usage block -> None
+        assert audit_runner._extract_input_tokens(self._agent_end_stream(None)) is None
+        # No agent_end event -> None
+        assert audit_runner._extract_input_tokens('{"type": "turn_end"}') is None
+        assert audit_runner._extract_input_tokens("") is None
+
+    def test_input_tokens_attached_on_success(self):
+        """_call_pi attaches input_tokens from the agent_end usage block."""
+        mock_process = self._make_mock_popen(self._agent_end_stream({"input": 769}))
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result["verdict"] == "met"
+        assert result["input_tokens"] == 769
+
+    def test_input_tokens_none_when_no_usage(self):
+        """input_tokens is None when the stream carries no usage data."""
+        mock_process = self._make_mock_popen(self._agent_end_stream(None))
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result["verdict"] == "met"
+        assert result["input_tokens"] is None
+
+    def test_input_tokens_attached_on_free_form_text(self):
+        """input_tokens is attached even when pi returns free-form text."""
+        stream = self._agent_end_stream({"input": 500}, text="plain response")
+        mock_process = self._make_mock_popen(stream)
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result["verdict"] == "met"
+        assert result["input_tokens"] == 500
+
+    def test_timing_line_includes_input_tokens(self, capsys):
+        """The per-call timing line appends input_tokens when captured."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "met", "evidence": "ok",
+                "elapsed_seconds": 3.0, "input_tokens": 769,
+            }
+            audit_runner._call_pi_and_maybe_log("SA-123", "parent", "prompt")
+        captured = capsys.readouterr()
+        assert "input_tokens=769" in captured.err
+
+    def test_timing_line_omits_input_tokens_when_absent(self, capsys):
+        """The timing line keeps the legacy format when input_tokens is None."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "met", "evidence": "ok", "elapsed_seconds": 3.0,
+            }
+            audit_runner._call_pi_and_maybe_log("SA-123", "parent", "prompt")
+        captured = capsys.readouterr()
+        assert "input_tokens" not in captured.err
+        assert "elapsed_seconds=3.00" in captured.err
+
+
 class TestPhase2TimingInstrumentation:
     """Tests that Phase 2 parent and child calls emit per-call timings (AC4)."""
 
@@ -1014,7 +1098,7 @@ class TestPhase2TimingInstrumentation:
 
         def _fake_call_pi(prompt, model="test-model", pi_bin="pi",
                           enable_tools=False, timeout=None, max_retries=None,
-                          ac_fallback_used=None):
+                          ac_fallback_used=None, child_screen=False):
             return {
                 "verdict": "met",
                 "evidence": "file.py:10 works",
@@ -1400,12 +1484,13 @@ class TestPhase2ChildVerdictReuse:
         with mock.patch.object(
             audit_runner, "_run_wl", side_effect=_fake_run_wl
         ) as mock_wl:
-            verdict, reason = audit_runner._get_child_audit_verdict(
+            verdict, reason, audited_at = audit_runner._get_child_audit_verdict(
                 mock.MagicMock(), "STALE-1"
             )
 
         assert verdict is None
         assert reason == "stale"
+        assert audited_at == stale_audit_time
         # The freshness check queried both the audit and the work item
         assert mock_wl.call_count == 2
 
@@ -3042,6 +3127,12 @@ class TestOptInChildAuditCascade:
                     stderr="",
                 )
 
+            # Working-tree fingerprint (SA-0MSL1YXG7004F2BZ): a clean tree
+            # yields an empty marker — matches the stored fingerprint computed
+            # with a MagicMock runner (no git output).
+            if cmd_str.startswith(("git status", "git diff")):
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
             return SimpleNamespace(
                 returncode=0, stdout=json.dumps({"success": True}), stderr="",
             )
@@ -3051,7 +3142,12 @@ class TestOptInChildAuditCascade:
 
     def _run(self, triggered, **cmd_kwargs):
         """Run cmd_issue with a mocked pipeline, recording child subprocess
-        spawns in *triggered*."""
+        spawns in *triggered*.
+
+        ``--force`` defaults to False so child-verdict reuse (the content
+        gate) is active; pass ``force=True`` to exercise the force-bypass
+        path (LP-0MSQ32MF200675AR).
+        """
         pi_result = {
             "extracted_text": '[{"index": 0, "verdict": "met", "evidence": "mocked"}]',
         }
@@ -3066,6 +3162,7 @@ class TestOptInChildAuditCascade:
             return SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
         runner_kwargs = cmd_kwargs.pop("runner_kwargs", {})
+        force = cmd_kwargs.pop("force", False)
         with (
             mock.patch.object(
                 audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
@@ -3084,7 +3181,7 @@ class TestOptInChildAuditCascade:
             mock.patch.object(audit_runner, "persist_audit", return_value=0),
         ):
             return audit_runner.cmd_issue(
-                "TEST-1", persist=True, force=True,
+                "TEST-1", persist=True, force=force,
                 runner=self._make_runner(**runner_kwargs),
                 json_mode=True,
                 parent_timeout=None,
@@ -3118,9 +3215,11 @@ class TestOptInChildAuditCascade:
         assert len(triggered) == 2
 
     def test_unchanged_child_skipped_via_content_gate(self, capsys):
-        """AC4: a child whose audit is stale by the TIME gate but content-
-        unchanged (fingerprint matches) is not re-audited even with
-        --audit-children — its stored verdict is reused via the content gate."""
+        """AC4 (LP-0MSQ32MF200675AR): a child whose audit is stale by the
+        TIME gate but content-unchanged (fingerprint matches) is not
+        re-audited even with --audit-children — the Phase 1 pre-pass reuses
+        its stored verdict via the content gate (zero pi calls, no
+        auto-triggered child audit)."""
         from skill.audit.scripts import audit_runner as ar
         head = "a" * 40
         child_desc = "## Acceptance Criteria\n- CAC1: child criterion"
@@ -3136,7 +3235,8 @@ class TestOptInChildAuditCascade:
         triggered: list[str] = []
         # The stored audit is OLD (auditedAt 2026-08-01) while the child was
         # updated LATER (updatedAt 2026-08-05) → stale by the time gate, but
-        # the content fingerprint still matches → content gate reuses it.
+        # the content fingerprint still matches → the pre-pass content gate
+        # reuses it.
         with mock.patch.object(ar, "_resolve_audited_head", return_value=head):
             rc = self._run(
                 triggered,
@@ -3151,7 +3251,10 @@ class TestOptInChildAuditCascade:
         assert triggered == [], (
             "content-unchanged child must not be re-audited"
         )
-        assert "Reusing fresh audit" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "Auto-triggering audit for child" not in err, (
+            "content-unchanged child must not be auto-audited"
+        )
 
     def test_not_ready_child_still_blocks_parent(self):
         """AC5: a child without a fresh audit (no --audit-children) stays
@@ -3160,6 +3263,592 @@ class TestOptInChildAuditCascade:
         rc = self._run(triggered, runner_kwargs={"n_children": 1})
         assert rc == 0
         assert triggered == []
+
+
+# ===========================================================================
+# Child verdict reuse in parent audits (LP-0MSQ32MF200675AR)
+#
+# AC4(a)-(d) + AC5 regression: a parent audit reuses a child's fresh valid
+# audit (content fingerprint unchanged + verdict present) with ZERO child pi
+# calls (no child Phase 1 screening, no child Phase 2 deep/batch entry);
+# children without a fresh audit are still audited; --force bypasses reuse;
+# the item-level freshness gate (SA-0MSKB6US1009CNHT) is unchanged.
+# ===========================================================================
+
+
+class TestChildVerdictReuseInParentAudits:
+    """Parent audits reuse fresh child audit verdicts instead of re-auditing.
+
+    A fresh child audit is one whose stored report carries a content
+    fingerprint that matches the child's current state AND a parseable
+    verdict (same logic as the item-level freshness gate). Reused children
+    cost ZERO pi calls; stale/legacy children keep the existing audit flow.
+    """
+
+    PARENT_HEAD = "a" * 40
+    CHILD_DESC = "## Acceptance Criteria\n- CAC1: child criterion"
+    AUDITED_AT = "2026-08-01T00:00:00.000Z"
+
+    def _fingerprinted_raw(self, ar, child_id, verdict="Yes",
+                           head=None, acs=None):
+        """Build a child audit rawOutput carrying a content fingerprint.
+
+        The fingerprint is computed under the same mocked HEAD the runtime
+        uses, so a stored report built here counts as content-fresh when the
+        runner evaluates it.
+        """
+        head = head or self.PARENT_HEAD
+        with mock.patch.object(ar, "_resolve_audited_head", return_value=head):
+            fp = ar._compute_content_fingerprint(
+                mock.MagicMock(), child_id,
+                work_item={"description": self.CHILD_DESC},
+            )
+        lines = [
+            f"Audit report for work item {child_id}",
+            f"Ready to close: {verdict}",
+            "",
+            f"{ar.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fp}",
+            "",
+            "## Summary",
+            "Child audit ok.",
+            "",
+            "## Acceptance Criteria Status",
+            "",
+            "| # | Criterion | Verdict | Evidence |",
+            "|---|-----------|---------|----------|",
+        ]
+        if acs is None:
+            acs = [("CAC1: child criterion", "met", "child.py:1")]
+        for i, (text, v, ev) in enumerate(acs, 1):
+            lines.append(f"| {i} | {text} | {v} | {ev} |")
+        return "\n".join(lines)
+
+    def _make_runner(self, n_children=1, child_audit_raw=None,
+                     child_stage="in_review"):
+        """Mock runner: parent + *n_children* children; per-child
+        ``wl audit-show`` returns the mapped rawOutput (None = no audit)."""
+        mock_runner = mock.MagicMock()
+        child_audit_raw = child_audit_raw or {}
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+
+            if "audit-show" in cmd_str:
+                child_id = cmd_str.split("audit-show", 1)[1].strip().split()[0]
+                if child_id == "TEST-1":
+                    # Stored audit for the parent (used by the freshness
+                    # check and the post-persist readback verification).
+                    # No fingerprint + no updatedAt on the work item → the
+                    # item-level freshness gate cannot short-circuit and the
+                    # pipeline runs.
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "audit": {
+                                "rawOutput": "TEST-1 audit report",
+                                "auditedAt": "2026-01-01T00:00:00.000Z",
+                            },
+                        }),
+                        stderr="",
+                    )
+                raw = child_audit_raw.get(child_id)
+                if raw is None:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"success": True, "audit": None}),
+                        stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "audit": {
+                            "rawOutput": raw,
+                            "auditedAt": self.AUDITED_AT,
+                        },
+                    }),
+                    stderr="",
+                )
+
+            # wl show <parent> --json (freshness / lifecycle lookups).
+            if "show" in cmd_str and "--children" not in cmd_str \
+                    and "TEST-1" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1", "status": "open",
+                            "stage": "plan_complete",
+                        },
+                    }),
+                    stderr="",
+                )
+
+            # wl show <child> --json (fingerprint computation + time gate):
+            # the child's description drives the content fingerprint.
+            if "show" in cmd_str and "--children" not in cmd_str:
+                child_id = cmd_str.split("show", 1)[1].strip().split()[0]
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": child_id,
+                            "description": self.CHILD_DESC,
+                            "updatedAt": "2026-08-05T00:00:00.000Z",
+                        },
+                    }),
+                    stderr="",
+                )
+
+            # _run_wl -> wl show <parent> --children --json
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": "## Acceptance Criteria\n"
+                                            "- AC1: parent criterion",
+                            "status": "in_progress",
+                        },
+                        "children": [{
+                            "id": f"CHILD-{i}",
+                            "title": f"Child Issue {i}",
+                            "status": "open",
+                            "stage": child_stage,
+                            "updatedAt": "2026-08-05T00:00:00.000Z",
+                            "description": self.CHILD_DESC,
+                        } for i in range(1, n_children + 1)],
+                    }),
+                    stderr="",
+                )
+
+            # StatusLifecycle -> wl update <id> --status ...
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}),
+                    stderr="",
+                )
+
+            # Working-tree fingerprint (SA-0MSL1YXG7004F2BZ): a clean tree
+            # yields the empty marker — matches the stored fingerprint.
+            if cmd_str.startswith(("git status", "git diff")):
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def _run(self, child_pi_contexts, triggered, *, n_children=1,
+             child_audit_raw=None, audit_children=True, force=False,
+             persist=True, child_stage="in_review", persist_calls=None):
+        """Run cmd_issue with a mocked pipeline.
+
+        *child_pi_contexts* collects the ``context`` of every
+        ``_call_pi_and_maybe_log`` invocation (child Phase 1 contexts are
+        ``child:<id>``; Phase 2 contexts are ``phase2_deep`` /
+        ``phase2_child:<i>`` / ``phase2_batch``).
+        *triggered* collects auto-triggered child audit subprocess commands.
+        *persist_calls* (optional list) collects ``persist_audit`` call args
+        so tests can assert persistence hygiene.
+        """
+        pi_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "mocked"},
+            ]),
+        }
+
+        def _capture(issue_id, context, prompt, **kwargs):
+            child_pi_contexts.append(context)
+            return pi_result
+
+        def _passthrough_phase2(work_item, ac_results, child_results, **kwargs):
+            return (ac_results, child_results, True)
+
+        def _fake_subprocess_run(cmd, **kwargs):
+            cmd_str = " ".join(cmd)
+            if "audit_runner.py" in cmd_str and "issue" in cmd_str:
+                triggered.append(cmd_str)
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        def _fake_persist(issue_id, report, worklog_dir=None):
+            if persist_calls is not None:
+                persist_calls.append((issue_id, report))
+            return 0
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+            mock.patch.object(
+                audit_runner, "_run_phase2_deep_analysis",
+                side_effect=_passthrough_phase2,
+            ),
+            mock.patch.object(
+                audit_runner.subprocess, "run", side_effect=_fake_subprocess_run
+            ),
+            mock.patch.object(
+                audit_runner, "persist_audit", side_effect=_fake_persist
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head",
+                return_value=self.PARENT_HEAD,
+            ),
+        ):
+            return audit_runner.cmd_issue(
+                "TEST-1", persist=persist, force=force,
+                runner=self._make_runner(
+                    n_children=n_children, child_audit_raw=child_audit_raw,
+                    child_stage=child_stage,
+                ),
+                json_mode=False, parent_timeout=None,
+                audit_children=audit_children,
+            )
+
+    @staticmethod
+    def _is_child_pi_context(context: str) -> bool:
+        """True when a pi call context targets a child (Phase 1 ``child:<id>``
+        or Phase 2 ``phase2_child:<i>`` / ``phase2_batch``)."""
+        return (
+            context.startswith(("child:", "phase2_child"))
+            or context == "phase2_batch"
+        )
+
+    # ------------------------------------------------------------------
+    # AC4(a): parent with 5 fresh children issues ZERO child pi calls
+    # ------------------------------------------------------------------
+
+    def test_five_fresh_children_zero_child_pi_calls(self):
+        """AC4(a): a parent with 5 fresh children (content fingerprint
+        unchanged + verdict present) issues ZERO child pi calls through
+        cmd_issue with --audit-children — no child Phase 1, no child Phase 2
+        deep/batch entry — and no child audit is auto-triggered."""
+        ar = audit_runner
+        raw = {
+            f"CHILD-{i}": self._fingerprinted_raw(ar, f"CHILD-{i}")
+            for i in range(1, 6)
+        }
+        child_pi_contexts: list[str] = []
+        triggered: list[str] = []
+
+        rc = self._run(child_pi_contexts, triggered, n_children=5,
+                       child_audit_raw=raw, audit_children=True)
+
+        assert rc == 0
+        child_calls = [
+            c for c in child_pi_contexts if self._is_child_pi_context(c)
+        ]
+        assert child_calls == [], f"child pi calls fired: {child_calls}"
+        assert triggered == [], "fresh children must not be auto-audited"
+
+    # ------------------------------------------------------------------
+    # AC4(b): parent with 1 stale + 4 fresh children audits only the stale
+    # ------------------------------------------------------------------
+
+    def test_stale_child_audited_alone_among_fresh(self):
+        """AC4(b): a parent with 1 stale + 4 fresh children audits ONLY the
+        stale child — exactly 1 child pi call and 1 child auto-audit."""
+        ar = audit_runner
+        raw = {
+            f"CHILD-{i}": self._fingerprinted_raw(ar, f"CHILD-{i}")
+            for i in range(1, 6)
+        }
+        # CHILD-1 is stale: its stored report carries a fingerprint computed
+        # at a DIFFERENT HEAD (content changed) → content gate rejects it.
+        raw["CHILD-1"] = self._fingerprinted_raw(
+            ar, "CHILD-1", head="b" * 40,
+        )
+        child_pi_contexts: list[str] = []
+        triggered: list[str] = []
+
+        rc = self._run(child_pi_contexts, triggered, n_children=5,
+                       child_audit_raw=raw, audit_children=True)
+
+        assert rc == 0
+        child_calls = [
+            c for c in child_pi_contexts if self._is_child_pi_context(c)
+        ]
+        assert len(child_calls) == 1, f"expected 1 child pi call: {child_calls}"
+        assert "child:CHILD-1" in child_calls[0]
+        assert len(triggered) == 1, f"expected 1 child auto-audit: {triggered}"
+        assert "CHILD-1" in triggered[0]
+        assert all("CHILD-2" not in t and "CHILD-3" not in t
+                   for t in triggered)
+
+    # ------------------------------------------------------------------
+    # AC4(c): reused tables carry correct verdicts + reuse marker
+    # ------------------------------------------------------------------
+
+    def test_reused_table_verdicts_and_marker(self, capsys):
+        """AC4(c): a reused child's AC table carries the verdicts from the
+        child's own audit report and the parent report marks the reuse with
+        ``reused from <auditedAt>``."""
+        ar = audit_runner
+        raw = {
+            "CHILD-1": self._fingerprinted_raw(
+                ar, "CHILD-1", verdict="Yes",
+                acs=[
+                    ("CAC1: child criterion", "met", "child.py:1"),
+                    ("CAC2: child criterion", "adjusted", "child.py:2"),
+                ],
+            ),
+        }
+        child_pi_contexts: list[str] = []
+        triggered: list[str] = []
+
+        rc = self._run(child_pi_contexts, triggered, n_children=1,
+                       child_audit_raw=raw, audit_children=True)
+
+        assert rc == 0
+        child_calls = [
+            c for c in child_pi_contexts if self._is_child_pi_context(c)
+        ]
+        assert child_calls == [], f"child pi calls fired: {child_calls}"
+        assert triggered == []
+        report = capsys.readouterr().out
+        assert f"Child verdict reused from {self.AUDITED_AT}" in report
+        assert "content unchanged, no fresh audit performed" in report
+        # Verdicts come from the child's OWN report table.
+        assert "| 1 | CAC1: child criterion | met | child.py:1 |" in report
+        assert "| 2 | CAC2: child criterion | adjusted | child.py:2 |" in report
+
+    def test_reused_child_not_repersisted(self):
+        """F2 AC5 (persistence hygiene): a reused child keeps its own
+        authoritative audit — the parent does NOT re-persist it. Only the
+        parent report is persisted."""
+        ar = audit_runner
+        raw = {"CHILD-1": self._fingerprinted_raw(ar, "CHILD-1")}
+        child_pi_contexts: list[str] = []
+        triggered: list[str] = []
+        persist_calls: list[tuple[str, str]] = []
+
+        rc = self._run(child_pi_contexts, triggered, n_children=1,
+                       child_audit_raw=raw, audit_children=True,
+                       persist=True, persist_calls=persist_calls)
+
+        assert rc == 0
+        persisted_ids = [i for i, _ in persist_calls]
+        assert "CHILD-1" not in persisted_ids, \
+            f"reused child re-persisted: {persisted_ids}"
+        assert "TEST-1" in persisted_ids  # the parent report still persists
+
+    # ------------------------------------------------------------------
+    # AC4(d): --force bypasses reuse — all children re-audited
+    # ------------------------------------------------------------------
+
+    def test_force_bypasses_reuse_reaudits_all(self):
+        """AC4(d): --force on the parent bypasses child reuse — all 5 fresh
+        children are re-audited (5 child auto-audits + 5 child Phase 1
+        screening calls)."""
+        ar = audit_runner
+        raw = {
+            f"CHILD-{i}": self._fingerprinted_raw(ar, f"CHILD-{i}")
+            for i in range(1, 6)
+        }
+        child_pi_contexts: list[str] = []
+        triggered: list[str] = []
+
+        rc = self._run(child_pi_contexts, triggered, n_children=5,
+                       child_audit_raw=raw, audit_children=True, force=True)
+
+        assert rc == 0
+        child_calls = [
+            c for c in child_pi_contexts if self._is_child_pi_context(c)
+        ]
+        assert len(triggered) == 5, f"expected all 5 children re-audited: {triggered}"
+        assert len(child_calls) == 5, f"expected 5 child Phase 1 calls: {child_calls}"
+        assert all(f"CHILD-{i}" in triggered[i - 1] for i in range(1, 6))
+
+    # ------------------------------------------------------------------
+    # AC5 regression: item-level freshness gate unchanged
+    # ------------------------------------------------------------------
+
+    def test_item_level_freshness_gate_still_short_circuits(self):
+        """AC5 regression (SA-0MSKB6US1009CNHT): the item-level content
+        gate still returns the stored report for an unchanged item — the
+        pipeline short-circuits."""
+        ar = audit_runner
+        stored = self._fingerprinted_raw(ar, "TEST-1")
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "audit": {
+                            "rawOutput": stored,
+                            "auditedAt": self.AUDITED_AT,
+                        },
+                    }),
+                    stderr="",
+                )
+            if "show" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": self.CHILD_DESC,
+                        },
+                    }),
+                    stderr="",
+                )
+            if cmd_str.startswith(("git status", "git diff")):
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        with mock.patch.object(
+            ar, "_resolve_audited_head", return_value=self.PARENT_HEAD
+        ):
+            fresh = ar._check_audit_freshness(mock_runner, "TEST-1")
+        assert fresh == stored
+
+    # ------------------------------------------------------------------
+    # F2 AC1 unit tests: content-first freshness in _get_child_audit_verdict
+    # ------------------------------------------------------------------
+
+    def _verdict_runner(self, raw, audited_at=AUDITED_AT):
+        """Mock runner for direct _get_child_audit_verdict calls."""
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+            if "audit-show" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "audit": {"rawOutput": raw, "auditedAt": audited_at},
+                    }),
+                    stderr="",
+                )
+            if "show" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "CHILD-1",
+                            "description": self.CHILD_DESC,
+                        },
+                    }),
+                    stderr="",
+                )
+            if cmd_str.startswith(("git status", "git diff")):
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        mock_runner.side_effect = _side_effect
+        return mock_runner
+
+    def test_verdict_content_fresh_ready(self):
+        """F2 AC1: a child whose stored fingerprint matches the current state
+        and whose report carries a verdict is fresh (ready)."""
+        ar = audit_runner
+        raw = self._fingerprinted_raw(ar, "CHILD-1", verdict="Yes")
+        with mock.patch.object(
+            ar, "_resolve_audited_head", return_value=self.PARENT_HEAD
+        ):
+            verdict, reason, audited_at = ar._get_child_audit_verdict(
+                self._verdict_runner(raw), "CHILD-1",
+            )
+        assert verdict is True
+        assert reason == "ready"
+        assert audited_at == self.AUDITED_AT
+
+    def test_verdict_content_fresh_not_ready(self):
+        """F2 AC1: a fresh audit with an explicit not-ready verdict is also
+        reused (verdict False, reason not_ready) — it still blocks the parent
+        but costs zero pi calls."""
+        ar = audit_runner
+        raw = self._fingerprinted_raw(ar, "CHILD-1", verdict="No")
+        with mock.patch.object(
+            ar, "_resolve_audited_head", return_value=self.PARENT_HEAD
+        ):
+            verdict, reason, audited_at = ar._get_child_audit_verdict(
+                self._verdict_runner(raw), "CHILD-1",
+            )
+        assert verdict is False
+        assert reason == "not_ready"
+        assert audited_at == self.AUDITED_AT
+
+    def test_verdict_content_changed_stale(self):
+        """F2 AC1: a fingerprint mismatch (content changed) means stale — the
+        child is re-audited."""
+        ar = audit_runner
+        raw = self._fingerprinted_raw(ar, "CHILD-1", head="b" * 40)
+        with mock.patch.object(
+            ar, "_resolve_audited_head", return_value=self.PARENT_HEAD
+        ):
+            verdict, reason, audited_at = ar._get_child_audit_verdict(
+                self._verdict_runner(raw), "CHILD-1",
+            )
+        assert verdict is None
+        assert reason == "stale"
+        assert audited_at == self.AUDITED_AT
+
+    def test_verdict_force_bypasses_reuse(self):
+        """F2 AC1/AC4: --force bypasses BOTH gates — a content-fresh child
+        verdict is not reused."""
+        ar = audit_runner
+        raw = self._fingerprinted_raw(ar, "CHILD-1", verdict="Yes")
+        with mock.patch.object(
+            ar, "_resolve_audited_head", return_value=self.PARENT_HEAD
+        ):
+            verdict, reason, _audited_at = ar._get_child_audit_verdict(
+                self._verdict_runner(raw), "CHILD-1", force=True,
+            )
+        assert verdict is None
+        assert reason == "force"
+
+    # ------------------------------------------------------------------
+    # F2 AC5 unit test: parent-persisted child reports embed the fingerprint
+    # ------------------------------------------------------------------
+
+    def test_persist_child_audit_embeds_fingerprint(self):
+        """F2 AC5: child reports persisted by the parent embed the content
+        fingerprint so they stay content-gate-able on future runs."""
+        ar = audit_runner
+        fp = "f" * 64
+        captured: dict = {}
+
+        def _fake_persist(issue_id, report, worklog_dir=None):
+            captured["report"] = report
+            return 0
+
+        with mock.patch.object(ar, "persist_audit", side_effect=_fake_persist):
+            rc, report = ar._persist_child_audit(
+                "CHILD-1", "Child", "open", "plan_complete",
+                ac_results=[
+                    {"text": "AC1", "verdict": "met", "evidence": "ok"},
+                ],
+                content_fingerprint=fp,
+            )
+        assert rc == 0
+        assert f"{ar.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fp}" in report
+        assert "CHILD-1" in report
 
 
 # ===========================================================================
@@ -4637,7 +5326,7 @@ class TestPhase1ChildAuditReuse:
             self._mock_cq(),
         ):
             rc = audit_runner.cmd_issue(
-                "TEST-1", persist=False, force=True, runner=mock_runner,
+                "TEST-1", persist=False, force=False, runner=mock_runner,
                 audit_children=True,  # child Phase 1 review is opt-in (SA-0MSKB6VJA005N43F)
             )
 
@@ -5065,7 +5754,7 @@ class TestPhase2NotReadyChildReuse:
             ),
         ):
             rc = audit_runner.cmd_issue(
-                "TEST-1", persist=False, force=True, runner=mock_runner,
+                "TEST-1", persist=False, force=False, runner=mock_runner,
                 audit_children=True,  # child flow is opt-in (SA-0MSKB6VJA005N43F)
             )
 
@@ -5680,6 +6369,21 @@ _AUTO_GREEN_ENTRY = {
 """A plausible green entry returned by ``query_cached``."""
 
 
+_NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
+
+
+def _make_suite_dirs(tmp_path) -> Path:
+    """Create the canonical node suite dirs under *tmp_path*.
+
+    ``full_suite_commands`` skips missing suite dirs (SA-0MSJELL44009XYIL), so
+    tests that exercise the full 4-command set must create the dirs first —
+    otherwise only the pytest command is queried.
+    """
+    for d in _NODE_SUITE_DIRS:
+        (tmp_path / d).mkdir(parents=True, exist_ok=True)
+    return tmp_path
+
+
 class TestAutoGreenRunResolution:
     """Unit tests for the read-only automatic green-run resolution."""
 
@@ -5732,6 +6436,8 @@ class TestAutoGreenRunResolution:
 
     def test_partial_cache_no_evidence(self, tmp_path):
         """AC2: only some suites cached → fail-closed (no evidence)."""
+        _make_suite_dirs(tmp_path)
+
         def _side_effect(command, **kwargs):
             # pytest + two node dirs cached green; the tests/unit run is missing
             return _AUTO_GREEN_ENTRY if "tests/unit" not in command else None
@@ -5764,8 +6470,9 @@ class TestAutoGreenRunResolution:
         assert sha is None
         mock_q.assert_not_called()
 
-    def test_query_cached_consumed_read_only(self, tmp_path):
+    def test_query_cached_consumed_read_only(self, tmp_path, capsys):
         """AC1: resolution consumes the cache (never executes) at the project cwd."""
+        _make_suite_dirs(tmp_path)
         with mock.patch.object(
             audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
         ) as mock_q:
@@ -5776,6 +6483,61 @@ class TestAutoGreenRunResolution:
         for call in mock_q.call_args_list:
             assert call.kwargs["cwd"] == str(tmp_path.resolve())
             assert call.kwargs["ttl"] == audit_runner.DEFAULT_TTL_SECONDS
+
+    # -----------------------------------------------------------------------
+    # Diagnostic output (SA-0MSJELL44009XYIL AC: clear diagnostic on failure)
+    # -----------------------------------------------------------------------
+
+    def test_missing_cache_emits_diagnostic(self, tmp_path, capsys):
+        """A cache miss yields a clear diagnostic naming the command + remedy."""
+        _make_suite_dirs(tmp_path)
+        with mock.patch.object(audit_runner, "query_cached", return_value=None):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+        err = capsys.readouterr().err
+        assert "Automatic full-suite verification unavailable" in err
+        assert "pytest -q -r a --disable-warnings" in err
+        assert "no cached full-suite run" in err
+        assert "run_tests.py --force" in err or "/skill:test" in err
+        assert "--green-run HEAD" in err
+
+    def test_failed_cached_run_emits_diagnostic(self, tmp_path, capsys):
+        """A non-zero cached run is distinguished from a miss in the diagnostic."""
+        _make_suite_dirs(tmp_path)
+
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "tests/cli" in command:
+                entry["exit_code"] = 7
+            return entry
+
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert block is None
+        assert sha is None
+        err = capsys.readouterr().err
+        assert "Automatic full-suite verification unavailable" in err
+        assert "exited non-zero" in err
+        assert "(7)" in err
+        assert "--green-run HEAD" in err
+
+    def test_green_run_no_diagnostic(self, tmp_path, capsys):
+        """A fully green cache set yields evidence and no diagnostic noise."""
+        _make_suite_dirs(tmp_path)
+        with mock.patch.object(
+            audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
+        ):
+            block, sha = audit_runner._resolve_auto_green_run(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert sha == _GREEN_RUN_HEAD
+        assert block is not None
+        assert "Automatic full-suite verification unavailable" not in capsys.readouterr().err
 
 
 class TestAutoGreenRunReportLine:
@@ -5902,12 +6664,34 @@ class TestAutoGreenRunPromptInjection:
         assert _GREEN_RUN_HEAD in prompts["parent"]
         assert "GREEN-RUN ATTESTATION" not in prompts["parent"]
 
-    def test_cache_miss_no_auto_block_no_crash(self):
-        """AC2: a cache miss leaves the prompts unchanged and the audit completes."""
-        prompts = self._capture_context_prompts(cache_result=None)
-        assert "parent" in prompts
-        assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
-        assert "GREEN-RUN ATTESTATION" not in prompts["parent"]
+    def test_cache_miss_blocks_audit(self, capsys):
+        """SA-0MSQ72BVV0011SRU AC1: a cache miss blocks the audit (no Phase 1).
+
+        This replaces the historical 'miss → diagnostic + continue' behavior:
+        a missing full-suite cache with no opt-out must exit non-zero before
+        any Phase 1 pi call so execution-dependent ACs can never be marked
+        'met' from implementer-reported evidence (the degraded-verdict bug
+        the pre-flight gate fixes).
+        """
+        mock_runner = self._make_cmd_issue_runner()
+
+        def _fake_call(*args, **kwargs):  # pragma: no cover - must not run
+            raise AssertionError("Phase 1 pi call must not happen on a cache miss")
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=None
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "Audit blocked" in err
+        assert "/skill:test" in err
+        assert "--green-run HEAD" in err
+        assert "NOT produce a report" in err
 
     def test_failing_cache_no_auto_block(self):
         """AC2: a non-zero cached exit never injects the block."""
@@ -6060,6 +6844,648 @@ class TestAutoGreenRunCmdIssue:
         out = capsys.readouterr().out
         assert "AUTO-VERIFIED GREEN RUN" not in out
         assert "Automatic green run evidence" not in out
+
+
+# ===========================================================================
+# Pre-flight full-suite cache gate (SA-0MSQ72BVV0011SRU)
+# ===========================================================================
+
+
+class TestFullSuiteCacheClassification:
+    """Unit tests for _classify_full_suite_cache statuses."""
+
+    def test_green_all_commands_cached(self, tmp_path):
+        """Every suite command cached green at HEAD → 'green' + evidence sha."""
+        with mock.patch.object(
+            audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
+        ):
+            status, sha, problems = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == "green"
+        assert sha == _GREEN_RUN_HEAD
+        assert problems == []
+
+    def test_miss_any_command_uncached(self, tmp_path):
+        """At least one command without a cached entry → 'miss'."""
+        def _side_effect(command, **kwargs):
+            return None if "tests/unit" in command else _AUTO_GREEN_ENTRY
+
+        _make_suite_dirs(tmp_path)
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            status, sha, problems = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == "miss"
+        assert sha == _GREEN_RUN_HEAD
+        assert any("no cached full-suite run" in p for p in problems)
+
+    def test_red_nonzero_cached_run(self, tmp_path):
+        """All commands cached but one exited non-zero → 'red'."""
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "tests/cli" in command:
+                entry["exit_code"] = 7
+            return entry
+
+        _make_suite_dirs(tmp_path)
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            status, sha, problems = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == "red"
+        assert sha == _GREEN_RUN_HEAD
+        assert any("exited non-zero" in p for p in problems)
+
+    def test_miss_dominates_over_red(self, tmp_path):
+        """A mix of missing + red entries classifies as 'miss' (gate fires)."""
+        def _side_effect(command, **kwargs):
+            if "tests/unit" in command:
+                return None
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "tests/cli" in command:
+                entry["exit_code"] = 7
+            return entry
+
+        _make_suite_dirs(tmp_path)
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            status, _, _ = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == "miss"
+
+    def test_error_when_head_unresolvable(self, tmp_path):
+        """Unresolvable HEAD → 'error' with no cache query."""
+        with mock.patch.object(audit_runner, "query_cached") as mock_q:
+            status, sha, _ = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(head_sha=None), cwd=str(tmp_path),
+            )
+        assert status == "error"
+        assert sha is None
+        mock_q.assert_not_called()
+
+
+class TestEffectiveSuiteCommands:
+    """Repo-aware command set (AC3): no phantom pytest for no-pytest repos."""
+
+    def test_pytest_ini_counts_as_pytest_suite(self, tmp_path):
+        (tmp_path / "pytest.ini").write_text("[pytest]\n")
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is True
+        assert any(
+            "pytest" in c
+            for c in audit_runner._effective_suite_commands(tmp_path)
+        )
+
+    def test_pyproject_marker_counts_as_pytest_suite(self, tmp_path):
+        (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is True
+
+    def test_python_test_files_count_as_pytest_suite(self, tmp_path):
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_x.py").write_text("def test_x(): pass\n")
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is True
+
+    def test_no_pytest_suite_skips_pytest_command(self, tmp_path):
+        """A node-only repo keeps node commands but drops the pytest command."""
+        _make_suite_dirs(tmp_path)
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is False
+        cmds = audit_runner._effective_suite_commands(tmp_path)
+        assert cmds  # node commands remain
+        assert not any("pytest" in c for c in cmds)
+
+    def test_no_suite_at_all_yields_empty_set(self, tmp_path):
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is False
+        assert audit_runner._effective_suite_commands(tmp_path) == []
+
+
+class TestPreflightCacheGate:
+    """Unit tests for the gate decision (repo-aware, fail-open on red/error)."""
+
+    def _gate_message(self, tmp_path, side_effect=None, return_value=None):
+        if side_effect is not None:
+            patcher = mock.patch.object(
+                audit_runner, "query_cached", side_effect=side_effect
+            )
+        else:
+            patcher = mock.patch.object(
+                audit_runner, "query_cached", return_value=return_value
+            )
+        with patcher:
+            return audit_runner._preflight_cache_gate(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+
+    def _with_pytest(self, tmp_path):
+        (tmp_path / "pytest.ini").write_text("[pytest]\n")
+        return tmp_path
+
+    def test_miss_returns_blocking_message(self, tmp_path):
+        """AC1: a cache miss yields an actionable blocking message."""
+        self._with_pytest(tmp_path)
+        message = self._gate_message(tmp_path, return_value=None)
+        assert message is not None
+        assert "Audit blocked" in message
+        assert "/skill:test" in message
+        assert "--green-run HEAD" in message
+        assert "NOT produce a report" in message
+        assert "pre-audit work-item status/stage" in message
+
+    def test_green_returns_none(self, tmp_path):
+        """A green cache proceeds (no message)."""
+        self._with_pytest(tmp_path)
+        assert self._gate_message(tmp_path, return_value=_AUTO_GREEN_ENTRY) is None
+
+    def test_red_returns_none(self, tmp_path):
+        """AC2: a red cached run keeps partial + diagnostic (no gate)."""
+        self._with_pytest(tmp_path)
+
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "pytest" in command:
+                entry["exit_code"] = 1
+            return entry
+
+        assert self._gate_message(tmp_path, side_effect=_side_effect) is None
+
+    def test_cache_error_fails_open(self, tmp_path):
+        """AC2: a cache/infra error never blocks the audit."""
+        self._with_pytest(tmp_path)
+        assert self._gate_message(
+            tmp_path, side_effect=RuntimeError("cache corrupt")
+        ) is None
+
+    def test_no_pytest_repo_not_blocked(self, tmp_path):
+        """AC3: a repo without a pytest suite is not falsely gated."""
+        _make_suite_dirs(tmp_path)  # node dirs; no pytest config/test files
+        assert audit_runner._repo_has_pytest_suite(tmp_path) is False
+        # node suites cached green → the effective set has no miss
+        assert self._gate_message(tmp_path, return_value=_AUTO_GREEN_ENTRY) is None
+
+    def test_no_suite_repo_not_blocked(self, tmp_path):
+        """AC3: a repo with no suite at all (docs-only) is never gated."""
+        assert self._gate_message(tmp_path, return_value=None) is None
+
+
+class TestPreflightGateCmdIssue:
+    """End-to-end gate matrix at the cmd_issue level (AC1/AC2/AC4)."""
+
+    def _make_cmd_issue_runner(self, **kwargs):
+        return TestAutoGreenRunPromptInjection()._make_cmd_issue_runner(**kwargs)
+
+    def _run_issue(self, *, cache_return=None, cache_side_effect=None,
+                   green_run=None, run_tests=False):
+        """Run cmd_issue (force, no persist) with a mocked pi call."""
+        mock_runner = self._make_cmd_issue_runner()
+        calls: list[str] = []
+
+        def _fake_call(*args, **kwargs):
+            calls.append(args[1])
+            return {"extracted_text": "[]"}
+
+        patches = [
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                mock.MagicMock(
+                    return_value={"success": True, "findings": [], "fixes_applied": 0}
+                ),
+            ),
+        ]
+        if cache_side_effect is not None:
+            patches.append(mock.patch.object(
+                audit_runner, "query_cached", side_effect=cache_side_effect
+            ))
+        else:
+            patches.append(mock.patch.object(
+                audit_runner, "query_cached", return_value=cache_return
+            ))
+        if run_tests:
+            patches.append(mock.patch.object(
+                audit_runner, "_run_tests_via_test_skill",
+                return_value={
+                    "success": True, "results": [], "failures": [],
+                    "triaged": [], "notice": "",
+                },
+            ))
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+                green_run=green_run, run_tests=run_tests,
+            )
+        return rc, calls, mock_runner
+
+    def test_cache_miss_exits_nonzero_before_phase1(self, capsys):
+        """AC1: cache miss + no opt-out → rc 1, zero pi calls, no status change."""
+        rc, calls, runner = self._run_issue(cache_return=None)
+        assert rc == 1
+        assert calls == []  # no Phase 1 pi call
+        # pre-audit status/stage preserved: no wl update reached the runner
+        assert not any(
+            "update" in " ".join(c.args[0]) for c in runner.call_args_list
+        )
+        err = capsys.readouterr().err
+        assert "Audit blocked" in err
+        assert "run_tests.py --force" in err
+
+    def test_cache_miss_with_run_tests_proceeds(self):
+        """AC1/AC2: cache miss + --run-tests executes the suite and proceeds."""
+        rc, calls, _ = self._run_issue(cache_return=None, run_tests=True)
+        assert rc == 0
+        assert "parent" in calls  # reached Phase 1
+
+    def test_cache_miss_with_green_run_proceeds(self):
+        """AC1/AC2: cache miss + --green-run HEAD attests and proceeds."""
+        rc, calls, _ = self._run_issue(cache_return=None, green_run="HEAD")
+        assert rc == 0
+        assert "parent" in calls
+
+    def test_green_cache_proceeds(self):
+        """A green cached full-suite run proceeds (auto-verified)."""
+        rc, calls, _ = self._run_issue(cache_return=_AUTO_GREEN_ENTRY)
+        assert rc == 0
+        assert "parent" in calls
+
+    def test_red_cache_proceeds_partial(self):
+        """AC2: a red cached run keeps current behavior (partial, no gate)."""
+        def _side_effect(command, **kwargs):
+            entry = dict(_AUTO_GREEN_ENTRY)
+            if "pytest" in command:
+                entry["exit_code"] = 1
+            return entry
+
+        rc, calls, _ = self._run_issue(cache_side_effect=_side_effect)
+        assert rc == 0
+        assert "parent" in calls
+
+
+# ===========================================================================
+# --run-tests test-skill invocation (SA-0MSJELSWS002UF60)
+# ===========================================================================
+
+
+class TestRunTestsViaTestSkill:
+    """Unit tests for the --run-tests test-skill invocation.
+
+    Covers: green executed run (AC1), failures triaged per the test skill
+    (AC4), fail-closed notices, and triage-error resilience.
+    """
+
+    def _green_run(self, command, **kwargs):
+        return {
+            "stdout": "5 passed in 0.03s",
+            "stderr": "",
+            "exit_code": 0,
+            "completed_at": 1000.0,
+            "command": command,
+            "git_state": "fingerprint",
+            "cached": False,
+        }
+
+    def test_green_run_success_refreshes_cache(self, tmp_path, capsys):
+        """AC1: a green executed suite yields success and refreshes the cache."""
+        _make_suite_dirs(tmp_path)
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=self._green_run
+        ) as mock_run:
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is True
+        assert result["failures"] == []
+        assert result["triaged"] == []
+        assert result["notice"] == ""
+        # force=True executes fresh and stores, so the cache is refreshed.
+        assert mock_run.call_count == 4  # pytest + 3 node suite commands
+        for call in mock_run.call_args_list:
+            assert call.kwargs["cwd"] == str(tmp_path.resolve())
+            assert call.kwargs["force"] is True
+            assert call.kwargs["ttl"] == audit_runner.DEFAULT_TTL_SECONDS
+        err = capsys.readouterr().err
+        assert "Invoking test skill (run_tests.py)" in err
+        assert "Test skill run completed: success=True" in err
+
+    def test_failing_run_triages_failures(self, tmp_path, capsys):
+        """AC4: failures are triaged per the test skill, never silently ignored."""
+        def _side_effect(command, **kwargs):
+            if "pytest" in command:
+                return {
+                    "stdout": (
+                        "FAILED tests/test_x.py::test_boom - "
+                        "AssertionError: boom"
+                    ),
+                    "stderr": "",
+                    "exit_code": 1,
+                    "completed_at": 1000.0,
+                    "command": command,
+                    "git_state": "fingerprint",
+                    "cached": False,
+                }
+            return self._green_run(command, **kwargs)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ), mock.patch(
+            "skill.triage.scripts.check_or_create.check_or_create",
+            return_value={"issueId": "SA-TRIAGE-1", "created": True},
+        ) as mock_triage:
+            result = audit_runner._run_tests_via_test_skill(
+                cwd=tmp_path, parent_work_item_id="TEST-1", head_sha="abc123",
+            )
+        assert result["success"] is False
+        assert len(result["failures"]) == 1
+        assert result["failures"][0]["test_name"] == "tests/test_x.py::test_boom"
+        assert mock_triage.call_count == 1
+        payload = mock_triage.call_args.args[0]
+        assert payload["test_name"] == "tests/test_x.py::test_boom"
+        assert payload["parent_work_item_id"] == "TEST-1"
+        assert payload["commit_hash"] == "abc123"
+        assert payload["repo_path"] == str(tmp_path.resolve())
+        err = capsys.readouterr().err
+        assert "Test skill run completed: success=False" in err
+        assert "failures=1 triaged=1" in err
+
+    def test_nonzero_exit_without_parseable_failures(self, tmp_path):
+        """A non-zero exit with no FAILED lines is recorded, never silently green."""
+        def _side_effect(command, **kwargs):
+            if "pytest" in command:
+                return {
+                    "stdout": "crash before any test ran",
+                    "stderr": "",
+                    "exit_code": 1,
+                    "completed_at": 1000.0,
+                    "command": command,
+                    "git_state": "fingerprint",
+                    "cached": False,
+                }
+            return self._green_run(command, **kwargs)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ), mock.patch(
+            "skill.triage.scripts.check_or_create.check_or_create",
+            return_value={"issueId": "SA-TRIAGE-1", "created": True},
+        ) as mock_triage:
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is False
+        assert len(result["failures"]) == 1
+        assert "<suite exited 1>" in result["failures"][0]["test_name"]
+        assert mock_triage.call_count == 1
+
+    def test_timeout_notice_fail_closed(self, tmp_path):
+        """A suite timeout yields a notice, no evidence, no crash."""
+        def _side_effect(command, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=command, timeout=600)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ):
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is False
+        assert "timed out" in result["notice"]
+        assert result["failures"] == []
+
+    def test_command_not_found_notice_fail_closed(self, tmp_path):
+        """A missing suite binary yields a notice, no evidence, no crash."""
+        def _side_effect(command, **kwargs):
+            raise FileNotFoundError("pytest")
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ):
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is False
+        assert "command not found" in result["notice"]
+        assert result["failures"] == []
+
+    def test_triage_error_never_crashes_run(self, tmp_path):
+        """AC4: a triage helper failure is recorded, never crashes the run."""
+        def _side_effect(command, **kwargs):
+            if "pytest" in command:
+                return {
+                    "stdout": (
+                        "FAILED tests/test_x.py::test_boom - "
+                        "AssertionError: boom"
+                    ),
+                    "stderr": "",
+                    "exit_code": 1,
+                    "completed_at": 1000.0,
+                    "command": command,
+                    "git_state": "fingerprint",
+                    "cached": False,
+                }
+            return self._green_run(command, **kwargs)
+
+        with mock.patch.object(
+            audit_runner, "run_cached", side_effect=_side_effect
+        ), mock.patch(
+            "skill.triage.scripts.check_or_create.check_or_create",
+            side_effect=RuntimeError("triage boom"),
+        ):
+            result = audit_runner._run_tests_via_test_skill(cwd=tmp_path)
+        assert result["success"] is False
+        assert result["triaged"][0]["error"] == "triage boom"
+
+
+class TestRunTestsPromptInjection:
+    """Prompt-content assertions for the --run-tests path (SA-0MSJELSWS002UF60)."""
+
+    def _make_cmd_issue_runner(self, description: str = _GREEN_RUN_DESC,
+                               head_sha: str | None = _GREEN_RUN_HEAD):
+        return TestAutoGreenRunPromptInjection()._make_cmd_issue_runner(
+            description=description, head_sha=head_sha,
+        )
+
+    def _mock_cq(self):
+        return mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+    def _capture_context_prompts(self, cache_result=None, test_run=None,
+                                 **cmd_kwargs):
+        """Run cmd_issue with query_cached + _run_tests_via_test_skill mocked.
+
+        Returns (prompts, mock_run_tests) so tests can assert both the prompt
+        content and whether the test-skill invocation was (not) called.
+        """
+        mock_runner = self._make_cmd_issue_runner()
+        prompts: dict[str, str] = {}
+        effective_test_run = test_run or {
+            "success": True, "results": [], "failures": [],
+            "triaged": [], "notice": "",
+        }
+
+        def _fake_call(*args, **kwargs):
+            prompts[args[1]] = args[2]
+            return {"extracted_text": "[]"}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=cache_result
+        ), mock.patch.object(
+            audit_runner, "_run_tests_via_test_skill",
+            return_value=effective_test_run,
+        ) as mock_run_tests, mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+                **cmd_kwargs,
+            )
+        return prompts, mock_run_tests
+
+    def test_run_tests_with_empty_cache_invokes_test_skill(self):
+        """AC1: cache miss + --run-tests → the test skill is invoked and a green
+        executed run injects the TEST-SKILL RUN block (no operator round-trip)."""
+        prompts, mock_run_tests = self._capture_context_prompts(
+            cache_result=None, run_tests=True,
+        )
+        assert "parent" in prompts
+        assert mock_run_tests.call_count == 1
+        assert mock_run_tests.call_args.kwargs["parent_work_item_id"] == "TEST-1"
+        assert "TEST-SKILL GREEN RUN" in prompts["parent"]
+        assert _GREEN_RUN_HEAD in prompts["parent"]
+        assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
+
+    def test_without_run_tests_never_invokes_test_skill(self, capsys):
+        """AC2/AC1: without --run-tests the test skill is never invoked — and on
+        a cache miss the pre-flight gate blocks the audit (SA-0MSQ72BVV0011SRU)
+        before the invocation could ever be reached: no report, no persistence,
+        non-zero exit."""
+        mock_runner = self._make_cmd_issue_runner()
+
+        def _fake_call(*args, **kwargs):  # pragma: no cover - must not run
+            raise AssertionError("Phase 1 pi call must not happen on a cache miss")
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=None
+        ), mock.patch.object(
+            audit_runner, "_run_tests_via_test_skill",
+            return_value={
+                "success": True, "results": [], "failures": [],
+                "triaged": [], "notice": "",
+            },
+        ) as mock_run_tests, mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+            )
+        assert rc == 1
+        mock_run_tests.assert_not_called()
+        err = capsys.readouterr().err
+        assert "Audit blocked" in err
+        assert "--run-tests" in err  # the message names the explicit opt-outs
+
+    def test_green_cache_skips_test_skill_invocation(self):
+        """AC1: a green cached run short-circuits the invocation entirely."""
+        prompts, mock_run_tests = self._capture_context_prompts(
+            cache_result=_AUTO_GREEN_ENTRY, run_tests=True,
+        )
+        assert "AUTO-VERIFIED GREEN RUN" in prompts["parent"]
+        mock_run_tests.assert_not_called()
+
+    def test_failing_test_run_injects_no_block(self):
+        """AC1/AC4: a non-green executed run yields no evidence (fail-closed)."""
+        prompts, mock_run_tests = self._capture_context_prompts(
+            cache_result=None, run_tests=True,
+            test_run={
+                "success": False, "results": [],
+                "failures": [{"test_name": "tests/test_x.py::test_boom"}],
+                "triaged": [{"issueId": "SA-TRIAGE-1"}], "notice": "",
+            },
+        )
+        assert "parent" in prompts
+        assert mock_run_tests.call_count == 1
+        assert "TEST-SKILL GREEN RUN" not in prompts["parent"]
+        assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
+
+    def test_log_lines_show_invocation_and_result(self, capsys):
+        """AC3: clear log lines show when the test skill is invoked and its result.
+
+        The real ``_run_tests_via_test_skill`` runs here (with ``run_cached``
+        mocked green) so the invocation log lines are actually emitted.
+        """
+        mock_runner = self._make_cmd_issue_runner()
+
+        def _fake_call(*args, **kwargs):
+            return {"extracted_text": "[]"}
+
+        def _green_run(command, **kwargs):
+            return {
+                "stdout": "5 passed in 0.03s",
+                "stderr": "",
+                "exit_code": 0,
+                "completed_at": 1000.0,
+                "command": command,
+                "git_state": "fingerprint",
+                "cached": False,
+            }
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=None
+        ), mock.patch.object(
+            audit_runner, "run_cached", side_effect=_green_run
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            self._mock_cq(),
+        ):
+            audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
+                run_tests=True,
+            )
+        err = capsys.readouterr().err
+        assert "Invoking test skill (run_tests.py)" in err
+        assert "Test skill run completed: success=True" in err
+
+
+class TestRunTestsReportLine:
+    """The persisted report records the executed-run evidence (AC1/AC3)."""
+
+    def test_report_includes_test_skill_run_line(self):
+        """AC1: 'Test skill run evidence: <sha>' appears near the header."""
+        issue = {"id": "TEST-1"}
+        acs = [{"text": "AC", "verdict": "met", "evidence": ""}]
+        report = audit_runner._assemble_issue_report(
+            issue, acs, [], model="m", model_source="local",
+            test_skill_run_sha=_GREEN_RUN_HEAD,
+        )
+        assert f"Test skill run evidence: {_GREEN_RUN_HEAD}" in report
+        assert "executed full-suite run, --run-tests" in report
+        assert "Automatic green run evidence" not in report
+
+    def test_report_without_test_skill_run_has_no_line(self):
+        """Backward compatibility: no executed-run line without evidence."""
+        issue = {"id": "TEST-1"}
+        acs = [{"text": "AC", "verdict": "met", "evidence": ""}]
+        report = audit_runner._assemble_issue_report(
+            issue, acs, [], model="m", model_source="local",
+        )
+        assert "Test skill run evidence" not in report
+
+
+class TestRunTestsCliFlag:
+    """The --run-tests flag parses and defaults off (AC2)."""
+
+    def test_flag_defaults_off(self):
+        """AC2: without the flag the audit stays strictly read-only."""
+        args = audit_runner.build_parser().parse_args(["issue", "TEST-1"])
+        assert args.run_tests is False
+
+    def test_flag_enables(self):
+        """The flag enables the test-skill invocation path."""
+        args = audit_runner.build_parser().parse_args(
+            ["issue", "TEST-1", "--run-tests"]
+        )
+        assert args.run_tests is True
 
 
 # ===========================================================================
@@ -6266,6 +7692,14 @@ class TestContentFreshnessGate:
     Legacy audits without a fingerprint fall back to the 60s time floor.
     """
 
+    @staticmethod
+    def _proc(returncode: int, stdout: str):
+        """Build a canned CompletedProcess for git subprocess calls."""
+        return subprocess.CompletedProcess(
+            args=[], returncode=returncode, stdout=stdout, stderr="",
+        )
+
+
     _HEAD = "a" * 40
     _DESC = "## Acceptance Criteria\n- AC1: do the thing\n\n## Key Files\n- `src/a.py`"
 
@@ -6383,6 +7817,106 @@ class TestContentFreshnessGate:
         assert audit_runner._extract_content_fingerprint(
             "Ready to close: Yes\n\n## Summary\nok"
         ) is None
+
+    # ------------------------------------------------------------------
+    # Working-tree state in the fingerprint (SA-0MSL1YXG7004F2BZ)
+    # ------------------------------------------------------------------
+
+    def _tree_state(self, *status_lines):
+        """Compute a fingerprint given git status/diff output lines."""
+        status = "\n".join(status_lines)
+
+        def _fake_runner(cmd):
+            cmd_str = " ".join(cmd)
+            if cmd_str.startswith("git status"):
+                return self._proc(0, status)
+            if cmd_str.startswith("git diff"):
+                return self._proc(0, "")  # diff name-only folded into status output
+            raise AssertionError(f"unexpected cmd: {cmd_str}")
+
+        return audit_runner._compute_content_fingerprint(
+            _fake_runner, "TEST-1", work_item={"description": self._DESC},
+        )
+
+    def test_fingerprint_changes_with_uncommitted_modified_file(self):
+        """AC1: an uncommitted tracked-file change invalidates the fingerprint."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            f_clean = self._tree_state()
+            f_dirty = self._tree_state(" M src/a.py")
+        assert f_clean != f_dirty
+
+    def test_fingerprint_changes_with_untracked_file(self):
+        """AC2: an added untracked file invalidates the fingerprint."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            f_clean = self._tree_state()
+            f_untracked = self._tree_state("?? new_file.py")
+        assert f_clean != f_untracked
+
+    def test_fingerprint_committed_change_invalidates_via_head(self):
+        """AC3: committing a change invalidates via the existing HEAD sha component."""
+        with mock.patch.object(audit_runner, "_resolve_audited_head") as mock_head:
+            mock_head.side_effect = ["h" * 40, "g" * 40]
+            f1 = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+            f2 = audit_runner._compute_content_fingerprint(
+                mock.MagicMock(), "TEST-1", work_item={"description": self._DESC},
+            )
+        assert f1 != f2
+
+    def test_fingerprint_stable_for_untouched_tree(self):
+        """AC4: an untouched working tree keeps the same fingerprint."""
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            f1 = self._tree_state()
+            f2 = self._tree_state()
+        assert f1 == f2
+
+    def test_fingerprint_stable_when_git_status_unavailable(self):
+        """AC4 (fail-open): git status failure does not break the fingerprint.
+
+        The working-tree component degrades to an empty marker so audits in
+        environments without git (or with a broken runner) keep working;
+        freshness still works off the remaining components.
+        """
+        def _fake_runner(cmd):
+            cmd_str = " ".join(cmd)
+            if cmd_str.startswith("git status"):
+                return self._proc(1, "fatal: not a git repository")
+            raise AssertionError(f"unexpected cmd: {cmd_str}")
+
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            fp = audit_runner._compute_content_fingerprint(
+                _fake_runner, "TEST-1", work_item={"description": self._DESC},
+            )
+        assert fp is not None
+        assert len(fp) == 64
+
+    def test_fingerprint_changes_with_git_diff_output(self):
+        """AC1: staged changes reported by git diff --name-only HEAD count too."""
+        def _fake_runner(cmd):
+            cmd_str = " ".join(cmd)
+            if cmd_str.startswith("git status"):
+                return self._proc(0, "")
+            if cmd_str.startswith("git diff"):
+                return self._proc(0, "src/a.py\nsrc/b.py")
+            raise AssertionError(f"unexpected cmd: {cmd_str}")
+
+        with mock.patch.object(
+            audit_runner, "_resolve_audited_head", return_value=self._HEAD,
+        ):
+            f_clean = self._tree_state()
+            f_staged = audit_runner._compute_content_fingerprint(
+                _fake_runner, "TEST-1", work_item={"description": self._DESC},
+            )
+        assert f_clean != f_staged
 
     # ------------------------------------------------------------------
     # Freshness gate decisions (AC1, AC3)
@@ -6701,7 +8235,7 @@ class TestCmdProjectPiOutputWiring:
     3. Unit tests cover both the wired path and the fallback path.
     """
 
-    _WORK_ITEMS = [
+    _WORK_ITEMS: ClassVar[list[dict[str, str]]] = [
         {"id": "SA-1", "status": "in_progress"},
         {"id": "SA-2", "status": "blocked"},
         {"id": "SA-3", "status": "completed"},
@@ -6722,6 +8256,9 @@ class TestCmdProjectPiOutputWiring:
                 audit_runner,
                 "_run_wl",
                 return_value={"success": True, "workItems": self._WORK_ITEMS},
+            ),
+            mock.patch.object(
+                audit_runner, "_run_wl_projected", return_value=1
             ),
             mock.patch.object(
                 audit_runner, "_call_pi_and_maybe_log", return_value=pi_result
@@ -6771,6 +8308,9 @@ class TestCmdProjectPiOutputWiring:
                 return_value={"success": True, "workItems": self._WORK_ITEMS},
             ),
             mock.patch.object(
+                audit_runner, "_run_wl_projected", return_value=1
+            ),
+            mock.patch.object(
                 audit_runner,
                 "_call_pi_and_maybe_log",
                 side_effect=RuntimeError("pi binary not found"),
@@ -6807,3 +8347,263 @@ class TestCmdProjectPiOutputWiring:
         payload = json.loads(out)
         assert payload["summary"] == self._LOCAL_SUMMARY
         assert payload["recommendation"] == self._LOCAL_RECOMMENDATION
+
+
+# ===========================================================================
+# LP-0MSQ32S2M001EA74: stall-abort, short-budget, slot-aware concurrency
+# (AC4a/AC4b/AC4c/AC5) — additive tests only.
+# ===========================================================================
+
+
+class _StallingProcess:
+    """Fake Popen whose stdout/stderr are real pipes that never emit output.
+
+    Used by the stall-abort tests (AC4a): a process whose output streams
+    stay completely silent while ``poll()`` reports it still running. The
+    in-process stall detector must kill it well before the full 1800s
+    budget and return a ``_timeout`` verdict.
+    """
+
+    def __init__(self):
+        r1, w1 = os.pipe()
+        r2, w2 = os.pipe()
+        self.stdout = os.fdopen(r1, "rb", buffering=0)
+        self.stderr = os.fdopen(r2, "rb", buffering=0)
+        self._w1, self._w2 = w1, w2
+        self.returncode = None
+
+    def poll(self):
+        return None  # never exits
+
+    def kill(self):
+        try:
+            os.close(self._w1)
+            os.close(self._w2)
+        except OSError:
+            pass
+
+    def communicate(self, timeout=None):
+        return "", ""
+
+    def close(self):
+        self.stdout.close()
+        self.stderr.close()
+        for fd in (self._w1, self._w2):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+class TestStallAbort:
+    """AC4a: a stalled Pi call aborts in-process well before the 1800s budget."""
+
+    def _call_pi_with_stall(self, stall_env: str, effective_timeout: int | None = None) -> tuple[dict, float]:
+        proc = _StallingProcess()
+        try:
+            with mock.patch.object(audit_runner.subprocess, "Popen", return_value=proc), \
+                 mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_STALL_TIMEOUT_ENV: stall_env}, clear=False):
+                start = time.monotonic()
+                kwargs = {"model": "test-model"} if effective_timeout is None else {"model": "test-model", "timeout": effective_timeout}
+                result = audit_runner._call_pi("test prompt", **kwargs)
+                elapsed = time.monotonic() - start
+        finally:
+            proc.close()
+        return result, elapsed
+
+    def test_stalled_call_aborts_well_before_full_budget(self):
+        """A call with no output for the stall threshold aborts in-process.
+
+        With ``AUDIT_STALL_TIMEOUT=1`` the call must return a ``_timeout``
+        verdict after ~1s, not after the full 1800s budget.
+        """
+        result, elapsed = self._call_pi_with_stall("1")
+        assert result.get("_timeout") is True
+        assert result.get("verdict") == "unmet"
+        assert elapsed < 60, f"stalled call took {elapsed:.1f}s; expected abort well before 1800s"
+        assert result.get("elapsed_seconds", 0) < 60
+        assert "stall" in result.get("evidence", "").lower()
+
+    def test_stall_abort_sets_timeout_marker(self):
+        """The stall abort returns the existing ``_timeout`` marker (AC4a)."""
+        result, _ = self._call_pi_with_stall("1")
+        assert result.get("_timeout") is True
+        assert result.get("raw_stdout") is not None
+
+    def test_stall_timeout_env_resolution(self):
+        """AUDIT_STALL_TIMEOUT env var is honored; invalid values warn + default."""
+        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_STALL_TIMEOUT_ENV: "120"}, clear=False):
+            assert audit_runner._resolve_stall_timeout() == 120
+        with mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            assert audit_runner._resolve_stall_timeout() == 600
+        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_STALL_TIMEOUT_ENV: "abc"}, clear=False), \
+             mock.patch("sys.stderr") as mock_err:
+            assert audit_runner._resolve_stall_timeout() == 600
+            assert "invalid" in mock_err.write.call_args_list[0][0][0].lower()
+
+
+class TestChildScreenShortBudget:
+    """AC4b: child Phase-1 screens get a short budget; Phase 2 keeps 1800."""
+
+    def _timeout_mock_process(self):
+        """Mock Popen whose communicate() raises TimeoutExpired then drains."""
+        mock_process = mock.MagicMock()
+        timeout_error = subprocess.TimeoutExpired(cmd="pi", timeout=10, output="", stderr="")
+        mock_process.communicate.side_effect = [timeout_error, ("", "")]
+        return mock_process
+
+    def test_child_screen_uses_short_budget(self):
+        """A child Phase-1 screen exceeding its short budget returns a clean timeout verdict.
+
+        The effective per-call budget for a child screen defaults to
+        ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (600s), never the full 1800s.
+        """
+        mock_process = self._timeout_mock_process()
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            result = audit_runner._call_pi("test prompt", model="test-model", child_screen=True)
+        assert result.get("_timeout") is True
+        assert result.get("verdict") == "unmet"
+        assert str(audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT) in result.get("evidence", "")
+        assert "1800" not in result.get("evidence", "")
+
+    def test_child_screen_timeout_env_override(self):
+        """AUDIT_CHILD_SCREEN_TIMEOUT overrides the default short budget."""
+        mock_process = self._timeout_mock_process()
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_CHILD_SCREEN_TIMEOUT_ENV: "300"}, clear=False):
+            result = audit_runner._call_pi("test prompt", model="test-model", child_screen=True)
+        assert result.get("_timeout") is True
+        assert "300" in result.get("evidence", "")
+
+    def test_phase2_retains_1800_budget(self):
+        """Phase 2 (non-child) calls keep the existing 1800s budget."""
+        mock_process = self._timeout_mock_process()
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result.get("_timeout") is True
+        assert str(audit_runner.CALL_PI_TIMEOUT) in result.get("evidence", "")
+
+    def test_parent_phase1_retains_1800_budget(self):
+        """Parent Phase-1 screens (child_screen=False) keep 1800s."""
+        mock_process = self._timeout_mock_process()
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            result = audit_runner._call_pi("test prompt", model="test-model", child_screen=False)
+        assert str(audit_runner.CALL_PI_TIMEOUT) in result.get("evidence", "")
+
+    def test_explicit_timeout_arg_wins_over_short_budget(self):
+        """An explicit timeout arg still wins over the child-screen default."""
+        mock_process = self._timeout_mock_process()
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            result = audit_runner._call_pi("test prompt", model="test-model", child_screen=True, timeout=3600)
+        assert "3600" in result.get("evidence", "")
+
+    def test_child_screen_timeout_constants_defined(self):
+        assert audit_runner.AUDIT_CHILD_SCREEN_TIMEOUT_ENV == "AUDIT_CHILD_SCREEN_TIMEOUT"
+        assert audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT == 600
+
+    def test_phase1_review_child_acs_forwards_child_screen(self):
+        """_phase1_review_child_acs passes child_screen=True to _call_pi."""
+        child = {
+            "id": "CHILD-1",
+            "title": "Child Issue",
+            "description": "## Acceptance Criteria\n1. AC one\n2. AC two",
+        }
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": '[{"index": 0, "verdict": "met", "evidence": "ok"}, {"index": 1, "verdict": "met", "evidence": "ok"}]'},
+        ) as mock_call, mock.patch.object(audit_runner, "_build_file_scope_manifest", return_value="manifest"):
+            audit_runner._phase1_review_child_acs(
+                0, child, "test-model", "pi", None, None,
+                mock.MagicMock(), lambda *a, **k: None,
+            )
+        _args, kwargs = mock_call.call_args
+        assert kwargs.get("child_screen") is True
+
+
+class TestSlotAwareConcurrency:
+    """AC4c: dynamic child-call ceiling from proxy slots; fail-open fallback."""
+
+    def _mock_slot_status(self, available, total):
+        return mock.patch.object(
+            audit_runner, "_query_slot_status", return_value=(available, total),
+        )
+
+    def test_dynamic_ceiling_caps_by_available_slots(self):
+        """available=2 → ceiling min(2, max); available=1 → 1; available=0 → 1 floor."""
+        with self._mock_slot_status(2, 4):
+            assert audit_runner._resolve_child_concurrency() == 2
+        with self._mock_slot_status(1, 4):
+            assert audit_runner._resolve_child_concurrency() == 1
+        with self._mock_slot_status(0, 4):
+            assert audit_runner._resolve_child_concurrency() == 1  # floor, never 0
+        with self._mock_slot_status(8, 8):
+            assert audit_runner._resolve_child_concurrency() == 2  # capped by configured max
+
+    def test_fallback_to_static_on_query_failure(self):
+        """Query failure (None, None) degrades to the static ceiling (fail-open)."""
+        with self._mock_slot_status(None, None):
+            assert audit_runner._resolve_child_concurrency() == 2  # AUDIT_PHASE2_PARALLELISM default
+        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "3"}, clear=False), \
+             self._mock_slot_status(None, None):
+            assert audit_runner._resolve_child_concurrency() == 3
+
+    def test_slot_status_query_parses_endpoint_json(self):
+        """_query_slot_status parses the proxy /llama/local/status payload."""
+        mock_resp = mock.MagicMock()
+        mock_resp.read.return_value = b'{"available_slots": 2, "total_slots": 4}'
+        mock_resp.__enter__.return_value = mock_resp
+        with mock.patch("urllib.request.urlopen", return_value=mock_resp) as mock_open:
+            available, total = audit_runner._query_slot_status(url="http://localhost:8000/llama/local/status")
+        assert (available, total) == (2, 4)
+        mock_open.assert_called_once()
+        _args, kwargs = mock_open.call_args
+        assert kwargs.get("timeout") == audit_runner.AUDIT_SLOT_STATUS_TIMEOUT
+
+    def test_slot_status_query_fail_open_on_error(self):
+        """A failed/erroring slot query returns (None, None) — never raises."""
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            assert audit_runner._query_slot_status(url="http://localhost:8000/llama/local/status") == (None, None)
+        with mock.patch("urllib.request.urlopen", side_effect=Exception("boom")):
+            assert audit_runner._query_slot_status(url="http://x") == (None, None)
+
+    def test_slot_status_constants(self):
+        assert audit_runner.AUDIT_SLOT_STATUS_URL_ENV == "AUDIT_SLOT_STATUS_URL"
+        assert audit_runner.AUDIT_SLOT_STATUS_URL_DEFAULT.endswith("/llama/local/status")
+        assert audit_runner.AUDIT_SLOT_STATUS_TIMEOUT <= 2  # short timeout (1s)
+
+    def test_max_child_concurrency_env(self):
+        """AUDIT_MAX_CHILD_CONCURRENCY caps the dynamic ceiling."""
+        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_MAX_CHILD_CONCURRENCY_ENV: "1"}, clear=False), \
+             self._mock_slot_status(4, 4):
+            assert audit_runner._resolve_child_concurrency() == 1
+
+
+class TestStallAndBudgetRegression:
+    """AC5: healthy audits complete unchanged with the new knobs."""
+
+    def test_healthy_call_with_default_stall_detection(self):
+        """A healthy call producing output promptly is unaffected by stall detection."""
+        mock_process = mock.MagicMock()
+        inner = json.dumps({"verdict": "met", "evidence": "ok"})
+        stdout_text = json.dumps({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_end", "content": inner},
+        })
+        mock_process.communicate.return_value = (stdout_text, "")
+        mock_process.returncode = 0
+        with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
+             mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            result = audit_runner._call_pi("test prompt", model="test-model")
+        assert result.get("verdict") == "met"
+        assert result.get("_timeout") is None
+
+    def test_full_budget_still_available_for_phase2(self):
+        """Phase 2 calls (no child_screen) still resolve to CALL_PI_TIMEOUT=1800."""
+        assert audit_runner.CALL_PI_TIMEOUT == 1800
+        with mock.patch.dict(audit_runner.os.environ, {}, clear=True):
+            assert audit_runner._resolve_call_timeout(None, child_screen=False) == audit_runner.CALL_PI_TIMEOUT
+            assert audit_runner._resolve_call_timeout(None, child_screen=True) == audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT

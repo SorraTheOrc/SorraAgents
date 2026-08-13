@@ -1,6 +1,6 @@
 ---
 name: author-command
-description: "Authors a brand new command for the agent framework following project best practices and conventions. Trigger on user queries such as: 'Create a new command to <do something>', 'Author a command that <does something>', 'I need a command that <does something>'."
+description: "Author a new agent-framework command per project conventions. Use when asked: 'Create a new command to <do>'."
 ---
 
 # Author Command

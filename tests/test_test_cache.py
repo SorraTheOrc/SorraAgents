@@ -16,6 +16,7 @@ import pytest
 
 from skill.test_cache import (
     DEFAULT_TTL_SECONDS,
+    FAILED_RUN_TTL_SECONDS,
     cache_dir,
     compute_git_state,
     lookup,
@@ -420,3 +421,67 @@ def _key_for(command: str, git_state: str) -> str:
 
 def test_default_ttl_is_two_hours() -> None:
     assert DEFAULT_TTL_SECONDS == 2 * 60 * 60
+
+
+# ---------------------------------------------------------------------------
+# Failed-run cache policy (SA-0MSJELL44009XYIL)
+# ---------------------------------------------------------------------------
+
+
+def _backdate_entry(git_repo: Path, command: str, seconds: float) -> None:
+    """Backdate the stored entry's completed_at by *seconds* seconds."""
+    entry = query_cached(command, cwd=str(git_repo))
+    assert entry is not None
+    entry_dir = cache_dir(git_repo) / _key_for(command, entry["git_state"])
+    meta_path = entry_dir / "metadata.json"
+    meta = json.loads(meta_path.read_text())
+    meta["completed_at"] = meta["completed_at"] - seconds
+    meta_path.write_text(json.dumps(meta))
+
+
+def test_failed_run_expires_after_short_ttl(git_repo: Path) -> None:
+    """A failed run must NOT be re-served for the full 2h TTL.
+
+    A non-zero exit (e.g. a transient infra failure) expires after the short
+    failed-run TTL so a later query/run re-executes fresh instead of being
+    served a stale failure as if it were current (SA-0MSJELL44009XYIL).
+    """
+    calls: list[str] = []
+    run_cached("npm test", cwd=str(git_repo), runner=make_runner(calls, exit_code=1))
+    # Backdate beyond the failed-run TTL but still within the default TTL.
+    _backdate_entry(git_repo, "npm test", FAILED_RUN_TTL_SECONDS + 60)
+
+    assert query_cached("npm test", cwd=str(git_repo)) is None
+    # A subsequent run re-executes (miss) rather than serving the stale failure.
+    result = run_cached("npm test", cwd=str(git_repo), runner=make_runner(calls, exit_code=1))
+    assert result["cached"] is False
+
+
+def test_failed_run_served_within_short_ttl(git_repo: Path) -> None:
+    """A recent failed run is still served (short TTL, not immediate expiry)."""
+    calls: list[str] = []
+    run_cached("npm test", cwd=str(git_repo), runner=make_runner(calls, exit_code=1))
+    _backdate_entry(git_repo, "npm test", FAILED_RUN_TTL_SECONDS - 60)
+
+    entry = query_cached("npm test", cwd=str(git_repo))
+    assert entry is not None
+    assert entry["exit_code"] == 1
+    assert entry["cached"] is True
+
+
+def test_green_run_keeps_full_ttl(git_repo: Path) -> None:
+    """Green runs are unaffected: still served well past the failed-run TTL."""
+    calls: list[str] = []
+    run_cached("pytest", cwd=str(git_repo), runner=make_runner(calls))
+    _backdate_entry(git_repo, "pytest", FAILED_RUN_TTL_SECONDS + 60)
+
+    entry = query_cached("pytest", cwd=str(git_repo))
+    assert entry is not None
+    assert entry["exit_code"] == 0
+    assert entry["cached"] is True
+
+
+def test_failed_run_ttl_constant_is_short() -> None:
+    """The failed-run TTL must be strictly shorter than the default TTL."""
+    assert FAILED_RUN_TTL_SECONDS > 0
+    assert FAILED_RUN_TTL_SECONDS < DEFAULT_TTL_SECONDS

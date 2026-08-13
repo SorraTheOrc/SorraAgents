@@ -226,4 +226,24 @@ describe('pre-push hook file', () => {
       'Hook should support BRANCH_POLICY_SKIP bypass'
     );
   });
+
+  test('hook file contains context-budget gate (F6)', () => {
+    const content = fs.readFileSync(HOOK_PATH, 'utf8');
+    assert.ok(
+      content.includes('Context-budget regression gate'),
+      'Hook should include the context-budget regression gate'
+    );
+    assert.ok(
+      content.includes('measure_context.py'),
+      'Hook should invoke measure_context.py'
+    );
+    assert.ok(
+      content.includes('context-budget.thresholds.json'),
+      'Hook should reference the thresholds file'
+    );
+    assert.ok(
+      content.includes('CONTEXT_BUDGET_SKIP'),
+      'Hook should support CONTEXT_BUDGET_SKIP bypass'
+    );
+  });
 });

@@ -163,7 +163,6 @@ class TestAuditReadOnlyCodeQuality:
     def test_cmd_issue_passes_files_and_fix_false(self):
         """cmd_issue scopes the code-quality scan to git changed files and
         never passes fix=True (read-only mandate)."""
-        import sys as _sys
         sys.path.insert(0, str(REPO_ROOT))
         from skill.audit.scripts import audit_runner
 
