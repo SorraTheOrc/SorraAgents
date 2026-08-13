@@ -945,7 +945,8 @@ def _audit_time_is_fresh(audit_time: datetime, update_time: datetime) -> bool:
 
 
 def _check_audit_freshness(runner: Runner, issue_id: str,
-                           worklog_dir: str | None = None) -> str | None:
+                           worklog_dir: str | None = None,
+                           work_item: dict | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
 
     Two-stage freshness gate:
@@ -970,6 +971,11 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     The gate gracefully falls through on any failure (no audit data, command
     error, parse error) so that the normal audit pipeline always runs when
     freshness cannot be determined.
+
+    *work_item* may be passed in to avoid a redundant ``wl show`` when the
+    caller already fetched the work item (SA-0MSL1Z7E9005TLBA): it is used
+    for the fingerprint computation and the time-gate ``updatedAt``.
+    When omitted, the work item is fetched via ``wl show``.
     """
 
     try:
@@ -998,7 +1004,7 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     stored_fingerprint = _extract_content_fingerprint(raw_output)
     if stored_fingerprint is not None:
         current_fingerprint = _compute_content_fingerprint(
-            runner, issue_id, worklog_dir=worklog_dir,
+            runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
         )
         if current_fingerprint is None:
             # Fingerprint cannot be computed now (e.g. git unavailable) —
@@ -1010,14 +1016,16 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
         return None
 
     # ── Time gate (floor): legacy audits without a fingerprint ──────────
-    # Get the work item's updatedAt
-    try:
-        wi_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
-                          worklog_dir=worklog_dir)
-    except RuntimeError:
-        return None
+    # Get the work item's updatedAt (reuse an already-fetched work_item
+    # when the caller has it — SA-0MSL1Z7E9005TLBA).
+    if work_item is None:
+        try:
+            wi_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                              worklog_dir=worklog_dir)
+        except RuntimeError:
+            return None
 
-    work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
+        work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
     updated_at = work_item.get("updatedAt")
     if not updated_at:
         return None
@@ -3724,7 +3732,8 @@ def _demote_met_to_partial(results: list[dict]) -> list[dict]:
 
 def _get_child_audit_verdict(runner: Runner, child_id: str,
                              worklog_dir: str | None = None,
-                             force: bool = False) -> tuple[bool | None, str, str | None]:
+                             force: bool = False,
+                             child: dict | None = None) -> tuple[bool | None, str, str | None]:
     """Check a child's persisted audit verdict via wl audit-show.
 
     Returns a (verdict, reason, audited_at) tuple:
@@ -3748,6 +3757,12 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
 
     The child's auditedAt is returned so callers can record the reuse
     marker ("reused from <auditedAt>") in the parent report.
+
+    *child* may be passed in to avoid a redundant ``wl show`` when the
+    caller already fetched the child via ``wl show --children``
+    (SA-0MSL1Z7E9005TLBA): it supplies the description for the fingerprint
+    computation and the updatedAt for the legacy time gate. When omitted,
+    the child is fetched via ``wl show``.
     """
 
     try:
@@ -3786,7 +3801,7 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
     stored_fingerprint = _extract_content_fingerprint(raw_output)
     if stored_fingerprint is not None:
         current_fingerprint = _compute_content_fingerprint(
-            runner, child_id, worklog_dir=worklog_dir,
+            runner, child_id, worklog_dir=worklog_dir, work_item=child,
         )
         if current_fingerprint is None:
             # Fingerprint cannot be computed now (e.g. git unavailable) —
@@ -3799,31 +3814,35 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
         return _parse_child_audit_verdict(raw_output, audited_at)
 
     # ── Time gate (floor): legacy audits without a fingerprint ──────────
-    # Get the work item's updatedAt
-    try:
-        wi_data = _run_wl(runner, ["wl", "show", child_id, "--json"],
-                          worklog_dir=worklog_dir)
-    except RuntimeError:
-        # Can't check freshness; treat as fresh since we have an audit
-        pass
+    # Get the work item's updatedAt (reuse an already-fetched child dict
+    # when the caller has it — SA-0MSL1Z7E9005TLBA).
+    if child is not None:
+        updated_at = child.get("updatedAt")
     else:
-        work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
-        updated_at = work_item.get("updatedAt")
-        if updated_at:
-            audit_time = _parse_iso_utc(audited_at)
-            update_time = _parse_iso_utc(updated_at)
-            if (audit_time is not None and update_time is not None
-                    and not _audit_time_is_fresh(audit_time, update_time)):
-                # The child's own persistence write bumps its updatedAt to
-                # ~the audit's auditedAt. When the two timestamps coincide
-                # within the persistence tolerance, the bump is the audit's
-                # own write, so the audit reflects current state and is
-                # trusted (prevents the parent runner from re-triggering
-                # child audits forever — SA-0MSI3XH34001LLU4).
-                write_delta = update_time - audit_time
-                if not (timedelta(0) <= write_delta
-                        <= timedelta(seconds=AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS)):
-                    return None, "stale", audited_at
+        try:
+            wi_data = _run_wl(runner, ["wl", "show", child_id, "--json"],
+                              worklog_dir=worklog_dir)
+        except RuntimeError:
+            # Can't check freshness; treat as fresh since we have an audit
+            updated_at = None
+        else:
+            work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
+            updated_at = work_item.get("updatedAt")
+    if updated_at:
+        audit_time = _parse_iso_utc(audited_at)
+        update_time = _parse_iso_utc(updated_at)
+        if (audit_time is not None and update_time is not None
+                and not _audit_time_is_fresh(audit_time, update_time)):
+            # The child's own persistence write bumps its updatedAt to
+            # ~the audit's auditedAt. When the two timestamps coincide
+            # within the persistence tolerance, the bump is the audit's
+            # own write, so the audit reflects current state and is
+            # trusted (prevents the parent runner from re-triggering
+            # child audits forever — SA-0MSI3XH34001LLU4).
+            write_delta = update_time - audit_time
+            if not (timedelta(0) <= write_delta
+                    <= timedelta(seconds=AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS)):
+                return None, "stale", audited_at
 
     return _parse_child_audit_verdict(raw_output, audited_at)
 
@@ -4105,7 +4124,8 @@ def _parent_has_gaps(ac_results: list[dict]) -> bool:
 
 
 def _child_content_changed(runner: Runner, child_id: str,
-                           worklog_dir: str | None = None) -> bool:
+                           worklog_dir: str | None = None,
+                           work_item: dict | None = None) -> bool:
     """Return True when a child's own content changed since its last audit.
 
     Uses the Feature 1 content-based freshness gate (SA-0MSKB6US1009CNHT): a
@@ -4116,7 +4136,7 @@ def _child_content_changed(runner: Runner, child_id: str,
     safe. A child with a content-fresh audit returns False too.
     """
     fresh_report = _check_audit_freshness(
-        runner, child_id, worklog_dir=worklog_dir,
+        runner, child_id, worklog_dir=worklog_dir, work_item=work_item,
     )
     if fresh_report is not None:
         return False  # content-fresh audit exists → unchanged
@@ -5349,12 +5369,38 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 test_skill_run_sha = head_sha
 
     # ------------------------------------------------------------------
+    # Capture original status + stage before the freshness gate / status
+    # lifecycle, so the finally block can restore a safe consistent state
+    # on failure and apply a verdict-driven terminal transition on success.
+    # The fetched work item is also reused by the freshness gate below
+    # (SA-0MSL1Z7E9005TLBA) — a single ``wl show`` serves both the status
+    # capture and the freshness fingerprint/time-gate computation.
+    # ------------------------------------------------------------------
+    original_status = "open"  # safe default
+    original_stage = ""       # safe default (unknown)
+    wi: dict | None = None
+    try:
+        item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
+                            worklog_dir=worklog_dir)
+        if isinstance(item_data, dict):
+            # wl show nests the item under "workItem" — unwrap it so the
+            # captured state reflects the item (not the response envelope).
+            wi = item_data.get("workItem")
+            if not isinstance(wi, dict):
+                wi = item_data
+            original_status = wi.get("status", "open")
+            original_stage = wi.get("stage", "")
+    except RuntimeError:
+        pass  # Fall back to safe defaults
+
+    # ------------------------------------------------------------------
     # Freshness gate: skip if a recent audit already exists
     # (before status lifecycle to avoid unnecessary in_progress transitions)
     # ------------------------------------------------------------------
     if not force:
         fresh_report = _check_audit_freshness(runner, issue_id,
-                                              worklog_dir=worklog_dir)
+                                              worklog_dir=worklog_dir,
+                                              work_item=wi)
         if fresh_report is not None:
             print("Skipping: audit still fresh")
             print(fresh_report)
@@ -5401,27 +5447,6 @@ def cmd_issue(issue_id: str, persist: bool = True,
         if script_failure is not None:
             return
         script_failure = _format_script_failure(script_name, exc)
-
-    # ------------------------------------------------------------------
-    # Capture original status + stage before setting in_progress, so the
-    # finally block can restore a safe consistent state on failure and
-    # apply a verdict-driven terminal transition on success.
-    # ------------------------------------------------------------------
-    original_status = "open"  # safe default
-    original_stage = ""       # safe default (unknown)
-    try:
-        item_data = _run_wl(runner, ["wl", "show", issue_id, "--json"],
-                            worklog_dir=worklog_dir)
-        if isinstance(item_data, dict):
-            # wl show nests the item under "workItem" — unwrap it so the
-            # captured state reflects the item (not the response envelope).
-            wi = item_data.get("workItem")
-            if not isinstance(wi, dict):
-                wi = item_data
-            original_status = wi.get("status", "open")
-            original_stage = wi.get("stage", "")
-    except RuntimeError:
-        pass  # Fall back to safe defaults
 
     # Audit verdict parsed from the assembled report ("yes"/"no"); stays
     # None when the audit failed or the verdict could not be parsed.
@@ -5781,7 +5806,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
 
                 verdict, reason, audited_at = _get_child_audit_verdict(
                     runner, child["id"], worklog_dir=worklog_dir,
-                    force=force,
+                    force=force, child=child,
                 )
                 pre_verdicts[child["id"]] = (verdict, reason)
                 if verdict is not None:
@@ -5876,6 +5901,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                         # child is re-audited (LP-0MSQ32MF200675AR AC4).
                         fresh_report = None if force else _check_audit_freshness(
                             runner, child["id"], worklog_dir=worklog_dir,
+                            work_item=child,
                         )
                         if fresh_report is not None:
                             fresh_ready = _parse_ready_to_close(fresh_report)
@@ -5957,6 +5983,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                                 # Re-check verdict after triggered audit
                                 verdict, reason, _audited_at = _get_child_audit_verdict(
                                     runner, child["id"], worklog_dir=worklog_dir,
+                                    child=child,
                                 )
                             except subprocess.TimeoutExpired:
                                 print(
@@ -6237,6 +6264,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
                     # changed children are never silently inherited-passed).
                     if _child_content_changed(
                         runner, child["id"], worklog_dir=worklog_dir,
+                        work_item=child,
                     ):
                         cr["child_audit_ready"] = False
                         pending_children.append((len(child_results), child))

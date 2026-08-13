@@ -7904,6 +7904,182 @@ class TestExtractAcsHeadingVariantsIntegration:
 # ===========================================================================
 
 
+class TestWlShowDedup:
+    """SA-0MSL1Z7E9005TLBA: no duplicate ``wl show`` of the same item when
+    the data is already in hand.
+
+    cmd_issue used to fetch the parent up to twice without ``--children``
+    (once inside the freshness gate's fingerprint computation, once for the
+    pre-audit status/stage capture) and re-fetch each child inside
+    ``_get_child_audit_verdict`` even though ``wl show --children`` already
+    returned the child dict (description + updatedAt). With already-fetched
+    data passed through (``_check_audit_freshness`` accepts ``work_item``;
+    ``_get_child_audit_verdict`` accepts ``child``), a single fetch is
+    reused across the freshness gate and the status capture, and per-child
+    freshness reuses the in-hand child dict.
+    """
+
+    # Never matches a real fingerprint (sha256 hex) → parent audit is stale
+    # by the content gate, so the pipeline runs.
+    _STALE_FP = "0" * 64
+    _HEAD = "a" * 40
+
+    def _make_runner(self, calls, child_audit=None):
+        """Recording runner: appends every invocation to *calls*.
+
+        Serves a stale-fingerprint parent audit (content gate says stale →
+        the audit pipeline runs), the ``wl show`` parent fetch, a
+        ``--children`` fetch with one open child, optional per-child audits,
+        and canned git responses for fingerprint/scope computation.
+        """
+        def _side_effect(cmd):
+            calls.append(list(cmd))
+            cmd_str = " ".join(cmd)
+
+            if "audit-show" in cmd_str:
+                if "CHILD-1" in cmd_str:
+                    audit = child_audit or None
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"success": True, "audit": audit}),
+                        stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "audit": {
+                            "auditedAt": "2026-08-01T00:00:00.000Z",
+                            "rawOutput": (
+                                f"Ready to close: No\n\n"
+                                f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}"
+                                f"{self._STALE_FP}\n\n## Summary\nstale"
+                            ),
+                        },
+                    }),
+                    stderr="",
+                )
+
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps({"success": True}), stderr="",
+                )
+
+            if "show" in cmd_str and "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": "## Acceptance Criteria\n- AC1: parent criterion",
+                            "status": "open",
+                            "stage": "plan_complete",
+                            "updatedAt": "2026-08-01T00:00:00.000Z",
+                        },
+                        "children": [{
+                            "id": "CHILD-1",
+                            "title": "Child 1",
+                            "status": "open",
+                            "stage": "plan_complete",
+                            "updatedAt": "2026-08-01T00:00:00.000Z",
+                            "description": "## Acceptance Criteria\n- CAC1: child criterion",
+                        }],
+                    }),
+                    stderr="",
+                )
+
+            if "show" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": "## Acceptance Criteria\n- AC1: parent criterion",
+                            "status": "open",
+                            "stage": "plan_complete",
+                            "updatedAt": "2026-08-01T00:00:00.000Z",
+                        },
+                    }),
+                    stderr="",
+                )
+
+            # git fingerprint / scope computation (best-effort, empty OK)
+            if cmd_str.startswith("git rev-parse"):
+                return SimpleNamespace(
+                    returncode=0, stdout=self._HEAD + "\n", stderr="",
+                )
+            if "git status --porcelain" in cmd_str or "git diff --name-only" in cmd_str:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        return _side_effect
+
+    def _run_single_child_audit(self, calls, child_audit=None):
+        """Run a full cmd_issue for a single-child item; return its rc."""
+        runner = self._make_runner(calls, child_audit=child_audit)
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log",
+                return_value={
+                    "extracted_text": (
+                        '[{"index": 0, "verdict": "met", "evidence": "ok"}]'
+                    ),
+                    "verdict": "met",
+                    "evidence": "ok",
+                },
+            ),
+            mock.patch.object(
+                audit_runner, "_assemble_issue_report",
+                return_value="Ready to close: Yes\n\n## Summary\nall met",
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [], "fixes_applied": 0},
+            ),
+        ):
+            return audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=False, runner=runner,
+            )
+
+    def test_parent_show_fetched_once_despite_stale_fingerprint(self):
+        """AC1: the parent's ``wl show`` is fetched exactly once even when
+        the stale-fingerprint freshness gate must compute the current
+        fingerprint (previously a second fetch) and the status capture must
+        run (previously a third, when the time gate also fetched)."""
+        calls = []
+        rc = self._run_single_child_audit(calls)
+        assert rc == 0
+        parent_shows = [
+            c for c in calls if "show" in c and "TEST-1" in c
+            and "--children" not in c
+        ]
+        assert len(parent_shows) == 1, \
+            f"expected exactly 1 parent wl show, got {len(parent_shows)}: {parent_shows}"
+
+    def test_child_verdict_reuses_in_hand_child_data(self):
+        """AC1: a legacy (fingerprint-less) child audit forces the time
+        gate, which used to fetch ``wl show CHILD-1`` for updatedAt; with
+        the child dict passed through, no per-child ``wl show`` is issued.
+        """
+        child_audit = {
+            "auditedAt": "2026-08-02T00:00:00.000Z",  # 1 day after updatedAt
+            "rawOutput": "Ready to close: Yes\n\n## Summary\nchild audited",
+        }
+        calls = []
+        rc = self._run_single_child_audit(calls, child_audit=child_audit)
+        assert rc == 0
+        child_shows = [
+            c for c in calls if "show" in c and "CHILD-1" in c
+        ]
+        assert child_shows == [], \
+            f"unexpected per-child wl show: {child_shows}"
+
+
 class TestSharedFreshnessHelpers:
     """Unit tests for the shared ISO-8601 freshness helpers
     (SA-0MSL1Z70C007B9VZ): _parse_iso_utc and _audit_time_is_fresh.
