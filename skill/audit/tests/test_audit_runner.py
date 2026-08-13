@@ -9,6 +9,7 @@ Tests cover:
 from __future__ import annotations
 
 import contextlib
+import datetime
 import json
 import os
 import subprocess
@@ -7901,6 +7902,71 @@ class TestExtractAcsHeadingVariantsIntegration:
 # ===========================================================================
 # Content-based freshness gate (SA-0MSKB6US1009CNHT)
 # ===========================================================================
+
+
+class TestSharedFreshnessHelpers:
+    """Unit tests for the shared ISO-8601 freshness helpers
+    (SA-0MSL1Z70C007B9VZ): _parse_iso_utc and _audit_time_is_fresh.
+
+    Both _check_audit_freshness and _get_child_audit_verdict previously
+    inlined ~25 identical lines of Z-normalize → fromisoformat →
+    tz-aware-ify → threshold-compare; the helpers below are the single
+    implementation both call sites delegate to.
+    """
+
+    # ------------------------------------------------------------------
+    # _parse_iso_utc
+    # ------------------------------------------------------------------
+
+    def test_parse_iso_utc_z_suffix_becomes_aware_utc(self):
+        """'Z' suffix normalizes to +00:00 and stays tz-aware."""
+        parsed = audit_runner._parse_iso_utc("2026-08-01T00:00:00.000Z")
+        assert parsed is not None
+        assert parsed.year == 2026 and parsed.month == 8 and parsed.day == 1
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset() == datetime.timedelta(0)
+
+    def test_parse_iso_utc_naive_timestamp_gets_utc(self):
+        """Naive timestamps (no offset) fall back to UTC."""
+        parsed = audit_runner._parse_iso_utc("2026-08-01T00:00:00.000")
+        assert parsed is not None
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset() == datetime.timedelta(0)
+
+    def test_parse_iso_utc_explicit_offset_preserved(self):
+        """An explicit non-UTC offset is preserved, not rewritten."""
+        parsed = audit_runner._parse_iso_utc("2026-08-01T00:00:00+02:00")
+        assert parsed is not None
+        assert parsed.utcoffset() == datetime.timedelta(hours=2)
+
+    def test_parse_iso_utc_invalid_returns_none(self):
+        """Unparseable values return None instead of raising."""
+        assert audit_runner._parse_iso_utc("not-a-date") is None
+        assert audit_runner._parse_iso_utc(None) is None
+        assert audit_runner._parse_iso_utc(42) is None
+
+    # ------------------------------------------------------------------
+    # _audit_time_is_fresh
+    # ------------------------------------------------------------------
+
+    def test_audit_time_is_fresh_after_buffer(self):
+        """auditedAt > updatedAt + buffer → fresh."""
+        audited = datetime.datetime(2026, 8, 2, tzinfo=datetime.timezone.utc)
+        updated = datetime.datetime(2026, 8, 1, tzinfo=datetime.timezone.utc)
+        assert audit_runner._audit_time_is_fresh(audited, updated) is True
+
+    def test_audit_time_is_fresh_within_buffer(self):
+        """auditedAt within updatedAt + buffer → not fresh (needs the
+        persistence-tolerance check in the child gate)."""
+        updated = datetime.datetime(2026, 8, 1, 0, 0, tzinfo=datetime.timezone.utc)
+        audited = updated + datetime.timedelta(seconds=10)  # 10s < 60s buffer
+        assert audit_runner._audit_time_is_fresh(audited, updated) is False
+
+    def test_audit_time_is_fresh_before_update(self):
+        """auditedAt before updatedAt → not fresh."""
+        audited = datetime.datetime(2026, 8, 1, tzinfo=datetime.timezone.utc)
+        updated = datetime.datetime(2026, 8, 2, tzinfo=datetime.timezone.utc)
+        assert audit_runner._audit_time_is_fresh(audited, updated) is False
 
 
 class TestContentFreshnessGate:

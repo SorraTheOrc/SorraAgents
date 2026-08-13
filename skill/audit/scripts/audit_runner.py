@@ -55,6 +55,7 @@ import time
 import urllib.request
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -911,6 +912,38 @@ def _validate_file_scope_manifest(file_scope: str,
 # ---------------------------------------------------------------------------
 
 
+def _parse_iso_utc(value) -> datetime | None:
+    """Parse an ISO-8601 timestamp into a tz-aware UTC ``datetime``.
+
+    Normalizes the ``Z`` suffix for Python 3.10 compatibility, parses via
+    ``datetime.fromisoformat``, and treats naive timestamps as UTC. Returns
+    ``None`` when the value cannot be parsed (``ValueError``/``TypeError``
+    swallowed). Shared by the freshness gates in ``_check_audit_freshness``
+    and ``_get_child_audit_verdict`` (SA-0MSL1Z70C007B9VZ) — the single
+    timestamp-parse implementation both callers use.
+    """
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _audit_time_is_fresh(audit_time: datetime, update_time: datetime) -> bool:
+    """Whether an audit is newer than the freshness threshold.
+
+    True when ``audit_time > update_time + AUDIT_FRESHNESS_BUFFER_SECONDS``,
+    i.e. the audit was persisted after the item's last update plus the
+    freshness buffer. Shared by the item-level and child freshness gates
+    (SA-0MSL1Z70C007B9VZ); the child gate additionally applies the
+    persistence-write tolerance when this returns False.
+    """
+    threshold = update_time + timedelta(seconds=AUDIT_FRESHNESS_BUFFER_SECONDS)
+    return audit_time > threshold
+
+
 def _check_audit_freshness(runner: Runner, issue_id: str,
                            worklog_dir: str | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
@@ -938,7 +971,6 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     error, parse error) so that the normal audit pipeline always runs when
     freshness cannot be determined.
     """
-    from datetime import datetime, timedelta, timezone
 
     try:
         data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"],
@@ -991,26 +1023,13 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
         return None
 
     # Compare ISO-8601 timestamps
-    try:
-        # Normalize Z suffix for Python 3.10 compatibility
-        audit_time_str = str(audited_at).replace("Z", "+00:00")
-        update_time_str = str(updated_at).replace("Z", "+00:00")
+    audit_time = _parse_iso_utc(audited_at)
+    update_time = _parse_iso_utc(updated_at)
+    if audit_time is None or update_time is None:
+        return None  # Unparseable timestamps → not fresh (fail open)
 
-        audit_time = datetime.fromisoformat(audit_time_str)
-        update_time = datetime.fromisoformat(update_time_str)
-
-        # Ensure both are timezone-aware for comparison
-        if audit_time.tzinfo is None:
-            audit_time = audit_time.replace(tzinfo=timezone.utc)
-        if update_time.tzinfo is None:
-            update_time = update_time.replace(tzinfo=timezone.utc)
-
-        freshness_threshold = update_time + timedelta(seconds=AUDIT_FRESHNESS_BUFFER_SECONDS)
-
-        if audit_time > freshness_threshold:
-            return raw_output
-    except (ValueError, TypeError):
-        return None
+    if _audit_time_is_fresh(audit_time, update_time):
+        return raw_output
 
     return None
 
@@ -3730,7 +3749,6 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
     The child's auditedAt is returned so callers can record the reuse
     marker ("reused from <auditedAt>") in the parent report.
     """
-    from datetime import datetime, timedelta, timezone
 
     try:
         data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"],
@@ -3792,29 +3810,20 @@ def _get_child_audit_verdict(runner: Runner, child_id: str,
         work_item = wi_data.get("workItem", {}) if isinstance(wi_data, dict) else {}
         updated_at = work_item.get("updatedAt")
         if updated_at:
-            try:
-                audit_time_str = str(audited_at).replace("Z", "+00:00")
-                update_time_str = str(updated_at).replace("Z", "+00:00")
-                audit_time = datetime.fromisoformat(audit_time_str)
-                update_time = datetime.fromisoformat(update_time_str)
-                if audit_time.tzinfo is None:
-                    audit_time = audit_time.replace(tzinfo=timezone.utc)
-                if update_time.tzinfo is None:
-                    update_time = update_time.replace(tzinfo=timezone.utc)
-                freshness_threshold = update_time + timedelta(seconds=AUDIT_FRESHNESS_BUFFER_SECONDS)
-                if not (audit_time > freshness_threshold):
-                    # The child's own persistence write bumps its updatedAt to
-                    # ~the audit's auditedAt. When the two timestamps coincide
-                    # within the persistence tolerance, the bump is the audit's
-                    # own write, so the audit reflects current state and is
-                    # trusted (prevents the parent runner from re-triggering
-                    # child audits forever — SA-0MSI3XH34001LLU4).
-                    write_delta = update_time - audit_time
-                    if not (timedelta(0) <= write_delta
-                            <= timedelta(seconds=AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS)):
-                        return None, "stale", audited_at
-            except (ValueError, TypeError):
-                pass  # Can't parse timestamps; treat as fresh since we have an audit
+            audit_time = _parse_iso_utc(audited_at)
+            update_time = _parse_iso_utc(updated_at)
+            if (audit_time is not None and update_time is not None
+                    and not _audit_time_is_fresh(audit_time, update_time)):
+                # The child's own persistence write bumps its updatedAt to
+                # ~the audit's auditedAt. When the two timestamps coincide
+                # within the persistence tolerance, the bump is the audit's
+                # own write, so the audit reflects current state and is
+                # trusted (prevents the parent runner from re-triggering
+                # child audits forever — SA-0MSI3XH34001LLU4).
+                write_delta = update_time - audit_time
+                if not (timedelta(0) <= write_delta
+                        <= timedelta(seconds=AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS)):
+                    return None, "stale", audited_at
 
     return _parse_child_audit_verdict(raw_output, audited_at)
 
