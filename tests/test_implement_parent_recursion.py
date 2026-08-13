@@ -307,6 +307,72 @@ class TestInProgressSkip:
 
 
 # ===========================================================================
+# Soft-deleted children are skipped, never claimed, and never block the
+# parent (SA-0MSRVN28E009OL5S)
+# ===========================================================================
+
+
+class TestDeletedChildren:
+    def test_deleted_child_classified_as_skip_terminal(self, implement_mod):
+        """A soft-deleted child must be classified skippable, never
+        'implement' — phase_parent must not try to claim it."""
+        children = [_child("SA-C1", status="deleted")]
+        report = _run_parent(implement_mod, "SA-PARENT001", children)
+
+        actions = {c["id"]: c["action"] for c in report.get("children", [])}
+        assert actions["SA-C1"] == "skip-terminal"
+        assert report["_calls"]["phase_start"] == []
+
+    def test_parent_with_only_deleted_children_advances(self, implement_mod):
+        """A parent whose only children are soft-deleted (spurious scanner
+        duplicates) must advance to completed/in_review like an
+        all-terminal parent — the deleted items can never be implemented."""
+        children = [_child("SA-C1", status="deleted")]
+        report = _run_parent(implement_mod, "SA-PARENT001", children)
+
+        assert report["success"] is True
+        assert report.get("parent_advanced") is True
+        assert report["_calls"]["update_status"] == [
+            ("SA-PARENT001", "completed", "in_review", None)
+        ]
+        assert report["_calls"]["phase_start"] == []
+
+    def test_parent_with_deleted_and_terminal_children_advances(self, implement_mod):
+        """Deleted children mix freely with terminal children: the parent is
+        advanced when nothing implementable remains."""
+        children = [
+            _child("SA-C1", status="completed"),
+            _child("SA-C2", status="deleted"),
+        ]
+        report = _run_parent(implement_mod, "SA-PARENT001", children)
+
+        assert report["success"] is True
+        assert report.get("parent_advanced") is True
+        assert report["_calls"]["phase_start"] == []
+
+    def test_deleted_child_skipped_when_open_siblings_remain(self, implement_mod):
+        """A deleted child never hides genuinely open siblings: the next
+        startable open child is still implemented."""
+        children = [
+            _child("SA-C1", status="deleted"),
+            _child("SA-C2", status="open"),
+        ]
+        report = _run_parent(implement_mod, "SA-PARENT001", children)
+
+        assert report["success"] is True
+        assert report.get("parent_advanced") is None or report.get("parent_advanced") is False
+        assert report["_calls"]["phase_start"] == ["SA-C2"]
+        assert report.get("next_child") == "SA-C2"
+
+    def test_classify_child_deleted_is_skip_terminal(self, implement_mod):
+        """Unit-level: _classify_child must map 'deleted' to
+        'skip-terminal' (never 'implement')."""
+        assert implement_mod._classify_child(_child("SA-C1", status="deleted")) == "skip-terminal"
+        assert implement_mod._classify_child(_child("SA-C2", status="completed")) == "skip-terminal"
+        assert implement_mod._classify_child(_child("SA-C3", status="open")) == "implement"
+
+
+# ===========================================================================
 # Failure handling: a failed child start stops the chain with a report
 # ===========================================================================
 
