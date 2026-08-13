@@ -419,7 +419,6 @@ class TestRunCompletionCleanup:
                                          "status": "open",
                                          "stage": "plan_complete",
                                          "description": "Acceptance Criteria:\n- Verify X works"}}
-            fake_run_ac = self._fake_run_wl
             def _run_wl_with_ac(runner, cmd, worklog_dir=None):
                 cmd_str = " ".join(cmd)
                 if "show" in cmd_str:  # both --json and --children --json
