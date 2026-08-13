@@ -1223,7 +1223,7 @@ class TestStatusLifecycle:
             },
         )
 
-        cmd_issue("SA-ORIGSTAT2", runner=self._fake_runner_with_status(calls, status="in_progress"), persist=False)
+        cmd_issue("SA-ORIGSTAT2", runner=self._fake_runner_with_status(calls, status="in_progress"), persist=False, force=True)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-ORIGSTAT2"]]
         # The only in_progress update is the entry claim — the item must NOT be
@@ -2095,7 +2095,8 @@ class TestCmdIssueChildAuditAutoTrigger:
             return _fake_proc(stdout=json.dumps({"success": True}))
 
         cmd_issue("SA-PARENT", runner=fake_runner, persist=True,
-                  audit_children=True)  # cascade is opt-in (SA-0MSKB6V5Q007YDHE)
+                  audit_children=True,  # cascade is opt-in (SA-0MSKB6V5Q007YDHE)
+                  force=True)  # fixture status is in_progress; bypass pre-flight guard
         # Should have triggered an audit for the active child
         assert "SA-ACTIVE" in triggered_children
 
@@ -2187,7 +2188,8 @@ class TestCmdIssueChildAuditAutoTrigger:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        cmd_issue("SA-PARENT", runner=fake_runner, persist=True)
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=True,
+                  force=True)  # fixture status is in_progress; bypass pre-flight guard
 
         # The just-persisted audit must be trusted as fresh: no re-trigger,
         # and the child is treated ready (child_audit_ready=True).
@@ -2529,7 +2531,8 @@ class TestRC2RCFallbackVerdict:
             capturing_assemble,
         )
 
-        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False,
+                  force=True)  # fixture status is in_progress; bypass pre-flight guard
 
         # Find the child result
         child = next((c for c in captured_child_results if c["id"] == "SA-CHILD"), None)
@@ -2593,7 +2596,8 @@ class TestRC2RCFallbackVerdict:
             capturing_assemble,
         )
 
-        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False,
+                  force=True)  # fixture status is in_progress; bypass pre-flight guard
 
         assert len(captured_ac_results) > 0, "Should have AC results"
         for ac in captured_ac_results:
@@ -2691,7 +2695,8 @@ class TestRC2RCFallbackVerdict:
             capturing_assemble,
         )
 
-        cmd_issue("SA-PARENT", runner=fake_runner, persist=False)
+        cmd_issue("SA-PARENT", runner=fake_runner, persist=False,
+                  force=True)  # fixture status is in_progress; bypass pre-flight guard
 
         child = next((c for c in captured_child_results if c["id"] == "SA-CHILD"), None)
         assert child is not None, "Child should be in results"

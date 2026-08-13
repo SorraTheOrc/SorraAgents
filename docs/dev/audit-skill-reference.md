@@ -125,6 +125,23 @@ run:
 or contradict a runner verdict that already completed its lifecycle: if the
 runner finished, its verdict and status transitions stand untouched.
 
+## Pre-flight affirmation guard
+
+Entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY) preventing two audits of the same work item from racing. The SKILL.md long documented a "pre-flight affirmation" with no code behind it; this guard makes docs and code agree.
+
+### Behavior
+
+1. After the read-only gates (freshness, full-suite cache) but **before** the status lifecycle, the runner fetches the item and checks its current status.
+2. If the item is already `in_progress` at entry and `--force` is NOT given → abort: `Error: Refusing to audit <id>: the work item is already in_progress (a concurrent audit or implementation owns it). Pass --force to bypass this pre-flight guard.` Exit code 1, **no** report, **no** persistence, **no** status transition (the runner never sets `in_progress` itself, so the pre-audit state is preserved exactly). JSON mode emits `{"error": ..., "pre_flight": {"issue_id", "status", "bypass": "--force"}}`.
+3. `--force` bypasses the guard and proceeds (also bypasses the freshness gate).
+4. Any other status (`open`, `completed`, …) audits normally without `--force`.
+
+### Why
+
+The concurrency semaphore (`skill/shared/process_semaphore.py`) caps pi subprocesses host-wide but cannot see per-item claims: two audits of the same item would both set `in_progress`, both run the pipeline, and the last writer would win on persist + status transition. `in_progress` at entry is the reliable signal that another audit (or an implementation claim) owns the item.
+
+> Implementation self-review audits (implement skill Step 6) audit in-progress items and therefore pass `--force`.
+
 ## Freshness Gate
 
 Short-circuits item-level audits when a recent, valid audit exists to avoid unnecessary model calls.

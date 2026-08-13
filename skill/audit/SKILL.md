@@ -21,7 +21,11 @@ Provide a concise, human-friendly summary of project status or a specific work i
 
 ## Pre-flight affirmation
 
-Verify absence before proceeding. Confirm the work item is ready for audit and no active conflicting processes exist.
+Implemented as a lightweight entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY). Before the status lifecycle runs, the runner checks the item's current status:
+
+- **Item already `in_progress` at entry + no `--force`** → abort with exit 1: `Error: Refusing to audit <id>: the work item is already in_progress (a concurrent audit or implementation owns it). Pass --force to bypass this pre-flight guard.` No report is produced, nothing is persisted, and the pre-audit status/stage are untouched (the guard runs before the runner sets `in_progress`). This prevents two audits of the same item racing — both would set `in_progress`, run the pipeline, and the last writer would win on persist + status transition. The concurrency semaphore (`../shared/process_semaphore.py`) caps pi subprocesses host-wide but cannot see per-item claims.
+- **`--force`** → bypass the guard and proceed (also bypasses the freshness gate).
+- **Implementation self-review audits** (implement skill Step 6) audit in-progress items, so they pass `--force`.
 
 ## Status Lifecycle
 
@@ -226,6 +230,7 @@ Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, t
 ```bash
 python3 ./scripts/audit_runner.py issue SA-123                  # audit + persist
 python3 ./scripts/audit_runner.py issue SA-123 --do-not-persist  # dry run
+python3 ./scripts/audit_runner.py issue SA-123 --force           # in-progress item (bypasses pre-flight guard + freshness)
 ```
 
 ## Script Execution Failure Notice

@@ -2264,6 +2264,62 @@ class TestVerdictDrivenStatusLifecycle:
         assert updates == []
 
     # ------------------------------------------------------------------
+    # Pre-flight affirmation guard (SA-0MSL1Z1WU005O5IY)
+    # ------------------------------------------------------------------
+
+    def test_preflight_guard_aborts_on_in_progress_item(self):
+        """AC2: an in_progress item without --force does not start an audit.
+
+        The guard aborts BEFORE the status lifecycle: no ``wl update`` is
+        issued, no report is produced, and the pre-audit state is preserved.
+        """
+        updates = []
+        mock_runner = self._make_runner(
+            updates, status="in_progress", stage="in_progress",
+        )
+        rc = audit_runner.cmd_issue(
+            "TEST-1", persist=False, force=False, runner=mock_runner,
+        )
+        assert rc == 1
+        assert updates == [], "guard must abort before any wl update"
+
+    def test_preflight_guard_bypassed_with_force(self):
+        """AC2: --force bypasses the guard and the audit proceeds normally."""
+        updates = []
+        rc = self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes\n\n## Summary\nAll met.",
+            status="in_progress", stage="in_progress",
+        )
+        assert rc == 0
+        assert self._last_update(updates) == [
+            "wl", "update", "TEST-1",
+            "--status", "completed", "--stage", "in_review", "--json",
+        ]
+
+    def test_preflight_guard_allows_open_items(self):
+        """AC2: an open item audits normally without --force."""
+        updates = []
+        mock_runner = self._make_runner(
+            updates, status="open", stage="plan_complete",
+        )
+        with mock.patch.object(
+            audit_runner, "_assemble_issue_report",
+            return_value="Ready to close: Yes\n\n## Summary\nAll met.",
+        ), mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            return_value={"success": True, "findings": [], "fixes_applied": 0},
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=False, runner=mock_runner,
+            )
+        assert rc == 0
+        assert self._last_update(updates) == [
+            "wl", "update", "TEST-1",
+            "--status", "completed", "--stage", "in_review", "--json",
+        ]
+
+    # ------------------------------------------------------------------
     # Infra-failure fallback verdicts (SA-0MSG9SLGI002OF7V)
     #
     # A "Ready to close: No" verdict produced solely from infrastructure-

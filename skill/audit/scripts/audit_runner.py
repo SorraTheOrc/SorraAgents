@@ -5424,6 +5424,36 @@ def cmd_issue(issue_id: str, persist: bool = True,
     ac_fallback_used = threading.Event()
 
     # ------------------------------------------------------------------
+    # Pre-flight affirmation guard (SA-0MSL1Z1WU005O5IY): the SKILL.md
+    # documented a "pre-flight affirmation" that no code implemented. A
+    # work item already ``in_progress`` at entry means another audit (or an
+    # implementation claim) owns the item — starting a competing audit races
+    # status transitions and lets the last writer win on persist + status.
+    # Abort with a clear, actionable message unless ``--force`` explicitly
+    # overrides the guard. No report is produced, nothing is persisted, and
+    # the pre-audit status/stage are untouched (guard runs before the
+    # status lifecycle below).
+    # ------------------------------------------------------------------
+    if not force and original_status in ("in_progress", "in-progress"):
+        pre_flight_msg = (
+            f"Refusing to audit {issue_id}: the work item is already "
+            f"in_progress (a concurrent audit or implementation owns it). "
+            f"Pass --force to bypass this pre-flight guard."
+        )
+        if json_mode:
+            print(json.dumps({
+                "error": pre_flight_msg,
+                "pre_flight": {
+                    "issue_id": issue_id,
+                    "status": original_status,
+                    "bypass": "--force",
+                },
+            }, indent=2))
+        else:
+            print(f"Error: {pre_flight_msg}", file=sys.stderr)
+        return 1
+
+    # ------------------------------------------------------------------
     # Status lifecycle: set in_progress on entry (verdict-driven on exit)
     # ------------------------------------------------------------------
     _run_wl(runner, ["wl", "update", issue_id, "--status", "in_progress", "--json"],

@@ -254,7 +254,7 @@ parent itself gets no worktree.
 6. Automated self-review
 
 - Build and lint; fix any issues.
-- Audit: `/skill:audit <work-item-id>` — if ACs unmet, inform the user and return to step 5.
+- Audit: `/skill:audit <work-item-id>` — if ACs unmet, inform the user and return to step 5. The item is `in_progress` during implementation, so pass `--force` (the audit's pre-flight affirmation guard refuses to audit an in-progress item without it — see [../audit/SKILL.md](../audit/SKILL.md)).
 - Sequential passes: completeness, dependencies & safety, scope & regression, tests & acceptance, polish & handoff. Small, goal-aligned edits; intent changes → Open Question and stop.
 
 7. Optional refactor step
