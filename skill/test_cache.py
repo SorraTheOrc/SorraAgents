@@ -13,6 +13,9 @@ module adds a caching layer so repeated verification is cheap:
   HEAD sha plus a hash of ``git status --porcelain`` output, resolved against
   the repo containing the working directory (worktree-aware).
 - **2-hour TTL** (configurable): expired entries are re-run and replaced.
+  Failed (non-zero-exit) runs use a short 5-minute TTL instead
+  (SA-0MSJELL44009XYIL) so transient infra failures are not re-served as
+  current results.
 - **Correctness first**: a hit requires the git state to match AND the run to
   be within the TTL. Corrupt/unreadable entries degrade to a fresh run and
   never raise into the caller. ``force`` / ``no_cache`` bypass the cache.
@@ -48,6 +51,12 @@ from typing import Any
 from skill.test_runner import normalize_test_command
 
 DEFAULT_TTL_SECONDS = 2 * 60 * 60  # 2 hours (operator decision)
+# Non-zero-exit runs get a much shorter TTL (SA-0MSJELL44009XYIL): a failed
+# run may reflect a transient infra failure (e.g. /tmp disk quota) and must
+# not be re-served as a current result for the full 2h TTL — it expires
+# quickly so a later query/run re-executes fresh. Green runs keep the full
+# TTL.
+FAILED_RUN_TTL_SECONDS = 5 * 60  # 5 minutes
 _CACHE_VERSION = 1
 _KEY_LENGTH = 32
 # Token separated from the command when hashing so that command+state pairs
@@ -190,7 +199,11 @@ def lookup(
     if meta.get("git_state") != git_state:
         return None  # stale state: never return stale data silently
     completed_at = float(meta.get("completed_at", 0))
-    if time.time() - completed_at > ttl:
+    exit_code = int(meta.get("exit_code", 0))
+    # Failed runs expire after the short failed-run TTL; green runs keep the
+    # caller's TTL (SA-0MSJELL44009XYIL).
+    effective_ttl = ttl if exit_code == 0 else min(ttl, FAILED_RUN_TTL_SECONDS)
+    if time.time() - completed_at > effective_ttl:
         return None  # expired TTL
 
     return {
@@ -359,6 +372,7 @@ def summary_lines(
 
 __all__ = [
     "DEFAULT_TTL_SECONDS",
+    "FAILED_RUN_TTL_SECONDS",
     "cache_dir",
     "cache_key",
     "compute_git_state",

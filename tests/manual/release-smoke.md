@@ -36,13 +36,13 @@ Verify the document contains:
 ### Step 2 — Validate the merge script exists and is executable
 
 ```bash
-test -x scripts/release/merge-dev-to-main.sh && echo "PASS: merge script exists and is executable" || echo "FAIL: merge script missing or not executable"
+test -x skill/ship/scripts/release/merge-dev-to-main.sh && echo "PASS: merge script exists and is executable" || echo "FAIL: merge script missing or not executable"
 ```
 
 ### Step 3 — Validate the merge script help
 
 ```bash
-bash scripts/release/merge-dev-to-main.sh --help
+bash skill/ship/scripts/release/merge-dev-to-main.sh --help
 ```
 
 Expected output: usage information with `--dry-run`, `--force`,

@@ -1,6 +1,7 @@
 ---
 name: speak
-description: Generate audible speech from text using a TTS API and play it back. Invokes ./scripts/speak.sh to convert text to a WAV file, manages a rolling buffer of 5 recent audio files, and plays the result.
+disable-model-invocation: true
+description: "Generate audible speech from text via TTS and play it back. Use when asked to speak text aloud."
 ---
 
 # Speak Skill

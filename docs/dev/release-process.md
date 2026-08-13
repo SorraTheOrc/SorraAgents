@@ -141,7 +141,7 @@ See [Release Tests](./release-tests.md) for commands to run these locally.
 Run the merge script from the repository root:
 
 ```bash
-bash scripts/release/merge-dev-to-main.sh
+bash skill/ship/scripts/release/merge-dev-to-main.sh
 ```
 
 The script will:
@@ -164,7 +164,7 @@ The script will:
 Example with custom bump:
 
 ```bash
-bash scripts/release/merge-dev-to-main.sh --bump minor
+bash skill/ship/scripts/release/merge-dev-to-main.sh --bump minor
 ```
 
 The PR-based approach works with **server-side branch protection** on `main`
@@ -237,7 +237,7 @@ gh pr create --base main --head "$(git rev-parse --abbrev-ref HEAD)" --title "Re
 5. Customize the bump type with the `--bump` flag:
 
    ```bash
-   bash scripts/release/merge-dev-to-main.sh --bump minor
+   bash skill/ship/scripts/release/merge-dev-to-main.sh --bump minor
    ```
 
 6. Update any downstream consumers or deployment targets.

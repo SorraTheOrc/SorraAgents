@@ -173,6 +173,9 @@ class TestChildAuditWorklogDirThreading:
     def test_child_audit_subprocess_carries_resolved_worklog_dir(self, tmp_path):
         """AC4: when a child audit is auto-triggered, the spawned runner command
         includes the resolved --worklog-dir flags.
+
+        Launched from the owning project root (the launch-context guard makes
+        non-owning launches fatal — LP-0MSQ32HNR007AI6B).
         """
         target, patcher = _make_sibling_projects(tmp_path, prefix="OSL")
         recorded: list[list[str]] = []
@@ -222,6 +225,9 @@ class TestChildAuditWorklogDirThreading:
 
         with (
             patcher,
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", target.parent
+            ),
             mock.patch("skill.code_review.scripts.code_quality.run_code_quality",
                        return_value={"success": True, "findings": [],
                                     "fixes_applied": 0}),
@@ -318,8 +324,14 @@ class TestSiblingScanBaseCwdIndependence:
 # ===========================================================================
 
 
-class TestStatusLifecycleFromNonProjectCwd:
-    """Status lifecycle completes without RuntimeError from a non-project cwd."""
+class TestStatusLifecycleFromOwningProjectRoot:
+    """Status lifecycle completes from the owning project root.
+
+    The launch-context guard (LP-0MSQ32HNR007AI6B) makes launches from a
+    non-owning cwd fatal, so the lifecycle is exercised from the owning
+    project root — the wl commands still carry the resolved ``--worklog-dir``
+    pointing at the owning project's store.
+    """
 
     def _make_lifecycle_runner(self, recorded: list[list[str]]):
         """Fake runner handling the wl calls made by cmd_issue with an empty
@@ -363,14 +375,17 @@ class TestStatusLifecycleFromNonProjectCwd:
 
     def test_lifecycle_completes_and_commands_carry_worklog_dir(self, tmp_path):
         """AC2: capture -> in_progress -> terminal transition completes without
-        RuntimeError from a non-project cwd, and every wl command carries
-        --worklog-dir pointing at the target project's store.
+        RuntimeError from the owning project root, and every wl command
+        carries --worklog-dir pointing at the target project's store.
         """
         target, patcher = _make_sibling_projects(tmp_path, prefix="OSL")
         recorded: list[list[str]] = []
 
         with (
             patcher,
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", target.parent
+            ),
             mock.patch(
                 "skill.code_review.scripts.code_quality.run_code_quality",
                 return_value={"success": True, "findings": [], "fixes_applied": 0},

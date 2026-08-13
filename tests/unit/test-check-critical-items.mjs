@@ -54,13 +54,15 @@ function runCheckCriticalItems(opts = {}) {
     writeFileSync(testModulePath, readFileSync(CHECK_CRITICAL_ITEMS_SRC, 'utf8'));
   }
 
-  // Create a mock `wl` script that returns controlled output
+  // Create a mock `wl` script that returns controlled output, filtered by
+  // the `--status` argument (the gate now queries non-terminal statuses
+  // directly — SA-0MSPPHLF9009UMWA).
   const binDir = join(tmpDir, 'bin');
   mkdirSync(binDir, { recursive: true });
 
   const wlScriptPath = join(binDir, 'wl');
   let wlScriptContent;
-  
+
   if (wlCriticalItems === null) {
     // Simulate wl not found
     wlScriptContent = `#!/bin/bash\nexit 127\n`;
@@ -68,9 +70,16 @@ function runCheckCriticalItems(opts = {}) {
     // Simulate an empty response (no critical items)
     wlScriptContent = `#!/bin/bash\necho '{"success":true,"count":0,"workItems":[]}'\n`;
   } else {
-    // Return the provided items
-    const json = JSON.stringify({ success: true, count: wlCriticalItems.length, workItems: wlCriticalItems });
-    wlScriptContent = `#!/bin/bash\necho '${json}'\n`;
+    // Node mock: parse --status and filter the provided items.
+    const itemsJson = JSON.stringify(wlCriticalItems);
+    wlScriptContent = `#!/usr/bin/env node
+const items = ${itemsJson};
+const args = process.argv.slice(2);
+const si = args.indexOf('--status');
+const status = si >= 0 ? args[si + 1] : null;
+const filtered = status ? items.filter((i) => i.status === status) : items;
+process.stdout.write(JSON.stringify({ success: true, count: filtered.length, workItems: filtered }));
+`;
   }
 
   writeFileSync(wlScriptPath, wlScriptContent, { mode: 0o755 });
@@ -128,7 +137,7 @@ describe('checkCriticalItems()', () => {
     const output = JSON.parse(result.stdout);
     assert.strictEqual(output.hasBlockingItems, false);
     assert.strictEqual(output.blockingItems.length, 0);
-    assert.ok(output.message.includes('critical-priority work item(s) are in a terminal state'));
+    assert.ok(output.message.includes('non-terminal critical-priority work items'));
   });
 
   // ── Scenario (b): One or more blocking critical items ──────────────────
@@ -206,7 +215,7 @@ describe('checkCriticalItems()', () => {
     const output = JSON.parse(result.stdout);
     assert.strictEqual(output.hasBlockingItems, false);
     assert.strictEqual(output.blockingItems.length, 0);
-    assert.ok(output.message.includes('No critical-priority work items found'));
+    assert.ok(output.message.includes('No non-terminal critical-priority work items found'));
   });
 
   // ── Edge case: wl CLI not available ────────────────────────────────────
@@ -276,8 +285,12 @@ describe('checkCriticalItems()', () => {
     assert.strictEqual(output.blockingItems[0].workItemId, 'SA-NONTERM-001');
   });
 
-  // ── Edge case: critical item in completed status but wrong stage ───────
-  test('flags critical item that is completed but not in terminal stage', () => {
+  // ── Edge case: completed status is never queried (model invariant) ─────
+  test('completed items are never queried (status-filtered gate)', () => {
+    // The gate queries non-terminal statuses (open/in-progress/blocked)
+    // directly, so a status=completed item — even with an unusual stage — is
+    // out of scope. Per the stage/status model, completed only pairs with
+    // in_review/done; the worklog enforces this (0 violations observed).
     const items = [
       {
         id: 'SA-EDGE-001',
@@ -292,8 +305,7 @@ describe('checkCriticalItems()', () => {
 
     assert.strictEqual(result.status, 0);
     const output = JSON.parse(result.stdout);
-    assert.strictEqual(output.hasBlockingItems, true);
-    assert.strictEqual(output.blockingItems.length, 1);
-    assert.strictEqual(output.blockingItems[0].workItemId, 'SA-EDGE-001');
+    assert.strictEqual(output.hasBlockingItems, false);
+    assert.strictEqual(output.blockingItems.length, 0);
   });
 });

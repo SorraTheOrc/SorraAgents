@@ -10,7 +10,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -507,6 +507,105 @@ test('check-audit-gate: ship.js re-exports checkProducerReviewStatus', async () 
     checkModule.checkProducerReviewStatus,
     'ship.js should export the same checkProducerReviewStatus function',
   );
+});
+
+// ---------------------------------------------------------------------------
+// 17. getCandidateItems — single stage query + jq projection (SA-0MSLW5P7J0068UFZ,
+//     SA-0MSPPDCTH004561Z)
+// ---------------------------------------------------------------------------
+// These tests mock `wl` on PATH to verify the query/projection contract:
+// exactly ONE `wl list --stage in_review --json`
+// invocation piped through jq, so large outputs cannot overflow execSync's
+// default 1 MB buffer (ENOBUFS).
+
+/**
+ * Create a fake `wl` executable on a temp PATH that records its arguments
+ * and emits a canned workItems payload (or fails).
+ *
+ * @param {object} opts
+ * @param {Array<object>} opts.workItems - Items for the fake `wl list` output.
+ * @param {string} opts.argsLogPath - File where the fake wl appends its args.
+ * @param {boolean} [opts.fail] - When true the fake wl exits 1.
+ * @returns {string} The temp bin dir to prepend to PATH.
+ */
+function createWlMock({ workItems, argsLogPath, fail = false }) {
+  const binDir = mkdtempSync(join(tmpdir(), 'fakebin-'));
+  const payloadPath = join(binDir, 'payload.json');
+  writeFileSync(payloadPath, JSON.stringify({ success: true, workItems }), 'utf-8');
+  const wlPath = join(binDir, 'wl');
+  const script = `#!/usr/bin/env bash\n`
+    + `echo "$@" >> "${argsLogPath}"\n`
+    + (fail ? 'exit 1\n' : `cat "${payloadPath}"\n`);
+  writeFileSync(wlPath, script, { mode: 0o755 });
+  return binDir;
+}
+
+/**
+ * Run *fn* with *binDir* prepended to PATH, restoring PATH afterwards.
+ */
+function withWlMock(binDir, fn) {
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${savedPath}`;
+  try {
+    return fn();
+  } finally {
+    process.env.PATH = savedPath;
+    rmSync(binDir, { recursive: true, force: true });
+  }
+}
+
+describe('getCandidateItems - single stage query + jq projection', () => {
+  test('issues exactly one stage-only query', async () => {
+    const mod = await import(MODULE_PATH);
+    const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
+    const argsLogPath = join(tmpDir, 'args.log');
+    const workItems = [{ id: 'SA-1', title: 'One', needsProducerReview: false }];
+    const binDir = createWlMock({ workItems, argsLogPath });
+
+    const items = withWlMock(binDir, () => mod.getCandidateItems());
+    const calls = readFileSync(argsLogPath, 'utf-8').trim().split('\n').filter(Boolean);
+
+    assert.equal(calls.length, 1, 'should be exactly one wl list invocation');
+    assert.ok(calls[0].includes('--stage in_review'), `should filter stage, got: ${calls[0]}`);
+    assert.ok(!calls[0].includes('--status completed'), `should drop redundant status filter (completed-minus-done == in_review), got: ${calls[0]}`);
+    assert.ok(calls[0].includes('--json'), `should request JSON, got: ${calls[0]}`);
+    assert.deepEqual(items, [{ id: 'SA-1', title: 'One', needsProducerReview: false }]);
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('does not overflow execSync buffer with >1MB wl output', async () => {
+    const mod = await import(MODULE_PATH);
+    const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
+    const argsLogPath = join(tmpDir, 'args.log');
+    // ~200 items x ~6KB description ≈ 1.2MB — over execSync's default 1MB maxBuffer
+    const workItems = Array.from({ length: 200 }, (_, i) => ({
+      id: `SA-LARGE-${i}`,
+      title: `Large item ${i}`,
+      needsProducerReview: false,
+      description: 'x'.repeat(6000),
+    }));
+    const binDir = createWlMock({ workItems, argsLogPath });
+
+    const items = withWlMock(binDir, () => mod.getCandidateItems());
+
+    assert.equal(items.length, 200, 'all items should be returned without ENOBUFS');
+    for (const item of items) {
+      assert.ok('id' in item && 'title' in item && 'needsProducerReview' in item);
+    }
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('returns [] and logs a warning when wl query fails', async () => {
+    const mod = await import(MODULE_PATH);
+    const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
+    const argsLogPath = join(tmpDir, 'args.log');
+    const binDir = createWlMock({ workItems: [], argsLogPath, fail: true });
+
+    const items = withWlMock(binDir, () => mod.getCandidateItems());
+
+    assert.deepEqual(items, [], 'failed query should yield no candidates');
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
 });
 
 // ---------------------------------------------------------------------------

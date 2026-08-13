@@ -1753,7 +1753,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is True
         assert reason == "ready"
 
@@ -1773,7 +1773,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is False
         assert reason == "not_ready"
 
@@ -1789,7 +1789,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is None
         assert reason == "no_audit"
 
@@ -1820,7 +1820,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(wi_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is None
         assert reason == "stale"
 
@@ -1851,7 +1851,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(wi_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is True
         assert reason == "ready"
 
@@ -1892,7 +1892,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(wi_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is True
         assert reason == "ready"
 
@@ -1927,7 +1927,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(wi_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is False
         assert reason == "not_ready"
 
@@ -1963,7 +1963,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(wi_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is None
         assert reason == "stale"
 
@@ -1974,7 +1974,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(returncode=1, stderr="command failed")
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is None
         assert reason == "error"
 
@@ -1994,7 +1994,7 @@ class TestGetChildAuditVerdict:
                 return _fake_proc(stdout=json.dumps(audit_data))
             return _fake_proc(stdout=json.dumps({"success": True}))
 
-        verdict, reason = _get_child_audit_verdict(runner, "SA-CHILD")
+        verdict, reason, _ = _get_child_audit_verdict(runner, "SA-CHILD")
         assert verdict is None
         assert reason == "no_audit"
 
@@ -2015,6 +2015,15 @@ class TestCmdIssueChildAuditAutoTrigger:
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
             fake_call_pi,
+        )
+
+        # Fail the launch-context / file-scope guards open (LP-0MSQ32HNR007AI6B):
+        # these tests exercise child auto-trigger logic with fake work items,
+        # not scope validation — an unknown owning project is the documented
+        # fail-open path for both guards.
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._resolve_owning_project_root",
+            lambda *args, **kwargs: None,
         )
 
         triggered_children = []
@@ -2109,6 +2118,15 @@ class TestCmdIssueChildAuditAutoTrigger:
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._call_pi",
             fake_call_pi,
+        )
+
+        # Fail the launch-context / file-scope guards open (LP-0MSQ32HNR007AI6B):
+        # these tests exercise child auto-trigger logic with fake work items,
+        # not scope validation — an unknown owning project is the documented
+        # fail-open path for both guards.
+        monkeypatch.setattr(
+            "skill.audit.scripts.audit_runner._resolve_owning_project_root",
+            lambda *args, **kwargs: None,
         )
 
         def fake_subprocess_run(cmd, **kwargs):
