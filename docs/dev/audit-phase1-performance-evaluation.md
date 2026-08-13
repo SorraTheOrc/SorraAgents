@@ -36,7 +36,7 @@ This work item applies the Phase 2 treatment to Phase 1: prompts now carry the
 file-scope manifest + SCANNING block, sessions enable the same read-only tool
 set (`--tools read,bash,grep,find,ls --exclude-tools ask_question`), pending
 child screenings run with bounded concurrency (default 2, configurable via
-`AUDIT_PHASE2_PARALLELISM`), and ready children skip Phase 1 screening
+`AUDIT_PARALLELISM`), and ready children skip Phase 1 screening
 entirely, reusing their persisted AC verdicts.
 
 **Verdict semantics are unchanged** — Phase 1 verdicts remain
@@ -87,7 +87,7 @@ elapsed_seconds=...` instrumentation used for Phase 2).
 
 | Scenario | Parallelism | Phase 1 child calls | Wall-clock | Reduction vs sequential |
 |----------|-------------|--------------------:|-----------:|-------------------------|
-| A sequential | 1 (`AUDIT_PHASE2_PARALLELISM=1`) | 4 | 3.62s | baseline |
+| A sequential | 1 (`AUDIT_PARALLELISM=1`) | 4 | 3.62s | baseline |
 | B parallel | 2 (default) | 4 | 2.01s | 44% |
 | C parallel | 4 | 4 | 1.21s | 67% |
 | D ready-reuse | 2 | **0** | 0.40s | 89% |

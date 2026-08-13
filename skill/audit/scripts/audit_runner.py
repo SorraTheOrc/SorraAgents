@@ -339,8 +339,8 @@ still giving transient provider glitches a chance to recover. Short Phase 1
 bare calls keep ``_PI_MAX_RETRIES`` (2).
 """
 
-AUDIT_PHASE2_PARALLELISM_ENV = "AUDIT_PHASE2_PARALLELISM"
-"""Environment variable controlling Phase 2 child deep-analysis concurrency.
+AUDIT_PARALLELISM_ENV = "AUDIT_PARALLELISM"
+"""Environment variable controlling child deep-analysis concurrency.
 
 When set (an integer >= 1), this is the maximum number of independent child
 ``phase2_child:<i>`` Pi calls that may run concurrently inside
@@ -349,12 +349,18 @@ first and is never parallelized. Setting this to 1 restores the historical
 strictly-sequential behavior. Invalid values are ignored with a warning.
 """
 
-_PHASE2_DEFAULT_PARALLELISM = 2
-"""Default bounded concurrency cap for Phase 2 child deep-analysis calls.
+AUDIT_PHASE2_PARALLELISM_ENV_LEGACY = "AUDIT_PHASE2_PARALLELISM"
+"""Legacy name for ``AUDIT_PARALLELISM_ENV`` — kept for backward compatibility.
+
+When ``AUDIT_PARALLELISM`` is not set, the runner falls back to this legacy
+name so existing scripts and automation are not broken."""
+
+_PARALLELISM_DEFAULT = 2
+"""Default bounded concurrency cap for child deep-analysis calls.
 
 Chosen conservatively so the local model proxy is not overwhelmed while
 still collapsing the N-sequential-calls wall-clock to N/cap. Operators can
-override via ``AUDIT_PHASE2_PARALLELISM``.
+override via ``AUDIT_PARALLELISM``.
 """
 
 AUDIT_SLOT_STATUS_URL_ENV = "AUDIT_SLOT_STATUS_URL"
@@ -384,7 +390,7 @@ AUDIT_MAX_CHILD_CONCURRENCY_ENV = "AUDIT_MAX_CHILD_CONCURRENCY"
 """Environment variable name for the max child-call concurrency cap.
 
 Caps the dynamic slot-aware ceiling (LP-0MSQ32S2M001EA74 AC3). Defaults to
-``_resolve_phase2_parallelism()`` (``AUDIT_PHASE2_PARALLELISM`` env or 2),
+``_resolve_parallelism()`` (``AUDIT_PARALLELISM`` env or 2),
 preserving the existing static knob as the floor/fallback.
 """
 
@@ -1839,28 +1845,33 @@ def _acquire_audit_slot(max_concurrency: int | None = None) -> Semaphore:
     return sem
 
 
-def _resolve_phase2_parallelism() -> int:
-    """Resolve the bounded concurrency cap for Phase 2 child deep analysis.
+def _resolve_parallelism() -> int:
+    """Resolve the bounded concurrency cap for child deep analysis.
+
     Precedence:
-      1. ``AUDIT_PHASE2_PARALLELISM`` environment variable (integer >= 1)
-      2. ``_PHASE2_DEFAULT_PARALLELISM`` (2)
+      1. ``AUDIT_PARALLELISM`` environment variable (integer >= 1)
+      2. ``AUDIT_PHASE2_PARALLELISM`` (legacy fallback — integer >= 1)
+      3. ``_PARALLELISM_DEFAULT`` (2)
 
     Values below 1 are clamped to 1. An invalid (non-integer) value is
     ignored with a warning so a misconfigured environment cannot break the
     audit run.
     """
-    env_value = os.environ.get(AUDIT_PHASE2_PARALLELISM_ENV)
+    env_value = os.environ.get(AUDIT_PARALLELISM_ENV)
+    if not env_value:
+        # Legacy fallback: honor the old name when the new one is unset.
+        env_value = os.environ.get(AUDIT_PHASE2_PARALLELISM_ENV_LEGACY)
     if env_value:
         try:
             parsed = int(env_value)
             return max(1, parsed)
         except ValueError:
             print(
-                f"Warning: invalid {AUDIT_PHASE2_PARALLELISM_ENV} value {env_value!r}; "
+                f"Warning: invalid {AUDIT_PARALLELISM_ENV} value {env_value!r}; "
                 "using default parallelism",
                 file=sys.stderr,
             )
-    return _PHASE2_DEFAULT_PARALLELISM
+    return _PARALLELISM_DEFAULT
 
 
 def _query_slot_status(url: str | None = None,
@@ -1894,7 +1905,7 @@ def _resolve_max_child_concurrency() -> int:
 
     Precedence:
       1. ``AUDIT_MAX_CHILD_CONCURRENCY`` environment variable (integer >= 1)
-      2. ``_resolve_phase2_parallelism()`` (``AUDIT_PHASE2_PARALLELISM`` env or 2)
+      2. ``_resolve_parallelism()`` (``AUDIT_PARALLELISM`` env or 2)
 
     Values below 1 are clamped to 1. An invalid (non-integer) value is
     ignored with a warning so a misconfigured environment cannot break the
@@ -1911,7 +1922,7 @@ def _resolve_max_child_concurrency() -> int:
                 "using default max child concurrency",
                 file=sys.stderr,
             )
-    return _resolve_phase2_parallelism()
+    return _resolve_parallelism()
 
 
 def _resolve_child_concurrency() -> int:
@@ -1925,7 +1936,7 @@ def _resolve_child_concurrency() -> int:
 
     - When the slot query fails (unreachable/timeout/error), the runner
       degrades gracefully to the configured static ceiling
-      (``AUDIT_MAX_CHILD_CONCURRENCY`` > ``AUDIT_PHASE2_PARALLELISM`` > 2)
+      (``AUDIT_MAX_CHILD_CONCURRENCY`` > ``AUDIT_PARALLELISM`` > 2)
       — the dynamic ceiling never blocks or fails the audit (fail-open).
     - The result is always at least 1 (never 0) so a saturated pool
       degrades to sequential execution rather than stalling the audit.
@@ -5588,7 +5599,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         #     (child_audit_ready=True) skip the screening call and reuse the AC
         #     verdicts persisted in their own audit report.
         #  2. Pending children are reviewed with bounded parallelism
-        #     (ThreadPoolExecutor capped by _resolve_phase2_parallelism()).
+        #     (ThreadPoolExecutor capped by _resolve_parallelism()).
         #  3. The auto-trigger loop below reuses these pre-computed verdicts
         #     instead of re-querying wl audit-show per child.
         #

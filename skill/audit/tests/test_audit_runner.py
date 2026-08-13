@@ -1575,7 +1575,7 @@ class TestPhase2ParallelChildCalls:
 
         with mock.patch.dict(
             audit_runner.os.environ,
-            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "2"},
+            {audit_runner.AUDIT_PARALLELISM_ENV: "2"},
             clear=False,
         ), mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                                side_effect=_slow_call):
@@ -1610,7 +1610,7 @@ class TestPhase2ParallelChildCalls:
 
         with mock.patch.dict(
             audit_runner.os.environ,
-            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "1"},
+            {audit_runner.AUDIT_PARALLELISM_ENV: "1"},
             clear=False,
         ), mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                                side_effect=_ordered_call):
@@ -1626,7 +1626,7 @@ class TestPhase2ParallelChildCalls:
     def test_default_parallelism_cap(self):
         """AC1: a sensible default bounded concurrency cap exists."""
         with mock.patch.dict(audit_runner.os.environ, {}, clear=True):
-            cap = audit_runner._resolve_phase2_parallelism()
+            cap = audit_runner._resolve_parallelism()
         assert isinstance(cap, int)
         assert 1 <= cap <= 4
 
@@ -1634,21 +1634,46 @@ class TestPhase2ParallelChildCalls:
         """AC1: env var sets the concurrency cap."""
         with mock.patch.dict(
             audit_runner.os.environ,
-            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "3"},
+            {audit_runner.AUDIT_PARALLELISM_ENV: "3"},
             clear=False,
         ):
-            assert audit_runner._resolve_phase2_parallelism() == 3
+            assert audit_runner._resolve_parallelism() == 3
 
     def test_invalid_parallelism_env_falls_back(self):
         """AC2: invalid env value falls back to the default cap."""
         with mock.patch.dict(
             audit_runner.os.environ,
-            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "banana"},
+            {audit_runner.AUDIT_PARALLELISM_ENV: "banana"},
             clear=False,
         ):
-            cap = audit_runner._resolve_phase2_parallelism()
+            cap = audit_runner._resolve_parallelism()
         assert isinstance(cap, int)
         assert 1 <= cap <= 4
+
+    def test_legacy_alias_fallback(self):
+        """Legacy AUDIT_PHASE2_PARALLELISM is honored when AUDIT_PARALLELISM is unset."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV_LEGACY: "3"},
+            clear=False,
+        ):
+            # Ensure the new name is not set
+            assert audit_runner.AUDIT_PARALLELISM_ENV not in audit_runner.os.environ or audit_runner.os.environ.get(audit_runner.AUDIT_PARALLELISM_ENV) is None
+            cap = audit_runner._resolve_parallelism()
+        assert cap == 3
+
+    def test_new_name_takes_precedence_over_legacy(self):
+        """AUDIT_PARALLELISM wins when both are set."""
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {
+                audit_runner.AUDIT_PARALLELISM_ENV: "4",
+                audit_runner.AUDIT_PHASE2_PARALLELISM_ENV_LEGACY: "3",
+            },
+            clear=False,
+        ):
+            cap = audit_runner._resolve_parallelism()
+        assert cap == 4
 
     def test_ready_children_skipped_in_parallel_run(self):
         """AC3: child_audit_ready children are skipped even when parallelism > 1."""
@@ -1668,7 +1693,7 @@ class TestPhase2ParallelChildCalls:
 
         with mock.patch.dict(
             audit_runner.os.environ,
-            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "2"},
+            {audit_runner.AUDIT_PARALLELISM_ENV: "2"},
             clear=False,
         ), mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                                side_effect=_recording_call):
@@ -1696,7 +1721,7 @@ class TestPhase2ParallelChildCalls:
 
         with mock.patch.dict(
             audit_runner.os.environ,
-            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "2"},
+            {audit_runner.AUDIT_PARALLELISM_ENV: "2"},
             clear=False,
         ), mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
                                side_effect=_call_with_timeout):
@@ -5422,7 +5447,7 @@ class TestPhase1ChildParallelism:
 
         with mock.patch.dict(
             audit_runner.os.environ,
-            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "2"},
+            {audit_runner.AUDIT_PARALLELISM_ENV: "2"},
             clear=False,
         ), mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_slow
@@ -5455,7 +5480,7 @@ class TestPhase1ChildParallelism:
 
         with mock.patch.dict(
             audit_runner.os.environ,
-            {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "1"},
+            {audit_runner.AUDIT_PARALLELISM_ENV: "1"},
             clear=False,
         ), mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_ordered
@@ -8546,8 +8571,8 @@ class TestSlotAwareConcurrency:
     def test_fallback_to_static_on_query_failure(self):
         """Query failure (None, None) degrades to the static ceiling (fail-open)."""
         with self._mock_slot_status(None, None):
-            assert audit_runner._resolve_child_concurrency() == 2  # AUDIT_PHASE2_PARALLELISM default
-        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_PHASE2_PARALLELISM_ENV: "3"}, clear=False), \
+            assert audit_runner._resolve_child_concurrency() == 2  # AUDIT_PARALLELISM default
+        with mock.patch.dict(audit_runner.os.environ, {audit_runner.AUDIT_PARALLELISM_ENV: "3"}, clear=False), \
              self._mock_slot_status(None, None):
             assert audit_runner._resolve_child_concurrency() == 3
 
