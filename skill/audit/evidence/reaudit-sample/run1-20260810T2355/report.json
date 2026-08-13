@@ -1,0 +1,99 @@
+{
+  "check": "reaudit-sample",
+  "passed": false,
+  "controlled": true,
+  "items": 5,
+  "results": [
+    {
+      "item_id": "SA-0MS0BP707003KGRM",
+      "persisted_verdict": "No",
+      "flags_on_verdict": "Yes",
+      "flags_off_verdict": "Yes",
+      "input_tokens": [
+        2590,
+        2316
+      ],
+      "divergence": null,
+      "passed": true
+    },
+    {
+      "item_id": "SA-0MS3CITYB006E3DT",
+      "persisted_verdict": "No",
+      "flags_on_verdict": "No",
+      "flags_off_verdict": null,
+      "input_tokens": [
+        1863,
+        757
+      ],
+      "divergence": "audit timed out (no verdict)",
+      "passed": false
+    },
+    {
+      "item_id": "SA-0MS0QF0ZC0009CI5",
+      "persisted_verdict": "No",
+      "flags_on_verdict": "Yes",
+      "flags_off_verdict": "No",
+      "input_tokens": [
+        2476,
+        2698
+      ],
+      "divergence": "verdict differs with/without flags: on=Yes off=No",
+      "passed": false
+    },
+    {
+      "item_id": "SA-0MS8WAJAQ004VWTX",
+      "persisted_verdict": "Yes",
+      "flags_on_verdict": null,
+      "flags_off_verdict": null,
+      "input_tokens": [],
+      "divergence": "audit timed out (no verdict)",
+      "passed": false
+    },
+    {
+      "item_id": "SA-0MS1WXHVF008AKQW",
+      "persisted_verdict": "Yes",
+      "flags_on_verdict": "No",
+      "flags_off_verdict": "No",
+      "input_tokens": [
+        1095,
+        1127
+      ],
+      "divergence": null,
+      "passed": true
+    }
+  ],
+  "token_samples": [
+    {
+      "item_id": "SA-0MS0BP707003KGRM",
+      "input_tokens": 2590
+    },
+    {
+      "item_id": "SA-0MS0BP707003KGRM",
+      "input_tokens": 2316
+    },
+    {
+      "item_id": "SA-0MS3CITYB006E3DT",
+      "input_tokens": 1863
+    },
+    {
+      "item_id": "SA-0MS3CITYB006E3DT",
+      "input_tokens": 757
+    },
+    {
+      "item_id": "SA-0MS0QF0ZC0009CI5",
+      "input_tokens": 2476
+    },
+    {
+      "item_id": "SA-0MS0QF0ZC0009CI5",
+      "input_tokens": 2698
+    },
+    {
+      "item_id": "SA-0MS1WXHVF008AKQW",
+      "input_tokens": 1095
+    },
+    {
+      "item_id": "SA-0MS1WXHVF008AKQW",
+      "input_tokens": 1127
+    }
+  ]
+}

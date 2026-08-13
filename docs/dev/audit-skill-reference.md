@@ -479,3 +479,27 @@ runner and a flag-off runner copy, comparing verdicts (controlled before/after
 comparison). Exit status is 0 iff all checks pass; reports are written to
 `--report-dir` as JSON+Markdown for the work item's evidence record. Unit
 tests: `skill/audit/tests/test_verify_context_reduction.py`.
+
+### Recorded evidence (in-scope)
+
+Executed reports are committed under `skill/audit/evidence/` so the
+execution-dependent AC2/AC3 criteria are verifiable from repository files
+(SA-0MSRVNMFW005LWZL):
+
+- `sessions/` — AC2 `check-sessions` report (20 distinct audited items since
+  2026-08-07T11:15, first-call input tokens all < 10K, regenerated
+  2026-08-13).
+- `static/` — AC2 `check-static` report (without flags 14,914 B ≈ 3,728
+  tokens → with flags 1,721 B ≈ 430 tokens, 88.5% reduction).
+- `reaudit-sample/` — AC3 controlled flags-on vs flags-off verdict comparison
+  (run 1: 2026-08-10, run 2: 2026-08-11 triage re-run) with the analysis in
+  `SUMMARY.md` (divergences attributed to model non-determinism, not the
+  change; all per-call input tokens < 10K).
+
+Regenerate with:
+
+```bash
+python3 skill/audit/scripts/verify_context_reduction.py --report-dir skill/audit/evidence/sessions check-sessions
+python3 skill/audit/scripts/verify_context_reduction.py --report-dir skill/audit/evidence/static check-static
+python3 skill/audit/scripts/verify_context_reduction.py --report-dir skill/audit/evidence/reaudit-sample reaudit-sample
+```

@@ -1,0 +1,70 @@
+{
+  "check": "reaudit-sample",
+  "passed": false,
+  "controlled": true,
+  "items": 3,
+  "results": [
+    {
+      "item_id": "SA-0MS3CITYB006E3DT",
+      "persisted_verdict": "No",
+      "flags_on_verdict": "Yes",
+      "flags_off_verdict": "Yes",
+      "input_tokens": [
+        71,
+        722
+      ],
+      "divergence": null,
+      "passed": true
+    },
+    {
+      "item_id": "SA-0MS0QF0ZC0009CI5",
+      "persisted_verdict": "No",
+      "flags_on_verdict": "No",
+      "flags_off_verdict": "No",
+      "input_tokens": [
+        673,
+        829
+      ],
+      "divergence": null,
+      "passed": true
+    },
+    {
+      "item_id": "SA-0MS8WAJAQ004VWTX",
+      "persisted_verdict": "Yes",
+      "flags_on_verdict": "No",
+      "flags_off_verdict": "Yes",
+      "input_tokens": [
+        171,
+        2482
+      ],
+      "divergence": "verdict differs with/without flags: on=No off=Yes",
+      "passed": false
+    }
+  ],
+  "token_samples": [
+    {
+      "item_id": "SA-0MS3CITYB006E3DT",
+      "input_tokens": 71
+    },
+    {
+      "item_id": "SA-0MS3CITYB006E3DT",
+      "input_tokens": 722
+    },
+    {
+      "item_id": "SA-0MS0QF0ZC0009CI5",
+      "input_tokens": 673
+    },
+    {
+      "item_id": "SA-0MS0QF0ZC0009CI5",
+      "input_tokens": 829
+    },
+    {
+      "item_id": "SA-0MS8WAJAQ004VWTX",
+      "input_tokens": 171
+    },
+    {
+      "item_id": "SA-0MS8WAJAQ004VWTX",
+      "input_tokens": 2482
+    }
+  ]
+}

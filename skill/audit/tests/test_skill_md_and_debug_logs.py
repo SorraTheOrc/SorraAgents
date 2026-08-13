@@ -92,6 +92,39 @@ class TestSkillMdScanningGuidance:
 
 
 # ===========================================================================
+# Context reduction documentation (SA-0MSRVNMFW005LWZL)
+# ===========================================================================
+
+
+class TestSkillMdContextReductionDoc:
+    """SKILL.md documents the context-reduction flags AND the rationale.
+
+    Work item: SA-0MSRVNMFW005LWZL (gap remediation after the 2026-08-13
+    re-audit rated AC5 partial — SKILL.md documented the "what" (flags) but
+    not the "why" (prompts are self-contained); the rationale had been
+    trimmed by later SKILL.md edits). The restored text must state both the
+    mechanism and the self-contained invariant in its own words.
+    """
+
+    def test_skill_md_documents_flags_in_context_reduction(self) -> None:
+        """SKILL.md scripts section names both flags for _call_pi calls."""
+        text = SKILL_MD.read_text()
+        assert "--no-context-files" in text
+        assert "--no-skills" in text
+
+    def test_skill_md_documents_why_self_contained(self) -> None:
+        """SKILL.md states the rationale: prompts are fully self-contained."""
+        text = SKILL_MD.read_text()
+        assert "self-contained" in text
+        assert "never depend" in text or "invariant" in text
+
+    def test_skill_md_evidence_dir_referenced(self) -> None:
+        """SKILL.md points to the recorded in-scope AC2/AC3 evidence."""
+        text = SKILL_MD.read_text()
+        assert "evidence/" in text
+
+
+# ===========================================================================
 # Monitored Run Execution guidance (for SA-0MSL51XSF0086KM5)
 # ===========================================================================
 
