@@ -950,6 +950,100 @@ class TestMaxChildAuditsResolution:
             _args, kwargs = mock_cmd.call_args
             assert kwargs["audit_children"] is False
 
+class TestMaxCitationsPerACResolution:
+    """Tests for the Phase-2 evidence citation-cap resolution (F1-AC1/AC5).
+
+    The max-citations-per-AC cap resolves as ``--max-citations-per-ac`` CLI
+    flag > ``audit.max_citations_per_ac`` CWD config key > hardcoded default
+    5, with invalid values failing closed to the default with a warning
+    (LP-0MSQ32WM5000NCB7 AC1).
+    """
+
+    def test_default_constant_is_five(self):
+        """AC1: The hardcoded default cap is 5 file:line refs per AC."""
+        assert audit_runner._DEFAULT_MAX_CITATIONS_PER_AC == 5
+
+    def test_resolver_returns_default_with_no_config(self):
+        """AC1: No CLI flag or config key -> default 5."""
+        with mock.patch.object(audit_runner, "_load_config", return_value={}):
+            assert audit_runner._resolve_max_citations_per_ac(None) == 5
+
+    def test_config_dotted_key_overrides_default(self):
+        """AC1: the audit.max_citations_per_ac CWD config key overrides the default."""
+        with mock.patch.object(
+            audit_runner, "_load_config",
+            return_value={"audit.max_citations_per_ac": 3},
+        ):
+            assert audit_runner._resolve_max_citations_per_ac(None) == 3
+
+    def test_config_nested_key_overrides_default(self):
+        """AC1: the nested audit: {max_citations_per_ac} form is also honored."""
+        with mock.patch.object(
+            audit_runner, "_load_config",
+            return_value={"audit": {"max_citations_per_ac": 4}},
+        ):
+            assert audit_runner._resolve_max_citations_per_ac(None) == 4
+
+    def test_cli_flag_overrides_config(self):
+        """AC1: --max-citations-per-ac CLI flag beats the config key."""
+        with mock.patch.object(
+            audit_runner, "_load_config",
+            return_value={"audit.max_citations_per_ac": 3},
+        ):
+            assert audit_runner._resolve_max_citations_per_ac(2) == 2
+
+    def test_invalid_cli_fails_closed_with_warning(self, capsys):
+        """AC5: a non-positive --max-citations-per-ac falls back to the default."""
+        with mock.patch.object(audit_runner, "_load_config", return_value={}):
+            assert audit_runner._resolve_max_citations_per_ac(0) == 5
+        captured = capsys.readouterr()
+        assert "Warning" in captured.err
+        assert str(audit_runner._DEFAULT_MAX_CITATIONS_PER_AC) in captured.err
+
+    def test_invalid_config_value_fails_closed_with_warning(self, capsys):
+        """AC5: a non-int audit.max_citations_per_ac value falls back to the default."""
+        with mock.patch.object(
+            audit_runner, "_load_config",
+            return_value={"audit.max_citations_per_ac": "bogus"},
+        ):
+            assert audit_runner._resolve_max_citations_per_ac(None) == 5
+        assert "Warning" in capsys.readouterr().err
+
+    def test_negative_config_fails_closed_with_warning(self, capsys):
+        """AC5: a negative config value falls back to the default."""
+        with mock.patch.object(
+            audit_runner, "_load_config",
+            return_value={"audit.max_citations_per_ac": -3},
+        ):
+            assert audit_runner._resolve_max_citations_per_ac(None) == 5
+        assert "Warning" in capsys.readouterr().err
+
+    def test_main_passes_cli_cap_to_cmd_issue(self):
+        """AC1: main() resolves --max-citations-per-ac and passes it to cmd_issue."""
+        with (
+            mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
+            mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"),
+            mock.patch.object(audit_runner, "_load_config", return_value={}),
+        ):
+            audit_runner.main(
+                ["issue", "SA-123", "--do-not-persist", "--max-citations-per-ac", "4"]
+            )
+            _args, kwargs = mock_cmd.call_args
+            assert kwargs["max_citations_per_ac"] == 4
+
+    def test_main_defaults_cap_for_cmd_issue(self):
+        """AC1: main() resolves the default cap when no flag/config is present."""
+        with (
+            mock.patch.object(audit_runner, "cmd_issue") as mock_cmd,
+            mock.patch.object(audit_runner, "_apply_proxy_mode_serialization"),
+            mock.patch.object(audit_runner, "_load_config", return_value={}),
+        ):
+            audit_runner.main(["issue", "SA-123", "--do-not-persist"])
+            _args, kwargs = mock_cmd.call_args
+            assert kwargs["max_citations_per_ac"] == (
+                audit_runner._DEFAULT_MAX_CITATIONS_PER_AC
+            )
+
 class TestParentTimeoutGuardBehavior:
     """AC3: The elapsed-time guard skips children only in pathological runs;
     the scaled default gives multi-child parents a realistic budget and an

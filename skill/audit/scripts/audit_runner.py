@@ -286,6 +286,17 @@ no longer silently spawn an unbounded number of child audit subprocesses
 (SA-0MSKB6V5Q007YDHE).
 """
 
+_DEFAULT_MAX_CITATIONS_PER_AC = 5
+"""Default cap on file:line evidence citations per AC in Phase 2 deep prompts.
+
+Phase 2 deep analysis is 66% of audit model time; the dominant cost is long
+evidence-JSON generation on the local model, not context size. Bounding the
+number of file:line references the model may cite per criterion (default 5,
+minimum 1) shortens evidence generation without changing the model or
+verdict semantics (LP-0MSQ32WM5000NCB7 AC1). Prompt-level only: parsed
+evidence/verdicts are never mutated.
+"""
+
 _PI_MAX_RETRIES = 2
 """Number of retries for transient provider errors in ``_call_pi``.
 
@@ -1262,6 +1273,69 @@ def _resolve_max_child_audits(cli_value: int | None = None) -> int:
                 file=sys.stderr,
             )
     return _DEFAULT_MAX_CHILD_AUDITS
+
+
+def _resolve_max_citations_per_ac(cli_value: int | None = None) -> int:
+    """Resolve the max file:line citations per AC for Phase 2 deep prompts.
+
+    Precedence:
+      1. ``--max-citations-per-ac`` CLI flag (explicit override)
+      2. ``audit.max_citations_per_ac`` key in the CWD ``.ralph.json`` /
+         ``ralph.config.json`` (dotted form first, then the nested
+         ``audit: {max_citations_per_ac: N}`` form)
+      3. ``_DEFAULT_MAX_CITATIONS_PER_AC`` (5)
+
+    An invalid value (non-positive integer) fails closed to the default with
+    a warning so a misconfigured config cannot break the audit run (mirrors
+    ``_resolve_max_child_audits``; LP-0MSQ32WM5000NCB7 AC1/AC6).
+    """
+    if cli_value is not None:
+        if cli_value < 1:
+            print(
+                f"Warning: invalid --max-citations-per-ac value {cli_value}; "
+                f"using the default cap ({_DEFAULT_MAX_CITATIONS_PER_AC})",
+                file=sys.stderr,
+            )
+            return _DEFAULT_MAX_CITATIONS_PER_AC
+        return cli_value
+    config = _load_config()
+    config_value = config.get("audit.max_citations_per_ac")
+    if config_value is None:
+        audit_section = config.get("audit")
+        if isinstance(audit_section, dict):
+            config_value = audit_section.get("max_citations_per_ac")
+    if config_value is not None:
+        try:
+            parsed = int(config_value)
+            if parsed < 1:
+                raise ValueError
+            return parsed
+        except (ValueError, TypeError):
+            print(
+                f"Warning: invalid audit.max_citations_per_ac value "
+                f"{config_value!r}; using the default cap "
+                f"({_DEFAULT_MAX_CITATIONS_PER_AC})",
+                file=sys.stderr,
+            )
+    return _DEFAULT_MAX_CITATIONS_PER_AC
+
+
+def _max_citations_prompt_snippet(max_citations: int) -> str:
+    """Build the Phase-2 evidence citation-cap instruction.
+
+    Injected into all three deep-analysis prompts (parent ``phase2_deep``,
+    child ``phase2_child``, batch ``phase2_batch``) so evidence-JSON
+    generation is bounded while every AC keeps at least one specific
+    file:line reference (LP-0MSQ32WM5000NCB7 AC1/AC4). Prompt-level only:
+    never mutates parsed evidence or verdicts; the canonical report format
+    is untouched.
+    """
+    return (
+        f"EVIDENCE SCOPE — For each criterion, cite AT MOST "
+        f"{max_citations} specific file:line references as evidence "
+        f"(minimum 1). Prefer fewer, stronger references over exhaustive "
+        f"lists; this bound keeps deep analysis fast.\n"
+    )
 
 
 def _resolve_parent_timeout(cli_value: int | None) -> int | None:
@@ -4423,6 +4497,7 @@ def _deep_analyze_child(
     runner: Runner,
     ac_fallback_used: threading.Event | None = None,
     green_run_block: str | None = None,
+    max_citations_per_ac: int = _DEFAULT_MAX_CITATIONS_PER_AC,
 ) -> tuple[int, dict, bool]:
     """Run Phase 2 deep analysis for a single child (worker for parallelism).
 
@@ -4435,6 +4510,9 @@ def _deep_analyze_child(
     *green_run_block* is the GREEN-RUN attestation block (or ``None``); when
     set it is injected into the child deep-analysis prompt so the model may
     mark execution-dependent criteria met based on the operator attestation.
+
+    *max_citations_per_ac* bounds the file:line evidence citations the model
+    may emit per criterion (prompt-level only, LP-0MSQ32WM5000NCB7).
     """
     child_acs = child.get("ac_results", [])
     if not child_acs:
@@ -4457,6 +4535,7 @@ def _deep_analyze_child(
         f"{child_file_scope}\n\n"
         f"{_SCANNING_BLOCK}"
         f"{green_run_block or ''}"
+        f"{_max_citations_prompt_snippet(max_citations_per_ac)}"
         "For each criterion, read the actual implementation files and verify "
         "the code genuinely satisfies the stated requirements. "
         "Use the same verdict guidance as the parent deep analysis.\n\n"
@@ -4622,6 +4701,7 @@ def _run_batch_phase2(
     runner: Runner,
     ac_fallback_used: threading.Event | None = None,
     green_run_block: str | None = None,
+    max_citations_per_ac: int = _DEFAULT_MAX_CITATIONS_PER_AC,
 ) -> tuple[list[dict], list[dict], bool] | None:
     """Attempt Phase 2 batch deep analysis (P6).
 
@@ -4636,6 +4716,9 @@ def _run_batch_phase2(
 
     *green_run_block* is the GREEN-RUN attestation block (or ``None``); when
     set it is injected into the batch prompt.
+
+    *max_citations_per_ac* bounds the file:line evidence citations the model
+    may emit per criterion (prompt-level only, LP-0MSQ32WM5000NCB7).
     """
     ac_list: list[dict] = []
     for i, r in enumerate(ac_results):
@@ -4690,6 +4773,7 @@ def _run_batch_phase2(
     batch_prompt += (
         f"{_SCANNING_BLOCK}"
         f"{green_run_block or ''}"
+        f"{_max_citations_prompt_snippet(max_citations_per_ac)}"
         "For each criterion, read the actual implementation files and verify "
         "the code genuinely satisfies the stated requirement. Provide a "
         "specific file:line reference as evidence.\n\n"
@@ -4775,6 +4859,7 @@ def _run_phase2_deep_analysis(
     green_run_block: str | None = None,
     skip_parent_deep: bool = False,
     owning_root: Path | None = None,
+    max_citations_per_ac: int | None = None,
 ) -> tuple[list[dict], list[dict], bool]:
     """Run Phase 2 deep code analysis.
 
@@ -4815,12 +4900,21 @@ def _run_phase2_deep_analysis(
     (LP-0MSQ32HNR007AI6B) — the caller aborts instead of emitting 'unmet'
     verdicts from a wrong scope.
 
+    *max_citations_per_ac* bounds the file:line evidence citations the model
+    may emit per criterion in the parent/child/batch deep prompts (default:
+    resolved via ``_resolve_max_citations_per_ac``). Prompt-level only —
+    verdict semantics and the canonical report format are unchanged
+    (LP-0MSQ32WM5000NCB7).
+
     Returns (updated_ac_results, updated_child_results, phase2_completed).
     The ``phase2_completed`` flag is ``False`` when the Pi call times out,
     allowing the caller to set appropriate diagnostic evidence.
     """
     if runner is None:
         runner = _default_runner
+
+    if max_citations_per_ac is None:
+        max_citations_per_ac = _resolve_max_citations_per_ac()
 
     # Active children needing Phase 2 deep analysis (shared by the batch
     # path and the per-child path below).
@@ -4883,6 +4977,7 @@ def _run_phase2_deep_analysis(
             resolved_model, pi_bin, debug_log, timeout, runner,
             ac_fallback_used=ac_fallback_used,
             green_run_block=green_run_block,
+            max_citations_per_ac=max_citations_per_ac,
         )
         if batch_outcome is not None:
             return batch_outcome
@@ -4918,6 +5013,7 @@ def _run_phase2_deep_analysis(
             f"{file_scope}\n\n"
             f"{_SCANNING_BLOCK}"
             f"{green_run_block or ''}"
+            f"{_max_citations_prompt_snippet(max_citations_per_ac)}"
             "For each acceptance criterion:\n"
             "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
             "2. **Verify the code actually does what the criterion claims.**\n"
@@ -5097,6 +5193,7 @@ def _run_phase2_deep_analysis(
                     debug_log, timeout, runner,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    max_citations_per_ac=max_citations_per_ac,
                 )
                 for ci, child in pending
             ]
@@ -5116,6 +5213,7 @@ def _run_phase2_deep_analysis(
                 ci, child, resolved_model, pi_bin, debug_log, timeout, runner,
                 ac_fallback_used=ac_fallback_used,
                 green_run_block=green_run_block,
+                max_citations_per_ac=max_citations_per_ac,
             ))
 
     return updated_ac, updated_children, not child_timeout_occurred
@@ -5260,6 +5358,7 @@ class _AuditContext:
     audit_children: bool
     max_child_audits: int | None
     run_tests: bool
+    max_citations_per_ac: int | None = None
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
@@ -5831,6 +5930,9 @@ def _phase_children(ctx: _AuditContext) -> int | None:
     force = ctx.force
     audit_children = ctx.audit_children
     max_child_audits = ctx.max_child_audits
+    max_citations_per_ac = _resolve_max_citations_per_ac(
+        ctx.max_citations_per_ac
+    )
     batch_phase2 = ctx.batch_phase2
     green_run_block = ctx.green_run_block
     owning_root = ctx.owning_root
@@ -6273,6 +6375,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     green_run_block=green_run_block,
                     skip_parent_deep=True,
                     owning_root=owning_root,
+                    max_citations_per_ac=max_citations_per_ac,
                 )
                 # The parent's deep analysis definitively did not run — never
                 # report it as completed regardless of child outcomes.
@@ -6293,6 +6396,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
                     owning_root=owning_root,
+                    max_citations_per_ac=max_citations_per_ac,
                 )
         else:
             # ── PARENT-FIRST flow (default, SA-0MSKB6VJA005N43F) ──
@@ -6356,6 +6460,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
                     owning_root=owning_root,
+                    max_citations_per_ac=max_citations_per_ac,
                 )
 
             # 2. Parent verdict: any gaps? (unmet/partial ACs or blocking CQ).
@@ -6486,6 +6591,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     green_run_block=green_run_block,
                     skip_parent_deep=True,
                     owning_root=owning_root,
+                    max_citations_per_ac=max_citations_per_ac,
                 )
 
             # 6. Persist child audits (inherited children are explicit in the
@@ -6943,7 +7049,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
               green_run: str | None = None,
               audit_children: bool = False,
               max_child_audits: int | None = None,
-              run_tests: bool = False) -> int:
+              run_tests: bool = False,
+              max_citations_per_ac: int | None = None) -> int:
     """Audit a single work item.
 
     The resolved model name and source are included as a metadata line
@@ -6967,6 +7074,12 @@ def cmd_issue(issue_id: str, persist: bool = True,
     *max_child_audits* bounds the number of child audits a single run may
     auto-trigger (default: ``AUDIT_MAX_CHILD_AUDITS`` env or
     ``_DEFAULT_MAX_CHILD_AUDITS``).
+
+    *max_citations_per_ac* bounds the file:line evidence citations per AC in
+    the Phase 2 deep prompts (default: resolved via
+    ``_resolve_max_citations_per_ac`` — ``--max-citations-per-ac`` CLI flag
+    > ``audit.max_citations_per_ac`` CWD config key > 5). Prompt-level only
+    (LP-0MSQ32WM5000NCB7).
 
     *worklog_dir* is an explicit ``--worklog-dir`` value that overrides
     auto-resolution for every wl call made by this run (see
@@ -7028,6 +7141,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         worklog_dir=worklog_dir, batch_phase2=batch_phase2,
         green_run=green_run, audit_children=audit_children,
         max_child_audits=max_child_audits, run_tests=run_tests,
+        max_citations_per_ac=max_citations_per_ac,
     )
     rc = _phase_gate(ctx)
     if rc is not None:
@@ -7070,7 +7184,8 @@ def cmd_project(timeout: int | None = None,
                 model_source: str = DEFAULT_MODEL_SOURCE,
                 runner: Runner | None = None, json_mode: bool = False,
                 debug_log: str | None = None,
-                worklog_dir: str | None = None) -> int:
+                worklog_dir: str | None = None,
+                max_citations_per_ac: int | None = None) -> int:
     """Audit the overall project.
 
     Model resolution order (highest first):
@@ -7081,6 +7196,11 @@ def cmd_project(timeout: int | None = None,
     *worklog_dir* is an explicit ``--worklog-dir`` value that overrides
     auto-resolution for every wl call made by this run (see
     ``_resolve_worklog_flags``).
+
+    *max_citations_per_ac* is accepted for CLI parity with the issue
+    subcommand; project-level audits do not run Phase 2 deep analysis, so
+    the cap is validated upstream in ``main()`` and unused here
+    (LP-0MSQ32WM5000NCB7).
     """
     # Resolve the effective model from config + CLI
     config = _load_config()
@@ -7305,6 +7425,13 @@ def build_parser() -> argparse.ArgumentParser:
                              f"(default: {AUDIT_MAX_CHILD_AUDITS_ENV} env or "
                              f"{_DEFAULT_MAX_CHILD_AUDITS})"
                          ))
+    p_issue.add_argument("--max-citations-per-ac", type=int, default=None,
+                         help=(
+                             "Max file:line evidence citations per criterion in the "
+                             "Phase 2 deep-analysis prompts "
+                             f"(default: audit.max_citations_per_ac config key or "
+                             f"{_DEFAULT_MAX_CITATIONS_PER_AC})"
+                         ))
     p_issue.add_argument("--worklog-dir", default=None,
                          help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_issue.add_argument("--max-concurrency", type=int, default=None,
@@ -7349,6 +7476,13 @@ def build_parser() -> argparse.ArgumentParser:
                            help="Explicit .worklog directory to target (overrides auto-resolution)")
     p_project.add_argument("--max-concurrency", type=int, default=None,
                            help="Max concurrent pi/audit subprocesses (default: AUDIT_MAX_CONCURRENCY env or 2)")
+    p_project.add_argument("--max-citations-per-ac", type=int, default=None,
+                           help=(
+                               "Accepted for CLI parity with the issue subcommand; "
+                               "project-level audits do not run Phase 2 deep analysis "
+                               f"(default: audit.max_citations_per_ac config key or "
+                               f"{_DEFAULT_MAX_CITATIONS_PER_AC})"
+                           ))
 
     return p
 
@@ -7395,13 +7529,19 @@ def main(argv: list[str] | None = None) -> int:
                          max_child_audits=_resolve_max_child_audits(
                              args.max_child_audits
                          ),
+                         max_citations_per_ac=_resolve_max_citations_per_ac(
+                             args.max_citations_per_ac
+                         ),
                          run_tests=args.run_tests)
     elif args.command == "project":
         return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
                            pi_bin=args.pi_bin, model=args.model,
                            model_source=args.model_source, json_mode=args.json,
                            debug_log=args.debug_log,
-                           worklog_dir=args.worklog_dir)
+                           worklog_dir=args.worklog_dir,
+                           max_citations_per_ac=_resolve_max_citations_per_ac(
+                               args.max_citations_per_ac
+                           ))
 
     return 2
 

@@ -158,6 +158,137 @@ class TestRunPhase2DeepAnalysisEnableTools:
                 _args, kwargs = mock_cp.call_args
                 assert kwargs.get("enable_tools") is False
 
+class TestPhase2CitationCapPromptInjection:
+    """F1-AC2/AC3/AC4: the max-citations-per-AC cap is injected into all
+    three Phase-2 deep prompts (parent/child/batch) with the >=1 file:line
+    floor, while verdicts/evidence pass through unchanged (prompt-level
+    only; LP-0MSQ32WM5000NCB7)."""
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text",
+                  verdict: str = "met") -> dict:
+        return {"index": index, "text": text, "verdict": verdict, "evidence": ""}
+
+    def _make_child(self, child_id: str = "CHILD-1", ac_count: int = 1) -> dict:
+        return {
+            "id": child_id,
+            "title": "Child Issue",
+            "stage": "in_progress",
+            "status": "open",
+            "ac_results": [
+                {"index": i, "text": f"Child AC {i}", "verdict": "met", "evidence": ""}
+                for i in range(ac_count)
+            ],
+        }
+
+    def _cap_instruction(self, n: int) -> str:
+        """The canonical cap instruction text the prompt must carry."""
+        return f"AT MOST {n} specific file:line references"
+
+    def test_parent_prompt_contains_cap_instruction(self):
+        """AC2: the phase2_deep prompt carries the cap + >=1 floor."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(issue, acs, [], "test-model")
+        prompt = mock_call.call_args.args[2]
+        assert self._cap_instruction(audit_runner._DEFAULT_MAX_CITATIONS_PER_AC) in prompt
+        assert "(minimum 1)" in prompt
+
+    def test_child_prompt_contains_cap_instruction(self):
+        """AC2: the phase2_child prompt carries the cap + >=1 floor."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = self._make_child("CHILD-1")
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(issue, acs, [child], "test-model")
+        child_calls = [
+            c for c in mock_call.call_args_list
+            if c.args[1] == "phase2_child:0"
+        ]
+        assert len(child_calls) == 1
+        prompt = child_calls[0].args[2]
+        assert self._cap_instruction(audit_runner._DEFAULT_MAX_CITATIONS_PER_AC) in prompt
+        assert "(minimum 1)" in prompt
+
+    def test_batch_prompt_contains_cap_instruction(self):
+        """AC2: the phase2_batch prompt carries the cap + >=1 floor."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = self._make_child("CHILD-1")
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model", batch_phase2=True,
+            )
+        prompt = mock_call.call_args.args[2]
+        assert self._cap_instruction(audit_runner._DEFAULT_MAX_CITATIONS_PER_AC) in prompt
+        assert "(minimum 1)" in prompt
+
+    def test_configured_cap_value_reflected_in_prompt(self):
+        """AC1/AC2: a configured cap value flows into the injected instruction."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call, mock.patch.object(
+            audit_runner, "_load_config",
+            return_value={"audit.max_citations_per_ac": 3},
+        ):
+            audit_runner._run_phase2_deep_analysis(issue, acs, [], "test-model")
+        prompt = mock_call.call_args.args[2]
+        assert self._cap_instruction(3) in prompt
+
+    def test_legacy_prompt_structure_preserved(self):
+        """AC3: the cap instruction is the only addition - legacy structure
+        (header, FILE SCOPE, SCANNING block, criteria JSON, file:line
+        guidance) survives verbatim, so no accidental restructuring."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "Parent AC text")]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(issue, acs, [], "test-model")
+        prompt = mock_call.call_args.args[2]
+        assert "[READ-ONLY AUDIT] [PHASE 2 — DEEP CODE ANALYSIS] " in prompt
+        assert "FILE SCOPE — Read ONLY the files listed in the manifest below" in prompt
+        assert audit_runner._SCANNING_BLOCK in prompt
+        assert "Provide a specific file:line reference" in prompt
+        assert 'Criteria: [{"index": 0, "text": "Parent AC text"' in prompt
+
+    def test_verdicts_and_evidence_never_mutated_by_cap(self):
+        """AC4: the cap is prompt-level - parsed verdicts/evidence pass through
+        unchanged (canonical report format preserved)."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, "AC text")]
+        deep_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "file.py:10"},
+            ]),
+        }
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=deep_result
+        ):
+            updated_acs, _children, phase2_completed = (
+                audit_runner._run_phase2_deep_analysis(issue, acs, [], "test-model")
+            )
+        assert phase2_completed is True
+        assert updated_acs[0]["verdict"] == "met"
+        assert updated_acs[0]["evidence"] == "file.py:10"
+        assert updated_acs[0]["text"] == "AC text"
+
 class TestPhase2TimeoutHandling:
     """Tests for Phase 2 graceful timeout handling (AC1-AC3)."""
 
