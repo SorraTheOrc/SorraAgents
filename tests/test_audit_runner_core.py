@@ -2017,13 +2017,14 @@ class TestCmdIssueChildAuditAutoTrigger:
             fake_call_pi,
         )
 
-        # Fail the launch-context / file-scope guards open (LP-0MSQ32HNR007AI6B):
-        # these tests exercise child auto-trigger logic with fake work items,
-        # not scope validation — an unknown owning project is the documented
-        # fail-open path for both guards.
+        # Resolve ownership to the launch cwd's project root
+        # (SA-0MSLLGDW00098UCC AC2): these tests exercise child auto-trigger
+        # logic with fake work items, not scope validation — undeterminable
+        # ownership now aborts, so resolve to the launch cwd's root (the
+        # legacy fail-open equivalent) to keep the flow deterministic.
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._resolve_owning_project_root",
-            lambda *args, **kwargs: None,
+            lambda *args, **kwargs: Path.cwd(),
         )
 
         triggered_children = []
@@ -2121,13 +2122,14 @@ class TestCmdIssueChildAuditAutoTrigger:
             fake_call_pi,
         )
 
-        # Fail the launch-context / file-scope guards open (LP-0MSQ32HNR007AI6B):
-        # these tests exercise child auto-trigger logic with fake work items,
-        # not scope validation — an unknown owning project is the documented
-        # fail-open path for both guards.
+        # Resolve ownership to the launch cwd's project root
+        # (SA-0MSLLGDW00098UCC AC2): these tests exercise child auto-trigger
+        # logic with fake work items, not scope validation — undeterminable
+        # ownership now aborts, so resolve to the launch cwd's root (the
+        # legacy fail-open equivalent) to keep the flow deterministic.
         monkeypatch.setattr(
             "skill.audit.scripts.audit_runner._resolve_owning_project_root",
-            lambda *args, **kwargs: None,
+            lambda *args, **kwargs: Path.cwd(),
         )
 
         def fake_subprocess_run(cmd, **kwargs):

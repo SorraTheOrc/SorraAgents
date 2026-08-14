@@ -36,3 +36,36 @@ def _default_green_full_suite_cache():
     }
     with mock.patch.object(audit_runner, "query_cached", return_value=green):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _default_resolvable_ownership():
+    """Resolve undeterminable ownership to the launch project root.
+
+    The undeterminable-ownership abort (SA-0MSLLGDW00098UCC) makes
+    ``cmd_issue`` exit non-zero when the owning project root cannot be
+    determined (no --worklog-dir, unknown item prefix, no sibling match).
+    Flow tests that don't exercise ownership resolution (they audit ids
+    like "SA-SKIP-ALL" or "TEST-1" without a worklog or a patched sibling
+    scan) would otherwise abort for reasons unrelated to what they test.
+    This autouse fixture resolves unknown prefixes to
+    ``TARGET_PROJECT_ROOT`` — the launch cwd's project root — preserving
+    the legacy fail-open behavior for those flows; tests that DO exercise
+    ownership resolution override it with their own
+    ``mock.patch.object(audit_runner, "_resolve_owning_project_root", ...)``
+    — the inner patch wins while active.
+    """
+    from skill.audit.scripts import audit_runner
+
+    real_resolve = audit_runner._resolve_owning_project_root
+
+    def _resolvable(issue_id, worklog_dir=None):
+        root = real_resolve(issue_id, worklog_dir=worklog_dir)
+        if root is not None:
+            return root
+        return audit_runner.TARGET_PROJECT_ROOT
+
+    with mock.patch.object(
+        audit_runner, "_resolve_owning_project_root", side_effect=_resolvable
+    ):
+        yield

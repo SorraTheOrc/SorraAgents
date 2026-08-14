@@ -266,12 +266,18 @@ class TestLaunchContextGuard:
 
         assert rc == 0
 
-    def test_fail_open_when_ownership_cannot_be_determined(self, tmp_path):
-        """AC1: when no sibling project matches the item's prefix, ownership
-        cannot be determined and the guard fails open (never blocks).
+    def test_undeterminable_ownership_aborts(self, tmp_path, capsys):
+        """AC2 (SA-0MSLLGDW00098UCC): when no sibling project matches the
+        item's prefix and no --worklog-dir is given, ownership is
+        undeterminable — the run aborts with a clear error instead of
+        falling back to the launch cwd's repository for git-derived content.
         """
-        # No patcher → the real sibling scan has no project with prefix ZZZ.
+        # Override the conftest autouse resolvable-ownership fixture: this
+        # test exercises the abort path, so resolution must return None.
         with (
+            mock.patch.object(
+                audit_runner, "_resolve_owning_project_root", return_value=None
+            ),
             mock.patch.object(
                 audit_runner, "TARGET_PROJECT_ROOT", tmp_path / "elsewhere"
             ),
@@ -282,11 +288,13 @@ class TestLaunchContextGuard:
             ),
         ):
             rc = audit_runner.cmd_issue(
-                "ZZZ-1", persist=False, force=True,
+                "ZZ-0001", persist=False, force=True,
                 runner=_make_minimal_runner(description=""),
             )
 
-        assert rc == 0
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "undeterminable project scope" in err.lower()
 
 
 # ===========================================================================
@@ -592,3 +600,130 @@ class TestChildPersistFailureFatal:
             persist_rc=PERSIST_CONTENT_INVALID, tmp_path=tmp_path
         )
         assert rc == 0
+
+
+# ===========================================================================
+# SA-0MSLLGDW00098UCC: git file-scope/HEAD resolution must be
+# cwd-independent — git commands target the owning project's repository.
+# ===========================================================================
+
+
+class TestGitResolutionFromNonOwningCwd:
+    """Git-derived content resolves against the OWNING project, not the
+    launch cwd (SA-0MSLLGDW00098UCC).
+
+    The audit runner's git pieces (HEAD sha, working-tree hash, file-scope
+    manifest, green-run evidence) execute git via the runner, which runs in
+    the process cwd — the launch directory. A launch from an unrelated cwd
+    with ``--worklog-dir`` pointing at the audited project would therefore
+    scope git-derived content to the WRONG repository. The fix pins every
+    runner git command to the owning project's root via ``git -C
+    <owning_root>`` unless the launch cwd IS the owning root (or a worktree
+    of it), where commands pass through byte-identical.
+    """
+
+    def test_git_commands_target_owning_project_root(self, tmp_path):
+        """AC1: a simulated launch from an unrelated cwd with --worklog-dir
+        produces git commands pinned to the owning project via `git -C`.
+        """
+        target, target_root, patcher = _make_sibling_projects(tmp_path)
+        # The launch cwd's project root — unrelated to the owning project.
+        launch_root = tmp_path / "skill-install-dir"
+        launch_root.mkdir()
+        recorded: list[list[str]] = []
+
+        with (
+            patcher,
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", launch_root
+            ),
+            mock.patch.object(
+                audit_runner, "_verify_launch_context", return_value=None
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(recorded),
+                worklog_dir=str(target),
+            )
+
+        assert rc == 0
+        git_cmds = [c for c in recorded if c and c[0] == "git"]
+        assert git_cmds, "expected at least one git command to be recorded"
+        for cmd in git_cmds:
+            assert cmd[1] == "-C", f"git command lacks -C: {cmd}"
+            assert cmd[2] == str(target_root), (
+                f"git command must target the owning project root: {cmd}"
+            )
+
+    def test_undeterminable_ownership_aborts_before_git(self, tmp_path, capsys):
+        """AC2: unknown prefix + no --worklog-dir + no sibling match aborts
+        with a clear error before any git command runs (no fallback to the
+        launch cwd's repository).
+        """
+        launch_root = tmp_path / "elsewhere"
+        launch_root.mkdir()
+        recorded: list[list[str]] = []
+
+        with (
+            mock.patch.object(
+                audit_runner, "_resolve_owning_project_root", return_value=None
+            ),
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", launch_root
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "ZZ-0001", persist=False, force=True,
+                runner=_make_minimal_runner(recorded),
+            )
+
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "undeterminable project scope" in err.lower()
+        git_cmds = [c for c in recorded if c and c[0] == "git"]
+        assert git_cmds == [], (
+            "undeterminable ownership must abort before any git command"
+        )
+
+    def test_owning_project_launch_git_commands_unchanged(self, tmp_path):
+        """AC3: launching from the owning project root leaves git commands
+        byte-identical — no `-C` injection, zero regression for the
+        standard owning-project path.
+        """
+        _target, target_root, patcher = _make_sibling_projects(tmp_path)
+        recorded: list[list[str]] = []
+
+        with (
+            patcher,
+            mock.patch.object(
+                audit_runner, "TARGET_PROJECT_ROOT", target_root
+            ),
+            mock.patch(
+                "skill.code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(recorded),
+            )
+
+        assert rc == 0
+        git_cmds = [c for c in recorded if c and c[0] == "git"]
+        assert git_cmds, "expected at least one git command to be recorded"
+        for cmd in git_cmds:
+            assert cmd[1] != "-C", (
+                f"owning-project launch must not inject -C: {cmd}"
+            )
