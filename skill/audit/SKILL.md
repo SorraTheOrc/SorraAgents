@@ -33,7 +33,8 @@ The runner manages the item's `status`/`stage` during execution to prevent concu
 
 - Capture original status+stage at `cmd_issue()` start; set `in_progress`.
 - `Ready to close: Yes` → `completed`/`in_review` (keep `done` if terminal); `No` → `open`/`plan_complete`.
-- Failure/timeout/unparseable → restore captured pre-audit status/stage (fallback only if undeterminable) and **clear the assignee**. Only an explicit `No` moves to `open` — a transient timeout never demotes an `in_review` item.
+- A completed `Yes` verdict advances **even when AC evidence was fallback-tainted** (e.g. a read-only test skip with a variance note) — a fallback on some ACs does not invalidate an explicit model `Yes` (WL-0MSN7XAUS008WOPQ). The fallback flag only forces the restore path for a `No` verdict (an infra-fallback `No` is not an explicit model assessment).
+- Failure/timeout/unparseable → restore captured pre-audit status/stage (fallback only if undeterminable) and **clear the assignee**. Only an explicit `No` moves to `open` — a transient timeout never demotes an `in_review` item. If a completed `Yes` run is ever restored (script failure during the run), a visible warning is printed — never a silent divergence.
 - `--do-not-persist` doesn't affect the lifecycle; status-update failures are silently caught (still reported).
 
 ### Manual Fallback

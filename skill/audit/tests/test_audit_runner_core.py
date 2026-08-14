@@ -1608,6 +1608,127 @@ class TestCmdIssuePhases:
         assert "--status" in last and "open" in last
         assert "--stage" in last and "plan_complete" in last
 
+    # ------------------------------------------------------------------
+    # Fallback-tainted 'Yes' verdicts (WL-0MSN7XAUS008WOPQ)
+    #
+    # A completed 'Ready to close: Yes' run must advance to
+    # completed/in_review even when AC evidence was fallback-tainted
+    # (read-only test skip, diagnostic 'partial' fallback, etc.). The
+    # fallback taint only forces the restore branch for a 'No' verdict
+    # (an infra-fallback 'No' is not an explicit model assessment).
+    # Genuine infrastructure failures still restore, and a restore of a
+    # completed 'Yes' run always prints a visible warning.
+    # ------------------------------------------------------------------
+
+    def _run_terminal_lifecycle(self, *, fallback_tainted=False, **ctx_overrides):
+        """Run _apply_terminal_lifecycle on a ctx with an update-recording runner.
+
+        *fallback_tainted* sets the ctx's ``ac_fallback_used`` event so the
+        infra-fallback provenance flag is visible to the lifecycle.
+        """
+        updates = []
+
+        def _runner(cmd):
+            cs = " ".join(cmd)
+            if "update" in cs:
+                updates.append(list(cmd))
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        ctx = self._make_ctx(_runner)
+        if fallback_tainted:
+            ctx.ac_fallback_used.set()
+        for key, value in ctx_overrides.items():
+            setattr(ctx, key, value)
+        audit_runner._apply_terminal_lifecycle(ctx)
+        return updates
+
+    def test_terminal_lifecycle_yes_advances_when_fallback_tainted(self):
+        """A completed 'Yes' run with the fallback flag set still advances to
+        completed/in_review (AC1) — fallback-tainted AC evidence must NOT
+        block the advance when the overall verdict is 'Yes'."""
+        updates = self._run_terminal_lifecycle(
+            fallback_tainted=True,
+            audit_verdict="yes",
+            audit_completed=True,
+            original_status="in_progress",
+            original_stage="in_progress",
+        )
+        assert updates, "expected a terminal wl update"
+        last = updates[-1]
+        assert "TEST-1" in last
+        assert "--status" in last and "completed" in last
+        assert "--stage" in last and "in_review" in last
+
+    def test_terminal_lifecycle_yes_fallback_tainted_keeps_done(self):
+        """A completed 'Yes' run with the fallback flag set on a terminal
+        'done' item keeps the done stage (no stage transition)."""
+        updates = self._run_terminal_lifecycle(
+            fallback_tainted=True,
+            audit_verdict="yes",
+            audit_completed=True,
+            original_status="completed",
+            original_stage="done",
+        )
+        assert updates, "expected a terminal wl update"
+        last = updates[-1]
+        assert "--status" in last and "completed" in last
+        assert "--stage" not in last  # stage stays 'done'
+
+    def test_terminal_lifecycle_script_failure_restores_pre_audit_state(self):
+        """A genuine infrastructure failure (script failure) still restores
+        the pre-audit state — unchanged behaviour (AC2)."""
+        updates = self._run_terminal_lifecycle(
+            audit_verdict="yes",
+            audit_completed=True,
+            script_failure={
+                "script_name": "pi (parent AC review)",
+                "reason": "model timeout",
+            },
+            original_status="in_progress",
+            original_stage="in_progress",
+        )
+        assert updates, "expected a terminal wl update"
+        last = updates[-1]
+        assert "--status" in last and "in_progress" in last
+        assert "--stage" in last and "in_progress" in last
+        assert "--assignee" in last and "" in last
+
+    def test_terminal_lifecycle_no_still_demotes(self):
+        """A 'No' verdict still demotes to open/plan_complete (AC3)."""
+        updates = self._run_terminal_lifecycle(
+            audit_verdict="no",
+            audit_completed=True,
+            original_status="completed",
+            original_stage="in_review",
+        )
+        assert updates, "expected a terminal wl update"
+        last = updates[-1]
+        assert "--status" in last and "open" in last
+        assert "--stage" in last and "plan_complete" in last
+
+    def test_terminal_lifecycle_restore_of_completed_yes_warns(self, capsys):
+        """Any restore of a completed 'Yes' run prints a visible warning
+        (AC4) — never a silent divergence between the persisted report's
+        'Ready to close: Yes' and the item's restored pre-audit state."""
+        updates = self._run_terminal_lifecycle(
+            audit_verdict="yes",
+            audit_completed=True,
+            script_failure={
+                "script_name": "pi (Phase 2 deep analysis)",
+                "reason": "provider error",
+            },
+            original_status="in_progress",
+            original_stage="in_progress",
+        )
+        assert updates, "expected a terminal wl update"
+        last = updates[-1]
+        assert "--status" in last and "in_progress" in last
+        captured = capsys.readouterr()
+        assert "Warning" in captured.err
+        assert "Yes" in captured.err
+
 class TestWlShowDedup:
     """SA-0MSL1Z7E9005TLBA: no duplicate ``wl show`` of the same item when
     the data is already in hand.

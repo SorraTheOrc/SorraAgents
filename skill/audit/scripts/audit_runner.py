@@ -6775,6 +6775,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
     # in_progress after the audit completes.
     #
     #   Ready to close: Yes → completed / in_review (stage kept 'done')
+    #       — even when AC evidence was fallback-tainted (WL-0MSN7XAUS008WOPQ):
+    #       a fallback (e.g. a read-only test skip) does not invalidate an
+    #       explicit model 'Yes' verdict; the report is complete/persisted.
     #   Ready to close: No  → open / plan_complete (only when the "No" is
     #       a genuine explicit model verdict with parseable AC evidence)
     #   Failure / timeout / unparseable verdict (infrastructure failure) →
@@ -6789,7 +6792,12 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
     #       unparseable output, Phase-2 timeout) is NOT an explicit model
     #       assessment — it takes the restore branch. The flag is set at
     #       every fallback site; an evidence-marker backstop defends
-    #       against future fallback sites that forget to set it.
+    #       against future fallback sites that forget to set it. The flag
+    #       only forces restore for a "No" verdict — a completed "Yes"
+    #       run advances regardless (WL-0MSN7XAUS008WOPQ). If a completed
+    #       "Yes" run ever takes the restore path (script failure while
+    #       the report still parsed a Yes verdict), a visible warning is
+    #       printed — never a silent divergence.
     #
     # The transition is retried on transient wl failures so a single
     # hiccup never leaves the item stuck in_progress; if it still fails a
@@ -6805,9 +6813,11 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
     fallback_tainted = True
     try:
         # Infra-fallback provenance: a "No" derived from infrastructure-
-        # failure fallbacks must restore, never demote. A "Yes" verdict
-        # with the flag set also restores (conservative — a fallback
-        # implies the assessment is incomplete).
+        # failure fallbacks must restore, never demote. The flag does NOT
+        # block a completed "Yes" advance (WL-0MSN7XAUS008WOPQ) — a
+        # fallback on some AC evidence (e.g. a read-only test skip with a
+        # variance note) leaves the overall 'Ready to close: Yes' verdict
+        # trustworthy, so the item still moves to the review queue.
         fallback_tainted = ctx.ac_fallback_used.is_set()
         if ctx.audit_verdict == "no" and not fallback_tainted:
             # Evidence-marker backstop: if any AC evidence carries a known
@@ -6816,7 +6826,9 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
             fallback_tainted = _evidence_has_infra_failure_markers(
                 ctx.ac_results, ctx.child_results,
             )
-        if ctx.script_failure is not None or not ctx.audit_completed or ctx.audit_verdict is None or fallback_tainted:
+        if (ctx.script_failure is not None or not ctx.audit_completed
+                or ctx.audit_verdict is None
+                or (ctx.audit_verdict == "no" and fallback_tainted)):
             # Infrastructure failure / unparseable verdict: restore the
             # pre-audit state captured on entry (status + stage). A
             # transient failure (model timeout, provider error, wl hiccup)
@@ -6833,6 +6845,22 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
                 # Stage unknown (capture failed): pick a stage valid for
                 # the restored status so wl never rejects the combo.
                 safe_stage = "in_review" if safe_status == "completed" else "plan_complete"
+            if ctx.audit_completed and ctx.audit_verdict == "yes":
+                # Never silently diverge (WL-0MSN7XAUS008WOPQ AC4): a
+                # completed run whose report parsed 'Ready to close: Yes'
+                # is being restored (script failure during the run). The
+                # persisted report claims closure-ready while the item
+                # stays in its pre-audit state — surface that loudly so
+                # the operator can review and advance manually if right.
+                print(
+                    f"Warning: audit for {ctx.issue_id} returned 'Ready to "
+                    f"close: Yes' but the item was restored to its pre-audit "
+                    f"state ({safe_status}/{safe_stage}) because of an "
+                    "infrastructure failure during the run; review the "
+                    "persisted report and advance the item manually if "
+                    "appropriate.",
+                    file=sys.stderr,
+                )
             restore_cmd = [
                 "wl", "update", ctx.issue_id,
                 "--status", safe_status,
