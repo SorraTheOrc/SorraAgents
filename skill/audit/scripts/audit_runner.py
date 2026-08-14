@@ -218,6 +218,49 @@ a genuinely hung call well before its 1800 s budget (LP-0MSQ32S2M001EA74 AC2).
 """
 
 
+FP_SCREEN_CONTEXT = "false-positive-screen"
+"""Debug-log context label for the model-judged false-positive screen.
+
+The screen classifies ruff code-quality findings via a single batched Pi
+call (SA-0MST01NPD007MYG4 / SA-0MST01O4G002VPBR). Tests assert on this
+context to prove the screen is (not) invoked.
+"""
+
+FP_SCREEN_VALID_CLASSIFICATIONS = frozenset(
+    {"genuine", "confident-false-positive", "uncertain"}
+)
+"""Valid per-finding screen classifications.
+
+``uncertain`` is the caution-first default: a finding that is missing from
+the batch response, unparseable, or degraded by a provider failure is never
+classified ``confident-false-positive`` (T1 AC1/AC2).
+"""
+
+FP_CANDIDATE_ANNOTATION = "candidate false positive — producer decision required"
+"""Annotation appended to uncertain-screen findings that still block.
+
+An ``uncertain`` classification never triggers remediation; the finding
+remains blocking under ``_has_phase1_blocking_issues`` and is annotated so
+a producer makes the final call (SA-0MST01O4G002VPBR AC4).
+"""
+
+FP_SCREEN_FAILED_JUSTIFICATION = (
+    "Screen output could not be parsed or the Pi call failed — all findings "
+    "defaulted to uncertain (caution-first)."
+)
+"""Justification recorded when the whole screen degrades (T1 AC2)."""
+
+FP_SCREEN_MISSING_JUSTIFICATION = (
+    "Finding missing from the screen response — defaulted to uncertain "
+    "(caution-first)."
+)
+"""Justification recorded for a finding absent from the batch response.
+
+Never ``confident-false-positive``: a finding the model did not see cannot
+be declared a confident false positive (T1 AC1).
+"""
+
+
 AUDIT_GREEN_RUN_ENV = "AUDIT_GREEN_RUN"
 """Environment variable name for the operator-attested green test run.
 
@@ -3117,6 +3160,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            code_quality_findings: list[dict] | None = None,
                            code_quality_fixes_applied: int = 0,
                            code_quality_skipped_reason: str | None = None,
+                           fp_screen_results: list[dict] | None = None,
                            model: str | None = _MISSING,
                            model_source: str | None = _MISSING,
                            phase2_completed: bool = False,
@@ -3135,6 +3179,11 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       ``message``, ``linter``, ``code`` keys.
     *code_quality_skipped_reason* is an optional string explaining why
       code quality was not run (e.g., no linters available).
+    *fp_screen_results* is the optional list of false-positive screen
+      entries (see ``_parse_fp_screen_response``). When provided, the Code
+      Quality section lists each screened finding's classification +
+      justification, and only critical/high findings NOT classified
+      ``confident-false-positive`` block closure (SA-0MST01O4G002VPBR AC4).
     *model* is the name of the model used for the audit (e.g.,
       ``"opencode-go/deepseek-v4-flash"``). When not provided, no model
       line is emitted (backward compatibility). When provided as ``None``
@@ -3219,11 +3268,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     )
 
     # Code quality blocking: critical or high findings block closure
+    # unless the false-positive screen classified them
+    # confident-false-positive (uncertain findings stay blocking).
     cq_findings = code_quality_findings or []
-    has_blocking_cq = any(
-        f.get("severity") in ("critical", "high")
-        for f in cq_findings
-    )
+    has_blocking_cq = bool(_effective_blocking_findings(
+        cq_findings, fp_screen_results or []
+    ))
 
     ready_before_cq = "Yes" if (all_ac_acceptable and all_children_reviewed and not any_child_audit_not_ready) else "No"
     if ready_before_cq == "Yes" and has_blocking_cq:
@@ -3467,6 +3517,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
 
     cq_findings = code_quality_findings or []
     cq_fixes = code_quality_fixes_applied
+    fp_results = fp_screen_results or []
 
     if code_quality_skipped_reason:
         lines.append(f"Code quality check skipped: {code_quality_skipped_reason}")
@@ -3476,13 +3527,18 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         lines.append(f"All issues auto-fixed by **{cq_fixes}** linter(s).")
         lines.append("No remaining issues.")
     else:
-        has_critical_or_high = any(
-            f.get("severity") in ("critical", "high") for f in cq_findings
-        )
-        if has_critical_or_high:
+        effective_blocking = _effective_blocking_findings(cq_findings, fp_results)
+        if effective_blocking:
             lines.append(
                 "**Critical and/or high severity findings detected — "
                 "these block closure.**"
+            )
+        elif any(
+            f.get("severity") in ("critical", "high") for f in cq_findings
+        ):
+            lines.append(
+                "**Critical/high severity findings were screened as "
+                "confident false positives — they no longer block closure.**"
             )
         else:
             lines.append(
@@ -3499,6 +3555,31 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 f"{f.get('message', '')} | {f.get('linter', '?')} | "
                 f"{f.get('code', '')} |"
             )
+
+        # False-positive screen section (SA-0MST01O4G002VPBR AC3/AC4):
+        # per-finding classifications + justifications surface in the
+        # human-readable report. Screen-failed runs annotate every entry.
+        if fp_results:
+            lines.append("")
+            lines.append("#### False-positive screen")
+            lines.append("")
+            any_failed = any(e.get("screen_failed") for e in fp_results)
+            if any_failed:
+                lines.append(
+                    "**Screen degraded (provider error / timeout / unparseable "
+                    "output) — all findings defaulted to uncertain (caution-first).**"
+                )
+                lines.append("")
+            lines.append("| # | File | Line | Code | Classification | Justification |")
+            lines.append("|---|------|------|------|----------------|---------------|")
+            for e in fp_results:
+                f = e.get("finding", {})
+                lines.append(
+                    f"| {e.get('index', 0) + 1} | {f.get('file', '?')} | "
+                    f"{f.get('line', 0)} | {f.get('code', '?')} | "
+                    f"{e.get('classification', '?')} | "
+                    f"{e.get('justification', '')} |"
+                )
 
     lines.append("")
     return "\n".join(lines)
@@ -4352,14 +4433,18 @@ def _annotate_skip_evidence(ac_results: list[dict], note: str) -> list[dict]:
     return updated
 
 
-def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict]) -> tuple[bool, str]:
+def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dict],
+                                fp_screen_results: list[dict] | None = None) -> tuple[bool, str]:
     """Check whether Phase 1 automated screening has blocking issues.
 
     Returns (blocked, reason). If blocked, Phase 2 deep analysis should be
     skipped and all 'met' verdicts demoted to 'partial'.
 
     Blocking issues include:
-    - Critical/high code quality findings
+    - Critical/high code quality findings (unless the false-positive screen
+      classified them ``confident-false-positive``; ``uncertain`` findings
+      remain blocking with the candidate-false-positive annotation,
+      SA-0MST01O4G002VPBR AC4)
     - Children not in in_review/done stage
     - Active children in pre-review stages whose persisted audit says
       "Ready to close: No" (children in ``in_review`` stage are exempt
@@ -4367,8 +4452,17 @@ def _has_phase1_blocking_issues(cq_findings: list[dict], child_results: list[dic
       pre-review stages block)
     """
     # Check code quality findings
+    fp_results = fp_screen_results or []
     for f in cq_findings:
         if f.get("severity") in ("critical", "high"):
+            classification = _fp_classification_for(f, fp_results)
+            if classification == "confident-false-positive":
+                continue
+            if classification == "uncertain":
+                return True, (
+                    f"Critical/high code quality finding: {f.get('file', '?')}:{f.get('line', 0)} "
+                    f"— {f.get('message', '')} — {FP_CANDIDATE_ANNOTATION}"
+                )
             return True, f"Critical/high code quality finding: {f.get('file', '?')}:{f.get('line', 0)} — {f.get('message', '')}"
 
     # Check children stages — skip deleted children and inherited-pass
@@ -4408,6 +4502,7 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
                       child_results: list[dict],
                       code_quality_findings: list[dict] | None = None,
                       code_quality_fixes_applied: int = 0,
+                      fp_screen_results: list[dict] | None = None,
                       phase2_completed: bool = False,
                       phase2_skip_note: str | None = None) -> dict:
     """Build structured JSON payload for issue-mode audit.
@@ -4415,7 +4510,9 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
         ``adjusted`` criteria represent acceptable variance and do not block closure.
-      - Critical/high code quality findings block closure.
+      - Critical/high code quality findings block closure, unless the
+        false-positive screen classified them ``confident-false-positive``
+        (uncertain findings stay blocking; SA-0MST01O4G002VPBR AC4).
       - Children in ``in_review`` or ``done`` stage are exempt from child
         audit verdict checks. Per the audit spec, children in ``in_review``
         do NOT block closure — only pre-review stages (``idea``,
@@ -4456,10 +4553,9 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
 
     # Code quality blocking
     cq_findings = code_quality_findings or []
-    has_blocking_cq = any(
-        f.get("severity") in ("critical", "high")
-        for f in cq_findings
-    )
+    has_blocking_cq = bool(_effective_blocking_findings(
+        cq_findings, fp_screen_results or []
+    ))
 
     ready = all_ac_acceptable and all_children_reviewed and not has_blocking_cq and not any_child_audit_not_ready
 
@@ -4494,6 +4590,21 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
             "total_findings": len(cq_findings),
             "fixes_applied": code_quality_fixes_applied,
             "findings": cq_findings,
+            "false_positive_screen": [
+                {
+                    "index": e.get("index", 0),
+                    "file": e.get("finding", {}).get("file", "?"),
+                    "line": e.get("finding", {}).get("line", 0),
+                    "code": e.get("finding", {}).get("code", "?"),
+                    "linter": e.get("finding", {}).get("linter", "?"),
+                    "severity": e.get("finding", {}).get("severity", "?"),
+                    "classification": e.get("classification", "uncertain"),
+                    "justification": e.get("justification", ""),
+                    "remediable": e.get("remediable", False),
+                    "screen_failed": e.get("screen_failed", False),
+                }
+                for e in (fp_screen_results or [])
+            ],
         },
         "pipeline": {
             "phase1_completed": True,
@@ -5399,6 +5510,7 @@ class _AuditContext:
     cq_findings: list = field(default_factory=list)
     cq_fixes_applied: int = 0
     cq_skipped_reason: str | None = None
+    fp_screen_results: list = field(default_factory=list)
     ac_results: list = field(default_factory=list)
     child_results: list = field(default_factory=list)
     ac_fallback_used: threading.Event = field(default_factory=threading.Event)
@@ -5677,6 +5789,211 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     return None
 
 
+def _parse_fp_screen_response(raw_text: str,
+                              findings: list[dict]) -> tuple[list[dict], bool]:
+    """Parse a batched false-positive screen response into classifications.
+
+    Returns ``(entries, failed)`` where *entries* is one dict per ruff
+    finding (in input order) and *failed* is True when the whole response
+    degraded (unparseable output or an infra-failure marker) — in which
+    case EVERY finding is ``uncertain`` (T1 AC2).
+
+    Entry schema:
+      ``{"index": int, "finding": dict, "classification": str,
+        "justification": str, "remediable": bool, "screen_failed": bool}``
+
+    Caution-first rules:
+      - A finding missing from the batch defaults to ``uncertain`` and is
+        never ``confident-false-positive`` (T1 AC1).
+      - A classification outside ``FP_SCREEN_VALID_CLASSIFICATIONS``
+        normalizes to ``uncertain`` with a written justification.
+      - Only blocking-severity (critical/high) ``confident-false-positive``
+        findings are marked remediable; remediation is F2 scope (T1 AC5).
+    """
+    entries: list[dict] = []
+    raw_text = raw_text or ""
+    batch: list | None = _extract_json_array(raw_text)
+    if batch is None:
+        try:
+            batch = json.loads(raw_text)
+        except (json.JSONDecodeError, TypeError):
+            batch = None
+
+    if not isinstance(batch, list):
+        # Unparseable output — degrade EVERY finding to uncertain.
+        for i, f in enumerate(findings):
+            entries.append({
+                "index": i,
+                "finding": f,
+                "classification": "uncertain",
+                "justification": FP_SCREEN_FAILED_JUSTIFICATION,
+                "remediable": False,
+                "screen_failed": True,
+            })
+        return entries, True
+
+    reviewed = {
+        item.get("index"): item
+        for item in batch
+        if isinstance(item, dict) and isinstance(item.get("index"), int)
+    }
+    if not reviewed and batch and all(isinstance(item, dict) for item in batch):
+        # Model omitted explicit indexes — fall back to positional matching
+        # (same-count arrays), keeping the caution-first rules intact.
+        reviewed = {i: item for i, item in enumerate(batch)}
+    for i, f in enumerate(findings):
+        item = reviewed.get(i, {})
+        classification = item.get("classification", "uncertain")
+        if classification not in FP_SCREEN_VALID_CLASSIFICATIONS:
+            classification = "uncertain"
+        if not isinstance(item, dict) or "classification" not in item:
+            justification = FP_SCREEN_MISSING_JUSTIFICATION
+        elif item.get("classification") not in FP_SCREEN_VALID_CLASSIFICATIONS:
+            justification = (
+                f"Classification {item.get('classification')!r} not recognized — "
+                "normalized to uncertain (caution-first)."
+            )
+        else:
+            justification = item.get("justification", "") or ""
+        remediable = (
+            classification == "confident-false-positive"
+            and f.get("severity") in ("critical", "high")
+        )
+        entries.append({
+            "index": i,
+            "finding": f,
+            "classification": classification,
+            "justification": justification,
+            "remediable": remediable,
+            "screen_failed": False,
+        })
+    return entries, False
+
+
+def _fp_classification_for(finding: dict, fp_screen_results: list[dict]) -> str | None:
+    """Return the screen classification for *finding*, or None when the
+    finding was not screened (non-ruff finding, or screen skipped)."""
+    for entry in fp_screen_results or []:
+        if entry.get("finding") is finding or entry.get("finding") == finding:
+            return entry.get("classification")
+    return None
+
+
+def _screen_ruff_findings(issue_id: str, findings: list[dict],
+                          pi_bin: str, resolved_model: str,
+                          debug_log: str | None, timeout: int | None,
+                          ac_fallback_used: threading.Event) -> list[dict]:
+    """Model-judged false-positive screen over ruff findings (F1 scope).
+
+    Classifies each ruff finding via a SINGLE batched Pi call
+    (``FP_SCREEN_CONTEXT``); non-ruff findings are never sent to the screen.
+    Returns one entry per ruff finding (see ``_parse_fp_screen_response``
+    for the schema) or ``[]`` when there are no ruff findings — the screen
+    is skipped entirely, so zero Pi calls happen (T1 AC3).
+
+    Caution-first degradation (T1 AC2): a provider error, timeout,
+    concurrency-limit marker, unparseable output, or RuntimeError from the
+    Pi call marks EVERY finding ``uncertain`` (never
+    ``confident-false-positive``) and sets ``ac_fallback_used`` so a
+    verdict derived from the failed screen restores the pre-audit state
+    instead of demoting.
+    """
+    ruff_findings = [f for f in (findings or []) if f.get("linter") == "ruff"]
+    if not ruff_findings:
+        return []
+
+    finding_list_json = json.dumps([
+        {
+            "index": i,
+            "file": f.get("file", "?"),
+            "line": f.get("line", 0),
+            "severity": f.get("severity", "?"),
+            "code": f.get("code", "?"),
+            "message": f.get("message", ""),
+        }
+        for i, f in enumerate(ruff_findings)
+    ])
+    prompt = (
+        "[READ-ONLY AUDIT] You are performing a read-only audit. "
+        "Do NOT close, modify, create, or delete any work items. "
+        "Do NOT execute any wl, git, or other state-modifying commands. "
+        "Return ONLY a structured JSON array.\n\n"
+        "Classify each ruff lint finding below as either 'genuine' (a real "
+        "defect that should stay), 'confident-false-positive' (the rule "
+        "misfires for this file and the finding is not a real defect), or "
+        "'uncertain'. Err on the side of caution: when in doubt, choose "
+        "'uncertain'.\n\n"
+        "Return ONLY a JSON array of objects, each with keys 'index' "
+        "(integer, matching the input), 'classification' (one of: "
+        "genuine, confident-false-positive, uncertain) and 'justification' "
+        "(a one-line written reason).\n\n"
+        f"Findings: {finding_list_json}"
+    )
+    try:
+        result = _call_pi_and_maybe_log(
+            issue_id, FP_SCREEN_CONTEXT, prompt, model=resolved_model,
+            pi_bin=pi_bin, debug_log=debug_log, timeout=timeout,
+            ac_fallback_used=ac_fallback_used, child_screen=True,
+        )
+    except RuntimeError as exc:
+        ac_fallback_used.set()
+        print(
+            f"Warning: Pi call failed for false-positive screen: {exc} — "
+            "all findings defaulted to uncertain (caution-first).",
+            file=sys.stderr,
+        )
+        entries, _ = _parse_fp_screen_response("", ruff_findings)
+        return entries
+
+    degraded = bool(
+        result.get("_provider_error")
+        or result.get("_timeout")
+        or result.get("_concurrency_timeout")
+    )
+    if degraded:
+        # Infra failure: _call_pi already set ac_fallback_used for
+        # timeout/concurrency/provider-error paths; belt-and-suspenders here.
+        ac_fallback_used.set()
+        print(
+            "Warning: false-positive screen degraded (provider error / timeout / "
+            "concurrency limit) — all findings defaulted to uncertain "
+            "(caution-first).",
+            file=sys.stderr,
+        )
+        entries, _ = _parse_fp_screen_response("", ruff_findings)
+        return entries
+
+    raw_text = result.get("extracted_text", "") or result.get("evidence", "") or ""
+    entries, failed = _parse_fp_screen_response(raw_text, ruff_findings)
+    if failed:
+        ac_fallback_used.set()
+        print(
+            "Warning: unparseable Pi output for false-positive screen — "
+            "all findings defaulted to uncertain (caution-first).",
+            file=sys.stderr,
+        )
+    return entries
+
+
+def _effective_blocking_findings(cq_findings: list[dict],
+                                 fp_screen_results: list[dict]) -> list[dict]:
+    """Findings that still block closure after the false-positive screen.
+
+    Only ``confident-false-positive`` critical/high findings are screened
+    out; ``uncertain`` (caution-first) and ``genuine`` findings remain
+    blocking (SA-0MST01O4G002VPBR AC4). Non-ruff findings are never
+    screened and always block at critical/high.
+    """
+    blocking = []
+    for f in cq_findings or []:
+        if f.get("severity") not in ("critical", "high"):
+            continue
+        if _fp_classification_for(f, fp_screen_results or []) == "confident-false-positive":
+            continue
+        blocking.append(f)
+    return blocking
+
+
 def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     """Phase 2 — fetch the item + children, capture the content fingerprint,
     run the scoped code-quality scan, and extract the acceptance criteria.
@@ -5758,6 +6075,39 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
 
     acs = _extract_acs(description)
 
+    # ------------------------------------------------------------------
+    # False-positive screen (SA-0MST01NPD007MYG4 / SA-0MST01O4G002VPBR):
+    # model-judged classification of ruff findings via a single batched Pi
+    # call, BEFORE the Phase-1 blocking check consumes cq_findings. The
+    # screen is skipped (zero Pi calls) when the scan yields no ruff
+    # findings; non-ruff findings are never sent to it. Classifications +
+    # justifications feed the Phase-1 blocking decision and the report.
+    # ------------------------------------------------------------------
+    try:
+        fp_screen_results = _screen_ruff_findings(
+            issue_id=issue_id,
+            findings=cq_findings,
+            pi_bin=ctx.pi_bin,
+            resolved_model=ctx.resolved_model,
+            debug_log=ctx.debug_log,
+            timeout=ctx.timeout,
+            ac_fallback_used=ctx.ac_fallback_used,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the screen must never crash the audit
+        ctx.record_script_failure("false-positive screen", exc)
+        print(
+            f"Warning: false-positive screen failed unexpectedly: {exc} — "
+            "all findings defaulted to uncertain (caution-first).",
+            file=sys.stderr,
+        )
+        ctx.ac_fallback_used.set()
+        entries, _ = _parse_fp_screen_response("", cq_findings)
+        # Consistent with _screen_ruff_findings: only ruff findings are
+        # ever screened; non-ruff findings are never classified.
+        fp_screen_results = [
+            e for e in entries if e.get("finding", {}).get("linter") == "ruff"
+        ]
+
     ctx.work_item = work_item
     ctx.children = children
     ctx.description = description
@@ -5765,6 +6115,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     ctx.cq_findings = cq_findings
     ctx.cq_fixes_applied = cq_fixes_applied
     ctx.cq_skipped_reason = cq_skipped_reason
+    ctx.fp_screen_results = fp_screen_results
     ctx.acs = acs
     return None
 
@@ -6331,7 +6682,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
             # Phase 2 gate: check if Phase 1 automated screening has blocking issues
             # ------------------------------------------------------------------
             phase1_blocked, phase1_reason = _has_phase1_blocking_issues(
-                cq_findings, child_results
+                cq_findings, child_results, fp_screen_results=ctx.fp_screen_results
             )
             phase2_completed = False
             phase2_skip_note = None
@@ -6428,9 +6779,9 @@ def _phase_children(ctx: _AuditContext) -> int | None:
             # --audit-children (Feature 2) forces the full per-child flow.
             phase2_completed = False
             phase2_skip_note = None
-            has_blocking_cq = any(
-                f.get("severity") in ("critical", "high") for f in cq_findings
-            )
+            has_blocking_cq = bool(_effective_blocking_findings(
+                cq_findings, ctx.fp_screen_results
+            ))
             # 1. Parent Phase 2 deep analysis FIRST (parent-only).
             if has_blocking_cq:
                 # Blocking CQ findings → demote met verdicts to partial and
@@ -6734,6 +7085,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 code_quality_findings=cq_findings,
                 code_quality_fixes_applied=cq_fixes_applied,
                 code_quality_skipped_reason=cq_skipped_reason,
+                fp_screen_results=ctx.fp_screen_results,
                 model=resolved_model,
                 model_source=model_source,
                 phase2_completed=phase2_completed,
@@ -6765,6 +7117,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 work_item, ac_results, child_results,
                 code_quality_findings=cq_findings,
                 code_quality_fixes_applied=cq_fixes_applied,
+                fp_screen_results=ctx.fp_screen_results,
                 phase2_completed=phase2_completed,
                 phase2_skip_note=phase2_skip_note,
             )
