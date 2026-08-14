@@ -315,20 +315,23 @@ applied update is harmless.
 _STATUS_RESTORE_RETRY_DELAY_S = 0.5
 """Base delay (seconds) between status-restore retries; grows linearly."""
 
-_PHASE1_SCANNING_BLOCK = (
+_SCANNING_BLOCK = (
     "SCANNING — When you need to look something up, use the bounded helpers:\n"
     "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
     "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
     "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
     "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
 )
-"""Bounded-scanning guidance injected into Phase 1 AC review prompts (P7).
+"""Canonical bounded-scanning guidance injected into every audit prompt.
 
-Phase 1 (automated screening) now mirrors the Phase 2 performance pattern:
-the model reads only in-scope files and uses the bounded ``scan.py`` helpers
-instead of unbounded repository exploration. The parent Phase 2 prompt also
-includes the ``list-files`` bullet; we reuse that fuller version for both
-Phase 1 parent and child prompts for consistency.
+The single SCANNING block reused by ALL phases (SA-0MSL1Z6M7002EDS0):
+Phase 1 parent + child AC reviews and Phase 2 parent deep / child deep /
+batch prompts all interpolate this one constant so the guidance can never
+drift between sites (previously three inline copies had already diverged).
+It is the fuller version with the ``list-files`` bullet and the
+single-file ``.worklog`` grep note; the model reads only in-scope files and
+uses the bounded ``scan.py`` helpers instead of unbounded repository
+exploration (P7 / Phase 2 performance pattern).
 """
 
 _PHASE2_MAX_RETRIES = 1
@@ -4005,7 +4008,7 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
             f"or `ls -R` across the repo). If a criterion requires a file not listed "
             f"here, state that in the evidence instead of searching for it.\n\n"
             f"{file_scope}\n\n"
-            f"{_PHASE1_SCANNING_BLOCK}"
+            f"{_SCANNING_BLOCK}"
             f"If a criterion has acceptable variance (implementation differs from original "
             f"spec but still satisfies user story intent), use verdict 'adjusted' instead of 'unmet'. "
             f"Include justification in the evidence field.\n\n"
@@ -4424,10 +4427,7 @@ def _deep_analyze_child(
         "file not listed here, state that in the evidence instead of "
         "searching for it.\n\n"
         f"{child_file_scope}\n\n"
-        "SCANNING — When you need to look something up, use the bounded helpers:\n"
-        "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
-        "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
-        "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
+        f"{_SCANNING_BLOCK}"
         f"{green_run_block or ''}"
         "For each criterion, read the actual implementation files and verify "
         "the code genuinely satisfies the stated requirements. "
@@ -4660,10 +4660,7 @@ def _run_batch_phase2(
             f"({child.get('id', '')}):\n{manifest}\n\n"
         )
     batch_prompt += (
-        "SCANNING — When you need to look something up, use the bounded helpers:\n"
-        "- Worklog lookups: `python3 skill/audit/scripts/scan.py find-workitem <id>` (never `grep -r` over .worklog/).\n"
-        "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
-        "- NEVER run unbounded recursive grep over the repo root or .worklog/.\n\n"
+        f"{_SCANNING_BLOCK}"
         f"{green_run_block or ''}"
         "For each criterion, read the actual implementation files and verify "
         "the code genuinely satisfies the stated requirement. Provide a "
@@ -4891,11 +4888,7 @@ def _run_phase2_deep_analysis(
             "or `ls -R` across the repo). If a criterion requires a file not listed "
             "here, state that in the evidence instead of searching for it.\n\n"
             f"{file_scope}\n\n"
-            "SCANNING — When you need to look something up, use the bounded helpers:\n"
-            "- Worklog lookups: `wl search <keywords> --json` or `wl list <term> --json` for substring matching, `scan.py find-workitem <id>` for exact match (never `grep -r` over .worklog/).\n"
-            "- Code search: `python3 skill/audit/scripts/scan.py search-code <pattern> --path <dir> --type py` (bounded rg with prunes).\n"
-            "- File listing: `python3 skill/audit/scripts/scan.py list-files --path <dir> --type py`.\n"
-            "- NEVER run unbounded recursive grep over the repo root or .worklog/ (e.g. `grep -r ... .` or `grep -r ... .worklog/`).\n\n"
+            f"{_SCANNING_BLOCK}"
             f"{green_run_block or ''}"
             "For each acceptance criterion:\n"
             "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
@@ -5650,7 +5643,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             f"or `ls -R` across the repo). If a criterion requires a file not listed "
             f"here, state that in the evidence instead of searching for it.\n\n"
             f"{file_scope}\n\n"
-            f"{_PHASE1_SCANNING_BLOCK}"
+            f"{_SCANNING_BLOCK}"
             f"{green_run_block or ''}"
             f"Criteria: {ac_list_json}"
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -1263,6 +1264,37 @@ class TestPhase2BatchResolution:
             clear=False,
         ):
             assert audit_runner._phase2_batch_enabled(True) is True
+
+class TestCanonicalScanningBlock:
+    """SA-0MSL1Z6M7002EDS0: a single canonical SCANNING block constant is
+    reused in every audit prompt — no inline SCANNING strings remain.
+
+    The fuller version (with ``list-files`` and the single-file ``.worklog``
+    grep note) is defined once and interpolated at every prompt site:
+    Phase 1 parent, Phase 1 child, Phase 2 parent, Phase 2 child, Phase 2
+    batch.
+    """
+
+    def test_no_inline_scanning_literals_outside_constant(self):
+        """AC1: the SCANNING text appears in the runner only as the constant
+        definition (once); every prompt site interpolates it."""
+        src = Path(audit_runner.__file__).read_text()
+        inline = re.findall(r'"SCANNING — When you need to look something up', src)
+        assert len(inline) == 1, \
+            f"inline SCANNING string literals: {inline}"
+
+    def test_canonical_block_used_at_every_prompt_site(self):
+        """AC1: the constant is referenced at all 5 prompt sites."""
+        src = Path(audit_runner.__file__).read_text()
+        refs = re.findall(r'\{_SCANNING_BLOCK\}', src)
+        assert len(refs) == 5, f"prompt-site references: {refs}"
+
+    def test_canonical_block_is_the_full_version(self):
+        """The canonical block carries list-files and the .worklog grep note."""
+        block = audit_runner._SCANNING_BLOCK
+        assert "list-files" in block
+        assert "never `grep -r` over .worklog/" in block
+
 
 class TestPhase2BatchRouting:
     """AC1/AC2/AC4: Batch mode folds parent + pending child ACs into one
