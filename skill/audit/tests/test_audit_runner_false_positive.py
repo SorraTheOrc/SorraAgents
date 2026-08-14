@@ -468,7 +468,9 @@ class TestScreenBatchedCall:
     def test_cmd_issue_screen_wired_and_surfaces_in_report(self, capsys):
         """Integration: the screen is invoked once from the pipeline and the
         screened CFP unblocks closure (F1 AC4) with justification in the
-        report (AC4)."""
+        report (AC4). The remediation loop (F2/T2 scope) is neutralized
+        here — it is exercised by its own test module with a temp project
+        root so it never writes into the real checkout."""
         runner = self._make_runner(description="## Acceptance Criteria\n- AC1: thing")
 
         def _fake_pi(issue_id, context, prompt, **kwargs):
@@ -481,6 +483,18 @@ class TestScreenBatchedCall:
             return _ok_result(json.dumps([
                 {"index": 0, "verdict": "met", "evidence": "file.py:1"},
             ]))
+
+        def _neutral_loop(**kwargs):
+            return {
+                "iterations": 0,
+                "max_iterations": 3,
+                "exhausted": False,
+                "commits": [],
+                "fingerprint_before": kwargs.get("content_fingerprint"),
+                "fingerprint_after": kwargs.get("content_fingerprint"),
+                "cq_findings": kwargs.get("cq_findings"),
+                "fp_screen_results": kwargs.get("fp_screen_results"),
+            }
 
         with (
             mock.patch.object(audit_runner, "_call_pi_and_maybe_log",
@@ -496,6 +510,8 @@ class TestScreenBatchedCall:
                 "create_epics_for_findings",
                 return_value={"epic_id": None},
             ),
+            mock.patch.object(audit_runner, "_run_remediation_loop",
+                              side_effect=_neutral_loop),
         ):
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=runner,

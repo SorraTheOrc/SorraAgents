@@ -261,6 +261,29 @@ be declared a confident false positive (T1 AC1).
 """
 
 
+AUDIT_REMEDIATION_MAX_ITERATIONS_ENV = "AUDIT_REMEDIATION_MAX_ITERATIONS"
+"""Environment variable name for the config-fix iteration cap.
+
+The remediation loop (T2/F2) applies at most this many minimal ruff config
+edits per audit run. Default ``REMEDIATION_MAX_ITERATIONS_DEFAULT`` = 3;
+invalid values fail closed to the default.
+"""
+
+REMEDIATION_MAX_ITERATIONS_DEFAULT = 3
+"""Default cap on config-fix iterations per audit run (T2 AC5)."""
+
+REMEDIATION_EXHAUSTED_ANNOTATION = "remediation loop exhausted"
+"""Annotation for a finding still present after the iteration cap.
+
+A confident-false-positive finding that persists after ``max_iterations``
+config-fix iterations is demoted to blocking ``genuine`` with this
+annotation (T2 AC5) — the audit never suppresses it silently.
+"""
+
+REMEDIATION_COMMIT_MESSAGE = "audit: remediate ruff false positives (per-file-ignores)"
+"""Local (no-push) commit message for each applied config fix (T2 AC3)."""
+
+
 AUDIT_GREEN_RUN_ENV = "AUDIT_GREEN_RUN"
 """Environment variable name for the operator-attested green test run.
 
@@ -3161,6 +3184,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            code_quality_fixes_applied: int = 0,
                            code_quality_skipped_reason: str | None = None,
                            fp_screen_results: list[dict] | None = None,
+                           remediation_results: dict | None = None,
                            model: str | None = _MISSING,
                            model_source: str | None = _MISSING,
                            phase2_completed: bool = False,
@@ -3184,6 +3208,11 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       Quality section lists each screened finding's classification +
       justification, and only critical/high findings NOT classified
       ``confident-false-positive`` block closure (SA-0MST01O4G002VPBR AC4).
+    *remediation_results* is the optional dict from ``_run_remediation_loop``
+      (T2/F2). When the loop ran (iterations > 0 or exhaustion), the Code
+      Quality section gains a ``#### Remediation loop`` subsection listing
+      the applied config-fix commits, the fingerprint re-hash, and the
+      cap-exhaustion outcome.
     *model* is the name of the model used for the audit (e.g.,
       ``"opencode-go/deepseek-v4-flash"``). When not provided, no model
       line is emitted (backward compatibility). When provided as ``None``
@@ -3518,6 +3547,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     cq_findings = code_quality_findings or []
     cq_fixes = code_quality_fixes_applied
     fp_results = fp_screen_results or []
+    rem = remediation_results or {}
 
     if code_quality_skipped_reason:
         lines.append(f"Code quality check skipped: {code_quality_skipped_reason}")
@@ -3580,6 +3610,30 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                     f"{e.get('classification', '?')} | "
                     f"{e.get('justification', '')} |"
                 )
+
+    # Remediation loop section (SA-0MST01OIN008MXYT / F2): applied
+    # config-fix commits + fingerprint re-hash + cap-exhaustion outcome.
+    # Rendered outside the findings branch so a successful remediation
+    # (which clears the findings) still surfaces the loop record.
+    if rem.get("iterations") or rem.get("exhausted"):
+        lines.append("")
+        lines.append("#### Remediation loop")
+        lines.append("")
+        lines.append(
+            f"Config-fix iterations: {rem.get('iterations', 0)} / "
+            f"{rem.get('max_iterations', REMEDIATION_MAX_ITERATIONS_DEFAULT)}"
+        )
+        if rem.get("exhausted"):
+            lines.append(
+                f"**Cap exhausted — persisting findings remain blocking "
+                f"'genuine' ({REMEDIATION_EXHAUSTED_ANNOTATION}).**"
+            )
+        for c in rem.get("commits", []):
+            fp_after = c.get("fingerprint_after") or "unavailable"
+            lines.append(
+                f"- Commit {c.get('sha') or 'n/a'} ({c.get('file', '?')}) "
+                f"— fingerprint re-hashed after commit: {fp_after}"
+            )
 
     lines.append("")
     return "\n".join(lines)
@@ -4503,6 +4557,7 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
                       code_quality_findings: list[dict] | None = None,
                       code_quality_fixes_applied: int = 0,
                       fp_screen_results: list[dict] | None = None,
+                      remediation_results: dict | None = None,
                       phase2_completed: bool = False,
                       phase2_skip_note: str | None = None) -> dict:
     """Build structured JSON payload for issue-mode audit.
@@ -4605,6 +4660,7 @@ def _build_issue_json(issue: dict, ac_results: list[dict],
                 }
                 for e in (fp_screen_results or [])
             ],
+            "remediation": (remediation_results or {}),
         },
         "pipeline": {
             "phase1_completed": True,
@@ -5511,6 +5567,7 @@ class _AuditContext:
     cq_fixes_applied: int = 0
     cq_skipped_reason: str | None = None
     fp_screen_results: list = field(default_factory=list)
+    remediation_results: dict = field(default_factory=dict)
     ac_results: list = field(default_factory=list)
     child_results: list = field(default_factory=list)
     ac_fallback_used: threading.Event = field(default_factory=threading.Event)
@@ -5994,6 +6051,167 @@ def _effective_blocking_findings(cq_findings: list[dict],
     return blocking
 
 
+def _default_max_remediation_iterations() -> int:
+    """Resolve the config-fix iteration cap (env-configurable, T2 AC5).
+
+    ``AUDIT_REMEDIATION_MAX_ITERATIONS`` overrides the default 3; invalid
+    values (non-int, zero, negative) fail closed to the default.
+    """
+    try:
+        value = int(os.environ.get(AUDIT_REMEDIATION_MAX_ITERATIONS_ENV, ""))
+    except (TypeError, ValueError):
+        return REMEDIATION_MAX_ITERATIONS_DEFAULT
+    return value if value > 0 else REMEDIATION_MAX_ITERATIONS_DEFAULT
+
+
+def _commit_config_remediation(runner: Runner, config_path: Path,
+                               project_root: Path) -> str | None:
+    """Commit the applied ruff config fix locally (no push). T2 AC3.
+
+    Stages only the config file and commits with
+    ``REMEDIATION_COMMIT_MESSAGE``. Returns the short commit sha, or None
+    when the commit failed (nothing to commit, git error).
+    """
+    try:
+        rel = config_path.relative_to(project_root)
+    except ValueError:
+        rel = config_path
+    try:
+        runner(["git", "add", "--", str(rel)])
+        proc = runner(["git", "commit", "-m", REMEDIATION_COMMIT_MESSAGE])
+        if getattr(proc, "returncode", 0) != 0:
+            return None
+        head = runner(["git", "rev-parse", "--short", "HEAD"])
+        sha = getattr(head, "stdout", "").strip()
+        return sha or None
+    except Exception:  # noqa: BLE001 -- remediation must never crash the audit
+        return None
+
+
+def _run_remediation_loop(
+    issue_id: str,
+    cq_findings: list[dict],
+    fp_screen_results: list[dict],
+    runner: Runner,
+    pi_bin: str,
+    resolved_model: str,
+    debug_log: str | None,
+    timeout: int | None,
+    ac_fallback_used: threading.Event,
+    project_root: Path,
+    worklog_dir: str | None,
+    work_item: dict,
+    content_fingerprint: str | None,
+) -> dict:
+    """Confident-false-positive config remediation loop (F2 scope).
+
+    For each remediable (confident-false-positive critical/high) ruff
+    finding the loop: applies a MINIMAL per-file-ignores config edit
+    (``apply_ruff_remediation``), commits it locally (no push), recomputes
+    the content fingerprint AFTER the commit (working tree clean), re-runs
+    the scoped code-quality scan ONLY (``fix=False``, same changed-file
+    scoping — the pipeline is never restarted), and re-classifies remaining
+    ruff findings via the screen. Capped at
+    ``_default_max_remediation_iterations()`` iterations per audit run.
+
+    Uncertain findings never enter the loop (no config edit, no commit —
+    T2 AC6). A finding still persisting after the cap is demoted to
+    blocking ``genuine`` annotated ``REMEDIATION_EXHAUSTED_ANNOTATION``
+    (T2 AC5).
+
+    Returns a results dict (also the source of truth for the report):
+      ``{"iterations", "max_iterations", "exhausted", "commits":
+        [{"sha", "file", "fingerprint_after"}], "fingerprint_before",
+        "fingerprint_after", "cq_findings", "fp_screen_results"}``
+    """
+    max_iterations = _default_max_remediation_iterations()
+    results: dict = {
+        "iterations": 0,
+        "max_iterations": max_iterations,
+        "exhausted": False,
+        "commits": [],
+        "fingerprint_before": content_fingerprint,
+        "fingerprint_after": content_fingerprint,
+        "cq_findings": cq_findings,
+        "fp_screen_results": fp_screen_results,
+    }
+    try:
+        from skill.code_review.scripts.code_quality import run_code_quality
+        from skill.code_review.scripts.linter_runner import (
+            apply_ruff_remediation,
+            locate_ruff_config,
+        )
+    except ImportError:
+        # Remediation tooling unavailable — nothing to remediate.
+        return results
+
+    iteration = 0
+    while iteration < max_iterations:
+        targets = [
+            e for e in results["fp_screen_results"] if e.get("remediable")
+        ]
+        if not targets:
+            break
+        config_path = locate_ruff_config(project_root)
+        if not apply_ruff_remediation(config_path, targets):
+            # Nothing to add — the config cannot silence these findings.
+            results["exhausted"] = True
+            break
+        sha = _commit_config_remediation(runner, config_path, project_root)
+        new_fp = _compute_content_fingerprint(
+            runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
+        )
+        results["commits"].append({
+            "sha": sha,
+            "file": str(config_path),
+            "fingerprint_after": new_fp,
+        })
+        # Re-run the code-quality scan ONLY (no phase re-entry): same
+        # scoped changed-file list, fix=False (T2 AC4).
+        cq_scope_files = _git_changed_files(runner)
+        try:
+            cq_result = run_code_quality(
+                project_root=project_root, runner=runner, fix=False,
+                files=cq_scope_files or None,
+            )
+            if cq_result.get("success", False):
+                results["cq_findings"] = cq_result.get("findings", [])
+        except Exception as exc:  # noqa: BLE001 -- scan failure keeps prior findings
+            print(
+                f"Warning: remediation re-scan failed: {exc} — "
+                "keeping prior findings.",
+                file=sys.stderr,
+            )
+        # Re-classify remaining ruff findings via the screen.
+        results["fp_screen_results"] = _screen_ruff_findings(
+            issue_id, results["cq_findings"], pi_bin, resolved_model,
+            debug_log, timeout, ac_fallback_used,
+        )
+        results["fingerprint_after"] = new_fp
+        iteration += 1
+
+    results["iterations"] = iteration
+    if (
+        iteration >= max_iterations
+        and any(e.get("remediable") for e in results["fp_screen_results"])
+    ):
+        # Cap exhaustion: the finding persists after max iterations.
+        results["exhausted"] = True
+    if results.get("exhausted"):
+        # Persisting remediable findings become blocking 'genuine' with the
+        # exhaustion annotation (T2 AC5) — never silently suppressed.
+        for e in results["fp_screen_results"]:
+            if e.get("remediable"):
+                e["classification"] = "genuine"
+                e["remediable"] = False
+                e["remediation_exhausted"] = True
+                e["justification"] = (
+                    f"{e.get('justification', '')} — "
+                    f"{REMEDIATION_EXHAUSTED_ANNOTATION}"
+                ).strip(" —")
+    return results
+
+
 def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     """Phase 2 — fetch the item + children, capture the content fingerprint,
     run the scoped code-quality scan, and extract the acceptance criteria.
@@ -6108,6 +6326,38 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
             e for e in entries if e.get("finding", {}).get("linter") == "ruff"
         ]
 
+    # ------------------------------------------------------------------
+    # Config remediation loop (SA-0MST01OIN008MXYT / F2): confident-
+    # false-positive critical/high ruff findings get a MINIMAL per-file-
+    # ignores config edit, committed locally (no push), with the content
+    # fingerprint re-hashed and the scoped code-quality scan re-run ONLY
+    # (the pipeline is not restarted). Capped at N iterations; findings
+    # persisting past the cap stay blocking genuine with the exhaustion
+    # annotation. Uncertain findings never enter the loop.
+    # ------------------------------------------------------------------
+    remediation_results = _run_remediation_loop(
+        issue_id=issue_id,
+        cq_findings=cq_findings,
+        fp_screen_results=fp_screen_results,
+        runner=runner,
+        pi_bin=ctx.pi_bin,
+        resolved_model=ctx.resolved_model,
+        debug_log=ctx.debug_log,
+        timeout=ctx.timeout,
+        ac_fallback_used=ctx.ac_fallback_used,
+        project_root=TARGET_PROJECT_ROOT,
+        worklog_dir=worklog_dir,
+        work_item=work_item,
+        content_fingerprint=content_fingerprint,
+    )
+    cq_findings = remediation_results.get("cq_findings", cq_findings)
+    fp_screen_results = remediation_results.get(
+        "fp_screen_results", fp_screen_results
+    )
+    content_fingerprint = remediation_results.get(
+        "content_fingerprint", content_fingerprint
+    )
+
     ctx.work_item = work_item
     ctx.children = children
     ctx.description = description
@@ -6116,6 +6366,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     ctx.cq_fixes_applied = cq_fixes_applied
     ctx.cq_skipped_reason = cq_skipped_reason
     ctx.fp_screen_results = fp_screen_results
+    ctx.remediation_results = remediation_results
     ctx.acs = acs
     return None
 
@@ -7086,6 +7337,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 code_quality_fixes_applied=cq_fixes_applied,
                 code_quality_skipped_reason=cq_skipped_reason,
                 fp_screen_results=ctx.fp_screen_results,
+                remediation_results=ctx.remediation_results,
                 model=resolved_model,
                 model_source=model_source,
                 phase2_completed=phase2_completed,
@@ -7118,6 +7370,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 code_quality_findings=cq_findings,
                 code_quality_fixes_applied=cq_fixes_applied,
                 fp_screen_results=ctx.fp_screen_results,
+                remediation_results=ctx.remediation_results,
                 phase2_completed=phase2_completed,
                 phase2_skip_note=phase2_skip_note,
             )
