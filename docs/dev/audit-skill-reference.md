@@ -185,24 +185,42 @@ for each `wl` command:
    git root, or nearest ancestor.
 4. No flag — `wl` resolves from cwd.
 
-**Fail-fast launch context (LP-0MSQ32HNR007AI6B):** while `wl` resolution is
-cwd-independent, the *project scope* is not — `TARGET_PROJECT_ROOT` (the
-git root of the launch cwd) is the repository Phase 1/2 target. An audit
-MUST be launched from the project root that owns the work item. Before any
-phase runs (and before any pi/model call) the runner verifies:
+**Fail-fast launch context (LP-0MSQ32HNR007AI6B):** the *project scope* has
+two independent axes. The **launch-context guard** still checks the launch
+cwd: ``TARGET_PROJECT_ROOT`` (the git root of the launch cwd) must own the
+item or be a worktree of the owning project. But the runner's **git-derived
+content now follows the worklog** (SA-0MSLLGDW00098UCC): the file-scope
+manifest (changed-file list + repo index), HEAD attestations, working-tree
+hashes, and ``--green-run`` evidence resolve against the worklog-derived
+owning project root (``--worklog-dir`` parent, else prefix-to-sibling
+scan) — NOT the launch cwd. Before any phase runs (and before any pi/model
+call) the runner verifies:
 
 1. **Owning project** — the item's id prefix resolves to its owning project
-   via the prefix-to-sibling scan (explicit `--worklog-dir` takes
+   via the prefix-to-sibling scan (explicit ``--worklog-dir`` takes
    precedence: its parent is the expected project). A launch from a
    non-owning checkout aborts with `Error: Audit launch-context error:` and
    a non-zero exit — zero pi calls, no status lifecycle. A worktree of the
-   owning project counts as owning.
-2. **FILE SCOPE manifest** — before Phase 1 and again before Phase 2, the
+   owning project counts as owning (same git repository). When the owning
+   project root cannot be determined (no ``--worklog-dir``, unknown item
+   prefix, no sibling match), the run aborts with `Error: Undeterminable
+   project scope: ...` before any phase runs — never a silent fallback to
+   the launch cwd's repository for git-derived content.
+2. **Git scope follows the worklog** — every git command issued by the
+   runner targets the worklog-derived owning root (`git -C <owning_root>`
+   when it differs from the launch root), so launching from any cwd audits
+   the owning project's repository. A launch from the owning project — or a
+   worktree of it (same git repository) — keeps git resolving to that
+   checkout (byte-identical commands), so worktree-only changes and the
+   worktree branch HEAD stay correct. The remaining ``TARGET_PROJECT_ROOT``
+   consumers (code-quality scan and debug-log path) are still
+   launch-cwd-bound.
+3. **FILE SCOPE manifest** — before Phase 1 and again before Phase 2, the
    manifest must reference the item repository's files; a manifest built
    from the audit skill's own tree (or lacking the item repo) aborts with
    `Error: Audit scope error:` and a non-zero exit instead of emitting
    misleading "unmet" verdicts.
-3. **Child persistence** — a child audit that cannot be persisted
+4. **Child persistence** — a child audit that cannot be persisted
    (`wl audit-set` rc!=0, e.g. "Work item not found") aborts the run with a
    non-zero exit; `PERSIST_CONTENT_INVALID` (fallback notice persisted)
    remains a warning (the child audit is usable).
@@ -214,9 +232,13 @@ cd /path/to/owning-project
 python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN --do-not-persist
 ```
 
-`--worklog-dir` does NOT change the project scope; only the launch
-directory does. If auto-resolution cannot determine the target store while
-launching from the owning project root, pass an explicit dir:
+The runner is cwd-independent for both `wl` resolution and git-derived
+content: launching from any directory (e.g. the skill install dir) with
+`--worklog-dir` pointing at the audited project audits that project's
+repository. Only the remaining `TARGET_PROJECT_ROOT` consumers (code-quality
+scan, debug-log path) stay launch-cwd-bound. If auto-resolution cannot
+determine the target store while launching from the owning project root,
+pass an explicit dir:
 
 ```bash
 python3 <framework>/skill/audit/scripts/audit_runner.py issue OSL-0MSABC7SB001NVUN \

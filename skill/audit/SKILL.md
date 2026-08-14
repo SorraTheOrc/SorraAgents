@@ -74,8 +74,21 @@ the runner verifies the launch context:
 A mis-scoped audit is indistinguishable from a failed audit, so it MUST fail
 fast (seconds, no pi calls) rather than waste model time. To re-launch
 correctly, cd into the owning project root (a worktree of the owning project
-counts as owning). `--worklog-dir` does not change the project scope; only
-the launch directory does.
+counts as owning).
+
+**Git scope follows the worklog (SA-0MSLLGDW00098UCC).** The runner's
+git-derived content — the file-scope manifest (changed-file list + repo
+index), HEAD attestations, working-tree hashes, and `--green-run` evidence
+— resolves against the **worklog-derived owning project root**
+(`--worklog-dir` parent, else prefix-to-sibling scan), not the launch cwd.
+Launching from any cwd, the git-derived content reflects the audited
+project's repository, and an undeterminable owning root aborts with
+`Error: Undeterminable project scope: ...` before any phase runs (never a
+silent fallback to the launch cwd's repo). Launching from inside the
+owning project — or a worktree of it (same git repository) — keeps git
+resolving to that checkout, so worktree-only changes and the worktree
+branch HEAD stay correct. The remaining `TARGET_PROJECT_ROOT` consumers
+(code-quality scan and debug-log path) are still launch-cwd-bound.
 
 ## Monitored Run Execution
 
