@@ -332,6 +332,25 @@ Per-call timing: issue_id=<id> context=<context> elapsed_seconds=<seconds>
 
 where `<context>` is the call type (e.g. `parent`, `phase2_deep`, `phase2_child:<i>`, `child:<id>`, `project`). This establishes a performance baseline for Phase 2 deep analysis (N+1 sequential agent-mode calls: one parent + one per active child) and makes regressions visible. The same `elapsed_seconds` value is written into `--debug-log` JSONL entries alongside `issue_id`, `context`, and `provider_error`.
 
+**Per-AC latency (Phase 2, LP-0MSQ32WM5000NCB7):** Phase-2 call sites pass the AC count to `_call_pi_and_maybe_log`, so the timing line additionally surfaces per-AC latency for the deep-analysis contexts (`phase2_deep`, `phase2_child:<i>`, `phase2_batch`):
+
+```text
+Per-call timing: issue_id=<id> context=phase2_deep elapsed_seconds=<seconds> input_tokens=<tokens> ac_count=<N> avg_ac_elapsed_seconds=<seconds/N>
+```
+
+- `ac_count=<N>` — number of acceptance criteria covered by the call (`len(ac_results)` for the parent, `len(child_acs)` per child, total indexed AC count for the batch).
+- `avg_ac_elapsed_seconds=<elapsed/N>` — elapsed seconds divided by the AC count, so per-AC latency regressions are visible even when AC counts vary between runs.
+- A count of 0 is emitted as `ac_count=0` with no avg field (no division by zero); a missing count (non-Phase-2 contexts) keeps the legacy format byte-for-byte.
+- Debug-log JSONL entries are unaffected — the extension is timing-line only.
+
+**Evidence-scope cap (Phase 2, LP-0MSQ32WM5000NCB7):** the parent/child/batch deep prompts instruct the model to cite **at most N file:line references per criterion, minimum 1** (prompt-level only; parsed evidence/verdicts are never mutated, so verdict semantics and the canonical report format are unchanged). This bounds evidence-JSON generation — the dominant Phase 2 cost (Phase 2 is 66% of audit model time on inputs of only ~0.5–2.5K tokens) — without changing the model. Resolution precedence (config contract):
+
+1. `--max-citations-per-ac N` CLI flag (issue and project subcommands; highest)
+2. `audit.max_citations_per_ac` key in the CWD `.ralph.json` / `ralph.config.json` (dotted form, or nested `audit: {max_citations_per_ac: N}`)
+3. hardcoded default `_DEFAULT_MAX_CITATIONS_PER_AC` = 5
+
+Invalid values (0, negative, non-int) fail closed to the default with a warning (mirrors `_resolve_max_child_audits`). **Trade-off:** a smaller cap shortens deep analysis but narrows evidence breadth; the ≥1 file:line floor keeps every verdict substantiated. The benchmark `skill/audit/tests/test_audit_runner_phase2_benchmark.py` (`@pytest.mark.benchmark`, opt-in via `AUDIT_RUN_BENCHMARKS=1`) measures the median `phase2_deep` latency reduction against the 2026-08-12 baseline (median 1324 s of 1537/1324/903; threshold 927 s = 0.70×).
+
 **File-scope manifest (Phase 2):** Each Phase 2 prompt (parent `phase2_deep` and every child `phase2_child:<i>`) now includes a **FILE SCOPE** section built from the work item's **Key Files** section, the **git changed-file list** (`git diff --name-only HEAD` + `git status --porcelain`), **Phase 1 evidence file:line references** (so the model verifies named files rather than re-discovering them), and a lightweight **repository index** (top-level layout with file counts). The prompt instructs the model to read ONLY in-scope files and to avoid unbounded `find`/`grep -r`/`ls -R` exploration. This bounds the dominant Phase 2 cost (unbounded repo exploration) without changing verdict semantics. If git is unavailable, the manifest degrades gracefully to the Key Files/evidence/index entries that can still be determined. See `docs/dev/audit-phase2-performance-evaluation.md` (SA-0MSAHR63100415PM) for the underlying evaluation.
 
 **Low-risk/small-item skip (Phase 2, SA-0MSQ026T3009QY2L):** When a work item has `effort` ∈ {Extra Small, Small} **and** `risk` = Low (the first-class fields populated by the effort-and-risk skill), Phase 2 deep code analysis is skipped — Phase 1 verdicts stand unchanged (`met` remains `met`) and the AC evidence notes the skip reason (e.g. `Phase 2 deep analysis skipped (effort=Small, risk=Low): small, low-risk item per SA-0MSQ026T3009QY2L. Phase 1 verdict stands.`). The runner prints a diagnostic when the skip applies (e.g. `Skipping Phase 2 deep analysis: effort=Small, risk=Low. Phase 1 verdicts stand unchanged.`) and the report summary records the skip via `phase2_skip_note` instead of claiming deep analysis completed. Key semantics:
