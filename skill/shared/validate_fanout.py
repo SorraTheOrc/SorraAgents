@@ -176,6 +176,11 @@ def run_batch(worklog_dir: Path, ids: list[str], pi_bin: Path, max_concurrency: 
                 [
                     sys.executable, str(AUDIT_RUNNER), "issue", wid,
                     "--pi-bin", str(pi_bin), "--do-not-persist",
+                    # Explicit worklog-dir (the .worklog store) so ownership
+                    # resolves to the throwaway project (SA-0MSLLGDW00098UCC
+                    # AC2: ownership must be determinable; the tmp project is
+                    # not a sibling under SIBLING_SCAN_ROOT).
+                    "--worklog-dir", str(worklog_dir / ".worklog"),
                 ],
                 cwd=worklog_dir,
                 env=env,

@@ -599,6 +599,34 @@ def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=False, text=True, capture_output=True)
 
 
+def _cwd_aware_runner(git_root: Path,
+                      base_runner: Runner | None = None) -> Runner:
+    """Wrap *base_runner* so git commands resolve against *git_root*.
+
+    When *git_root* equals the launch cwd's project root
+    (``TARGET_PROJECT_ROOT``) — an owning-project or worktree launch — the
+    base runner is returned unchanged (commands pass through byte-identical;
+    zero regression for the standard path). When they differ (a non-owning
+    launch whose ownership was resolved from the worklog), every ``git``
+    command gets ``git -C <git_root>`` prepended so file-scope manifests,
+    HEAD shas, working-tree hashes, and green-run evidence resolve against
+    the owning project's repository — never the launch cwd's
+    (SA-0MSLLGDW00098UCC).
+    """
+    base = base_runner if base_runner is not None else _default_runner
+    launch_root = TARGET_PROJECT_ROOT.resolve()
+    git_root = git_root.resolve()
+    if git_root == launch_root:
+        return base
+
+    def _run(cmd: Sequence[str]) -> subprocess.CompletedProcess:
+        if cmd and cmd[0] == "git":
+            cmd = ["git", "-C", str(git_root)] + list(cmd[1:])
+        return base(cmd)
+
+    return _run
+
+
 def _extract_work_item_prefix(cmd: Sequence[str]) -> str | None:
     """Extract the work-item id prefix (e.g. ``OSL``) from a wl command.
 
@@ -5297,8 +5325,28 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
         return 1
 
     # Owning project root used by the Phase 1/2 FILE SCOPE manifest
-    # validation (resolved once; None → fail open).
+    # validation and as the git root for all runner-based git commands
+    # (resolved once; None → abort per AC2 — see below).
     owning_root = _resolve_owning_project_root(issue_id, worklog_dir=worklog_dir)
+    if owning_root is None:
+        # AC2 (SA-0MSLLGDW00098UCC): undeterminable ownership aborts. The
+        # git-derived content (file-scope manifest, HEAD sha, working-tree
+        # hash, green-run evidence) must resolve against the OWNING
+        # project's repository; with no --worklog-dir, an unknown prefix,
+        # and no sibling match, falling back to the launch cwd's repo would
+        # silently scope the audit to the wrong repository. Refuse.
+        error = (
+            f"Undeterminable project scope for work item {issue_id}: no "
+            f"--worklog-dir, unknown item prefix, and no sibling match. "
+            f"Refusing to fall back to the launch cwd's repository for "
+            f"git-derived content. Re-launch from the owning project or "
+            f"pass --worklog-dir."
+        )
+        if json_mode:
+            print(json.dumps({"error": error}, indent=2))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        return 1
 
     # Resolve the effective model from config + CLI
     config = _load_config()
@@ -5308,6 +5356,23 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
 
     if runner is None:
         runner = _default_runner
+
+    # Resolve the git root for every runner-based git command
+    # (SA-0MSLLGDW00098UCC): git-derived content must come from the OWNING
+    # project's repository — never the launch cwd's. The owning root is the
+    # default git root; when the launch cwd is the same git repository (a
+    # worktree of the owning project, or the owning project itself), keep
+    # the launch cwd so a worktree launch still resolves git to the
+    # worktree checkout (worktree branch HEAD and worktree-only changes
+    # stay correct — AC3). Then wrap the runner so every git call carries
+    # `git -C <git_root>` when git_root differs from the launch root (AC1)
+    # and stays byte-identical otherwise (zero regression for owning
+    # launches).
+    git_root = owning_root
+    if _same_git_repository(TARGET_PROJECT_ROOT, owning_root):
+        git_root = TARGET_PROJECT_ROOT
+    runner = _cwd_aware_runner(git_root, runner)
+    ctx.runner = runner
 
     # Resolve the operator-attested green test run (if any). The attestation
     # is external evidence: the runner NEVER executes the test suite itself
