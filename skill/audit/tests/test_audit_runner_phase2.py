@@ -289,6 +289,83 @@ class TestPhase2CitationCapPromptInjection:
         assert updated_acs[0]["evidence"] == "file.py:10"
         assert updated_acs[0]["text"] == "AC text"
 
+class TestPhase2AcCountThreading:
+    """F3-AC1/F4-AC1: the Phase-2 call sites pass the AC count so the
+    per-call timing line can surface per-AC latency (LP-0MSQ32WM5000NCB7)."""
+
+    def _make_issue(self, issue_id: str = "TEST-1") -> dict:
+        return {"id": issue_id, "title": "Test Issue"}
+
+    def _make_ac(self, index: int, text: str = "AC text",
+                  verdict: str = "met") -> dict:
+        return {"index": index, "text": text, "verdict": verdict, "evidence": ""}
+
+    def _make_child(self, child_id: str = "CHILD-1", ac_count: int = 1) -> dict:
+        return {
+            "id": child_id,
+            "title": "Child Issue",
+            "stage": "in_progress",
+            "status": "open",
+            "ac_results": [
+                {"index": i, "text": f"Child AC {i}", "verdict": "met", "evidence": ""}
+                for i in range(ac_count)
+            ],
+        }
+
+    def test_parent_call_passes_ac_count(self):
+        """AC1: the phase2_deep call passes ac_count=len(ac_results)."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0), self._make_ac(1)]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(issue, acs, [], "test-model")
+        parent_calls = [
+            c for c in mock_call.call_args_list if c.args[1] == "phase2_deep"
+        ]
+        assert len(parent_calls) == 1
+        assert parent_calls[0].kwargs.get("ac_count") == 2
+
+    def test_child_call_passes_ac_count(self):
+        """AC1: the phase2_child call passes ac_count=len(child_acs)."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0)]
+        child = self._make_child("CHILD-1", ac_count=3)
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": "[]"},
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(issue, acs, [child], "test-model")
+        child_calls = [
+            c for c in mock_call.call_args_list if c.args[1] == "phase2_child:0"
+        ]
+        assert len(child_calls) == 1
+        assert child_calls[0].kwargs.get("ac_count") == 3
+
+    def test_batch_call_passes_total_ac_count(self):
+        """AC1: the phase2_batch call passes the total AC count (parent + children)."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0), self._make_ac(1)]  # 2 parent ACs
+        child = self._make_child("CHILD-1", ac_count=1)  # 1 child AC
+        batch_result = {
+            "extracted_text": json.dumps([
+                {"index": 0, "verdict": "met", "evidence": "p0"},
+                {"index": 1, "verdict": "met", "evidence": "p1"},
+                {"index": 2, "verdict": "met", "evidence": "c0"},
+            ]),
+        }
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", return_value=batch_result,
+        ) as mock_call:
+            audit_runner._run_phase2_deep_analysis(
+                issue, acs, [child], "test-model", batch_phase2=True,
+            )
+        assert mock_call.call_count == 1
+        context = mock_call.call_args.args[1]
+        assert context == "phase2_batch"
+        assert mock_call.call_args.kwargs.get("ac_count") == 3
+
 class TestPhase2TimeoutHandling:
     """Tests for Phase 2 graceful timeout handling (AC1-AC3)."""
 
@@ -536,7 +613,7 @@ class TestPhase2FileScopeManifest:
         """Return a side_effect that matches _call_pi_and_maybe_log's signature."""
         def _side_effect(issue_id, context, prompt, model="m", pi_bin="pi",
                          debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                         ac_fallback_used=None):
+                         ac_fallback_used=None, ac_count=None):
             captured["prompt"] = prompt
             return {"extracted_text": "[]"}
         return _side_effect
@@ -653,7 +730,7 @@ class TestPhase2FileScopeManifest:
 
         def _fake_call(issue_id, context, prompt, model="m", pi_bin="pi",
                        debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                       ac_fallback_used=None):
+                       ac_fallback_used=None, ac_count=None):
             prompts.append(prompt)
             return {"extracted_text": "[]"}
 
@@ -920,7 +997,7 @@ class TestPhase2ParallelChildCalls:
 
         def _slow_call(issue_id, context, prompt, model="m", pi_bin="pi",
                        debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                       ac_fallback_used=None):
+                       ac_fallback_used=None, ac_count=None):
             if context.startswith("phase2_child"):
                 started.wait(timeout=5)  # raises BrokenBarrierError if not concurrent
             return {"extracted_text": "[]"}
@@ -955,7 +1032,7 @@ class TestPhase2ParallelChildCalls:
 
         def _ordered_call(issue_id, context, prompt, model="m", pi_bin="pi",
                           debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                          ac_fallback_used=None):
+                          ac_fallback_used=None, ac_count=None):
             if context.startswith("phase2_child"):
                 call_order.append(issue_id)
             return {"extracted_text": "[]"}
@@ -1039,7 +1116,7 @@ class TestPhase2ParallelChildCalls:
 
         def _recording_call(issue_id, context, prompt, model="m", pi_bin="pi",
                             debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                            ac_fallback_used=None):
+                            ac_fallback_used=None, ac_count=None):
             call_ids.append(issue_id)
             return {"extracted_text": "[]"}
 
@@ -1065,7 +1142,7 @@ class TestPhase2ParallelChildCalls:
 
         def _call_with_timeout(issue_id, context, prompt, model="m", pi_bin="pi",
                                debug_log=None, enable_tools=False, timeout=None, max_retries=None,
-                               ac_fallback_used=None):
+                               ac_fallback_used=None, ac_count=None):
             if issue_id == "C-1":
                 return {"_timeout": True, "verdict": "unmet",
                         "evidence": "timed out", "extracted_text": ""}
@@ -1247,7 +1324,7 @@ class TestPhase2RetryTuning:
         def _provider_error_call(issue_id, context, prompt, model="m",
                                  pi_bin="pi", debug_log=None,
                                  enable_tools=False, timeout=None,
-                                 max_retries=None, ac_fallback_used=None):
+                                 max_retries=None, ac_fallback_used=None, ac_count=None):
             if context.startswith("phase2_child"):
                 return {
                     "verdict": "unmet",

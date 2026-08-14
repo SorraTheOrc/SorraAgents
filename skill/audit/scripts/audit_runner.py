@@ -3732,7 +3732,8 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
                            timeout: int | None = None,
                            max_retries: int | None = None,
                            ac_fallback_used: threading.Event | None = None,
-                           child_screen: bool = False) -> dict:
+                           child_screen: bool = False,
+                           ac_count: int | None = None) -> dict:
     """Call _call_pi and optionally write debug information to a log.
 
     Args:
@@ -3751,6 +3752,12 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         child_screen: If True, forwards to _call_pi() so child Phase-1
             AC-review screens use the short per-call budget
             (LP-0MSQ32S2M001EA74 AC1).
+        ac_count: Number of acceptance criteria covered by this call. When
+            supplied, the per-call timing line appends ``ac_count=N`` and
+            ``avg_ac_elapsed_seconds`` (elapsed / N) so Phase-2 per-AC
+            latency is visible and regressions surface (LP-0MSQ32WM5000NCB7
+            F4 AC1). A count of 0 is emitted without the avg field; a
+            missing count keeps the legacy timing format byte-for-byte.
 
         # Context reduction: every forwarded pi call runs with
         ``--no-context-files --no-skills`` (see _call_pi) so audit sessions
@@ -3769,7 +3776,9 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
     # measurable and regressions are visible without a debug log. When the pi
     # stream reported usage, the initial input-token count is appended so the
     # context-reduction bound (<10K tokens, SA-0MSISKM8F004NW1U AC2) is
-    # verifiable from the timing line alone.
+    # verifiable from the timing line alone. Phase-2 call sites additionally
+    # pass an AC count so the line surfaces per-AC latency
+    # (``ac_count`` + ``avg_ac_elapsed_seconds``, LP-0MSQ32WM5000NCB7 F4).
     elapsed = result.get("elapsed_seconds")
     if elapsed is not None:
         timing = (
@@ -3779,6 +3788,12 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
         input_tokens = result.get("input_tokens")
         if input_tokens is not None:
             timing += f" input_tokens={input_tokens}"
+        if ac_count is not None:
+            timing += f" ac_count={ac_count}"
+            if ac_count > 0:
+                timing += (
+                    f" avg_ac_elapsed_seconds={float(elapsed) / ac_count:.2f}"
+                )
         print(timing, file=sys.stderr)
 
     # Decide whether to write a debug line
@@ -4549,6 +4564,7 @@ def _deep_analyze_child(
             enable_tools=True, timeout=timeout,
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
+            ac_count=len(child_acs),
         )
     except RuntimeError:
         return ci, child, False
@@ -4791,6 +4807,7 @@ def _run_batch_phase2(
             enable_tools=True, timeout=timeout,
             max_retries=_PHASE2_MAX_RETRIES,
             ac_fallback_used=ac_fallback_used,
+            ac_count=len(ac_list),
         )
     except RuntimeError:
         return None
@@ -5037,6 +5054,7 @@ def _run_phase2_deep_analysis(
                 enable_tools=True, timeout=timeout,
                 max_retries=_PHASE2_MAX_RETRIES,
                 ac_fallback_used=ac_fallback_used,
+                ac_count=len(ac_results),
             )
         except RuntimeError as exc:
             # Phase 2 failure is non-fatal; log and fall back to Phase 1 results

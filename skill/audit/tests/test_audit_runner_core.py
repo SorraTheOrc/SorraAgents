@@ -648,6 +648,84 @@ class TestCallPiAndMaybeLogTiming:
         assert entry["context"] == "phase2_child:0"
         assert entry["elapsed_seconds"] == 5.5
 
+class TestCallPiAcCountTiming:
+    """F3-AC1/AC2/AC3/AC4: per-AC latency breakdown on the timing line.
+
+    Phase-2 call sites pass an AC count so the ``Per-call timing:`` line
+    surfaces ``ac_count`` and ``avg_ac_elapsed_seconds``; non-phase-2
+    contexts (or no count supplied) keep the existing format byte-for-byte;
+    a 0/missing count never divides by zero (LP-0MSQ32WM5000NCB7 F4).
+    """
+
+    def test_phase2_context_emits_ac_count_and_avg(self, capsys):
+        """AC1: ac_count=N and avg_ac_elapsed_seconds appear on the timing line."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "met", "evidence": "ok", "elapsed_seconds": 12.0,
+            }
+            audit_runner._call_pi_and_maybe_log(
+                "SA-123", "phase2_deep", "prompt", ac_count=2,
+            )
+        captured = capsys.readouterr()
+        assert "ac_count=2" in captured.err
+        assert "avg_ac_elapsed_seconds=6.00" in captured.err  # 12.0 / 2
+
+    def test_non_phase2_context_keeps_legacy_format(self, capsys):
+        """AC2: no ac_count supplied -> byte-identical legacy timing line."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "met", "evidence": "ok", "elapsed_seconds": 3.5,
+            }
+            audit_runner._call_pi_and_maybe_log("SA-123", "parent", "prompt")
+        captured = capsys.readouterr()
+        assert "ac_count" not in captured.err
+        assert "avg_ac_elapsed_seconds" not in captured.err
+        assert "elapsed_seconds=3.50" in captured.err
+
+    def test_zero_ac_count_no_division_by_zero(self, capsys):
+        """AC3: ac_count=0 never divides by zero; the avg field is omitted."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "met", "evidence": "ok", "elapsed_seconds": 4.0,
+            }
+            audit_runner._call_pi_and_maybe_log(
+                "SA-123", "phase2_batch", "prompt", ac_count=0,
+            )
+        captured = capsys.readouterr()
+        assert "ac_count=0" in captured.err
+        assert "avg_ac_elapsed_seconds" not in captured.err
+
+    def test_missing_ac_count_keeps_legacy_format(self, capsys):
+        """AC2/AC3: ac_count omitted (None) -> legacy format, no crash."""
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "met", "evidence": "ok", "elapsed_seconds": 2.25,
+            }
+            audit_runner._call_pi_and_maybe_log("SA-123", "phase1", "prompt")
+        captured = capsys.readouterr()
+        assert "ac_count" not in captured.err
+        assert "avg_ac_elapsed_seconds" not in captured.err
+
+    def test_debug_log_entry_unchanged_by_ac_count(self, tmp_path):
+        """AC4: debug-log entry fields are unaffected by the timing extension."""
+        log = tmp_path / "debug.jsonl"
+        with mock.patch.object(audit_runner, "_call_pi") as mock_call:
+            mock_call.return_value = {
+                "verdict": "unmet", "evidence": "", "raw_stdout": "raw",
+                "elapsed_seconds": 5.5,
+            }
+            audit_runner._call_pi_and_maybe_log(
+                "SA-123", "phase2_deep", "prompt", debug_log=str(log), ac_count=3,
+            )
+        lines = log.read_text().strip().splitlines()
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry["issue_id"] == "SA-123"
+        assert entry["context"] == "phase2_deep"
+        assert entry["elapsed_seconds"] == 5.5
+        assert "ac_count" not in entry
+        assert "avg_ac_elapsed_seconds" not in entry
+
 class TestInputTokensCapture:
     """Tests for input-token capture (SA-0MSISKM8F004NW1U AC2).
 
