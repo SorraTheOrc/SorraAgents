@@ -250,6 +250,13 @@ FP_SCREEN_FAILED_JUSTIFICATION = (
 )
 """Justification recorded when the whole screen degrades (T1 AC2)."""
 
+FP_CHORE_ANNOTATION = FP_CANDIDATE_ANNOTATION
+"""Annotation for medium/low confident-false-positive tracking chores.
+
+The chore links the finding for a producer decision but carries NO commit
+link (no config change happened — SA-0MST01PQQ009T0CI AC2).
+"""
+
 FP_SCREEN_MISSING_JUSTIFICATION = (
     "Finding missing from the screen response — defaulted to uncertain "
     "(caution-first)."
@@ -3615,7 +3622,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     # config-fix commits + fingerprint re-hash + cap-exhaustion outcome.
     # Rendered outside the findings branch so a successful remediation
     # (which clears the findings) still surfaces the loop record.
-    if rem.get("iterations") or rem.get("exhausted"):
+    if (rem.get("iterations") or rem.get("exhausted")
+            or rem.get("chore_items") or rem.get("chore_failures")):
         lines.append("")
         lines.append("#### Remediation loop")
         lines.append("")
@@ -3634,6 +3642,27 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(
                 f"- Commit {c.get('sha') or 'n/a'} ({c.get('file', '?')}) "
                 f"— {change}; fingerprint re-hashed after commit: {fp_after}"
+            )
+        for ci in rem.get("chore_items", []):
+            commit_ref = ci.get("commit_sha")
+            if commit_ref:
+                lines.append(
+                    f"- Chore work item {ci.get('id', '?')} tracks the "
+                    f"config fix (commit {commit_ref})"
+                )
+            else:
+                lines.append(
+                    f"- Chore work item {ci.get('id', '?')} tracks a "
+                    f"medium/low false positive — {FP_CHORE_ANNOTATION}"
+                )
+        for f in rem.get("chore_failures", []):
+            ref = (f.get("change")
+                   or (f.get("finding", {}).get("code", "?") if isinstance(
+                       f.get("finding"), dict) else "?"))
+            lines.append(
+                f"- ⚠ Chore tracking failed ({f.get('error', '')}) — "
+                f"{ref}; the commit stands, the finding stays blocking "
+                f"'genuine'"
             )
 
     lines.append("")
@@ -5973,7 +6002,9 @@ def _screen_ruff_findings(issue_id: str, findings: list[dict],
     ])
     prompt = (
         "[READ-ONLY AUDIT] You are performing a read-only audit. "
-        "Do NOT close, modify, create, or delete any work items. "
+        "Do NOT close, modify, or delete any work items; you MAY create "
+        "a chore work item to track a false-positive finding (config-fix "
+        "remediation). "
         "Do NOT execute any wl, git, or other state-modifying commands. "
         "Return ONLY a structured JSON array.\n\n"
         "Classify each ruff lint finding below as either 'genuine' (a real "
@@ -6115,6 +6146,51 @@ def _fp_remediation_change_summary(targets: list[dict]) -> str:
     ) or "per-file-ignores"
 
 
+def _create_chore_item(runner: Runner, *, title: str, description: str,
+                       worklog_dir: str | None) -> str | None:
+    """Create a ``chore`` work item via ``wl create`` (F3 scope).
+
+    Dispatches through ``_run_wl`` so ``--worklog-dir`` resolves via
+    ``_resolve_worklog_flags`` (explicit dir / prefix-to-sibling — sibling
+    project audits create the chore in the owning project's worklog,
+    SA-0MST01PBJ008100Y AC5). Returns the new work-item id, or ``None``
+    when creation failed — the caller handles the failure fail-safely
+    (F3 AC5: the remediation commit still stands, the finding stays
+    blocking 'genuine', the failure is recorded in the report).
+    """
+    cmd = ["wl", "create", "--issue-type", "chore",
+           "--title", title, "--description", description, "--json"]
+    try:
+        data = _run_wl(runner, cmd, worklog_dir=worklog_dir)
+    except RuntimeError as exc:
+        print(f"Warning: chore-item creation failed: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict) or data.get("success") is False:
+        return None
+    wi = data.get("workItem", {})
+    if not isinstance(wi, dict):
+        return None
+    return wi.get("id") or None
+
+
+def _chore_description_for_fix(entries: list[dict], sha: str) -> str:
+    """Description for a config-fix chore: links each remediated false-
+    positive finding (file, rule, justification) and the local commit sha
+    (F3 AC1)."""
+    lines = []
+    for e in entries or []:
+        finding = e.get("finding", {}) if isinstance(e, dict) else {}
+        lines.append(
+            f"- {finding.get('code', '?')} in {finding.get('file', '?')}:"
+            f"{finding.get('line', 0)} — {e.get('justification', '')}"
+        )
+    body = "\n".join(lines) or "(no finding details)"
+    return (
+        "Ruff false positives remediated by a minimal per-file-ignores "
+        f"config fix.\n{body}\n\nSilenced by config commit {sha}."
+    )
+
+
 def _run_remediation_loop(
     issue_id: str,
     cq_findings: list[dict],
@@ -6149,7 +6225,9 @@ def _run_remediation_loop(
     Returns a results dict (also the source of truth for the report):
       ``{"iterations", "max_iterations", "exhausted", "commits":
         [{"sha", "file", "fingerprint_after"}], "fingerprint_before",
-        "fingerprint_after", "cq_findings", "fp_screen_results"}``
+        "fingerprint_after", "cq_findings", "fp_screen_results",
+        "chore_items": [{"id", "commit_sha"}],
+        "chore_failures": [{"commit_sha"|"finding", "error"}]}``
     """
     max_iterations = _default_max_remediation_iterations()
     results: dict = {
@@ -6157,6 +6235,8 @@ def _run_remediation_loop(
         "max_iterations": max_iterations,
         "exhausted": False,
         "commits": [],
+        "chore_items": [],
+        "chore_failures": [],
         "fingerprint_before": content_fingerprint,
         "fingerprint_after": content_fingerprint,
         "cq_findings": cq_findings,
@@ -6187,6 +6267,25 @@ def _run_remediation_loop(
         sha = _commit_config_remediation(runner, config_path, project_root,
                                           issue_id)
         change = _fp_remediation_change_summary(targets)
+        # Track the applied config fix with a chore work item linking the
+        # findings + commit sha (F3 AC1). Failure is fail-safe (F3 AC5):
+        # the commit stands; the failure is recorded and the affected
+        # finding stays blocking 'genuine' (post-loop pass below).
+        chore_id = _create_chore_item(
+            runner,
+            title=f"ruff false positives silenced by config fix {sha}",
+            description=_chore_description_for_fix(targets, sha),
+            worklog_dir=worklog_dir,
+        )
+        if chore_id:
+            results["chore_items"].append({
+                "id": chore_id, "commit_sha": sha,
+            })
+        else:
+            results["chore_failures"].append({
+                "commit_sha": sha, "change": change,
+                "error": "wl create failed",
+            })
         new_fp = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
         )
@@ -6238,6 +6337,63 @@ def _run_remediation_loop(
                 e["justification"] = (
                     f"{e.get('justification', '')} — "
                     f"{REMEDIATION_EXHAUSTED_ANNOTATION}"
+                ).strip(" —")
+
+    # ── Tracked work items (F3 AC1/AC2/AC3) ────────────────────────────────
+    # AC2: every medium/low confident-false-positive finding gets a
+    # tracking chore (no config change, no commit link) annotated for a
+    # producer decision. AC3: uncertain and genuine findings never get a
+    # work item (they are not confident-false-positive).
+    for e in results["fp_screen_results"]:
+        finding = e.get("finding", {}) if isinstance(e, dict) else {}
+        if (
+            e.get("classification") == "confident-false-positive"
+            and finding.get("severity") in ("medium", "low")
+            and not e.get("remediation_exhausted")
+        ):
+            code = finding.get("code", "?")
+            file = finding.get("file", "?")
+            chore_id = _create_chore_item(
+                runner,
+                title=f"ruff {code} in {file} — {FP_CHORE_ANNOTATION}",
+                description=(
+                    f"False-positive candidate (medium/low severity). "
+                    f"{code} in {file}:{finding.get('line', 0)} — "
+                    f"{e.get('justification', '')}. {FP_CHORE_ANNOTATION}."
+                ),
+                worklog_dir=worklog_dir,
+            )
+            if chore_id:
+                results["chore_items"].append({"id": chore_id})
+            else:
+                results["chore_failures"].append({
+                    "finding": finding,
+                    "error": "wl create failed",
+                })
+
+    # ── Fail-safe (F3 AC5) ────────────────────────────────────────────────
+    # A failed config-fix chore leaves the affected finding blocking
+    # 'genuine' (the commit stands, but the finding cannot be considered
+    # tracked/resolved) — never silently suppressed. Only entries still
+    # present after the re-scan are demoted; the failure itself is always
+    # recorded in the report.
+    failed_pairs = set()
+    for f in results["chore_failures"]:
+        if f.get("change"):
+            for part in f["change"].split("; "):
+                if " -> " in part:
+                    failed_pairs.add(part)
+    if failed_pairs:
+        for e in results["fp_screen_results"]:
+            finding = e.get("finding", {})
+            key = f"{finding.get('file', '')} -> {finding.get('code', '')}"
+            if key in failed_pairs and e.get("classification") != "genuine":
+                e["classification"] = "genuine"
+                e["remediable"] = False
+                e["chore_failed"] = True
+                e["justification"] = (
+                    f"{e.get('justification', '')} — chore tracking failed; "
+                    "finding remains blocking genuine"
                 ).strip(" —")
     return results
 
