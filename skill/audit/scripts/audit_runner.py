@@ -93,7 +93,7 @@ from skill.test.scripts.run_tests import (
     full_suite_commands,
     parse_node_failures,
     parse_pytest_failures,
-    pytest_command,
+    suite_timeout_per_command,
 )
 from skill.test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
 
@@ -1663,69 +1663,27 @@ _FULL_SUITE_CACHE_GREEN = "green"
 _FULL_SUITE_CACHE_MISS = "miss"
 _FULL_SUITE_CACHE_RED = "red"
 _FULL_SUITE_CACHE_ERROR = "error"
-
-# pytest config markers, mirroring implement.py's _has_pytest_markers so the
-# audit and the implement/test skills agree on whether a repo has a pytest
-# suite (SA-0MSQ72BVV0011SRU AC3).
-_PYTEST_CONFIG_MARKERS = (
-    ("pyproject.toml", "[tool.pytest.ini_options]"),
-    ("setup.cfg", "[tool:pytest]"),
-    ("tox.ini", "[pytest]"),
-)
-
-
-def _repo_has_pytest_suite(project_root: Path) -> bool:
-    """Whether *project_root* declares a runnable pytest suite.
-
-    True when the repo carries a pytest config marker (pytest.ini, or the
-    pytest section of pyproject.toml / setup.cfg / tox.ini) or pytest-style
-    test files (``tests/``/``test/`` dirs containing ``*.py``, or root-level
-    ``test_*.py`` / ``*_test.py``). Importability is deliberately NOT probed:
-    the audit process runs from the framework interpreter which always
-    provides pytest, so the presence of markers or test files is the
-    discriminator that decides whether the pytest suite command applies to
-    this repo.
-
-    Mirrors implement.py's pytest-suite detection so a repo the implement
-    skill treats as having no pytest suite is never falsely gated on a
-    phantom pytest cache miss (AC3).
-    """
-    if (project_root / "pytest.ini").is_file():
-        return True
-    for name, marker in _PYTEST_CONFIG_MARKERS:
-        path = project_root / name
-        if not path.is_file():
-            continue
-        try:
-            if marker in path.read_text(encoding="utf-8"):
-                return True
-        except OSError:
-            continue
-    for dirname in ("tests", "test"):
-        test_dir = project_root / dirname
-        if test_dir.is_dir() and any(test_dir.rglob("*.py")):
-            return True
-    return bool(
-        any(project_root.glob("test_*.py")) or any(project_root.glob("*_test.py"))
-    )
+# No suite command is resolvable for this project (no pytest config, no
+# node suite dirs, no npm test script, no .pi/test-config.json). Introduced
+# with F2 (SA-0MSTMYE79006NA61): once full_suite_commands stops emitting the
+# phantom pytest, an empty command set must NOT classify as vacuously green
+# (parent AC3 — never ship a partial verdict with zero evidence).
+_FULL_SUITE_CACHE_EMPTY = "empty"
 
 
 def _effective_suite_commands(project_root: Path) -> list[str]:
     """The full-suite command set that actually applies to *project_root*.
 
-    ``full_suite_commands`` is already node-dir-aware: node suite commands
-    are emitted only for ``tests/node``, ``tests/cli`` and ``tests/unit``
-    dirs that exist in the repo (SA-0MSJELL44009XYIL). The pytest command is
-    additionally dropped when the repo does not declare a pytest suite
-    (SA-0MSQ72BVV0011SRU AC3) — a phantom pytest command would otherwise
-    produce a permanent cache miss that falsely blocks audits of no-pytest
-    repos (e.g. a docs-only repo) even after the real suites ran green.
+    Delegates to ``full_suite_commands`` — the single source of truth (F2
+    AC4). The shared function is already repo-aware: pytest is emitted only
+    when the repo declares a pytest suite (``repo_has_pytest_suite``,
+    SA-0MSQ72BVV0011SRU AC3), node commands only for existing
+    ``tests/{unit,node,cli}`` dirs (SA-0MSJELL44009XYIL), an npm-test
+    convention applies to TCE-like repos (F2 AC2), and the per-project
+    ``.pi/test-config.json`` extension file overrides convention detection
+    (F2 AC1).
     """
-    commands = full_suite_commands(project_root)
-    if _repo_has_pytest_suite(project_root):
-        return commands
-    pytest_cmd = pytest_command()
-    return [c for c in commands if c != pytest_cmd]
+    return full_suite_commands(project_root)
 
 
 def _classify_full_suite_cache(
@@ -1758,6 +1716,12 @@ def _classify_full_suite_cache(
     - ``"error"`` — HEAD could not be resolved (``head_sha`` None). A cache
       query exception propagates to the caller, which decides fail-closed
       (``_resolve_auto_green_run``) vs fail-open (the pre-flight gate).
+    - ``"empty"`` — no suite command is resolvable for this project
+      (F2 AC4 single source of truth; ``_effective_suite_commands``
+      delegated to ``full_suite_commands``). NEVER vacuously green:
+      ``_resolve_auto_green_run`` fails closed (no evidence), and the
+      pre-flight gate fails open (never blocks) — the audit proceeds with
+      execution-dependent ACs partial + a documented reason (parent AC3).
     """
     head_sha = _resolve_audited_head(runner)
     if head_sha is None:
@@ -1766,6 +1730,12 @@ def _classify_full_suite_cache(
     project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
     if commands is None:
         commands = full_suite_commands(project_root)
+    if not commands:
+        return _FULL_SUITE_CACHE_EMPTY, head_sha, [
+            ("no suite commands resolvable for this project (no pytest config, "
+             "no tests/{unit,node,cli} dirs, no npm test script); add "
+             ".pi/test-config.json or run /skill:test at HEAD")
+        ]
     problems: list[str] = []
     for command in commands:
         entry = query_cached(
@@ -1810,6 +1780,16 @@ def _resolve_auto_green_run(
         status, head_sha, problems = _classify_full_suite_cache(runner, cwd=cwd)
         if status == _FULL_SUITE_CACHE_GREEN and head_sha is not None:
             return _auto_green_run_prompt_block(head_sha), head_sha
+        if status == _FULL_SUITE_CACHE_EMPTY:
+            print(
+                "Automatic full-suite verification unavailable: no suite "
+                "commands resolvable for this project (no pytest config, no "
+                "tests/{unit,node,cli} dirs, no npm test script). Add "
+                ".pi/test-config.json or run the suite at this commit. "
+                "Execution-dependent criteria stay partial.",
+                file=sys.stderr,
+            )
+            return None, None
         if head_sha is None:
             return None, None
         commands = full_suite_commands(Path(cwd or TARGET_PROJECT_ROOT).resolve())
@@ -1847,10 +1827,13 @@ def _preflight_cache_gate(
     Fires ONLY on a cache **miss** — at least one command in the repo's
     effective suite set has no cached run at HEAD. It is repo-aware: the
     pytest command is not required for repos without a pytest suite
-    (``_effective_suite_commands``, AC3), so a docs-only or vitest-only repo
-    is never falsely blocked. A **red** cached run keeps the historical
-    partial + diagnostic behavior (evidence exists that the suite ran; it
-    just failed), a **green** cache proceeds, and cache errors fail open
+    (``_effective_suite_commands`` → ``full_suite_commands``, F2 AC4), so a
+    docs-only or vitest-only repo is never falsely blocked. An **empty**
+    effective set (no resolvable suite commands) is NOT a miss — the gate
+    fails open (parent AC3 / F4 never-block; the auto-green-run path fails
+    closed separately). A **red** cached run keeps the historical partial +
+    diagnostic behavior (evidence exists that the suite ran; it just
+    failed), a **green** cache proceeds, and cache errors fail open
     (an infra hiccup must not block an audit that today proceeds partial).
 
     Returns the message for the caller to print (and exit non-zero with),
@@ -1936,6 +1919,9 @@ def _run_tests_via_test_skill(
       notice    — error string when the suite could not be executed at all
     """
     project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
+    # The extension file's timeoutPerCommand (F2 AC1) overrides the default
+    # per-command timeout — single source of truth via run_tests.py.
+    timeout = suite_timeout_per_command(project_root) or timeout
     print(
         f"Invoking test skill (run_tests.py) — --run-tests enabled: executing "
         f"the full project test suite at {project_root} in quiet mode "

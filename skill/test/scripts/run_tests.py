@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """Run the full project test suite in quiet mode and report every failure.
 
-Suites:
-  - pytest:  pytest -q -r a --disable-warnings   (canonicalized via skill/test_runner.py)
-  - node:    node --test "tests/<dir>/**/*.mjs"   (npm --silent test when a test script exists)
+Suites are resolved per-repo through ``full_suite_commands`` (the single
+source of truth, F2 AC4):
+
+  1. ``.pi/test-config.json`` ``suiteCommands`` when present (primary list;
+     convention detection skipped)
+  2. pytest: ``pytest -q -r a --disable-warnings`` — only when the repo
+     declares a pytest suite (never a phantom pytest command, F2 AC3)
+  3. node: ``node --test "tests/<dir>/**/*.mjs"`` per existing
+     ``tests/{unit,node,cli}`` dir (npm --silent test when a test script
+     exists)
+  4. npm-test convention: ``npm --silent test`` for TCE-like repos (npm test
+     script, no pytest config, no node suite dirs — F2 AC2)
+
+The optional ``timeoutPerCommand`` in ``.pi/test-config.json`` overrides the
+per-command timeout (F2 AC1).
 
 Results are cached per-repo (see skill/test_cache.py) by default so repeated
 verification at the same git state is served without re-executing the suite.
@@ -55,6 +67,21 @@ CACHE_TTL_SECONDS = DEFAULT_TTL_SECONDS
 PYTEST_CMD = canonicalize_quiet_test_command("pytest")
 NODE_SUITE_DIRS = ("tests/node", "tests/cli", "tests/unit")
 
+# pytest config markers, mirroring implement.py's _has_pytest_markers so the
+# test/implement/audit skills agree on whether a repo has a pytest suite
+# (SA-0MSQ72BVV0011SRU AC3; single source of truth per F2 AC4).
+_PYTEST_CONFIG_MARKERS = (
+    ("pyproject.toml", "[tool.pytest.ini_options]"),
+    ("setup.cfg", "[tool:pytest]"),
+    ("tox.ini", "[pytest]"),
+)
+
+# The per-project suite-command extension file (F2 AC1):
+# <project_root>/.pi/test-config.json with an optional ``suiteCommands`` list
+# (the primary command list; convention detection is skipped when present) and
+# an optional ``timeoutPerCommand`` (per-command timeout in seconds).
+TEST_CONFIG_FILE = ".pi/test-config.json"
+
 
 def detect_project_root() -> Path:
     """Resolve the project the CLI should target, from the invoking cwd.
@@ -98,6 +125,105 @@ _NODE_NOT_OK_RE = re.compile(r"^not ok\s+\d+\s*-\s*(.+)$", re.MULTILINE)
 def pytest_command() -> str:
     """Return the quiet canonicalized pytest command."""
     return PYTEST_CMD
+
+
+def repo_has_pytest_suite(project_root: Path | None = None) -> bool:
+    """Whether *project_root* declares a runnable pytest suite.
+
+    True when the repo carries a pytest config marker (pytest.ini, or the
+    pytest section of pyproject.toml / setup.cfg / tox.ini) or pytest-style
+    test files (``tests/``/``test/`` dirs containing ``*.py``, or root-level
+    ``test_*.py`` / ``*_test.py``). Importability is deliberately NOT probed:
+    the runner process always provides pytest, so the presence of markers or
+    test files is the discriminator that decides whether the pytest suite
+    command applies to this repo (SA-0MSQ72BVV0011SRU AC3).
+
+    This is the single source of truth for pytest-suite detection: the audit
+    skill imports it (F2 AC4) instead of duplicating the markers.
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    if (root / "pytest.ini").is_file():
+        return True
+    for name, marker in _PYTEST_CONFIG_MARKERS:
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            if marker in path.read_text(encoding="utf-8"):
+                return True
+        except OSError:
+            continue
+    for dirname in ("tests", "test"):
+        test_dir = root / dirname
+        if test_dir.is_dir() and any(test_dir.rglob("*.py")):
+            return True
+    return bool(
+        any(root.glob("test_*.py")) or any(root.glob("*_test.py"))
+    )
+
+
+def _read_test_config(project_root: Path) -> dict | None:
+    """Read ``.pi/test-config.json`` under *project_root* (None when absent
+    or unreadable — a corrupt file is treated as absent, never an error)."""
+    config_path = project_root / TEST_CONFIG_FILE
+    if not config_path.is_file():
+        return None
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def extension_suite_commands(project_root: Path | None = None) -> list[str] | None:
+    """The extension file's ``suiteCommands`` list, or None when absent.
+
+    When a valid list is present it is the PRIMARY command list and convention
+    detection is skipped (F2 AC1). An explicitly-empty list is honored as-is
+    (a project declaring "no runnable suite").
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    config = _read_test_config(root)
+    if config is None:
+        return None
+    suite_commands = config.get("suiteCommands")
+    if not isinstance(suite_commands, list):
+        return None
+    if not all(isinstance(c, str) and c.strip() for c in suite_commands):
+        return None
+    return suite_commands
+
+
+def suite_timeout_per_command(project_root: Path | None = None) -> int | None:
+    """Optional per-command timeout (seconds) from the extension file.
+
+    Returns the ``timeoutPerCommand`` value when present and positive, else
+    None (callers fall back to their default per-command timeout).
+    """
+    root = Path(project_root or REPO_ROOT).resolve()
+    config = _read_test_config(root)
+    if config is None:
+        return None
+    timeout = config.get("timeoutPerCommand")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        return None
+    timeout = int(timeout)
+    return timeout if timeout > 0 else None
+
+
+def _npm_test_command(project_root: Path) -> str | None:
+    """The canonical ``npm --silent test`` command when the repo declares a
+    package.json ``test`` script, else None (F2 AC2 npm-test convention)."""
+    pkg_json = project_root / "package.json"
+    if not pkg_json.is_file():
+        return None
+    try:
+        scripts = json.loads(pkg_json.read_text(encoding="utf-8")).get("scripts", {})
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(scripts, dict) or not scripts.get("test"):
+        return None
+    return canonicalize_quiet_test_command("npm test")
 
 
 def node_suite_commands(project_root: Path | None = None) -> list[str]:
@@ -147,14 +273,41 @@ def node_suite_commands(project_root: Path | None = None) -> list[str]:
 def full_suite_commands(project_root: Path | None = None) -> list[str]:
     """Return the canonical full-suite command set for *project_root*.
 
-    The set that constitutes "the full project test suite": the quiet
-    canonicalized pytest command plus one node command per suite directory.
+    The set that constitutes "the full project test suite", resolved in order:
+
+    1. **Extension file** (F2 AC1): ``<root>/.pi/test-config.json``
+       ``suiteCommands`` — when present, convention detection is skipped.
+    2. **pytest** only when the repo declares a pytest suite
+       (``repo_has_pytest_suite`` — never a phantom pytest command, F2 AC3).
+    3. **node** — one command per existing ``tests/{unit,node,cli}`` dir
+       (SA-0MSJELL44009XYIL).
+    4. **npm-test convention** (F2 AC2): when neither pytest nor any node
+       suite dir applies and ``package.json`` declares a ``test`` script,
+       emit ``npm --silent test`` (the TCE fix — a vitest/npm repo's real
+       suite becomes cacheable/verifiable instead of the phantom pytest).
+
     Read-only consumers (e.g. the audit skill's automatic full-suite
     verification, SA-0MSIU5HFI0024D7W) query the per-repo test cache with
     exactly these commands so cache entries written by ``run_tests.py`` are
-    reused without executing anything.
+    reused without executing anything. This function is the single source of
+    truth for suite-command resolution (F2 AC4).
     """
-    return [pytest_command()] + node_suite_commands(project_root)
+    root = Path(project_root or REPO_ROOT).resolve()
+
+    ext = extension_suite_commands(root)
+    if ext is not None:
+        return ext
+
+    commands: list[str] = []
+    if repo_has_pytest_suite(root):
+        commands.append(pytest_command())
+    commands.extend(node_suite_commands(root))
+
+    if not commands:
+        npm = _npm_test_command(root)
+        if npm is not None:
+            commands.append(npm)
+    return commands
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +451,7 @@ def run_suite(
     use_cache: bool = True,
     force: bool = False,
     no_cache: bool = False,
+    commands: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run a single named suite and return structured results.
 
@@ -307,18 +461,27 @@ def run_suite(
     and storage. The result carries ``cached`` (True when every command in
     the suite was served from cache) and ``command`` for display.
 
+    *commands* (F2 AC4) overrides name-based resolution: ``name == "all"``
+    resolves the repo's full suite via ``full_suite_commands(cwd)`` — the
+    single source of truth — instead of the hardcoded pytest+node pair. The
+    failure parser is chosen per command (pytest commands → pytest parser,
+    everything else → node parser), mirroring the audit's
+    ``_run_tests_via_test_skill``.
+
     Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
     ``cached`` and (on missing binary) ``notice``.
     """
     cwd = cwd or REPO_ROOT
-    if name == "pytest":
-        command = pytest_command()
-        commands = [command]
-    elif name == "node":
-        commands = node_suite_commands()
-        command = " && ".join(commands)
-    else:
-        raise ValueError(f"unknown suite: {name}")
+    if commands is None:
+        if name == "pytest":
+            commands = [pytest_command()]
+        elif name == "node":
+            commands = node_suite_commands()
+        elif name == "all":
+            commands = full_suite_commands(cwd)
+        else:
+            raise ValueError(f"unknown suite: {name}")
+    command = " && ".join(commands)
 
     all_failures: list[dict[str, str]] = []
     overall_returncode = 0
@@ -360,7 +523,7 @@ def run_suite(
             }
 
         output = f"{proc.stdout}\n{proc.stderr}"
-        if name == "pytest":
+        if "pytest" in cmd:
             failures = parse_pytest_failures(output)
         else:
             failures = parse_node_failures(output)
@@ -379,14 +542,21 @@ def run_suite(
 
 
 def run_all(
-    suites: tuple[str, ...] = ("pytest", "node"),
+    suites: tuple[str, ...] = ("all",),
     cwd: Path | None = None,
     timeout: int = 600,
     use_cache: bool = True,
     force: bool = False,
     no_cache: bool = False,
 ) -> dict[str, Any]:
-    """Run the selected suites and aggregate failures."""
+    """Run the selected suites and aggregate failures.
+
+    The default ``("all",)`` resolves the repo's full suite through
+    ``full_suite_commands(cwd)`` — the single source of truth (F2 AC4): a
+    no-pytest repo never runs a phantom pytest command, and a vitest/npm repo
+    runs its real ``npm --silent test``. Explicit ``("pytest",)``/``("node",)``
+    selections keep the historical per-suite behavior.
+    """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
     notices: list[str] = []
@@ -515,15 +685,19 @@ def run_summary(
 
     Suites with no cached entry report a clear miss. The result carries
     ``success`` (True only when every selected suite had a cached entry),
-    ``lines`` per suite, and ``missing`` (list of suite names).
+    ``lines`` per suite, and ``missing`` (list of suite names). The ``"all"``
+    suite resolves commands via ``full_suite_commands(cwd)`` — the single
+    source of truth (F2 AC4).
     """
     cwd = cwd or REPO_ROOT
     result: dict[str, Any] = {"lines": {}, "missing": [], "success": True}
     for name in suites:
         if name == "pytest":
             commands = [pytest_command()]
-        else:
+        elif name == "node":
             commands = node_suite_commands()
+        else:
+            commands = full_suite_commands(cwd)
         lines: list[str] = []
         for cmd in commands:
             entry = query_cached(cmd, cwd=str(cwd), ttl=CACHE_TTL_SECONDS)
@@ -538,11 +712,15 @@ def run_summary(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    suites = ("pytest", "node") if args.suite == "all" else (args.suite,)
+    suites = (args.suite,)
 
     # Resolve the project root: explicit flag wins, else detect from cwd at
     # CLI time so a non-framework invocation tests that project (SA-0MSNQV9J20010LE7).
     project_root = Path(args.project_root).resolve() if args.project_root else detect_project_root()
+
+    # Per-command timeout: explicit --timeout wins, else the extension file's
+    # timeoutPerCommand (F2 AC1), else the default 600.
+    timeout = args.timeout or suite_timeout_per_command(project_root) or 600
 
     if args.summary:
         summary = run_summary(suites, cwd=project_root, pattern=args.summary_grep)
@@ -561,14 +739,14 @@ def main(argv: list[str] | None = None) -> int:
     result = run_all(
         suites=suites,
         cwd=project_root,
-        timeout=args.timeout,
+        timeout=timeout,
         use_cache=not args.no_cache,
         force=args.force,
         no_cache=args.no_cache,
     )
 
     if args.rerun_failures and result["failures"]:
-        result["failures"] = rerun_failures(result["failures"], timeout=args.timeout)
+        result["failures"] = rerun_failures(result["failures"], timeout=timeout)
         result["success"] = all(r["success"] for r in result["suites"].values()) and not result["failures"]
 
     if args.json:

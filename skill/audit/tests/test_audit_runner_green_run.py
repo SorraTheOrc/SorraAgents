@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 import pytest
 
 from skill.audit.scripts import audit_runner
+from skill.test.scripts.run_tests import repo_has_pytest_suite
 
 
 @pytest.fixture(autouse=True)
@@ -586,6 +587,17 @@ def _make_suite_dirs(tmp_path) -> Path:
         (tmp_path / d).mkdir(parents=True, exist_ok=True)
     return tmp_path
 
+
+def _with_pytest_config(tmp_path) -> Path:
+    """Declare a pytest suite under *tmp_path* (pytest.ini).
+
+    F2 (SA-0MSTMYE79006NA61): ``full_suite_commands`` emits pytest only when
+    the repo declares a pytest suite — fixtures that exercise the pytest
+    command must declare it explicitly.
+    """
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    return tmp_path
+
 class TestAutoGreenRunResolution:
     """Unit tests for the read-only automatic green-run resolution."""
 
@@ -609,6 +621,7 @@ class TestAutoGreenRunResolution:
 
     def test_green_cached_run_yields_evidence(self, tmp_path):
         """AC1: green cached full-suite entries yield a prompt block + sha."""
+        _with_pytest_config(tmp_path)
         with mock.patch.object(audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY):
             block, sha = audit_runner._resolve_auto_green_run(
                 _green_run_git_runner(), cwd=str(tmp_path),
@@ -675,6 +688,7 @@ class TestAutoGreenRunResolution:
     def test_query_cached_consumed_read_only(self, tmp_path, capsys):
         """AC1: resolution consumes the cache (never executes) at the project cwd."""
         _make_suite_dirs(tmp_path)
+        _with_pytest_config(tmp_path)
         with mock.patch.object(
             audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
         ) as mock_q:
@@ -693,6 +707,7 @@ class TestAutoGreenRunResolution:
     def test_missing_cache_emits_diagnostic(self, tmp_path, capsys):
         """A cache miss yields a clear diagnostic naming the command + remedy."""
         _make_suite_dirs(tmp_path)
+        _with_pytest_config(tmp_path)
         with mock.patch.object(audit_runner, "query_cached", return_value=None):
             block, sha = audit_runner._resolve_auto_green_run(
                 _green_run_git_runner(), cwd=str(tmp_path),
@@ -1049,6 +1064,7 @@ class TestFullSuiteCacheClassification:
 
     def test_green_all_commands_cached(self, tmp_path):
         """Every suite command cached green at HEAD → 'green' + evidence sha."""
+        _with_pytest_config(tmp_path)
         with mock.patch.object(
             audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY
         ):
@@ -1118,11 +1134,16 @@ class TestFullSuiteCacheClassification:
         mock_q.assert_not_called()
 
 class TestEffectiveSuiteCommands:
-    """Repo-aware command set (AC3): no phantom pytest for no-pytest repos."""
+    """Repo-aware command set (AC3): no phantom pytest for no-pytest repos.
+
+    Pytest-suite detection is the shared ``repo_has_pytest_suite`` from the
+    test skill runner (single source of truth, F2 AC4); the effective command
+    set delegates to ``full_suite_commands``.
+    """
 
     def test_pytest_ini_counts_as_pytest_suite(self, tmp_path):
         (tmp_path / "pytest.ini").write_text("[pytest]\n")
-        assert audit_runner._repo_has_pytest_suite(tmp_path) is True
+        assert repo_has_pytest_suite(tmp_path) is True
         assert any(
             "pytest" in c
             for c in audit_runner._effective_suite_commands(tmp_path)
@@ -1130,23 +1151,23 @@ class TestEffectiveSuiteCommands:
 
     def test_pyproject_marker_counts_as_pytest_suite(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
-        assert audit_runner._repo_has_pytest_suite(tmp_path) is True
+        assert repo_has_pytest_suite(tmp_path) is True
 
     def test_python_test_files_count_as_pytest_suite(self, tmp_path):
         (tmp_path / "tests").mkdir()
         (tmp_path / "tests" / "test_x.py").write_text("def test_x(): pass\n")
-        assert audit_runner._repo_has_pytest_suite(tmp_path) is True
+        assert repo_has_pytest_suite(tmp_path) is True
 
     def test_no_pytest_suite_skips_pytest_command(self, tmp_path):
         """A node-only repo keeps node commands but drops the pytest command."""
         _make_suite_dirs(tmp_path)
-        assert audit_runner._repo_has_pytest_suite(tmp_path) is False
+        assert repo_has_pytest_suite(tmp_path) is False
         cmds = audit_runner._effective_suite_commands(tmp_path)
         assert cmds  # node commands remain
         assert not any("pytest" in c for c in cmds)
 
     def test_no_suite_at_all_yields_empty_set(self, tmp_path):
-        assert audit_runner._repo_has_pytest_suite(tmp_path) is False
+        assert repo_has_pytest_suite(tmp_path) is False
         assert audit_runner._effective_suite_commands(tmp_path) == []
 
 class TestPreflightCacheGate:
@@ -1208,7 +1229,7 @@ class TestPreflightCacheGate:
     def test_no_pytest_repo_not_blocked(self, tmp_path):
         """AC3: a repo without a pytest suite is not falsely gated."""
         _make_suite_dirs(tmp_path)  # node dirs; no pytest config/test files
-        assert audit_runner._repo_has_pytest_suite(tmp_path) is False
+        assert repo_has_pytest_suite(tmp_path) is False
         # node suites cached green → the effective set has no miss
         assert self._gate_message(tmp_path, return_value=_AUTO_GREEN_ENTRY) is None
 
@@ -1332,6 +1353,7 @@ class TestRunTestsViaTestSkill:
     def test_green_run_success_refreshes_cache(self, tmp_path, capsys):
         """AC1: a green executed suite yields success and refreshes the cache."""
         _make_suite_dirs(tmp_path)
+        _with_pytest_config(tmp_path)
         with mock.patch.object(
             audit_runner, "run_cached", side_effect=self._green_run
         ) as mock_run:
@@ -1352,6 +1374,8 @@ class TestRunTestsViaTestSkill:
 
     def test_failing_run_triages_failures(self, tmp_path, capsys):
         """AC4: failures are triaged per the test skill, never silently ignored."""
+        _with_pytest_config(tmp_path)
+
         def _side_effect(command, **kwargs):
             if "pytest" in command:
                 return {
@@ -1392,6 +1416,8 @@ class TestRunTestsViaTestSkill:
 
     def test_nonzero_exit_without_parseable_failures(self, tmp_path):
         """A non-zero exit with no FAILED lines is recorded, never silently green."""
+        _with_pytest_config(tmp_path)
+
         def _side_effect(command, **kwargs):
             if "pytest" in command:
                 return {
@@ -1419,6 +1445,8 @@ class TestRunTestsViaTestSkill:
 
     def test_timeout_notice_fail_closed(self, tmp_path):
         """A suite timeout yields a notice, no evidence, no crash."""
+        _with_pytest_config(tmp_path)
+
         def _side_effect(command, **kwargs):
             raise subprocess.TimeoutExpired(cmd=command, timeout=600)
 
@@ -1432,6 +1460,8 @@ class TestRunTestsViaTestSkill:
 
     def test_command_not_found_notice_fail_closed(self, tmp_path):
         """A missing suite binary yields a notice, no evidence, no crash."""
+        _with_pytest_config(tmp_path)
+
         def _side_effect(command, **kwargs):
             raise FileNotFoundError("pytest")
 
@@ -1445,6 +1475,8 @@ class TestRunTestsViaTestSkill:
 
     def test_triage_error_never_crashes_run(self, tmp_path):
         """AC4: a triage helper failure is recorded, never crashes the run."""
+        _with_pytest_config(tmp_path)
+
         def _side_effect(command, **kwargs):
             if "pytest" in command:
                 return {

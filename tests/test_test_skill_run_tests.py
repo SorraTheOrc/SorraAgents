@@ -167,7 +167,9 @@ def test_node_suite_commands_skip_missing_dirs(tmp_path: Path) -> None:
 
 def test_full_suite_commands_skip_missing_dirs(tmp_path: Path) -> None:
     """full_suite_commands emits only commands that can pass for the repo."""
+    # A repo with a pytest config + tests/cli only: pytest + cli, no node/unit.
     repo = _make_repo(tmp_path, dirs=("tests/cli",))
+    (repo / "pytest.ini").write_text("[pytest]\n")
     cmds = full_suite_commands(repo)
     assert cmds[0] == "pytest -q -r a --disable-warnings"
     assert len(cmds) == 2  # pytest + tests/cli only
@@ -176,11 +178,16 @@ def test_full_suite_commands_skip_missing_dirs(tmp_path: Path) -> None:
 
 
 def test_node_suite_commands_no_dirs_yields_empty(tmp_path: Path) -> None:
-    """A repo with no node suite dirs yields no node commands at all."""
+    """A repo with no node suite dirs and no pytest config yields no commands.
+
+    F2 AC3 (no phantom pytest): without a pytest config and without node suite
+    dirs, no command can pass — the effective set is empty (the audit's
+    never-block path reports a documented reason instead of gating).
+    """
     repo = _make_repo(tmp_path, dirs=())
     assert node_suite_commands(repo) == []
     cmds = full_suite_commands(repo)
-    assert cmds == ["pytest -q -r a --disable-warnings"]
+    assert cmds == []  # no phantom pytest for a repo without a pytest config
 
 
 def test_node_suite_commands_skip_missing_dirs_with_npm_script(
@@ -194,11 +201,12 @@ def test_node_suite_commands_skip_missing_dirs_with_npm_script(
 
 
 def test_full_suite_commands_framework_regression_unchanged(tmp_path: Path) -> None:
-    """The framework repo (all three suite dirs) keeps the full command set."""
-    # The framework itself has tests/node, tests/cli and tests/unit: a repo
-    # with all three dirs must produce the exact pre-fix command set (no
-    # accidental skips), preserving existing read-only consumers.
+    """The framework repo (pytest.ini + all three suite dirs) keeps the set."""
+    # The framework itself has pytest.ini plus tests/node, tests/cli and
+    # tests/unit: a repo with all of them must produce the exact pre-fix
+    # command set (pytest + 3 node dirs), preserving read-only consumers.
     repo = _make_repo(tmp_path)
+    (repo / "pytest.ini").write_text("[pytest]\n")
     cmds = full_suite_commands(repo)
     assert len(cmds) == 4  # pytest + 3 node suite dirs
     joined = " | ".join(cmds)
