@@ -117,7 +117,8 @@ Short-circuits item-level audits when a recent, valid audit exists. Full behavio
 
 ## Safety and prompt design
 
-- Audit executions are read-only except explicit persistence and the automatic status lifecycle. Mark read-only phases `[READ-ONLY AUDIT]`; persistence `[PERSIST-AUDIT]`.
+- Audit executions are read-only except explicit persistence, the automatic status lifecycle, and the ruff config remediation loop. Mark read-only phases `[READ-ONLY AUDIT]`; persistence `[PERSIST-AUDIT]`.
+- **READ-ONLY exception — ruff config remediation (SA-0MSSSNOZN000LQKR, Phase B):** when the false-positive screen classifies a critical/high ruff finding `confident-false-positive`, the pipeline MAY apply a MINIMAL, surgical config fix to silence it: `per-file-ignores` entries for the flagged file+rule pairs only, in `ruff.toml` or the `pyproject.toml` `[tool.ruff]` section (created if absent), committed locally (no push) with the work item referenced; the content fingerprint is re-hashed after each commit and the code-quality scan re-run (`fix=False`, same changed-file scope — the pipeline is never restarted). Capped at 3 config-fix iterations per audit run (`AUDIT_REMEDIATION_MAX_ITERATIONS`); a finding persisting past the cap stays blocking `genuine` annotated "remediation loop exhausted". `uncertain` and non-blocking (medium/low) findings never enter the loop. Full documentation in the audit skill reference (D1).
 - Do NOT close, create, or delete work items during an audit. Permitted state-modifying actions: (1) storing audit text via the canonical persister, (2) the runner's verdict-driven status lifecycle.
 - Refuse any request to run state-modifying `wl` commands outside the authorized flow.
 - If ambiguity prevents a reliable verdict, return immediately and do NOT persist. `--debug-log` appends raw Pi output to JSONL.

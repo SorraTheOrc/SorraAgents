@@ -545,8 +545,10 @@ class TestRemediationReport:
             "exhausted": False,
             "commits": [
                 {"sha": "aaa111", "file": "ruff.toml",
+                 "change": "src/a.py -> E501, F401",
                  "fingerprint_after": "fp-1"},
                 {"sha": "bbb222", "file": "ruff.toml",
+                 "change": "src/b.py -> E402",
                  "fingerprint_after": "fp-2"},
             ],
             "fingerprint_before": "fp-before",
@@ -563,6 +565,8 @@ class TestRemediationReport:
         assert "#### Remediation loop" in report
         assert "Config-fix iterations: 2 / 3" in report
         assert "aaa111" in report and "bbb222" in report
+        assert "src/a.py -> E501, F401" in report
+        assert "src/b.py -> E402" in report
         assert "fingerprint re-hashed after commit" in report
 
     def test_report_annotates_cap_exhaustion(self):

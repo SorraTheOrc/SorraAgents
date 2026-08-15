@@ -3630,9 +3630,10 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             )
         for c in rem.get("commits", []):
             fp_after = c.get("fingerprint_after") or "unavailable"
+            change = c.get("change") or "per-file-ignores"
             lines.append(
                 f"- Commit {c.get('sha') or 'n/a'} ({c.get('file', '?')}) "
-                f"— fingerprint re-hashed after commit: {fp_after}"
+                f"— {change}; fingerprint re-hashed after commit: {fp_after}"
             )
 
     lines.append("")
@@ -6088,6 +6089,26 @@ def _commit_config_remediation(runner: Runner, config_path: Path,
         return None
 
 
+def _fp_remediation_change_summary(targets: list[dict]) -> str:
+    """Human-readable summary of the per-file-ignores change applied.
+
+    Renders ``file -> code1, code2`` for each flagged file in the
+    remediated target set (F2: per-iteration config-change note).
+    """
+    by_file: dict[str, list[str]] = {}
+    for t in targets or []:
+        finding = t.get("finding", {}) if isinstance(t, dict) else {}
+        file = finding.get("file", "")
+        code = finding.get("code", "")
+        if file and code:
+            by_file.setdefault(file, [])
+            if code not in by_file[file]:
+                by_file[file].append(code)
+    return "; ".join(
+        f"{f} -> {', '.join(sorted(codes))}" for f, codes in by_file.items()
+    ) or "per-file-ignores"
+
+
 def _run_remediation_loop(
     issue_id: str,
     cq_findings: list[dict],
@@ -6158,12 +6179,14 @@ def _run_remediation_loop(
             results["exhausted"] = True
             break
         sha = _commit_config_remediation(runner, config_path, project_root)
+        change = _fp_remediation_change_summary(targets)
         new_fp = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
         )
         results["commits"].append({
             "sha": sha,
             "file": str(config_path),
+            "change": change,
             "fingerprint_after": new_fp,
         })
         # Re-run the code-quality scan ONLY (no phase re-entry): same
