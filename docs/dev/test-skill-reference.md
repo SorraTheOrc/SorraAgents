@@ -67,4 +67,33 @@ only cover node suite dirs that actually exist in the target repo
 SA-0MSJELL44009XYIL), so a repo whose layout diverges from that set can still
 auto-verify; when it cannot, the runner prints a clear diagnostic naming the
 missing/failed command and the remedy (`/skill:test` or `--green-run HEAD`).
+Since F3 (SA-0MSTN5KRF0097TVP) a cache miss triggers auto-execution via this
+skill's machinery instead of blocking; since F4 (SA-0MSTN8CWM003AAU9) the
+audit never hard-blocks on execution-impossible repos.
+
+### 1. Suite-command resolution order (F2, SA-0MSTMYE79006NA61)
+
+The full suite is `full_suite_commands(project_root)`, resolved in this
+order (single source of truth shared by the test skill runner, the audit
+runner's auto-execution path, and its read-only cache classification):
+
+1. **`.pi/test-config.json` extension file** (repo root) — overrides
+   convention detection entirely: `{"suiteCommands": ["..."], "timeoutPerCommand": 600}`.
+   Use it for bespoke suites (e.g. a monorepo package command) that
+   conventions would miss. `timeoutPerCommand` overrides the audit runner's
+   `AUDIT_TEST_SKILL_RUN_TIMEOUT` default (600s per command).
+2. **npm-test convention** — `npm --silent test` for repos whose
+   `package.json` declares a `test` script (TCE-like layouts).
+3. **pytest** — `pytest -q -r a --disable-warnings` ONLY when the repo
+   declares a pytest suite (`pytest.ini` / `[tool.pytest.ini_options]` /
+   pytest-style `tests/**/test_*.py` files) — no phantom pytest for
+   no-pytest repos (SA-0MSQ72BVV0011SRU AC3, `repo_has_pytest_suite`).
+4. **Node suite dirs** — `node --test "tests/node/**/*.mjs"
+   "tests/cli/**/*.mjs" "tests/unit/**/*.mjs"` (or `npm --silent test` per
+   suite dir); only dirs that exist under the target repo are included.
+
+An empty resolved set (no extension file, no npm test script, no pytest
+suite, no node dirs) is NOT an error: `run_tests.py` reports zero commands
+and the audit skill treats the repo as execution-impossible — fail-open
+partial, never blocks (F4 AC2).
 

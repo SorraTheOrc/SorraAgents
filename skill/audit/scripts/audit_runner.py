@@ -26,8 +26,12 @@ Execution-dependent criteria (e.g. 'full project test suite passes'):
   ACs stay partial with failure evidence). Evidence is also supplied by
   the operator-attested ``--green-run`` path or, automatically, by a green
   full-suite run found READ-ONLY in the per-repo test cache
-  (query_cached — see SA-0MSIU5HFI0024D7W). The pre-flight cache gate
-  (SA-0MSQ72BVV0011SRU) no longer hard-blocks: ``--no-execute`` /
+  (query_cached — see SA-0MSIU5HFI0024D7W). F4 (SA-0MSTN8CWM003AAU9)
+  guarantees the audit NEVER hard-blocks solely because it cannot run tests
+  (no cache, no test runner, no configured suite commands, execution
+  impossible): every such case degrades to a fail-open partial verdict with
+  a documented reason in the report (the old pre-flight hard gate,
+  SA-0MSQ72BVV0011SRU, was removed). ``--no-execute`` /
   ``AUDIT_NO_EXECUTE=1`` opts out of auto-execution and proceeds fail-open
   partial instead. All paths are fail-closed on EVIDENCE: missing evidence
   leaves execution-dependent ACs partial (never a degraded 'met').
@@ -1675,8 +1679,8 @@ def _auto_green_run_prompt_block(sha: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Full-suite cache classification (shared by the automatic verification path
-# and the pre-flight gate, SA-0MSQ72BVV0011SRU)
+# Full-suite cache classification (shared by the automatic verification path,
+# SA-0MSIU5HFI0024D7W / F4 SA-0MSTN8CWM003AAU9)
 # ---------------------------------------------------------------------------
 
 # Classification statuses returned by _classify_full_suite_cache.
@@ -1692,21 +1696,6 @@ _FULL_SUITE_CACHE_ERROR = "error"
 _FULL_SUITE_CACHE_EMPTY = "empty"
 
 
-def _effective_suite_commands(project_root: Path) -> list[str]:
-    """The full-suite command set that actually applies to *project_root*.
-
-    Delegates to ``full_suite_commands`` — the single source of truth (F2
-    AC4). The shared function is already repo-aware: pytest is emitted only
-    when the repo declares a pytest suite (``repo_has_pytest_suite``,
-    SA-0MSQ72BVV0011SRU AC3), node commands only for existing
-    ``tests/{unit,node,cli}`` dirs (SA-0MSJELL44009XYIL), an npm-test
-    convention applies to TCE-like repos (F2 AC2), and the per-project
-    ``.pi/test-config.json`` extension file overrides convention detection
-    (F2 AC1).
-    """
-    return full_suite_commands(project_root)
-
-
 def _classify_full_suite_cache(
     runner: Runner,
     cwd: str | Path | None = None,
@@ -1717,9 +1706,8 @@ def _classify_full_suite_cache(
     Queries the per-repo test cache (``query_cached``) for each command in
     the canonical full-suite set at *cwd* (default ``TARGET_PROJECT_ROOT``)
     — never executing anything, so the audit's read-only mandate is preserved
-    unconditionally (SA-0MSIU5HFI0024D7W). *commands* overrides the set
-    (the pre-flight gate passes ``_effective_suite_commands``); the default
-    is ``full_suite_commands`` — already node-dir-aware
+    unconditionally (SA-0MSIU5HFI0024D7W). *commands* overrides the set; the
+    default is ``full_suite_commands`` — already node-dir-aware
     (SA-0MSJELL44009XYIL), so a repo without tests/node is never asked
     about a phantom tests/node command.
 
@@ -1729,20 +1717,20 @@ def _classify_full_suite_cache(
       state within the cache TTL AND every entry's exit code is 0
       (``head_sha`` set, ``problems`` empty).
     - ``"miss"``  — at least one command has NO cached entry at HEAD
-      (``head_sha`` set; ``problems`` name the missing commands). This is
-      the state the pre-flight gate blocks on.
+      (``head_sha`` set; ``problems`` name the missing commands). F3
+      (SA-0MSTN5KRF0097TVP) auto-executes the suite on this state; F4
+      (SA-0MSTN8CWM003AAU9) guarantees it never hard-blocks.
     - ``"red"``   — every command is cached but at least one entry exited
       non-zero (``head_sha`` set; ``problems`` name the failing commands).
-      Keeps the historical partial + diagnostic behavior — NOT a gate state.
+      Keeps the historical partial + diagnostic behavior — never a block.
     - ``"error"`` — HEAD could not be resolved (``head_sha`` None). A cache
       query exception propagates to the caller, which decides fail-closed
-      (``_resolve_auto_green_run``) vs fail-open (the pre-flight gate).
+      (``_resolve_auto_green_run``).
     - ``"empty"`` — no suite command is resolvable for this project
-      (F2 AC4 single source of truth; ``_effective_suite_commands``
-      delegated to ``full_suite_commands``). NEVER vacuously green:
-      ``_resolve_auto_green_run`` fails closed (no evidence), and the
-      pre-flight gate fails open (never blocks) — the audit proceeds with
-      execution-dependent ACs partial + a documented reason (parent AC3).
+      (F2 AC4 single source of truth via ``full_suite_commands``). NEVER
+      vacuously green: ``_resolve_auto_green_run`` fails closed (no
+      evidence), and the audit proceeds with execution-dependent ACs
+      partial + a documented reason (parent AC3 / F4 AC2 — never block).
     """
     head_sha = _resolve_audited_head(runner)
     if head_sha is None:
@@ -1785,7 +1773,8 @@ def _auto_green_run_outcome(
     """Resolve automatically-verified green full-suite evidence, read-only.
 
     Delegates the cache query to :func:`_classify_full_suite_cache` (the
-    single source of truth shared with the pre-flight gate) and maps the
+    single source of truth shared across the execution-dependent verification
+    paths) and maps the
     classification onto the historical contract. Same behavior as the
     historical :func:`_resolve_auto_green_run` (which remains a thin
     wrapper), plus the raw classification *status* so the caller can
@@ -1849,59 +1838,6 @@ def _resolve_auto_green_run(
     """
     block, sha, _status = _auto_green_run_outcome(runner, cwd=cwd)
     return block, sha
-
-
-def _preflight_cache_gate(
-    runner: Runner,
-    cwd: str | Path | None = None,
-) -> str | None:
-    """Return an actionable blocking message when the full-suite cache is MISSING at HEAD.
-
-    The pre-flight gate (SA-0MSQ72BVV0011SRU): turns the cache-miss
-    *diagnostic* into an *early exit* so the audit can never ship a report
-    with degraded 'met' verdicts on execution-dependent ACs when no
-    full-suite evidence exists and the caller did not explicitly opt out
-    (``--run-tests`` executes the suite; ``--green-run`` attests it).
-
-    Fires ONLY on a cache **miss** — at least one command in the repo's
-    effective suite set has no cached run at HEAD. It is repo-aware: the
-    pytest command is not required for repos without a pytest suite
-    (``_effective_suite_commands`` → ``full_suite_commands``, F2 AC4), so a
-    docs-only or vitest-only repo is never falsely blocked. An **empty**
-    effective set (no resolvable suite commands) is NOT a miss — the gate
-    fails open (parent AC3 / F4 never-block; the auto-green-run path fails
-    closed separately). A **red** cached run keeps the historical partial +
-    diagnostic behavior (evidence exists that the suite ran; it just
-    failed), a **green** cache proceeds, and cache errors fail open
-    (an infra hiccup must not block an audit that today proceeds partial).
-
-    Returns the message for the caller to print (and exit non-zero with),
-    or None to proceed.
-    """
-    project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
-    try:
-        status, head_sha, problems = _classify_full_suite_cache(
-            runner, cwd=str(project_root),
-            commands=_effective_suite_commands(project_root),
-        )
-    except Exception:  # noqa: BLE001 -- fail-open: infra hiccups never block
-        return None
-    if status != _FULL_SUITE_CACHE_MISS:
-        return None
-    missing = [p for p in problems if p.startswith("no cached full-suite run")]
-    detail = "; ".join(missing) if missing else "; ".join(problems)
-    return (
-        "Audit blocked: no green full-suite run is cached at HEAD "
-        f"{head_sha or 'unknown'} (full-suite cache miss: {detail}). The "
-        "audit cannot verify execution-dependent acceptance criteria "
-        "without evidence, so it will NOT produce a report or persist an "
-        "audit — degraded 'met' verdicts are not allowed. Run the full "
-        "suite once at this commit (/skill:test or run_tests.py --force) to "
-        "populate the test cache, then re-audit — or explicitly opt out "
-        "with --run-tests (executes the suite and populates the cache) or "
-        "--green-run HEAD (operator attestation). The pre-audit work-item "
-        "status/stage were left untouched."
-    )
 
 
 def _test_skill_run_prompt_block(sha: str) -> str:
@@ -5670,11 +5606,13 @@ class _AuditContext:
 
 def _phase_gate(ctx: _AuditContext) -> int | None:
     """Phase 1 — launch-context guard, model/green-run resolution, original
-    status capture, freshness + pre-flight gates, and the in_progress claim.
+    status capture, freshness gates, and the in_progress claim.
 
-    Returns an exit code for early-abort paths (fresh-skip, cache-miss,
-    pre-flight refusal) — cmd_issue returns it directly without touching the
+    Returns an exit code for early-abort paths (fresh-skip, pre-flight
+    refusal) — cmd_issue returns it directly without touching the
     status lifecycle. Returns None when the pipeline should continue.
+    Note (F4, SA-0MSTN8CWM003AAU9): a full-suite cache miss is NOT an
+    early-abort — it auto-executes (F3) or fails open partial.
     """
     issue_id = ctx.issue_id
     json_mode = ctx.json_mode
@@ -5838,16 +5776,15 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
             return 0
 
     # ------------------------------------------------------------------
-    # Pre-flight full-suite cache gate (SA-0MSQ72BVV0011SRU) — REPLACED by
-    # F3 (SA-0MSTN5KRF0097TVP): a cache miss no longer hard-exits the audit.
-    # The automatic path above auto-executes the repo's real suite on a miss
-    # (unless --no-execute / AUDIT_NO_EXECUTE=1 opts out), so execution-
-    # dependent ACs are either verified from the executed green run or stay
-    # partial with a documented reason — never a degraded 'met' verdict and
-    # never a hard block. Red executed runs and cache errors fail open (the
-    # audit proceeds; execution-dependent ACs stay partial). The old gate's
-    # repo-aware empty-set handling (F2 AC4) is preserved: an unresolvable
-    # command set fails open partial.
+    # Never-block guarantee (F4, SA-0MSTN8CWM003AAU9): the audit NEVER
+    # hard-exits solely because it cannot run tests. The old pre-flight
+    # hard gate (SA-0MSQ72BVV0011SRU) was removed; a cache miss is handled
+    # by F3's auto-execution above (or fail-open partial under
+    # --no-execute / AUDIT_NO_EXECUTE=1). Execution-dependent ACs are
+    # verified from the executed green run or stay partial with a documented
+    # reason — never a degraded 'met' verdict, never a hard block. Red
+    # executed runs, cache errors, unresolvable HEADs, and empty command
+    # sets (F2 AC4 / F4 AC2) all fail open partial.
     # ------------------------------------------------------------------
     if no_execute and green_run_sha is None and auto_green_run_sha is None \
             and test_skill_run_sha is None and not run_tests:

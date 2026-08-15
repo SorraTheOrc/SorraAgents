@@ -189,6 +189,14 @@ class TestGateNeverBlocksOnCacheMiss:
         err = capsys.readouterr().err
         assert "Audit blocked" not in err
 
+    def test_no_hard_block_code_path_remains(self):
+        """F4 AC6 (SA-0MSTN8CWM003AAU9): no code path in the audit runner may
+        emit 'Audit blocked: no green full-suite run is cached at HEAD' as a
+        hard exit — the pre-flight gate that produced it was removed."""
+        src = Path(audit_runner.__file__).read_text(encoding="utf-8")
+        assert "Audit blocked: no green full-suite run is cached at HEAD" not in src
+        assert "_preflight_cache_gate" not in src
+
 
 class TestNoExecuteHatch:
     """AC3 (regression guard, GREEN since F3): ``AUDIT_NO_EXECUTE=1`` must

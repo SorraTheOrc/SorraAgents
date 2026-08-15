@@ -1145,7 +1145,9 @@ class TestEffectiveSuiteCommands:
 
     Pytest-suite detection is the shared ``repo_has_pytest_suite`` from the
     test skill runner (single source of truth, F2 AC4); the effective command
-    set delegates to ``full_suite_commands``.
+    set is ``full_suite_commands`` directly (F4, SA-0MSTN8CWM003AAU9:
+    the thin ``_effective_suite_commands`` wrapper was removed with the
+    pre-flight gate it served).
     """
 
     def test_pytest_ini_counts_as_pytest_suite(self, tmp_path):
@@ -1153,7 +1155,7 @@ class TestEffectiveSuiteCommands:
         assert repo_has_pytest_suite(tmp_path) is True
         assert any(
             "pytest" in c
-            for c in audit_runner._effective_suite_commands(tmp_path)
+            for c in audit_runner.full_suite_commands(tmp_path)
         )
 
     def test_pyproject_marker_counts_as_pytest_suite(self, tmp_path):
@@ -1169,80 +1171,66 @@ class TestEffectiveSuiteCommands:
         """A node-only repo keeps node commands but drops the pytest command."""
         _make_suite_dirs(tmp_path)
         assert repo_has_pytest_suite(tmp_path) is False
-        cmds = audit_runner._effective_suite_commands(tmp_path)
+        cmds = audit_runner.full_suite_commands(tmp_path)
         assert cmds  # node commands remain
         assert not any("pytest" in c for c in cmds)
 
     def test_no_suite_at_all_yields_empty_set(self, tmp_path):
         assert repo_has_pytest_suite(tmp_path) is False
-        assert audit_runner._effective_suite_commands(tmp_path) == []
+        assert audit_runner.full_suite_commands(tmp_path) == []
 
-class TestPreflightCacheGate:
-    """Unit tests for the gate decision (repo-aware, fail-open on red/error)."""
 
-    def _gate_message(self, tmp_path, side_effect=None, return_value=None):
-        if side_effect is not None:
-            patcher = mock.patch.object(
-                audit_runner, "query_cached", side_effect=side_effect
+class TestNeverBlocksOnExecutionImpossible:
+    """F4 never-block guarantee (SA-0MSTN8CWM003AAU9 AC1/AC2): the audit
+    must NEVER exit with a hard block solely because it cannot run tests —
+    no cache, no test runner, no configured suite commands, execution
+    impossible. Every such case degrades to a fail-open partial verdict with
+    a clear diagnostic (the old pre-flight cache gate was removed).
+    """
+
+    def test_gate_function_removed(self):
+        """AC6: the blocking gate no longer exists — no code path can emit
+        'Audit blocked: no green full-suite run is cached at HEAD' as a hard
+        exit (the F1 contract test asserts the message never appears in err)."""
+        assert not hasattr(audit_runner, "_preflight_cache_gate")
+
+    def test_no_suite_repo_proceeds_partial(self, tmp_path):
+        """AC2: a docs-only repo (empty command set) proceeds — no block, no
+        execution, execution-dependent ACs stay partial with a documented
+        reason."""
+        prompts: dict[str, str] = {}
+        mock_runner = TestAutoGreenRunPromptInjection()._make_cmd_issue_runner()
+
+        def _fake_call(*args, **kwargs):
+            prompts[args[1]] = args[2]
+            return {"extracted_text": "[]"}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=None
+        ), mock.patch.object(
+            audit_runner, "_run_tests_via_test_skill",
+            return_value={
+                "success": True, "results": [], "failures": [],
+                "triaged": [], "notice": "",
+            },
+        ) as mock_run_tests, mock.patch(
+            "skill.code_review.scripts.code_quality.run_code_quality",
+            mock.MagicMock(
+                return_value={"success": True, "findings": [], "fixes_applied": 0}
+            ),
+        ), mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", tmp_path):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=True, runner=mock_runner,
             )
-        else:
-            patcher = mock.patch.object(
-                audit_runner, "query_cached", return_value=return_value
-            )
-        with patcher:
-            return audit_runner._preflight_cache_gate(
-                _green_run_git_runner(), cwd=str(tmp_path),
-            )
+        assert rc == 0, "an execution-impossible repo must never hard-block"
+        assert "parent" in prompts, "Phase 1 must be reached"
+        # EMPTY classification → no auto-execution (nothing to run) and no
+        # TEST-SKILL GREEN RUN block.
+        mock_run_tests.assert_not_called()
+        assert "TEST-SKILL GREEN RUN" not in prompts.get("parent", "")
 
-    def _with_pytest(self, tmp_path):
-        (tmp_path / "pytest.ini").write_text("[pytest]\n")
-        return tmp_path
-
-    def test_miss_returns_blocking_message(self, tmp_path):
-        """AC1: a cache miss yields an actionable blocking message."""
-        self._with_pytest(tmp_path)
-        message = self._gate_message(tmp_path, return_value=None)
-        assert message is not None
-        assert "Audit blocked" in message
-        assert "/skill:test" in message
-        assert "--green-run HEAD" in message
-        assert "NOT produce a report" in message
-        assert "pre-audit work-item status/stage" in message
-
-    def test_green_returns_none(self, tmp_path):
-        """A green cache proceeds (no message)."""
-        self._with_pytest(tmp_path)
-        assert self._gate_message(tmp_path, return_value=_AUTO_GREEN_ENTRY) is None
-
-    def test_red_returns_none(self, tmp_path):
-        """AC2: a red cached run keeps partial + diagnostic (no gate)."""
-        self._with_pytest(tmp_path)
-
-        def _side_effect(command, **kwargs):
-            entry = dict(_AUTO_GREEN_ENTRY)
-            if "pytest" in command:
-                entry["exit_code"] = 1
-            return entry
-
-        assert self._gate_message(tmp_path, side_effect=_side_effect) is None
-
-    def test_cache_error_fails_open(self, tmp_path):
-        """AC2: a cache/infra error never blocks the audit."""
-        self._with_pytest(tmp_path)
-        assert self._gate_message(
-            tmp_path, side_effect=RuntimeError("cache corrupt")
-        ) is None
-
-    def test_no_pytest_repo_not_blocked(self, tmp_path):
-        """AC3: a repo without a pytest suite is not falsely gated."""
-        _make_suite_dirs(tmp_path)  # node dirs; no pytest config/test files
-        assert repo_has_pytest_suite(tmp_path) is False
-        # node suites cached green → the effective set has no miss
-        assert self._gate_message(tmp_path, return_value=_AUTO_GREEN_ENTRY) is None
-
-    def test_no_suite_repo_not_blocked(self, tmp_path):
-        """AC3: a repo with no suite at all (docs-only) is never gated."""
-        assert self._gate_message(tmp_path, return_value=None) is None
 
 class TestPreflightGateCmdIssue:
     """End-to-end gate matrix at the cmd_issue level (AC1/AC2/AC4)."""
