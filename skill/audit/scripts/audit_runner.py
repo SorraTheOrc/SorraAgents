@@ -6,7 +6,7 @@ Provides two subcommands:
   project      – audit the overall project
 
 Usage:
-  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--run-tests]
+  audit_runner.py issue <id> [--do-not-persist] [--pi-bin pi] [--model <name>] [--run-tests] [--no-execute]
   audit_runner.py project [--pi-bin pi] [--model <name>]
 
 Verdicts:
@@ -17,14 +17,20 @@ Verdicts:
               (does not block ready-to-close, recorded in variance decisions)
 
 Execution-dependent criteria (e.g. 'full project test suite passes'):
-  by default the runner never executes the suite (read-only mandate).
-  Evidence is supplied either by the operator-attested ``--green-run`` path
-  or, automatically, by a green full-suite run found READ-ONLY in the
-  per-repo test cache (query_cached — see SA-0MSIU5HFI0024D7W). With the
-  explicit ``--run-tests`` flag (SA-0MSJELSWS002UF60) the runner instead
-  invokes the test skill (run_tests.py) to execute the full suite when the
-  cache is missing/stale, triaging failures per the test skill. All paths
-  are fail-closed: missing/mismatched evidence leaves such ACs partial.
+  by default the runner AUTO-EXECUTES the repo's actual suite on a
+  full-suite cache miss (F3, SA-0MSTN5KRF0097TVP): it invokes the test
+  skill (run_tests.py) to run the suite resolved by full_suite_commands
+  (F2 AC4 — including vitest/npm repos like Tableau-Card-Engine),
+  triaging failures per the test skill. A green executed run injects the
+  TEST-SKILL GREEN RUN evidence block; a red run is fail-open (no block,
+  ACs stay partial with failure evidence). Evidence is also supplied by
+  the operator-attested ``--green-run`` path or, automatically, by a green
+  full-suite run found READ-ONLY in the per-repo test cache
+  (query_cached — see SA-0MSIU5HFI0024D7W). The pre-flight cache gate
+  (SA-0MSQ72BVV0011SRU) no longer hard-blocks: ``--no-execute`` /
+  ``AUDIT_NO_EXECUTE=1`` opts out of auto-execution and proceeds fail-open
+  partial instead. All paths are fail-closed on EVIDENCE: missing evidence
+  leaves execution-dependent ACs partial (never a degraded 'met').
 
 Persist + verify invariant:
   Unless ``--do-not-persist`` is given, the runner ALWAYS persists the
@@ -297,6 +303,17 @@ AUDIT_GREEN_RUN_ENV = "AUDIT_GREEN_RUN"
 When set (and ``--green-run`` is not passed), this value (an exact commit
 sha or the alias ``HEAD``) is used as the green-run attestation. Precedence:
 ``--green-run`` flag > ``AUDIT_GREEN_RUN`` env var > unset (no attestation).
+"""
+
+
+AUDIT_NO_EXECUTE_ENV = "AUDIT_NO_EXECUTE"
+"""Environment variable name for the automatic suite-execution hatch (F3).
+
+When set to ``1`` (or ``--no-execute`` is passed), the audit does NOT
+auto-execute the test suite on a full-suite cache miss — it proceeds with a
+fail-open partial (execution-dependent ACs stay partial) instead of
+invoking the test skill. Precedence: ``--no-execute`` flag > env var >
+auto-execute on cache miss (default).
 """
 
 AUTO_GREEN_RUN_BLOCK_HEADER = "AUTO-VERIFIED GREEN RUN"
@@ -1553,9 +1570,10 @@ def _green_run_prompt_block(sha: str) -> str:
         "GREEN-RUN ATTESTATION — The operator attests the full project test "
         f"suite passed at commit {sha} (== current HEAD). "
         "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
-        "marked met based on this attestation. Do NOT execute the test suite "
-        "or any other state-modifying command — the read-only mandate "
-        "otherwise remains in force.\n\n"
+        "marked met based on this attestation. The audit runner manages test "
+        "execution: Do NOT execute tests yourself — the runner decides when "
+        "the suite runs. Do NOT execute any other state-modifying command "
+        "(wl, git, …) — the read-only mandate otherwise remains in force.\n\n"
     )
 
 
@@ -1645,11 +1663,14 @@ def _auto_green_run_prompt_block(sha: str) -> str:
     return (
         f"{AUTO_GREEN_RUN_BLOCK_HEADER} — A cached full test-suite run at "
         f"commit {sha} (== current HEAD) was verified green from the per-repo "
-        "test cache (read-only query; the audit never executes the suite). "
+        "test cache (read-only query; the audit never executes the suite on "
+        "this path). "
         "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
-        "marked met based on this verified cached result. Do NOT execute the "
-        "test suite or any other state-modifying command — the read-only "
-        "mandate otherwise remains in force.\n\n"
+        "marked met based on this verified cached result. The audit runner "
+        "manages test execution: Do NOT execute tests yourself — the runner "
+        "decides when the suite runs. Do NOT execute any other "
+        "state-modifying command (wl, git, …) — the read-only mandate "
+        "otherwise remains in force.\n\n"
     )
 
 
@@ -1757,29 +1778,33 @@ def _classify_full_suite_cache(
     return _FULL_SUITE_CACHE_RED, head_sha, problems
 
 
-def _resolve_auto_green_run(
+def _auto_green_run_outcome(
     runner: Runner,
     cwd: str | Path | None = None,
-) -> tuple[str | None, str | None]:
-    """Resolve an automatically-verified green full-suite run, read-only.
+) -> tuple[str | None, str | None, str]:
+    """Resolve automatically-verified green full-suite evidence, read-only.
 
     Delegates the cache query to :func:`_classify_full_suite_cache` (the
     single source of truth shared with the pre-flight gate) and maps the
-    classification onto the historical contract:
+    classification onto the historical contract. Same behavior as the
+    historical :func:`_resolve_auto_green_run` (which remains a thin
+    wrapper), plus the raw classification *status* so the caller can
+    distinguish a cache MISS (F3 auto-execution trigger) from RED / ERROR /
+    EMPTY (fail-open partial, no auto-execution — F3, SA-0MSTN5KRF0097TVP).
 
-    Returns ``(prompt_block, head_sha)`` when the cache is GREEN (every
-    suite command has a cached entry at the audited git state within the
-    cache TTL AND every entry's exit code is 0). Otherwise prints a clear
-    diagnostic to stderr — distinguishing a cache miss ('run /skill:test
-    once to populate the cache') from a non-zero cached run ('suite is red;
-    fix or attest with --green-run HEAD') — and returns ``(None, None)``,
-    fail-closed: no evidence, the audit completes normally, and
-    execution-dependent ACs stay partial.
+    Returns ``(prompt_block, head_sha, status)`` when the cache is GREEN
+    (every suite command has a cached entry at the audited git state within
+    the cache TTL AND every entry's exit code is 0). Otherwise prints a
+    clear diagnostic to stderr — distinguishing a cache miss ('run
+    /skill:test once to populate the cache') from a non-zero cached run
+    ('suite is red; fix or attest with --green-run HEAD') — and returns
+    ``(None, None, status)``, fail-closed: no evidence, the audit completes
+    normally, and execution-dependent ACs stay partial.
     """
     try:
         status, head_sha, problems = _classify_full_suite_cache(runner, cwd=cwd)
         if status == _FULL_SUITE_CACHE_GREEN and head_sha is not None:
-            return _auto_green_run_prompt_block(head_sha), head_sha
+            return _auto_green_run_prompt_block(head_sha), head_sha, status
         if status == _FULL_SUITE_CACHE_EMPTY:
             print(
                 "Automatic full-suite verification unavailable: no suite "
@@ -1789,9 +1814,9 @@ def _resolve_auto_green_run(
                 "Execution-dependent criteria stay partial.",
                 file=sys.stderr,
             )
-            return None, None
+            return None, None, status
         if head_sha is None:
-            return None, None
+            return None, None, status
         commands = full_suite_commands(Path(cwd or TARGET_PROJECT_ROOT).resolve())
         print(
             "Automatic full-suite verification unavailable: "
@@ -1809,7 +1834,21 @@ def _resolve_auto_green_run(
             "Execution-dependent criteria stay partial.",
             file=sys.stderr,
         )
-    return None, None
+        return None, None, _FULL_SUITE_CACHE_ERROR
+    return None, None, status
+
+
+def _resolve_auto_green_run(
+    runner: Runner,
+    cwd: str | Path | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve an automatically-verified green full-suite run, read-only.
+
+    Thin wrapper over :func:`_auto_green_run_outcome` (historical 2-tuple
+    contract). See that function for the full behavior and diagnostics.
+    """
+    block, sha, _status = _auto_green_run_outcome(runner, cwd=cwd)
+    return block, sha
 
 
 def _preflight_cache_gate(
@@ -1870,21 +1909,24 @@ def _test_skill_run_prompt_block(sha: str) -> str:
 
     The block tells the model that the full project test suite was EXECUTED
     via the test skill (``run_tests.py``) at *sha* (== the audited HEAD) and
-    passed (``--run-tests`` path, SA-0MSJELSWS002UF60), so execution-
-    dependent criteria (e.g. 'full test suite passes') MAY be marked met
-    based on that executed green run — while the read-only mandate otherwise
-    remains in force and the suite must NOT be executed again. Returns a
-    string ending in a blank line so callers can splice it between existing
-    prompt sections.
+    passed (F3 auto-execution or the ``--run-tests`` path, SA-0MSJELSWS002UF60),
+    so execution-dependent criteria (e.g. 'full test suite passes') MAY be
+    marked met based on that executed green run. The runner manages test
+    execution — the model must NOT execute tests itself (F3 AC7: the
+    read-only suite-execution mandate is replaced by runner-managed
+    execution). Returns a string ending in a blank line so callers can
+    splice it between existing prompt sections.
     """
     return (
         f"{TEST_SKILL_RUN_BLOCK_HEADER} — The full project test suite was "
         f"executed via the test skill (/skill:test / run_tests.py) at commit "
-        f"{sha} (== current HEAD) and passed (--run-tests). "
+        f"{sha} (== current HEAD) and passed. "
         "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
-        "marked met based on this executed green run. Do NOT execute the test "
-        "suite again or any other state-modifying command — the read-only "
-        "mandate otherwise remains in force.\n\n"
+        "marked met based on this executed green run. The audit runner has "
+        "auto-executed the suite on your behalf. Do NOT execute tests "
+        "yourself — the runner manages execution. Do NOT execute any other "
+        "state-modifying command (wl, git, …) — the read-only mandate for "
+        "non-suite commands otherwise remains in force.\n\n"
     )
 
 
@@ -1896,12 +1938,14 @@ def _run_tests_via_test_skill(
 ) -> dict:
     """Execute the full project test suite via the test skill's runner.
 
-    The ``--run-tests`` path (SA-0MSJELSWS002UF60): an explicit,
-    operator-authorized deviation from the audit's read-only mandate. The
-    runner delegates to the test skill's machinery (``run_tests.py``) —
-    executing each command in ``full_suite_commands()`` at *cwd* in quiet
-    mode through the per-repo test cache with ``force=True`` (execute fresh,
-    refresh the stored entries so subsequent audits auto-verify).
+    The ``--run-tests`` path (SA-0MSJELSWS002UF60) and the F3 default
+    auto-execution path (SA-0MSTN5KRF0097TVP) both funnel here: an explicit
+    suite-execution deviation from the audit's read-only mandate for
+    NON-suite commands. The runner delegates to the test skill's machinery
+    (``run_tests.py``) — executing each command in ``full_suite_commands()``
+    at *cwd* in quiet mode through the per-repo test cache with
+    ``force=True`` (execute fresh, refresh the stored entries so subsequent
+    audits auto-verify read-only).
 
     Failures are triaged per the test skill, never silently ignored: each
     structured failure record is passed to the triage helper
@@ -1923,9 +1967,9 @@ def _run_tests_via_test_skill(
     # per-command timeout — single source of truth via run_tests.py.
     timeout = suite_timeout_per_command(project_root) or timeout
     print(
-        f"Invoking test skill (run_tests.py) — --run-tests enabled: executing "
-        f"the full project test suite at {project_root} in quiet mode "
-        f"(cache refresh, per-command timeout {timeout}s)...",
+        f"Invoking test skill (run_tests.py) — suite execution: "
+        f"executing the full project test suite at {project_root} in quiet "
+        f"mode (cache refresh, per-command timeout {timeout}s)...",
         file=sys.stderr,
     )
     results: list[dict] = []
@@ -3355,7 +3399,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append("")
             lines.append(
                 f"Test skill run evidence: {test_skill_run_sha} "
-                "(executed full-suite run, --run-tests)"
+                "(executed full-suite run)"
             )
         if content_fingerprint:
             lines.append("")
@@ -3380,7 +3424,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append("")
             lines.append(
                 f"Test skill run evidence: {test_skill_run_sha} "
-                "(executed full-suite run, --run-tests)"
+                "(executed full-suite run)"
             )
         if content_fingerprint:
             lines.append("")
@@ -5582,6 +5626,7 @@ class _AuditContext:
     audit_children: bool
     max_child_audits: int | None
     run_tests: bool
+    no_execute: bool = False
     max_citations_per_ac: int | None = None
 
     # Resolved / gate-phase state (set by _phase_gate)
@@ -5706,6 +5751,13 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
         green_run, runner,
     )
 
+    # F3 (SA-0MSTN5KRF0097TVP): automatic suite-execution hatch. By default
+    # the audit auto-executes the repo's actual suite on a cache miss; the
+    # operator can opt out with --no-execute / AUDIT_NO_EXECUTE=1 (proceed
+    # fail-open partial instead). Resolved here so the auto-verification
+    # path below can consult it.
+    no_execute = ctx.no_execute or os.environ.get(AUDIT_NO_EXECUTE_ENV) == "1"
+
     # Automatic full-suite verification (SA-0MSIU5HFI0024D7W): when there is
     # no operator attestation, consume a green full-suite run from the per-repo
     # test cache READ-ONLY (query_cached never executes anything). Fail-closed:
@@ -5715,20 +5767,28 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     auto_green_run_sha = None
     test_skill_run_sha = None
     if green_run_sha is None:
-        auto_block, auto_sha = _resolve_auto_green_run(
+        auto_block, auto_sha, auto_status = _auto_green_run_outcome(
             runner, cwd=str(TARGET_PROJECT_ROOT),
         )
         if auto_sha is not None:
             green_run_block = auto_block
             auto_green_run_sha = auto_sha
-        elif run_tests:
-            # --run-tests path (SA-0MSJELSWS002UF60): no operator attestation
-            # and no cached green evidence. Invoke the test skill (run_tests.py)
-            # to execute the full project test suite in quiet mode, triage any
-            # failures per the test skill, and refresh the per-repo cache so
-            # subsequent audits auto-verify. This is an explicit,
-            # operator-authorized deviation from the audit's read-only mandate;
-            # the default (no --run-tests) stays strictly read-only.
+        elif run_tests or (not no_execute
+                           and auto_status == _FULL_SUITE_CACHE_MISS):
+            # F3 (SA-0MSTN5KRF0097TVP): default auto-execution on cache miss.
+            # The audit's read-only mandate is lifted for suite execution:
+            # when no operator attestation and no cached green evidence exist
+            # AND the cache is MISSING (not red, error, or empty — those stay
+            # fail-open partial, no execution), the runner invokes the test
+            # skill (run_tests.py) to execute the repo's ACTUAL suite
+            # (full_suite_commands — F2 AC4), triage any failures per the
+            # test skill, and refresh the per-repo cache so subsequent audits
+            # auto-verify read-only. A green executed run injects the
+            # TEST-SKILL GREEN RUN block; a red run is fail-open (no block,
+            # execution-dependent ACs stay partial with failure evidence).
+            # --no-execute / AUDIT_NO_EXECUTE=1 opts out and proceeds
+            # fail-open partial (no execution, no block). --run-tests is the
+            # explicit override that executes on ANY non-green state.
             head_sha = _resolve_audited_head(runner)
             test_run = _run_tests_via_test_skill(
                 cwd=TARGET_PROJECT_ROOT,
@@ -5778,31 +5838,25 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
             return 0
 
     # ------------------------------------------------------------------
-    # Pre-flight full-suite cache gate (SA-0MSQ72BVV0011SRU): a MISSING
-    # full-suite cache at HEAD (no green cached run via query_cached) with
-    # no explicit opt-out (--run-tests executes the suite; --green-run
-    # attests it) blocks the audit BEFORE any Phase 1 pi call, report, or
-    # persistence — and before the status lifecycle, so pre-audit
-    # status/stage are preserved. Without the gate a cache miss degraded to
-    # a diagnostic and the run continued, letting the Phase 2 model mark
-    # execution-dependent ACs 'met' from implementer-reported evidence with
-    # no forcing function to populate the cache (the degraded-verdict bug
-    # this gate fixes). A red cached run and cache errors keep the
-    # historical partial + diagnostic behavior (fail-open); only a miss
-    # exits non-zero, and only for repos whose effective suite set actually
-    # requires the suite (no-pytest repos are never falsely blocked, AC3).
+    # Pre-flight full-suite cache gate (SA-0MSQ72BVV0011SRU) — REPLACED by
+    # F3 (SA-0MSTN5KRF0097TVP): a cache miss no longer hard-exits the audit.
+    # The automatic path above auto-executes the repo's real suite on a miss
+    # (unless --no-execute / AUDIT_NO_EXECUTE=1 opts out), so execution-
+    # dependent ACs are either verified from the executed green run or stay
+    # partial with a documented reason — never a degraded 'met' verdict and
+    # never a hard block. Red executed runs and cache errors fail open (the
+    # audit proceeds; execution-dependent ACs stay partial). The old gate's
+    # repo-aware empty-set handling (F2 AC4) is preserved: an unresolvable
+    # command set fails open partial.
     # ------------------------------------------------------------------
-    if (green_run_sha is None and auto_green_run_sha is None
-            and test_skill_run_sha is None and not run_tests):
-        gate_message = _preflight_cache_gate(
-            runner, cwd=str(TARGET_PROJECT_ROOT),
+    if no_execute and green_run_sha is None and auto_green_run_sha is None \
+            and test_skill_run_sha is None and not run_tests:
+        print(
+            "AUDIT_NO_EXECUTE=1 / --no-execute: automatic suite execution "
+            "skipped — execution-dependent acceptance criteria stay partial "
+            "(fail-open, no block).",
+            file=sys.stderr,
         )
-        if gate_message is not None:
-            if json_mode:
-                print(json.dumps({"error": gate_message}, indent=2))
-            else:
-                print(f"Error: {gate_message}", file=sys.stderr)
-            return 1
 
     # Track script execution failures for prominent surfacing: the
     # first-failure-only recorder lives on the context (record_script_failure)
@@ -7869,6 +7923,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
               audit_children: bool = False,
               max_child_audits: int | None = None,
               run_tests: bool = False,
+              no_execute: bool = False,
               max_citations_per_ac: int | None = None) -> int:
     """Audit a single work item.
 
@@ -7960,6 +8015,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         worklog_dir=worklog_dir, batch_phase2=batch_phase2,
         green_run=green_run, audit_children=audit_children,
         max_child_audits=max_child_audits, run_tests=run_tests,
+        no_execute=no_execute,
         max_citations_per_ac=max_citations_per_ac,
     )
     rc = _phase_gate(ctx)
@@ -8271,11 +8327,24 @@ def build_parser() -> argparse.ArgumentParser:
                              "(/skill:test / run_tests.py) when execution-dependent "
                              "acceptance criteria are present and no cached green "
                              "full-suite run exists, then auto-verify those criteria "
-                             "from the executed green run. OFF by default: the audit "
-                             "is otherwise strictly read-only and never executes the "
-                             "suite (environments that forbid test execution during "
-                             "audits are unaffected). Failures are triaged per the "
-                             "test skill (critical test-failure work items)."
+                             "from the executed green run. Note: since F3 "
+                             "(SA-0MSTN5KRF0097TVP) the runner AUTO-EXECUTES on a "
+                             "cache miss by default, so this flag is now a no-op on "
+                             "the miss path; it remains the explicit override that "
+                             "executes even on red/error/empty cache states and is "
+                             "overridden by --no-execute / AUDIT_NO_EXECUTE=1. "
+                             "Failures are triaged per the test skill (critical "
+                             "test-failure work items)."
+                         ))
+    p_issue.add_argument("--no-execute", action="store_true",
+                         help=(
+                             "Opt out of automatic suite execution on a cache miss "
+                             "(F3, SA-0MSTN5KRF0097TVP): the audit proceeds fail-open "
+                             "partial — execution-dependent acceptance criteria stay "
+                             "partial with a documented reason, and the suite is never "
+                             "executed. Env: AUDIT_NO_EXECUTE=1. Without this flag the "
+                             "runner auto-executes the repo's actual suite on a miss "
+                             "via the test skill."
                          ))
 
     p_project = sub.add_parser("project", help="Audit the overall project")
@@ -8351,7 +8420,8 @@ def main(argv: list[str] | None = None) -> int:
                          max_citations_per_ac=_resolve_max_citations_per_ac(
                              args.max_citations_per_ac
                          ),
-                         run_tests=args.run_tests)
+                         run_tests=args.run_tests,
+                         no_execute=getattr(args, "no_execute", False))
     elif args.command == "project":
         return cmd_project(timeout=_resolve_effective_timeout(args.timeout),
                            pi_bin=args.pi_bin, model=args.model,

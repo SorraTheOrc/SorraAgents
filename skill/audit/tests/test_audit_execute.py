@@ -1,26 +1,22 @@
-"""F1 test contract (SA-0MSTMW275003BDWU): audit execution behavior.
+"""F1/F3 test contract: audit execution behavior (SA-0MSTMW275003BDWU /
+SA-0MSTN5KRF0097TVP).
 
 Pins the audit runner's execution-dependent verification contract:
 
-- AC2 (RED until F3): a full-suite cache miss must NOT hard-exit the audit.
-  Today the pre-flight gate blocks ("no green full-suite run is cached at
-  HEAD") and the audit exits 1 with no Phase 1. After F3 the runner
-  auto-executes the suite on a cache miss and proceeds.
-- AC3 (regression guard, green today and after F3): ``AUDIT_NO_EXECUTE=1``
-  must prevent suite execution even on a cache miss (today the audit never
-  executes; after F3 the hatch must suppress auto-execution).
-- AC5 (RED until F3): TCE audit E2E — cache miss, npm test suite detected,
-  executed via the test skill, TEST-SKILL GREEN RUN block injected. Today
-  the TCE audit completes WITHOUT execution (no evidence block); after F3
-  it auto-executes ``npm test`` and injects the block.
-- AC6 (regression guard, green today and after F3): a FAILING suite
-  execution must never block the audit — execution-dependent ACs stay
-  partial with failure evidence (no TEST-SKILL GREEN RUN block, so 'met'
-  cannot be claimed from implementer reports).
-
-RED tests (AC2, AC5) are pinned ``xfail(strict=True)`` so the suite stays
-green at F1's commit; when F3 lands the behavior the tests XPASS and the
-strict marker forces F3 to remove it.
+- AC2 (GREEN since F3): a full-suite cache miss must NOT hard-exit the
+  audit. F3 (SA-0MSTN5KRF0097TVP) replaced the pre-flight gate's hard
+  block with default auto-execution: on a cache miss the runner invokes
+  the test skill to run the repo's actual suite and proceeds to Phase 1.
+- AC3 (GREEN since F3): ``AUDIT_NO_EXECUTE=1`` / ``--no-execute`` must
+  prevent suite execution even on a cache miss — the hatch suppresses
+  auto-execution and the audit proceeds fail-open partial (rc 0).
+- AC5 (GREEN since F3): TCE audit E2E — cache miss, npm test suite
+  detected, executed via the test skill, TEST-SKILL GREEN RUN block
+  injected.
+- AC4/AC6 (GREEN since F3): a FAILING suite execution (auto or
+  ``--run-tests``) must never block the audit — execution-dependent ACs
+  stay partial with failure evidence (no TEST-SKILL GREEN RUN block, so
+  'met' cannot be claimed from implementer reports).
 """
 
 from __future__ import annotations
@@ -35,8 +31,6 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-import pytest
 
 from skill.audit.scripts import audit_runner
 
@@ -131,7 +125,8 @@ def _mock_cq():
 
 
 def _run_issue(*, cache_return=None, test_run=_GREEN_TEST_RUN,
-               run_tests=False, env=None, project_root=None):
+               run_tests=False, no_execute=False, env=None,
+               project_root=None):
     """Run cmd_issue (force, no persist) with mocked pi/cache/test-skill.
 
     Returns ``(rc, prompts, mock_run_tests)``.
@@ -169,23 +164,15 @@ def _run_issue(*, cache_return=None, test_run=_GREEN_TEST_RUN,
         mock_run_tests = entered[2]  # the _run_tests_via_test_skill mock
         rc = audit_runner.cmd_issue(
             "TEST-1", persist=False, force=True, runner=mock_runner,
-            run_tests=run_tests,
+            run_tests=run_tests, no_execute=no_execute,
         )
     return rc, prompts, mock_run_tests
 
 
 class TestGateNeverBlocksOnCacheMiss:
-    """AC2 (RED until F3): a full-suite cache miss must not hard-exit the
+    """AC2 (GREEN since F3): a full-suite cache miss must not hard-exit the
     audit — the runner auto-executes the suite and proceeds to Phase 1."""
 
-    @pytest.mark.xfail(
-        reason=(
-            "F1 contract AC2 — auto-execution on cache miss lands in F3 "
-            "(SA-0MSTN5KRF0097TVP); RED on current code (pre-flight gate "
-            "blocks with a non-zero exit)"
-        ),
-        strict=True,
-    )
     def test_cache_miss_proceeds_to_phase1(self):
         """A cache miss (no opt-out) must NOT exit non-zero: the suite is
         auto-executed and the audit reaches the Phase 1 parent prompt."""
@@ -194,14 +181,6 @@ class TestGateNeverBlocksOnCacheMiss:
         assert "parent" in prompts, "Phase 1 must be reached on a cache miss"
         mock_run_tests.assert_called_once()
 
-    @pytest.mark.xfail(
-        reason=(
-            "F1 contract AC2 — auto-execution on cache miss lands in F3 "
-            "(SA-0MSTN5KRF0097TVP); RED on current code (pre-flight gate "
-            "blocks with a non-zero exit)"
-        ),
-        strict=True,
-    )
     def test_gate_message_no_longer_blocks(self, capsys):
         """The 'no green full-suite run is cached' blocking message must not
         be emitted as a hard exit on a cache miss."""
@@ -212,32 +191,58 @@ class TestGateNeverBlocksOnCacheMiss:
 
 
 class TestNoExecuteHatch:
-    """AC3 (regression guard): ``AUDIT_NO_EXECUTE=1`` must prevent suite
-    execution even on a cache miss.
+    """AC3 (regression guard, GREEN since F3): ``AUDIT_NO_EXECUTE=1`` must
+    prevent suite execution even on a cache miss.
 
-    Passes today (the audit never executes the suite read-only) and must
-    continue passing after F3 (the hatch must suppress auto-execution).
+    F3 (SA-0MSTN5KRF0097TVP) introduced the hatch as the opt-out from
+    default auto-execution: with the hatch set the audit proceeds fail-open
+    partial — no suite execution, no TEST-SKILL GREEN RUN block, rc 0.
     """
 
     def test_no_execute_env_never_executes_suite(self):
-        """With AUDIT_NO_EXECUTE=1 the test skill is never invoked.
-
-        Today the audit is read-only (no execution exists) and on a cache
-        miss the gate blocks before any invocation could occur; after F3 the
-        hatch must suppress the auto-execution path. The invariant that
-        holds in BOTH worlds: ``_run_tests_via_test_skill`` is never called.
-        """
+        """With AUDIT_NO_EXECUTE=1 the test skill is never invoked — the
+        auto-execution path is suppressed and the audit proceeds fail-open
+        partial (rc 0, no executed-run evidence)."""
         rc, prompts, mock_run_tests = _run_issue(
             cache_return=None, env={AUDIT_NO_EXECUTE_ENV: "1"},
         )
         mock_run_tests.assert_not_called()
+        assert rc == 0, "the hatch proceeds fail-open partial, never blocks"
         assert all(
             "TEST-SKILL GREEN RUN" not in p for p in prompts.values()
         ), "no executed-run evidence may be injected under the hatch"
-        # Today the pre-flight gate still blocks the miss (rc 1, before
-        # execution); after F3 the hatch proceeds fail-open partial (rc 0,
-        # still without execution). Either way execution never happens.
-        assert rc in (0, 1)
+
+    def test_no_execute_flag_never_executes_suite(self):
+        """The ``--no-execute`` CLI flag has the same effect as the env var:
+        the suite is never executed on a cache miss."""
+        rc, prompts, mock_run_tests = _run_issue(
+            cache_return=None, no_execute=True,
+        )
+        mock_run_tests.assert_not_called()
+        assert rc == 0
+        assert all(
+            "TEST-SKILL GREEN RUN" not in p for p in prompts.values()
+        )
+
+    def test_flag_defaults_to_execute(self):
+        """AC2/AC8: by default (no --no-execute, no env) a cache miss
+        auto-executes the suite — the escape hatch is opt-in, not default."""
+        rc, prompts, mock_run_tests = _run_issue(cache_return=None)
+        assert rc == 0
+        mock_run_tests.assert_called_once()
+        assert "TEST-SKILL GREEN RUN" in prompts.get("parent", "")
+
+    def test_flag_and_env_both_set(self):
+        """The flag and the env var agree (both opt out) — deterministic."""
+        rc, prompts, mock_run_tests = _run_issue(
+            cache_return=None, no_execute=True,
+            env={AUDIT_NO_EXECUTE_ENV: "1"},
+        )
+        mock_run_tests.assert_not_called()
+        assert rc == 0
+        assert all(
+            "TEST-SKILL GREEN RUN" not in p for p in prompts.values()
+        )
 
 
 class TestTceAuditAutoExecution:
@@ -253,14 +258,6 @@ class TestTceAuditAutoExecution:
         )
         return tmp_path
 
-    @pytest.mark.xfail(
-        reason=(
-            "F1 contract AC5 — TCE auto-execution lands in F3 "
-            "(SA-0MSTN5KRF0097TVP); RED on current code (TCE audit completes "
-            "without executing the suite, so no TEST-SKILL GREEN RUN block)"
-        ),
-        strict=True,
-    )
     def test_tce_audit_auto_executes_npm_test(self, tmp_path: Path):
         """A TCE audit on a cache miss executes the suite via the test skill
         and injects the TEST-SKILL GREEN RUN block into the Phase 1 parent
@@ -292,12 +289,14 @@ class TestTceAuditAutoExecution:
 
 
 class TestFailOpenOnExecutionError:
-    """AC6 (regression guard): a FAILING suite execution must never block the
-    audit — execution-dependent ACs stay partial with failure evidence.
+    """AC4/AC6 (regression guard): a FAILING suite execution must never
+    block the audit — execution-dependent ACs stay partial with failure
+    evidence.
 
-    Passes today (the --run-tests failure path is fail-open: rc 0, no green
-    block) and must continue passing after F3 (auto-execution failures must
-    also fail open).
+    GREEN since F3 (SA-0MSTN5KRF0097TVP): auto-execution failures fail
+    open exactly like the historical ``--run-tests`` failure path — rc 0,
+    no TEST-SKILL GREEN RUN block (so 'met' cannot be claimed from
+    implementer reports).
     """
 
     def test_failing_execution_never_blocks(self):
@@ -306,6 +305,16 @@ class TestFailOpenOnExecutionError:
         'met' from implementer claims)."""
         rc, prompts, mock_run_tests = _run_issue(
             cache_return=None, test_run=_FAILING_TEST_RUN, run_tests=True,
+        )
+        assert rc == 0
+        mock_run_tests.assert_called_once()
+        assert "TEST-SKILL GREEN RUN" not in prompts.get("parent", "")
+
+    def test_failing_auto_execution_never_blocks(self):
+        """AC4: a failing AUTO-execution (no --run-tests, default F3 path)
+        also fails open — rc 0, no executed-green evidence injected."""
+        rc, prompts, mock_run_tests = _run_issue(
+            cache_return=None, test_run=_FAILING_TEST_RUN,
         )
         assert rc == 0
         mock_run_tests.assert_called_once()

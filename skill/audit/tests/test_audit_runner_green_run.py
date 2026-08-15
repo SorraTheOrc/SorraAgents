@@ -148,13 +148,16 @@ class TestGreenRunResolution:
         assert "could not be resolved" in capsys.readouterr().err
 
     def test_prompt_block_keeps_read_only_mandate(self):
-        """The block permits met-on-attestation but forbids executing the suite."""
+        """AC7: the block permits met-on-attestation but defers suite
+        execution to the runner (no universal 'Do NOT execute the test suite'
+        rule)."""
         block, _ = audit_runner._resolve_green_run_attestation(
             "HEAD", _green_run_git_runner(),
         )
         assert "GREEN-RUN ATTESTATION" in block
         assert "MAY be marked met based on this attestation" in block
-        assert "Do NOT execute the test suite" in block
+        assert "Do NOT execute tests yourself" in block
+        assert "runner manages test execution" in block
         assert "read-only mandate" in block
 
 class TestGreenRunPromptInjection:
@@ -631,7 +634,7 @@ class TestAutoGreenRunResolution:
         assert "AUTO-VERIFIED GREEN RUN" in block
         assert _GREEN_RUN_HEAD in block
         assert "MAY be marked met" in block
-        assert "Do NOT execute the test suite" in block
+        assert "Do NOT execute tests yourself" in block
         assert "read-only mandate" in block
 
     def test_failing_cached_run_no_evidence(self, tmp_path):
@@ -879,34 +882,38 @@ class TestAutoGreenRunPromptInjection:
         assert _GREEN_RUN_HEAD in prompts["parent"]
         assert "GREEN-RUN ATTESTATION" not in prompts["parent"]
 
-    def test_cache_miss_blocks_audit(self, capsys):
-        """SA-0MSQ72BVV0011SRU AC1: a cache miss blocks the audit (no Phase 1).
+    def test_cache_miss_proceeds_on_auto_execute(self, capsys):
+        """F3 (SA-0MSTN5KRF0097TVP): a cache miss no longer blocks — auto-
+        executes the suite and proceeds to Phase 1.
 
-        This replaces the historical 'miss → diagnostic + continue' behavior:
-        a missing full-suite cache with no opt-out must exit non-zero before
-        any Phase 1 pi call so execution-dependent ACs can never be marked
-        'met' from implementer-reported evidence (the degraded-verdict bug
-        the pre-flight gate fixes).
-        """
+        The old gate (SA-0MSQ72BVV0011SRU) that exited rc 1 on cache miss
+        is replaced by F3's default auto-execution path."""
         mock_runner = self._make_cmd_issue_runner()
+        prompts: dict[str, str] = {}
 
-        def _fake_call(*args, **kwargs):  # pragma: no cover - must not run
-            raise AssertionError("Phase 1 pi call must not happen on a cache miss")
+        def _fake_call(*args, **kwargs):
+            prompts[args[1]] = args[2]
+            return {"extracted_text": "[]"}
 
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
         ), mock.patch.object(
             audit_runner, "query_cached", return_value=None
+        ), mock.patch.object(
+            audit_runner, "_run_tests_via_test_skill",
+            return_value={
+                "success": True, "results": [], "failures": [],
+                "triaged": [], "notice": "",
+            },
         ):
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
             )
-        assert rc == 1
+        assert rc == 0
+        assert "parent" in prompts
+        assert "TEST-SKILL GREEN RUN" in prompts["parent"]
         err = capsys.readouterr().err
-        assert "Audit blocked" in err
-        assert "/skill:test" in err
-        assert "--green-run HEAD" in err
-        assert "NOT produce a report" in err
+        assert "AUDIT_NO_EXECUTE" not in err
 
     def test_failing_cache_no_auto_block(self):
         """AC2: a non-zero cached exit never injects the block."""
@@ -1272,14 +1279,17 @@ class TestPreflightGateCmdIssue:
             patches.append(mock.patch.object(
                 audit_runner, "query_cached", return_value=cache_return
             ))
-        if run_tests:
-            patches.append(mock.patch.object(
-                audit_runner, "_run_tests_via_test_skill",
-                return_value={
-                    "success": True, "results": [], "failures": [],
-                    "triaged": [], "notice": "",
-                },
-            ))
+        # F3 (SA-0MSTN5KRF0097TVP): a cache miss auto-executes the suite via
+        # the test skill by default, so mock the invocation unconditionally
+        # to keep these cmd_issue-level tests hermetic (a real invocation
+        # would run the repo's actual suite).
+        patches.append(mock.patch.object(
+            audit_runner, "_run_tests_via_test_skill",
+            return_value={
+                "success": True, "results": [], "failures": [],
+                "triaged": [], "notice": "",
+            },
+        ))
         with contextlib.ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
@@ -1289,18 +1299,17 @@ class TestPreflightGateCmdIssue:
             )
         return rc, calls, mock_runner
 
-    def test_cache_miss_exits_nonzero_before_phase1(self, capsys):
-        """AC1: cache miss + no opt-out → rc 1, zero pi calls, no status change."""
-        rc, calls, runner = self._run_issue(cache_return=None)
-        assert rc == 1
-        assert calls == []  # no Phase 1 pi call
-        # pre-audit status/stage preserved: no wl update reached the runner
-        assert not any(
-            "update" in " ".join(c.args[0]) for c in runner.call_args_list
-        )
+    def test_cache_miss_auto_executes_and_proceeds(self, capsys):
+        """F3 (SA-0MSTN5KRF0097TVP): cache miss + no opt-out → auto-executes
+        the suite, proceeds to Phase 1 (no longer exits non-zero).
+
+        The old gate (SA-0MSQ72BVV0011SRU) that exited rc 1 is replaced by
+        F3's auto-execution path."""
+        rc, calls, _runner = self._run_issue(cache_return=None)
+        assert rc == 0
+        assert "parent" in calls  # reached Phase 1
         err = capsys.readouterr().err
-        assert "Audit blocked" in err
-        assert "run_tests.py --force" in err
+        assert "AUDIT_NO_EXECUTE" not in err
 
     def test_cache_miss_with_run_tests_proceeds(self):
         """AC1/AC2: cache miss + --run-tests executes the suite and proceeds."""
@@ -1565,15 +1574,20 @@ class TestRunTestsPromptInjection:
         assert _GREEN_RUN_HEAD in prompts["parent"]
         assert "AUTO-VERIFIED GREEN RUN" not in prompts["parent"]
 
-    def test_without_run_tests_never_invokes_test_skill(self, capsys):
-        """AC2/AC1: without --run-tests the test skill is never invoked — and on
-        a cache miss the pre-flight gate blocks the audit (SA-0MSQ72BVV0011SRU)
-        before the invocation could ever be reached: no report, no persistence,
-        non-zero exit."""
-        mock_runner = self._make_cmd_issue_runner()
+    def test_without_run_tests_auto_executes_on_cache_miss(self, capsys):
+        """F3 (SA-0MSTN5KRF0097TVP): without --run-tests but with a cache miss,
+        the test skill IS auto-invoked (default auto-execution path).
 
-        def _fake_call(*args, **kwargs):  # pragma: no cover - must not run
-            raise AssertionError("Phase 1 pi call must not happen on a cache miss")
+        The old gate (SA-0MSQ72BVV0011SRU) that blocked before invocation is
+        replaced by F3's auto-execution: rc 0, Phase 1 reached, TEST-SKILL
+        GREEN RUN injected. With --no-execute the skill is not invoked
+        (fail-open partial)."""
+        mock_runner = self._make_cmd_issue_runner()
+        prompts: dict[str, str] = {}
+
+        def _fake_call(*args, **kwargs):
+            prompts[args[1]] = args[2]
+            return {"extracted_text": "[]"}
 
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_call
@@ -1592,11 +1606,10 @@ class TestRunTestsPromptInjection:
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=True, runner=mock_runner,
             )
-        assert rc == 1
-        mock_run_tests.assert_not_called()
-        err = capsys.readouterr().err
-        assert "Audit blocked" in err
-        assert "--run-tests" in err  # the message names the explicit opt-outs
+        assert rc == 0
+        mock_run_tests.assert_called_once()
+        assert "parent" in prompts
+        assert "TEST-SKILL GREEN RUN" in prompts["parent"]
 
     def test_green_cache_skips_test_skill_invocation(self):
         """AC1: a green cached run short-circuits the invocation entirely."""
@@ -1673,7 +1686,7 @@ class TestRunTestsReportLine:
             test_skill_run_sha=_GREEN_RUN_HEAD,
         )
         assert f"Test skill run evidence: {_GREEN_RUN_HEAD}" in report
-        assert "executed full-suite run, --run-tests" in report
+        assert "executed full-suite run" in report
         assert "Automatic green run evidence" not in report
 
     def test_report_without_test_skill_run_has_no_line(self):
@@ -1686,7 +1699,8 @@ class TestRunTestsReportLine:
         assert "Test skill run evidence" not in report
 
 class TestRunTestsCliFlag:
-    """The --run-tests flag parses and defaults off (AC2)."""
+    """The --run-tests / --no-execute flags parse and default correctly
+    (F3 AC2: --no-execute defaults off; auto-execution is the default)."""
 
     def test_flag_defaults_off(self):
         """AC2: without the flag the audit stays strictly read-only."""
@@ -1699,4 +1713,16 @@ class TestRunTestsCliFlag:
             ["issue", "TEST-1", "--run-tests"]
         )
         assert args.run_tests is True
+
+    def test_no_execute_defaults_off(self):
+        """F3 AC2: auto-execution is the default — --no-execute defaults off."""
+        args = audit_runner.build_parser().parse_args(["issue", "TEST-1"])
+        assert args.no_execute is False
+
+    def test_no_execute_flag_enables(self):
+        """F3 AC2: --no-execute opts out of auto-execution on cache miss."""
+        args = audit_runner.build_parser().parse_args(
+            ["issue", "TEST-1", "--no-execute"]
+        )
+        assert args.no_execute is True
 
