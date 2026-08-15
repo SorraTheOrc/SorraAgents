@@ -171,9 +171,11 @@ No status lifecycle transitions occur, and no persistence is performed. An expli
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
 **Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
-(including the status lifecycle and `persist_audit`) targets the correct
-worklog store regardless of the caller's working directory. Resolution order
-for each `wl` command:
+(including the status lifecycle) **and by `persist_audit`** targets the correct
+worklog store regardless of the caller's working directory — including the
+standalone `persist_audit.py` CLI, which resolves the store itself when no
+`--worklog-dir` is passed (SA-0MSKQERKH002IBLG). Resolution order for each
+`wl` command:
 
 1. Explicit `--worklog-dir DIR` (highest precedence — overrides everything).
 2. Prefix-to-project sibling scan: the work-item id prefix (e.g. `OSL-…`)
@@ -449,6 +451,14 @@ Runner performs code quality checks before AC verification (invokes `../code_rev
 - Persist from stdin: `cat report.md | python3 ./scripts/persist_audit.py --issue-id SA-123`
 - Persist from a file: `python3 ./scripts/persist_audit.py --issue-id SA-123 --file report.md`
 - Persist from a CLI string: `python3 ./scripts/persist_audit.py --issue-id SA-123 --report "Ready to close: Yes\n..."`
+- The persister is cwd-independent: without `--worklog-dir`, the store is
+  auto-resolved from the work-item id prefix (prefix-to-sibling scan) with a
+  cwd-chain fallback, so `persist_audit.py` can be launched from any directory
+  (e.g. the skill install dir) and still persist to the item's own store
+  (SA-0MSKQERKH002IBLG). An explicit `--worklog-dir` keeps highest precedence.
+  Note: the repo-scope facet of the skill-dir launch pattern
+  (`TARGET_PROJECT_ROOT` code-quality scan / debug-log consumers) remains
+  launch-cwd-bound — tracked in SA-0MSRLECW2001AA15.
 
 **Unique report file naming convention:**
 
@@ -477,7 +487,7 @@ Notes:
 - **Persistence + readback verification is an invariant of the runner.** Unless `--do-not-persist` is given, the runner ALWAYS persists the audit and then performs a readback verification via `wl audit-show --json` to confirm the stored audit is retrievable. If either step fails, the runner exits non-zero. Use `--do-not-persist` for dry runs. The `--require-persist` flag has been removed — persist+verify is now unconditional.
 - **Resilient audit persistence (P8):** the final `wl update <id> --audit-text <report>` step is the last write of the run. If it rejects the assembled verdict content (malformed JSON / validation error), `persist_audit()` never leaves the audit text field as the 43-char stub (`Audit result persisted via persist_audit.py`). It (1) runs a repair pass that salvages broken JSON fragments (valid JSON prefixes extracted; per-AC rows preserved; zero model calls) and retries once; (2) if the retry fails, persists a compact markdown fallback notice (with a clear failure notice naming the work item, so the identity/readback guards pass) and returns `PERSIST_CONTENT_INVALID` (4); (3) the runner then performs a *bounded* re-ask — at most **one** additional model call to re-emit the verdict array in valid JSON — reassembles the report and retries persistence. The repair never re-runs the full audit pipeline. If every attempt fails, `persist_audit()` returns non-zero and the run reports failure.
 - **Priority normalization on 'Ready to close: Yes':** when the persisted report says `Ready to close: Yes` and the work item currently carries `critical` priority, `persist_audit.py` lowers it to `high` (via `wl update <id> --priority high`) before calling `wl audit-set`, so resolved items leave the critical queue. This is best-effort: a failed priority fetch/update logs a warning and never blocks persistence. It applies to both parent and child audit persistence (single `persist_audit()` entry point).
-- The persister (and the runner when persisting) call: `wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json` and return a non-zero exit code on failure. After a successful return code, the runner calls `wl audit-show <issue-id> --json` and exits non-zero if the stored audit is null, has empty `rawOutput`/`summary`, **or the stored content does not reference the target work-item ID** (content identity check — catches a stale report persisted to the wrong item).
+- The persister (and the runner when persisting) call: `wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json` and return a non-zero exit code on failure. Every `wl` command built by `persist_audit` resolves the worklog store exactly like the runner's READ path (explicit `--worklog-dir` > prefix-to-sibling scan > cwd-chain > no flag) via the shared `skill.shared.status_lifecycle` helpers — the PERSIST path is cwd-independent by construction (SA-0MSKQERKH002IBLG), covering the runner parent/child path, the re-ask path, and the standalone CLI. After a successful return code, the runner calls `wl audit-show <issue-id> --json` and exits non-zero if the stored audit is null, has empty `rawOutput`/`summary`, **or the stored content does not reference the target work-item ID** (content identity check — catches a stale report persisted to the wrong item). The readback runs through the same resolved store, so it verifies against the store the audit was persisted to.
 - **Child item audit persistence:** When auditing a parent work item with children, the runner also persists an individual audit report to each child work item. Each child receives a focused report covering only its own acceptance criteria. Child persistence is controlled by the same `--do-not-persist` flag — if persistence is disabled for the parent, child persistence is also skipped. Child persist failures are logged as warnings to stderr but do not prevent the parent audit from succeeding. Child readback verification is out of scope for the current release.
 
 ### Agent-mode response parsing
