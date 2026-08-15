@@ -496,6 +496,20 @@ Notes:
 - The `_extract_json_array()` function strips prose text before/after JSON arrays,
   so it works correctly regardless of whether the model wraps its output in
   explanatory text (common in agent mode).
+- **Non-string evidence tolerance (SA-0MSKM2LSP006L0K8):** Phase 2 models
+  occasionally emit `evidence` as a structured JSON object (e.g.
+  `{"file": ..., "line": ..., "note": ...}`) inside the verdict array instead
+  of the requested `path/file:line` string. Every evidence consumer — gap
+  mapping to children (`_map_gaps_to_children`), Phase 1 file-scope refs
+  (`_phase1_evidence_refs`), infra-failure marker detection
+  (`_evidence_has_infra_failure_markers`), report assembly, and the verdict
+  re-emit prompt — normalizes through the shared `_evidence_text()` helper:
+  `None` → `""`, `str` → unchanged, `dict`/`list` → `json.dumps` (so embedded
+  file references stay regex-salvageable), anything else → `str()`. Phase 2
+  merge sites (parent deep, child deep, batch) also normalize before writing
+  evidence into `ac_results`, so downstream consumers never receive a
+  non-string. Verdict semantics and the conservative fail-closed gap-mapping
+  behavior are unchanged.
 
 
 ## False-positive screen (SA-0MST01NPD007MYG4 / SA-0MST01O4G002VPBR)

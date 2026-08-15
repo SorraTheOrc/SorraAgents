@@ -157,6 +157,28 @@ class TestRunPhase2DeepAnalysisEnableTools:
                 audit_runner._call_pi_and_maybe_log("PRJ", "project", "test")
                 _args, kwargs = mock_cp.call_args
                 assert kwargs.get("enable_tools") is False
+    def test_parent_deep_analysis_dict_evidence_normalized(self):
+        """SA-0MSKM2LSP006L0K8: Phase 2 batch items carrying structured
+        dict evidence are normalized to a string (json-serialized, file
+        refs salvageable) when merged into ac_results, instead of crashing
+        downstream (e.g. _map_gaps_to_children)."""
+        issue = self._make_issue()
+        acs = [self._make_ac(0, verdict="met")]
+        batch = [
+            {"index": 0, "verdict": "met", "evidence": {
+                "file": "src/gap.py", "line": 10, "note": "verified"}},
+        ]
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log",
+            return_value={"extracted_text": json.dumps(batch)},
+        ) as mock_call:
+            updated_ac, _children, _ok = audit_runner._run_phase2_deep_analysis(
+                issue, acs, [], "test-model",
+            )
+        mock_call.assert_called_once()
+        assert isinstance(updated_ac[0]["evidence"], str)
+        assert "src/gap.py" in updated_ac[0]["evidence"]
+
 
 class TestPhase2CitationCapPromptInjection:
     """F1-AC2/AC3/AC4: the max-citations-per-AC cap is injected into all

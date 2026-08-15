@@ -1378,3 +1378,66 @@ class TestParentFirstChildPassThrough:
         mapped = audit_runner._map_gaps_to_children(ac_results, children)
         assert mapped == ["CHILD-1"]
 
+    def test_map_gaps_to_children_dict_evidence_salvages_file_ref(self):
+        """_map_gaps_to_children: Phase 2 structured dict evidence (e.g.
+        {file, line, note}) must not crash; the file ref is salvaged from
+        the JSON rendering and mapped normally (SA-0MSKM2LSP006L0K8)."""
+        ac_results = [
+            {"verdict": "unmet", "evidence": {
+                "file": "src/gap.py", "line": 10, "note": "not implemented"}},
+        ]
+        children = [
+            self._child("CHILD-1", key_file="src/gap.py"),
+            self._child("CHILD-2", key_file="src/other.py"),
+        ]
+        mapped = audit_runner._map_gaps_to_children(ac_results, children)
+        assert mapped == ["CHILD-1"]
+
+    def test_map_gaps_to_children_dict_evidence_no_refs_returns_all(self):
+        """_map_gaps_to_children: dict evidence with no salvageable file
+        refs → conservative: all children are mapped (SA-0MSKM2LSP006L0K8)."""
+        ac_results = [
+            {"verdict": "unmet", "evidence": {
+                "note": "not implemented", "line": 10}},
+        ]
+        children = [self._child("CHILD-1"), self._child("CHILD-2")]
+        mapped = audit_runner._map_gaps_to_children(ac_results, children)
+        assert set(mapped) == {"CHILD-1", "CHILD-2"}
+
+
+class TestNonStringEvidenceTolerance:
+    """SA-0MSKM2LSP006L0K8: sibling evidence consumers tolerate non-string
+    evidence. Phase 2 models occasionally emit structured dict evidence
+    instead of the requested ``path/file:line`` string; no consumer may
+    crash or silently miss (e.g. substring checks against dict keys)."""
+
+    def test_phase1_evidence_refs_dict_evidence_no_crash(self):
+        """_phase1_evidence_refs: dict evidence never reaches re.finditer;
+        a ref list is returned (empty when nothing is salvageable)."""
+        ac_results = [
+            {"verdict": "met", "evidence": {
+                "file": "src/app.py", "line": 42, "note": "ok"}},
+        ]
+        refs = audit_runner._phase1_evidence_refs(ac_results)
+        assert isinstance(refs, list)
+
+    def test_infra_markers_dict_evidence_detected(self):
+        """_evidence_has_infra_failure_markers: dict evidence carrying an
+        infra-failure marker inside a value is detected (substring check
+        must not inspect dict keys)."""
+        ac_results = [
+            {"verdict": "no", "evidence": {
+                "note": "Pi model output could not be parsed"}},
+        ]
+        assert audit_runner._evidence_has_infra_failure_markers(
+            ac_results, []) is True
+
+    def test_infra_markers_dict_evidence_without_marker_false(self):
+        """_evidence_has_infra_failure_markers: dict evidence without a
+        marker stays False (no false positive from stringification)."""
+        ac_results = [
+            {"verdict": "no", "evidence": {"note": "plain diagnostic", "line": 1}},
+        ]
+        assert audit_runner._evidence_has_infra_failure_markers(
+            ac_results, []) is False
+

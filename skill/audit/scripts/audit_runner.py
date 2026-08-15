@@ -656,6 +656,29 @@ _INFRA_FALLBACK_MARKERS = (
 )
 
 
+def _evidence_text(value) -> str:
+    """Render an evidence value as text, whatever its type.
+
+    Phase 2 models occasionally emit ``evidence`` as a structured JSON
+    object (e.g. ``{"file": ..., "line": ..., "note": ...}``) instead of
+    the ``path/file:line`` string the prompt requests. Every evidence
+    consumer must tolerate that: dicts/lists are json-serialized (so file
+    references inside remain regex-salvageable) and any other non-string
+    scalar is str()-ed — nothing may reach ``re.finditer`` or a substring
+    check as a non-string (SA-0MSKM2LSP006L0K8).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
 def _evidence_has_infra_failure_markers(ac_results: list[dict],
                                         child_results: list[dict]) -> bool:
     """Return True when any parent/child AC evidence carries an infra-failure marker.
@@ -668,12 +691,12 @@ def _evidence_has_infra_failure_markers(ac_results: list[dict],
     infrastructure failure is still restored rather than demoted.
     """
     for r in ac_results:
-        evidence = r.get("evidence", "") or ""
+        evidence = _evidence_text(r.get("evidence"))
         if any(marker in evidence for marker in _INFRA_FALLBACK_MARKERS):
             return True
     for cr in child_results:
         for r in cr.get("ac_results", []):
-            evidence = r.get("evidence", "") or ""
+            evidence = _evidence_text(r.get("evidence"))
             if any(marker in evidence for marker in _INFRA_FALLBACK_MARKERS):
                 return True
     return False
@@ -2671,7 +2694,7 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
         if isinstance(obj, dict):
             return {
                 "verdict": _normalize_verdict(obj.get("verdict", "unmet")),
-                "evidence": obj.get("evidence", ""),
+                "evidence": _evidence_text(obj.get("evidence")),
                 "raw_stdout": stdout,
                 "raw_stderr": stderr,
                 "extracted_text": text,
@@ -3125,7 +3148,7 @@ def _phase1_evidence_refs(ac_results: list[dict],
     refs: list[str] = []
     seen: set[str] = set()
     for r in ac_results:
-        evidence = r.get("evidence", "") or ""
+        evidence = _evidence_text(r.get("evidence"))
         for m in re.finditer(r"([\w./-]+\.\w+):(\d+)", evidence):
             ref = f"{m.group(1)}:{m.group(2)}"
             if ref not in seen:
@@ -3413,7 +3436,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     else:
         if not phase2_completed and any(
             r["verdict"] == VERDICT_PARTIAL
-            and "pending deep code review" in r.get("evidence", "")
+            and "pending deep code review" in _evidence_text(r.get("evidence"))
             for r in ac_results
         ):
             lines.append(
@@ -4328,7 +4351,7 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
                 child_ac_results.append({
                     "text": ac,
                     "verdict": _normalize_verdict(item.get("verdict", "unmet")),
-                    "evidence": item.get("evidence", ""),
+                    "evidence": _evidence_text(item.get("evidence")),
                 })
         else:
             # Fallback: this path is reached when the Pi response was not a
@@ -4379,7 +4402,7 @@ def _phase1_review_child_acs(ci: int, child: dict, resolved_model: str,
                     "criterion could not be evaluated."
                 )
             else:
-                outer_evidence = result.get("evidence", "")
+                outer_evidence = _evidence_text(result.get("evidence"))
                 if outer_evidence:
                     evidence = (
                         f"Pi model output could not be parsed — raw output logged. "
@@ -4452,7 +4475,7 @@ def _map_gaps_to_children(ac_results: list[dict],
     for r in ac_results:
         if r.get("verdict") in _ACCEPTABLE_VERDICTS:
             continue
-        evidence = r.get("evidence", "") or ""
+        evidence = _evidence_text(r.get("evidence"))
         for m in re.finditer(r"([\w./-]+\.\w+)(?::\d+)?", evidence):
             gap_refs.add(m.group(1))
     if not gap_refs:
@@ -4832,7 +4855,7 @@ def _deep_analyze_child(
         for i in range(len(updated_child_acs)):
             item = reviewed.get(i, {})
             deep_verdict = _normalize_verdict(item.get("verdict", ""))
-            deep_evidence = item.get("evidence", "")
+            deep_evidence = _evidence_text(item.get("evidence"))
             if deep_verdict:
                 initial = updated_child_acs[i]["verdict"]
                 if initial == VERDICT_MET and deep_verdict == VERDICT_MET:
@@ -4874,7 +4897,7 @@ def _apply_deep_verdicts(
     for i in range(len(updated)):
         item = reviewed.get(i, {})
         deep_verdict = _normalize_verdict(item.get("verdict", ""))
-        deep_evidence = item.get("evidence", "")
+        deep_evidence = _evidence_text(item.get("evidence"))
         if not deep_verdict:
             continue
         initial = updated[i]["verdict"]
@@ -5354,7 +5377,7 @@ def _run_phase2_deep_analysis(
             for i in range(len(updated_ac)):
                 item = reviewed.get(i, {})
                 deep_verdict = _normalize_verdict(item.get("verdict", ""))
-                deep_evidence = item.get("evidence", "")
+                deep_evidence = _evidence_text(item.get("evidence"))
                 if deep_verdict:
                     # Final verdict = Phase 1 passes AND Phase 2 confirms
                     initial = updated_ac[i]["verdict"]
@@ -5461,7 +5484,7 @@ def _reask_verdict_array_once(
             "index": i,
             "text": r.get("text", ""),
             "verdict": r.get("verdict", "unmet"),
-            "evidence": (r.get("evidence", "") or "")[:200],
+            "evidence": _evidence_text(r.get("evidence"))[:200],
         }
         for i, r in enumerate(ac_results)
     ])
@@ -5519,7 +5542,7 @@ def _reask_verdict_array_once(
             "verdict": _normalize_verdict(
                 item.get("verdict", r.get("verdict", "unmet"))
             ),
-            "evidence": item.get("evidence", r.get("evidence", "")),
+            "evidence": _evidence_text(item.get("evidence", r.get("evidence", ""))),
         })
     return repaired
 
@@ -6642,7 +6665,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                 ac_results.append({
                     "text": ac,
                     "verdict": _normalize_verdict(item.get("verdict", "unmet")),
-                    "evidence": item.get("evidence", ""),
+                    "evidence": _evidence_text(item.get("evidence")),
                 })
         else:
             # Fallback: this path is reached when the Pi response was not a
@@ -6694,7 +6717,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                     "criterion could not be evaluated."
                 )
             else:
-                outer_evidence = result.get("evidence", "")
+                outer_evidence = _evidence_text(result.get("evidence"))
                 if outer_evidence:
                     evidence = (
                         f"Pi model output could not be parsed — raw output logged. "

@@ -374,6 +374,51 @@ class TestBoundedReask:
         err = capsys.readouterr().err
         assert "fallback" in err.lower()
 
+    def test_dict_evidence_completes_and_persists(self, monkeypatch):
+        """SA-0MSKM2LSP006L0K8 AC3: a full cmd_issue run whose Phase 2
+        parent deep call returns structured dict evidence completes (rc 0)
+        and persists a report carrying the salvaged evidence string.
+
+        The first persist attempt is rejected (PERSIST_CONTENT_INVALID) so
+        the bounded verdict re-ask runs against ac_results that still carry
+        the dict evidence — pre-fix this crashed at the re-emit prompt's
+        evidence slice ((dict)[:200]) and no report was persisted; post-fix
+        the evidence is normalized to a string everywhere.
+        """
+        from skill.audit.scripts import audit_runner as ar_module
+
+        def fake_pi_and_maybe_log(issue_id, context, prompt, **kwargs):
+            if context == "phase2_deep":
+                batch = [{
+                    "index": 0, "verdict": "met",
+                    "evidence": {"file": "src/app.py", "line": 42,
+                                  "note": "verified in code"},
+                }]
+                payload = json.dumps(batch)
+                return {"verdict": "met", "evidence": payload,
+                        "extracted_text": payload}
+            return _fake_pi_result()
+
+        monkeypatch.setattr(
+            ar_module, "_call_pi_and_maybe_log", fake_pi_and_maybe_log)
+        persist_results = iter([PERSIST_CONTENT_INVALID, 0])
+        persisted: list[str] = []
+
+        def fake_persist(issue_id, report_text, **kwargs):
+            persisted.append(report_text)
+            return next(persist_results)
+
+        monkeypatch.setattr(ar_module, "persist_audit", fake_persist)
+
+        rc = ar_module.cmd_issue("SA-FIXTURE-001", runner=self._fixture_runner())
+
+        assert rc == 0
+        # Original + post-re-ask persist attempts both completed.
+        assert len(persisted) == 2
+        # The dict evidence was normalized to a string and survived Phase 2
+        # merge + report assembly + the re-ask prompt (no crash, no drop).
+        assert "src/app.py" in persisted[0]
+
 
 def _fake_pi_result(ac_count: int = 3, verdict: str = "met") -> dict:
     """Build a mock Pi result that returns a valid JSON array for AC review."""
