@@ -354,6 +354,56 @@ class TestSkillMdDocumentsBatchAndConcurrencyFlags:
         assert "--max-concurrency" in usage_line
 
 
+class TestSkillMdReadOnlyException:
+    """SKILL.md + reference doc document the justified READ-ONLY exception
+    (SA-0MST01Q4W005G495 AC1-AC3)."""
+
+    def test_exception_scope_documented(self) -> None:
+        """The exception scope (config write, local commit, chore creation,
+        code-quality re-run) is documented; never close/delete/push."""
+        text = _skill_docs()
+        assert "READ-ONLY exception" in text
+        assert "per-file-ignores" in text
+        assert "committed locally (no push)" in text
+        assert "chore" in text.lower()
+        assert "Do NOT close or delete work items" in text
+
+    def test_no_create_rule_relaxation_documented(self) -> None:
+        """The no-create rule states the config-fix chore exception and its
+        preconditions (model confidence + no-breakage verification)."""
+        text = _skill_docs()
+        assert "ONLY relaxation of the no-create rule" in text
+        assert "confident-false-positive" in text
+        assert "no-breakage verification" in text
+
+    def test_reference_doc_documents_false_positive_screen(self) -> None:
+        """The reference doc documents the screen classifications and
+        caution-first degradation."""
+        text = _skill_docs()
+        assert "False-positive screen" in text
+        assert "confident-false-positive" in text
+        assert "caution-first" in text
+        assert "uncertain" in text
+
+    def test_reference_doc_documents_remediation_loop_and_env_var(self) -> None:
+        """The reference doc documents the remediation loop and the env var
+        with its default (3)."""
+        text = _skill_docs()
+        assert "Remediation loop" in text
+        assert "AUDIT_REMEDIATION_MAX_ITERATIONS" in text
+        assert "default `3`" in text
+        assert "remediation loop exhausted" in text
+
+    def test_reference_doc_documents_chore_creation(self) -> None:
+        """The reference doc documents chore creation for config fixes and
+        medium/low tracking (worklog resolution, fail-safe)."""
+        text = _skill_docs()
+        assert "Chore work-item creation" in text
+        assert "candidate false positive — producer decision required" in text
+        assert "--worklog-dir" in text
+        assert "chore_failures" in text
+
+
 class TestDebugLogLocation:
     def test_default_path_outside_worklog_and_repo(self) -> None:
         """_default_debug_log_path resolves outside .worklog/ and repo tree."""

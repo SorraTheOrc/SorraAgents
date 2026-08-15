@@ -497,6 +497,80 @@ Notes:
   so it works correctly regardless of whether the model wraps its output in
   explanatory text (common in agent mode).
 
+
+## False-positive screen (SA-0MST01NPD007MYG4 / SA-0MST01O4G002VPBR)
+
+Ruff code-quality findings are screened by a single batched Pi call before they can
+block closure:
+
+- **Scope**: only findings with `linter == "ruff"` are screened; non-ruff findings
+  (eslint, markdownlint, shellcheck) are never sent. When no ruff findings exist
+  the screen is skipped entirely — zero Pi calls.
+- **Classifications** (per finding, with a written one-line justification):
+  `genuine` (real defect — stays blocking), `confident-false-positive` (rule
+  misfires — eligible for config remediation), `uncertain` (caution-first —
+  remains blocking).
+- **Caution-first degradation**: a missing finding in the batch, an unparseable
+  response, a provider error, a timeout, a concurrency-limit marker, or a
+  `RuntimeError` from the Pi call defaults EVERY finding to `uncertain` — never
+  `confident-false-positive` — and sets the infra-fallback flag so a verdict
+  derived from the failed screen restores the pre-audit state instead of demoting.
+- **Blocking decision**: only `confident-false-positive` critical/high findings
+  are non-blocking (remediable); `uncertain` findings remain blocking annotated
+  "candidate false positive — producer decision required".
+- Surfaces in the report as a `#### False-positive screen` table under
+  `### Code Quality`, and in `_build_issue_json` under
+  `code_quality.false_positive_screen`.
+
+## Ruff config remediation loop (SA-0MST01OIN008MXYT / SA-0MST01OX4007Z17C)
+
+The justified READ-ONLY exception (SA-0MSSSNOZN000LQKR): a
+`confident-false-positive` critical/high ruff finding is silenced by a MINIMAL,
+surgical ruff config change, then re-scanned:
+
+1. **Locate/create the config** (`locate_ruff_config` in
+   `skill/code_review/scripts/linter_runner.py`): existing `ruff.toml`, else the
+   `pyproject.toml` `[tool.ruff]` section, else a new `ruff.toml` created in
+   `TARGET_PROJECT_ROOT`.
+2. **Minimal edit** (`apply_ruff_remediation`): `per-file-ignores` entries for the
+   flagged file+rule pairs only — no sweeping rule changes, no inline source
+   suppressions, no `_RUFF_SEVERITY_MAP` / `_classify_ruff` edits.
+3. **Local commit** (`_commit_config_remediation`): `git add <config>` +
+   `git commit` (never `git push`), message referencing the work item.
+4. **Fingerprint re-hash** AFTER the commit (working tree clean → freshness gate
+   stable).
+5. **Code-quality-only re-run**: `run_code_quality(fix=False, files=<same
+   changed-file scope>)` — the pipeline is never restarted; remaining findings
+   flow back through the screen.
+6. **Cap**: at most 3 config-fix iterations per audit run by default,
+   env-configurable via `AUDIT_REMEDIATION_MAX_ITERATIONS` (default `3`;
+   invalid values fail closed). A finding persisting past the cap stays blocking
+   `genuine` annotated "remediation loop exhausted". `uncertain` and non-blocking
+   (medium/low) findings never enter the loop.
+
+Outcomes surface in the report as `#### Remediation loop` and in
+`_build_issue_json` under `code_quality.remediation`.
+
+## Chore work-item creation (SA-0MST01PQQ009T0CI)
+
+The ONLY relaxation of the audit's no-create rule, for tracking false positives:
+
+- **Per applied config fix**: a `chore` work item is created via `_run_wl`
+  (`wl create --issue-type chore --title <finding> --description <finding refs +
+  commit sha>`) with full `--worklog-dir` resolution
+  (`_resolve_worklog_flags`: explicit dir > prefix-to-sibling > cwd-chain), so
+  sibling-project audits create the chore in the owning project's worklog.
+- **Medium/low confident-false-positive findings**: a tracking `chore` with no
+  commit link, annotated "candidate false positive — producer decision required".
+- **Never tracked**: `uncertain` and `genuine` findings get no work item.
+- **Fail-safe** (`chore_failures`): a `wl create` failure never reverts the
+  remediation commit; the affected finding stays blocking `genuine` (demoted with
+  `chore_failed`) and the failure is recorded in the report.
+
+Chore ids surface in the report (`#### Remediation loop`) and in
+`_build_issue_json` under `code_quality.remediation.chore_items` /
+`.chore_failures`.
+
 ## Context reduction (SA-0MSISKM8F004NW1U)
 
 Every pi call (`_call_pi`) runs with `--no-context-files --no-skills` in both
