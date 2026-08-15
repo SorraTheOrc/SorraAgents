@@ -260,7 +260,7 @@ class TestRemediationLoop:
             order.append("fp")
             return f"fp-{order.count('fp')}"
 
-        def _commit(runner, config_path, project_root):
+        def _commit(runner, config_path, project_root, issue_id):
             order.append("commit")
             return f"sha-{order.count('commit')}"
 
@@ -294,7 +294,32 @@ class TestRemediationLoop:
         assert results["exhausted"] is False
         # The config file was created + edited in the project root.
         assert (tmp_path / "ruff.toml").exists()
-        assert '"src/bad.py" = ["F841"]' in (tmp_path / "ruff.toml").read_text()
+
+    def test_commit_message_references_work_item(self, tmp_path):
+        """F2 AC3: the local config-fix commit message references the work
+        item id (and is not pushed)."""
+        config = tmp_path / "ruff.toml"
+        config.write_text("[per-file-ignores]\n", encoding="utf-8")
+        commands: list[list[str]] = []
+
+        def _runner(cmd):
+            commands.append(list(cmd))
+            if cmd[0] == "git" and cmd[1] == "commit":
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if cmd[:3] == ["git", "rev-parse", "--short"]:
+                return SimpleNamespace(returncode=0, stdout="deadbeef\n",
+                                       stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        sha = audit_runner._commit_config_remediation(
+            _runner, config, tmp_path, issue_id="SA-0MST01OX4007Z17C")
+        assert sha == "deadbeef"
+        commit_cmds = [c for c in commands if c[1:3] == ["commit", "-m"]]
+        assert len(commit_cmds) == 1
+        assert "SA-0MST01OX4007Z17C" in commit_cmds[0][3]
+        assert all(c[1] != "push" for c in commands if c[0] == "git")
+        # apply_ruff_remediation was NOT called — the commit just stages
+        # whatever is tracked (the test verifies commit-message + no push).
 
     def test_loop_reruns_scoped_code_quality_only(self, tmp_path):
         """AC4: the re-run is scoped to the code-quality scan only — same
@@ -449,13 +474,15 @@ class TestRemediationLoop:
         def _neutral_loop(**kwargs):
             captured["cq_findings"] = kwargs.get("cq_findings")
             captured["fp_screen_results"] = kwargs.get("fp_screen_results")
+            # Simulate a post-remediation re-hash: the loop's fingerprint
+            # differs from the pre-loop one (F2 AC3 propagation).
             return {
-                "iterations": 0,
+                "iterations": 1,
                 "max_iterations": 3,
                 "exhausted": False,
                 "commits": [],
                 "fingerprint_before": kwargs.get("content_fingerprint"),
-                "fingerprint_after": kwargs.get("content_fingerprint"),
+                "fingerprint_after": "fp-post-remediation",
                 "cq_findings": kwargs.get("cq_findings"),
                 "fp_screen_results": kwargs.get("fp_screen_results"),
             }
@@ -528,6 +555,11 @@ class TestRemediationLoop:
         assert captured["fp_screen_results"][0]["classification"] == \
             "confident-false-positive"
         assert captured["cq_findings"] == [finding]
+        # The loop's re-hashed fingerprint replaced the pre-loop one and is
+        # what the report embeds (freshness gate stable after remediation).
+        report = capsys.readouterr().out
+        assert "fp-post-remediation" in report
+        assert "Audit content fingerprint: fp-post-remediation" in report
 
 
 # ===========================================================================

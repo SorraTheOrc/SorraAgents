@@ -6066,20 +6066,26 @@ def _default_max_remediation_iterations() -> int:
 
 
 def _commit_config_remediation(runner: Runner, config_path: Path,
-                               project_root: Path) -> str | None:
-    """Commit the applied ruff config fix locally (no push). T2 AC3.
+                               project_root: Path,
+                               issue_id: str | None = None) -> str | None:
+    """Commit the applied ruff config fix locally (no push). T2 AC3 / F2 AC3.
 
     Stages only the config file and commits with
-    ``REMEDIATION_COMMIT_MESSAGE``. Returns the short commit sha, or None
-    when the commit failed (nothing to commit, git error).
+    ``REMEDIATION_COMMIT_MESSAGE`` (plus the work-item id when known so
+    the message references the work item — F2 AC3). Returns the short
+    commit sha, or None when the commit failed (nothing to commit, git
+    error).
     """
     try:
         rel = config_path.relative_to(project_root)
     except ValueError:
         rel = config_path
+    message = REMEDIATION_COMMIT_MESSAGE
+    if issue_id:
+        message = f"{message} — {issue_id}"
     try:
         runner(["git", "add", "--", str(rel)])
-        proc = runner(["git", "commit", "-m", REMEDIATION_COMMIT_MESSAGE])
+        proc = runner(["git", "commit", "-m", message])
         if getattr(proc, "returncode", 0) != 0:
             return None
         head = runner(["git", "rev-parse", "--short", "HEAD"])
@@ -6178,7 +6184,8 @@ def _run_remediation_loop(
             # Nothing to add — the config cannot silence these findings.
             results["exhausted"] = True
             break
-        sha = _commit_config_remediation(runner, config_path, project_root)
+        sha = _commit_config_remediation(runner, config_path, project_root,
+                                          issue_id)
         change = _fp_remediation_change_summary(targets)
         new_fp = _compute_content_fingerprint(
             runner, issue_id, worklog_dir=worklog_dir, work_item=work_item,
@@ -6378,7 +6385,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         "fp_screen_results", fp_screen_results
     )
     content_fingerprint = remediation_results.get(
-        "content_fingerprint", content_fingerprint
+        "fingerprint_after", content_fingerprint
     )
 
     ctx.work_item = work_item
