@@ -7786,10 +7786,23 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> None:
             ]
         elif ctx.audit_verdict == "yes":
             # Advance to the review queue. Keep a terminal 'done' stage.
+            # Top-level items (no parent) get --needs-producer-review yes so
+            # the producer-review gate (closeWorkItemsAfterRelease) blocks
+            # release until the producer explicitly reviews the item.  Child
+            # items are covered by their parent's review and must NOT be
+            # flagged — the flag would flood the producer queue with
+            # redundant approvals (SA-0MSSVKYEW008PJ9H). The flag is
+            # inserted before the trailing --json (file convention:
+            # --json is always the last flag).
+            cmd = ["wl", "update", ctx.issue_id]
             if ctx.original_stage == "done":
-                restore_cmd = ["wl", "update", ctx.issue_id, "--status", "completed", "--json"]
+                cmd += ["--status", "completed"]
             else:
-                restore_cmd = ["wl", "update", ctx.issue_id, "--status", "completed", "--stage", "in_review", "--json"]
+                cmd += ["--status", "completed", "--stage", "in_review"]
+            if not ctx.wi or not ctx.wi.get("parentId"):
+                cmd += ["--needs-producer-review", "yes"]
+            cmd.append("--json")
+            restore_cmd = cmd
         else:  # ctx.audit_verdict == "no"
             # Return to the actionable queue at a fixed pre-review stage.
             restore_cmd = ["wl", "update", ctx.issue_id, "--status", "open", "--stage", "plan_complete", "--json"]

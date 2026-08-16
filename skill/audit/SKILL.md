@@ -32,7 +32,7 @@ Implemented as a lightweight entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY). B
 The runner manages the item's `status`/`stage` during execution to prevent concurrent audits and leave it consistent with the verdict (via `try/finally`, guaranteed even on failure):
 
 - Capture original status+stage at `cmd_issue()` start; set `in_progress`.
-- `Ready to close: Yes` → `completed`/`in_review` (keep `done` if terminal); `No` → `open`/`plan_complete`.
+- `Ready to close: Yes` → `completed`/`in_review` (keep `done` if terminal); `No` → `open`/`plan_complete`. A top-level item (no parent) with a `Yes` verdict also gets `needsProducerReview: true` (via `--needs-producer-review yes`) so the release gate (`closeWorkItemsAfterRelease`) blocks until the producer reviews it; child items (with a parent) are **not** flagged — their parent's review covers the subtree (SA-0MSSVKYEW008PJ9H).
 - A completed `Yes` verdict advances **even when AC evidence was fallback-tainted** (e.g. a read-only test skip with a variance note) — a fallback on some ACs does not invalidate an explicit model `Yes` (WL-0MSN7XAUS008WOPQ). The fallback flag only forces the restore path for a `No` verdict (an infra-fallback `No` is not an explicit model assessment).
 - Failure/timeout/unparseable → restore captured pre-audit status/stage (fallback only if undeterminable) and **clear the assignee**. Only an explicit `No` moves to `open` — a transient timeout never demotes an `in_review` item. If a completed `Yes` run is ever restored (script failure during the run), a visible warning is printed — never a silent divergence.
 - `--do-not-persist` doesn't affect the lifecycle; status-update failures are silently caught (still reported).
@@ -43,7 +43,8 @@ Without `audit_runner.py` (always `--json`; `ORIG_STATUS` = pre-audit status):
 
 ```bash
 wl update <id> --status in_progress --json
-# Yes:  wl update <id> --status completed --stage in_review --json
+# Yes (top-level, no parent):  wl update <id> --status completed --stage in_review --needs-producer-review yes --json
+# Yes (child item):            wl update <id> --status completed --stage in_review --json
 # No:   wl update <id> --status open --stage plan_complete --json
 # Fail: wl update <id> --status "$ORIG_STATUS" --assignee "" --json
 ```

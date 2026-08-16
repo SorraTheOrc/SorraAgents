@@ -1382,8 +1382,10 @@ class TestStatusLifecycle:
     # Tests: needs_producer_review flag (AC1, AC2)
     # ------------------------------------------------------------------
 
-    def test_status_restore_does_not_include_producer_review_flags(self, monkeypatch):
-        """The verdict-driven transition does not include --needs-producer-review."""
+    def test_completed_update_includes_needs_producer_review_when_ready_to_close(self, monkeypatch):
+        """On a 'Ready to close: Yes' verdict for a top-level item (no parent),
+        the terminal wl update includes --needs-producer-review yes (AC1,
+        SA-0MSSVKYEW008PJ9H)."""
         calls = []
 
         monkeypatch.setattr(
@@ -1398,20 +1400,26 @@ class TestStatusLifecycle:
         cmd_issue("SA-NPR1", runner=self._fake_runner_with_calls(calls), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR1"]]
-        # The verdict-driven transition (final update) should NOT include
-        # --needs-producer-review. It DOES set a compatible stage
-        # (in_review for a yes verdict).
+        # The verdict-driven transition (final update) sets a compatible stage
+        # (in_review for a yes verdict) and, for a top-level item (no parentId
+        # in the captured work item), --needs-producer-review yes.
         final_update = wl_updates[-1] if wl_updates else []
-        assert "--needs-producer-review" not in final_update, (
-            f"Status transition must NOT include --needs-producer-review, got: {final_update}"
-        )
         assert final_update[3:7] == ["--status", "completed", "--stage", "in_review"], (
             f"Expected completed/in_review transition on yes verdict, got: {final_update}"
+        )
+        assert "--needs-producer-review" in final_update, (
+            f"Top-level yes verdict must include --needs-producer-review, got: {final_update}"
+        )
+        npr_idx = final_update.index("--needs-producer-review")
+        assert final_update[npr_idx + 1] == "yes", (
+            f"--needs-producer-review must be 'yes', got: {final_update}"
         )
 
     def test_no_needs_producer_review_when_not_ready_to_close(self, monkeypatch):
         """When audit verdict is NOT ready-to-close, the status update must NOT
-        include --needs-producer-review (AC1: only set when verdict is ready-to-close)."""
+        include --needs-producer-review (AC3: only set for a yes verdict on a
+        top-level item). The AC screen returns 'unmet' so the audit lands on a
+        genuine 'Ready to close: No' verdict."""
         calls = []
 
         monkeypatch.setattr(
@@ -1423,7 +1431,7 @@ class TestStatusLifecycle:
             },
         )
 
-        cmd_issue("SA-NPR2", runner=self._fake_runner_with_calls(calls, has_acs=False), persist=False)
+        cmd_issue("SA-NPR2", runner=self._fake_runner_with_calls(calls, has_acs=True), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR2"]]
         for update in wl_updates:

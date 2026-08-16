@@ -54,7 +54,8 @@ class TestVerdictDrivenStatusLifecycle:
     # ------------------------------------------------------------------
 
     def _make_runner(self, updates, status="open", stage="plan_complete",
-                     description="", children=None, fail_children_show=False):
+                     description="", children=None, fail_children_show=False,
+                     parent_id=None):
         """Build a mock runner that records every ``wl update`` command.
 
         Handles the exact ``wl`` command sequence issued by ``cmd_issue``:
@@ -72,14 +73,16 @@ class TestVerdictDrivenStatusLifecycle:
                     returncode=0, stdout=json.dumps({"success": True}), stderr="",
                 )
 
-            # Original status/stage capture → wl show <id> --json
+            # Original status/stage capture → wl show <id> --json.
+            # The captured work item carries an optional parentId so tests can
+            # exercise the top-level vs child producer-review gating.
             if "show" in cmd_str and "--children" not in cmd_str:
+                wi = {"id": "TEST-1", "status": status, "stage": stage}
+                if parent_id is not None:
+                    wi["parentId"] = parent_id
                 return SimpleNamespace(
                     returncode=0,
-                    stdout=json.dumps({
-                        "success": True,
-                        "workItem": {"id": "TEST-1", "status": status, "stage": stage},
-                    }),
+                    stdout=json.dumps({"success": True, "workItem": wi}),
                     stderr="",
                 )
 
@@ -147,7 +150,9 @@ class TestVerdictDrivenStatusLifecycle:
     def test_ready_yes_sets_completed_in_review(self):
         """AC1: Ready to close: Yes → status=completed, stage=in_review.
 
-        Applies regardless of the pre-audit status (here: in_progress).
+        Applies regardless of the pre-audit status (here: in_progress). The
+        item has no parent, so the terminal update also sets
+        --needs-producer-review yes (SA-0MSSVKYEW008PJ9H).
         """
         updates = []
         self._run_issue(
@@ -157,11 +162,29 @@ class TestVerdictDrivenStatusLifecycle:
         )
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
+            "--status", "completed", "--stage", "in_review",
+            "--needs-producer-review", "yes", "--json",
+        ]
+
+    def test_ready_yes_child_does_not_set_producer_review(self):
+        """AC2: Ready to close: Yes on a child item (has a parent) does not
+        set --needs-producer-review — the parent's review covers the subtree.
+        """
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes\n\n## Summary\nAll met.",
+            status="in_progress", stage="in_progress",
+            parent_id="PARENT-1",
+        )
+        assert self._last_update(updates) == [
+            "wl", "update", "TEST-1",
             "--status", "completed", "--stage", "in_review", "--json",
         ]
 
     def test_ready_yes_keeps_terminal_done_stage(self):
-        """AC1: Ready to close: Yes keeps a pre-existing 'done' stage."""
+        """AC1: Ready to close: Yes keeps a pre-existing 'done' stage, and a
+        top-level item still gets --needs-producer-review yes."""
         updates = []
         self._run_issue(
             updates,
@@ -171,6 +194,22 @@ class TestVerdictDrivenStatusLifecycle:
         last = self._last_update(updates)
         assert "--status" in last and "completed" in last
         assert "--stage" not in last  # stage stays 'done'
+        assert "--needs-producer-review" in last and "yes" in last
+
+    def test_ready_yes_child_keeps_terminal_done_stage(self):
+        """AC2: A child keeps a pre-existing 'done' stage and does NOT get the
+        producer-review flag on the terminal update."""
+        updates = []
+        self._run_issue(
+            updates,
+            verdict_report="Ready to close: Yes\n\n## Summary\nAll met.",
+            status="completed", stage="done",
+            parent_id="PARENT-1",
+        )
+        last = self._last_update(updates)
+        assert "--status" in last and "completed" in last
+        assert "--stage" not in last  # stage stays 'done'
+        assert "--needs-producer-review" not in last
 
     def test_ready_yes_idempotent_on_completed_in_review(self):
         """AC6: Re-auditing a completed/in_review item with Yes stays completed/in_review."""
@@ -182,7 +221,8 @@ class TestVerdictDrivenStatusLifecycle:
         )
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
-            "--status", "completed", "--stage", "in_review", "--json",
+            "--status", "completed", "--stage", "in_review",
+            "--needs-producer-review", "yes", "--json",
         ]
 
     # ------------------------------------------------------------------
@@ -354,7 +394,8 @@ class TestVerdictDrivenStatusLifecycle:
         assert rc == 0
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
-            "--status", "completed", "--stage", "in_review", "--json",
+            "--status", "completed", "--stage", "in_review",
+            "--needs-producer-review", "yes", "--json",
         ]
 
     def test_preflight_guard_allows_open_items(self):
@@ -376,7 +417,8 @@ class TestVerdictDrivenStatusLifecycle:
         assert rc == 0
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
-            "--status", "completed", "--stage", "in_review", "--json",
+            "--status", "completed", "--stage", "in_review",
+            "--needs-producer-review", "yes", "--json",
         ]
 
     # ------------------------------------------------------------------
